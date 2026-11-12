@@ -12,7 +12,7 @@ use crate::{sql_err, stack_format};
 
 use super::super::{
     ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, datum_to_text, eval_full,
-    expression_type_identity, sqlstate, text_arg, type_mismatch,
+    expression_type_identity, sqlstate, text_arg,
 };
 
 fn decimal(bytes: &[u8], at: &mut usize) -> Result<Option<usize>, SqlError> {
@@ -193,7 +193,10 @@ pub(crate) fn dispatch<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Option<Result<Datum<'a>, SqlError>> {
-    if !matches!(name, "row" | "pg_size_pretty" | "format" | "to_number") {
+    if !matches!(
+        name,
+        "row" | crate::sql::parser::ROWS_NOT_DISTINCT | "pg_size_pretty" | "format" | "to_number"
+    ) {
         return None;
     }
     let arity = |n: usize| -> Result<(), SqlError> {
@@ -251,6 +254,41 @@ pub(crate) fn dispatch<'a>(
                 }
                 Ok(Datum::Record(fields.as_slice()))
             }
+            crate::sql::parser::ROWS_NOT_DISTINCT => {
+                arity(2)?;
+                let (
+                    Datum::Record(left) | Datum::Composite { fields: left, .. },
+                    Datum::Record(right) | Datum::Composite { fields: right, .. },
+                ) = (
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    eval_full(args[1], arena, params, row, hooks)?,
+                )
+                else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "row constructor did not produce a record"
+                    ));
+                };
+                if left.len() != right.len() {
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "unequal number of entries in row expressions"
+                    ));
+                }
+                for (left, right) in left.iter().zip(right) {
+                    let same = match (left.value.is_null(), right.value.is_null()) {
+                        (true, true) => true,
+                        (false, false) => {
+                            crate::sql::eval::compare_datums(&left.value, &right.value)?.is_eq()
+                        }
+                        _ => false,
+                    };
+                    if !same {
+                        return Ok(Datum::Bool(false));
+                    }
+                }
+                Ok(Datum::Bool(true))
+            }
             "pg_size_pretty" => {
                 // Human-readable byte size, matching PostgreSQL's pg_size_pretty:
                 // "N bytes" below 10 kB, then half-rounded kB/MB/GB/TB/PB via the
@@ -263,7 +301,9 @@ pub(crate) fn dispatch<'a>(
                     Datum::Null => return Ok(Datum::Null),
                     Datum::Int8(v) => v,
                     Datum::Numeric(n) => n.to_i64()?,
-                    other => return Err(type_mismatch(name, &other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 const UNITS: [&str; 6] = ["bytes", "kB", "MB", "GB", "TB", "PB"];
                 let limit: i64 = 10 * 1024;
@@ -354,7 +394,11 @@ pub(crate) fn dispatch<'a>(
                             Datum::Int2(value) => Some(i64::from(value)),
                             Datum::Int4(value) => Some(i64::from(value)),
                             Datum::Int8(value) => Some(value),
-                            other => return Err(type_mismatch("format", &other)),
+                            other => {
+                                return Err(crate::sql::eval::function_argument_mismatch(
+                                    "format", &other,
+                                ));
+                            }
                         };
                     } else if let Some(written) = decimal(bytes, &mut i)? {
                         width = Some(i64::try_from(written).map_err(|_| {

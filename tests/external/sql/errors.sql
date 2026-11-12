@@ -21,6 +21,12 @@ SELECT 'é',
   'ü' FROM WHERE;
 SELECT count(*), id FROM t_err;
 DROP TABLE missing_table;
+-- Unicode escapes, type modifiers checked after parsing, operator and cast
+-- errors with PostgreSQL's position and hint.
+SELECT U&'\D83D';
+SELECT 1::numeric(2000);
+SELECT '{}'::jsonb ? 1;
+SELECT 1::int::timestamp;
 -- psql sends each ;-separated statement as its own Query message and
 -- (with ON_ERROR_STOP off) continues after errors; the wire_probe covers
 -- true multi-statement strings in one message.

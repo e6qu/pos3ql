@@ -8,7 +8,7 @@
 //! scan machinery can resolve against, which is what is synthesized here.
 
 use crate::mem::arena::{Arena, ArenaList, ArenaString};
-use crate::sql::ast::{Expr, Select, SelectItem, TableRef};
+use crate::sql::ast::{Expr, Select, SelectItem, SetTree, TableRef};
 use crate::sql::eval::{ColumnLookup, EvalHooks, ProjectSetValue, SqlError, eval_full, sqlstate};
 use crate::sql::exec::MAX_PROJ;
 
@@ -795,7 +795,7 @@ pub(super) fn srf_in_item<'a>(item: &'a SelectItem<'a>) -> Option<&'a Expr<'a>> 
     match item {
         SelectItem::Expr { expression, .. } => srf_in_expr(expression),
         SelectItem::RecordStar(base) => srf_in_expr(base),
-        SelectItem::Wildcard | SelectItem::TableWildcard(_) => None,
+        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => None,
     }
 }
 
@@ -831,7 +831,7 @@ pub(super) fn has_project_set(items: &[SelectItem<'_>], storage: &Storage, txid:
         SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
             expression_has_project_set(expression, storage, txid)
         }
-        SelectItem::Wildcard | SelectItem::TableWildcard(_) => false,
+        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => false,
     })
 }
 
@@ -1111,6 +1111,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                         authorization_role: None,
                         bound_table: None,
                         view_access: None,
+                        join_members: None,
                     })
                     .map_err(|_| arena_full())?;
                 let routine = capture_table_func_routine(
@@ -1355,10 +1356,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                     Datum::Json { text, .. } | Datum::Text(text) => text,
                     Datum::Null => return Ok(&[]),
                     other => {
-                        return Err(crate::sql::eval::type_mismatch_pub(
-                            "populate_recordset requires JSON",
-                            &other,
-                        ));
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
                     }
                 };
                 let crate::sql::json::Json::Array(items) = crate::sql::json::parse(source, arena)?
@@ -1561,7 +1559,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
     for item in items {
         let expression = match item {
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => expression,
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => continue,
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => continue,
         };
         visit(
             expression,
@@ -2045,10 +2043,7 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
             Datum::Json { text, .. } | Datum::Text(text) => text,
             Datum::Null => return Ok(0),
             other => {
-                return Err(crate::sql::eval::type_mismatch_pub(
-                    "populate_recordset requires JSON",
-                    &other,
-                ));
+                return Err(crate::sql::eval::function_argument_mismatch(name, &other));
             }
         };
         match crate::sql::json::parse(source, arena)? {
@@ -2141,8 +2136,6 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
         }
         let jsonb =
             name.eq_ignore_ascii_case("jsonb_each") || name.eq_ignore_ascii_case("jsonb_each_text");
-        let as_text = name.eq_ignore_ascii_case("json_each_text")
-            || name.eq_ignore_ascii_case("jsonb_each_text");
         let document = eval_full(args[0], arena, params, row, hooks)?;
         crate::sql::eval::funcs::json::check_json_family(name, &document)?;
         let text = match crate::sql::eval::text_view(document) {
@@ -2150,13 +2143,14 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
             Datum::Text(s) => s,
             Datum::Null => return Ok(0),
             _ => {
-                return Err(sql_err!(
-                    sqlstate::INVALID_PARAMETER_VALUE,
-                    "cannot deconstruct a scalar"
+                return Err(crate::sql::json::each_error(
+                    name,
+                    jsonb,
+                    crate::sql::json::Kind::Scalar,
                 ));
             }
         };
-        Ok(crate::sql::eval::json_each_pairs(text, jsonb, as_text, arena)?.len())
+        Ok(crate::sql::eval::json_each_pairs(name, text, arena)?.len())
     } else if name.eq_ignore_ascii_case("regexp_split_to_table") {
         if !(2..=3).contains(&args.len()) {
             return Err(sql_err!(
@@ -2282,8 +2276,8 @@ pub(super) fn preserve_projection_type_identities(
         match entry {
             super::ResolvedColumn::Table(table, column) => resolver
                 .column_meta(
-                    Some(scope.names[table]),
-                    scope.defs.column_name(table, column),
+                    Some(scope.column_reference_name(table, column).0),
+                    scope.column_reference_name(table, column).1,
                 )
                 .map(|metadata| metadata.type_oid)
                 .ok_or_else(shape_error),
@@ -2293,7 +2287,7 @@ pub(super) fn preserve_projection_type_identities(
     let mut output = 0usize;
     for item in items {
         match item {
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 let scope = scope.ok_or_else(shape_error)?;
                 for index in 0..scope.star_columns() {
                     *type_oids.get_mut(output).ok_or_else(shape_error)? =
@@ -2342,8 +2336,85 @@ pub(super) fn preserve_projection_type_identities(
     Ok(())
 }
 
+/// A record column of a set operation has the field shape of its leftmost
+/// query's expression, as PostgreSQL resolves `(u.tail).f1` through the
+/// first query's target list.
+fn register_set_record_shapes<'a>(
+    storage: &Storage,
+    tree: &SetTree<'_>,
+    txid: u32,
+    arena: &'a Arena,
+    descriptors: &mut [ColDesc<'a>],
+) -> Result<(), SqlError> {
+    let mut leaf = tree;
+    while let SetTree::Op { left, .. } = leaf {
+        leaf = left;
+    }
+    let SetTree::Select(leaf) = leaf else {
+        unreachable!("set tree leaf");
+    };
+    if leaf.set_body.is_some()
+        || !descriptors
+            .iter()
+            .any(|column| column.type_oid == crate::sql::types::oid::RECORD)
+    {
+        return Ok(());
+    }
+    let scope = leaf
+        .from
+        .as_ref()
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, None))
+        .transpose()?;
+    let scoped = scope.as_ref().map(|scope| super::CatalogScopeCols {
+        scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    });
+    let fromless = crate::sql::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    let columns: &dyn crate::sql::exec::ColTypeResolver = match scoped.as_ref() {
+        Some(columns) => columns,
+        None => &fromless,
+    };
+    let mut slot = 0usize;
+    for item in leaf.items {
+        match item {
+            SelectItem::Wildcard(_) => slot += scope.as_ref().map_or(0, QueryScope::star_columns),
+            SelectItem::TableWildcard(name) => {
+                if let Some(scope) = scope.as_ref() {
+                    slot += scope.qualified_star_columns(name)?;
+                }
+            }
+            SelectItem::RecordStar(base) => {
+                slot += record_star_width(base, scope.as_ref(), storage, txid, arena)?;
+            }
+            SelectItem::Expr { expression, .. } => {
+                if let Some(column) = descriptors.get_mut(slot)
+                    && column.type_oid == crate::sql::types::oid::RECORD
+                    && let Some(handle) =
+                        crate::sql::exec::register_shape_for(expression, columns, arena)?
+                {
+                    column.type_mod = handle;
+                }
+                slot += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Describes a derived table without retaining a maximum-width arena image.
-/// FROM-less LATERAL projections use the preceding tables' column types.
+/// `outer` resolves the names the derived table may read from outside
+/// itself: the enclosing queries, and for a `LATERAL` item first the FROM
+/// items before it.
 pub(crate) fn describe_derived_definition<'a>(
     storage: &Storage,
     sub: &Select<'_>,
@@ -2351,7 +2422,7 @@ pub(crate) fn describe_derived_definition<'a>(
     col_alias: Option<&[&str]>,
     txid: u32,
     arena: &'a Arena,
-    outer: Option<&QueryScope<'_>>,
+    outer: Option<&dyn ColumnLookup<'_>>,
 ) -> Result<RelationDefinition<'a>, SqlError> {
     let sub = if sub.with.is_empty() {
         sub
@@ -2360,27 +2431,35 @@ pub(crate) fn describe_derived_definition<'a>(
         // columns, including during procedural input/dependency analysis.
         super::expand_ctes(sub, storage, txid, arena)?
     };
-    let outer_schema = outer.map(super::ScopeSchema);
-    let outer_columns = outer_schema
-        .as_ref()
-        .map(|schema| schema as &dyn ColumnLookup<'_>);
+    let outer_columns = outer;
     let mut descriptors = [ColDesc::new("", 0, 0); MAX_PROJ];
     let mut type_oids = [0_i32; MAX_PROJ];
-    let mut output_collations = [crate::sql::ast::Collation::None; MAX_PROJ];
     let n_cols = match sub.set_body {
-        Some(tree) => describe_set_body(
-            storage,
-            tree,
-            txid,
-            &mut descriptors,
-            arena,
-            Some(&mut type_oids),
-            crate::sql::exec::DescriptionTarget::Sql,
-            None,
-        )?,
+        Some(tree) => {
+            let outer_types = outer.map(super::scope::OuterColumnTypes);
+            let n = describe_set_body(
+                storage,
+                tree,
+                txid,
+                &mut descriptors,
+                arena,
+                Some(&mut type_oids),
+                crate::sql::exec::DescriptionTarget::Sql,
+                outer_types
+                    .as_ref()
+                    .map(|types| types as &dyn ColumnLookup<'_>),
+            )?;
+            register_set_record_shapes(storage, tree, txid, arena, &mut descriptors[..n])?;
+            n
+        }
         None => match &sub.from {
-            Some(f) => {
-                let ss = QueryScope::resolve_schema(storage, f, txid, arena, outer_columns)?;
+            // A FROM-less body may still read the enclosing queries
+            // (`LATERAL (SELECT t.a * 2)` sees the enclosing `t`).
+            from if from.is_some() || outer.is_some() => {
+                let ss = match from {
+                    Some(f) => QueryScope::resolve_schema(storage, f, txid, arena, outer_columns)?,
+                    None => QueryScope::singleton(storage, txid, arena)?,
+                };
                 let n = describe_scope_items(
                     sub.items,
                     &ss,
@@ -2398,7 +2477,7 @@ pub(crate) fn describe_derived_definition<'a>(
                 let mut slot = 0usize;
                 for item in sub.items {
                     match item {
-                        SelectItem::Wildcard => slot += ss.star_columns(),
+                        SelectItem::Wildcard(_) => slot += ss.star_columns(),
                         SelectItem::TableWildcard(q) => {
                             slot += ss.qualified_star_columns(q)?;
                         }
@@ -2415,7 +2494,7 @@ pub(crate) fn describe_derived_definition<'a>(
                                     expression,
                                     &super::CatalogScopeCols {
                                         scope: &ss,
-                                        outer_scope: outer,
+                                        outer,
                                         storage,
                                         txid,
                                         arena,
@@ -2454,31 +2533,19 @@ pub(crate) fn describe_derived_definition<'a>(
                         }
                     }
                 }
-                let mut slot = 0usize;
+                // Collation conflicts in the projection fail here; the
+                // descriptors already carry each column's collation.
                 for item in sub.items {
                     match item {
-                        SelectItem::Wildcard => {
-                            for position in 0..ss.star_columns() {
-                                output_collations[slot] =
-                                    ss.output_collation(ss.star_entry(position));
-                                slot += 1;
-                            }
-                        }
                         SelectItem::TableWildcard(name) => {
                             for index in 0..ss.qualified_star_columns(name)? {
-                                output_collations[slot] =
-                                    ss.output_collation(ss.qualified_star_entry(name, index)?);
-                                slot += 1;
+                                ss.qualified_star_entry(name, index)?;
                             }
                         }
-                        SelectItem::RecordStar(base) => {
-                            slot += record_star_width(base, Some(&ss), storage, txid, arena)?;
-                        }
                         SelectItem::Expr { expression, .. } => {
-                            output_collations[slot] =
-                                ss.expression_collation(storage, arena, expression)?;
-                            slot += 1;
+                            ss.enclosed_expression_collation(storage, arena, expression, outer)?;
                         }
+                        SelectItem::Wildcard(_) | SelectItem::RecordStar(_) => {}
                     }
                 }
                 preserve_projection_type_identities(
@@ -2486,7 +2553,7 @@ pub(crate) fn describe_derived_definition<'a>(
                     Some(&ss),
                     &super::CatalogScopeCols {
                         scope: &ss,
-                        outer_scope: outer,
+                        outer,
                         storage,
                         txid,
                         arena,
@@ -2496,36 +2563,7 @@ pub(crate) fn describe_derived_definition<'a>(
                 )?;
                 n
             }
-            // A FROM-less lateral body types its projection against the outer
-            // scope (`SELECT t.a * 2` sees the enclosing `t`).
-            None if outer.is_some() => {
-                let outer = outer.expect("checked");
-                let n = describe_scope_items(
-                    sub.items,
-                    outer,
-                    None,
-                    storage,
-                    txid,
-                    arena,
-                    &mut descriptors,
-                    crate::sql::exec::DescriptionTarget::Sql,
-                )?;
-                preserve_projection_type_identities(
-                    sub.items,
-                    Some(outer),
-                    &super::CatalogScopeCols {
-                        scope: outer,
-                        outer_scope: None,
-                        storage,
-                        txid,
-                        arena,
-                    },
-                    &descriptors[..n],
-                    &mut type_oids[..n],
-                )?;
-                n
-            }
-            None => {
+            _ => {
                 let n = super::describe_catalog_items(
                     sub.items,
                     None,
@@ -2576,12 +2614,27 @@ pub(crate) fn describe_derived_definition<'a>(
             }
         },
     };
-    for (output, description) in output_collations[..n_cols]
-        .iter_mut()
-        .zip(&descriptors[..n_cols])
-    {
-        *output = description.collation;
-    }
+    finish_derived_definition(
+        storage,
+        exposed,
+        col_alias,
+        txid,
+        arena,
+        &mut descriptors[..n_cols],
+        &type_oids[..n_cols],
+    )
+}
+
+fn finish_derived_definition<'a, 'd>(
+    storage: &Storage,
+    exposed: &str,
+    col_alias: Option<&[&'d str]>,
+    txid: u32,
+    arena: &'a Arena,
+    descriptors: &mut [ColDesc<'d>],
+    type_oids: &[i32],
+) -> Result<RelationDefinition<'a>, SqlError> {
+    let n_cols = descriptors.len();
     if n_cols > MAX_COLUMNS {
         return Err(sql_err!(
             sqlstate::TOO_MANY_COLUMNS,
@@ -2593,12 +2646,8 @@ pub(crate) fn describe_derived_definition<'a>(
     // supply no more names than the derived table has columns.
     if let Some(aliases) = col_alias {
         if aliases.len() > n_cols {
-            return Err(sql_err!(
-                sqlstate::INVALID_COLUMN_REFERENCE,
-                "table \"{}\" has {} columns available but {} columns specified",
-                exposed,
-                n_cols,
-                aliases.len()
+            return Err(super::scope::derived_alias_mismatch(
+                exposed, n_cols, aliases,
             ));
         }
         for (i, alias) in aliases.iter().enumerate() {
@@ -2640,7 +2689,7 @@ pub(crate) fn describe_derived_definition<'a>(
             ctype,
             type_mod: descriptors[i].type_mod,
             collation: if ctype.is_collatable() {
-                match output_collations[i] {
+                match descriptors[i].collation {
                     crate::sql::ast::Collation::None => crate::sql::ast::Collation::Default,
                     collation => collation,
                 }
@@ -3887,8 +3936,10 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
                     Expr::Cast { type_mod, .. } => *type_mod,
                     _ => -1,
                 };
+                // A single array's element column takes the table alias, as a
+                // scalar function's column does; several stay `unnest`.
                 default_cols[index] = table_function_column(
-                    SqlName::parse("unnest")?,
+                    SqlName::parse(if args.len() == 1 { name } else { "unnest" })?,
                     ctype,
                     user_type,
                     type_mod,
@@ -3988,13 +4039,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     if let Some(aliases) = tref.col_alias
         && aliases.len() > n_out
     {
-        return Err(sql_err!(
-            sqlstate::INVALID_COLUMN_REFERENCE,
-            "table \"{}\" has {} columns available but {} columns specified",
-            name,
-            n_out,
-            aliases.len()
-        ));
+        return Err(super::scope::derived_alias_mismatch(name, n_out, aliases));
     }
     let mut columns = [ColumnMeta::EMPTY; MAX_COLUMNS];
     for (i, default) in default_cols[..n_default].iter().enumerate() {
@@ -5374,7 +5419,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         Datum::Null => {
                             return Err(sql_err!(
                                 sqlstate::NULL_VALUE_NOT_ALLOWED,
-                                "null value not allowed"
+                                "null array element not allowed in this context"
                             ));
                         }
                         _ => return Err(srf_signature_error(tref.table)),
@@ -5391,8 +5436,6 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             if is_json_each_name(tref.table) {
                 let jsonb = tref.table.eq_ignore_ascii_case("jsonb_each")
                     || tref.table.eq_ignore_ascii_case("jsonb_each_text");
-                let as_text = tref.table.eq_ignore_ascii_case("json_each_text")
-                    || tref.table.eq_ignore_ascii_case("jsonb_each_text");
                 let document = eval_argument(args[0])?;
                 crate::sql::eval::funcs::json::check_json_family(tref.table, &document)?;
                 let text = match crate::sql::eval::text_view(document) {
@@ -5400,13 +5443,14 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     Datum::Text(s) => s,
                     Datum::Null => return Ok(&[]),
                     _ => {
-                        return Err(sql_err!(
-                            sqlstate::INVALID_PARAMETER_VALUE,
-                            "cannot deconstruct a scalar"
+                        return Err(crate::sql::json::each_error(
+                            tref.table,
+                            jsonb,
+                            crate::sql::json::Kind::Scalar,
                         ));
                     }
                 };
-                let pairs = crate::sql::eval::json_each_pairs(text, jsonb, as_text, arena)?;
+                let pairs = crate::sql::eval::json_each_pairs(tref.table, text, arena)?;
                 const EMPTY: &[u8] = &[];
                 let rows = arena
                     .alloc_slice_with(pairs.len(), |_| EMPTY)
@@ -5604,24 +5648,12 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         &mut spans,
                     )?
                 {
-                    let mut elems = [Datum::Null; crate::sql::regex::MAX_GROUPS];
-                    let count = if ng == 0 {
-                        elems[0] = Datum::Text(&string[mstart..mend]);
-                        1
-                    } else {
-                        for (i, span) in spans[..ng].iter().enumerate() {
-                            elems[i] = if span.0 < 0 {
-                                Datum::Null
-                            } else {
-                                Datum::Text(&string[span.0 as usize..span.1 as usize])
-                            };
-                        }
-                        ng
-                    };
-                    let arr = Datum::Array {
-                        element: crate::sql::types::ArrElem::Text,
-                        raw: crate::sql::array::build(&elems[..count], arena)?,
-                    };
+                    let arr = crate::sql::eval::regexp_match_array(
+                        string,
+                        (mstart, mend),
+                        &spans[..ng],
+                        arena,
+                    )?;
                     rows.push(crate::sql::exec::encode_projected_pub(&[arr], arena)?)
                         .map_err(|_| arena_full())?;
                     if !parsed.global {
@@ -6383,8 +6415,9 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             .alloc_slice_with(count, |_| EMPTY)
             .map_err(|_| arena_full())?;
         for slot in rows.iter_mut() {
-            let value = series.next(arena)?.expect("integer series count");
-            *slot = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+            let mut value = [Datum::Null];
+            assert!(series.next_row(arena, &mut value)?, "integer series count");
+            *slot = crate::sql::exec::encode_projected_pub(&value, arena)?;
         }
         Ok(&*rows)
     })?;
@@ -6436,10 +6469,7 @@ fn json_to_record_rows<'a, C: ColumnLookup<'a>>(
                 .map_err(|_| arena_full());
         }
         other => {
-            return Err(crate::sql::eval::type_mismatch_pub(
-                "JSON record conversion requires JSON",
-                &other,
-            ));
+            return Err(crate::sql::eval::function_argument_mismatch(name, &other));
         }
     };
     let parsed = crate::sql::json::parse(source, arena)?;
@@ -6558,10 +6588,7 @@ fn populate_record_rows<'a, C: ColumnLookup<'a>>(
         Datum::Json { text, .. } | Datum::Text(text) => text,
         Datum::Null => return Ok(&[]),
         other => {
-            return Err(crate::sql::eval::type_mismatch_pub(
-                "populate_record requires JSON",
-                &other,
-            ));
+            return Err(crate::sql::eval::function_argument_mismatch(name, &other));
         }
     };
     let parsed = crate::sql::json::parse(source, arena)?;

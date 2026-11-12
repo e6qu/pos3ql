@@ -1317,6 +1317,7 @@ mod tests {
                         loc: Some(location),
                         changed_columns: ColumnSet::EMPTY,
                         changes_existence: false,
+                        moved_out: false,
                     },
                 )
                 .unwrap();

@@ -7,7 +7,9 @@
 use super::*;
 use crate::mem::mutex::Mutex;
 
+mod aggregate_levels;
 mod array_element_comparisons;
+mod assignment_and_name_diagnostics;
 mod bound_definition_renames;
 mod builtin_aggregate_resolution;
 mod builtin_argument_binding;
@@ -16,15 +18,20 @@ mod builtin_routine_comments;
 mod canonical_sequences;
 mod cast_and_operator_class_descriptions;
 mod catalog_identity_lookup;
+mod catalog_join_probes;
 mod catalog_join_work;
 mod check_no_inherit;
 mod client_catalog;
+mod compatibility_diagnostics;
 mod composite_parameter_fields;
 mod constraint_index_identity;
 mod cursor_execution;
 mod deparsed_expressions;
 mod dependency_rows;
 mod drop_dependency_reports;
+mod error_report_fields;
+mod evaluation_timing;
+mod foreign_key_lookups;
 mod foreign_parent_admission;
 mod function_progress;
 mod geometric_casts;
@@ -33,6 +40,8 @@ mod index_expression_mutability;
 mod index_parent_ownership;
 mod indirect_execute_privileges;
 mod information_schema_domains;
+mod initplans;
+mod joined_dml_returning;
 mod key_preparation;
 mod nested_planner_inputs;
 pub(super) mod object_reads;
@@ -40,6 +49,8 @@ mod oid_alias_comparisons;
 mod owner_role_inheritance;
 mod partition_ancestry;
 mod partition_index_propagation;
+mod plpgsql_data_modifying_with;
+mod plpgsql_row_variables;
 mod polymorphic_resolution;
 mod predefined_roles;
 mod prepared_object_capacity;
@@ -47,8 +58,11 @@ mod prepared_parameter_types;
 mod procedural_expression_calls;
 mod procedural_progress;
 mod procedural_subtransactions;
+mod procedure_progress;
 mod pseudo_type_identities;
 mod query_execution;
+mod query_scope_chain;
+mod record_comparisons;
 mod relation_row_types;
 mod result_streams;
 mod rewritten_expression_recovery;
@@ -57,6 +71,7 @@ mod routine_identity_diagnostics;
 mod routine_selection;
 mod row_history;
 mod row_layout;
+mod row_lock_conflicts;
 mod runtime_input_validity;
 mod runtime_plan_invalidation;
 mod sequence_inheritance;
@@ -77,6 +92,7 @@ mod type_input_binding;
 mod type_input_positions;
 mod view_reloptions;
 mod virtual_search_path;
+mod write_progress;
 
 #[test]
 fn sequence_session_setval_modes_lastval_identity_and_privileges_match_postgresql() {
@@ -553,11 +569,11 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
                     &mut editor.transaction,
                     &editor.guc,
                     crate::sql::txn::CommitTarget::Ordinary,
-                    Some(CursorCommitContext {
+                    CursorCommitContext {
                         cursors: &mut editor.cursors,
-                        plans: &mut editor.pool,
+                        plans: Some(&mut editor.pool),
                         arena: &editor.arena,
-                    }),
+                    },
                     &editor.arena,
                     &mut Responder::new(&mut editor.send),
                 )
@@ -4852,7 +4868,7 @@ fn metadata_sequence_comment_reuse_keeps_replacement() {
         let output = session.success(
             &mut engine,
             include_str!(
-                "../../tests/external/differential_exact/06_metadata_comment_lifetimes.sql"
+                "../../tests/external/differential_exact/104_metadata_comment_lifetimes.sql"
             ),
             true,
         );
@@ -8079,13 +8095,7 @@ fn postgresql_18_refcursor_type_catalog_and_native_plpgsql_cursors() {
          BEGIN; SELECT returned_cursor_probe(); \
          SELECT name, statement, is_holdable, is_binary, is_scrollable \
            FROM pg_cursors WHERE name = 'returned'; \
-         FETCH NEXT FROM returned; CLOSE returned; COMMIT; \
-         BEGIN; \
-         DECLARE visible SCROLL CURSOR FOR SELECT 1; \
-         SELECT name, statement, is_holdable, is_binary, is_scrollable, creation_time IS NOT NULL \
-           FROM pg_cursors; \
-         SELECT count(*) FROM pg_cursor(); \
-         CLOSE visible; COMMIT",
+         FETCH NEXT FROM returned; CLOSE returned; COMMIT",
     );
     assert_eq!(
         data_rows(&output),
@@ -8101,11 +8111,21 @@ fn postgresql_18_refcursor_type_catalog_and_native_plpgsql_cursors() {
             "returned",
             "returned|SELECT 11::integer AS value|f|f|f",
             "11",
-            "visible|DECLARE visible SCROLL CURSOR FOR SELECT 1|f|f|t|t",
-            "1",
         ],
         "{}",
         String::from_utf8_lossy(&output),
+    );
+    // A declared cursor shows the client's whole query string.
+    const DECLARED: &str = "BEGIN; DECLARE visible SCROLL CURSOR FOR SELECT 1; \
+         SELECT name, statement, is_holdable, is_binary, is_scrollable, creation_time IS NOT NULL \
+           FROM pg_cursors; \
+         SELECT count(*) FROM pg_cursor(); CLOSE visible; COMMIT";
+    let declared = run_with(&mut engine, &mut budget, DECLARED);
+    assert_eq!(
+        data_rows(&declared),
+        [format!("visible|{DECLARED}|f|f|t|t"), "1".to_string()],
+        "{}",
+        String::from_utf8_lossy(&declared),
     );
     assert_eq!(copy_data_rows(&output), ["saved\t{left,right}"]);
     for query in [
@@ -13729,12 +13749,28 @@ fn rewrite_rules_expand_defaults_returning_and_on_conflict_contracts() {
         (
             "CREATE RULE invalid_returning AS ON INSERT TO rule_defaults \
              DO ALSO INSERT INTO rule_default_log VALUES (NEW.id, NEW.label) RETURNING id",
-            "conditional or non-INSTEAD",
+            "RETURNING lists are not supported in non-INSTEAD rules",
         ),
         (
             "CREATE RULE second_returning AS ON INSERT TO rule_redirect DO INSTEAD \
-             INSERT INTO rule_destination VALUES (NEW.id) RETURNING id",
-            "multiple RETURNING lists",
+             INSERT INTO rule_destination VALUES (NEW.id) RETURNING id; \
+             INSERT INTO rule_redirect VALUES (1) RETURNING id",
+            "cannot have RETURNING lists in multiple rules",
+        ),
+        (
+            "CREATE RULE wide_returning AS ON INSERT TO rule_defaults DO INSTEAD \
+             INSERT INTO rule_default_log VALUES (NEW.id, NEW.label) RETURNING id, label, 1",
+            "RETURNING list has too many entries",
+        ),
+        (
+            "CREATE RULE narrow_returning AS ON INSERT TO rule_defaults DO INSTEAD \
+             INSERT INTO rule_default_log VALUES (NEW.id, NEW.label) RETURNING id",
+            "RETURNING list has too few entries",
+        ),
+        (
+            "CREATE RULE typed_returning AS ON INSERT TO rule_defaults DO INSTEAD \
+             INSERT INTO rule_default_log VALUES (NEW.id, NEW.label) RETURNING label, id",
+            "RETURNING list's entry 1 has different type from column \"id\"",
         ),
         (
             "CREATE RULE update_guard AS ON UPDATE TO rule_defaults DO ALSO NOTHING; \
@@ -13754,12 +13790,12 @@ fn rewrite_rules_expand_defaults_returning_and_on_conflict_contracts() {
         (
             "CREATE RULE invalid_old AS ON INSERT TO rule_defaults \
              DO ALSO INSERT INTO rule_default_log VALUES (OLD.id, NEW.label)",
-            "cannot reference OLD",
+            "cannot use OLD",
         ),
         (
             "CREATE RULE invalid_new AS ON DELETE TO rule_defaults \
              DO ALSO INSERT INTO rule_default_log VALUES (NEW.id, OLD.label)",
-            "cannot reference NEW",
+            "cannot use NEW",
         ),
         (
             "CREATE RULE conditional_notify AS ON INSERT TO rule_defaults \
@@ -13773,7 +13809,7 @@ fn rewrite_rules_expand_defaults_returning_and_on_conflict_contracts() {
             "{sql}: {}",
             String::from_utf8_lossy(&rejected)
         );
-        if expected.starts_with("cannot reference") {
+        if expected.starts_with("cannot use") {
             assert_eq!(error_sqlstates(&rejected), ["42P17"], "{sql}");
         }
     }
@@ -18318,7 +18354,14 @@ fn copy_line(
     engine.copy_row_line(
         setup,
         line,
-        super::CopyRowContext::new(txn, guc, arena, &mut responder, inserted),
+        super::CopyRowContext::new(
+            txn,
+            guc,
+            &mut super::cursor::CursorPool::for_tests(),
+            arena,
+            &mut responder,
+            inserted,
+        ),
     )
 }
 
@@ -18341,7 +18384,14 @@ fn copy_binary_row(
     engine.copy_row_binary(
         setup,
         row,
-        super::CopyRowContext::new(txn, guc, arena, &mut responder, inserted),
+        super::CopyRowContext::new(
+            txn,
+            guc,
+            &mut super::cursor::CursorPool::for_tests(),
+            arena,
+            &mut responder,
+            inserted,
+        ),
     )
 }
 
@@ -18354,11 +18404,16 @@ fn finish_copy(
     inserted: &mut crate::sql::exec::CopyTransitionRows,
 ) -> Result<(), SqlError> {
     let mut send = crate::mem::FixedBuf::new(budget, "copy finish response", 1 << 16).unwrap();
+    let arena = Arena::new(budget, "copy finish arena", 1 << 12).unwrap();
     let result = engine.copy_finish(
         setup,
         txn,
         guc,
-        None,
+        CursorCommitContext {
+            cursors: &mut super::cursor::CursorPool::for_tests(),
+            plans: None,
+            arena: &arena,
+        },
         &mut Responder::new(&mut send),
         inserted,
         CopyFinishMode::ImplicitTransaction,
@@ -19134,17 +19189,20 @@ fn configured_transaction_capacity_covers_deferred_exhaustion_and_reuse() {
         (
             "deferred-metadata",
             2,
-            4096,
+            crate::sql::trigger_events::TRIGGER_EVENT_PAGE_BYTES,
             "INSERT INTO bounded_deferred VALUES(1, 'x'), (2, 'x'), (3, 'x')",
         ),
         (
+            // One in-memory page and no spill file: an event larger than the
+            // page cannot be queued.
             "deferred-row-images",
             8,
-            128,
-            "INSERT INTO bounded_deferred VALUES(1, repeat('x', 256))",
+            crate::sql::trigger_events::TRIGGER_EVENT_PAGE_BYTES,
+            "INSERT INTO bounded_deferred VALUES(1, repeat('x', 70000))",
         ),
     ] {
         let mut config = test_config(label);
+        config.trigger_event_spill_bytes = 0;
         config.max_deferred_constraints_per_transaction = metadata;
         config.deferred_trigger_bytes = row_bytes;
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
@@ -19158,6 +19216,56 @@ fn configured_transaction_capacity_covers_deferred_exhaustion_and_reuse() {
             String::from_utf8_lossy(&exhausted)
         );
         assert_eq!(data_rows(&session.success(&mut engine, "ROLLBACK TO before_exhaustion; SELECT count(*) FROM bounded_deferred; INSERT INTO bounded_deferred VALUES(1, 'x'); COMMIT; SELECT count(*) FROM bounded_deferred_audit; BEGIN; INSERT INTO bounded_deferred VALUES(2, 'x'); COMMIT; SELECT count(*) FROM bounded_deferred_audit", true)), ["0", "1", "2"]);
+    }
+}
+
+/// Queued foreign key checks past one in-memory page move to the shared
+/// spill file; without it the queue fails with a named `54000`, and a
+/// rollback leaves the transaction usable.
+#[test]
+fn foreign_key_events_spill_past_memory_and_fail_named_without_spill() {
+    for spill in [true, false] {
+        let mut config = test_config(if spill {
+            "trigger-events-spill"
+        } else {
+            "trigger-events-memory"
+        });
+        config.deferred_trigger_bytes = crate::sql::trigger_events::TRIGGER_EVENT_PAGE_BYTES;
+        config.trigger_event_spill_bytes = if spill { 1 << 24 } else { 0 };
+        config.txn_rows = 4096;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        if let Some(file) = engine.trigger_event_spill() {
+            session.transaction.attach_trigger_event_spill(file);
+        }
+        session.success(
+            &mut engine,
+            "CREATE TABLE spill_parent(id int PRIMARY KEY); \
+             CREATE TABLE spill_child(id int, parent int REFERENCES spill_parent); \
+             INSERT INTO spill_parent SELECT generate_series(1, 1500)",
+            false,
+        );
+        let output = session.execute(
+            &mut engine,
+            "INSERT INTO spill_child SELECT g, g FROM generate_series(1, 1500) g",
+            true,
+        );
+        if spill {
+            assert!(error_sqlstates(&output).is_empty());
+            let output = session.execute(
+                &mut engine,
+                "INSERT INTO spill_child SELECT g, g + 1 FROM generate_series(1490, 1500) g",
+                true,
+            );
+            assert_eq!(error_sqlstates(&output), ["23503"]);
+        } else {
+            assert_eq!(error_sqlstates(&output), ["54000"]);
+        }
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT count(*) FROM spill_child", true)),
+            [if spill { "1500" } else { "0" }]
+        );
     }
 }
 
@@ -26670,6 +26778,24 @@ fn command_tags(bytes: &[u8]) -> Vec<String> {
 }
 
 /// Extracts text values from DataRow messages, '|'-joined per row.
+/// The message text of each `NoticeResponse` in `bytes`.
+fn notice_messages(bytes: &[u8]) -> Vec<String> {
+    let mut messages = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let length = u32::from_be_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+        if bytes[offset] == b'N'
+            && let Some(message) = bytes[offset + 5..offset + 1 + length]
+                .split(|byte| *byte == 0)
+                .find(|field| field.first() == Some(&b'M'))
+        {
+            messages.push(String::from_utf8(message[1..].to_vec()).unwrap());
+        }
+        offset += 1 + length;
+    }
+    messages
+}
+
 fn data_rows(bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -28511,6 +28637,20 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
         )
         .unwrap();
     assert_eq!(inferred[..2], [domain_oid, enum_oid]);
+    // Parameters inside a data-modifying statement's own expressions take
+    // the type their target-scope operands give them, through an alias too.
+    let inferred = engine
+        .infer_param_types(
+            "UPDATE protocol_types AS t SET count = t.count + $1 \
+             WHERE t.count + $2 > 0 RETURNING t.count * $3",
+            &arena,
+            &transaction,
+            3,
+            &[],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(inferred[..3], [crate::sql::types::oid::INT4; 3]);
     let inferred = engine
         .infer_param_types(
             "SELECT p.state, count(*) FROM protocol_types p \
@@ -32342,7 +32482,9 @@ fn owned_copy_to_sources_preserve_saved_leaf_rows_pending_changes_and_cold_recov
             "COPY export_low TO STDOUT (FORMAT csv, HEADER true); COPY export_other TO STDOUT (FORMAT csv)",
             true
         )),
-        ["id,note", "3,moved", "30,\"far, saved\"", "31,added"]
+        // COPY reads a table in the order SELECT scans it: pending rows,
+        // then saved ones.
+        ["id,note", "3,moved", "31,added", "30,\"far, saved\""]
     );
     assert_eq!(
         copy_data_rows(&session.success(
@@ -32350,7 +32492,7 @@ fn owned_copy_to_sources_preserve_saved_leaf_rows_pending_changes_and_cold_recov
             "COPY export_low (note, id) TO STDOUT; COPY export_other (note, id) TO STDOUT",
             true
         )),
-        ["moved\t3", "far, saved\t30", "added\t31"]
+        ["moved\t3", "added\t31", "far, saved\t30"]
     );
     let binary = session.success(
         &mut engine,
@@ -34488,7 +34630,7 @@ fn session_gucs_honored_or_rejected_faithfully() {
     }
     // SET then SHOW within one message (GUC state is per session/message).
     assert!(run("SET extra_float_digits = 2; SHOW extra_float_digits").contains('2'));
-    assert!(run("SET lock_timeout = 5000; SHOW lock_timeout").contains("5000"));
+    assert!(run("SET lock_timeout = 5000; SHOW lock_timeout").contains("5s"));
     assert!(run("SET lock_timeout = '50ms'; SHOW lock_timeout").contains("50ms"));
     assert!(run("SET row_security = off; SHOW row_security").contains("off"));
     for style in ["postgres", "postgres_verbose", "sql_standard", "iso_8601"] {
@@ -34512,7 +34654,7 @@ fn session_gucs_honored_or_rejected_faithfully() {
     );
     // statement_timeout is now accepted (enforced at scan boundaries); a
     // malformed value is still rejected loudly.
-    assert!(run("SET statement_timeout = 5000; SHOW statement_timeout").contains("5000"));
+    assert!(run("SET statement_timeout = 5000; SHOW statement_timeout").contains("5s"));
     assert!(
         run("SET lock_timeout = 'bogus'").contains("22023"),
         "bad lock timeout"
@@ -34544,6 +34686,128 @@ fn session_gucs_honored_or_rejected_faithfully() {
         run("SET default_table_access_method = columnar").contains("0A000"),
         "unsupported table access method"
     );
+}
+
+/// Integer settings parse, round, range-check and show as PostgreSQL 18's
+/// `parse_int` and `ShowGUCOption` do; `pg_settings` reports base units.
+#[test]
+fn integer_settings_parse_and_show_like_postgresql() {
+    let (mut e, mut b) = test_engine();
+    let mut t = TxnState::new(&mut b, 256).unwrap();
+    let mut run = |sql: &str| run_txn(&mut e, &mut b, &mut t, sql);
+    for (value, shown) in [
+        ("'1.5MB'", "1536kB"),
+        ("'65537B'", "64kB"),
+        ("2048", "2MB"),
+        ("'3000kB'", "3000kB"),
+        ("'2GB'", "2GB"),
+        ("'1TB'", "1TB"),
+        ("'2147483647kB'", "2147483647kB"),
+        ("' 64 kB '", "64kB"),
+        ("'1048576kB'", "1GB"),
+        ("'64.4'", "64kB"),
+        ("'1e3'", "1000kB"),
+        ("'0x100'", "256kB"),
+        ("'1 MB'", "1MB"),
+        ("default", "4MB"),
+    ] {
+        let out = run(&format!("SET work_mem = {value}; SHOW work_mem"));
+        assert!(
+            out.contains(&format!("D{shown}")) || out.contains(shown),
+            "{value}: {out}"
+        );
+        assert!(!out.contains("ERROR"), "{value}: {out}");
+    }
+    for (value, message) in [
+        (
+            "'10'",
+            "10 kB is outside the valid range for parameter \"work_mem\" (64 kB .. 2147483647 kB)",
+        ),
+        ("'100B'", "0 kB is outside the valid range"),
+        ("1.5", "2 kB is outside the valid range"),
+        ("'-1'", "-1 kB is outside the valid range"),
+        ("'1mb'", "invalid value for parameter \"work_mem\": \"1mb\""),
+        (
+            "'2147483648kB'",
+            "invalid value for parameter \"work_mem\": \"2147483648kB\"",
+        ),
+        (
+            "'1e10'",
+            "invalid value for parameter \"work_mem\": \"1e10\"",
+        ),
+        ("'abc'", "invalid value for parameter \"work_mem\": \"abc\""),
+    ] {
+        let out = run(&format!("SET work_mem = {value}"));
+        assert!(
+            out.contains("22023") && out.contains(message),
+            "{value}: {out}"
+        );
+    }
+    let out = run("SET work_mem = '1mb'");
+    assert!(
+        out.contains(
+            "Valid units for this parameter are \"B\", \"kB\", \"MB\", \"GB\", and \"TB\"."
+        ),
+        "{out}"
+    );
+    let out = run("SET work_mem = '2147483648kB'");
+    assert!(out.contains("Value exceeds integer range."), "{out}");
+    for (value, shown) in [
+        ("5000", "5s"),
+        ("'60000ms'", "1min"),
+        ("'1.5s'", "1500ms"),
+        ("'100us'", "0"),
+        ("'1500us'", "2ms"),
+        ("'3d'", "3d"),
+        ("'1 h'", "1h"),
+        ("'1e2'", "100ms"),
+        ("'+5'", "5ms"),
+    ] {
+        let out = run(&format!(
+            "SET statement_timeout = {value}; SHOW statement_timeout"
+        ));
+        assert!(
+            out.contains(shown) && !out.contains("ERROR"),
+            "{value}: {out}"
+        );
+    }
+    let out = run("SET statement_timeout = '1H'");
+    assert!(
+        out.contains(
+            "Valid units for this parameter are \"us\", \"ms\", \"s\", \"min\", \"h\", and \"d\"."
+        ),
+        "{out}"
+    );
+    let out = run("SET statement_timeout = '-1'");
+    assert!(
+        out.contains("-1 ms is outside the valid range for parameter \"statement_timeout\" (0 ms .. 2147483647 ms)"),
+        "{out}"
+    );
+    let out = run("SET extra_float_digits = '2.6'; SHOW extra_float_digits");
+    assert!(out.contains('3') && !out.contains("ERROR"), "{out}");
+    let out = run("SET extra_float_digits = '2kB'");
+    assert!(
+        out.contains("invalid value for parameter \"extra_float_digits\""),
+        "{out}"
+    );
+    let out = run(
+        "SET statement_timeout = '1.5s'; SET work_mem = '8MB'; SELECT name || '=' || setting || '/' || unit || '/' || vartype || '/' || min_val || '/' || max_val || '/' || boot_val || '/' || category FROM pg_settings WHERE name IN ('work_mem', 'statement_timeout') ORDER BY name",
+    );
+    assert!(
+        out.contains("statement_timeout=1500/ms/integer/0/2147483647/0/")
+            && out.contains("work_mem=8192/kB/integer/64/2147483647/4096/Resource Usage / Memory"),
+        "{out}"
+    );
+    let out = run("BEGIN; SET LOCAL work_mem = '8MB'; SHOW work_mem; ROLLBACK; SHOW work_mem");
+    assert!(out.contains("8MB") && out.contains("4MB"), "{out}");
+    let out = run(
+        "CREATE FUNCTION configured_work_mem() RETURNS text LANGUAGE sql SET work_mem = '64MB' AS 'SELECT current_setting(''work_mem'')'; SELECT configured_work_mem() || ',' || current_setting('work_mem') || ',' || array_to_string(proconfig, ';') FROM pg_proc WHERE proname = 'configured_work_mem'",
+    );
+    assert!(out.contains("64MB,4MB,work_mem=64MB"), "{out}");
+    let out = run(
+        "CREATE PROCEDURE bad_work_mem() LANGUAGE plpgsql SET work_mem = '1mb' AS $$BEGIN END$$",
+    );
+    assert!(out.contains("22023") && out.contains("\"1mb\""), "{out}");
 }
 
 #[test]
@@ -42322,7 +42586,7 @@ fn plpgsql_call_and_do_own_real_non_atomic_transaction_boundaries() {
 }
 
 #[test]
-fn plpgsql_non_atomic_call_never_replays_across_a_committed_boundary() {
+fn plpgsql_non_atomic_call_resumes_after_a_committed_boundary() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(
         &mut engine,
@@ -42358,12 +42622,12 @@ fn plpgsql_non_atomic_call_never_replays_across_a_committed_boundary() {
 
     let mut caller = TxnState::new(&mut budget, 256).unwrap();
     let mut send = crate::mem::FixedBuf::new(&mut budget, "procedure wait send", 1 << 18).unwrap();
-    let arena = Arena::new(&mut budget, "procedure wait SQL", 1 << 18).unwrap();
+    let mut arena = Arena::new(&mut budget, "procedure wait SQL", 1 << 18).unwrap();
     let mut pool = test_pool(&mut budget);
     let guc = GucState::new();
     let mut cursors = test_cursors(&mut budget);
     let call = "CALL procedure_wait()";
-    let rejected = engine
+    let status = engine
         .execute_simple(
             call,
             &arena,
@@ -42375,15 +42639,49 @@ fn plpgsql_non_atomic_call_never_replays_across_a_committed_boundary() {
             2,
         )
         .unwrap();
-    assert_eq!(rejected, ExecutionStatus::Complete);
-    let error = String::from_utf8_lossy(send.readable());
-    assert!(error.contains("0A000"), "{error}");
-    assert!(
-        error.contains("cannot suspend after transaction control"),
-        "{error}"
+    let ExecutionStatus::Blocked {
+        completed_statements,
+        output_mark,
+        wait: StatementWait::Lock,
+    } = status
+    else {
+        panic!(
+            "procedure did not wait after COMMIT: {status:?}: {}",
+            String::from_utf8_lossy(send.readable())
+        );
+    };
+    // The committed first transaction is visible while the call waits.
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT phase FROM procedure_wait_log",
+        )),
+        ["before"]
     );
-
     assert!(run_txn(&mut engine, &mut budget, &mut blocker, "COMMIT").contains("COMMIT"));
+    output_mark.truncate_unsent(&mut send);
+    arena.recycle_front();
+    let status = engine
+        .execute_simple_from(
+            call,
+            completed_statements,
+            &arena,
+            &mut caller,
+            &mut pool,
+            &mut cursors,
+            &guc,
+            &mut Responder::new(&mut send),
+            2,
+            false,
+        )
+        .unwrap();
+    assert_eq!(status, ExecutionStatus::Complete);
+    assert!(
+        error_sqlstates(send.readable()).is_empty(),
+        "{}",
+        String::from_utf8_lossy(send.readable())
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
@@ -42391,7 +42689,7 @@ fn plpgsql_non_atomic_call_never_replays_across_a_committed_boundary() {
             "SELECT phase, count(*) FROM procedure_wait_log GROUP BY phase ORDER BY phase; \
              SELECT value FROM procedure_wait_target",
         )),
-        ["before|1", "20"]
+        ["after|1", "before|1", "21"]
     );
 }
 
@@ -44307,7 +44605,7 @@ fn table_routine_final_query_resumes_nested_mutable_scalar_routine() {
 }
 
 #[test]
-fn data_modifying_routine_result_resumes_nested_mutable_scalar_routine() {
+fn data_modifying_routine_result_rejects_rows_its_nested_call_updated() {
     let (mut engine, mut budget) = test_engine();
     run_with(
         &mut engine,
@@ -44327,12 +44625,9 @@ fn data_modifying_routine_result_resumes_nested_mutable_scalar_routine() {
          SELECT value FROM routine_dml_nested WHERE id = 1; \
          ROLLBACK",
     );
-    assert_eq!(
-        data_rows(&output),
-        ["41", "41"],
-        "{}",
-        String::from_utf8_lossy(&output)
-    );
+    // PostgreSQL 18.6: the call updated the row its caller updates next.
+    assert_eq!(error_sqlstates(&output), ["27000"]);
+    assert!(data_rows(&output).is_empty());
 }
 
 #[test]
@@ -44366,7 +44661,7 @@ fn table_routine_returns_results_after_completed_nested_writes() {
 }
 
 #[test]
-fn void_routine_result_resumes_nested_mutable_scalar_routine() {
+fn void_routine_result_rejects_rows_its_nested_call_updated() {
     let (mut engine, mut budget) = test_engine();
     run_with(
         &mut engine,
@@ -44386,12 +44681,9 @@ fn void_routine_result_resumes_nested_mutable_scalar_routine() {
          SELECT value FROM routine_void_nested WHERE id = 1; \
          ROLLBACK",
     );
-    assert_eq!(
-        data_rows(&output),
-        ["NULL", "41"],
-        "{}",
-        String::from_utf8_lossy(&output)
-    );
+    // PostgreSQL 18.6: the call updated the row its caller updates next.
+    assert_eq!(error_sqlstates(&output), ["27000"]);
+    assert!(data_rows(&output).is_empty());
 }
 
 #[test]
@@ -44423,7 +44715,7 @@ fn mutable_routine_writes_obey_enclosing_savepoint_rollback() {
 }
 
 #[test]
-fn nested_sql_writes_reject_unowned_row_restarts_without_partial_changes() {
+fn nested_sql_writes_keep_rows_and_report_postgresql_row_conflicts() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
@@ -44446,7 +44738,13 @@ fn nested_sql_writes_reject_unowned_row_restarts_without_partial_changes() {
                 UPDATE routine_retry_rows SET value=CASE WHEN id=2 THEN read_retry_row(1) ELSE value+10 END RETURNING value $$; \
              CREATE FUNCTION all_retry_rows() RETURNS SETOF integer LANGUAGE SQL AS $$ \
                 UPDATE routine_retry_rows SET value=bump_retry_row(id) RETURNING value $$", true);
-        for name in ["update_retry_rows", "observe_retry_rows", "all_retry_rows"] {
+        // PostgreSQL 18.6: a call that updates a row the write changes next
+        // fails with 27000; a call that reads an earlier row sees its change.
+        for (name, sqlstates, rows) in [
+            ("update_retry_rows", &["27000"][..], &[][..]),
+            ("observe_retry_rows", &[], &["50", "50"][..]),
+            ("all_retry_rows", &["27000"], &[]),
+        ] {
             let output = session.execute(
                 &mut engine,
                 &format!("BEGIN; SELECT value FROM {name}() AS result(value) ORDER BY value"),
@@ -44454,15 +44752,11 @@ fn nested_sql_writes_reject_unowned_row_restarts_without_partial_changes() {
             );
             assert_eq!(
                 error_sqlstates(&output),
-                ["0A000"],
-                "{}",
+                sqlstates,
+                "{name}: {}",
                 String::from_utf8_lossy(&output)
             );
-            assert!(
-                String::from_utf8_lossy(&output)
-                    .contains("SQL row expression requires retained write progress")
-            );
-            assert!(data_rows(&output).is_empty());
+            assert_eq!(data_rows(&output), rows, "{name}");
             assert_eq!(
                 data_rows(&session.success(
                     &mut engine,
@@ -45599,7 +45893,7 @@ fn trigger_exception_diagnostic_surface_is_typed_and_scoped() {
     assert_eq!(
         data_rows(&output),
         [
-            "ZX123|typed failure|typed detail|typed hint|PL/pgSQL function public.trigger_diagnostic_surface()|PL/pgSQL function public.trigger_diagnostic_surface()|||||"
+            "ZX123|typed failure|typed detail|typed hint|PL/pgSQL function trigger_diagnostic_surface() line 6 at RAISE|PL/pgSQL function trigger_diagnostic_surface() line 9 at GET DIAGNOSTICS|||||"
         ],
         "{}",
         String::from_utf8_lossy(&output)
@@ -46364,7 +46658,9 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
         String::from_utf8_lossy(&branches)
     );
 
-    let unsupported = run_with(
+    // An AFTER trigger's NEW is a record local to the invocation, as in
+    // PostgreSQL: assigning it does not change the stored row.
+    run_with(
         &mut engine,
         &mut budget,
         "CREATE FUNCTION after_mutation() RETURNS trigger LANGUAGE plpgsql AS
@@ -46373,30 +46669,31 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
            FOR EACH ROW EXECUTE FUNCTION after_mutation();
          INSERT INTO trigger_body_target (id, value) VALUES (2, 3);",
     );
-    assert!(
-        String::from_utf8_lossy(&unsupported).contains("0A000"),
-        "{}",
-        String::from_utf8_lossy(&unsupported)
-    );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT count(*) FROM trigger_body_target WHERE id = 2"
+            "SELECT value FROM trigger_body_target WHERE id = 2"
         )),
-        ["0"]
+        // The BEFORE trigger's increment, not the AFTER trigger's assignment.
+        ["4"]
     );
 
+    // As in PostgreSQL, RETURNING without INTO is accepted when the function
+    // is created and fails when the statement has run.
     let rejected = run_with(
         &mut engine,
         &mut budget,
         "CREATE FUNCTION reject_trigger_returning() RETURNS trigger LANGUAGE plpgsql AS
-           'BEGIN INSERT INTO trigger_body_audit VALUES (1, 1) RETURNING id; RETURN NEW; END'",
+           'BEGIN INSERT INTO trigger_body_audit VALUES (1, 1) RETURNING id; RETURN NEW; END';
+         CREATE TRIGGER reject_trigger_returning BEFORE INSERT ON trigger_body_target
+           FOR EACH ROW EXECUTE FUNCTION reject_trigger_returning();
+         INSERT INTO trigger_body_target (id, value) VALUES (3, 1);",
     );
+    let text = String::from_utf8_lossy(&rejected);
     assert!(
-        String::from_utf8_lossy(&rejected).contains("0A000"),
-        "{}",
-        String::from_utf8_lossy(&rejected)
+        text.contains("C42601") && text.contains("query has no destination for result data"),
+        "{text}"
     );
 }
 
@@ -48034,7 +48331,10 @@ fn sql_procedure_call_is_typed_durable_and_catalogued() {
         let failing_created = run_with(
             &mut engine,
             &mut budget,
-            "CREATE PROCEDURE log_then_fail(value integer) LANGUAGE SQL AS \
+            // PostgreSQL rejects the missing relation at CREATE unless body
+            // checks are off.
+            "SET check_function_bodies = off; \
+             CREATE PROCEDURE log_then_fail(value integer) LANGUAGE SQL AS \
              'INSERT INTO procedure_log VALUES ($1); INSERT INTO missing_log VALUES ($1)'",
         );
         assert!(
@@ -50675,7 +50975,7 @@ fn generated_expression_evolution_rewrites_rows_and_survives_cold_recovery() {
             "ALTER TABLE generated_expression_evolution \
              ALTER COLUMN b DROP EXPRESSION IF EXISTS"
         ))
-        .contains("not a stored generated column, skipping")
+        .contains("not a generated column, skipping")
     );
     cold.commit_wal().unwrap();
     assert!(cold.checkpoint().unwrap());
@@ -51561,14 +51861,22 @@ fn merge_assignment_states_and_inheritance_selection_are_typed() {
         ["1|10"]
     );
 
-    for invalid in [
-        "MERGE INTO merge_assignment_target AS target USING merge_assignment_source AS source \
-           ON target.id = source.id WHEN MATCHED THEN UPDATE SET value = 1, value = 2",
-        "MERGE INTO merge_assignment_target AS target USING merge_assignment_source AS source \
-           ON target.id = source.id WHEN NOT MATCHED THEN INSERT (id, id) VALUES (1, 2)",
+    // PostgreSQL's rewriter and checkInsertTargets report these.
+    for (invalid, sqlstate) in [
+        (
+            "MERGE INTO merge_assignment_target AS target USING merge_assignment_source AS source \
+               ON target.id = source.id WHEN MATCHED THEN UPDATE SET value = 1, value = 2",
+            "42601",
+        ),
+        (
+            "MERGE INTO merge_assignment_target AS target USING merge_assignment_source AS source \
+               ON target.id = source.id WHEN NOT MATCHED THEN INSERT (id, id) VALUES (1, 2)",
+            "42701",
+        ),
     ] {
         assert!(
-            String::from_utf8_lossy(&run_with(&mut engine, &mut budget, invalid)).contains("42601"),
+            String::from_utf8_lossy(&run_with(&mut engine, &mut budget, invalid))
+                .contains(sqlstate),
             "{invalid}"
         );
     }
@@ -54484,8 +54792,8 @@ fn hash_join_matches_nested_loop() {
     assert_eq!(r, ["d"], "LEFT JOIN + WHERE mc2.w IS NULL: {r:?}");
 
     // reltuples is deliberately a planner estimate. A stale underestimate
-    // must exhaust the selected fixed-capacity hash table loudly rather than
-    // changing execution plans at runtime.
+    // sizes the selected hash table, which grows to hold the actual build
+    // rows without changing the plan; PostgreSQL 18.6 returns every match.
     run_with(&mut e, &mut b, "CREATE TABLE stale_build (k int, v text)");
     run_with(&mut e, &mut b, "CREATE TABLE stale_probe (k int, v text)");
     run_with(&mut e, &mut b, "INSERT INTO stale_build VALUES (1, 'one')");
@@ -54500,16 +54808,12 @@ fn hash_join_matches_nested_loop() {
         &mut b,
         "INSERT INTO stale_probe VALUES (1, 'a'), (2, 'b'), (3, 'c')",
     );
-    let result = run_with(
+    let result = data_rows(&run_with(
         &mut e,
         &mut b,
         "SELECT p.v, b.v FROM stale_probe p JOIN stale_build b ON p.k = b.k ORDER BY 1",
-    );
-    assert!(
-        String::from_utf8_lossy(&result).contains("54000"),
-        "stale reltuples must fail loudly: {}",
-        String::from_utf8_lossy(&result)
-    );
+    ));
+    assert_eq!(result, ["a|one", "b|two", "c|three"]);
 }
 
 #[test]
@@ -62544,14 +62848,15 @@ fn lateral_joins() {
         data_rows(&bytes),
         ["1|1|10", "1|2|20", "2|1|10", "2|2|20", "2|3|30"]
     );
-    // RIGHT JOIN LATERAL is rejected loudly.
-    assert!(
-        String::from_utf8_lossy(&run_with(
+    // A LATERAL item on the right of a RIGHT join that reads nothing of
+    // the join's left side runs once for the join, as in PostgreSQL.
+    assert_eq!(
+        data_rows(&run_with(
             &mut e,
             &mut b,
-            "SELECT * FROM lt t RIGHT JOIN LATERAL (SELECT 1) s ON true"
-        ))
-        .contains("0A000")
+            "SELECT t.id, s.k FROM lt t RIGHT JOIN LATERAL (SELECT 1 AS k) s ON true ORDER BY 1"
+        )),
+        ["1|1", "2|1", "3|1"]
     );
 }
 
@@ -63265,86 +63570,111 @@ fn row_lock_deadlock_aborts_one_explicit_transaction_and_wakes_the_other() {
 
 #[test]
 fn unique_key_writer_waits_then_rechecks_the_committed_outcome() {
-    let (mut engine, mut budget) = test_engine();
-    let mut owner = TxnState::new(&mut budget, 256).unwrap();
-    let mut waiter = TxnState::new(&mut budget, 256).unwrap();
-    run_txn(
+    // The waiting statement resumes in its own connection memory, as a
+    // parked protocol message does.
+    let config = test_config("unique-key-wait");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut owner = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut waiter = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    owner.success(
         &mut engine,
-        &mut budget,
-        &mut owner,
-        "CREATE TABLE unique_wait (id int primary key)",
+        "CREATE TABLE unique_wait (id int primary key); BEGIN; \
+         INSERT INTO unique_wait VALUES (1)",
+        true,
     );
-    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
-    run_txn(
-        &mut engine,
-        &mut budget,
-        &mut owner,
-        "INSERT INTO unique_wait VALUES (1)",
-    );
-    let blocked = run_txn(
-        &mut engine,
-        &mut budget,
-        &mut waiter,
-        "INSERT INTO unique_wait VALUES (1)",
-    );
-    assert!(blocked.is_empty(), "{blocked}");
-    run_txn(&mut engine, &mut budget, &mut owner, "COMMIT");
-    let duplicate = run_txn(
-        &mut engine,
-        &mut budget,
-        &mut waiter,
-        "INSERT INTO unique_wait VALUES (1)",
-    );
-    assert!(duplicate.contains("23505"), "{duplicate}");
+    let sql = "INSERT INTO unique_wait VALUES (1)";
+    let ExecutionStatus::Blocked {
+        completed_statements,
+        output_mark,
+        ..
+    } = waiter.execute_status(&mut engine, sql, true)
+    else {
+        panic!("the insert must wait for the uncommitted key");
+    };
+    owner.success(&mut engine, "COMMIT", true);
+    output_mark.truncate_unsent(&mut waiter.send);
+    waiter.arena.recycle_front();
+    let status = crate::mem::guard::forbid_alloc(|| {
+        engine.execute_simple_from(
+            sql,
+            completed_statements,
+            &waiter.arena,
+            &mut waiter.transaction,
+            &mut waiter.pool,
+            &mut waiter.cursors,
+            &waiter.guc,
+            &mut Responder::new(&mut waiter.send),
+            waiter.connection_id,
+            false,
+        )
+    })
+    .unwrap();
+    assert_eq!(status, ExecutionStatus::Complete);
+    assert_eq!(error_sqlstates(waiter.send.readable()), ["23505"]);
+    drop((owner, waiter, engine));
+    std::fs::remove_dir_all(config.data_dir).unwrap();
 }
 
+/// A write parked on a unique conflict keeps the rows before the waiting one,
+/// as PostgreSQL does while it waits, and rolls back only the waiting row.
 #[test]
-fn parked_statement_rewinds_partial_rows_before_replay() {
-    let (mut engine, mut budget) = test_engine();
-    let mut owner = TxnState::new(&mut budget, 256).unwrap();
-    let mut waiter = TxnState::new(&mut budget, 256).unwrap();
-    run_txn(
+fn parked_statement_keeps_finished_rows_and_rewinds_the_waiting_row() {
+    let config = test_config("parked-statement-rows");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut owner = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut waiter = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    owner.success(
         &mut engine,
-        &mut budget,
-        &mut owner,
-        "CREATE TABLE replay_rows (id int primary key)",
+        "CREATE TABLE replay_rows (id int primary key); BEGIN; INSERT INTO replay_rows VALUES (2)",
+        true,
     );
-    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
-    run_txn(
-        &mut engine,
-        &mut budget,
-        &mut owner,
-        "INSERT INTO replay_rows VALUES (2)",
+    let sql = "INSERT INTO replay_rows VALUES (1), (2)";
+    let ExecutionStatus::Blocked {
+        completed_statements,
+        output_mark,
+        ..
+    } = waiter.execute_status(&mut engine, sql, true)
+    else {
+        panic!("the insert must wait for the uncommitted key");
+    };
+    assert_eq!(
+        engine
+            .storage
+            .resident_rows(engine.storage.find_table("public", "replay_rows").unwrap())
+            .iter()
+            .filter(|(_, state)| {
+                state
+                    .pending_last()
+                    .is_some_and(|pending| pending.txid == waiter.transaction.txid)
+            })
+            .count(),
+        1,
+        "the parked statement keeps its first row and no part of the waiting one"
     );
-    let blocked = run_txn(
-        &mut engine,
-        &mut budget,
-        &mut waiter,
-        "INSERT INTO replay_rows VALUES (1), (2)",
-    );
-    assert!(blocked.is_empty(), "{blocked}");
-    assert!(
-        {
-            let storage = &engine.storage;
-            storage
-                .resident_rows(engine.storage.find_table("public", "replay_rows").unwrap())
-                .iter()
-                .all(|(_, state)| {
-                    state
-                        .pending_last()
-                        .is_none_or(|pending| pending.txid != waiter.txid)
-                })
-        },
-        "the parked statement must leave no partial pending row"
-    );
-    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
-    let resumed = run_txn(
-        &mut engine,
-        &mut budget,
-        &mut waiter,
-        "INSERT INTO replay_rows VALUES (1), (2)",
-    );
-    assert!(resumed.contains("INSERT 0 2"), "{resumed}");
+    owner.success(&mut engine, "ROLLBACK", true);
+    output_mark.truncate_unsent(&mut waiter.send);
+    waiter.arena.recycle_front();
+    let status = crate::mem::guard::forbid_alloc(|| {
+        engine.execute_simple_from(
+            sql,
+            completed_statements,
+            &waiter.arena,
+            &mut waiter.transaction,
+            &mut waiter.pool,
+            &mut waiter.cursors,
+            &waiter.guc,
+            &mut Responder::new(&mut waiter.send),
+            waiter.connection_id,
+            false,
+        )
+    })
+    .unwrap();
+    assert_eq!(status, ExecutionStatus::Complete);
+    assert_eq!(command_tags(waiter.send.readable()), ["INSERT 0 2"]);
+    drop((owner, waiter, engine));
+    std::fs::remove_dir_all(config.data_dir).unwrap();
 }
 
 #[test]
@@ -65192,7 +65522,7 @@ fn index_validation_uniqueness_reuses_own_changed_cached_keys_without_object_ree
         let start = &start;
         let completed = &completed;
         let writer = scope.spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = crate::test_wait::deadline();
             while !start.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
                 std::thread::yield_now();
             }
@@ -65221,8 +65551,7 @@ fn index_validation_uniqueness_reuses_own_changed_cached_keys_without_object_ree
                         assert!(encoded.is_some());
                         visits += 1;
                         start.store(true, Ordering::Release);
-                        let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        let deadline = crate::test_wait::deadline();
                         while !completed.load(Ordering::Acquire)
                             && std::time::Instant::now() < deadline
                         {
@@ -75051,7 +75380,7 @@ fn typed_table_membership_controls_composite_attribute_and_drop_lifecycle() {
         "ALTER TABLE typed_lifecycle_rows ADD COLUMN forbidden integer",
     );
     assert!(
-        String::from_utf8_lossy(&output).contains("0A000"),
+        String::from_utf8_lossy(&output).contains("cannot add column to typed table"),
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -76232,10 +76561,6 @@ fn drop_database_force_marks_every_live_backend_for_administrative_termination()
     assert!(engine.reserve_database_connection(database, false));
     assert!(engine.reserve_database_connection(database, false));
 
-    let output = run_with(&mut engine, &mut budget, "DROP DATABASE force_target");
-    assert!(String::from_utf8_lossy(&output).contains("55006"));
-    assert!(engine.database_login("force_target").is_some());
-
     let output = run_with(
         &mut engine,
         &mut budget,
@@ -76251,6 +76576,121 @@ fn drop_database_force_marks_every_live_backend_for_administrative_termination()
     engine.release_database_connection(database.slot);
     engine.release_database_connection(database.slot);
     assert!(!engine.database_connection_must_terminate(database.slot as usize));
+}
+
+/// Like PostgreSQL's `CountOtherDBBackends`, a database statement that needs
+/// a database to itself waits up to five seconds for other sessions to leave:
+/// the connection parks on a timer and the statement re-checks on resume.
+#[test]
+fn database_statements_wait_for_other_sessions_before_reporting_in_use() {
+    let config = test_config("database-session-wait");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for sql in [
+        "CREATE DATABASE left_target",
+        "CREATE DATABASE busy_target",
+        "CREATE DATABASE busy_template",
+        "CREATE DATABASE busy_tablespace",
+        "CREATE TABLESPACE wait_space LOCATION '/object/wait-space'",
+    ] {
+        session.success(&mut engine, sql, false);
+    }
+    let resume = |session: &mut ConfiguredTransactionSession,
+                  engine: &mut Engine,
+                  sql: &str,
+                  completed_statements: usize| {
+        session.send.clear();
+        session.arena.recycle_front();
+        engine
+            .execute_simple_from(
+                sql,
+                completed_statements,
+                &session.arena,
+                &mut session.transaction,
+                &mut session.pool,
+                &mut session.cursors,
+                &session.guc,
+                &mut Responder::new(&mut session.send),
+                session.connection_id,
+                false,
+            )
+            .unwrap()
+    };
+
+    // The other session leaves while the statement waits.
+    let left = engine.database_login("left_target").unwrap();
+    assert!(engine.reserve_database_connection(left, false));
+    let sql = "DROP DATABASE left_target";
+    let ExecutionStatus::Blocked {
+        completed_statements,
+        ..
+    } = session.execute_status(&mut engine, sql, false)
+    else {
+        panic!("DROP DATABASE did not wait for the other session");
+    };
+    assert!(session.guc.seq_session().sleep_until().is_some());
+    assert!(session.send.readable().is_empty());
+    engine.release_database_connection(left.slot);
+    assert_eq!(
+        resume(&mut session, &mut engine, sql, completed_statements),
+        ExecutionStatus::Complete
+    );
+    assert!(error_sqlstates(session.send.readable()).is_empty());
+    assert!(engine.database_login("left_target").is_none());
+
+    // Sessions that stay past the window make each statement report 55006.
+    let busy = engine.database_login("busy_target").unwrap();
+    let template = engine.database_login("busy_template").unwrap();
+    let tablespace = engine.database_login("busy_tablespace").unwrap();
+    for database in [busy, template, tablespace] {
+        assert!(engine.reserve_database_connection(database, false));
+    }
+    for (sql, message) in [
+        (
+            "DROP DATABASE busy_target",
+            "database \"busy_target\" is being accessed by other users",
+        ),
+        (
+            "CREATE DATABASE from_busy TEMPLATE busy_template",
+            "source database \"busy_template\" is being accessed by other users",
+        ),
+        (
+            "ALTER DATABASE busy_tablespace SET TABLESPACE wait_space",
+            "database \"busy_tablespace\" is being accessed by other users",
+        ),
+    ] {
+        let ExecutionStatus::Blocked {
+            completed_statements,
+            ..
+        } = session.execute_status(&mut engine, sql, false)
+        else {
+            panic!("{sql} did not wait for the other session");
+        };
+        let started = session.guc.seq_session().database_wait_since().unwrap();
+        session
+            .guc
+            .seq_session()
+            .set_database_wait_since(Some(started - 5_000_000));
+        assert_eq!(
+            resume(&mut session, &mut engine, sql, completed_statements),
+            ExecutionStatus::Complete,
+            "{sql}"
+        );
+        let output = String::from_utf8_lossy(session.send.readable()).into_owned();
+        assert!(
+            output.contains("55006") && output.contains(message),
+            "{sql}: {output}"
+        );
+        crate::sql::sequence::finish_statement(session.guc.seq_session());
+    }
+    assert!(engine.database_login("busy_target").is_some());
+    assert!(engine.database_login("from_busy").is_none());
+    for database in [busy, template, tablespace] {
+        engine.release_database_connection(database.slot);
+    }
+    drop((session, engine));
+    std::fs::remove_dir_all(config.data_dir).unwrap();
 }
 
 #[test]
@@ -82507,24 +82947,23 @@ fn checkpoint_reslice_reuses_unchanged_staged_value_indexes() {
 }
 
 #[test]
-fn array_element_assignment_sets_elements_instead_of_treating_them_as_jsonb() {
+fn array_element_assignment_is_not_treated_as_jsonb() {
     let config = test_config("array-element-assignment");
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
         &mut budget,
-        "CREATE TABLE element_targets (a int[], j jsonb); \
-         INSERT INTO element_targets VALUES ('{1,2}', '{}'), (NULL, NULL)",
+        "CREATE TABLE element_targets (id int, a int[], j jsonb); \
+         INSERT INTO element_targets VALUES (1, '{1,2}', '{}'), (2, NULL, NULL)",
     );
-    // PostgreSQL grows a one-dimensional array and makes a NULL array hold
-    // only the assigned element.
+    // A NULL array column takes the shape of its subscripts, as in PostgreSQL.
     let output = run_with(
         &mut engine,
         &mut budget,
-        "UPDATE element_targets SET a[3] = 9 RETURNING a::text",
+        "UPDATE element_targets SET a[1] = 9; SELECT a FROM element_targets ORDER BY id",
     );
-    assert_eq!(data_rows(&output), ["{1,2,9}", "[3:3]={9}"]);
+    assert_eq!(data_rows(&output), ["{9,2}", "{9}"]);
     let output = run_with(
         &mut engine,
         &mut budget,
@@ -86887,6 +87326,25 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
             "0|2857", "1|2858", "2|2857", "3|2857", "4|2857", "5|2857", "6|2857",
         ],
     );
+    // Without ORDER BY, rows leave in the last-evaluated window's order with
+    // ties in the earlier windows' order, as PostgreSQL 18.6 returns them.
+    partitioned(
+        &mut engine,
+        &mut budget,
+        "SELECT id, row_number() OVER (ORDER BY id DESC)
+         FROM external_window_rows WHERE grp = 1 AND id <= 50 LIMIT 3",
+        &["50|1", "43|2", "36|3"],
+    );
+    partitioned(
+        &mut engine,
+        &mut budget,
+        "SELECT grp, id, rank() OVER (ORDER BY id DESC), count(*) OVER (PARTITION BY grp)
+         FROM external_window_rows WHERE id <= 9",
+        &[
+            "2|9|1|2", "1|8|2|2", "0|7|3|1", "6|6|4|1", "5|5|5|1", "4|4|6|1", "3|3|7|1", "2|2|8|2",
+            "1|1|9|2",
+        ],
+    );
     let traffic = engine.storage.block_io_stats().saturating_sub(before);
     assert!(
         traffic.object_puts > 0 && traffic.object_gets > 0,
@@ -89147,7 +89605,7 @@ fn prepare_coerces_args_to_declared_types() {
         "{:?}",
         String::from_utf8_lossy(&bad)
     );
-    // Wrong argument count is rejected as PostgreSQL's EvaluateParams does.
+    // Wrong argument count is rejected with PostgreSQL 18.6's 42601.
     let count = run_with(
         &mut e,
         &mut b,
@@ -94696,7 +95154,7 @@ fn finish_sliced_cleanup(engine: &mut Engine) -> usize {
 fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     let (mut engine, mut budget, mut config) =
         sliced_cleanup_fixture("metadata-cleanup-cached-orders", false);
@@ -94728,7 +95186,7 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
     );
     let mut stream = None;
     for (method, response) in [("GET ", empty), ("GET ", orphan.as_str()), ("DELETE ", "")] {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         loop {
             assert!(
                 Instant::now() < deadline,
@@ -94758,7 +95216,7 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
             };
             accepted.set_nonblocking(false).unwrap();
             accepted
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(crate::test_wait::HANG))
                 .unwrap();
             stream = Some(accepted);
         }
@@ -94820,7 +95278,7 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_log_deletion() {
 fn maintenance_metadata_waits_leave_cached_sql_runnable_through_file_deletion() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     let (mut engine, mut budget, mut config) =
         sliced_cleanup_fixture("file-cleanup-cached-orders", false);
@@ -94852,7 +95310,7 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_file_deletion() 
     );
     let mut stream = None;
     for (method, response) in [("GET ", empty), ("GET ", orphan.as_str()), ("DELETE ", "")] {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         loop {
             assert!(
                 Instant::now() < deadline,
@@ -94882,7 +95340,7 @@ fn maintenance_metadata_waits_leave_cached_sql_runnable_through_file_deletion() 
             };
             accepted.set_nonblocking(false).unwrap();
             accepted
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(crate::test_wait::HANG))
                 .unwrap();
             stream = Some(accepted);
         }
@@ -95695,7 +96153,7 @@ fn check_cleanup_during_download(
     );
     let _ = engine.replace_read_owner(foreground_owner);
     listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     let (mut stream, _) = loop {
         engine.advance_pending_block_read(0).unwrap();
         match listener.accept() {
@@ -95710,7 +96168,7 @@ fn check_cleanup_during_download(
     stream.set_nonblocking(false).unwrap();
     engine.advance_pending_block_read(0).unwrap();
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(crate::test_wait::HANG))
         .unwrap();
     let mut request = [0u8; 4096];
     let mut received = 0;
@@ -95778,7 +96236,7 @@ fn check_cleanup_during_download(
     crate::storage::rowenc::decode(&current, &[ColType::Int4, ColType::Text], &mut values).unwrap();
     assert!(matches!(values[1], Datum::Text(value) if value.len() == 8192));
     stream
-        .set_write_timeout(Some(Duration::from_secs(2)))
+        .set_write_timeout(Some(crate::test_wait::HANG))
         .unwrap();
     if fail_read {
         stream
@@ -95792,7 +96250,7 @@ fn check_cleanup_during_download(
         .unwrap();
         stream.write_all(&framed[..framed_len]).unwrap();
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     crate::mem::guard::forbid_alloc(|| {
         loop {
             assert!(Instant::now() < deadline, "released GET did not complete");
@@ -96564,6 +97022,7 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                     &setup,
                     &mut reader.transaction,
                     &reader.guc,
+                    &mut reader.cursors,
                     &arena,
                     &mut Responder::new(&mut send),
                 )
@@ -96577,6 +97036,7 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                 let context = CopyRowContext::new(
                     &mut reader.transaction,
                     &reader.guc,
+                    &mut reader.cursors,
                     &arena,
                     &mut responder,
                     &mut transition,
@@ -96619,11 +97079,11 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                         &setup,
                         &mut reader.transaction,
                         &reader.guc,
-                        Some(CursorCommitContext {
+                        CursorCommitContext {
                             cursors: &mut reader.cursors,
-                            plans: &mut reader.pool,
+                            plans: Some(&mut reader.pool),
                             arena: &reader.arena,
-                        }),
+                        },
                         &mut Responder::new(&mut send),
                         &transition,
                         CopyFinishMode::ImplicitTransaction,
@@ -98681,7 +99141,7 @@ fn parallel_physical_merge_source_failures_retry_the_same_pair_without_losing_ro
 fn held_maintenance_read(mode: crate::config::TransactionMode, phase: &str) {
     use crate::store::BlockStore;
     use std::net::TcpListener;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use object_reads::{accept, advance, read_request, replace_uncached_blocks, reply};
 
@@ -98813,7 +99273,7 @@ fn held_maintenance_read(mode: crate::config::TransactionMode, phase: &str) {
             break;
         }
         reply(&mut stream, &request, &body);
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         while engine.block_reads_pending() {
             advance(&mut engine);
             assert!(
@@ -98976,7 +99436,7 @@ fn held_maintenance_read(mode: crate::config::TransactionMode, phase: &str) {
         &foreground_request,
         &foreground_body,
     );
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     loop {
         advance(&mut engine);
         let prior = engine.replace_read_owner(Some(foreground_owner));
@@ -99009,7 +99469,7 @@ fn held_maintenance_read(mode: crate::config::TransactionMode, phase: &str) {
         assert!(!engine.checkpoint_can_progress());
         reply(stream.as_mut().unwrap(), &request, &body);
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     while engine.ckpt.as_ref().unwrap().retained_output_pending() {
         advance(&mut engine);
         if !engine.ckpt.as_ref().unwrap().retained_output_pending() {
@@ -100132,7 +100592,6 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
     use crate::store::BlockStore;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
-    use std::time::Duration;
 
     for extended in [false, true] {
         let mut config = test_config(if extended {
@@ -100383,7 +100842,7 @@ fn atomic_block_reads_function_and_sequence_effects_survive_cold_http_reads_once
         );
         assert!(engine.pending_block_read_fd(0).is_some());
         hold_response.store(false, Ordering::Release);
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         while !engine.advance_pending_block_read(0).unwrap() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -100857,7 +101316,9 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
     }
 }
 
+mod engine_triggers;
 mod relation_input_granularity;
+mod row_progress;
 
 #[test]
 fn pseudo_type_columns_fail_like_postgresql() {
@@ -100919,4 +101380,38 @@ fn pseudo_type_columns_fail_like_postgresql() {
     }
     let output = session.execute(&mut engine, "CREATE TABLE p(c anyelement[])", false);
     assert_eq!(error_sqlstates(&output), ["42704"]);
+}
+
+#[test]
+fn spilled_grouping_keys_read_enclosing_aggregates() {
+    for external in [false, true] {
+        let mut config = test_config(if external {
+            "outer-aggregate-key-external"
+        } else {
+            "outer-aggregate-key-inline"
+        });
+        config.object_store_on = external;
+        config.object_store_sim = external;
+        config.object_store_bucket =
+            format!("outer-aggregate-key-{}-{external}", std::process::id());
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        assert_eq!(engine.storage.spill_attached(), external);
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE oak_t (id int); CREATE TABLE oak_u (x int); \
+             INSERT INTO oak_t VALUES (1),(2),(3); INSERT INTO oak_u VALUES (5),(6)",
+        );
+        assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+        // The inner query groups by the outer query's aggregate.
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT (SELECT count(*) FROM oak_u GROUP BY max(oak_t.id)) FROM oak_t",
+            )),
+            ["2"]
+        );
+    }
 }

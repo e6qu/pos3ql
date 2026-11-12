@@ -115,6 +115,84 @@ def probe(args, trace):
             error(owner, "error.waits_for_affected_fetch", "FETCH NEXT FROM later_error", "22012")
             owner.execute("ROLLBACK")
 
+            # Regex, JSON and ROWS FROM sources produce each row at its FETCH.
+            owner.execute("SELECT setval('calls',500,false)")
+            owner.execute("BEGIN")
+            owner.execute(
+                "DECLARE pieces NO SCROLL CURSOR FOR SELECT *, nextval('calls') FROM ROWS FROM "
+                "(regexp_split_to_table('a-b-c', '-'), json_each_text('{\"k\": \"v\"}')) "
+                "WITH ORDINALITY"
+            )
+            rows(owner, "functions.declare", "SELECT last_value,is_called FROM calls", [(500, False)])
+            rows(owner, "functions.first", "FETCH NEXT FROM pieces", [("a", "k", "v", 1, 500)])
+            rows(owner, "functions.first_only", "SELECT last_value,is_called FROM calls", [(500, True)])
+            rows(
+                owner,
+                "functions.rest",
+                "FETCH ALL FROM pieces",
+                [("b", None, None, 2, 501), ("c", None, None, 3, 502)],
+            )
+            owner.execute("DECLARE broken NO SCROLL CURSOR FOR SELECT * FROM jsonb_each('[1]')")
+            error(owner, "functions.argument_error_at_fetch", "FETCH NEXT FROM broken", "22023")
+            owner.execute("ROLLBACK")
+
+            # A join cursor projects each joined row at its FETCH; a NULL key
+            # never matches and a LEFT JOIN returns the unmatched row.
+            owner.execute("SELECT setval('calls',700,false)")
+            owner.execute("CREATE TABLE join_keys(k integer, label text)")
+            owner.execute("INSERT INTO join_keys VALUES (1, 'one'), (NULL, 'none'), (3, 'three')")
+            owner.execute("BEGIN")
+            owner.execute(
+                "DECLARE joined NO SCROLL CURSOR FOR SELECT s.id, j.label, nextval('calls') "
+                "FROM source_rows s LEFT JOIN join_keys j ON j.k = s.id WHERE s.id = 2"
+            )
+            rows(owner, "joins.declare", "SELECT last_value,is_called FROM calls", [(700, False)])
+            rows(owner, "joins.left_unmatched", "FETCH NEXT FROM joined", [(2, None, 700)])
+            rows(owner, "joins.end", "FETCH NEXT FROM joined", [])
+            rows(owner, "joins.one_call", "SELECT last_value,is_called FROM calls", [(700, True)])
+            owner.execute("ROLLBACK")
+
+            # A forward FETCH larger than pos3ql's cursor_bytes streams its
+            # rows; each is projected when it is fetched.
+            owner.execute("SELECT setval('calls',1000,false)")
+            owner.execute("BEGIN")
+            owner.execute(
+                "DECLARE large NO SCROLL CURSOR FOR "
+                "SELECT g, nextval('calls'), repeat('x', 500) FROM generate_series(1,3000) g"
+            )
+            rows(owner, "large.first_rows", "FETCH 2 FROM large", [(1, 1000, "x" * 500), (2, 1001, "x" * 500)])
+            with owner.cursor() as cursor:
+                cursor.execute("FETCH ALL FROM large")
+                fetched = cursor.fetchall()
+                entry = {
+                    "case": "large.fetch_all_streams",
+                    "count": len(fetched),
+                    "last": list(fetched[-1][:2]),
+                    "tag": cursor.statusmessage,
+                }
+                trace.append(entry)
+                assert fetched == [(g, 999 + g, "x" * 500) for g in range(3, 3001)], json.dumps(entry)
+                assert cursor.statusmessage == "FETCH 2998", json.dumps(entry)
+            rows(owner, "large.after_end", "FETCH NEXT FROM large", [])
+            rows(owner, "large.projected_once", "SELECT last_value,is_called FROM calls", [(3999, True)])
+            owner.execute("COMMIT")
+
+            # A function scan's cursor is scrollable by default. Its FETCH ALL
+            # exceeds pos3ql's cursor_bytes; it streams, and moving back
+            # reads the series again from its start.
+            owner.execute("BEGIN")
+            owner.execute("DECLARE wide CURSOR FOR SELECT g, repeat('x', 900) FROM generate_series(1,5000) g")
+            with owner.cursor() as cursor:
+                cursor.execute("FETCH ALL FROM wide")
+                fetched = cursor.fetchall()
+                entry = {"case": "scroll.fetch_all_streams", "count": len(fetched), "tag": cursor.statusmessage}
+                trace.append(entry)
+                assert fetched == [(g, "x" * 900) for g in range(1, 5001)], json.dumps(entry)
+            rows(owner, "scroll.prior_after_all", "FETCH PRIOR FROM wide", [(5000, "x" * 900)])
+            rows(owner, "scroll.absolute_back", "FETCH ABSOLUTE 2 FROM wide", [(2, "x" * 900)])
+            rows(owner, "scroll.backward_to_start", "FETCH BACKWARD 2 FROM wide", [(1, "x" * 900)])
+            owner.execute("COMMIT")
+
             owner.execute("BEGIN")
             owner.execute("DECLARE locked NO SCROLL CURSOR FOR SELECT id FROM source_rows ORDER BY id FOR UPDATE")
             observer.execute("BEGIN")
@@ -173,6 +251,20 @@ def probe(args, trace):
             rows(owner, "scroll.limit_edge_not_evaluated", "FETCH PRIOR FROM windowed", [(3, 502)])
             rows(owner, "scroll.limit_inner_row_evaluated", "FETCH PRIOR FROM windowed", [(2, 503)])
             owner.execute("CLOSE windowed")
+            owner.execute("COMMIT")
+
+            # An ordered cursor sorts at its first fetch and evaluates its
+            # output list per fetched row, again on revisits.
+            owner.execute("SELECT setval('calls',600,false)")
+            owner.execute("BEGIN")
+            owner.execute(
+                "DECLARE ordered SCROLL CURSOR FOR SELECT id, nextval('calls') FROM source_rows ORDER BY id DESC"
+            )
+            rows(owner, "ordered.declare_does_not_project", "SELECT last_value,is_called FROM calls", [(600, False)])
+            rows(owner, "ordered.first", "FETCH NEXT FROM ordered", [(3, 600)])
+            rows(owner, "ordered.second", "FETCH NEXT FROM ordered", [(2, 601)])
+            rows(owner, "ordered.prior_evaluates_projection", "FETCH PRIOR FROM ordered", [(3, 602)])
+            rows(owner, "ordered.last", "FETCH LAST FROM ordered", [(1, 605)])
             owner.execute("COMMIT")
 
             owner.execute("BEGIN")

@@ -1039,21 +1039,7 @@ pub fn canonicalize_multirange<'a>(
     kind: RangeKind,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
-    // Rust's unstable slice sort uses no heap scratch. Capture the first
-    // malformed component error because a comparator cannot return Result.
-    let mut comparison_error = None;
-    ranges.sort_unstable_by(|left, right| match cmp_ranges(left, right, kind) {
-        Ok(ordering) => ordering,
-        Err(error) => {
-            if comparison_error.is_none() {
-                comparison_error = Some(error);
-            }
-            Ordering::Equal
-        }
-    });
-    if let Some(error) = comparison_error {
-        return Err(error);
-    }
+    crate::util::try_sort_unstable_by(ranges, |left, right| cmp_ranges(left, right, kind))?;
     // Merge overlapping or adjacent neighbours in place (input is sorted).
     let mut k = 0usize;
     for i in 0..ranges.len() {

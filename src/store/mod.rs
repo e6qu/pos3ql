@@ -27,6 +27,10 @@ macro_rules! delegate_async_block_reads {
             self.inner.read_capacity_generation()
         }
 
+        fn owner_awaits_read(&self, owner: super::ReadOwner) -> bool {
+            self.inner.owner_awaits_read(owner)
+        }
+
         fn enable_async_gets(&mut self) {
             self.inner.enable_async_gets();
         }
@@ -415,6 +419,12 @@ pub(crate) trait BlockStore {
     /// Retains a wakeup when a response barrier postpones a waiting connection.
     fn read_capacity_generation(&self) -> u64 {
         0
+    }
+
+    /// Whether `owner` waits on an object read still in flight and holds no
+    /// completed one: running its statement again would only wait again.
+    fn owner_awaits_read(&self, _owner: ReadOwner) -> bool {
+        false
     }
 
     /// Enables non-blocking object reads for this stack. The server owns the

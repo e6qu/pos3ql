@@ -1432,9 +1432,13 @@ fn routine_arguments_run_once_and_preserve_strict_null_effects() {
         "SELECT dispatch_missing({})",
         vec!["nextval('dispatch_effects')"; 24].join(",")
     );
+    // The whole signature is reported, and no argument runs.
     let rejected = session.execute(&mut engine, &oversized, true);
-    assert_eq!(error_sqlstates(&rejected), ["54000"]);
-    assert!(String::from_utf8_lossy(&rejected).contains("192 bytes"));
+    assert_eq!(error_sqlstates(&rejected), ["42883"]);
+    assert!(String::from_utf8_lossy(&rejected).contains(&format!(
+        "function dispatch_missing({}) does not exist",
+        vec!["bigint"; 24].join(", ")
+    )));
     assert_eq!(
         data_rows(&session.success(&mut engine, "SELECT last_value FROM dispatch_effects", true)),
         ["18"]
@@ -2200,26 +2204,33 @@ fn search_path_sql_capacity_errors_preserve_the_selected_value() {
         "SELECT set_config('search_path','GUC_RAW,public',false)",
         true,
     );
-    for name in [
-        "a".repeat(64),
-        "a".repeat(65),
-        "é".repeat(32),
-        format!("{}a", "é".repeat(32)),
+    // PostgreSQL's scanner truncates a long identifier to 63 bytes, at a
+    // character boundary, with a NOTICE; the setting takes the truncated name.
+    for (name, truncated) in [
+        ("a".repeat(64), "a".repeat(63)),
+        ("a".repeat(65), "a".repeat(63)),
+        ("é".repeat(32), format!("\"{}\"", "é".repeat(31))),
+        (
+            format!("{}a", "é".repeat(32)),
+            format!("\"{}\"", "é".repeat(31)),
+        ),
     ] {
         for sql in [
             format!("SET search_path TO {name}"),
             format!("SET search_path TO \"{name}\""),
         ] {
-            assert_eq!(
-                error_sqlstates(&session.execute(&mut engine, &sql, true)),
-                ["42622"]
-            );
+            assert!(error_sqlstates(&session.execute(&mut engine, &sql, true)).is_empty());
             assert_eq!(
                 data_rows(&session.success(&mut engine, "SHOW search_path", true)),
-                ["GUC_RAW,public"]
+                core::slice::from_ref(&truncated)
             );
         }
     }
+    session.success(
+        &mut engine,
+        "SELECT set_config('search_path','GUC_RAW,public',false)",
+        true,
+    );
     for value in ["a".repeat(129), "é".repeat(64), "é".repeat(65)] {
         assert_eq!(
             error_sqlstates(&session.execute(
@@ -4292,9 +4303,9 @@ fn relation_row_types_in_routine_signatures_resolve_like_postgresql() {
     ]);
 }
 
-/// PostgreSQL's parse analysis accepts only queries, data changes and CALL in
-/// a `BEGIN ATOMIC` body, naming any other statement by its command tag before
-/// checking the declared result.
+/// PostgreSQL's parse analysis accepts only queries and data changes in a
+/// `BEGIN ATOMIC` body, naming any other statement (`CALL` included) by its
+/// command tag before checking the declared result.
 #[test]
 fn unquoted_bodies_reject_utility_statements_at_creation() {
     use super::routine_identity_diagnostics::diagnostics;
@@ -4302,6 +4313,11 @@ fn unquoted_bodies_reject_utility_statements_at_creation() {
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE PROCEDURE atomic_target() LANGUAGE sql AS 'SELECT 1'",
+        true,
+    );
     for (body, tag) in [
         ("COMMIT", "COMMIT"),
         ("VACUUM", "VACUUM"),
@@ -4313,6 +4329,7 @@ fn unquoted_bodies_reject_utility_statements_at_creation() {
         ("START TRANSACTION", "START TRANSACTION"),
         ("ROLLBACK TO a", "ROLLBACK"),
         ("RELEASE a", "RELEASE"),
+        ("CALL atomic_target()", "CALL"),
     ] {
         let sql = format!(
             "CREATE FUNCTION atomic_utility() RETURNS integer LANGUAGE sql \
@@ -4373,4 +4390,363 @@ fn unassigned_record_fields_report_postgresql_state() {
             &[('E', "42703", "record \"rec\" has no field \"b\"")],
         ),
     ]);
+}
+
+/// A trigger fired inside a write may `CALL` a PL/pgSQL procedure. The call
+/// is atomic, so transaction control inside it fails as in PostgreSQL 18.6.
+#[test]
+fn trigger_functions_call_procedures_atomically() {
+    use super::routine_identity_diagnostics::{NONE, check};
+    let invalid = &[('E', "2D000", "invalid transaction termination")][..];
+    check(&[
+        (
+            "CREATE TABLE trigger_calls(a integer); CREATE TABLE trigger_call_log(msg text, v integer); \
+             CREATE PROCEDURE trigger_logged(m text, INOUT v integer) LANGUAGE plpgsql AS \
+                 $$BEGIN INSERT INTO trigger_call_log VALUES (m, v); v := v * 10; END$$; \
+             CREATE PROCEDURE trigger_commits() LANGUAGE plpgsql AS \
+                 $$BEGIN INSERT INTO trigger_call_log VALUES ('c', 0); COMMIT; END$$; \
+             CREATE PROCEDURE trigger_sql(x integer) LANGUAGE sql AS \
+                 $$INSERT INTO trigger_call_log VALUES ('sql', x)$$; \
+             CREATE FUNCTION trigger_caller() RETURNS trigger LANGUAGE plpgsql AS \
+                 $$DECLARE r integer; BEGIN r := NEW.a; CALL trigger_logged(TG_OP, r); \
+                 NEW.a := r; RETURN NEW; END$$; \
+             CREATE TRIGGER trigger_caller BEFORE INSERT ON trigger_calls \
+                 FOR EACH ROW EXECUTE FUNCTION trigger_caller(); \
+             INSERT INTO trigger_calls VALUES (1), (2)",
+            NONE,
+        ),
+        (
+            "DO $$DECLARE rows text; logged text; BEGIN \
+             SELECT string_agg(a::text, ',' ORDER BY a) INTO rows FROM trigger_calls; \
+             SELECT string_agg(msg || v, ',' ORDER BY v) INTO logged FROM trigger_call_log; \
+             RAISE NOTICE '% %', rows, logged; END$$",
+            &[('N', "00000", "10,20 INSERT1,INSERT2")],
+        ),
+        (
+            "CREATE FUNCTION trigger_committer() RETURNS trigger LANGUAGE plpgsql AS \
+                 $$BEGIN CALL trigger_commits(); RETURN NEW; END$$; \
+             CREATE TABLE trigger_commit_rows(a integer); \
+             CREATE TRIGGER trigger_committer BEFORE INSERT ON trigger_commit_rows \
+                 FOR EACH ROW EXECUTE FUNCTION trigger_committer()",
+            NONE,
+        ),
+        ("INSERT INTO trigger_commit_rows VALUES (1)", invalid),
+        (
+            "CREATE FUNCTION trigger_sql_caller() RETURNS trigger LANGUAGE plpgsql AS \
+                 $$BEGIN CALL trigger_sql(NEW.a); RETURN NEW; END$$; \
+             CREATE TABLE trigger_sql_rows(a integer); \
+             CREATE TRIGGER trigger_sql_caller BEFORE INSERT ON trigger_sql_rows \
+                 FOR EACH ROW EXECUTE FUNCTION trigger_sql_caller()",
+            NONE,
+        ),
+        ("INSERT INTO trigger_sql_rows VALUES (1)", NONE),
+        (
+            "DO $$DECLARE logged text; BEGIN \
+             SELECT string_agg(msg || v, ',' ORDER BY msg, v) INTO logged \
+               FROM trigger_call_log; RAISE NOTICE '%', logged; END$$",
+            &[('N', "00000", "INSERT1,INSERT2,sql1")],
+        ),
+    ]);
+}
+
+/// SQL-language procedures called from a BEFORE row trigger or a deferred
+/// constraint trigger run statement by statement on the write's storage:
+/// each statement sees the earlier ones, the final row fills INOUT
+/// arguments (also from `RETURNING`), nested `CALL` works and errors abort
+/// the write. A procedure that runs DDL moves the whole trigger body to the
+/// statement executor, which runs it once. Expected notices and errors come
+/// from PostgreSQL 18.6.
+#[test]
+fn trigger_functions_call_sql_procedures_atomically() {
+    use super::routine_identity_diagnostics::{NONE, check};
+    check(&[
+        (
+            "CREATE TABLE sql_call_rows(a integer, b integer); \
+             CREATE TABLE sql_call_log(msg text, n integer); \
+             CREATE PROCEDURE sql_call_in(x integer) LANGUAGE sql AS \
+                 $$INSERT INTO sql_call_log VALUES ('in', x)$$; \
+             CREATE PROCEDURE sql_call_out(x integer, INOUT r integer) LANGUAGE sql AS \
+                 $$CALL sql_call_in(x); SELECT x * 2$$; \
+             CREATE PROCEDURE sql_call_ret(x integer, INOUT r integer) LANGUAGE sql AS \
+                 $$INSERT INTO sql_call_log VALUES ('ret', x) RETURNING n * 3$$; \
+             CREATE PROCEDURE sql_call_seen(INOUT r text) LANGUAGE sql AS \
+                 $$SELECT string_agg(msg || n, ',' ORDER BY msg, n) FROM sql_call_log$$; \
+             CREATE PROCEDURE sql_call_fails() LANGUAGE sql AS \
+                 $$INSERT INTO sql_call_log VALUES ('bad', 1 / 0)$$; \
+             CREATE PROCEDURE sql_call_ddl() LANGUAGE sql AS $$CREATE TABLE sql_call_made(a int)$$; \
+             CREATE FUNCTION sql_call_trigger() RETURNS trigger LANGUAGE plpgsql AS \
+                 $$DECLARE v integer; seen text; BEGIN \
+                 CALL sql_call_ret(NEW.a, v); NEW.b := v; CALL sql_call_out(NEW.a, v); \
+                 CALL sql_call_seen(seen); RAISE NOTICE '% %', v, seen; \
+                 IF NEW.a < 0 THEN CALL sql_call_fails(); END IF; \
+                 IF NEW.a = 0 THEN CALL sql_call_ddl(); END IF; RETURN NEW; END$$; \
+             CREATE TRIGGER sql_call_trigger BEFORE INSERT ON sql_call_rows \
+                 FOR EACH ROW EXECUTE FUNCTION sql_call_trigger()",
+            NONE,
+        ),
+        (
+            "INSERT INTO sql_call_rows(a) VALUES (7), (8)",
+            &[
+                ('N', "00000", "14 in7,ret7"),
+                ('N', "00000", "16 in7,in8,ret7,ret8"),
+            ],
+        ),
+        (
+            "INSERT INTO sql_call_rows(a) VALUES (-1)",
+            &[
+                ('N', "00000", "-2 in-1,in7,in8,ret-1,ret7,ret8"),
+                ('E', "22012", "division by zero"),
+            ],
+        ),
+        (
+            "INSERT INTO sql_call_rows(a) VALUES (0)",
+            &[('N', "00000", "0 in0,in7,in8,ret0,ret7,ret8")],
+        ),
+        (
+            "CREATE PROCEDURE sql_call_bad(x integer, INOUT r integer) LANGUAGE sql AS \
+                 $$CALL sql_call_ret(x, NULL)$$",
+            &[(
+                'E',
+                "0A000",
+                "calling procedures with output arguments is not supported in SQL functions",
+            )],
+        ),
+        (
+            "CREATE FUNCTION sql_call_bad_function(x integer) RETURNS integer LANGUAGE sql \
+                 BEGIN ATOMIC CALL sql_call_ret(x, NULL); SELECT 1; END",
+            &[(
+                'E',
+                "0A000",
+                "CALL is not yet supported in unquoted SQL function body",
+            )],
+        ),
+        (
+            "CREATE TABLE sql_call_deferred(a integer); \
+             CREATE FUNCTION sql_call_constraint() RETURNS trigger LANGUAGE plpgsql AS \
+                 $$DECLARE v integer; BEGIN CALL sql_call_out(NEW.a * 7, v); \
+                 RAISE NOTICE 'v=%', v; RETURN NULL; END$$; \
+             CREATE CONSTRAINT TRIGGER sql_call_constraint AFTER INSERT ON sql_call_deferred \
+                 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW \
+                 EXECUTE FUNCTION sql_call_constraint(); \
+             BEGIN; INSERT INTO sql_call_deferred VALUES (3)",
+            NONE,
+        ),
+        ("COMMIT", &[('N', "00000", "v=42")]),
+        (
+            "DO $$DECLARE rows text; logged text; BEGIN \
+             SELECT string_agg(a || ':' || b, ',' ORDER BY a) INTO rows FROM sql_call_rows; \
+             SELECT string_agg(msg || n, ',' ORDER BY msg, n) INTO logged FROM sql_call_log; \
+             RAISE NOTICE '% %', rows, logged; END$$",
+            &[(
+                'N',
+                "00000",
+                "0:0,7:21,8:24 in0,in7,in8,in21,ret0,ret7,ret8",
+            )],
+        ),
+    ]);
+}
+
+/// Statements after a procedure's own `COMMIT` or `ROLLBACK` see what its
+/// earlier transactions committed. Expected notices are PostgreSQL 18.6's.
+#[test]
+fn procedure_statements_after_transaction_control_see_committed_rows() {
+    use super::routine_identity_diagnostics::{NONE, check};
+    let call = "DO $$DECLARE t bigint; BEGIN CALL seen_sum(t); RAISE NOTICE '%', t; END$$";
+    check(&[
+        (
+            "CREATE TABLE seen_rows(n bigint); \
+             CREATE PROCEDURE seen_sum(INOUT total bigint) LANGUAGE plpgsql AS $$BEGIN \
+             INSERT INTO seen_rows VALUES (10); COMMIT; INSERT INTO seen_rows VALUES (20); \
+             SELECT sum(n) INTO total FROM seen_rows; INSERT INTO seen_rows VALUES (400); \
+             ROLLBACK; SELECT total + sum(n) INTO total FROM seen_rows; END$$",
+            NONE,
+        ),
+        (call, &[('N', "00000", "40")]),
+        (call, &[('N', "00000", "60")]),
+    ]);
+}
+
+/// A PL/pgSQL function's return value is cast to a domain result type with
+/// the domain's `NOT NULL` and `CHECK` constraints, including a check that
+/// calls a function, as in PostgreSQL 18.6.
+#[test]
+fn plpgsql_domain_results_enforce_constraints() {
+    use super::routine_identity_diagnostics::{NONE, check};
+    check(&[
+        (
+            "CREATE DOMAIN result_positive AS integer CHECK (VALUE > 0); \
+             CREATE DOMAIN result_present AS text NOT NULL; \
+             CREATE FUNCTION result_checked(integer) RETURNS boolean LANGUAGE plpgsql \
+             AS $$BEGIN RAISE NOTICE 'checked %', $1; RETURN $1 < 10; END$$; \
+             CREATE DOMAIN result_small AS integer CHECK (result_checked(VALUE)); \
+             CREATE FUNCTION result_negative() RETURNS result_positive LANGUAGE plpgsql \
+             AS $$BEGIN RETURN -1; END$$; \
+             CREATE FUNCTION result_one() RETURNS result_positive LANGUAGE plpgsql \
+             AS $$BEGIN RETURN 1; END$$; \
+             CREATE FUNCTION result_null() RETURNS result_present LANGUAGE plpgsql \
+             AS $$BEGIN RETURN NULL; END$$; \
+             CREATE FUNCTION result_value(n integer) RETURNS result_small \
+             LANGUAGE plpgsql AS $$BEGIN RETURN n; END$$",
+            NONE,
+        ),
+        (
+            "SELECT result_negative()",
+            &[(
+                'E',
+                "23514",
+                "value for domain result_positive violates check constraint \"result_positive_check\"",
+            )],
+        ),
+        (
+            "DO $$BEGIN RAISE NOTICE '%', result_one(); END$$",
+            &[('N', "00000", "1")],
+        ),
+        (
+            "SELECT result_null()",
+            &[(
+                'E',
+                "23502",
+                "domain result_present does not allow null values",
+            )],
+        ),
+        (
+            "DO $$BEGIN RAISE NOTICE '%', result_value(3); END$$",
+            &[('N', "00000", "checked 3"), ('N', "00000", "3")],
+        ),
+        (
+            "SELECT result_value(30)",
+            &[
+                ('N', "00000", "checked 30"),
+                (
+                    'E',
+                    "23514",
+                    "value for domain result_small violates check constraint \"result_small_check\"",
+                ),
+            ],
+        ),
+    ]);
+}
+
+/// A PL/pgSQL variable in a grouped `SELECT ... INTO` is a constant within
+/// every group, in the select list, `HAVING`, aggregate and window function
+/// arguments, over tables, derived tables and no `FROM` at all, as in
+/// PostgreSQL 18.6.
+#[test]
+fn plpgsql_variables_in_grouped_queries_are_constants() {
+    use super::routine_identity_diagnostics::{NONE, check};
+    check(&[
+        (
+            "CREATE TABLE grouped_values(n integer); \
+             INSERT INTO grouped_values VALUES (1), (2), (2)",
+            NONE,
+        ),
+        (
+            "DO $$DECLARE t bigint := 5; u bigint; BEGIN \
+             SELECT t + sum(n) INTO u FROM grouped_values; RAISE NOTICE '%', u; END$$",
+            &[('N', "00000", "10")],
+        ),
+        (
+            "DO $$DECLARE t bigint := 5; u text; BEGIN \
+             SELECT t * n || ':' || count(*) INTO u FROM grouped_values GROUP BY n \
+             HAVING count(*) > t - 4; RAISE NOTICE '%', u; END$$",
+            &[('N', "00000", "10:2")],
+        ),
+        (
+            "DO $$DECLARE t bigint := 5; u text; BEGIN \
+             SELECT string_agg(t + n || '', ',' ORDER BY n) INTO u \
+             FROM (SELECT n FROM grouped_values) s; RAISE NOTICE '%', u; END$$",
+            &[('N', "00000", "6,7,7")],
+        ),
+        (
+            "DO $$DECLARE t bigint := 5; u bigint; BEGIN \
+             SELECT t + count(*) INTO u; RAISE NOTICE '%', u; END$$",
+            &[('N', "00000", "6")],
+        ),
+        (
+            "DO $$DECLARE t bigint := 5; u bigint; BEGIN \
+             SELECT sum(t) INTO u FROM (SELECT n FROM grouped_values) s; \
+             RAISE NOTICE '%', u; END$$",
+            &[('N', "00000", "15")],
+        ),
+        (
+            "DO $$DECLARE t bigint := 5; u bigint; BEGIN \
+             SELECT sum(t) INTO u; RAISE NOTICE '%', u; END$$",
+            &[('N', "00000", "5")],
+        ),
+        (
+            "DO $$DECLARE t bigint := 5; u bigint; BEGIN \
+             SELECT sum(t + n) INTO u FROM grouped_values GROUP BY n \
+             ORDER BY n DESC LIMIT 1; RAISE NOTICE '%', u; END$$",
+            &[('N', "00000", "14")],
+        ),
+        (
+            "DO $$DECLARE t bigint := 5; u bigint; BEGIN \
+             SELECT sum(t) OVER () INTO u FROM grouped_values; RAISE NOTICE '%', u; END$$",
+            &[('N', "00000", "15")],
+        ),
+        (
+            "SELECT nope + sum(n) FROM grouped_values",
+            &[('E', "42703", "column \"nope\" does not exist")],
+        ),
+        (
+            "SELECT n, sum(n) FROM grouped_values",
+            &[(
+                'E',
+                "42803",
+                "column \"grouped_values.n\" must appear in the GROUP BY clause or be used in an aggregate function",
+            )],
+        ),
+    ]);
+}
+
+/// Routine variables and a trigger's rows are the outer level of every
+/// subquery in a static statement: derived tables, correlated and grouped
+/// subqueries and set operations read them, as in PostgreSQL.
+#[test]
+fn static_statement_subqueries_read_routine_variables() {
+    let config = test_config("routine-variable-subqueries");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE t(a int, b text); INSERT INTO t VALUES (1, 'one'), (2, 'two'); \
+         CREATE FUNCTION w(x int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN \
+         INSERT INTO t SELECT v, 'ins' FROM (SELECT x AS v) s; \
+         UPDATE t SET b = b || '+upd' FROM (SELECT x AS v) s WHERE t.a = s.v; \
+         MERGE INTO t USING (SELECT x + 1 AS v) s ON t.a = s.v \
+         WHEN MATCHED THEN UPDATE SET b = b || '+merged'; \
+         RETURN (SELECT count(*) FROM (SELECT x AS v) s JOIN t ON t.a = s.v); END$$; \
+         CREATE FUNCTION r(x int) RETURNS SETOF int LANGUAGE plpgsql AS $$ BEGIN \
+         RETURN QUERY SELECT (SELECT t.a + x) FROM t GROUP BY a ORDER BY 1; \
+         RETURN QUERY SELECT a FROM t WHERE a IN \
+         (SELECT y FROM (SELECT x - 9 AS y UNION ALL SELECT x - 8) d) ORDER BY 1; END$$; \
+         CREATE TABLE tt(id int, v int); INSERT INTO tt VALUES (1, 10); \
+         CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         DECLARE rec record; BEGIN rec := new; \
+         UPDATE t SET b = b || '+' || (new).v WHERE a = (new).id; \
+         INSERT INTO t SELECT i, 'trg' FROM (SELECT (rec).id + 50 AS i) d; RETURN new; END$$; \
+         CREATE TRIGGER trg BEFORE UPDATE ON tt FOR EACH ROW EXECUTE FUNCTION trg()",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT w(1); SELECT * FROM r(10); UPDATE tt SET v = 20; \
+             SELECT a, b FROM t ORDER BY a, b",
+            true,
+        )),
+        [
+            "2",
+            "11",
+            "12",
+            "1",
+            "1",
+            "2",
+            "1|ins+upd+20",
+            "1|one+upd+20",
+            "2|two+merged",
+            "51|trg",
+        ]
+    );
 }

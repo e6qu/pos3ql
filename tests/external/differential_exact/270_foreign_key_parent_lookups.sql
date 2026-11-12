@@ -1,0 +1,41 @@
+-- Foreign key checks find the parent row by its unique key: composite and
+-- text keys, a varchar child of a text parent, parents the same transaction
+-- inserted, updated or deleted, and NULL child keys.
+CREATE SCHEMA foreign_key_parent_lookups;
+SET search_path = foreign_key_parent_lookups, public;
+create table p(a int, b text, primary key (a, b));
+insert into p select g, 'k' || g from generate_series(1, 300) g;
+create table c(id int, a int, b text, foreign key (a, b) references p);
+insert into c select g, g, 'k' || g from generate_series(1, 300) g;
+insert into c values (301, 5, 'k6');
+insert into c values (302, 5, 'K5');
+insert into c values (303, null, 'nope'), (304, 7, null);
+create table wide(id text primary key);
+insert into wide select 'w' || generate_series(1, 50);
+create table narrow(id varchar(8) references wide);
+insert into narrow values ('w7'), ('w50');
+insert into narrow values ('w51');
+begin;
+insert into p values (400, 'k400'), (401, 'k401');
+insert into c values (400, 400, 'k400');
+update p set b = 'moved' where a = 401;
+insert into c values (401, 401, 'moved');
+insert into c values (402, 401, 'k401');
+rollback;
+begin;
+delete from p where a = 300 and false;
+insert into p values (500, 'k500');
+delete from p where a = 500;
+insert into c values (403, 500, 'k500');
+rollback;
+select count(*), sum(id) from c;
+create table u(code text unique);
+insert into u values ('x'), ('y');
+create table uc(code text references u(code));
+insert into uc values ('x'), ('y');
+insert into uc values ('z');
+select count(*), sum(id) from c;
+select * from narrow order by id;
+select * from uc order by code;
+RESET search_path;
+DROP SCHEMA foreign_key_parent_lookups CASCADE;

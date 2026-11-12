@@ -35,12 +35,14 @@ mod operators;
 pub(crate) use args::*;
 
 mod pattern;
-pub(crate) use pattern::for_each_regex_split;
+pub(crate) use pattern::{RegexSplit, for_each_regex_split, regexp_match_array};
 pub use pattern::{like_match, regex_split_count_pub, regex_split_piece_at_pub, regexp_options};
 pub(crate) use pattern::{regex_substring, similar_to_posix, sql_regex_substring};
 
 pub(crate) use operators::arithmetic;
-pub(crate) use operators::{binary, coerce_unknown, membership_eq};
+pub(crate) use operators::{
+    binary, builtin_record_field_type_name, check_record_field_types, coerce_unknown, membership_eq,
+};
 pub use operators::{
     compare_datums, compare_datums_collated, compare_datums_with_catalog, hash_key,
     hash_key_collated,
@@ -56,7 +58,80 @@ pub const MAX_DIAGNOSTIC_DETAIL_BYTES: usize = 64 * 192;
 #[derive(Clone, Copy)]
 pub struct Diagnostic {
     pub detail: Option<StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>>,
-    pub hint: Option<StackStr<128>>,
+    pub hint: Option<StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>>,
+    pub objects: ErrorObjects,
+}
+
+/// The longest schema, table, column, data type or constraint name an error
+/// reports. Catalog names are at most 63 bytes; `RAISE ... USING` accepts
+/// longer text up to this bound and rejects the rest with 54000.
+pub const MAX_ERROR_OBJECT_BYTES: usize = 1024;
+
+/// The database objects PostgreSQL names in an error's `s`, `t`, `c`, `d`
+/// and `n` fields.
+#[derive(Clone, Copy, Default, PartialEq)]
+pub struct ErrorObjects {
+    pub schema: Option<StackStr<MAX_ERROR_OBJECT_BYTES>>,
+    pub table: Option<StackStr<MAX_ERROR_OBJECT_BYTES>>,
+    pub column: Option<StackStr<MAX_ERROR_OBJECT_BYTES>>,
+    pub datatype: Option<StackStr<MAX_ERROR_OBJECT_BYTES>>,
+    pub constraint: Option<StackStr<MAX_ERROR_OBJECT_BYTES>>,
+}
+
+impl ErrorObjects {
+    /// A table's schema and name, as `errtable` reports them.
+    pub fn table(schema: &str, table: &str) -> Self {
+        Self {
+            schema: Some(StackStr::from_str(schema)),
+            table: Some(StackStr::from_str(table)),
+            ..Self::default()
+        }
+    }
+
+    /// A table constraint, as `errtableconstraint` reports it.
+    pub fn table_constraint(schema: &str, table: &str, constraint: &str) -> Self {
+        Self {
+            constraint: Some(StackStr::from_str(constraint)),
+            ..Self::table(schema, table)
+        }
+    }
+
+    /// A table column, as `errtablecol` reports it.
+    pub fn table_column(schema: &str, table: &str, column: &str) -> Self {
+        Self {
+            column: Some(StackStr::from_str(column)),
+            ..Self::table(schema, table)
+        }
+    }
+
+    /// A data type and optionally one of its constraints, as
+    /// `errdatatype` and `errdomainconstraint` report them.
+    pub fn datatype(schema: &str, datatype: &str, constraint: Option<&str>) -> Self {
+        Self {
+            schema: Some(StackStr::from_str(schema)),
+            datatype: Some(StackStr::from_str(datatype)),
+            constraint: constraint.map(StackStr::from_str),
+            ..Self::default()
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Each present field with its ErrorResponse code, in PostgreSQL's
+    /// field order.
+    pub fn fields(&self) -> impl Iterator<Item = (u8, &str)> {
+        [
+            (b's', &self.schema),
+            (b't', &self.table),
+            (b'c', &self.column),
+            (b'd', &self.datatype),
+            (b'n', &self.constraint),
+        ]
+        .into_iter()
+        .filter_map(|(code, value)| value.as_ref().map(|value| (code, value.as_str())))
+    }
 }
 
 std::thread_local! {
@@ -68,7 +143,25 @@ pub fn stash_diagnostic(
     detail: Option<StackStr<MAX_DIAGNOSTIC_DETAIL_BYTES>>,
     hint: Option<StackStr<128>>,
 ) {
-    PENDING_DIAGNOSTIC.with(|d| *d.borrow_mut() = Some(Diagnostic { detail, hint }));
+    stash_full_diagnostic(Diagnostic {
+        detail,
+        hint: hint.map(|hint| StackStr::from_str(hint.as_str())),
+        objects: ErrorObjects::default(),
+    });
+}
+
+/// Replaces the pending diagnostic, including the objects it names.
+pub fn stash_full_diagnostic(diagnostic: Diagnostic) {
+    PENDING_DIAGNOSTIC.with(|d| *d.borrow_mut() = Some(diagnostic));
+}
+
+/// Stashes `detail` and `objects` for the next error.
+pub fn stash_object_diagnostic(detail: Option<&str>, objects: ErrorObjects) {
+    stash_full_diagnostic(Diagnostic {
+        detail: detail.map(StackStr::from_str),
+        hint: None,
+        objects,
+    });
 }
 
 /// Returns `error` after stashing its `DETAIL` line.
@@ -97,6 +190,9 @@ enum ErrorOrigin {
     Sql,
     InputExpression,
     Control(InternalControl),
+    /// A retained plan node's build did not fit `plan_build_bytes`; the
+    /// statement can still run the general executor's way.
+    PlanBuild,
 }
 
 impl PartialEq for SqlState {
@@ -164,7 +260,7 @@ impl SqlState {
     pub(crate) fn internal_control(self) -> Option<InternalControl> {
         match self.1 {
             ErrorOrigin::Control(control) => Some(control),
-            ErrorOrigin::Sql | ErrorOrigin::InputExpression => None,
+            ErrorOrigin::Sql | ErrorOrigin::InputExpression | ErrorOrigin::PlanBuild => None,
         }
     }
 
@@ -255,6 +351,19 @@ impl SqlError {
             self.sqlstate.1 = ErrorOrigin::InputExpression;
         }
         self
+    }
+
+    /// Marks a `54000` raised because a retained sort or hash table did not
+    /// fit `plan_build_bytes`.
+    pub(crate) fn plan_build_exhausted(mut self) -> Self {
+        self.sqlstate.1 = ErrorOrigin::PlanBuild;
+        self
+    }
+
+    /// Whether only a retained build's capacity stopped the statement, so
+    /// the general executor can run it instead.
+    pub(crate) fn is_plan_build_exhausted(&self) -> bool {
+        self.sqlstate.1 == ErrorOrigin::PlanBuild
     }
 }
 
@@ -434,6 +543,7 @@ pub mod sqlstate {
     pub const INVALID_CURSOR_DEFINITION: &str = "42P11";
     pub const DUPLICATE_FUNCTION: &str = "42723";
     pub const UNDEFINED_CURSOR: &str = "34000";
+    pub const INVALID_CURSOR_STATE: &str = "24000";
     pub const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
     pub const UNSAFE_NEW_ENUM_VALUE_USAGE: &str = "55P04";
     pub const AMBIGUOUS_ALIAS: &str = "42P09";
@@ -523,6 +633,7 @@ pub mod sqlstate {
     pub const EXCLUSION_VIOLATION: &str = "23P01";
     pub const DUPLICATE_PREPARED_STATEMENT: &str = "42P05";
     pub const FOREIGN_KEY_VIOLATION: &str = "23503";
+    pub const RESTRICT_VIOLATION: &str = "23001";
     pub const INVALID_FOREIGN_KEY: &str = "42830";
     pub const INVALID_PRECEDING_OR_FOLLOWING_SIZE: &str = "22013";
     pub const INVALID_RECURSION: &str = "42P19";
@@ -588,8 +699,201 @@ fn same_resolved_column<'a>(row: &impl ColumnLookup<'a>, a: &Expr, b: &Expr) -> 
     }
 }
 
+/// An enclosing row read by a query whose own values live shorter than the
+/// row's, such as a routine's variables read by a statement's derived source.
+/// Whole-row expansion allocates in the row's own arena, which a shorter
+/// query cannot supply, so it fails loudly as in any other row without it.
+pub(crate) struct EnclosingRow<'s, 'a>(pub(crate) &'s dyn ColumnLookup<'a>);
+
+impl<'b, 'a: 'b> ColumnLookup<'b> for EnclosingRow<'_, 'a> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'b>, SqlError> {
+        self.0.lookup(qualifier, name)
+    }
+
+    fn procedural_variable(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::sql::guc::VariableConflict> {
+        self.0.procedural_variable(qualifier, name)
+    }
+
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        self.0.column_type_mod(qualifier, name)
+    }
+
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.0.resolve_column_type(qualifier, name)
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.0.is_empty_scope()
+    }
+
+    fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'b>, SqlError> {
+        self.0.recursive_state(qualifier, index)
+    }
+
+    fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
+        self.0.column_identity(qualifier, name)
+    }
+
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn CatalogAccess>,
+    ) -> Option<(StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        self.0.whole_row_field_metadata(table, index, catalog)
+    }
+
+    fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        self.0.whole_row_present(table)
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        self.0.col_type(qualifier, name)
+    }
+
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        self.0.column_type_oid(qualifier, name)
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        self.0.collation(qualifier, name)
+    }
+
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
+        self.0.column_user_type(qualifier, name)
+    }
+
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.0.whole_row_is_scalar(table)
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.0.whole_row_type(table)
+    }
+}
+
+/// The routine variables of an enclosing row, as a `WITH` query sees them: a
+/// `WITH` query reads a routine's variables, as PostgreSQL's parser hook binds
+/// them, but not the columns of the query that reads it. Like
+/// [`EnclosingRow`], it serves a query whose values live shorter than the row.
+pub(crate) struct RoutineVariables<'s, 'a>(pub(crate) &'s dyn ColumnLookup<'a>);
+
+impl RoutineVariables<'_, '_> {
+    fn names(&self, qualifier: Option<&str>, name: &str) -> bool {
+        self.0.procedural_variable(qualifier, name).is_some()
+    }
+}
+
+impl<'b, 'a: 'b> ColumnLookup<'b> for RoutineVariables<'_, 'a> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'b>, SqlError> {
+        if self.names(qualifier, name) {
+            return self.0.lookup(qualifier, name);
+        }
+        Err(crate::sql::error_position::column_reference(
+            empty_scope_column_error(qualifier, name),
+            qualifier,
+            name,
+        ))
+    }
+
+    fn procedural_variable(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::sql::guc::VariableConflict> {
+        self.0.procedural_variable(qualifier, name)
+    }
+
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        if self.names(qualifier, name) {
+            self.0.column_type_mod(qualifier, name)
+        } else {
+            -1
+        }
+    }
+
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        if self.names(qualifier, name) {
+            return self.0.resolve_column_type(qualifier, name);
+        }
+        Err(crate::sql::error_position::column_reference(
+            empty_scope_column_error(qualifier, name),
+            qualifier,
+            name,
+        ))
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.0.is_empty_scope()
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        self.names(qualifier, name)
+            .then(|| self.0.col_type(qualifier, name))
+            .flatten()
+    }
+
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        self.names(qualifier, name)
+            .then(|| self.0.column_type_oid(qualifier, name))
+            .flatten()
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        if self.names(qualifier, name) {
+            self.0.collation(qualifier, name)
+        } else {
+            crate::sql::ast::Collation::None
+        }
+    }
+
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
+        self.names(qualifier, name)
+            .then(|| self.0.column_user_type(qualifier, name))
+            .flatten()
+    }
+}
+
 pub trait ColumnLookup<'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError>;
+
+    /// The `plpgsql.variable_conflict` rule of the PL/pgSQL variable this
+    /// scope or an enclosing one names `qualifier.name`, or None when no
+    /// variable answers to it. A scope that puts a relation's columns in front
+    /// of an enclosing scope asks this before letting a column win.
+    fn procedural_variable(
+        &self,
+        _qualifier: Option<&str>,
+        _name: &str,
+    ) -> Option<crate::sql::guc::VariableConflict> {
+        None
+    }
+
+    /// The current group's value of an aggregate that this scope's query, or
+    /// an enclosing one, computes for a nested subquery (`Expr::OuterAggregate`).
+    fn outer_aggregate(&self, _call: *const Expr<'_>) -> Option<Datum<'a>> {
+        None
+    }
 
     /// Declared size/precision, or the registered shape of a record column.
     fn column_type_mod(&self, _qualifier: Option<&str>, _name: &str) -> i32 {
@@ -610,7 +914,7 @@ pub trait ColumnLookup<'a> {
                     .flatten()
             })
             .ok_or_else(|| {
-                if let Some(qualifier) = qualifier
+                let error = if let Some(qualifier) = qualifier
                     && self.whole_row_type(qualifier).is_some()
                 {
                     sql_err!(
@@ -627,7 +931,8 @@ pub trait ColumnLookup<'a> {
                         "column \"{}\" does not exist",
                         name
                     )
-                }
+                };
+                crate::sql::error_position::column_reference(error, qualifier, name)
             })
     }
 
@@ -651,6 +956,18 @@ pub trait ColumnLookup<'a> {
     /// USING/NATURAL-merged column encoded as (u32::MAX, merge index).
     fn column_identity(&self, _qualifier: Option<&str>, _name: &str) -> Option<(u32, u32)> {
         None
+    }
+
+    /// Checks that `qualifier.name`, read as NULL from a row variable that
+    /// holds no value yet, is one of the fields its declared row type has.
+    fn check_unassigned_row_field(
+        &self,
+        _qualifier: &str,
+        _name: &str,
+        _catalog: Option<&dyn CatalogAccess>,
+        _arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        Ok(())
     }
 
     /// The named table's row as record fields (name + type + value), or None
@@ -804,6 +1121,13 @@ pub(crate) enum ExpressionTypeIdentity {
 }
 
 impl ExpressionTypeIdentity {
+    pub(crate) const fn known_oid(self) -> Option<i32> {
+        match self {
+            Self::Known(oid) => Some(oid),
+            Self::Unresolved => None,
+        }
+    }
+
     pub(crate) const fn record_field_oid(self) -> i32 {
         match self {
             Self::Known(oid) => oid,
@@ -1420,6 +1744,18 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
 /// A reference to a lookup is itself a lookup, so `&dyn ColumnLookup` can be
 /// passed to the generic `eval`/`where_passes` helpers.
 impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
+    fn outer_aggregate(&self, call: *const Expr<'_>) -> Option<Datum<'a>> {
+        (**self).outer_aggregate(call)
+    }
+
+    fn procedural_variable(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::sql::guc::VariableConflict> {
+        (**self).procedural_variable(qualifier, name)
+    }
+
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         (**self).column_type_mod(qualifier, name)
     }
@@ -1535,7 +1871,97 @@ pub fn qualifier_answers_target(
     }
 }
 
+/// PostgreSQL's error for `qualifier`, which names no source of a DML
+/// statement whose only source is its target: the target's own name hidden
+/// by `alias` is out of reach, with a hint naming the alias.
+pub(crate) fn unknown_target_qualifier(
+    def: crate::storage::RelationDefinition<'_>,
+    alias: Option<&str>,
+    qualifier: &str,
+) -> SqlError {
+    match alias {
+        Some(alias) if qualifier_answers_single(def, qualifier) => {
+            crate::sql::error_position::with_computed_hint(
+                sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "invalid reference to FROM-clause entry for table \"{}\"",
+                    qualifier
+                ),
+                format_args!(
+                    "Perhaps you meant to reference the table alias \"{}\".",
+                    alias
+                ),
+            )
+        }
+        _ => sql_err!(
+            sqlstate::UNDEFINED_TABLE,
+            "missing FROM-clause entry for table \"{}\"",
+            qualifier
+        ),
+    }
+}
+
 pub struct NoColumns;
+
+/// The column lookup a parameter reference skips when its variable wins: it
+/// reads as no column of that name, so the parameter branch answers.
+pub(crate) fn parameter_wins() -> SqlError {
+    sql_err!(
+        sqlstate::UNDEFINED_COLUMN,
+        "a PL/pgSQL variable takes precedence over the column"
+    )
+}
+
+/// Which meaning a name has when a relation in front of `outer` has a column
+/// of that name and a PL/pgSQL variable in `outer` may share it, as
+/// PostgreSQL's `plpgsql.variable_conflict` decides: Ok(true) for the column,
+/// Ok(false) for the variable, and PostgreSQL's ambiguity error otherwise.
+pub(crate) fn column_precedes_variable(
+    outer: Option<&dyn ColumnLookup<'_>>,
+    qualifier: Option<&str>,
+    name: &str,
+) -> Result<bool, SqlError> {
+    use crate::sql::guc::VariableConflict;
+    match outer.and_then(|outer| outer.procedural_variable(qualifier, name)) {
+        None | Some(VariableConflict::UseColumn) => Ok(true),
+        Some(VariableConflict::UseVariable) => Ok(false),
+        Some(VariableConflict::Error) => Err(ambiguous_procedural_reference(qualifier, name)),
+    }
+}
+
+/// [`column_precedes_variable`] for a lookup that cannot report an error:
+/// an ambiguous name reads as the column, and the lookup that reports errors
+/// for the same reference raises the ambiguity.
+pub(crate) fn column_precedes_variable_quietly(
+    outer: Option<&dyn ColumnLookup<'_>>,
+    qualifier: Option<&str>,
+    name: &str,
+) -> bool {
+    outer.and_then(|outer| outer.procedural_variable(qualifier, name))
+        != Some(crate::sql::guc::VariableConflict::UseVariable)
+}
+
+/// PostgreSQL's report of a name that is both a PL/pgSQL variable and a
+/// column, positioned at the reference.
+pub(crate) fn ambiguous_procedural_reference(qualifier: Option<&str>, name: &str) -> SqlError {
+    stash_diagnostic(
+        Some(StackStr::from_str(
+            "It could refer to either a PL/pgSQL variable or a table column.",
+        )),
+        None,
+    );
+    crate::sql::error_position::column_reference(
+        sql_err!(
+            sqlstate::AMBIGUOUS_COLUMN,
+            "column reference \"{}{}{}\" is ambiguous",
+            qualifier.unwrap_or(""),
+            if qualifier.is_some() { "." } else { "" },
+            name
+        ),
+        qualifier,
+        name,
+    )
+}
 
 pub(crate) fn empty_scope_column_error(qualifier: Option<&str>, name: &str) -> SqlError {
     match qualifier {
@@ -1638,6 +2064,11 @@ pub trait SequenceAccess {
         value: i64,
         is_called: bool,
     ) -> Result<i64, SqlError>;
+
+    /// False for a dry run that previews values without consuming them.
+    fn has_effects(&self) -> bool {
+        true
+    }
 }
 
 /// Reconstructs catalog definition text (index / constraint DDL) that psql's
@@ -1690,6 +2121,7 @@ pub(crate) fn sql_syntax_call_name(name: &str) -> bool {
             | "current_schema"
             | "similar to"
             | "overlaps periods"
+            | "rows not distinct"
             | "__is_json_scalar"
             | "__is_json_array"
             | "__is_json_object"
@@ -1761,6 +2193,8 @@ pub(crate) fn sql_syntax_call_name(name: &str) -> bool {
             | "__json_table_exists"
             | "__json_table_value"
             | "__jsonb_subscript_set"
+            | "__array_subscript_set"
+            | "__assign_path"
     )
 }
 
@@ -2106,6 +2540,24 @@ pub trait CatalogAccess {
     /// of first reducing it to scalar text as domains and enums require.
     fn is_composite_type_name(&self, _type_name: &str) -> bool {
         false
+    }
+    /// Orders values holding stored named composites (see
+    /// [`operators::needs_catalog_order`]); their fields come from the
+    /// catalog.
+    /// The row type OID of the table in `slot`, as a row variable declares it.
+    fn table_row_type_oid(&self, _slot: usize) -> Option<i32> {
+        None
+    }
+    fn compare_stored(
+        &self,
+        _collation: Collation,
+        _left: &Datum<'_>,
+        _right: &Datum<'_>,
+    ) -> Result<core::cmp::Ordering, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "named composite catalog access is unavailable"
+        ))
     }
     /// Compares text with a resolved database collation. A query executor must
     /// supply this for the database default; an evaluator without a catalog
@@ -2994,7 +3446,7 @@ pub trait SubqueryListProbe: 'static {
     fn probe<'a>(
         &self,
         value: Datum<'a>,
-        collations: &[Collation],
+        columns: QuantifiedColumns<'_>,
         catalog: Option<&dyn CatalogAccess>,
         arena: &'a Arena,
     ) -> Result<(bool, bool), SqlError>;
@@ -3004,10 +3456,19 @@ pub trait SubqueryListProbe: 'static {
         value: Datum<'a>,
         operator: BinaryOp,
         all: bool,
-        collations: &[Collation],
+        columns: QuantifiedColumns<'_>,
         catalog: Option<&dyn CatalogAccess>,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError>;
+}
+
+/// How a quantified subquery's operand meets each member: a `ROW(...)`
+/// operand compares field by field with a multi-column subquery, any other
+/// operand compares as one value.
+#[derive(Clone, Copy)]
+pub struct QuantifiedColumns<'c> {
+    pub row_constructor: bool,
+    pub collations: &'c [Collation],
 }
 
 /// One pre-evaluated `IN (subquery)` result.
@@ -3038,6 +3499,211 @@ pub struct SubqueryValues<'h, 'a> {
     /// all-NULL, matching PostgreSQL (which type-checks `x IN (...)` regardless
     /// of contents).
     pub lists: &'h [SubqueryList<'a>],
+    /// Subqueries run where evaluation reaches them, as PostgreSQL runs a
+    /// subplan or an initPlan: those with effects, so their calls, sequence
+    /// values and data-modifying `WITH` reads keep PostgreSQL's order, and a
+    /// query's uncorrelated scalar subqueries, so an expression no row
+    /// reaches never runs its subquery.
+    pub deferred: &'h [DeferredSubquery<'h>],
+}
+
+/// A subquery run when evaluation first reaches it. An uncorrelated one runs
+/// once per statement, like PostgreSQL's initplan, and keeps its value in
+/// retained bytes that outlive per-row memory.
+#[derive(Clone, Copy)]
+pub struct DeferredSubquery<'h> {
+    pub(crate) node: *const (),
+    pub(crate) executor: &'h dyn SubqueryExecution,
+    pub(crate) owner: &'h Arena,
+    pub(crate) cache: Option<&'h core::cell::Cell<DeferredSubqueryCache>>,
+}
+
+/// An uncorrelated deferred subquery's saved result: length-prefixed
+/// projected rows in `owner`'s retained bytes. A scalar is one row of value
+/// and witness; a list is a row of witness and NULL-seen flag, then its
+/// members in rows of at most [`LIST_CACHE_CHUNK`] values.
+#[derive(Clone, Copy, Default)]
+pub struct DeferredSubqueryCache {
+    /// The encoded result in `owner`'s persistent tail, as an address and
+    /// length; `None` until the subquery has run.
+    pub(crate) bytes: Option<(usize, usize)>,
+    pub(crate) list: bool,
+    /// A list's comparison collations in `owner`'s persistent tail, as an
+    /// address and length so the cache does not fix the hooks' lifetime.
+    collations: (usize, usize),
+    /// A list's declared column types, kept the same way.
+    column_types: (usize, usize),
+}
+
+const LIST_CACHE_CHUNK: usize = 1024;
+
+impl<'h> DeferredSubquery<'h> {
+    fn evaluate<'a>(
+        &self,
+        expression: &Expr<'a>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        row: &dyn ColumnLookup<'a>,
+        sequences: Option<&dyn SequenceAccess>,
+    ) -> Result<SubqueryResult<'a>, SqlError> {
+        if let Some(saved) = self.cache.map(core::cell::Cell::get)
+            && let Some((address, length)) = saved.bytes
+        {
+            // SAFETY: the bytes were written into `owner`'s persistent tail,
+            // which per-row rewinds and resumed attempts do not reclaim.
+            let bytes: &[u8] = unsafe { core::slice::from_raw_parts(address as *const u8, length) };
+            let bytes = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
+            // SAFETY: the collations were copied into `owner`'s persistent
+            // tail, which lives as long as `owner` is not reset.
+            let collations: &[Collation] = unsafe {
+                core::slice::from_raw_parts(
+                    saved.collations.0 as *const Collation,
+                    saved.collations.1,
+                )
+            };
+            // SAFETY: as for the collations.
+            let column_types: &[i32] = unsafe {
+                core::slice::from_raw_parts(
+                    saved.column_types.0 as *const i32,
+                    saved.column_types.1,
+                )
+            };
+            return decode_cached_subquery(
+                bytes,
+                saved.list,
+                collations,
+                column_types,
+                self.node,
+                arena,
+            );
+        }
+        let result = self.executor.evaluate(
+            expression,
+            arena,
+            params,
+            row,
+            sequences,
+            self.cache.is_some(),
+        )?;
+        if let Some(cache) = self.cache {
+            cache.set(self.save(&result)?);
+        }
+        Ok(result)
+    }
+
+    fn save(&self, result: &SubqueryResult<'_>) -> Result<DeferredSubqueryCache, SqlError> {
+        let header;
+        let (list, members, collations, column_types) = match result {
+            SubqueryResult::Scalar { value, witness } => {
+                header = [*value, *witness];
+                (false, &[][..], &[][..], &[][..])
+            }
+            SubqueryResult::List(list) => {
+                if list.probe.is_some() {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "a retained subquery list was spooled"
+                    ));
+                }
+                header = [list.witness, Datum::Bool(list.saw_null)];
+                (true, list.values, list.collations, list.column_types)
+            }
+        };
+        let mut length = 0usize;
+        for chunk in core::iter::once(&header[..]).chain(members.chunks(LIST_CACHE_CHUNK)) {
+            length += 4 + crate::sql::exec::projected_row_len(chunk)?;
+        }
+        let bytes = self
+            .owner
+            .alloc_persistent_slice_with(length, |_| 0u8)
+            .map_err(|_| arena_full())?;
+        let mut at = 0usize;
+        for chunk in core::iter::once(&header[..]).chain(members.chunks(LIST_CACHE_CHUNK)) {
+            let chunk_length = crate::sql::exec::projected_row_len(chunk)?;
+            let prefix = u32::try_from(chunk_length).map_err(|_| arena_full())?;
+            bytes[at..at + 4].copy_from_slice(&prefix.to_le_bytes());
+            at += 4;
+            crate::sql::exec::encode_projected_into(chunk, &mut bytes[at..at + chunk_length])?;
+            at += chunk_length;
+        }
+        let collations = self
+            .owner
+            .alloc_persistent_slice_with(collations.len(), |index| collations[index])
+            .map_err(|_| arena_full())?;
+        let column_types = self
+            .owner
+            .alloc_persistent_slice_with(column_types.len(), |index| column_types[index])
+            .map_err(|_| arena_full())?;
+        Ok(DeferredSubqueryCache {
+            bytes: Some((bytes.as_ptr() as usize, bytes.len())),
+            list,
+            collations: (collations.as_ptr() as usize, collations.len()),
+            column_types: (column_types.as_ptr() as usize, column_types.len()),
+        })
+    }
+}
+
+fn decode_cached_subquery<'a>(
+    bytes: &'a [u8],
+    list: bool,
+    collations: &[Collation],
+    column_types: &[i32],
+    node: *const (),
+    arena: &'a Arena,
+) -> Result<SubqueryResult<'a>, SqlError> {
+    let corrupt = || {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "retained subquery result is corrupt"
+        )
+    };
+    /// One length-prefixed chunk and the bytes after it.
+    type Chunk<'b> = Option<(&'b [u8], &'b [u8])>;
+    let split = |rest: &'a [u8]| -> Result<Chunk<'a>, SqlError> {
+        let Some(prefix) = rest.get(..4) else {
+            return Ok(None);
+        };
+        let length = u32::from_le_bytes(prefix.try_into().map_err(|_| corrupt())?) as usize;
+        let chunk = rest.get(4..4 + length).ok_or_else(corrupt)?;
+        Ok(Some((chunk, &rest[4 + length..])))
+    };
+    let (header, members) = split(bytes)?.ok_or_else(corrupt)?;
+    let first = crate::sql::exec::decode_projected_col_record(header, 0, arena)?;
+    let second = crate::sql::exec::decode_projected_col_record(header, 1, arena)?;
+    if !list {
+        return Ok(SubqueryResult::Scalar {
+            value: first,
+            witness: second,
+        });
+    }
+    let mut count = 0usize;
+    let mut rest = members;
+    while let Some((chunk, next)) = split(rest)? {
+        count += crate::sql::exec::projected_row_width(chunk);
+        rest = next;
+    }
+    let values = arena
+        .alloc_slice_with(count, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    let mut filled = 0usize;
+    let mut rest = members;
+    while let Some((chunk, next)) = split(rest)? {
+        filled += crate::sql::exec::decode_projected_row_into(chunk, arena, &mut values[filled..])?;
+        rest = next;
+    }
+    Ok(SubqueryResult::List(SubqueryList {
+        node,
+        values,
+        probe: None,
+        saw_null: matches!(second, Datum::Bool(true)),
+        witness: first,
+        column_types: arena
+            .alloc_slice_copy(column_types)
+            .map_err(|_| arena_full())?,
+        collations: arena
+            .alloc_slice_copy(collations)
+            .map_err(|_| arena_full())?,
+    }))
 }
 
 pub enum SubqueryResult<'a> {
@@ -3051,6 +3717,8 @@ pub enum SubqueryResult<'a> {
 /// Runs one reached subquery. Returned values own arena-backed bytes or borrow
 /// static data; they never retain the executor's storage or outer-row borrow.
 pub trait SubqueryExecution {
+    /// `retained` asks for a result that can be saved past this row: a list
+    /// is gathered in memory rather than spooled.
     fn evaluate<'a>(
         &self,
         expression: &Expr<'a>,
@@ -3058,6 +3726,7 @@ pub trait SubqueryExecution {
         params: &[Datum<'a>],
         outer: &dyn ColumnLookup<'a>,
         sequences: Option<&dyn SequenceAccess>,
+        retained: bool,
     ) -> Result<SubqueryResult<'a>, SqlError>;
 }
 
@@ -3368,6 +4037,7 @@ fn fold_check<'a>(
         | Expr::SchemaColumn { .. }
         | Expr::RecursiveState { .. }
         | Expr::Param(_)
+        | Expr::OuterAggregate { .. }
         | Expr::DefaultMarker => Ok(None),
         // Boolean connectives short-circuit like PostgreSQL's folding: a FALSE
         // (AND) / TRUE (OR) operand settles the result and drops the sibling,
@@ -3873,7 +4543,7 @@ fn eval_binary_expression<'a>(
             expression.right,
             row,
             hooks.catalog,
-        )?)
+        ))
     } else {
         None
     };
@@ -3887,6 +4557,66 @@ fn eval_binary_expression<'a>(
         hooks,
         arena,
     )?;
+    // PostgreSQL's strict comparison functions are not called with a NULL
+    // input, so an indeterminate collation is reported only for two values.
+    let comparison_collation = match comparison_collation {
+        Some(Err(error))
+            if error.sqlstate == sqlstate::INDETERMINATE_COLLATION
+                && (left.is_null() || right.is_null()) =>
+        {
+            Some(crate::sql::ast::Collation::None)
+        }
+        Some(resolved) => Some(resolved?),
+        None => None,
+    };
+    if expression.left.is_row_constructor()
+        && expression.right.is_row_constructor()
+        && comparison_collation.is_some()
+        && let (Datum::Record(a), Datum::Record(b)) = (&left, &right)
+    {
+        // An untyped literal field takes the type of the field it is
+        // compared with, as PostgreSQL resolves it, and reports invalid input.
+        if let (
+            Expr::Call {
+                args: left_args, ..
+            },
+            Expr::Call {
+                args: right_args, ..
+            },
+        ) = (expression.left, expression.right)
+            && left_args.len() == a.len()
+            && right_args.len() == b.len()
+            && (0..a.len()).any(|field| {
+                is_unknown_literal(left_args[field]) != is_unknown_literal(right_args[field])
+            })
+        {
+            let fields = |values: &[RecordField<'a>]| {
+                arena
+                    .alloc_slice_with(values.len(), |field| values[field])
+                    .map_err(|_| arena_full())
+            };
+            let (a, b) = (fields(a)?, fields(b)?);
+            for field in 0..a.len() {
+                let (left_unknown, right_unknown) = (
+                    is_unknown_literal(left_args[field]),
+                    is_unknown_literal(right_args[field]),
+                );
+                if left_unknown && !right_unknown && !b[field].value.is_null() {
+                    a[field].value = operators::coerce_unknown(a[field].value, &b[field].value)
+                        .map_err(|error| {
+                            crate::sql::error_position::at_expression(error, left_args[field])
+                        })?;
+                } else if right_unknown && !left_unknown && !a[field].value.is_null() {
+                    b[field].value = operators::coerce_unknown(b[field].value, &a[field].value)
+                        .map_err(|error| {
+                            crate::sql::error_position::at_expression(error, right_args[field])
+                        })?;
+                }
+            }
+            return operators::row_constructor_compare(expression.operator, a, b, hooks.catalog);
+        }
+        return operators::row_constructor_compare(expression.operator, a, b, hooks.catalog);
+    }
     Ok(eval_binary_values(
         expression,
         left,
@@ -4102,7 +4832,11 @@ pub(crate) fn require_node_builtin_execute<'a>(
             let target = ColType::from_sql_name(type_name)
                 .map(ColType::oid)
                 .or_else(|| catalog.user_type_oid(type_name));
-            if let Some(target) = target {
+            // An empty `ARRAY[]` takes the target type itself; no cast
+            // function runs.
+            if let Some(target) = target
+                && !matches!(operand, Expr::Array([]))
+            {
                 let source = expression_type_identity(operand, row, hooks)?.routine_argument_oid();
                 require_builtin_cast_execute(catalog, base(source), base(target), *type_mod)?;
             }
@@ -4316,6 +5050,26 @@ fn require_builtin_subquery_operator_execute<'a>(
     if !catalog.builtin_routine_privileges_present() {
         return Ok(());
     }
+    // A row operand compares column by column with the subquery's output.
+    if let Some(fields) = row_constructor_fields(operand) {
+        let base = Expr::RowSubquery {
+            select,
+            arity: u8::try_from(fields.len()).unwrap_or(u8::MAX),
+        };
+        for (index, field) in fields.iter().enumerate() {
+            let column = Expr::RecordFieldIndex {
+                base: &base,
+                index: u16::try_from(index).unwrap_or(u16::MAX),
+            };
+            let left = operator_input_type(field, row, hooks, catalog)?;
+            let Some(right) = catalog.subquery_type(&column, row)? else {
+                continue;
+            };
+            let right = catalog.domain_base_type(right).map_or(right, ColType::oid);
+            require_builtin_operator_types_execute(catalog, name, Some(left), right)?;
+        }
+        return Ok(());
+    }
     let left = operator_input_type(operand, row, hooks, catalog)?;
     let Some(right) = catalog.subquery_type(&Expr::Subquery(select), row)? else {
         return Ok(());
@@ -4368,6 +5122,20 @@ fn require_builtin_cast_execute(
     result
 }
 
+/// The type name a record comparison error reports for a field type.
+fn record_field_type_name(
+    type_oid: i32,
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &Arena,
+) -> Result<crate::util::StackStr<260>, SqlError> {
+    if let Some(catalog) = catalog
+        && let Some(name) = catalog.type_name(type_oid, arena)?
+    {
+        return Ok(crate::util::StackStr::from_str(name));
+    }
+    operators::builtin_record_field_type_name(type_oid)
+}
+
 fn eval_binary_values<'a>(
     expression: BinaryExpression<'_, 'a>,
     mut l: Datum<'a>,
@@ -4392,17 +5160,24 @@ fn eval_binary_values<'a>(
     {
         let left_oid = expression_type_identity(left, row, hooks)?.routine_argument_oid();
         let right_oid = expression_type_identity(right, row, hooks)?.routine_argument_oid();
-        if let Some(value) = catalog.call_operator(
-            name,
-            [l, r],
-            [left_oid, right_oid],
-            routine_input_collation(&[left, right], row, hooks.catalog)?,
-            [
-                coercion_input_collation(left, row, hooks.catalog)?,
-                coercion_input_collation(right, row, hooks.catalog)?,
-            ],
-            nulls,
-            arena,
+        let input_collation = routine_input_collation(&[left, right], row, hooks.catalog)?;
+        let argument_collations = [
+            coercion_input_collation(left, row, hooks.catalog)?,
+            coercion_input_collation(right, row, hooks.catalog)?,
+        ];
+        if let Some(value) = crate::sql::query::with_call_arguments(
+            left.folds_to_constant() && right.folds_to_constant(),
+            || {
+                catalog.call_operator(
+                    name,
+                    [l, r],
+                    [left_oid, right_oid],
+                    input_collation,
+                    argument_collations,
+                    nulls,
+                    arena,
+                )
+            },
         )? {
             return Ok(value);
         }
@@ -4418,7 +5193,20 @@ fn eval_binary_values<'a>(
         row,
         hooks,
     )?;
-    if comparison_collation.is_some() {
+    // A number or boolean is never an enum's value, so neither operand's
+    // declared type can be an enum or a domain over one.
+    let not_enum = |value: &Datum<'_>| {
+        matches!(
+            value,
+            Datum::Bool(_)
+                | Datum::Int2(_)
+                | Datum::Int4(_)
+                | Datum::Int8(_)
+                | Datum::Float4(_)
+                | Datum::Float8(_)
+        )
+    };
+    if comparison_collation.is_some() && !(not_enum(&l) && not_enum(&r)) {
         validate_enum_operator_types(operator, left, right, row, hooks, arena)?;
     }
     if nulls == OperatorNulls::ReturnNull {
@@ -4457,6 +5245,32 @@ fn eval_binary_values<'a>(
                 _ => cast_to(r, target, arena)?,
             };
         }
+    }
+    if operator == BinaryOp::Concat {
+        // A named composite appended to or prepended onto an array of its
+        // type enters the array in its durable form.
+        let durable = |value: Datum<'a>, array: &Datum<'a>| -> Result<Datum<'a>, SqlError> {
+            match (array, value) {
+                (
+                    Datum::Array {
+                        element: super::types::ArrElem::Composite(Some(slot)),
+                        ..
+                    },
+                    Datum::Composite { .. },
+                ) => hooks
+                    .catalog
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "named composite catalog access is unavailable"
+                        )
+                    })?
+                    .composite_array_element(value, *slot, arena),
+                _ => Ok(value),
+            }
+        };
+        l = durable(l, &r)?;
+        r = durable(r, &l)?;
     }
     if operator == BinaryOp::Concat
         && let Some(value) = array_null_concat(l, r, left, right, row, arena)?
@@ -4515,6 +5329,39 @@ fn eval_binary_values<'a>(
         )?;
         return Ok(OperatorEvaluation {
             value,
+            first_argument: l,
+        });
+    }
+    if matches!(
+        operator,
+        BinaryOp::Contains | BinaryOp::ContainedBy | BinaryOp::Overlaps
+    ) && matches!((&l, &r), (Datum::Array { .. }, Datum::Array { .. }))
+        && operators::needs_catalog_order(&l, &r)
+    {
+        return Ok(OperatorEvaluation {
+            value: operators::array_set_op(operator, l, r, hooks.catalog)?,
+            first_argument: l,
+        });
+    }
+    if let Some(comparison) = comparison
+        && operators::needs_catalog_order(&l, &r)
+    {
+        let collation = comparison_collation.unwrap_or(Collation::Default);
+        let ordering = compare_datums_with_catalog(collation, hooks.catalog, &l, &r)?;
+        return Ok(OperatorEvaluation {
+            value: Datum::Bool(comparison.holds(ordering)),
+            first_argument: l,
+        });
+    }
+    if comparison.is_some()
+        && let (
+            Datum::Record(a) | Datum::Composite { fields: a, .. },
+            Datum::Record(b) | Datum::Composite { fields: b, .. },
+        ) = (&l, &r)
+    {
+        let type_name = |type_oid| record_field_type_name(type_oid, hooks.catalog, arena);
+        return Ok(OperatorEvaluation {
+            value: operators::record_compare(operator, a, b, &type_name)?,
             first_argument: l,
         });
     }
@@ -4641,7 +5488,13 @@ pub(crate) fn routine_input_handoff(
                     schema == Some("pg_catalog")
                         && catalog.is_none_or(|catalog| !catalog.has_operator_candidate(symbol))
                 });
+            // A builtin aggregate folds in the executor and runs no routine
+            // body; its arguments may still call one.
+            let builtin_aggregate = expression.is_aggregate_use()
+                && bound_oid.is_none()
+                && catalog.is_none_or(|catalog| !catalog.has_routine_candidate(name, args.len()));
             if !builtin_operator
+                && !builtin_aggregate
                 && (bound_oid.is_some()
                     || catalog
                         .is_some_and(|catalog| catalog.has_routine_candidate(name, args.len()))
@@ -4687,6 +5540,341 @@ pub(crate) fn routine_input_handoff(
 }
 
 pub fn eval_full<'a>(
+    expression: &Expr<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    eval_full_unpositioned(expression, arena, params, row, hooks).map_err(|error| {
+        let error = complete_function_mismatch(error, expression, row, hooks);
+        crate::sql::error_position::expression_error(error, expression)
+    })
+}
+
+/// Completes the signature of a [`function_argument_mismatch`] raised by a
+/// call with several arguments, naming every argument's type as PostgreSQL's
+/// `function f(type, ...) does not exist` does.
+fn complete_function_mismatch<'a>(
+    error: SqlError,
+    expression: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> SqlError {
+    let type_of = |argument: &Expr<'a>| match argument {
+        Expr::Str(_) | Expr::Null => "unknown",
+        argument => match expression_type_identity(argument, row, hooks) {
+            Ok(ExpressionTypeIdentity::Known(oid)) => ColType::from_oid(oid).map(ColType::name),
+            _ => None,
+        }
+        .or_else(|| static_type(argument, row).map(ColType::name))
+        .unwrap_or("unknown"),
+    };
+    // An operand check names one type, or the lookup only the symbol; PostgreSQL
+    // names the operator with every operand type.
+    let operator = match expression {
+        Expr::Binary {
+            operator,
+            left,
+            right,
+            ..
+        } => operator
+            .operator_name()
+            .map(|symbol| (symbol, Some(*left), *right)),
+        Expr::Unary {
+            operator, operand, ..
+        } => match operator {
+            UnaryOp::Neg => Some("-"),
+            UnaryOp::BitNot => Some("~"),
+            UnaryOp::SquareRoot => Some("|/"),
+            UnaryOp::CubeRoot => Some("||/"),
+            UnaryOp::AbsoluteValue => Some("@"),
+            UnaryOp::TextSearchNot => Some("!!"),
+            UnaryOp::Not => None,
+        }
+        .map(|symbol| (symbol, None, *operand)),
+        Expr::Call { name, args, .. } => match (super::ast::catalog_operator_call(name), args) {
+            (Some((_, symbol)), [left, right]) => Some((symbol, Some(*left), *right)),
+            (Some((_, symbol)), [operand]) => Some((symbol, None, *operand)),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some((symbol, left, right)) = operator {
+        let named = error
+            .message
+            .as_str()
+            .strip_prefix("operator does not exist: ")
+            .filter(|_| error.sqlstate == sqlstate::UNDEFINED_FUNCTION);
+        let left_type = left.map(type_of);
+        let right_type = type_of(right);
+        if let Some(named) = named
+            && (named == symbol || Some(named) == left_type || named == right_type)
+        {
+            return match left_type {
+                Some(left_type) => sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "operator does not exist: {} {} {}",
+                    left_type,
+                    symbol,
+                    right_type
+                ),
+                None => sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "operator does not exist: {} {}",
+                    symbol,
+                    right_type
+                ),
+            };
+        }
+        return error;
+    }
+    let Expr::Call { name, args, .. } = expression else {
+        return error;
+    };
+    if error.sqlstate != sqlstate::UNDEFINED_FUNCTION || args.len() == 1 {
+        return error;
+    }
+    let message = error.message.as_str();
+    let single_type = message
+        .strip_prefix("function ")
+        .and_then(|rest| rest.strip_prefix(*name))
+        .and_then(|rest| rest.strip_prefix('('))
+        .and_then(|rest| rest.strip_suffix(") does not exist"));
+    if single_type.is_none_or(|types| types.contains(", ")) {
+        return error;
+    }
+    crate::sql::error_position::full_message_error(sqlstate::UNDEFINED_FUNCTION, |text| {
+        let _ = write!(text, "function {name}(");
+        for (index, argument) in args.iter().enumerate() {
+            if index != 0 {
+                let _ = text.write_str(", ");
+            }
+            let _ = text.write_str(type_of(argument));
+        }
+        let _ = text.write_str(") does not exist");
+        Ok(())
+    })
+}
+
+/// A function argument of a type no overload of `name` accepts: PostgreSQL's
+/// `function name(type) does not exist`, completed with every argument's
+/// type when the call has several.
+pub(crate) fn function_argument_mismatch(name: &str, value: &Datum) -> SqlError {
+    sql_err!(
+        sqlstate::UNDEFINED_FUNCTION,
+        "function {}({}) does not exist",
+        name,
+        type_name_of(value)
+    )
+}
+
+/// PostgreSQL's 42883 for an operator no overload of which takes `operand`;
+/// the operator's expression completes the message with its symbol and
+/// every operand's type.
+pub(crate) fn operand_type_mismatch(operand: &Datum) -> SqlError {
+    sql_err!(
+        sqlstate::UNDEFINED_FUNCTION,
+        "operator does not exist: {}",
+        type_name_of(operand)
+    )
+}
+
+/// PostgreSQL's 42804 for a SQL construct's argument of the wrong type.
+pub(crate) fn argument_type_mismatch(construct: &str, expected: &str, value: &Datum) -> SqlError {
+    sql_err!(
+        sqlstate::DATATYPE_MISMATCH,
+        "argument of {} must be type {}, not type {}",
+        construct,
+        expected,
+        type_name_of(value)
+    )
+}
+
+/// One subscript of an array reference: a bound is absent when omitted and
+/// `None` inside when its value is NULL.
+#[derive(Clone, Copy)]
+struct ReadSubscript {
+    lower: Option<Option<i64>>,
+    upper: Option<Option<i64>>,
+    slice: bool,
+}
+
+/// Evaluates a subscript list on an array-typed value the way PostgreSQL
+/// does: the whole list addresses one element, or, when any subscript is a
+/// slice, one slice in which a plain `[i]` means `[1:i]`. Returns `None` for
+/// a base that is not statically an array, which subscripts one at a time.
+fn array_subscripts<'a>(
+    expression: &Expr<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Option<Datum<'a>>, SqlError> {
+    const MAX_DIMENSIONS: usize = 6;
+    let mut chain = [None::<&Expr<'a>>; MAX_DIMENSIONS + 1];
+    let mut count = 0;
+    let mut base = expression;
+    while let Expr::Subscript { base: inner, .. } | Expr::Slice { base: inner, .. } = base {
+        if count == chain.len() {
+            return Ok(None);
+        }
+        chain[count] = Some(base);
+        count += 1;
+        base = inner;
+    }
+    if !matches!(static_type(base, row), Some(ColType::Array(_))) {
+        return Ok(None);
+    }
+    let value = eval_full(base, arena, params, row, hooks)?;
+    let bound = |bound: &Expr<'a>| -> Result<Option<i64>, SqlError> {
+        match eval_full(bound, arena, params, row, hooks)? {
+            Datum::Int2(value) => Ok(Some(i64::from(value))),
+            Datum::Int4(value) => Ok(Some(i64::from(value))),
+            Datum::Int8(value) => Ok(Some(value)),
+            Datum::Null => Ok(None),
+            _ => Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "array subscript must have type integer"
+            )),
+        }
+    };
+    // The chain runs outermost first; subscripts apply innermost first.
+    let mut subscripts = [ReadSubscript {
+        lower: None,
+        upper: None,
+        slice: false,
+    }; MAX_DIMENSIONS + 1];
+    for (slot, node) in subscripts
+        .iter_mut()
+        .zip(chain[..count].iter().rev().flatten())
+    {
+        *slot = match node {
+            Expr::Subscript { index, .. } => ReadSubscript {
+                lower: None,
+                upper: Some(bound(index)?),
+                slice: false,
+            },
+            Expr::Slice { lower, upper, .. } => ReadSubscript {
+                lower: lower.map(bound).transpose()?,
+                upper: upper.map(bound).transpose()?,
+                slice: true,
+            },
+            _ => unreachable!("the chain holds subscripts"),
+        };
+    }
+    let subscripts = &subscripts[..count];
+    let Datum::Array { element, raw } = value else {
+        return Ok(Some(Datum::Null));
+    };
+    let any_null = subscripts
+        .iter()
+        .any(|subscript| subscript.lower == Some(None) || subscript.upper == Some(None));
+    if any_null {
+        return Ok(Some(Datum::Null));
+    }
+    let shape = super::array::shape(raw).expect("array datum invariant");
+    let dimensions = shape.dimension_count();
+    let empty = || Datum::Array {
+        element,
+        raw: super::array::EMPTY,
+    };
+    if !subscripts.iter().any(|subscript| subscript.slice) {
+        if dimensions == 0 || dimensions != subscripts.len() {
+            return Ok(Some(Datum::Null));
+        }
+        let mut offset = 0usize;
+        for (dimension, subscript) in subscripts.iter().enumerate() {
+            let position = subscript
+                .upper
+                .flatten()
+                .expect("element subscripts are set");
+            let lower = i64::from(shape.lower_bound(dimension).expect("in range"));
+            let upper = i64::from(shape.upper_bound(dimension).expect("in range"));
+            if position < lower || position > upper {
+                return Ok(Some(Datum::Null));
+            }
+            offset = offset * shape.dimension(dimension).expect("in range")
+                + (position - lower) as usize;
+        }
+        return Ok(super::array::get(raw, element, offset));
+    }
+    if dimensions == 0 || subscripts.len() > dimensions {
+        return Ok(Some(empty()));
+    }
+    let mut lower = [0i64; MAX_DIMENSIONS];
+    let mut upper = [0i64; MAX_DIMENSIONS];
+    for dimension in 0..dimensions {
+        let current_lower = i64::from(shape.lower_bound(dimension).expect("in range"));
+        let current_upper = i64::from(shape.upper_bound(dimension).expect("in range"));
+        let (given_lower, given_upper) = match subscripts.get(dimension) {
+            Some(ReadSubscript {
+                upper,
+                slice: false,
+                ..
+            }) => (Some(1), upper.flatten()),
+            Some(ReadSubscript { lower, upper, .. }) => (lower.flatten(), upper.flatten()),
+            None => (None, None),
+        };
+        lower[dimension] = given_lower.unwrap_or(current_lower).max(current_lower);
+        upper[dimension] = given_upper.unwrap_or(current_upper).min(current_upper);
+        if lower[dimension] > upper[dimension] {
+            return Ok(Some(empty()));
+        }
+    }
+    let mut lengths = [0usize; MAX_DIMENSIONS];
+    let ones = [1i32; MAX_DIMENSIONS];
+    for dimension in 0..dimensions {
+        lengths[dimension] = (upper[dimension] - lower[dimension] + 1) as usize;
+    }
+    let result = super::array::Shape::new(&lengths[..dimensions], &ones[..dimensions])?;
+    let items = super::array::alloc_items(arena, result.element_count())?;
+    let mut position = [0i64; MAX_DIMENSIONS];
+    position[..dimensions].copy_from_slice(&lower[..dimensions]);
+    for item in items.iter_mut() {
+        let mut offset = 0usize;
+        for (dimension, at) in position.iter().enumerate().take(dimensions) {
+            let current_lower = i64::from(shape.lower_bound(dimension).expect("in range"));
+            offset = offset * shape.dimension(dimension).expect("in range")
+                + (at - current_lower) as usize;
+        }
+        *item = super::array::get(raw, element, offset).expect("slice within bounds");
+        for dimension in (0..dimensions).rev() {
+            if position[dimension] < upper[dimension] {
+                position[dimension] += 1;
+                break;
+            }
+            position[dimension] = lower[dimension];
+        }
+    }
+    Ok(Some(Datum::Array {
+        element,
+        raw: super::array::build_shaped(items, result, arena)?,
+    }))
+}
+
+/// PostgreSQL's 42804 for a jsonb subscript of a type it cannot coerce.
+fn jsonb_subscript_mismatch(value: &Datum) -> SqlError {
+    crate::sql::error_position::with_hint(
+        sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "subscript type {} is not supported",
+            type_name_of(value)
+        ),
+        "jsonb subscript must be coercible to either integer or text.",
+    )
+}
+
+/// PostgreSQL's 42804 for subscripting a value whose type has no subscripts.
+pub(crate) fn not_subscriptable(value: &Datum) -> SqlError {
+    sql_err!(
+        sqlstate::DATATYPE_MISMATCH,
+        "cannot subscript type {} because it does not support subscripting",
+        type_name_of(value)
+    )
+}
+
+fn eval_full_unpositioned<'a>(
     expression: &Expr<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -4878,6 +6066,51 @@ fn eval_full_inner<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
+    if let Some(deferred) = hooks.subs.and_then(|subs| {
+        subs.deferred
+            .iter()
+            .find(|deferred| core::ptr::eq(deferred.node, (expression as *const Expr).cast()))
+    }) && hooks.subs.is_some_and(|subs| {
+        !subs
+            .scalars
+            .iter()
+            .any(|(node, _, _)| core::ptr::eq(*node, expression))
+    }) {
+        let result = deferred.evaluate(expression, arena, params, row, hooks.sequences)?;
+        let scalars;
+        let lists;
+        let values = match result {
+            SubqueryResult::Scalar { value, witness } => {
+                scalars = [(expression as *const Expr, value, witness)];
+                SubqueryValues {
+                    scalars: &scalars,
+                    lists: &[],
+                    deferred: &[],
+                }
+            }
+            SubqueryResult::List(list) => {
+                lists = [SubqueryList {
+                    node: (expression as *const Expr).cast(),
+                    ..list
+                }];
+                SubqueryValues {
+                    scalars: &[],
+                    lists: &lists,
+                    deferred: &[],
+                }
+            }
+        };
+        return eval_full_inner(
+            expression,
+            arena,
+            params,
+            row,
+            &EvalHooks {
+                subs: Some(&values),
+                ..*hooks
+            },
+        );
+    }
     if let Some(executor) = hooks.subquery_executor
         && matches!(
             expression,
@@ -4899,7 +6132,7 @@ fn eval_full_inner<'a>(
                     .any(|list| core::ptr::eq(list.node, (expression as *const Expr).cast()))
         })
     {
-        let result = executor.evaluate(expression, arena, params, row, hooks.sequences)?;
+        let result = executor.evaluate(expression, arena, params, row, hooks.sequences, false)?;
         let mut scalars = [(expression as *const Expr, Datum::Null, Datum::Null)];
         let mut lists = [SubqueryList {
             node: core::ptr::null(),
@@ -4917,6 +6150,7 @@ fn eval_full_inner<'a>(
                 SubqueryValues {
                     scalars: &scalars,
                     lists: &[],
+                    deferred: &[],
                 }
             }
             SubqueryResult::List(list) => {
@@ -4927,6 +6161,7 @@ fn eval_full_inner<'a>(
                 SubqueryValues {
                     scalars: &[],
                     lists: &lists,
+                    deferred: &[],
                 }
             }
         };
@@ -5016,6 +6251,10 @@ fn eval_full_inner<'a>(
             varying: false,
         }),
         Expr::Column { qualifier, name } => match row.lookup(qualifier, name) {
+            Ok(Datum::Null) if let Some(qualifier) = qualifier => {
+                row.check_unassigned_row_field(qualifier, name, hooks.catalog, arena)?;
+                Ok(Datum::Null)
+            }
             Ok(v) => materialize_named_composite(v, hooks, arena),
             // A bare name that is not a column but names a FROM item is a
             // whole-row reference (`SELECT t FROM t`, `row_to_json(r)`).
@@ -5026,24 +6265,27 @@ fn eval_full_inner<'a>(
                     }
                     Ok(Some(fields)) => Ok(whole_row_value(row, hooks.catalog, name, fields)),
                     Ok(None) => Ok(Datum::Null),
-                    Err(_) => Err(e),
+                    Err(_) => Err(crate::sql::error_position::column_reference(
+                        e, qualifier, name,
+                    )),
                 }
             }
-            Err(e) => Err(e),
+            Err(e) => Err(crate::sql::error_position::column_reference(
+                e, qualifier, name,
+            )),
         },
         Expr::RoutineParam {
             qualifier,
             name,
             index,
             source,
-        } => match row.lookup(qualifier, name) {
-            Ok(_) if source == crate::sql::ast::ParameterSource::PlpgsqlCursor => Err(sql_err!(
-                sqlstate::AMBIGUOUS_COLUMN,
-                "column reference \"{}{}{}\" is ambiguous",
-                qualifier.unwrap_or(""),
-                if qualifier.is_some() { "." } else { "" },
-                name
-            )),
+        } => match match source.collision() {
+            crate::sql::ast::ParameterCollision::Parameter => Err(parameter_wins()),
+            _ => row.lookup(qualifier, name),
+        } {
+            Ok(_) if source.collision() == crate::sql::ast::ParameterCollision::Ambiguous => {
+                Err(ambiguous_procedural_reference(qualifier, name))
+            }
             Ok(value) => materialize_named_composite(value, hooks, arena),
             Err(error)
                 if error.sqlstate == sqlstate::UNDEFINED_COLUMN
@@ -5076,8 +6318,11 @@ fn eval_full_inner<'a>(
             table,
             name,
         } => {
+            // PostgreSQL positions a three-part reference at its start.
+            let positioned =
+                |error| crate::sql::error_position::column_reference(error, Some(schema), name);
             if row.is_empty_scope() {
-                return Err(empty_scope_column_error(Some(table), name));
+                return Err(positioned(empty_scope_column_error(Some(table), name)));
             }
             // A three-part reference resolves through a composed
             // `schema.table` qualifier: only an unaliased FROM entry whose
@@ -5087,12 +6332,25 @@ fn eval_full_inner<'a>(
             let composed = arena
                 .alloc_str(crate::stack_format!(130, "{}.{}", schema, table).as_str())
                 .map_err(|_| arena_full())?;
-            let value = row.lookup(Some(composed), name)?;
+            let value = row.lookup(Some(composed), name).map_err(positioned)?;
             materialize_named_composite(value, hooks, arena)
         }
         Expr::RecursiveState {
             qualifier, index, ..
         } => row.recursive_state(qualifier, index as usize),
+        Expr::OuterAggregate { call, .. } => {
+            let value = row.outer_aggregate(call).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "outer-level aggregate is evaluated outside its query's groups"
+                )
+            })?;
+            materialize_enum_values(
+                materialize_acl_value(value, hooks, arena)?,
+                hooks.catalog,
+                arena,
+            )
+        }
         Expr::Param(n) => params.get(n as usize - 1).copied().ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_PARAMETER,
@@ -5118,7 +6376,13 @@ fn eval_full_inner<'a>(
                 );
             }
             let v = eval_full(operand, arena, params, row, hooks)?;
-            unary(operator, v, arena)
+            unary(operator, v, arena).map_err(|error| {
+                if operator == UnaryOp::Not && error.sqlstate == sqlstate::DATATYPE_MISMATCH {
+                    crate::sql::error_position::at_expression(error, operand)
+                } else {
+                    error
+                }
+            })
         }
         Expr::Binary {
             operator: BinaryOp::And,
@@ -5645,7 +6909,19 @@ fn eval_full_inner<'a>(
                             return Ok(Datum::Bool(!negated));
                         }
                     }
-                    _ => match membership_eq(&l, &r)? {
+                    // `(a, b) IN ((c, d), ...)` compares each row constructor
+                    // field by field; any other member compares as a value.
+                    (Datum::Record(a), Datum::Record(b))
+                        if operand.is_row_constructor() && item.is_row_constructor() =>
+                    {
+                        match operators::row_constructor_compare(BinaryOp::Eq, a, b, hooks.catalog)?
+                        {
+                            Datum::Bool(true) => return Ok(Datum::Bool(!negated)),
+                            Datum::Bool(_) => {}
+                            _ => saw_null = true,
+                        }
+                    }
+                    _ => match membership_eq(&l, &r, hooks.catalog)? {
                         Some(true) => return Ok(Datum::Bool(!negated)),
                         Some(false) => {}
                         None => saw_null = true,
@@ -5820,7 +7096,10 @@ fn eval_full_inner<'a>(
                             boolean_argument(
                                 eval_full(cond, arena, params, row, hooks)?,
                                 "CASE/WHEN"
-                            )?,
+                            )
+                            .map_err(|error| {
+                                crate::sql::error_position::at_expression(error, cond)
+                            })?,
                             Datum::Bool(true)
                         ),
                     };
@@ -5840,7 +7119,7 @@ fn eval_full_inner<'a>(
         }
         Expr::DefaultMarker => Err(sql_err!(
             sqlstate::SYNTAX_ERROR,
-            "DEFAULT is only allowed as a DML assignment value"
+            "DEFAULT is not allowed in this context"
         )),
         Expr::Subquery(_) | Expr::RowSubquery { .. } | Expr::ArraySubquery(_) => {
             if let Some(subs) = hooks.subs {
@@ -5891,8 +7170,31 @@ fn eval_full_inner<'a>(
             // type-checks `x IN (...)` regardless of the set's contents, so a
             // string literal that cannot become the column type errors even
             // against an empty or all-NULL set.
-            let v = eval_full(operand, arena, params, row, hooks)?;
+            let v = single_column_row_constructor(
+                operand,
+                eval_full(operand, arena, params, row, hooks)?,
+            );
             let v = coerce_unknown(v, &witness)?;
+            // Resolve `=` against a single-column subquery's declared output
+            // type even when it is empty or yields only NULLs, as PostgreSQL
+            // does while analysing the query.
+            // A record compares with `record_eq`, whose field types are
+            // checked against each member below; a named composite's type
+            // witness carries no fields.
+            let record =
+                |value: &Datum<'_>| matches!(value, Datum::Record(_) | Datum::Composite { .. });
+            if !v.is_null() && !witness.is_null() && !record(&v) && !record(&witness) {
+                quantified_comparison(
+                    BinaryOp::Eq,
+                    v,
+                    witness,
+                    operand.is_row_constructor(),
+                    collations,
+                    hooks.catalog,
+                    arena,
+                )
+                .map_err(|error| crate::sql::error_position::operator_at_node(error, expression))?;
+            }
             // A bit string is comparable only to another bit string; reject a
             // bit-vs-other membership test up front (PostgreSQL type-checks the
             // operand against the column type even over an empty set).
@@ -5927,7 +7229,15 @@ fn eval_full_inner<'a>(
                 }
                 let l = coerce_unknown(v, member)?;
                 let r = coerce_unknown(*member, &l)?;
-                match quantified_comparison(BinaryOp::Eq, l, r, collations, hooks.catalog, arena)? {
+                match quantified_comparison(
+                    BinaryOp::Eq,
+                    l,
+                    r,
+                    operand.is_row_constructor(),
+                    collations,
+                    hooks.catalog,
+                    arena,
+                )? {
                     Datum::Bool(true) => return Ok(Datum::Bool(!negated)),
                     Datum::Bool(false) => {}
                     Datum::Null => saw_null = true,
@@ -5936,8 +7246,15 @@ fn eval_full_inner<'a>(
             }
             if let Some(probe) = list.probe {
                 // SAFETY: see the lifetime invariant on `SubqueryList::probe`.
-                let (matched, unknown) =
-                    unsafe { probe.as_ref() }.probe(v, collations, hooks.catalog, arena)?;
+                let (matched, unknown) = unsafe { probe.as_ref() }.probe(
+                    v,
+                    QuantifiedColumns {
+                        row_constructor: operand.is_row_constructor(),
+                        collations,
+                    },
+                    hooks.catalog,
+                    arena,
+                )?;
                 if matched {
                     return Ok(Datum::Bool(!negated));
                 }
@@ -5987,7 +7304,10 @@ fn eval_full_inner<'a>(
                 hooks,
             )?;
             let value = materialize_named_composite(
-                eval_full(operand, arena, params, row, hooks)?,
+                single_column_row_constructor(
+                    operand,
+                    eval_full(operand, arena, params, row, hooks)?,
+                ),
                 hooks,
                 arena,
             )?;
@@ -6005,10 +7325,12 @@ fn eval_full_inner<'a>(
                 operator,
                 value,
                 list.witness,
+                operand.is_row_constructor(),
                 collations,
                 hooks.catalog,
                 arena,
-            )?;
+            )
+            .map_err(|error| crate::sql::error_position::operator_at_node(error, expression))?;
             let mut saw_unknown = false;
             for member in list.values {
                 let left = coerce_unknown(value, member)?;
@@ -6017,6 +7339,7 @@ fn eval_full_inner<'a>(
                     operator,
                     left,
                     right,
+                    operand.is_row_constructor(),
                     collations,
                     hooks.catalog,
                     arena,
@@ -6025,7 +7348,12 @@ fn eval_full_inner<'a>(
                     Datum::Bool(false) if all => return Ok(Datum::Bool(false)),
                     Datum::Null => saw_unknown = true,
                     Datum::Bool(_) => {}
-                    other => return Err(type_mismatch("quantified comparison", &other)),
+                    _other => {
+                        return Err(sql_err!(
+                            sqlstate::WRONG_OBJECT_TYPE,
+                            "op ANY/ALL (array) requires operator to yield boolean"
+                        ));
+                    }
                 }
             }
             if let Some(probe) = list.probe {
@@ -6034,7 +7362,10 @@ fn eval_full_inner<'a>(
                     value,
                     operator,
                     all,
-                    collations,
+                    QuantifiedColumns {
+                        row_constructor: operand.is_row_constructor(),
+                        collations,
+                    },
                     hooks.catalog,
                     arena,
                 )?;
@@ -6079,6 +7410,9 @@ fn eval_full_inner<'a>(
             hooks,
         ),
         Expr::Subscript { base, index } => {
+            if let Some(value) = array_subscripts(expression, arena, params, row, hooks)? {
+                return Ok(value);
+            }
             let b = eval_full(base, arena, params, row, hooks)?;
             let i = eval_full(index, arena, params, row, hooks)?;
             if i.is_null() {
@@ -6088,7 +7422,10 @@ fn eval_full_inner<'a>(
                 Datum::Int2(x) => Ok(i64::from(*x)),
                 Datum::Int4(x) => Ok(i64::from(*x)),
                 Datum::Int8(x) => Ok(*x),
-                _ => Err(type_mismatch("array subscript must be integer", value)),
+                _ => Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "array subscript must have type integer"
+                )),
             };
             match b {
                 Datum::Array { element, raw } => {
@@ -6190,10 +7527,7 @@ fn eval_full_inner<'a>(
                                     arena.alloc_str_display(value).map_err(|_| arena_full())?
                                 }
                                 other => {
-                                    return Err(type_mismatch(
-                                        "jsonb object subscript must be text",
-                                        &other,
-                                    ));
+                                    return Err(jsonb_subscript_mismatch(&other));
                                 }
                             };
                             tree.get_field(key)
@@ -6210,10 +7544,7 @@ fn eval_full_inner<'a>(
                                     index
                                 }
                                 other => {
-                                    return Err(type_mismatch(
-                                        "jsonb array subscript must be coercible to integer or text",
-                                        &other,
-                                    ));
+                                    return Err(jsonb_subscript_mismatch(&other));
                                 }
                             };
                             tree.get_index(index)
@@ -6237,15 +7568,18 @@ fn eval_full_inner<'a>(
                     funcs::geometry::subscript(kind, text, index, arena)
                 }
                 Datum::Null => Ok(Datum::Null),
-                _ => Err(type_mismatch("cannot subscript a non-array", &b)),
+                _ => Err(not_subscriptable(&b)),
             }
         }
         Expr::Slice { base, lower, upper } => {
+            if let Some(value) = array_subscripts(expression, arena, params, row, hooks)? {
+                return Ok(value);
+            }
             let b = eval_full(base, arena, params, row, hooks)?;
             let (element, raw) = match b {
                 Datum::Array { element, raw } => (element, raw),
                 Datum::Null => return Ok(Datum::Null),
-                _ => return Err(type_mismatch("cannot slice a non-array", &b)),
+                _ => return Err(not_subscriptable(&b)),
             };
             // Resolve the leading-dimension bounds; chained slices address the
             // remaining dimensions.
@@ -6255,7 +7589,10 @@ fn eval_full_inner<'a>(
                     Datum::Int4(x) => Ok(Some(x as i64)),
                     Datum::Int8(x) => Ok(Some(x)),
                     Datum::Null => Ok(None),
-                    other => Err(type_mismatch("array slice bound must be integer", &other)),
+                    _other => Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "array subscript must have type integer"
+                    )),
                 }
             };
             let shape = super::array::shape(raw).expect("array datum invariant");
@@ -6528,7 +7865,20 @@ fn eval_full_inner<'a>(
                 lhs => lhs,
             };
             let mut saw_null = false;
-            for el in super::array::elements(raw, element) {
+            for el in super::array::structured_elements(raw, element, arena) {
+                // Named-composite elements are stored as text; compare their
+                // fields.
+                let el = match (el?, hooks.catalog) {
+                    (
+                        Datum::CompositeText {
+                            slot,
+                            physical_fields,
+                            text,
+                        },
+                        Some(catalog),
+                    ) => catalog.materialize_composite(slot, physical_fields, text, arena)?,
+                    (el, _) => el,
+                };
                 let (left, right) =
                     coerce_enum_literal(lhs, el, is_unknown_literal(operand), false, hooks, arena)?;
                 match quantified_scalar(operator, left, right, collation, hooks.catalog, arena)? {
@@ -6638,6 +7988,12 @@ fn quantified_scalar<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     let (left, right) = operators::coerce_comparison_text(left, right, false, false, arena)?;
     if let Some(comparison) = operators::Comparison::from_binary(operator)
+        && operators::needs_catalog_order(&left, &right)
+    {
+        let ordering = compare_datums_with_catalog(collation, catalog, &left, &right)?;
+        return Ok(Datum::Bool(comparison.holds(ordering)));
+    }
+    if let Some(comparison) = operators::Comparison::from_binary(operator)
         && matches!(
             (&left, &right),
             (
@@ -6652,10 +8008,19 @@ fn quantified_scalar<'a>(
     }
 }
 
+/// `ROW(x) IN (SELECT y ...)` compares `x` with the single column `y`.
+fn single_column_row_constructor<'a>(operand: &Expr<'a>, value: Datum<'a>) -> Datum<'a> {
+    match value {
+        Datum::Record([field]) if operand.is_row_constructor() => field.value,
+        value => value,
+    }
+}
+
 pub(crate) fn quantified_comparison<'a>(
     operator: BinaryOp,
     left: Datum<'a>,
     right: Datum<'a>,
+    row_constructor: bool,
     collations: &[Collation],
     catalog: Option<&dyn CatalogAccess>,
     arena: &'a Arena,
@@ -6677,62 +8042,13 @@ pub(crate) fn quantified_comparison<'a>(
     };
     let left = materialize(left)?;
     let right = materialize(right)?;
-    let composite =
-        matches!(left, Datum::Composite { .. }) || matches!(right, Datum::Composite { .. });
     match (left, right) {
+        // A row constructor meets a multi-column subquery field by field; a
+        // record-valued column compares as one record value.
         (
             Datum::Record(left) | Datum::Composite { fields: left, .. },
             Datum::Record(right) | Datum::Composite { fields: right, .. },
-        ) if composite => {
-            // Composite-typed values use the record btree operators: NULL
-            // fields are equal to each other and sort after other values.
-            if left.len() != right.len() {
-                return Err(sql_err!(
-                    sqlstate::DATATYPE_MISMATCH,
-                    "cannot compare record types with different numbers of columns"
-                ));
-            }
-            for (index, (left, right)) in left.iter().zip(right).enumerate() {
-                let (left, right) = (
-                    typed_field_value(left, catalog, arena)?,
-                    typed_field_value(right, catalog, arena)?,
-                );
-                let ordering = match (left.is_null(), right.is_null()) {
-                    (true, true) => core::cmp::Ordering::Equal,
-                    (true, false) => core::cmp::Ordering::Greater,
-                    (false, true) => core::cmp::Ordering::Less,
-                    (false, false) => {
-                        let collation = collations.get(index).copied().unwrap_or(Collation::None);
-                        let field = |operator| {
-                            quantified_scalar(operator, left, right, collation, catalog, arena)
-                        };
-                        if field(BinaryOp::Eq)? == Datum::Bool(true) {
-                            core::cmp::Ordering::Equal
-                        } else if field(BinaryOp::Lt)? == Datum::Bool(true) {
-                            core::cmp::Ordering::Less
-                        } else {
-                            core::cmp::Ordering::Greater
-                        }
-                    }
-                };
-                if !ordering.is_eq() {
-                    return Ok(Datum::Bool(match operator {
-                        BinaryOp::NotEq => true,
-                        BinaryOp::Lt | BinaryOp::LtEq => ordering.is_lt(),
-                        BinaryOp::Gt | BinaryOp::GtEq => ordering.is_gt(),
-                        _ => false,
-                    }));
-                }
-            }
-            Ok(Datum::Bool(matches!(
-                operator,
-                BinaryOp::Eq | BinaryOp::LtEq | BinaryOp::GtEq
-            )))
-        }
-        (
-            Datum::Record(left) | Datum::Composite { fields: left, .. },
-            Datum::Record(right) | Datum::Composite { fields: right, .. },
-        ) => {
+        ) if row_constructor => {
             if left.len() != right.len() {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
@@ -6977,14 +8293,13 @@ fn expression_collation<'a>(
             name,
             index,
             source,
-        } => match row.resolve_column_type(*qualifier, name) {
-            Ok(_) if *source == super::ast::ParameterSource::PlpgsqlCursor => Err(sql_err!(
-                sqlstate::AMBIGUOUS_COLUMN,
-                "column reference \"{}{}{}\" is ambiguous",
-                qualifier.unwrap_or(""),
-                if qualifier.is_some() { "." } else { "" },
-                name,
-            )),
+        } => match match source.collision() {
+            super::ast::ParameterCollision::Parameter => Err(parameter_wins()),
+            _ => row.resolve_column_type(*qualifier, name),
+        } {
+            Ok(_) if source.collision() == super::ast::ParameterCollision::Ambiguous => {
+                Err(ambiguous_procedural_reference(*qualifier, name))
+            }
             Ok(ctype) => Ok(DerivedCollation::implicit(
                 row.collation(*qualifier, name),
                 ctype.is_collatable(),
@@ -7015,7 +8330,7 @@ fn expression_collation<'a>(
                             collatable,
                         )
                     }
-                    super::ast::ParameterSource::PlpgsqlCursor => None,
+                    super::ast::ParameterSource::PlpgsqlCursor(_) => None,
                 })
             }
             Err(error) => Err(error),
@@ -7761,6 +9076,16 @@ pub(crate) fn constructor_type_from_oid(
             Some(base)
         };
     }
+    // An information_schema domain constructs values of its base type.
+    if let Some((domain, array)) =
+        crate::sql::information_schema_domains::InformationSchemaDomain::from_oid(type_oid)
+    {
+        return if array {
+            ArrElem::from_coltype(domain.base()).map(ColType::Array)
+        } else {
+            Some(domain.base())
+        };
+    }
     ColType::from_oid(type_oid)
 }
 
@@ -8362,8 +9687,12 @@ fn call<'a>(
                 .unwrap_or(written_name)
         })
     };
-    if super::ast::is_volatile_function(name) {
-        super::query::protect_statement_effects();
+    // Sequence calls replay from the statement's log, so they protect
+    // themselves as replayable effects.
+    if super::ast::is_volatile_function(name)
+        && !matches!(name, "nextval" | "setval" | "currval" | "lastval")
+    {
+        super::query::protect_unreplayable_effect();
     }
     if let Some((oid, _)) = builtin
         && let Some(result) = builtin_operator_function(oid, args, arena, params, row, hooks)
@@ -8650,12 +9979,12 @@ fn call<'a>(
                         Datum::Int2(value) => i64::from(value),
                         Datum::Int4(value) => i64::from(value),
                         Datum::Int8(value) => value,
-                        other => return Err(type_mismatch(name, &other)),
+                        other => return Err(function_argument_mismatch(name, &other)),
                     };
                     let is_called = if args.len() == 3 {
                         match values[2] {
                             Datum::Bool(value) => value,
-                            other => return Err(type_mismatch(name, &other)),
+                            other => return Err(function_argument_mismatch(name, &other)),
                         }
                     } else {
                         true
@@ -8701,7 +10030,7 @@ fn call<'a>(
                     },
                 ),
                 Datum::Null => Ok(Datum::Null),
-                _ => Err(type_mismatch("unnest requires an array or multirange", &a)),
+                _ => Err(function_argument_mismatch("unnest", &a)),
             }
         }
         "generate_series" => {
@@ -8824,25 +10153,12 @@ fn call<'a>(
                 };
                 count += 1;
                 if count == k {
-                    // No capture groups: the whole match is the single element.
-                    let mut elems = [Datum::Null; super::regex::MAX_GROUPS];
-                    let n = if ng == 0 {
-                        elems[0] = Datum::Text(&string[mstart..mend]);
-                        1
-                    } else {
-                        for (i, span) in spans[..ng].iter().enumerate() {
-                            elems[i] = if span.0 < 0 {
-                                Datum::Null
-                            } else {
-                                Datum::Text(&string[span.0 as usize..span.1 as usize])
-                            };
-                        }
-                        ng
-                    };
-                    return Ok(Datum::Array {
-                        element: super::types::ArrElem::Text,
-                        raw: super::array::build(&elems[..n], arena)?,
-                    });
+                    return pattern::regexp_match_array(
+                        string,
+                        (mstart, mend),
+                        &spans[..ng],
+                        arena,
+                    );
                 }
                 if !parsed.global {
                     return Ok(Datum::Null);
@@ -8886,7 +10202,7 @@ fn call<'a>(
                     super::types::oid::OID,
                 ),
                 Datum::Null => return Ok(Datum::Null),
-                _ => return Err(type_mismatch("_pg_expandarray requires an array", &array)),
+                _ => return Err(function_argument_mismatch("_pg_expandarray", &array)),
             };
             let ordinal = i32::try_from(k).map_err(|_| {
                 sql_err!(
@@ -8984,9 +10300,8 @@ fn call<'a>(
             }
             let input = match eval_full(args[0], arena, params, row, hooks)? {
                 Datum::Null => return Ok(Datum::Null),
-                value => super::array::Input::from_datum(value).ok_or_else(|| {
-                    type_mismatch("generate_subscripts requires an array", &value)
-                })?,
+                value => super::array::Input::from_datum(value)
+                    .ok_or_else(|| function_argument_mismatch("generate_subscripts", &value))?,
             };
             let dim = match eval_full(args[1], arena, params, row, hooks)? {
                 Datum::Int2(v) => v as i64,
@@ -8994,10 +10309,7 @@ fn call<'a>(
                 Datum::Int8(v) => v,
                 Datum::Null => return Ok(Datum::Null),
                 other => {
-                    return Err(type_mismatch(
-                        "generate_subscripts dim must be an integer",
-                        &other,
-                    ));
+                    return Err(function_argument_mismatch("generate_subscripts", &other));
                 }
             };
             let k = hooks.srf_index.ok_or_else(|| {
@@ -9011,10 +10323,7 @@ fn call<'a>(
                     Datum::Bool(reverse) => reverse,
                     Datum::Null => return Ok(Datum::Null),
                     other => {
-                        return Err(type_mismatch(
-                            "generate_subscripts reverse must be boolean",
-                            &other,
-                        ));
+                        return Err(function_argument_mismatch("generate_subscripts", &other));
                     }
                 }
             } else {
@@ -9086,7 +10395,7 @@ fn call<'a>(
                 Datum::Json { text, .. } => text,
                 Datum::Text(s) => s,
                 Datum::Null => return Ok(Datum::Null),
-                other => return Err(type_mismatch("object_keys requires an object", &other)),
+                other => return Err(function_argument_mismatch(name, &other)),
             };
             let k = hooks.srf_index.ok_or_else(|| {
                 sql_err!(
@@ -9128,7 +10437,7 @@ fn call<'a>(
                 Datum::Json { text, .. } => text,
                 Datum::Text(s) => s,
                 Datum::Null => return Ok(Datum::Null),
-                other => return Err(type_mismatch("array_elements requires an array", &other)),
+                other => return Err(function_argument_mismatch(name, &other)),
             };
             let k = hooks.srf_index.ok_or_else(|| {
                 sql_err!(
@@ -9187,8 +10496,7 @@ fn call<'a>(
         "json_each" | "jsonb_each" | "json_each_text" | "jsonb_each_text" => {
             arity(1)?;
             let jsonb = name.starts_with("jsonb");
-            let as_text = name.ends_with("_text");
-            let value_oid = if as_text {
+            let value_oid = if name.ends_with("_text") {
                 super::types::oid::TEXT
             } else if jsonb {
                 super::types::oid::JSONB
@@ -9200,13 +10508,14 @@ fn call<'a>(
                 Datum::Text(s) => s,
                 Datum::Null => return Ok(Datum::Null),
                 _ => {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "cannot deconstruct a scalar"
+                    return Err(super::json::each_error(
+                        name,
+                        jsonb,
+                        super::json::Kind::Scalar,
                     ));
                 }
             };
-            let pairs = json_each_pairs(text, jsonb, as_text, arena)?;
+            let pairs = json_each_pairs(name, text, arena)?;
             let k = hooks.srf_index.ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -9240,7 +10549,7 @@ fn call<'a>(
                     raw,
                 } => raw,
                 Datum::Null => return Ok(Datum::Null),
-                other => return Err(type_mismatch("aclexplode", &other)),
+                other => return Err(function_argument_mismatch("aclexplode", &other)),
             };
             let index = hooks.srf_index.ok_or_else(|| {
                 sql_err!(
@@ -9291,7 +10600,7 @@ fn call<'a>(
                     raw,
                 } => raw,
                 Datum::Null => return Ok(Datum::Null),
-                other => return Err(type_mismatch("pg_options_to_table", &other)),
+                other => return Err(function_argument_mismatch("pg_options_to_table", &other)),
             };
             let index = hooks.srf_index.ok_or_else(|| {
                 sql_err!(
@@ -9304,11 +10613,13 @@ fn call<'a>(
                 Some(Datum::Null) => {
                     return Err(sql_err!(
                         sqlstate::NULL_VALUE_NOT_ALLOWED,
-                        "null value not allowed"
+                        "null array element not allowed in this context"
                     ));
                 }
                 None => return Ok(Datum::Null),
-                Some(other) => return Err(type_mismatch("pg_options_to_table", &other)),
+                Some(other) => {
+                    return Err(function_argument_mismatch("pg_options_to_table", &other));
+                }
             };
             let (option_name, option_value) = match option.split_once('=') {
                 Some((name, value)) => (Datum::Text(name), Datum::Text(value)),
@@ -10047,7 +11358,7 @@ fn json_get<'a>(
     let (text, jsonb) = match l {
         Datum::Json { text, jsonb } => (text, jsonb),
         Datum::Null => return Ok(Datum::Null),
-        other => return Err(type_mismatch("-> requires json/jsonb", &other)),
+        other => return Err(operand_type_mismatch(&other)),
     };
     if r.is_null() {
         return Ok(Datum::Null);
@@ -10058,7 +11369,7 @@ fn json_get<'a>(
         Datum::Int2(i) => tree.get_index(i as i64),
         Datum::Int4(i) => tree.get_index(i as i64),
         Datum::Int8(i) => tree.get_index(i),
-        other => return Err(type_mismatch("-> key must be text or integer", &other)),
+        other => return Err(operand_type_mismatch(&other)),
     };
     let Some(child) = child else {
         return Ok(Datum::Null);
@@ -10217,9 +11528,10 @@ pub fn record_star_expand<'a>(
                     )
                 })
         }
-        other => Err(type_mismatch(
-            "record expansion of a non-composite value",
-            &other,
+        other => Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "type {} is not composite",
+            type_name_of(&other)
         )),
     }
 }
@@ -10351,31 +11663,25 @@ pub(crate) fn materialize_composite_text_output<'a>(
     }
 }
 
-/// The `(key, value)` members a `json_each` / `jsonb_each` family call yields
-/// for the object `text`. `jsonb` selects normalized (sorted, deduplicated,
-/// re-rendered) members over the `json` variants' source-order/verbatim members;
-/// `as_text` makes each value the `_text` form (a decoded string, else the
-/// value's json text). Errors match PostgreSQL's `cannot deconstruct ...`.
+/// The `(key, value)` members the `json_each` / `jsonb_each` family call
+/// `name` yields for the object `text`. The `jsonb` variants yield normalized
+/// (sorted, deduplicated, re-rendered) members, the `json` variants
+/// source-order verbatim members; the `_text` variants make each value a
+/// decoded string, else the value's json text. Errors match PostgreSQL's.
 pub fn json_each_pairs<'a>(
+    name: &str,
     text: &'a str,
-    jsonb: bool,
-    as_text: bool,
     arena: &'a Arena,
 ) -> Result<&'a [(&'a str, Datum<'a>)], SqlError> {
-    match super::json::kind_of(text) {
-        super::json::Kind::Object => {}
-        super::json::Kind::Array => {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "cannot deconstruct an array as an object"
-            ));
-        }
-        super::json::Kind::Scalar => {
-            return Err(sql_err!(
-                sqlstate::INVALID_PARAMETER_VALUE,
-                "cannot deconstruct a scalar"
-            ));
-        }
+    let jsonb = name
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("jsonb"));
+    let as_text = name
+        .get(name.len().saturating_sub(5)..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case("_text"));
+    let kind = super::json::kind_of(text);
+    if kind != super::json::Kind::Object {
+        return Err(super::json::each_error(name, jsonb, kind));
     }
     if jsonb {
         let super::json::Json::Object(members) = super::json::parse(text, arena)? else {
@@ -10453,7 +11759,7 @@ fn jsonb_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
             // An unknown text literal (`'{"b":2}'`) coerces to jsonb.
             Datum::Text(s) => Ok(Some(s)),
             Datum::Null => Ok(None),
-            other => Err(type_mismatch("|| requires jsonb", &other)),
+            other => Err(operand_type_mismatch(&other)),
         }
     };
     let (Some(lt), Some(rt)) = (text_of(l)?, text_of(r)?) else {
@@ -10529,7 +11835,7 @@ fn json_path_parts<'a>(r: Datum<'a>, arena: &'a Arena) -> Result<&'a [&'a str], 
             super::types::ArrElem::Text,
             super::array::parse_literal(lit, super::types::ArrElem::Text, arena)?,
         ),
-        other => return Err(type_mismatch("path must be a text array", &other)),
+        other => return Err(operand_type_mismatch(&other)),
     };
     let n = super::array::len(raw);
     if n > 64 {
@@ -10559,7 +11865,7 @@ fn json_path_parts<'a>(r: Datum<'a>, arena: &'a Arena) -> Result<&'a [&'a str], 
 fn jsonb_delete<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     jsonb_operator_left("-", &l)?;
     let Datum::Json { text, .. } = l else {
-        return Err(type_mismatch("- requires jsonb", &l));
+        return Err(operand_type_mismatch(&l));
     };
     let root = super::json::parse(text, arena)?;
     let result = match r {
@@ -10578,7 +11884,7 @@ fn jsonb_delete<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
             }
             node
         }
-        other => return Err(type_mismatch("- requires text, text[], or integer", &other)),
+        other => return Err(operand_type_mismatch(&other)),
     };
     Ok(Datum::Json {
         text: json_to_text(&result, arena)?,
@@ -10596,7 +11902,7 @@ fn jsonb_delete_path<'a>(
     let text = match l {
         Datum::Json { text, .. } => text,
         Datum::Null => return Ok(Datum::Null),
-        other => return Err(type_mismatch("#- requires jsonb", &other)),
+        other => return Err(operand_type_mismatch(&other)),
     };
     if r.is_null() {
         return Ok(Datum::Null);
@@ -10615,7 +11921,7 @@ fn json_tree_arg<'a>(d: Datum<'a>, arena: &'a Arena) -> Result<super::json::Json
     match d {
         Datum::Json { text, .. } => super::json::parse(text, arena),
         Datum::Text(s) => super::json::parse(s, arena),
-        other => Err(type_mismatch("argument is not jsonb", &other)),
+        other => Err(operand_type_mismatch(&other)),
     }
 }
 
@@ -10628,7 +11934,7 @@ fn json_path<'a>(
     let (text, jsonb) = match l {
         Datum::Json { text, jsonb } => (text, jsonb),
         Datum::Null => return Ok(Datum::Null),
-        other => return Err(type_mismatch("#> requires json/jsonb", &other)),
+        other => return Err(operand_type_mismatch(&other)),
     };
     // The path is a `text[]`; an unknown literal (`'{a,b}'`) arrives as text
     // and is parsed as a text-array literal, as PostgreSQL coerces it.
@@ -10639,7 +11945,7 @@ fn json_path<'a>(
             super::array::parse_literal(lit, super::types::ArrElem::Text, arena)?,
         ),
         Datum::Null => return Ok(Datum::Null),
-        other => return Err(type_mismatch("#> path must be a text array", &other)),
+        other => return Err(operand_type_mismatch(&other)),
     };
     let mut node = super::json::parse(text, arena)?;
     for step in super::array::elements(raw, element) {
@@ -10691,7 +11997,7 @@ fn json_exists<'a>(
     let text = match l {
         Datum::Json { text, .. } => text,
         Datum::Null => return Ok(Datum::Null),
-        other => return Err(type_mismatch("? requires jsonb", &other)),
+        other => return Err(operand_type_mismatch(&other)),
     };
     let node = super::json::parse(text, arena)?;
     // Does a single string key exist (object key, or array string element)?
@@ -10710,7 +12016,7 @@ fn json_exists<'a>(
                 if r.is_null() {
                     return Ok(Datum::Null);
                 }
-                return Err(type_mismatch("? key must be text", &r));
+                return Err(operand_type_mismatch(&r));
             };
             Ok(Datum::Bool(has(key)))
         }
@@ -10722,7 +12028,7 @@ fn json_exists<'a>(
                     super::array::parse_literal(lit, super::types::ArrElem::Text, arena)?,
                 ),
                 Datum::Null => return Ok(Datum::Null),
-                other => return Err(type_mismatch("?|/?& require a text array", &other)),
+                other => return Err(operand_type_mismatch(&other)),
             };
             let all = operator == JsonExistsAll;
             let mut result = all;
@@ -10753,17 +12059,14 @@ fn jsonpath_operator<'a>(
     let target = match left {
         Datum::Json { text, jsonb: true } => text,
         Datum::Null => return Ok(Datum::Null),
-        other => return Err(type_mismatch("JSON path operator requires jsonb", &other)),
+        other => return Err(operand_type_mismatch(&other)),
     };
     let path = match right {
         Datum::JsonPath(text) => text,
         Datum::Text(text) => super::jsonpath::canonicalize(text, arena)?,
         Datum::Null => return Ok(Datum::Null),
         other => {
-            return Err(type_mismatch(
-                "JSON path operator requires jsonpath",
-                &other,
-            ));
+            return Err(operand_type_mismatch(&other));
         }
     };
     let outcome = super::jsonpath::query_outcome(target, path, None, true, false, arena)?;
@@ -11047,7 +12350,7 @@ fn timestamp_micros(name: &str, d: Datum) -> Result<i64, SqlError> {
     match d {
         Datum::Timestamp(t) | Datum::Timestamptz(t) => Ok(t),
         Datum::Date(day) => Ok(i64::from(day) * 86_400_000_000),
-        other => Err(type_mismatch(name, &other)),
+        other => Err(function_argument_mismatch(name, &other)),
     }
 }
 
@@ -11086,11 +12389,14 @@ fn check_boolean_operand<'a>(
             Expr::Str(text) => parse_bool(text).map(|_| ()),
             _ => Ok(()),
         },
-        Some(other) => Err(sql_err!(
-            crate::sql::eval::sqlstate::DATATYPE_MISMATCH,
-            "argument of {} must be type boolean, not type {}",
-            context,
-            other.name()
+        Some(other) => Err(crate::sql::error_position::at_expression(
+            sql_err!(
+                crate::sql::eval::sqlstate::DATATYPE_MISMATCH,
+                "argument of {} must be type boolean, not type {}",
+                context,
+                other.name()
+            ),
+            expression,
         )),
     }
 }
@@ -12136,11 +13442,12 @@ fn coerce_enum_value<'a>(
         Datum::Bpchar(s) => s.trim_end_matches(' '),
         _ => return Ok(value),
     };
+    // Without catalog access the label cannot be checked; a context-free
+    // constant probe leaves this to execution.
     let catalog = hooks.catalog.ok_or_else(|| {
         sql_err!(
-            sqlstate::INVALID_TEXT_REPRESENTATION,
-            "invalid input value for enum: \"{}\"",
-            label
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "enum input requires catalog access"
         )
     })?;
     let Some(sort) = catalog.enum_label_sort(slot, label)? else {
@@ -12293,150 +13600,6 @@ fn division_by_zero() -> SqlError {
     sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero")
 }
 
-/// [`type_mismatch`] for callers outside this module (table-function args).
-/// Assigning through an array subscript (`SET a[1] = 9`) is not implemented;
-/// it must not fall through to jsonb subscripting.
-/// `base[i][j] := value` for an array base (`__jsonb_subscript_set` with an
-/// array first argument): PostgreSQL's `array_set_element`. A NULL or empty
-/// base becomes an array holding only the value at the given subscripts; a
-/// one-dimensional array grows to the subscript, padding with NULLs; a
-/// multidimensional array only replaces an existing element. Returns `None`
-/// when the base is not an array.
-pub(crate) fn assign_array_element<'a>(
-    args: &[&'a Expr<'a>],
-    arena: &'a Arena,
-    params: &[Datum<'a>],
-    row: &impl ColumnLookup<'a>,
-    hooks: &EvalHooks<'_, 'a>,
-) -> Result<Option<Datum<'a>>, SqlError> {
-    let declared =
-        ColType::from_oid(expression_type_identity(args[0], row, hooks)?.routine_argument_oid());
-    if let Some(declared) = declared
-        && !matches!(
-            declared,
-            ColType::Array(_) | ColType::Jsonb | ColType::Geometry(_)
-        )
-    {
-        return Err(sql_err!(
-            sqlstate::DATATYPE_MISMATCH,
-            "cannot subscript type {} because it does not support subscripting",
-            declared.name()
-        ));
-    }
-    let base = eval_full(args[0], arena, params, row, hooks)?;
-    let (element, raw) = match (base, declared) {
-        (Datum::Array { element, raw }, _) => (element, Some(raw)),
-        (Datum::Null, Some(ColType::Array(element))) => (element, None),
-        _ => return Ok(None),
-    };
-    let subscripts = &args[2..];
-    if subscripts.len() > super::array::MAX_DIMENSIONS {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "number of array dimensions ({}) exceeds the maximum allowed ({})",
-            subscripts.len(),
-            super::array::MAX_DIMENSIONS
-        ));
-    }
-    let mut indexes = [0i32; super::array::MAX_DIMENSIONS];
-    for (slot, expression) in indexes.iter_mut().zip(subscripts) {
-        *slot = match eval_full(expression, arena, params, row, hooks)? {
-            Datum::Int2(index) => i32::from(index),
-            Datum::Int4(index) => index,
-            Datum::Int8(index) => i32::try_from(index)
-                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range"))?,
-            Datum::Null => {
-                return Err(sql_err!(
-                    sqlstate::NULL_VALUE_NOT_ALLOWED,
-                    "array subscript in assignment must not be null"
-                ));
-            }
-            other => return Err(type_mismatch("array subscript must be integer", &other)),
-        };
-    }
-    let indexes = &indexes[..subscripts.len()];
-    let value = eval_full(args[1], arena, params, row, hooks)?;
-    let value = if value.is_null() || ArrElem::from_datum(&value) == Some(element) {
-        value
-    } else {
-        match element {
-            ArrElem::Enum(_) | ArrElem::Composite(_) | ArrElem::Domain { .. } | ArrElem::Record => {
-                return Err(array_element_assignment_unsupported());
-            }
-            _ => cast_to(value, element.to_coltype(), arena)?,
-        }
-    };
-    let shape = raw.map_or_else(super::array::Shape::empty, |raw| {
-        super::array::shape(raw).expect("array datum invariant")
-    });
-    if shape.dimension_count() == 0 {
-        let dimensions = [1usize; super::array::MAX_DIMENSIONS];
-        let shape = super::array::Shape::new(&dimensions[..indexes.len()], indexes)?;
-        let raw = super::array::build_shaped(core::slice::from_ref(&value), shape, arena)?;
-        return Ok(Some(Datum::Array { element, raw }));
-    }
-    let raw = raw.expect("a shaped array has a datum");
-    if indexes.len() != shape.dimension_count() {
-        return Err(sql_err!(
-            sqlstate::ARRAY_SUBSCRIPT_ERROR,
-            "wrong number of array subscripts"
-        ));
-    }
-    let lower = shape.lower_bound(0).expect("dimension exists");
-    let length = shape.dimension(0).expect("dimension exists") as i64;
-    if indexes.len() == 1 {
-        let index = i64::from(indexes[0]);
-        let (lower, upper) = (i64::from(lower), i64::from(lower) + length - 1);
-        let new_lower = lower.min(index);
-        let new_upper = upper.max(index);
-        let count = usize::try_from(new_upper - new_lower + 1).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "array size exceeds the maximum allowed"
-            )
-        })?;
-        let items = super::array::alloc_items(arena, count)?;
-        for (offset, old) in super::array::elements(raw, element).enumerate() {
-            items[(lower + offset as i64 - new_lower) as usize] = old;
-        }
-        items[(index - new_lower) as usize] = value;
-        let shape = super::array::Shape::new(&[count], &[new_lower as i32])?;
-        let raw = super::array::build_shaped(items, shape, arena)?;
-        return Ok(Some(Datum::Array { element, raw }));
-    }
-    let mut position = 0usize;
-    for (dimension, index) in indexes.iter().enumerate() {
-        let lower = shape.lower_bound(dimension).expect("dimension exists");
-        let length = shape.dimension(dimension).expect("dimension exists");
-        let offset = i64::from(*index) - i64::from(lower);
-        if offset < 0 || offset >= length as i64 {
-            return Err(sql_err!(
-                sqlstate::ARRAY_SUBSCRIPT_ERROR,
-                "array subscript out of range"
-            ));
-        }
-        position = position * length + offset as usize;
-    }
-    let items = super::array::alloc_items(arena, shape.element_count())?;
-    for (slot, old) in items.iter_mut().zip(super::array::elements(raw, element)) {
-        *slot = old;
-    }
-    items[position] = value;
-    let raw = super::array::build_shaped(items, shape, arena)?;
-    Ok(Some(Datum::Array { element, raw }))
-}
-
-pub(crate) fn array_element_assignment_unsupported() -> SqlError {
-    sql_err!(
-        sqlstate::FEATURE_NOT_SUPPORTED,
-        "assignment to array elements and slices is not supported"
-    )
-}
-
-pub fn type_mismatch_pub(operator: &str, d: &Datum) -> SqlError {
-    type_mismatch(operator, d)
-}
-
 pub(crate) fn sequence_data_oid(value: Datum<'_>) -> Result<Option<i32>, SqlError> {
     match value {
         Datum::Oid(oid) => Ok(Some(oid as i32)),
@@ -12449,19 +13612,12 @@ pub(crate) fn sequence_data_oid(value: Datum<'_>) -> Result<Option<i32>, SqlErro
     }
 }
 
-fn type_mismatch(operator: &str, d: &Datum) -> SqlError {
+/// PostgreSQL's error for a cast with no conversion path, naming both types
+/// as `format_type` does.
+fn cast_unsupported(from: &Datum, to: &str) -> SqlError {
     sql_err!(
-        sqlstate::DATATYPE_MISMATCH,
-        "operator {} does not accept {}",
-        operator,
-        type_name_of(d)
-    )
-}
-
-fn cast_unsupported(from: &Datum, to: &'static str) -> SqlError {
-    sql_err!(
-        sqlstate::DATATYPE_MISMATCH,
-        "cannot cast {} to {}",
+        sqlstate::CANNOT_COERCE,
+        "cannot cast type {} to {}",
         type_name_of(from),
         to
     )
@@ -12629,7 +13785,7 @@ mod tests {
                 qualifier: None,
                 name: "input",
                 index: 1,
-                source: ParameterSource::PlpgsqlCursor,
+                source: ParameterSource::PlpgsqlCursor(crate::sql::guc::VariableConflict::Error),
             };
             assert_eq!(
                 routine_input_collation(&[&cursor], &Columns, None)
@@ -12974,6 +14130,7 @@ mod tests {
                 _: &[Datum<'a>],
                 _: &dyn ColumnLookup<'a>,
                 _: Option<&dyn SequenceAccess>,
+                _: bool,
             ) -> Result<SubqueryResult<'a>, SqlError> {
                 self.0.set(self.0.get() + 1);
                 match expression {

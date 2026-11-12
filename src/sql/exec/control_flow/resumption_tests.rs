@@ -6,6 +6,8 @@ use crate::sql::lock::{AdvisoryDecision, AdvisoryKey, AdvisoryMode};
 
 #[test]
 fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_statements() {
+    let mut test_cursors = crate::sql::cursor::CursorPool::for_tests();
+    let mut test_row_buffers = crate::storage::RowCursorBuffers::for_tests();
     const SOURCE: &str = "DECLARE n integer := 0; marker text := 'seed'; BEGIN \
         PERFORM pg_advisory_lock(41); n := n + 1; \
         FOR i IN 1..2 LOOP marker := marker || i::text; \
@@ -75,7 +77,7 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                 &storage,
                 command.txid,
                 &original,
-                &|_| false,
+                &|_| None,
             )
             .unwrap();
             let mut execution = execution_frame::ExecutionFrame::new(
@@ -89,7 +91,12 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
             .unwrap();
             let invocation = crate::sql::type_input_plans::with_owner(
                 crate::sql::type_input_plans::Owner::Backend,
-                TriggerInvocation::anonymous,
+                || {
+                    TriggerInvocation::anonymous(crate::sql::guc::PlpgsqlSettings {
+                        variable_conflict: crate::sql::guc::VariableConflict::Error,
+                        print_strict_params: false,
+                    })
+                },
             )
             .unwrap()
             .with_input_sites(program.input_sites);
@@ -97,7 +104,11 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
             let mut context = TriggerExecContext {
                 host: PlpgsqlExecHost::Atomic {
                     storage: &mut storage,
-                    seq_session: guc.seq_session(),
+                    services: crate::sql::exec::TriggerServices::new(
+                        guc.seq_session(),
+                        &mut test_cursors,
+                        &mut test_row_buffers,
+                    ),
                 },
                 txn: &mut command,
                 arena: &original,
@@ -111,8 +122,8 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                     invocation,
                     TriggerTransition {
                         definition,
-                        old: None,
-                        new: None,
+                        old: TriggerRecordValue::Empty,
+                        new: TriggerRecordValue::Empty,
                     },
                     &code,
                     &[],
@@ -123,9 +134,7 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                     &mut context,
                     definition,
                     invocation,
-                    None,
-                    &mut None,
-                    false,
+                    &mut TriggerRows::none(),
                     None,
                     &code,
                 )
@@ -190,11 +199,16 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                 assert_eq!(command.trigger_depth(), 1);
                 assert_eq!(command.command_id(), nested_command);
                 assert_eq!(storage.read_snapshot(), crate::storage::SNAPSHOT_ALL);
-                let (program, code) = saved.source().parse(&resumed).unwrap();
+                let (program, code) = saved.source().parse(&resumed, None).unwrap();
                 let mut execution = saved.restore(&resumed, &code).ok().unwrap();
                 let invocation = crate::sql::type_input_plans::with_owner(
                     crate::sql::type_input_plans::Owner::Backend,
-                    TriggerInvocation::anonymous,
+                    || {
+                        TriggerInvocation::anonymous(crate::sql::guc::PlpgsqlSettings {
+                            variable_conflict: crate::sql::guc::VariableConflict::Error,
+                            print_strict_params: false,
+                        })
+                    },
                 )
                 .unwrap()
                 .with_input_sites(program.input_sites);
@@ -202,7 +216,11 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                 let mut context = TriggerExecContext {
                     host: PlpgsqlExecHost::Atomic {
                         storage: &mut storage,
-                        seq_session: guc.seq_session(),
+                        services: crate::sql::exec::TriggerServices::new(
+                            guc.seq_session(),
+                            &mut test_cursors,
+                            &mut test_row_buffers,
+                        ),
                     },
                     txn: &mut command,
                     arena: &resumed,
@@ -214,9 +232,7 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                     &mut context,
                     definition,
                     invocation,
-                    None,
-                    &mut None,
-                    false,
+                    &mut TriggerRows::none(),
                     None,
                     &code,
                 );
@@ -243,9 +259,7 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                         &mut context,
                         definition,
                         invocation,
-                        None,
-                        &mut None,
-                        false,
+                        &mut TriggerRows::none(),
                         None,
                         &code,
                     )

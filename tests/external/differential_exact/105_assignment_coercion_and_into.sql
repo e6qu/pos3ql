@@ -1,0 +1,56 @@
+-- Assignment casts for INSERT, UPDATE and subscripted targets, PL/pgSQL
+-- conversions through text, SQL function results checked at CREATE,
+-- data-changing statements analysed at CREATE, constants compared inside
+-- subqueries, RETURNING ... INTO and function-qualified parameters.
+CREATE TYPE ac70_mood AS ENUM ('a', 'b');
+CREATE TABLE ac70 (a int, m int[], d date, j jsonb, ms ac70_mood[], v varchar(3));
+INSERT INTO ac70 (a) VALUES ('x'::text);
+INSERT INTO ac70 (a, d) VALUES (1, now()), ('y'::text, now());
+UPDATE ac70 SET a = now();
+INSERT INTO ac70 (a) VALUES ($$1$$::varchar);
+UPDATE ac70 SET m[1] = 'x'::text;
+UPDATE ac70 SET m[1:2] = '{1}'::text[];
+INSERT INTO ac70 (m[1:2]) SELECT '{1,2}' UNION ALL SELECT '{3,4}';
+INSERT INTO ac70 (a, m[1]) SELECT 1, 'x'::text;
+UPDATE ac70 SET j['k'] = 1;
+INSERT INTO ac70 (a) SELECT '1' UNION SELECT '2';
+UPDATE ac70 SET (a, d) = (SELECT 'x'::text, 1);
+UPDATE ac70 SET a = (SELECT '1');
+INSERT INTO ac70 (v) VALUES (12345);
+INSERT INTO ac70 (a, m) VALUES ('1', '{2}'), (1.5, NULL), (3::bigint, NULL);
+INSERT INTO ac70 (a, m[1]) SELECT '4', '5';
+INSERT INTO ac70 (ms) VALUES ('{a}');
+UPDATE ac70 SET ms[1] = 'b' WHERE ms IS NOT NULL;
+SELECT a, m, ms FROM ac70 ORDER BY a;
+SELECT (SELECT a FROM ac70 WHERE a = 'q');
+SELECT 1 WHERE EXISTS (SELECT 1 FROM ac70 WHERE a > 'x');
+SELECT (SELECT (SELECT a FROM ac70 x WHERE x.a = 'zz'));
+CREATE FUNCTION ac70_f1() RETURNS int LANGUAGE plpgsql AS $$ DECLARE x int; BEGIN x := true; RETURN x; END $$;
+SELECT ac70_f1();
+CREATE FUNCTION ac70_f2() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN true; END $$;
+SELECT ac70_f2();
+CREATE FUNCTION ac70_f3(OUT a int) LANGUAGE plpgsql AS $$ BEGIN a := 1.6; END $$;
+SELECT ac70_f3();
+CREATE FUNCTION ac70_s1() RETURNS int LANGUAGE sql AS $$SELECT 'abc'$$;
+CREATE FUNCTION ac70_s2() RETURNS int LANGUAGE sql AS $$SELECT 1, 2$$;
+CREATE FUNCTION ac70_s3() RETURNS SETOF int LANGUAGE sql AS $$SELECT now()$$;
+CREATE FUNCTION ac70_s4() RETURNS int LANGUAGE sql AS $$SELECT 1.5 UNION SELECT 2$$;
+CREATE FUNCTION ac70_s5() LANGUAGE sql RETURNS int AS 'SELECT 1';
+CREATE FUNCTION ac70_w1(x int) RETURNS void LANGUAGE sql AS $$ UPDATE ac70 SET nosuch = x $$;
+CREATE FUNCTION ac70_w2(x int) RETURNS void LANGUAGE sql AS $$ INSERT INTO ac70 (a, nosuch) VALUES (x, 1) $$;
+CREATE FUNCTION ac70_w3(x text) RETURNS void LANGUAGE sql AS $$ UPDATE ac70 SET a = x $$;
+CREATE FUNCTION ac70_w4(x int) RETURNS void LANGUAGE sql BEGIN ATOMIC; UPDATE ac70 SET a = 'q'::text; END;
+CREATE TABLE ac70_r (id int, v text);
+INSERT INTO ac70_r VALUES (1, 'a'), (2, 'b');
+CREATE FUNCTION ac70_i1() RETURNS text LANGUAGE plpgsql AS $$ DECLARE x int; y text; BEGIN INSERT INTO ac70_r VALUES (3, 'c') RETURNING id, v INTO x, y; RETURN x || y || found; END $$;
+SELECT ac70_i1();
+CREATE FUNCTION ac70_i2() RETURNS text LANGUAGE plpgsql AS $$ DECLARE x record; BEGIN DELETE FROM ac70_r WHERE id = 3 RETURNING * INTO x; RETURN x.id || x.v; END $$;
+SELECT ac70_i2();
+DO $$ DECLARE x int; BEGIN UPDATE ac70_r SET v = 'z' RETURNING id INTO x; END $$;
+DO $$ DECLARE x int; BEGIN UPDATE ac70_r SET v = 'z' WHERE id > 100 RETURNING id INTO STRICT x; END $$;
+DO $$ BEGIN UPDATE ac70_r SET v = 'q' RETURNING id; END $$;
+DO $$ DECLARE x int; BEGIN UPDATE ac70_r SET v = 'q' INTO x; END $$;
+DO $$ DECLARE x int; y int; BEGIN SELECT 1, 2 INTO x; SELECT 5 INTO x, y; RAISE NOTICE '% %', x, y; END $$;
+CREATE FUNCTION ac70_q(a int) RETURNS int LANGUAGE plpgsql AS $$ DECLARE b int; BEGIN b := ac70_q.a * 2; SELECT ac70_q.a + b INTO b; RETURN b; END $$;
+SELECT ac70_q(3);
+DROP ROUTINE ac70_f1(), ac70_f2(), ac70_f3(), ac70_s4(), ac70_i1(), ac70_i2(), ac70_q(integer) CASCADE;

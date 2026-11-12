@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 pub(crate) struct HttpObjectServer {
     stop: Arc<AtomicBool>,
     pub(super) requests: Arc<AtomicUsize>,
+    /// Every distinct key an object GET read.
+    pub(super) fetched: Arc<crate::mem::mutex::Mutex<std::collections::HashSet<String>>>,
     pub(super) uploads: Arc<AtomicUsize>,
     pub(super) hold_response: Arc<AtomicBool>,
     hold_upload_response: Arc<AtomicBool>,
@@ -52,11 +54,15 @@ impl HttpObjectServer {
         fixture_config.object_store_prefix.clear();
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(AtomicUsize::new(0));
+        let fetched = Arc::new(crate::mem::mutex::Mutex::new(
+            std::collections::HashSet::new(),
+        ));
         let uploads = Arc::new(AtomicUsize::new(0));
         let hold_response = Arc::new(AtomicBool::new(false));
         let hold_upload_response = Arc::new(AtomicBool::new(false));
         let server_stop = Arc::clone(&stop);
         let server_requests = Arc::clone(&requests);
+        let server_fetched = Arc::clone(&fetched);
         let server_uploads = Arc::clone(&uploads);
         let server_hold_response = Arc::clone(&hold_response);
         let server_hold_upload_response = Arc::clone(&hold_upload_response);
@@ -65,39 +71,66 @@ impl HttpObjectServer {
                 Budget::new(crate::object_store::Client::budget_bytes(&fixture_config));
             let mut backing =
                 crate::object_store::Client::new(&fixture_config, &mut fixture_budget).unwrap();
+            // Requests are served in the order their heads arrive: the engine
+            // may open a read and finish a synchronous one before it sends
+            // the first read's request.
+            let mut waiting: Vec<(std::net::TcpStream, Box<[u8; 8192]>, usize)> = Vec::new();
             while !server_stop.load(Ordering::Acquire) {
-                let mut stream = match listener.accept() {
-                    Ok((stream, _)) => stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(1));
-                        continue;
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream.set_nonblocking(true).unwrap();
+                            waiting.push((stream, Box::new([0u8; 8192]), 0));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) => panic!("accept object read: {error}"),
                     }
-                    Err(error) => panic!("accept object read: {error}"),
-                };
-                stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut request = [0u8; 8192];
-                let mut received = 0;
-                let header_end = loop {
-                    if let Some(at) = request[..received]
+                }
+                let head_end = |request: &[u8]| {
+                    request
                         .windows(4)
                         .position(|bytes| bytes == b"\r\n\r\n")
-                    {
-                        break at + 4;
-                    }
-                    assert!(
-                        received < request.len(),
-                        "fixture request headers are too large"
-                    );
-                    let n = stream.read(&mut request[received..]).unwrap();
-                    assert_ne!(n, 0, "request ended before its headers");
-                    received += n;
+                        .map(|at| at + 4)
                 };
+                let mut ready = None;
+                let mut index = 0;
+                while index < waiting.len() {
+                    let (stream, request, received) = &mut waiting[index];
+                    if head_end(&request[..*received]).is_none() {
+                        assert!(
+                            *received < request.len(),
+                            "fixture request headers are too large"
+                        );
+                        match stream.read(&mut request[*received..]) {
+                            // A restarted statement abandons its read.
+                            Ok(0) => {
+                                waiting.swap_remove(index);
+                                continue;
+                            }
+                            Ok(count) => *received += count,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(error) => panic!("read request headers: {error}"),
+                        }
+                    }
+                    if let Some(end) = head_end(&request[..*received]) {
+                        ready = Some((index, end));
+                        break;
+                    }
+                    index += 1;
+                }
+                let Some((index, header_end)) = ready else {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                };
+                let (mut stream, request, received) = waiting.swap_remove(index);
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(crate::test_wait::HANG))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(crate::test_wait::HANG))
+                    .unwrap();
+                let request = *request;
                 let headers = std::str::from_utf8(&request[..header_end]).unwrap();
                 let mut words = headers.lines().next().unwrap().split_whitespace();
                 let method = words.next().unwrap();
@@ -197,6 +230,7 @@ impl HttpObjectServer {
                         };
                         let data = backing.body_bytes();
                         server_requests.fetch_add(1, Ordering::Relaxed);
+                        server_fetched.lock().unwrap().insert(key.to_owned());
                         while server_hold_response.load(Ordering::Acquire)
                             && !server_stop.load(Ordering::Acquire)
                         {
@@ -233,6 +267,7 @@ impl HttpObjectServer {
         Self {
             stop,
             requests,
+            fetched,
             uploads,
             hold_response,
             hold_upload_response,
@@ -458,7 +493,7 @@ pub(super) fn advance(engine: &mut Engine) {
 }
 
 pub(super) fn accept(engine: &mut Engine, listener: &TcpListener) -> (TcpStream, String) {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     let mut stream = loop {
         advance(engine);
         match listener.accept() {
@@ -475,7 +510,7 @@ pub(super) fn accept(engine: &mut Engine, listener: &TcpListener) -> (TcpStream,
 }
 
 pub(super) fn read_request(engine: &mut Engine, stream: &mut TcpStream) -> String {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::test_wait::deadline();
     stream.set_nonblocking(true).unwrap();
     let mut request = [0; 8192];
     let mut used = 0;
@@ -498,7 +533,7 @@ pub(super) fn read_request(engine: &mut Engine, stream: &mut TcpStream) -> Strin
     }
     stream.set_nonblocking(false).unwrap();
     stream
-        .set_write_timeout(Some(Duration::from_secs(2)))
+        .set_write_timeout(Some(crate::test_wait::HANG))
         .unwrap();
     core::str::from_utf8(&request[..used]).unwrap().to_owned()
 }
@@ -525,14 +560,21 @@ pub(super) fn reply(stream: &mut TcpStream, request: &str, body: &[u8]) {
 }
 
 pub(super) fn replace_uncached_blocks(engine: &mut Engine, config: &Config) {
+    replace_blocks(engine, config, 0);
+}
+
+/// Replaces the engine's block stack with one reading `config`'s object
+/// endpoint through a RAM cache of `cache_bytes` and no disk tier.
+pub(super) fn replace_blocks(engine: &mut Engine, config: &Config, cache_bytes: usize) {
     use crate::store::{OwnedObjectStore, StackPlan};
     let blocks = engine.ckpt.as_ref().unwrap().block_stack();
-    let mut budget = Budget::new(OwnedObjectStore::budget_bytes(config));
+    let plan = StackPlan::resolve(cache_bytes, 0);
+    let mut budget = Budget::new(OwnedObjectStore::budget_bytes(config) + plan.ram_budget_bytes());
     let provider = OwnedObjectStore::new(config, &mut budget, "blocks/").unwrap();
     *blocks.lock().unwrap() = crate::store::build_tiers(
         &mut budget,
         provider,
-        StackPlan::resolve(0, 0),
+        plan,
         std::path::Path::new(&config.data_dir),
     )
     .unwrap();

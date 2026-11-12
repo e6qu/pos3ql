@@ -48,9 +48,8 @@ pub struct Savepoint {
     pub constraint_completion_mark: usize,
     pub constraint_mode_mark: usize,
     pub constraint_rename_mark: usize,
-    pub deferred_trigger_mark: usize,
-    pub deferred_trigger_completion_mark: usize,
-    pub deferred_trigger_bytes_mark: usize,
+    pub trigger_event_mark: crate::sql::trigger_events::TriggerEventMark,
+    pub pending_row_event_mark: u64,
     /// The `failed` flag at savepoint time, restored on ROLLBACK TO.
     pub failed: bool,
 }
@@ -74,19 +73,34 @@ pub(crate) struct StatementMark {
     pub constraint_completions: usize,
     pub constraint_modes: usize,
     pub constraint_renames: usize,
-    pub deferred_triggers: usize,
-    pub deferred_trigger_completions: usize,
-    pub deferred_trigger_bytes: usize,
+    pub trigger_events: crate::sql::trigger_events::TriggerEventMark,
+    pub pending_row_events: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TransactionEffectMark([usize; 15]);
+pub(crate) struct TransactionEffectMark([u64; 15]);
 
 #[derive(Clone, Copy)]
 pub(super) struct WriteCompletionBoundary {
     pub(super) mark: StatementMark,
     pub(super) command: u32,
     pub(super) depth: u16,
+    /// The owner keeps its frame across a wait. A function called from a
+    /// statement that restarts on a wait still takes its writes' AFTER work,
+    /// so those triggers run on the engine, but nothing in it is retained.
+    pub(super) retained: bool,
+    /// The write is a top-level statement: its completion also runs the
+    /// transaction's immediate constraint checks, so a wait in them keeps
+    /// the finished AFTER events instead of running the statement again.
+    pub(super) statement_end: bool,
+}
+
+impl TxnState {
+    /// A frame that keeps its execution across a wait owns this command.
+    pub(super) fn retains_write_frame(&self) -> bool {
+        self.write_completion_boundary
+            .is_some_and(|boundary| boundary.retained)
+    }
 }
 
 pub(crate) fn establish_savepoint(
@@ -428,7 +442,25 @@ pub struct TxnState {
     transaction_start: Option<i64>,
     suspended_statement: Option<SuspendedStatement>,
     pub(super) write_completion_boundary: Option<WriteCompletionBoundary>,
+    /// The statement (trigger depth, command) whose data-modifying `WITH`
+    /// sub-statement is running: its foreign key checks wait for the whole
+    /// statement's end, as PostgreSQL fires them after the main statement.
+    pub(crate) with_sub_statement: Option<(u16, u32)>,
     pub(super) pending_write_completion: Option<super::exec::SuspendedWriteCompletion>,
+    /// The top-level `CALL` or `DO` body waiting at a saved statement. It
+    /// outlives transactions the body commits; ending the statement releases it.
+    pub(super) pending_procedure: Option<super::exec::SuspendedProcedure>,
+    /// The top-level write waiting inside its rows; its next run continues
+    /// at the unfinished row. Ending or canceling the statement releases it.
+    retained_write: Option<super::exec::RetainedWrite>,
+    /// The snapshot of the foreign key check that made the running statement
+    /// wait for a parent row's lock; that check runs again under it.
+    awaited_parent_read: Option<(ConstraintIdentity, crate::storage::ValidationRead)>,
+    /// Saved procedure bodies currently running, and whether a wait inside
+    /// one reached a position no saved frame can own, so the whole statement
+    /// must instead roll back and run again.
+    pub(super) running_procedures: u16,
+    pub(super) procedure_restart: bool,
     pub(super) cache_capacity_wait: Option<CacheCapacityWait>,
     pub(super) checkpoint_request: Option<crate::checkpoint::CheckpointRequest>,
     /// Current statement identity. Snapshot K sees own writes with identifiers
@@ -482,9 +514,12 @@ pub struct TxnState {
     completed_constraints: FixedVec<usize>,
     constraint_modes: FixedVec<ConstraintModeChange>,
     constraint_renames: FixedVec<ConstraintLifecycle>,
-    deferred_triggers: FixedVec<DeferredTriggerEvent>,
-    completed_deferred_triggers: FixedVec<usize>,
-    deferred_trigger_bytes: FixedBuf,
+    trigger_events: crate::sql::trigger_events::TriggerEventQueue,
+    pending_row_events: PendingRowEvents,
+    /// Where the event log ended when recent commands began, so a statement's
+    /// end scans only the events queued since. A command not listed scans
+    /// from the start.
+    command_event_starts: [(u32, u64); COMMAND_EVENT_STARTS],
     large_object_descriptors: FixedVec<LargeObjectDescriptor>,
 }
 
@@ -837,8 +872,65 @@ pub(crate) struct ConstraintModeChange {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DeferredTriggerTuple {
-    pub(crate) offset: u32,
+    pub(crate) offset: u64,
     pub(crate) length: u32,
+}
+
+/// Which side of a foreign key a queued check protects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForeignKeyCheck {
+    /// An inserted or updated referencing row's key must have a referenced
+    /// row (PostgreSQL's `RI_FKey_check_ins` and `RI_FKey_check_upd`).
+    Referencing,
+    /// A deleted or re-keyed referenced row's old key must not be referenced
+    /// any more (`RI_FKey_noaction_*` and, never deferred, `RI_FKey_restrict_*`).
+    Referenced { restrict: bool },
+    /// A deleted or re-keyed referenced row's referencing rows are deleted
+    /// or rewritten (`RI_FKey_cascade_*`, `RI_FKey_setnull_*`,
+    /// `RI_FKey_setdefault_*`), never deferred.
+    Action(ReferentialAction),
+}
+
+/// The rewriting referential actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReferentialAction {
+    Cascade,
+    SetNull,
+    SetDefault,
+}
+
+impl ForeignKeyCheck {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Referencing => 1,
+            Self::Referenced { restrict: false } => 2,
+            Self::Referenced { restrict: true } => 3,
+            Self::Action(ReferentialAction::Cascade) => 4,
+            Self::Action(ReferentialAction::SetNull) => 5,
+            Self::Action(ReferentialAction::SetDefault) => 6,
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Referencing),
+            2 => Some(Self::Referenced { restrict: false }),
+            3 => Some(Self::Referenced { restrict: true }),
+            4 => Some(Self::Action(ReferentialAction::Cascade)),
+            5 => Some(Self::Action(ReferentialAction::SetNull)),
+            6 => Some(Self::Action(ReferentialAction::SetDefault)),
+            _ => None,
+        }
+    }
+
+    /// PostgreSQL creates only the NO ACTION trigger with the constraint's
+    /// deferrability.
+    pub(crate) const fn deferrable(self) -> bool {
+        matches!(
+            self,
+            Self::Referencing | Self::Referenced { restrict: false }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -852,19 +944,168 @@ pub(crate) struct DeferredTriggerEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeferredTriggerKind {
+    /// `trigger_depth` and `command` name the statement whose end fires an
+    /// immediate event: a statement waiting between attempts of its rows
+    /// keeps its events from another statement at the same depth.
     Constraint {
         identity: ConstraintIdentity,
         effective_table: u16,
         trigger_depth: u16,
+        command: u32,
     },
     AfterRow {
         trigger_slot: u16,
         effective_table: u16,
         trigger_depth: u16,
+        command: u32,
+    },
+    /// A foreign key check queued among the row's AFTER triggers. `rowid`
+    /// names the written referencing row; a referenced-side check carries the
+    /// old key as its OLD image of `effective_table`.
+    ForeignKey {
+        identity: ConstraintIdentity,
+        check: ForeignKeyCheck,
+        effective_table: u16,
+        trigger_depth: u16,
+        command: u32,
+        rowid: u64,
     },
 }
 
 pub const DEFERRED_TRIGGER_BYTES: usize = 256 * 1024;
+
+/// Foreign key checks one written row may hold before its AFTER triggers are
+/// queued: its own foreign keys and those referencing its table.
+const PENDING_ROW_EVENTS: usize = 64;
+/// Recent commands whose first queued event position is remembered.
+const COMMAND_EVENT_STARTS: usize = 16;
+/// Old referenced keys those checks carry.
+const PENDING_ROW_EVENT_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy)]
+struct PendingRowEvent {
+    serial: u64,
+    table: u16,
+    trigger_name: crate::storage::SqlName,
+    kind: DeferredTriggerKind,
+    event: u8,
+    old: Option<(usize, usize)>,
+}
+
+/// The foreign key checks of the rows being written that wait for their AFTER
+/// triggers. Each carries a serial number, so a rollback to a mark drops only
+/// the checks pended after it.
+struct PendingRowEvents {
+    entries: FixedVec<PendingRowEvent>,
+    bytes: FixedBuf,
+    serial: u64,
+}
+
+impl PendingRowEvents {
+    const BUDGET_BYTES: usize =
+        PENDING_ROW_EVENTS * core::mem::size_of::<PendingRowEvent>() + PENDING_ROW_EVENT_BYTES;
+
+    fn new(budget: &mut Budget) -> Result<Self, BudgetError> {
+        Ok(Self {
+            entries: FixedVec::new(budget, "pending foreign key checks", PENDING_ROW_EVENTS)?,
+            bytes: FixedBuf::new(
+                budget,
+                "pending foreign key check keys",
+                PENDING_ROW_EVENT_BYTES,
+            )?,
+            serial: 0,
+        })
+    }
+
+    fn push(
+        &mut self,
+        table: u16,
+        trigger_name: crate::storage::SqlName,
+        kind: DeferredTriggerKind,
+        event: u8,
+        old: Option<&[u8]>,
+    ) -> Result<(), SqlError> {
+        let full = || {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "a written row holds more than {} foreign key checks or {} bytes of their keys",
+                PENDING_ROW_EVENTS,
+                PENDING_ROW_EVENT_BYTES
+            )
+        };
+        if self.entries.len() == self.entries.capacity() {
+            return Err(full());
+        }
+        let old = match old {
+            Some(bytes) => {
+                let offset = self.bytes.mark();
+                if !self.bytes.append(bytes) {
+                    return Err(full());
+                }
+                Some((offset, bytes.len()))
+            }
+            None => None,
+        };
+        self.serial += 1;
+        self.entries
+            .push(PendingRowEvent {
+                serial: self.serial,
+                table,
+                trigger_name,
+                kind,
+                event,
+                old,
+            })
+            .map_err(|_| full())
+    }
+
+    /// The next entry to queue: the oldest of another table, else the
+    /// first-named of `table` before `before`.
+    fn next(&self, table: &impl Fn(u16) -> bool, before: Option<&str>) -> Option<usize> {
+        if let Some(index) = self.entries.iter().position(|entry| !table(entry.table)) {
+            return Some(index);
+        }
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| before.is_none_or(|before| entry.trigger_name.as_str() < before))
+            .min_by(|(_, left), (_, right)| {
+                left.trigger_name
+                    .as_str()
+                    .cmp(right.trigger_name.as_str())
+                    .then(left.serial.cmp(&right.serial))
+            })
+            .map(|(index, _)| index)
+    }
+
+    fn remove(&mut self, index: usize) {
+        let len = self.entries.len();
+        self.entries.as_mut_slice()[index..].rotate_left(1);
+        let _ = self.entries.pop();
+        debug_assert_eq!(self.entries.len(), len - 1);
+        if self.entries.is_empty() {
+            self.bytes.clear();
+        }
+    }
+
+    fn rewind(&mut self, serial: u64) {
+        while self
+            .entries
+            .last()
+            .is_some_and(|entry| entry.serial > serial)
+        {
+            let _ = self.entries.pop();
+        }
+        if self.entries.is_empty() {
+            self.bytes.clear();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes.clear();
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct TransactionCapacity {
@@ -874,6 +1115,7 @@ pub(crate) struct TransactionCapacity {
     savepoints: usize,
     deferred_constraints: usize,
     deferred_trigger_bytes: usize,
+    trigger_event_spill_pages: usize,
     analyze: usize,
     tables: usize,
 }
@@ -887,6 +1129,9 @@ impl TransactionCapacity {
             savepoints: config.max_savepoints_per_transaction,
             deferred_constraints: config.max_deferred_constraints_per_transaction,
             deferred_trigger_bytes: config.deferred_trigger_bytes,
+            trigger_event_spill_pages: crate::sql::trigger_events::TriggerEventSpill::pages(
+                config.trigger_event_spill_bytes,
+            ),
             analyze: config.max_analyze_per_transaction,
             tables: config.max_tables.saturating_add(1),
         }
@@ -900,6 +1145,7 @@ impl TransactionCapacity {
             savepoints: DEFAULT_MAX_SAVEPOINTS,
             deferred_constraints: DEFAULT_MAX_DEFERRED_CONSTRAINTS,
             deferred_trigger_bytes: DEFERRED_TRIGGER_BYTES,
+            trigger_event_spill_pages: 0,
             analyze: DEFAULT_MAX_TXN_ANALYZE,
             tables: DEFAULT_MAX_TRUNCATE_TABLES,
         }
@@ -1033,17 +1279,11 @@ impl TxnState {
                     .deferred_constraints
                     .saturating_mul(core::mem::size_of::<ConstraintLifecycle>()),
             )
-            .saturating_add(
-                capacity
-                    .deferred_constraints
-                    .saturating_mul(core::mem::size_of::<DeferredTriggerEvent>()),
-            )
-            .saturating_add(
-                capacity
-                    .deferred_constraints
-                    .saturating_mul(core::mem::size_of::<usize>()),
-            )
-            .saturating_add(capacity.deferred_trigger_bytes)
+            .saturating_add(crate::sql::trigger_events::TriggerEventQueue::budget_bytes(
+                capacity.deferred_trigger_bytes,
+                capacity.trigger_event_spill_pages,
+            ))
+            .saturating_add(PendingRowEvents::BUDGET_BYTES)
             .saturating_add(
                 capacity
                     .descriptors
@@ -1140,7 +1380,13 @@ impl TxnState {
             transaction_start: None,
             suspended_statement: None,
             write_completion_boundary: None,
+            with_sub_statement: None,
             pending_write_completion: None,
+            pending_procedure: None,
+            retained_write: None,
+            awaited_parent_read: None,
+            running_procedures: 0,
+            procedure_restart: false,
             cache_capacity_wait: None,
             checkpoint_request: None,
             command_id: 1,
@@ -1205,21 +1451,13 @@ impl TxnState {
                 "txn_constraint_renames",
                 capacity.deferred_constraints,
             )?,
-            deferred_triggers: FixedVec::new(
+            trigger_events: crate::sql::trigger_events::TriggerEventQueue::new(
                 budget,
-                "txn_deferred_triggers",
-                capacity.deferred_constraints,
-            )?,
-            completed_deferred_triggers: FixedVec::new(
-                budget,
-                "txn_completed_deferred_triggers",
-                capacity.deferred_constraints,
-            )?,
-            deferred_trigger_bytes: FixedBuf::new(
-                budget,
-                "txn_deferred_trigger_bytes",
                 capacity.deferred_trigger_bytes,
+                capacity.trigger_event_spill_pages,
             )?,
+            pending_row_events: PendingRowEvents::new(budget)?,
+            command_event_starts: [(0, 0); COMMAND_EVENT_STARTS],
             large_object_descriptors,
         })
     }
@@ -1600,6 +1838,19 @@ impl TxnState {
         }
     }
 
+    /// Moves a suspended statement's armed deadline into the past, so tests
+    /// expire statement_timeout without racing the host clock. Returns the
+    /// deadline it replaced.
+    #[cfg(test)]
+    pub(crate) fn expire_suspended_statement_deadline(&mut self) -> i64 {
+        let suspended = self
+            .suspended_statement
+            .as_mut()
+            .expect("a suspended statement");
+        assert_ne!(suspended.deadline, 0, "statement_timeout is armed");
+        core::mem::replace(&mut suspended.deadline, 1)
+    }
+
     pub(crate) fn enter_statement_timeout(&mut self, entry: super::StatementTimeoutEntry) {
         if self.staged_commit.is_some() {
             super::query::disarm_timeout();
@@ -1678,15 +1929,49 @@ impl TxnState {
 
     pub(crate) fn release_suspended_statement(&mut self) {
         self.suspended_statement = None;
+        self.retained_write = None;
+        self.awaited_parent_read = None;
         self.cache_capacity_wait = None;
         self.checkpoint_request = None;
+    }
+
+    /// Runs as `command` again, an earlier command of the running statement
+    /// that a resumed write step continues.
+    pub(crate) fn resume_command(&mut self, command: u32) {
+        debug_assert!(command <= self.command_counter);
+        self.command_id = command;
     }
 
     pub fn begin_command(&mut self) -> Result<(), SqlError> {
         let command = self.next_command_identity()?;
         self.command_counter = command;
         self.command_id = command;
+        self.command_event_starts.copy_within(1.., 0);
+        self.command_event_starts[COMMAND_EVENT_STARTS - 1] = (command, self.trigger_events.end());
+        self.awaited_parent_read = None;
         Ok(())
+    }
+
+    /// Keeps the snapshot of the foreign key check `constraint` that waits for
+    /// a parent row's lock.
+    pub(crate) fn await_parent_read(
+        &mut self,
+        constraint: ConstraintIdentity,
+        read: crate::storage::ValidationRead,
+    ) {
+        self.awaited_parent_read = Some((constraint, read));
+    }
+
+    /// The snapshot the waiting foreign key check `constraint` started with.
+    pub(crate) fn take_awaited_parent_read(
+        &mut self,
+        constraint: ConstraintIdentity,
+    ) -> Option<crate::storage::ValidationRead> {
+        let (awaited, read) = self.awaited_parent_read?;
+        (awaited == constraint).then(|| {
+            self.awaited_parent_read = None;
+            read
+        })
     }
 
     #[cfg(test)]
@@ -1728,12 +2013,53 @@ impl TxnState {
         })
     }
 
+    /// Joins the nested command already running instead of starting one:
+    /// the `WITH` queries of a PL/pgSQL statement and its write share one
+    /// command and snapshot, so neither sees the other's changes.
+    pub(crate) fn share_trigger_sql<'txn>(
+        &'txn mut self,
+        storage: &Storage,
+    ) -> TriggerSqlScope<'txn> {
+        let parent_command = self.command_id;
+        let parent_depth = self.trigger_depth;
+        TriggerSqlScope {
+            transaction: self,
+            parent_command,
+            parent_depth,
+            _snapshot: storage.same_statement_snapshot(),
+        }
+    }
+
     pub(crate) fn trigger_depth(&self) -> u16 {
         self.trigger_depth
     }
 
+    #[cfg(test)]
     pub(crate) fn has_pending_write_completion(&self) -> bool {
         self.pending_write_completion.is_some()
+    }
+
+    /// Whether the waiting statement keeps work and output it already did:
+    /// its next run continues instead of starting again.
+    pub(crate) fn retains_statement_progress(&self) -> bool {
+        self.pending_write_completion.is_some() || self.retained_write.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_retained_write(&self) -> bool {
+        self.retained_write.is_some()
+    }
+
+    pub(super) fn retain_write(&mut self, write: super::exec::RetainedWrite) {
+        self.retained_write = Some(write);
+    }
+
+    pub(super) fn take_retained_write(&mut self) -> Option<super::exec::RetainedWrite> {
+        self.retained_write.take()
+    }
+
+    pub(crate) fn release_retained_write(&mut self) {
+        self.retained_write = None;
     }
 
     pub(crate) fn enter_extension_script(&mut self) {
@@ -2399,19 +2725,14 @@ impl TxnState {
         }
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "rewind restores every independently bounded constraint queue"
-    )]
     pub(crate) fn rewind_constraints(
         &mut self,
         obligation_mark: usize,
         completion_mark: usize,
         mode_mark: usize,
         rename_mark: usize,
-        trigger_mark: usize,
-        trigger_completion_mark: usize,
-        trigger_bytes_mark: usize,
+        trigger_events: crate::sql::trigger_events::TriggerEventMark,
+        pending_row_events: u64,
     ) {
         while self.deferred_constraints.len() > obligation_mark {
             self.deferred_constraints.pop();
@@ -2425,13 +2746,12 @@ impl TxnState {
         while self.constraint_renames.len() > rename_mark {
             self.constraint_renames.pop();
         }
-        while self.deferred_triggers.len() > trigger_mark {
-            self.deferred_triggers.pop();
+        self.trigger_events.rewind(trigger_events);
+        self.pending_row_events.rewind(pending_row_events);
+        let end = self.trigger_events.end();
+        for (_, start) in &mut self.command_event_starts {
+            *start = (*start).min(end);
         }
-        while self.completed_deferred_triggers.len() > trigger_completion_mark {
-            self.completed_deferred_triggers.pop();
-        }
-        self.deferred_trigger_bytes.truncate_to(trigger_bytes_mark);
     }
 
     pub(crate) fn queue_constraint_trigger(
@@ -2448,6 +2768,7 @@ impl TxnState {
                 identity,
                 effective_table,
                 trigger_depth: self.trigger_depth,
+                command: self.command_id,
             },
             event,
             updated_columns,
@@ -2470,6 +2791,7 @@ impl TxnState {
                 trigger_slot,
                 effective_table,
                 trigger_depth: self.trigger_depth,
+                command: self.command_id,
             },
             event,
             updated_columns,
@@ -2486,87 +2808,157 @@ impl TxnState {
         old: Option<&[u8]>,
         new: Option<&[u8]>,
     ) -> Result<(), SqlError> {
-        let bytes_mark = self.deferred_trigger_bytes.mark();
-        let mut append = |bytes: Option<&[u8]>| -> Result<Option<DeferredTriggerTuple>, SqlError> {
-            let Some(bytes) = bytes else { return Ok(None) };
-            let offset = self.deferred_trigger_bytes.mark();
-            if !self.deferred_trigger_bytes.append(bytes) {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "deferred trigger row images exceed {} bytes",
-                    self.deferred_trigger_bytes.capacity()
-                ));
-            }
-            Ok(Some(DeferredTriggerTuple {
-                offset: offset as u32,
-                length: bytes.len() as u32,
-            }))
-        };
-        let old = append(old)?;
-        let new = match append(new) {
-            Ok(new) => new,
-            Err(error) => {
-                self.deferred_trigger_bytes.truncate_to(bytes_mark);
-                return Err(error);
-            }
-        };
-        if self
-            .deferred_triggers
-            .push(DeferredTriggerEvent {
-                kind,
-                event,
-                updated_columns,
+        self.trigger_events
+            .push(
+                &DeferredTriggerEvent {
+                    kind,
+                    event,
+                    updated_columns,
+                    old: None,
+                    new: None,
+                },
                 old,
                 new,
-            })
-            .is_err()
-        {
-            self.deferred_trigger_bytes.truncate_to(bytes_mark);
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "transaction queues more than {} constraint trigger firings",
-                self.constraint_capacity()
-            ));
+            )
+            .map(|_| ())
+    }
+
+    /// Holds a foreign key check of the row being written until its AFTER
+    /// triggers are queued, so it takes its place among them by name.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a pending check carries its complete queued identity"
+    )]
+    pub(crate) fn pend_foreign_key_event(
+        &mut self,
+        table: u16,
+        trigger_name: crate::storage::SqlName,
+        identity: ConstraintIdentity,
+        check: ForeignKeyCheck,
+        effective_table: u16,
+        event: u8,
+        rowid: u64,
+        old: Option<&[u8]>,
+    ) -> Result<(), SqlError> {
+        let kind = DeferredTriggerKind::ForeignKey {
+            identity,
+            check,
+            effective_table,
+            trigger_depth: self.trigger_depth,
+            command: self.command_id,
+            rowid,
+        };
+        self.pending_row_events
+            .push(table, trigger_name, kind, event, old)
+    }
+
+    /// Queues the pending foreign key checks of tables other than `table`,
+    /// then those of `table` named before `before` (all of them without a
+    /// name), in name order.
+    pub(crate) fn queue_pending_row_events(
+        &mut self,
+        table: impl Fn(u16) -> bool,
+        before: Option<&str>,
+    ) -> Result<(), SqlError> {
+        while let Some(index) = self.pending_row_events.next(&table, before) {
+            let entry = self.pending_row_events.entries[index];
+            let old = entry.old.map(|(offset, length)| {
+                &self.pending_row_events.bytes.readable()[offset..offset + length]
+            });
+            self.trigger_events.push(
+                &DeferredTriggerEvent {
+                    kind: entry.kind,
+                    event: entry.event,
+                    updated_columns: ColumnSet::EMPTY,
+                    old: None,
+                    new: None,
+                },
+                old,
+                None,
+            )?;
+            self.pending_row_events.remove(index);
         }
         Ok(())
     }
 
-    pub(crate) fn deferred_trigger_events(&self) -> &[DeferredTriggerEvent] {
-        &self.deferred_triggers
-    }
-
-    pub(crate) fn has_deferred_triggers(&self) -> bool {
-        self.deferred_triggers
-            .iter()
-            .enumerate()
-            .any(|(index, _)| !self.completed_deferred_triggers.contains(&index))
-    }
-
-    pub(crate) fn deferred_trigger_is_complete(&self, index: usize) -> bool {
-        self.completed_deferred_triggers.contains(&index)
-    }
-
-    pub(crate) fn deferred_trigger_bytes(&self, tuple: DeferredTriggerTuple) -> &[u8] {
-        &self.deferred_trigger_bytes.readable()
-            [tuple.offset as usize..tuple.offset as usize + tuple.length as usize]
-    }
-
-    pub(crate) fn complete_deferred_trigger(&mut self, index: usize) -> Result<(), SqlError> {
-        if self.completed_deferred_triggers.contains(&index) {
-            return Ok(());
+    /// Queues every pending foreign key check in the order it was written.
+    pub(crate) fn queue_all_pending_row_events(&mut self) -> Result<(), SqlError> {
+        while !self.pending_row_events.entries.is_empty() {
+            let entry = self.pending_row_events.entries[0];
+            let old = entry.old.map(|(offset, length)| {
+                &self.pending_row_events.bytes.readable()[offset..offset + length]
+            });
+            self.trigger_events.push(
+                &DeferredTriggerEvent {
+                    kind: entry.kind,
+                    event: entry.event,
+                    updated_columns: ColumnSet::EMPTY,
+                    old: None,
+                    new: None,
+                },
+                old,
+                None,
+            )?;
+            self.pending_row_events.remove(0);
         }
-        self.completed_deferred_triggers.push(index).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "transaction completes more than {} deferred trigger firings",
-                self.constraint_capacity()
-            )
-        })
+        Ok(())
     }
 
-    /// Reclaims completed queue entries only when no SQL savepoint can make
-    /// them live again. Completion markers otherwise form the undo state for
-    /// `ROLLBACK TO SAVEPOINT`.
+    pub(crate) fn attach_trigger_event_spill(
+        &mut self,
+        spill: crate::sql::trigger_events::SharedTriggerEventSpill,
+    ) {
+        self.trigger_events.attach_spill(spill);
+    }
+
+    /// The queued event `id`, the identity of the next one, and whether it
+    /// fired.
+    pub(crate) fn trigger_event(
+        &mut self,
+        id: u64,
+    ) -> Result<(DeferredTriggerEvent, u64, bool), SqlError> {
+        self.trigger_events.event(id)
+    }
+
+    /// The first event `command` can have queued.
+    pub(crate) fn trigger_events_from(&self, command: u32) -> u64 {
+        self.command_event_starts
+            .iter()
+            .rev()
+            .find(|(started, _)| *started == command)
+            .map_or(0, |(_, start)| *start)
+    }
+
+    /// The identity one past the last queued event.
+    pub(crate) fn trigger_events_end(&self) -> u64 {
+        self.trigger_events.end()
+    }
+
+    pub(crate) fn has_deferred_triggers(&mut self) -> Result<bool, SqlError> {
+        Ok(!self.pending_row_events.entries.is_empty() || self.trigger_events.has_waiting()?)
+    }
+
+    /// Copies a queued row image into `arena`.
+    pub(crate) fn trigger_event_tuple<'a>(
+        &mut self,
+        tuple: DeferredTriggerTuple,
+        arena: &'a crate::mem::arena::Arena,
+    ) -> Result<&'a [u8], SqlError> {
+        let bytes = arena
+            .alloc_slice_with(tuple.length as usize, |_| 0u8)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        self.trigger_events.tuple(tuple, bytes)?;
+        Ok(bytes)
+    }
+
+    /// Marks a queued event fired. Statement and savepoint rollback re-arm it.
+    pub(crate) fn fire_trigger_event(&mut self, id: u64) -> Result<(), SqlError> {
+        self.trigger_events.fire(id)
+    }
+
+    /// Empties the event queue once every event fired and no SQL savepoint
+    /// can make one live again. Fired events otherwise form the undo state
+    /// for `ROLLBACK TO SAVEPOINT`.
     pub(crate) fn compact_completed_constraints(&mut self) {
         if !self.savepoints.is_empty() {
             return;
@@ -2584,31 +2976,11 @@ impl TxnState {
             self.deferred_constraints.pop();
         }
         self.completed_constraints.clear();
-
-        let mut event_write = 0usize;
-        let mut byte_write = 0usize;
-        for read in 0..self.deferred_triggers.len() {
-            if self.completed_deferred_triggers.contains(&read) {
-                continue;
-            }
-            let mut event = self.deferred_triggers[read];
-            for tuple in [&mut event.old, &mut event.new].into_iter().flatten() {
-                let source = tuple.offset as usize;
-                let length = tuple.length as usize;
-                self.deferred_trigger_bytes
-                    .filled_mut()
-                    .copy_within(source..source + length, byte_write);
-                tuple.offset = byte_write as u32;
-                byte_write += length;
-            }
-            self.deferred_triggers[event_write] = event;
-            event_write += 1;
+        if self.pending_row_events.entries.is_empty()
+            && matches!(self.trigger_events.has_waiting(), Ok(false))
+        {
+            self.trigger_events.clear();
         }
-        while self.deferred_triggers.len() > event_write {
-            self.deferred_triggers.pop();
-        }
-        self.deferred_trigger_bytes.truncate_to(byte_write);
-        self.completed_deferred_triggers.clear();
     }
 
     /// Discards this transaction's buffered notifications and listen ops (at
@@ -2667,9 +3039,8 @@ impl TxnState {
             constraint_completion_mark: self.completed_constraints.len(),
             constraint_mode_mark: self.constraint_modes.len(),
             constraint_rename_mark: self.constraint_renames.len(),
-            deferred_trigger_mark: self.deferred_triggers.len(),
-            deferred_trigger_completion_mark: self.completed_deferred_triggers.len(),
-            deferred_trigger_bytes_mark: self.deferred_trigger_bytes.mark(),
+            trigger_event_mark: self.trigger_events.mark(),
+            pending_row_event_mark: self.pending_row_events.serial,
             failed: self.failed,
         };
         self.savepoints.push(sp).map_err(|_| {
@@ -2698,29 +3069,28 @@ impl TxnState {
             constraint_completions: self.completed_constraints.len(),
             constraint_modes: self.constraint_modes.len(),
             constraint_renames: self.constraint_renames.len(),
-            deferred_triggers: self.deferred_triggers.len(),
-            deferred_trigger_completions: self.completed_deferred_triggers.len(),
-            deferred_trigger_bytes: self.deferred_trigger_bytes.mark(),
+            trigger_events: self.trigger_events.mark(),
+            pending_row_events: self.pending_row_events.serial,
         }
     }
 
     pub(crate) fn transaction_effect_mark(&self) -> TransactionEffectMark {
         TransactionEffectMark([
-            self.touched.len(),
-            self.truncates.len(),
-            self.ddl.len(),
-            self.statistics_undo.len(),
-            self.pending_notifies.len(),
-            self.notify_payloads.mark(),
-            self.pending_listen_ops.len(),
-            self.subscription_advances.len(),
-            self.deferred_constraints.len(),
-            self.completed_constraints.len(),
-            self.constraint_modes.len(),
-            self.constraint_renames.len(),
-            self.deferred_triggers.len(),
-            self.completed_deferred_triggers.len(),
-            self.deferred_trigger_bytes.mark(),
+            self.touched.len() as u64,
+            self.truncates.len() as u64,
+            self.ddl.len() as u64,
+            self.statistics_undo.len() as u64,
+            self.pending_notifies.len() as u64,
+            self.notify_payloads.mark() as u64,
+            self.pending_listen_ops.len() as u64,
+            self.subscription_advances.len() as u64,
+            self.deferred_constraints.len() as u64,
+            self.completed_constraints.len() as u64,
+            self.constraint_modes.len() as u64,
+            self.constraint_renames.len() as u64,
+            self.trigger_events.end(),
+            u64::from(self.trigger_events.mark().fired),
+            self.pending_row_events.serial,
         ])
     }
 
@@ -2773,9 +3143,8 @@ impl TxnState {
             boundary.constraint_completion_mark,
             boundary.constraint_mode_mark,
             boundary.constraint_rename_mark,
-            boundary.deferred_trigger_mark,
-            boundary.deferred_trigger_completion_mark,
-            boundary.deferred_trigger_bytes_mark,
+            boundary.trigger_event_mark,
+            boundary.pending_row_event_mark,
         );
         self.rewind_notifications(
             boundary.notify_mark,
@@ -2994,6 +3363,31 @@ impl TxnState {
             ));
         }
         let undo = storage.write_pending_image(target, rowid, command, image, statistics)?;
+        if let Err(error) = self.touch(target.table() as u32, rowid, undo) {
+            storage.restore_pending(target.table(), rowid, self.txid, undo);
+            return Err(error);
+        }
+        Ok(undo)
+    }
+
+    /// Deletes a row an `UPDATE` or `MERGE` moves to another partition. The
+    /// storage marks the deletion as a move so concurrent lockers fail with
+    /// PostgreSQL's `40001` instead of skipping the row.
+    pub(crate) fn move_row_out(
+        &mut self,
+        storage: &crate::storage::Storage,
+        target: crate::storage::TableDefinitionTarget,
+        rowid: u64,
+        command: u32,
+        statistics: crate::storage::RowWriteStatistics,
+    ) -> Result<crate::storage::PendingWriteUndo, SqlError> {
+        if target.transaction() != self.txid {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::SERIALIZATION_FAILURE,
+                "row definition selection belongs to another transaction"
+            ));
+        }
+        let undo = storage.write_pending_move_out(target, rowid, command, statistics)?;
         if let Err(error) = self.touch(target.table() as u32, rowid, undo) {
             storage.restore_pending(target.table(), rowid, self.txid, undo);
             return Err(error);
@@ -3278,7 +3672,12 @@ impl TxnState {
 
     pub fn clear(&mut self) {
         self.pending_write_completion = None;
+        self.pending_procedure = None;
+        self.retained_write = None;
+        self.awaited_parent_read = None;
+        self.procedure_restart = false;
         self.write_completion_boundary = None;
+        self.with_sub_statement = None;
         self.concurrent_index = None;
         self.immediate_index_utility = None;
         if let Some(owner) = &self.plan_invalidations {
@@ -3325,9 +3724,9 @@ impl TxnState {
         self.completed_constraints.clear();
         self.constraint_modes.clear();
         self.constraint_renames.clear();
-        self.deferred_triggers.clear();
-        self.completed_deferred_triggers.clear();
-        self.deferred_trigger_bytes.clear();
+        self.trigger_events.clear();
+        self.pending_row_events.clear();
+        self.command_event_starts = [(0, 0); COMMAND_EVENT_STARTS];
         for descriptor in self.large_object_descriptors.iter_mut() {
             descriptor.active = false;
         }

@@ -582,7 +582,7 @@ pub(crate) mod tests {
 
     pub(crate) fn request(stream: &mut TcpStream, condition: Precondition<'_>) -> Vec<u8> {
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(crate::test_wait::HANG))
             .unwrap();
         let mut bytes = Vec::new();
         let mut part = [0; 8192];
@@ -645,7 +645,7 @@ pub(crate) mod tests {
                 vec![b'b'; 192 * 1024]
             );
             reply(&mut second, "second");
-            held.recv_timeout(Duration::from_secs(5)).unwrap();
+            held.recv_timeout(crate::test_wait::HANG).unwrap();
             reply(&mut first, "first");
         });
         let mut budget = Budget::new(Uploads::budget_bytes(
@@ -675,7 +675,7 @@ pub(crate) mod tests {
                 uploads.enqueue("full", b"x", Condition::ImmutableCreate),
                 Err(UploadError::SlotsExhausted)
             ));
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = crate::test_wait::deadline();
             loop {
                 assert!(
                     Instant::now() < deadline,

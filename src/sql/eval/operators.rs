@@ -9,6 +9,7 @@ use crate::sql::numeric::{self, Numeric};
 use crate::sql::types::{Datum, Interval, RangeKind, RecordField};
 use crate::sql::{array, datetime, range};
 use crate::sql_err;
+use core::cmp::Ordering;
 
 use super::cast_to;
 use crate::sql::types::ColType;
@@ -17,8 +18,7 @@ use super::{
     SqlError, arena_full, as_f64, as_i64, bad_text, cast_to_text, concat, datum_f64, datum_numeric,
     division_by_zero, interval_cmp_value, json_exists, json_get, json_path, jsonb_concat,
     jsonb_delete, jsonb_delete_path, jsonpath_operator, like_match, num_factor, out_of_range,
-    overflow, parse_bool, parse_uuid, sqlstate, to_numeric, type_mismatch, type_name_of,
-    validate_bits,
+    overflow, parse_bool, parse_uuid, sqlstate, to_numeric, type_name_of, validate_bits,
 };
 
 /// Only ordering and equality can enter the collated comparator. Quantified
@@ -44,6 +44,18 @@ impl Comparison {
             BinaryOp::GtEq => Self::GreaterEqual,
             _ => return None,
         })
+    }
+
+    /// Whether two values in `ordering` satisfy this comparison.
+    pub(crate) fn holds(self, ordering: core::cmp::Ordering) -> bool {
+        match self {
+            Self::Equal => ordering.is_eq(),
+            Self::NotEqual => ordering.is_ne(),
+            Self::Less => ordering.is_lt(),
+            Self::LessEqual => ordering.is_le(),
+            Self::Greater => ordering.is_gt(),
+            Self::GreaterEqual => ordering.is_ge(),
+        }
     }
 
     fn binary(self) -> BinaryOp {
@@ -92,21 +104,13 @@ pub(crate) fn compare_text_collated<'a>(
         Collation::Default | Collation::Catalog(_) => catalog
             .ok_or_else(|| {
                 sql_err!(
-                    sqlstate::INTERNAL_ERROR,
+                    sqlstate::FEATURE_NOT_SUPPORTED,
                     "database collation comparator is unavailable"
                 )
             })?
             .compare_text(collation, left, right)?,
     };
-    let out = match operator {
-        Comparison::Equal => ordering.is_eq(),
-        Comparison::NotEqual => ordering.is_ne(),
-        Comparison::Less => ordering.is_lt(),
-        Comparison::LessEqual => ordering.is_le(),
-        Comparison::Greater => ordering.is_gt(),
-        Comparison::GreaterEqual => ordering.is_ge(),
-    };
-    Ok(Datum::Bool(out))
+    Ok(Datum::Bool(operator.holds(ordering)))
 }
 
 /// An unknown-type literal facing an array operand takes the array's type, the
@@ -135,13 +139,13 @@ fn acl_contains(left: Datum<'_>, right: Datum<'_>) -> Result<Datum<'static>, Sql
         raw,
     } = left
     else {
-        return Err(type_mismatch("aclcontains", &left));
+        return Err(super::operand_type_mismatch(&left));
     };
     crate::sql::acl::validate_array_shape(raw)?;
     let right_item = match right {
         Datum::AclItem(item) => Some(item),
         Datum::Text(_) => None,
-        _ => return Err(type_mismatch("aclcontains", &right)),
+        _ => return Err(super::operand_type_mismatch(&right)),
     };
     let right_text = match right {
         Datum::Text(value) => Some(crate::sql::acl::parse(value)?),
@@ -178,6 +182,7 @@ pub(crate) fn array_set_op<'a>(
     operator: BinaryOp,
     l: Datum<'a>,
     r: Datum<'a>,
+    catalog: Option<&dyn super::CatalogAccess>,
 ) -> Result<Datum<'a>, SqlError> {
     use BinaryOp::{ContainedBy, Contains, Overlaps};
     if l.is_null() || r.is_null() {
@@ -208,7 +213,9 @@ pub(crate) fn array_set_op<'a>(
             return Ok(false);
         }
         for v in array::elements(raw, elem) {
-            if !v.is_null() && compare_datums(needle, &v)?.is_eq() {
+            if !v.is_null()
+                && compare_datums_with_catalog(Collation::C, catalog, needle, &v)?.is_eq()
+            {
                 return Ok(true);
             }
         }
@@ -340,7 +347,7 @@ pub(crate) fn range_setop<'a>(
         BinaryOp::Add => range::union(lt, rt, lk, arena)?,
         BinaryOp::Sub => range::difference(lt, rt, lk, arena)?,
         BinaryOp::Mul => range::intersect(lt, rt, lk, arena)?,
-        _ => return Err(type_mismatch("range operator", &l)),
+        _ => return Err(super::operand_type_mismatch(&l)),
     };
     Ok(Datum::Range { text, kind: lk })
 }
@@ -385,7 +392,7 @@ fn range_contains<'a>(
 fn as_range<'a>(d: &Datum<'a>) -> Result<(&'a str, RangeKind), SqlError> {
     match d {
         Datum::Range { text, kind } => Ok((text, *kind)),
-        other => Err(type_mismatch("range operator", other)),
+        other => Err(super::operand_type_mismatch(other)),
     }
 }
 
@@ -488,9 +495,9 @@ pub(crate) fn bit_shift<'a>(
         return Ok(Datum::Null);
     }
     let Datum::Bit { bits, varying } = l else {
-        return Err(type_mismatch("bit-string shift", &l));
+        return Err(super::operand_type_mismatch(&l));
     };
-    let count = as_i64(&r).ok_or_else(|| type_mismatch("bit-string shift amount", &r))?;
+    let count = as_i64(&r).ok_or_else(|| super::operand_type_mismatch(&r))?;
     // `<<` moves bits toward the most-significant (left) end.
     let left = if matches!(operator, BinaryOp::Shl) {
         count
@@ -558,6 +565,70 @@ fn compare_numeric_int(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlE
     }
 }
 
+/// PostgreSQL's `array_cmp`: contents first, element by element with
+/// `compare_elements` (NULL equals NULL and follows present values), then
+/// element count, dimensionality, dimension lengths and lower bounds.
+fn compare_array_values(
+    ra: &[u8],
+    rb: &[u8],
+    element: crate::sql::types::ArrElem,
+    compare_elements: &mut dyn FnMut(&Datum<'_>, &Datum<'_>) -> Result<Ordering, SqlError>,
+) -> Result<Ordering, SqlError> {
+    let (length_a, length_b) = (array::len(ra), array::len(rb));
+    if element == crate::sql::types::ArrElem::Record {
+        // Record elements keep their structure, which `record_cmp` needs;
+        // their decoded form is rendered text.
+        for (x, y) in array::element_payloads(ra).zip(array::element_payloads(rb)) {
+            let c = match (array::record_element(x), array::record_element(y)) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(x), Some(y)) => {
+                    crate::sql::exec::compare_projected_values(x, y, compare_elements)?
+                }
+            };
+            if !c.is_eq() {
+                return Ok(c);
+            }
+        }
+    } else {
+        for (x, y) in array::elements(ra, element).zip(array::elements(rb, element)) {
+            let c = match (x, y) {
+                (Datum::Null, Datum::Null) => Ordering::Equal,
+                (Datum::Null, _) => Ordering::Greater,
+                (_, Datum::Null) => Ordering::Less,
+                _ => compare_elements(&x, &y)?,
+            };
+            if !c.is_eq() {
+                return Ok(c);
+            }
+        }
+    }
+    let content = length_a.cmp(&length_b);
+    if !content.is_eq() {
+        return Ok(content);
+    }
+    let shape_a = array::shape(ra).expect("array datum invariant");
+    let shape_b = array::shape(rb).expect("array datum invariant");
+    let dimensions = shape_a.dimension_count().cmp(&shape_b.dimension_count());
+    if !dimensions.is_eq() {
+        return Ok(dimensions);
+    }
+    for index in 0..shape_a.dimension_count() {
+        let dimensions = shape_a.dimension(index).cmp(&shape_b.dimension(index));
+        if !dimensions.is_eq() {
+            return Ok(dimensions);
+        }
+    }
+    for index in 0..shape_a.dimension_count() {
+        let bounds = shape_a.lower_bound(index).cmp(&shape_b.lower_bound(index));
+        if !bounds.is_eq() {
+            return Ok(bounds);
+        }
+    }
+    Ok(Ordering::Equal)
+}
+
 /// PostgreSQL's error when an array operation needs equality on an element
 /// type that has none (`json`, `refcursor`).
 pub(crate) fn could_not_identify_equality(element: ColType) -> SqlError {
@@ -604,6 +675,22 @@ pub fn compare_datums_collated(
     left: &Datum<'_>,
     right: &Datum<'_>,
 ) -> Result<core::cmp::Ordering, SqlError> {
+    if needs_catalog_order(left, right) {
+        return storage.with_comparison_scratch(|scratch| {
+            compare_stored(storage, txid, collation, scratch, left, right)
+        });
+    }
+    compare_collated_leaf(storage, txid, collation, left, right)
+}
+
+/// [`compare_datums_collated`] for values that hold no stored named composite.
+fn compare_collated_leaf(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    collation: Collation,
+    left: &Datum<'_>,
+    right: &Datum<'_>,
+) -> Result<core::cmp::Ordering, SqlError> {
     if matches!((left, right), (Datum::Enum { .. }, Datum::Enum { .. })) {
         return Ok(super::super::enum_values::sort(*left, storage, txid)?
             .total_cmp(&super::super::enum_values::sort(*right, storage, txid)?));
@@ -620,6 +707,152 @@ pub fn compare_datums_collated(
     storage.compare_text(collation, left, right)
 }
 
+/// Whether ordering two values needs the catalog. A named composite stored
+/// as text (alone, as an array element, or inside a record field) orders
+/// field by field by PostgreSQL's `record_cmp`, and only the catalog knows
+/// its fields; its text order puts `(10,1)` before `(9,1)`.
+pub(crate) fn needs_catalog_order(left: &Datum<'_>, right: &Datum<'_>) -> bool {
+    holds_composite_text(left) || holds_composite_text(right)
+}
+
+fn holds_composite_text(value: &Datum<'_>) -> bool {
+    match value {
+        Datum::CompositeText { .. } => true,
+        Datum::Array { element, .. } => {
+            matches!(element.to_coltype(), ColType::Composite(_))
+        }
+        Datum::Record(fields) | Datum::Composite { fields, .. } => fields
+            .iter()
+            .any(|field| holds_composite_text(&field.value)),
+        _ => false,
+    }
+}
+
+fn catalog_order_unavailable() -> SqlError {
+    sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "named composite catalog access is unavailable"
+    )
+}
+
+/// Orders values that may hold stored named composites, decoding each one's
+/// fields into `scratch` when the comparison reaches it. Records follow
+/// `record_cmp` with their fields under the default collation (the one a row
+/// type's attributes carry); arrays compare element by element as
+/// [`compare_array_values`] does, each element's decoded fields released once
+/// the element is compared.
+fn compare_stored(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    collation: Collation,
+    scratch: &crate::mem::arena::Arena,
+    left: &Datum<'_>,
+    right: &Datum<'_>,
+) -> Result<core::cmp::Ordering, SqlError> {
+    fn decode<'s>(
+        storage: &crate::storage::Storage,
+        txid: u32,
+        scratch: &'s crate::mem::arena::Arena,
+        value: &Datum<'_>,
+    ) -> Result<Option<Datum<'s>>, SqlError> {
+        let Datum::CompositeText {
+            slot,
+            physical_fields,
+            text,
+        } = *value
+        else {
+            return Ok(None);
+        };
+        let text = scratch
+            .alloc_str(text)
+            .map_err(|_| comparison_scratch_full())?;
+        crate::sql::exec::decode_stored_composite_text(
+            text,
+            slot,
+            physical_fields,
+            storage,
+            txid,
+            scratch,
+        )
+        .map(Some)
+    }
+    if let Some(left) = decode(storage, txid, scratch, left)? {
+        return compare_stored(storage, txid, collation, scratch, &left, right);
+    }
+    if let Some(right) = decode(storage, txid, scratch, right)? {
+        return compare_stored(storage, txid, collation, scratch, left, &right);
+    }
+    match (left, right) {
+        (
+            Datum::Record(a) | Datum::Composite { fields: a, .. },
+            Datum::Record(b) | Datum::Composite { fields: b, .. },
+        ) => {
+            for (column, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                check_record_field_types(
+                    x.type_oid,
+                    y.type_oid,
+                    column,
+                    false,
+                    &builtin_record_field_type_name,
+                )?;
+                let ordering = match (x.value.is_null(), y.value.is_null()) {
+                    (true, true) => core::cmp::Ordering::Equal,
+                    (true, false) => core::cmp::Ordering::Greater,
+                    (false, true) => core::cmp::Ordering::Less,
+                    (false, false) => compare_stored(
+                        storage,
+                        txid,
+                        Collation::Default,
+                        scratch,
+                        &x.value,
+                        &y.value,
+                    )?,
+                };
+                if !ordering.is_eq() {
+                    return Ok(ordering);
+                }
+            }
+            if a.len() != b.len() {
+                return Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "cannot compare record types with different numbers of columns"
+                ));
+            }
+            Ok(core::cmp::Ordering::Equal)
+        }
+        (
+            Datum::Array {
+                element,
+                raw: left_raw,
+            },
+            Datum::Array {
+                element: right_element,
+                raw: right_raw,
+            },
+        ) if needs_catalog_order(left, right) => {
+            if element != right_element {
+                return compare_datums(left, right);
+            }
+            compare_array_values(left_raw, right_raw, *element, &mut |x, y| {
+                let mark = scratch.mark();
+                let ordering = compare_stored(storage, txid, collation, scratch, x, y);
+                // SAFETY: only the ordering leaves this element comparison;
+                // nothing allocated above the mark is referenced afterward.
+                unsafe { scratch.rewind_to(mark) };
+                ordering
+            })
+        }
+        _ => compare_collated_leaf(storage, txid, collation, left, right),
+    }
+}
+
+fn comparison_scratch_full() -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "named composite comparison exceeds its reserved scratch memory"
+    )
+}
+
 /// The evaluator-facing form of [`compare_datums_collated`].  Aggregate and
 /// expression execution have a catalog capability rather than a `Storage`
 /// reference, but must retain exactly the same default-collation contract.
@@ -629,6 +862,11 @@ pub fn compare_datums_with_catalog(
     left: &Datum<'_>,
     right: &Datum<'_>,
 ) -> Result<core::cmp::Ordering, SqlError> {
+    if needs_catalog_order(left, right) {
+        return catalog
+            .ok_or_else(catalog_order_unavailable)?
+            .compare_stored(collation, left, right);
+    }
     let (left, right) = match (left, right) {
         (Datum::Text(left), Datum::Text(right)) => (*left, *right),
         (Datum::Bpchar(left), Datum::Bpchar(right)) => {
@@ -647,7 +885,7 @@ pub fn compare_datums_with_catalog(
         Collation::Default | Collation::Catalog(_) => catalog
             .ok_or_else(|| {
                 sql_err!(
-                    sqlstate::INTERNAL_ERROR,
+                    sqlstate::FEATURE_NOT_SUPPORTED,
                     "database collation comparator is unavailable"
                 )
             })?
@@ -958,7 +1196,9 @@ pub(crate) fn compare_datums_as(
     l: &Datum,
     r: &Datum,
 ) -> Result<core::cmp::Ordering, SqlError> {
-    use core::cmp::Ordering;
+    if needs_catalog_order(l, r) {
+        return Err(catalog_order_unavailable());
+    }
     if l.catalog_oid().is_some() || r.catalog_oid().is_some() {
         let operand =
             |value: &Datum| -> Result<Option<u32>, SqlError> {
@@ -1077,35 +1317,7 @@ pub(crate) fn compare_datums_as(
         (
             Datum::Record(a) | Datum::Composite { fields: a, .. },
             Datum::Record(b) | Datum::Composite { fields: b, .. },
-        ) => {
-            // Field-wise, with a NULL field comparing greater (PostgreSQL
-            // record ordering); shorter record sorts first on a common prefix.
-            for i in 0..a.len().min(b.len()) {
-                let (x, y) = (&a[i].value, &b[i].value);
-                let c = match (x.is_null(), y.is_null()) {
-                    (true, true) => Ordering::Equal,
-                    (true, false) => Ordering::Greater,
-                    (false, true) => Ordering::Less,
-                    (false, false) => compare_datums(x, y)?,
-                };
-                if !c.is_eq() {
-                    return Ok(c);
-                }
-            }
-            a.len().cmp(&b.len())
-        }
-        (
-            Datum::CompositeText {
-                slot: left_slot,
-                text: left,
-                ..
-            },
-            Datum::CompositeText {
-                slot: right_slot,
-                text: right,
-                ..
-            },
-        ) => left_slot.cmp(right_slot).then_with(|| left.cmp(right)),
+        ) => record_ordering(a, b, false, &builtin_record_field_type_name)?,
         (Datum::Array { element, raw: ra }, Datum::Array { raw: rb, .. }) => {
             let element_type = element.to_coltype();
             if matches!(operator, "=" | "<>") && !element_type.has_default_equality() {
@@ -1130,43 +1342,7 @@ pub(crate) fn compare_datums_as(
                     element_type.name()
                 ));
             }
-            // PostgreSQL compares contents first, then dimensionality and bounds.
-            let (length_a, length_b) = (array::len(ra), array::len(rb));
-            for (x, y) in array::elements(ra, *element).zip(array::elements(rb, *element)) {
-                // Within an array, NULL equals NULL and follows present values.
-                let c = match (x, y) {
-                    (Datum::Null, Datum::Null) => Ordering::Equal,
-                    (Datum::Null, _) => Ordering::Greater,
-                    (_, Datum::Null) => Ordering::Less,
-                    _ => compare_datums(&x, &y)?,
-                };
-                if !c.is_eq() {
-                    return Ok(c);
-                }
-            }
-            let content = length_a.cmp(&length_b);
-            if !content.is_eq() {
-                return Ok(content);
-            }
-            let shape_a = array::shape(ra).expect("array datum invariant");
-            let shape_b = array::shape(rb).expect("array datum invariant");
-            let dimensions = shape_a.dimension_count().cmp(&shape_b.dimension_count());
-            if !dimensions.is_eq() {
-                return Ok(dimensions);
-            }
-            for index in 0..shape_a.dimension_count() {
-                let dimensions = shape_a.dimension(index).cmp(&shape_b.dimension(index));
-                if !dimensions.is_eq() {
-                    return Ok(dimensions);
-                }
-            }
-            for index in 0..shape_a.dimension_count() {
-                let bounds = shape_a.lower_bound(index).cmp(&shape_b.lower_bound(index));
-                if !bounds.is_eq() {
-                    return Ok(bounds);
-                }
-            }
-            Ordering::Equal
+            compare_array_values(ra, rb, *element, &mut |x, y| compare_datums(x, y))?
         }
         (Datum::Date(a), Datum::Timestamp(b)) => date_timestamp_for_compare(*a).cmp(b),
         (Datum::Timestamp(a), Datum::Date(b)) => a.cmp(&date_timestamp_for_compare(*b)),
@@ -1188,9 +1364,7 @@ pub(crate) fn compare_datums_as(
         // Enum values order by their member sort key (PostgreSQL's
         // enumsortorder), never by label text. The planner rejects comparing
         // two different enum types, so equal sorts here mean equal members.
-        (Datum::Enum { sort: a, .. }, Datum::Enum { sort: b, .. }) => {
-            a.partial_cmp(b).unwrap_or(Ordering::Equal)
-        }
+        (Datum::Enum { sort: a, .. }, Datum::Enum { sort: b, .. }) => a.total_cmp(b),
         // Intervals compare by canonical microsecond value (PostgreSQL's
         // interval_cmp_value: months count as 30 days, days as 24 hours), so
         // `1 month` = `30 days` = `720 hours`.
@@ -1967,7 +2141,7 @@ fn narrow_int<'a>(v: i64, l: &Datum, r: &Datum) -> Result<Datum<'a>, SqlError> {
 fn as_multirange<'a>(d: &Datum<'a>) -> Result<(&'a str, RangeKind), SqlError> {
     match d {
         Datum::Multirange { text, kind } => Ok((text, *kind)),
-        other => Err(type_mismatch("multirange operator", other)),
+        other => Err(super::operand_type_mismatch(other)),
     }
 }
 
@@ -1982,7 +2156,7 @@ fn as_multirange_coerce<'a>(
         Datum::Range { text, kind } => {
             Ok((range::multirange_from_range(text, *kind, arena)?, *kind))
         }
-        other => Err(type_mismatch("multirange operator", other)),
+        other => Err(super::operand_type_mismatch(other)),
     }
 }
 
@@ -2007,7 +2181,7 @@ pub(crate) fn multirange_setop<'a>(
         BinaryOp::Add => range::multirange_union(lt, rt, lk, arena)?,
         BinaryOp::Sub => range::multirange_difference(lt, rt, lk, arena)?,
         BinaryOp::Mul => range::multirange_intersect(lt, rt, lk, arena)?,
-        _ => return Err(type_mismatch("multirange operator", &l)),
+        _ => return Err(super::operand_type_mismatch(&l)),
     };
     Ok(Datum::Multirange { text, kind: lk })
 }
@@ -2053,7 +2227,7 @@ pub(crate) fn multirange_op<'a>(
                 lt, rt, lk, predicate,
             )?))
         }
-        _ => Err(type_mismatch("multirange operator", &l)),
+        _ => Err(super::operand_type_mismatch(&l)),
     }
 }
 
@@ -2099,7 +2273,7 @@ pub(crate) fn bitwise<'a>(
             Datum::Int2(v) => Ok(i64::from(*v)),
             Datum::Int4(v) => Ok(i64::from(*v)),
             Datum::Int8(v) => Ok(*v),
-            other => Err(type_mismatch("bitwise operator requires integers", other)),
+            other => Err(super::operand_type_mismatch(other)),
         }
     };
     if l.is_null() || r.is_null() {
@@ -2221,13 +2395,13 @@ pub(crate) fn unary<'a>(
             bytes.iter_mut().for_each(|byte| *byte = !*byte);
             Ok(Datum::Macaddr8(bytes))
         }
-        (UnaryOp::Neg, other) => Err(type_mismatch("-", &other)),
+        (UnaryOp::Neg, other) => Err(super::operand_type_mismatch(&other)),
         (UnaryOp::Not, other) => match super::boolean_argument(other, "NOT")? {
             Datum::Bool(b) => Ok(Datum::Bool(!b)),
             _ => Ok(Datum::Null),
         },
-        (UnaryOp::BitNot, other) => Err(type_mismatch("~", &other)),
-        (UnaryOp::TextSearchNot, other) => Err(type_mismatch("!!", &other)),
+        (UnaryOp::BitNot, other) => Err(super::operand_type_mismatch(&other)),
+        (UnaryOp::TextSearchNot, other) => Err(super::operand_type_mismatch(&other)),
         // The prefix arithmetic operators are evaluated through the functions
         // they compute, so a datum never reaches here wearing one.
         (UnaryOp::SquareRoot | UnaryOp::CubeRoot | UnaryOp::AbsoluteValue, _) => {
@@ -2236,17 +2410,25 @@ pub(crate) fn unary<'a>(
     }
 }
 
-/// PostgreSQL row comparison (`(a,b) = (c,d)`, `<`, …): three-valued and
-/// short-circuiting, distinct from the total order `compare_datums` gives
-/// ORDER BY. Equality scans every pair — a definite inequality is `false`, an
+/// PostgreSQL's comparison between two row constructors (`(a,b) = (c,d)`,
+/// `<`, …): three-valued and short-circuiting, unlike a record value
+/// comparison ([`record_compare`]). Equality scans every pair — a definite inequality is `false`, an
 /// all-equal row is `true`, and an otherwise-equal row with a NULL pair is
 /// NULL. Ordering walks left to right — the first non-equal pair decides, and a
 /// NULL pair reached before then yields NULL. The rows must have equal arity.
-fn row_compare<'a>(
+pub(crate) fn row_constructor_compare<'a>(
     operator: BinaryOp,
     a: &[RecordField<'a>],
     b: &[RecordField<'a>],
+    catalog: Option<&dyn super::CatalogAccess>,
 ) -> Result<Datum<'a>, SqlError> {
+    let field_ordering = |x: &Datum<'_>, y: &Datum<'_>, equality: bool| {
+        if needs_catalog_order(x, y) {
+            compare_datums_with_catalog(Collation::Default, catalog, x, y)
+        } else {
+            record_field_ordering(x, y, equality, &builtin_record_field_type_name)
+        }
+    };
     use BinaryOp::*;
     if a.len() != b.len() {
         return Err(sql_err!(
@@ -2260,7 +2442,7 @@ fn row_compare<'a>(
             for (x, y) in a.iter().zip(b) {
                 if x.value.is_null() || y.value.is_null() {
                     saw_null = true;
-                } else if !compare_datums(&x.value, &y.value)?.is_eq() {
+                } else if !field_ordering(&x.value, &y.value, true)?.is_eq() {
                     return Ok(Datum::Bool(operator == NotEq));
                 }
             }
@@ -2275,7 +2457,7 @@ fn row_compare<'a>(
                 if x.value.is_null() || y.value.is_null() {
                     return Ok(Datum::Null);
                 }
-                let ordering = compare_datums(&x.value, &y.value)?;
+                let ordering = field_ordering(&x.value, &y.value, false)?;
                 if !ordering.is_eq() {
                     return Ok(Datum::Bool(match operator {
                         Lt | LtEq => ordering.is_lt(),
@@ -2288,37 +2470,134 @@ fn row_compare<'a>(
     }
 }
 
-/// PostgreSQL's `record_eq`/`record_lt` family for composite-typed values.
-fn record_compare<'a>(
+/// PostgreSQL's comparison of two record values (`record_eq`, `record_lt`, …)
+/// as opposed to a comparison between two row constructors: two NULL fields
+/// are equal and a NULL field sorts after any value, so the result is never
+/// NULL. Fields must have identical types, and records of different widths
+/// are comparable only when an earlier field already decided the result.
+pub(crate) fn record_compare<'a>(
     operator: BinaryOp,
     a: &[RecordField<'a>],
     b: &[RecordField<'a>],
+    type_name: &dyn Fn(i32) -> Result<crate::util::StackStr<260>, SqlError>,
 ) -> Result<Datum<'a>, SqlError> {
     use BinaryOp::*;
-    if a.len() != b.len() {
-        return Err(sql_err!(
-            sqlstate::DATATYPE_MISMATCH,
-            "cannot compare record types with different numbers of columns"
-        ));
-    }
-    let ordering = compare_datums(&Datum::Record(a), &Datum::Record(b))?;
+    let ordering = record_ordering(a, b, matches!(operator, Eq | NotEq), type_name)?;
     Ok(Datum::Bool(match operator {
         Eq => ordering.is_eq(),
         NotEq => !ordering.is_eq(),
         Lt => ordering.is_lt(),
         LtEq => ordering.is_le(),
         Gt => ordering.is_gt(),
-        _ => ordering.is_ge(),
+        GtEq => ordering.is_ge(),
+        _ => unreachable!("record comparison received a non-comparison operator"),
     }))
 }
 
-/// SQL equality as the membership tests (`IN`, `NOT IN`) need it: three-valued,
-/// returning `None` for unknown. Rows go through [`row_compare`], so a NULL
-/// *inside* a row makes the membership unknown; `compare_datums` alone gives
-/// the total order ORDER BY wants, where a NULL field is just another value.
-pub(crate) fn membership_eq<'a>(l: &Datum<'a>, r: &Datum<'a>) -> Result<Option<bool>, SqlError> {
+/// The `record_cmp` order behind [`record_compare`]; `equality` selects the
+/// error PostgreSQL reports for a field type without the needed operator.
+fn record_ordering(
+    a: &[RecordField<'_>],
+    b: &[RecordField<'_>],
+    equality: bool,
+    type_name: &dyn Fn(i32) -> Result<crate::util::StackStr<260>, SqlError>,
+) -> Result<core::cmp::Ordering, SqlError> {
+    let mut ordering = core::cmp::Ordering::Equal;
+    for (column, (x, y)) in a.iter().zip(b).enumerate() {
+        check_record_field_types(x.type_oid, y.type_oid, column, equality, type_name)?;
+        ordering = match (x.value.is_null(), y.value.is_null()) {
+            (true, true) => core::cmp::Ordering::Equal,
+            (true, false) => core::cmp::Ordering::Greater,
+            (false, true) => core::cmp::Ordering::Less,
+            (false, false) => record_field_ordering(&x.value, &y.value, equality, type_name)?,
+        };
+        if !ordering.is_eq() {
+            break;
+        }
+    }
+    if ordering.is_eq() && a.len() != b.len() {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "cannot compare record types with different numbers of columns"
+        ));
+    }
+    Ok(ordering)
+}
+
+/// The per-column type check of `record_eq`/`record_cmp`: both records'
+/// column `column` (zero-based) must have one type, and that type needs the
+/// operator; `equality` selects which operator the error names.
+pub(crate) fn check_record_field_types(
+    left: i32,
+    right: i32,
+    column: usize,
+    equality: bool,
+    type_name: &dyn Fn(i32) -> Result<crate::util::StackStr<260>, SqlError>,
+) -> Result<(), SqlError> {
+    if left != right && left != 0 && right != 0 {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "cannot compare dissimilar column types {} and {} at record column {}",
+            type_name(left)?.as_str(),
+            type_name(right)?.as_str(),
+            column + 1
+        ));
+    }
+    if left == crate::sql::types::oid::UNKNOWN {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "could not identify {} for type unknown",
+            if equality {
+                "an equality operator"
+            } else {
+                "a comparison function"
+            }
+        ));
+    }
+    Ok(())
+}
+
+/// Orders two non-NULL field values; nested records use the record operators.
+fn record_field_ordering(
+    x: &Datum<'_>,
+    y: &Datum<'_>,
+    equality: bool,
+    type_name: &dyn Fn(i32) -> Result<crate::util::StackStr<260>, SqlError>,
+) -> Result<core::cmp::Ordering, SqlError> {
+    match (x, y) {
+        (
+            Datum::Record(a) | Datum::Composite { fields: a, .. },
+            Datum::Record(b) | Datum::Composite { fields: b, .. },
+        ) => record_ordering(a, b, equality, type_name),
+        _ => compare_datums(x, y),
+    }
+}
+
+/// Names a built-in record field type for an error raised without catalog
+/// access.
+pub(crate) fn builtin_record_field_type_name(
+    type_oid: i32,
+) -> Result<crate::util::StackStr<260>, SqlError> {
+    crate::sql::exec::builtin_type_name_fixed(type_oid)
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "type identity is unavailable"))
+}
+
+/// SQL equality as the membership tests need it: three-valued, returning
+/// `None` for unknown. Record members compare as record values, so their NULL
+/// fields equal each other; row-constructor lists compare field by field
+/// before reaching here.
+pub(crate) fn membership_eq<'a>(
+    l: &Datum<'a>,
+    r: &Datum<'a>,
+    catalog: Option<&dyn super::CatalogAccess>,
+) -> Result<Option<bool>, SqlError> {
     if l.is_null() || r.is_null() {
         return Ok(None);
+    }
+    if needs_catalog_order(l, r) {
+        return Ok(Some(
+            compare_datums_with_catalog(Collation::Default, catalog, l, r)?.is_eq(),
+        ));
     }
     if let (
         Datum::Composite { fields: a, .. },
@@ -2326,16 +2605,12 @@ pub(crate) fn membership_eq<'a>(l: &Datum<'a>, r: &Datum<'a>) -> Result<Option<b
     )
     | (Datum::Record(a), Datum::Composite { fields: b, .. }) = (l, r)
     {
-        return Ok(match record_compare(BinaryOp::Eq, a, b)? {
-            Datum::Bool(equal) => Some(equal),
-            _ => None,
-        });
-    }
-    if let (Datum::Record(a), Datum::Record(b)) = (l, r) {
-        return Ok(match row_compare(BinaryOp::Eq, a, b)? {
-            Datum::Bool(equal) => Some(equal),
-            _ => None,
-        });
+        return Ok(
+            match record_compare(BinaryOp::Eq, a, b, &builtin_record_field_type_name)? {
+                Datum::Bool(equal) => Some(equal),
+                _ => None,
+            },
+        );
     }
     Ok(Some(compare_datums(l, r)?.is_eq()))
 }
@@ -2623,6 +2898,64 @@ pub(crate) fn binary<'a>(
             _ => {}
         }
     }
+    // One unknown string beside a built-in scalar takes the input type of the
+    // operator PostgreSQL's candidate selection chooses (`numeric * '2'`,
+    // `interval * '2'`, `now() - '1 day'`).
+    if let Some(name) = operator.operator_name()
+        && l_unknown != r_unknown
+    {
+        let (unknown, peer, unknown_left) = if l_unknown {
+            (l, r, true)
+        } else {
+            (r, l, false)
+        };
+        let peer_oid = peer.type_oid();
+        if matches!(unknown, Datum::Text(_))
+            && !peer.is_null()
+            && ColType::from_oid(peer_oid).is_some_and(|ctype| {
+                !matches!(
+                    ctype,
+                    ColType::Geometry(_)
+                        | ColType::Range(_)
+                        | ColType::Multirange(_)
+                        | ColType::Enum(_)
+                        | ColType::Composite(_)
+                        | ColType::Record
+                )
+            })
+        {
+            let (left_oid, right_oid) = if unknown_left {
+                (crate::sql::types::oid::UNKNOWN, peer_oid)
+            } else {
+                (peer_oid, crate::sql::types::oid::UNKNOWN)
+            };
+            if let Some((Some(left_input), Some(right_input))) =
+                crate::sql::catalog::builtin_operator_input_oids(
+                    name,
+                    Some(left_oid),
+                    Some(right_oid),
+                )
+            {
+                let target = if unknown_left {
+                    left_input
+                } else {
+                    right_input
+                };
+                if target != crate::sql::types::oid::TEXT
+                    && target != crate::sql::types::oid::ANYARRAY
+                    && !crate::sql::catalog::is_polymorphic_pseudo_type(target)
+                    && let Some(target) = ColType::from_oid(target)
+                {
+                    let cast = cast_to(unknown, target, arena)?;
+                    if unknown_left {
+                        l = cast;
+                    } else {
+                        r = cast;
+                    }
+                }
+            }
+        }
+    }
     if let Some(name) = operator.operator_name() {
         if l_unknown
             && matches!(l, Datum::Text(_))
@@ -2874,20 +3207,12 @@ pub(crate) fn binary<'a>(
         Eq | NotEq | Lt | LtEq | Gt | GtEq => match (l, r) {
             (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => compare_ranges(operator, l, r),
             (Datum::Bit { .. }, _) | (_, Datum::Bit { .. }) => compare_bits(operator, l, r),
-            // Row comparison uses PostgreSQL's three-valued, short-circuiting
-            // semantics (NULL-propagating), distinct from the total order that
-            // `compare_datums` gives ORDER BY / DISTINCT.
-            // A composite-typed operand compares with the record btree
-            // operators: NULL fields are equal to each other and sort last,
-            // so the result is never unknown.
+            // Record values compare with record_eq/record_cmp; comparisons
+            // between two row constructors use `row_constructor_compare`.
             (
                 Datum::Composite { fields: a, .. },
                 Datum::Record(b) | Datum::Composite { fields: b, .. },
-            )
-            | (Datum::Record(a), Datum::Composite { fields: b, .. }) => {
-                record_compare(operator, a, b)
-            }
-            (Datum::Record(a), Datum::Record(b)) => row_compare(operator, a, b),
+            ) => record_compare(operator, a, b, &builtin_record_field_type_name),
             _ => compare(operator, l, r, l_unknown, r_unknown),
         },
         Add | Sub
@@ -2961,7 +3286,7 @@ pub(crate) fn binary<'a>(
         {
             let l = coerce_unknown_array(l, &r, arena)?;
             let r = coerce_unknown_array(r, &l, arena)?;
-            array_set_op(operator, l, r)
+            array_set_op(operator, l, r, None)
         }
         Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent
             if matches!(l, Datum::Multirange { .. }) || matches!(r, Datum::Multirange { .. }) =>

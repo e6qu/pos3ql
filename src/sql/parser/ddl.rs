@@ -6,8 +6,8 @@
 //! token helpers with every other statement, but nothing else refers to them.
 
 use super::{
-    ColumnDef, CreateTable, DropTable, FkAction, LikeClause, ParseError, Parser, QualName, Stmt,
-    TableConstraint, Tok,
+    ColumnDef, CreateTable, DropTable, FkAction, LikeClause, PARSE_MESSAGE_BYTES, ParseError,
+    Parser, QualName, Stmt, TableConstraint, Tok,
 };
 use crate::mem::arena::ArenaList;
 use crate::sql::ast::{
@@ -32,16 +32,141 @@ use crate::sql::ast::{
     PublicationOperations, PublicationTarget, RelationPersistence, RelationStorageOptionNames,
     RelationStorageOptions, RoleOptions, RoutineArgument, RoutineArgumentMode, RoutineArgumentType,
     RoutineCreateKind, RoutineIdentity, RoutineParallel, RoutineResultColumn, RoutineTargetKind,
-    RuleAction, RuleEvent, RuleMode, SchemaAuthorization, SchemaName, StatisticsExpression,
-    StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName, StatisticsTarget,
-    SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions, SubscriptionOrigin,
-    SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
+    RuleAction, RuleEvent, RuleMode, SchemaAuthorization, SchemaName, SourcePosition,
+    StatisticsExpression, StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName,
+    StatisticsTarget, SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions,
+    SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
     SubscriptionSynchronousCommit, TableAccessMethod, TableMembership, TablespaceOptionNames,
     TablespaceOptions, TextSearchConfigurationSource, TextSearchObjectKind, TextSearchOption,
     TransformFunction, TriggerEvent, TriggerIdentity, TriggerKind, TriggerTiming,
     TriggerTransitionTables, ViewSecurity, ViewSecurityBarrier,
 };
 use crate::sql::eval::sqlstate;
+
+/// PostgreSQL's constraint attribute bits (`CAS_*` in its grammar).
+const CAS_NOT_DEFERRABLE: u8 = 1 << 0;
+const CAS_DEFERRABLE: u8 = 1 << 1;
+const CAS_INITIALLY_IMMEDIATE: u8 = 1 << 2;
+const CAS_INITIALLY_DEFERRED: u8 = 1 << 3;
+const CAS_NOT_VALID: u8 = 1 << 4;
+const CAS_NO_INHERIT: u8 = 1 << 5;
+const CAS_NOT_ENFORCED: u8 = 1 << 6;
+const CAS_ENFORCED: u8 = 1 << 7;
+
+/// The attributes a constraint kind may carry, as PostgreSQL's
+/// `processCASbits` permits them; `kind` names the kind in its errors.
+#[derive(Clone, Copy)]
+pub(super) struct ConstraintAttributeRules {
+    kind: &'static str,
+    defer: bool,
+    enforce: bool,
+    not_valid: bool,
+    no_inherit: bool,
+}
+
+impl ConstraintAttributeRules {
+    const fn key(kind: &'static str) -> Self {
+        Self {
+            kind,
+            defer: true,
+            enforce: false,
+            not_valid: false,
+            no_inherit: false,
+        }
+    }
+    pub(super) const UNIQUE: Self = Self::key("UNIQUE");
+    pub(super) const PRIMARY_KEY: Self = Self::key("PRIMARY KEY");
+    pub(super) const EXCLUDE: Self = Self::key("EXCLUDE");
+    pub(super) const CHECK: Self = Self {
+        kind: "CHECK",
+        defer: false,
+        enforce: true,
+        not_valid: true,
+        no_inherit: true,
+    };
+    pub(super) const FOREIGN_KEY: Self = Self {
+        kind: "FOREIGN KEY",
+        defer: true,
+        enforce: true,
+        not_valid: true,
+        no_inherit: false,
+    };
+}
+
+/// A table constraint's resolved attributes.
+pub(super) struct ConstraintAttributes {
+    pub(super) timing: ConstraintTiming,
+    pub(super) validation: ConstraintValidation,
+    pub(super) no_inherit: bool,
+}
+
+/// Where a constraint is written, which decides what its attributes mean.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConstraintSite {
+    CreateTable,
+    CreateForeignTable,
+    AlterTable,
+    /// After a column definition, where attributes are separate elements.
+    Column,
+}
+
+impl ConstraintSite {
+    /// PostgreSQL skips validating a CHECK or FOREIGN KEY written `NOT
+    /// VALID` on a new ordinary table and marks it valid; a foreign table's
+    /// and an added constraint stay not valid.
+    fn written_validation(self, validation: ConstraintValidation) -> ConstraintValidation {
+        if self == Self::CreateTable && validation == ConstraintValidation::EnforcedNotValid {
+            ConstraintValidation::EnforcedValidated
+        } else {
+            validation
+        }
+    }
+}
+
+/// The constraint a column attribute element follows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColumnAttributeTarget {
+    /// None, or one that takes no attributes.
+    None,
+    Key,
+    ForeignKey,
+    Check,
+}
+
+fn multiple_deferrability(at: usize) -> ParseError {
+    positioned_syntax_error(at, "multiple DEFERRABLE/NOT DEFERRABLE clauses not allowed")
+}
+
+fn multiple_enforcement(at: usize) -> ParseError {
+    positioned_syntax_error(at, "multiple ENFORCED/NOT ENFORCED clauses not allowed")
+}
+
+fn deferred_not_deferrable(at: usize) -> ParseError {
+    positioned_syntax_error(
+        at,
+        "constraint declared INITIALLY DEFERRED must be DEFERRABLE",
+    )
+}
+
+fn positioned_syntax_error(at: usize, message: &str) -> ParseError {
+    let mut error = ParseError::new(at, message);
+    error.cursor = Some(at);
+    error
+}
+
+/// The column attributes [`Parser::column_clauses`] keeps on the column
+/// definition itself.
+pub(super) struct ColumnClauses<'a> {
+    pub(super) not_null: bool,
+    pub(super) not_null_name: Option<&'a str>,
+    pub(super) not_null_inheritable: bool,
+    pub(super) unique: bool,
+    pub(super) primary: bool,
+    pub(super) default: Option<&'a Expr<'a>>,
+    pub(super) default_text: Option<&'a str>,
+    pub(super) generated_text: Option<&'a str>,
+    pub(super) identity: Option<crate::sql::ast::IdentitySpec<'a>>,
+}
 
 fn rule_action_statement(statement: &Stmt<'_>) -> bool {
     match statement {
@@ -1579,11 +1704,15 @@ impl<'a> Parser<'a> {
         if self.eat_ident("group")? {
             return self.create_role(false);
         }
+        let global_at = self.peek_at;
         let temporary_scope = if self.eat_ident("global")? {
-            self.warn(stack_format!(
-                96,
-                "GLOBAL is deprecated in temporary table creation"
-            ))?;
+            self.notice(super::ParseNotice {
+                warning: true,
+                sqlstate: sqlstate::WARNING,
+                message: "GLOBAL is deprecated in temporary table creation",
+                cursor: Some(global_at),
+                raw: true,
+            })?;
             Some("GLOBAL")
         } else if self.eat_ident("local")? {
             Some("LOCAL")
@@ -1624,13 +1753,15 @@ impl<'a> Parser<'a> {
             Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(
-                    96,
+                    super::PARSE_MESSAGE_BYTES,
                     "access method \"{}\" is not supported for user-defined operator objects",
                     method
                 ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             })
         }
     }
@@ -1904,12 +2035,14 @@ impl<'a> Parser<'a> {
                 return Err(ParseError {
                     at: self.peek_at,
                     message: stack_format!(
-                        96,
+                        super::PARSE_MESSAGE_BYTES,
                         "custom selectivity functions are not supported by the bounded planner"
                     ),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             } else {
                 return Err(self.err_here("invalid CREATE OPERATOR option"));
@@ -1981,12 +2114,14 @@ impl<'a> Parser<'a> {
                         return Err(ParseError {
                             at: self.peek_at,
                             message: stack_format!(
-                                96,
+                                super::PARSE_MESSAGE_BYTES,
                                 "btree ordering operators are not supported in a search operator class"
                             ),
                             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                             cursor: None,
                             hint: None,
+                            near: None,
+                            detail: None,
                         });
                     }
                     self.expect_ident("search")?;
@@ -2058,45 +2193,53 @@ impl<'a> Parser<'a> {
                         return Err(ParseError {
                             at: self.peek_at,
                             message: stack_format!(
-                                96,
+                                super::PARSE_MESSAGE_BYTES,
                                 "operator attribute \"commutator\" cannot be changed"
                             ),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
                             cursor: None,
                             hint: None,
+                            near: None,
+                            detail: None,
                         });
                     } else if self.eat_ident("negator")? {
                         return Err(ParseError {
                             at: self.peek_at,
                             message: stack_format!(
-                                96,
+                                super::PARSE_MESSAGE_BYTES,
                                 "operator attribute \"negator\" cannot be changed"
                             ),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
                             cursor: None,
                             hint: None,
+                            near: None,
+                            detail: None,
                         });
                     } else if self.eat_ident("hashes")? {
                         return Err(ParseError {
                             at: self.peek_at,
                             message: stack_format!(
-                                96,
+                                super::PARSE_MESSAGE_BYTES,
                                 "operator attribute \"hashes\" cannot be changed"
                             ),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
                             cursor: None,
                             hint: None,
+                            near: None,
+                            detail: None,
                         });
                     } else if self.eat_ident("merges")? {
                         return Err(ParseError {
                             at: self.peek_at,
                             message: stack_format!(
-                                96,
+                                super::PARSE_MESSAGE_BYTES,
                                 "operator attribute \"merges\" cannot be changed"
                             ),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
                             cursor: None,
                             hint: None,
+                            near: None,
+                            detail: None,
                         });
                     } else if self.eat_ident("restrict")? {
                         self.expect_op("=")?;
@@ -2108,12 +2251,14 @@ impl<'a> Parser<'a> {
                             return Err(ParseError {
                                 at: self.peek_at,
                                 message: stack_format!(
-                                    96,
+                                    super::PARSE_MESSAGE_BYTES,
                                     "custom selectivity functions are not supported by the bounded planner"
                                 ),
                                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                                 cursor: None,
                                 hint: None,
+                                near: None,
+                                detail: None,
                             });
                         }
                         selectivity_reset.restrict = true;
@@ -2127,12 +2272,14 @@ impl<'a> Parser<'a> {
                             return Err(ParseError {
                                 at: self.peek_at,
                                 message: stack_format!(
-                                    96,
+                                    super::PARSE_MESSAGE_BYTES,
                                     "custom selectivity functions are not supported by the bounded planner"
                                 ),
                                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                                 cursor: None,
                                 hint: None,
+                                near: None,
+                                detail: None,
                             });
                         }
                         selectivity_reset.join = true;
@@ -2163,12 +2310,14 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "btree ordering operators are not supported in a search operator family"
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 self.expect_ident("search")?;
@@ -2361,10 +2510,16 @@ impl<'a> Parser<'a> {
         {
             return Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(96, "invalid extension version name: {}", version),
+                message: stack_format!(
+                    super::PARSE_MESSAGE_BYTES,
+                    "invalid extension version name: {}",
+                    version
+                ),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             });
         }
         self.advance()?;
@@ -2486,17 +2641,9 @@ impl<'a> Parser<'a> {
         let spelled = if written.schema.is_none() && !written.array {
             written.name
         } else {
-            let text = stack_format!(
-                264,
-                "{}{}{}{}",
-                written.schema.unwrap_or(""),
-                if written.schema.is_some() { "." } else { "" },
-                written.name,
-                if written.array { "[]" } else { "" }
-            );
             self.arena
-                .alloc_str(text.as_str())
-                .map_err(|_| self.err_here("type name too long"))?
+                .alloc_str_display(written)
+                .map_err(|_| self.arena_full("statement too large for SQL arena"))?
         };
         Ok((
             RoutineArgumentType {
@@ -2601,10 +2748,15 @@ impl<'a> Parser<'a> {
         }
         Err(ParseError {
             at: self.peek_at,
-            message: stack_format!(96, "unsupported extension member object kind"),
+            message: stack_format!(
+                super::PARSE_MESSAGE_BYTES,
+                "unsupported extension member object kind"
+            ),
             sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
             cursor: None,
             hint: None,
+            near: None,
+            detail: None,
         })
     }
 
@@ -2664,23 +2816,31 @@ impl<'a> Parser<'a> {
                 } else {
                     return Err(ParseError {
                         at: self.peek_at,
-                        message: stack_format!(96, "unrecognized statistics kind \"{}\"", kind),
+                        message: stack_format!(
+                            super::PARSE_MESSAGE_BYTES,
+                            "unrecognized statistics kind \"{}\"",
+                            kind
+                        ),
                         sqlstate: sqlstate::SYNTAX_ERROR,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 };
                 if !fresh {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "statistics kind \"{}\" specified more than once",
                             kind
                         ),
                         sqlstate: sqlstate::SYNTAX_ERROR,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 if !self.eat_op(",")? {
@@ -2850,10 +3010,16 @@ impl<'a> Parser<'a> {
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "unrecognized parameter \"{}\"",
+                        option
+                    ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -2878,10 +3044,16 @@ impl<'a> Parser<'a> {
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "unrecognized parameter \"{}\"",
+                        option
+                    ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             };
             if core::mem::replace(target, true) {
@@ -3032,10 +3204,16 @@ impl<'a> Parser<'a> {
             {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "database option {} is not supported", option),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "database option {} is not supported",
+                        option
+                    ),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             } else if option.eq_ignore_ascii_case("collation_version") {
                 if options
@@ -3059,10 +3237,7 @@ impl<'a> Parser<'a> {
                     return Err(self.err_here("ALLOW_CONNECTIONS specified more than once"));
                 }
             } else if option.eq_ignore_ascii_case("connection_limit") {
-                let value = i32::try_from(self.seq_int()?)
-                    .ok()
-                    .filter(|value| *value >= -1)
-                    .ok_or_else(|| self.err_here("connection limit is out of range"))?;
+                let value = self.database_connection_limit()?;
                 if options.connection_limit.replace(value).is_some() {
                     return Err(self.err_here("CONNECTION LIMIT specified more than once"));
                 }
@@ -3117,10 +3292,7 @@ impl<'a> Parser<'a> {
                         return Err(self.err_here("ALLOW_CONNECTIONS specified more than once"));
                     }
                 } else if option.eq_ignore_ascii_case("connection_limit") {
-                    let value = i32::try_from(self.seq_int()?)
-                        .ok()
-                        .filter(|value| *value >= -1)
-                        .ok_or_else(|| self.err_here("connection limit is out of range"))?;
+                    let value = self.database_connection_limit()?;
                     if connection_limit.replace(value).is_some() {
                         return Err(self.err_here("CONNECTION LIMIT specified more than once"));
                     }
@@ -3354,10 +3526,15 @@ impl<'a> Parser<'a> {
         if or_replace && constraint {
             return Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(96, "CREATE OR REPLACE CONSTRAINT TRIGGER is not supported"),
+                message: stack_format!(
+                    super::PARSE_MESSAGE_BYTES,
+                    "CREATE OR REPLACE CONSTRAINT TRIGGER is not supported"
+                ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             });
         }
         let name = self.col_ident("trigger name")?;
@@ -3385,13 +3562,15 @@ impl<'a> Parser<'a> {
                             return Err(ParseError {
                                 at: self.peek_at,
                                 message: stack_format!(
-                                    96,
+                                    super::PARSE_MESSAGE_BYTES,
                                     "column \"{}\" specified more than once",
                                     column
                                 ),
                                 sqlstate: sqlstate::DUPLICATE_COLUMN,
                                 cursor: None,
                                 hint: None,
+                                near: None,
+                                detail: None,
                             });
                         }
                         self.push(&mut update_columns, column)?;
@@ -3668,10 +3847,15 @@ impl<'a> Parser<'a> {
             WrittenMode::Out => {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "only input parameters can have default values"),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "only input parameters can have default values"
+                    ),
                     sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             }
             WrittenMode::InOut => RoutineArgumentMode::InOut { default_text },
@@ -3718,12 +3902,14 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "VARIADIC parameter must be the last input parameter"
                         ),
                         sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 if argument.mode.is_input() {
@@ -3733,12 +3919,14 @@ impl<'a> Parser<'a> {
                         return Err(ParseError {
                             at: self.peek_at,
                             message: stack_format!(
-                                96,
+                                super::PARSE_MESSAGE_BYTES,
                                 "input parameters after one with a default value must also have defaults"
                             ),
                             sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
                             cursor: None,
                             hint: None,
+                            near: None,
+                            detail: None,
                         });
                     }
                 }
@@ -3748,13 +3936,15 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "target lists can have at most {} entries",
                             crate::storage::MAX_COLUMNS
                         ),
                         sqlstate: sqlstate::TOO_MANY_COLUMNS,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 arguments[count] = argument;
@@ -3765,6 +3955,7 @@ impl<'a> Parser<'a> {
                 self.expect_op(",")?;
             }
         }
+        let mut missing_result = false;
         let kind = if function {
             let has_returns = self.eat_ident("returns")?;
             if has_returns && self.eat_ident("trigger")? {
@@ -3782,12 +3973,14 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "OUT and INOUT arguments cannot be used with RETURNS TABLE"
                         ),
                         sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 self.expect_op("(")?;
@@ -3801,13 +3994,15 @@ impl<'a> Parser<'a> {
                         return Err(ParseError {
                             at: self.peek_at,
                             message: stack_format!(
-                                96,
+                                super::PARSE_MESSAGE_BYTES,
                                 "target lists can have at most {} entries",
                                 columns.len()
                             ),
                             sqlstate: sqlstate::TOO_MANY_COLUMNS,
                             cursor: None,
                             hint: None,
+                            near: None,
+                            detail: None,
                         });
                     }
                     columns[column_count] = RoutineResultColumn {
@@ -3834,12 +4029,12 @@ impl<'a> Parser<'a> {
                     declared_result_type,
                     set_returning,
                 }
+            } else if !has_returns {
+                // PostgreSQL reports this after the options parse, so a
+                // syntax error there wins.
+                missing_result = true;
+                RoutineCreateKind::Procedure
             } else {
-                if !has_returns {
-                    return Err(
-                        self.invalid_function_definition("function result type must be specified")
-                    );
-                }
                 RoutineCreateKind::Function {
                     set_returning: self.eat_ident("setof")?,
                     result_type: self.type_name()?,
@@ -3877,13 +4072,15 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "routine language \"{}\" is not supported",
                             unsupported
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 });
             } else if self.eat_ident("as")? {
@@ -3896,12 +4093,14 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "native-library routine bodies are not supported"
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 body = Some(crate::sql::ast::RoutineBody::String(source));
@@ -3928,6 +4127,10 @@ impl<'a> Parser<'a> {
                     }
                     if self.peeked == Tok::Eof {
                         return Err(self.syntax_error_here());
+                    }
+                    // PostgreSQL's statement list allows empty statements.
+                    if self.eat_op(";")? {
+                        continue;
                     }
                     let _ = self.statement()?;
                     self.expect_op(";")?;
@@ -4061,26 +4264,41 @@ impl<'a> Parser<'a> {
             } else if self.eat_ident("window")? {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "user-defined window functions are not supported"),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "user-defined window functions are not supported"
+                    ),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             } else if self.eat_ident("transform")? {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "routine transforms are not supported"),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "routine transforms are not supported"
+                    ),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             } else if self.eat_ident("support")? {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "planner support functions are not supported"),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "planner support functions are not supported"
+                    ),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             } else if self.eat_ident("set")? {
                 let config_name = self.configuration_parameter_name()?;
@@ -4126,10 +4344,15 @@ impl<'a> Parser<'a> {
         }) {
             return Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(96, "SQL-standard bodies require LANGUAGE SQL"),
+                message: stack_format!(
+                    super::PARSE_MESSAGE_BYTES,
+                    "SQL-standard bodies require LANGUAGE SQL"
+                ),
                 sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             });
         }
         if !function
@@ -4141,6 +4364,9 @@ impl<'a> Parser<'a> {
                 || rows_seen)
         {
             return Err(self.syntax_error_here());
+        }
+        if missing_result {
+            return Err(self.invalid_function_definition("function result type must be specified"));
         }
         if attributes.rows.is_some()
             && !matches!(
@@ -4157,12 +4383,14 @@ impl<'a> Parser<'a> {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(
-                    96,
+                    super::PARSE_MESSAGE_BYTES,
                     "ROWS is not applicable when function does not return a set"
                 ),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             });
         }
         if language == crate::sql::ast::RoutineLanguage::PlPgSql
@@ -4178,10 +4406,15 @@ impl<'a> Parser<'a> {
         {
             return Err(ParseError {
                 at: self.peek_at,
-                message: stack_format!(96, "PL/pgSQL function execution is not supported"),
+                message: stack_format!(
+                    super::PARSE_MESSAGE_BYTES,
+                    "PL/pgSQL function execution is not supported"
+                ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             });
         }
         Ok(Stmt::CreateRoutine(CreateRoutine {
@@ -4345,6 +4578,32 @@ impl<'a> Parser<'a> {
         Err(self.syntax_error_here())
     }
 
+    /// PostgreSQL's `SignedIconst`: an `int4` integer constant with an optional
+    /// sign; anything else is a syntax error at the number.
+    fn signed_integer_constant(&mut self) -> Result<i32, ParseError> {
+        let negative = match self.peeked {
+            Tok::Op("-") => {
+                self.advance()?;
+                true
+            }
+            Tok::Op("+") => {
+                self.advance()?;
+                false
+            }
+            _ => false,
+        };
+        let Tok::Num(raw) = self.peeked else {
+            return Err(self.syntax_error_here());
+        };
+        let Some(value) =
+            crate::sql::eval::parse_int_literal(raw).and_then(|value| i32::try_from(value).ok())
+        else {
+            return Err(self.syntax_error_here());
+        };
+        self.advance()?;
+        Ok(if negative { -value } else { value })
+    }
+
     fn role_options(&mut self) -> Result<RoleOptions<'a>, ParseError> {
         let mut options = RoleOptions::EMPTY;
         while self.role_option(&mut options, false)? {}
@@ -4386,28 +4645,19 @@ impl<'a> Parser<'a> {
             self.set_role_option(&mut options.bypass_row_level_security, false)?;
         } else if self.eat_ident("connection")? {
             self.expect_ident("limit")?;
-            let negative = self.eat_op("-")?;
-            let Tok::Num(raw) = self.peeked else {
-                return Err(self.syntax_error_here());
-            };
-            let parsed = raw
-                .parse::<i32>()
-                .map_err(|_| self.unexpected("connection limit is out of range"))?;
-            self.advance()?;
-            self.set_role_option(
-                &mut options.connection_limit,
-                if negative { -parsed } else { parsed },
-            )?;
+            let limit = self.signed_integer_constant()?;
+            self.set_role_option(&mut options.connection_limit, limit)?;
         } else if allow_sysid && self.eat_ident("sysid")? {
-            let negative = self.eat_op("-")?;
             let Tok::Num(raw) = self.peeked else {
                 return Err(self.syntax_error_here());
             };
-            let parsed = raw
-                .parse::<i32>()
-                .map_err(|_| self.unexpected("SYSID is out of range"))?;
+            let Some(sysid) = crate::sql::eval::parse_int_literal(raw)
+                .and_then(|value| i32::try_from(value).ok())
+            else {
+                return Err(self.syntax_error_here());
+            };
             self.advance()?;
-            self.set_role_option(&mut options.sysid, if negative { -parsed } else { parsed })?;
+            self.set_role_option(&mut options.sysid, sysid)?;
         } else if self.eat_ident("password")? {
             let password = self.role_password_spec()?;
             self.set_role_option(&mut options.password, password)?;
@@ -4419,10 +4669,15 @@ impl<'a> Parser<'a> {
             self.expect_ident("password")?;
             return Err(ParseError {
                 at: self.peek_at,
-                message: crate::stack_format!(96, "UNENCRYPTED PASSWORD is no longer supported"),
+                message: crate::stack_format!(
+                    super::PARSE_MESSAGE_BYTES,
+                    "UNENCRYPTED PASSWORD is no longer supported"
+                ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             });
         } else if self.eat_ident("valid")? {
             self.expect_ident("until")?;
@@ -4460,13 +4715,15 @@ impl<'a> Parser<'a> {
                 return Err(ParseError {
                     at: self.peek_at,
                     message: crate::stack_format!(
-                        96,
+                        super::PARSE_MESSAGE_BYTES,
                         "SCRAM verifier salt exceeds {} bytes",
                         crate::pg::auth::SCRAM_SALT_MAX
                     ),
                     sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             }
         }
@@ -4649,10 +4906,15 @@ impl<'a> Parser<'a> {
                     DomainNullability::NotNull { .. } => {
                         return Err(ParseError {
                             at: self.peek_at,
-                            message: stack_format!(96, "redundant NOT NULL constraint definition"),
+                            message: stack_format!(
+                                super::PARSE_MESSAGE_BYTES,
+                                "redundant NOT NULL constraint definition"
+                            ),
                             sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
                             cursor: None,
                             hint: None,
+                            near: None,
+                            detail: None,
                         });
                     }
                     DomainNullability::Unspecified => {}
@@ -4662,12 +4924,14 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "not-null constraints for domains cannot be marked NO INHERIT"
                         ),
                         sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 nullability = DomainNullability::NotNull { name: cname };
@@ -4687,12 +4951,14 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "check constraints for domains cannot be marked NO INHERIT"
                         ),
                         sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 self.push(&mut checks, check)?;
@@ -5171,23 +5437,99 @@ impl<'a> Parser<'a> {
         Ok(o)
     }
 
-    /// A signed integer literal for a sequence option. Parses through `i128` so
-    /// `MINVALUE -9223372036854775808` (i64::MIN) is representable.
+    /// A sequence option value: PostgreSQL's `NumericOnly`, converted to
+    /// `bigint` when the statement runs, so a bad value is an analysis error.
     pub(super) fn seq_int(&mut self) -> Result<i64, ParseError> {
-        let negative = self.eat_op("-")?;
-        if !negative {
-            let _ = self.eat_op("+")?;
-        }
-        match self.peeked {
-            Tok::Num(text) => {
-                let magnitude: i128 = text.parse().map_err(|_| self.syntax_error_here())?;
-                self.advance()?;
-                let value = if negative { -magnitude } else { magnitude };
-                i64::try_from(value)
-                    .map_err(|_| self.unexpected("sequence option value out of range for bigint"))
+        let at = self.peek_at;
+        let (text, _) = self.numeric_only()?;
+        match crate::sql::eval::parse_int_bounded(text, i64::MIN, i64::MAX, "bigint") {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.analysis_error(ParseError {
+                    at,
+                    message: stack_format!(super::PARSE_MESSAGE_BYTES, "{}", error.message),
+                    sqlstate: if error.sqlstate == sqlstate::NUMERIC_OUT_OF_RANGE {
+                        sqlstate::NUMERIC_OUT_OF_RANGE
+                    } else {
+                        sqlstate::INVALID_TEXT_REPRESENTATION
+                    },
+                    cursor: None,
+                    hint: None,
+                    near: None,
+                    detail: None,
+                })?;
+                Ok(0)
             }
-            _ => Err(self.syntax_error_here()),
         }
+    }
+
+    /// PostgreSQL's `NumericOnly`: a numeric constant with an optional sign,
+    /// as text, and whether it is an integer constant (ICONST) that fits
+    /// `int4`.
+    pub(super) fn numeric_only(&mut self) -> Result<(&'a str, bool), ParseError> {
+        let sign = match self.peeked {
+            Tok::Op(sign @ ("-" | "+")) => {
+                self.advance()?;
+                sign
+            }
+            _ => "",
+        };
+        let Tok::Num(text) = self.peeked else {
+            return Err(self.syntax_error_here());
+        };
+        self.advance()?;
+        let integer = crate::sql::eval::parse_int_literal(text)
+            .is_some_and(|value| i32::try_from(value).is_ok());
+        if sign.is_empty() {
+            return Ok((text, integer));
+        }
+        let signed = self
+            .arena
+            .alloc_str_display(format_args!("{sign}{text}"))
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+        Ok((signed, integer))
+    }
+
+    /// `CONNECTION LIMIT` of `CREATE`/`ALTER DATABASE`, checked as PostgreSQL's
+    /// `defGetInt32` and connection-limit checks do when the statement runs.
+    fn database_connection_limit(&mut self) -> Result<i32, ParseError> {
+        let at = self.peek_at;
+        let value = match self.peeked {
+            Tok::Ident("default") => {
+                self.advance()?;
+                return Ok(-1);
+            }
+            Tok::Str(_) | Tok::Ident(_) | Tok::QuotedIdent(_) => {
+                self.advance()?;
+                None
+            }
+            _ => match self.numeric_only()? {
+                (text, true) => crate::sql::eval::parse_int_literal(text).map(|value| value as i32),
+                (_, false) => None,
+            },
+        };
+        let error = |sqlstate, message: core::fmt::Arguments<'_>| ParseError {
+            at,
+            message: stack_format!(super::PARSE_MESSAGE_BYTES, "{}", message),
+            sqlstate,
+            cursor: None,
+            hint: None,
+            near: None,
+            detail: None,
+        };
+        let failure = match value {
+            None => error(
+                sqlstate::SYNTAX_ERROR,
+                format_args!("connection_limit requires an integer value"),
+            ),
+            Some(limit) if limit < -1 => error(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                format_args!("invalid connection limit: {limit}"),
+            ),
+            Some(limit) => return Ok(limit),
+        };
+        self.analysis_error(failure)?;
+        Ok(-1)
     }
 
     /// The tail of a `GENERATED` column clause ("generated" consumed): either
@@ -5457,12 +5799,14 @@ impl<'a> Parser<'a> {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(
-                    96,
+                    super::PARSE_MESSAGE_BYTES,
                     "CREATE SCHEMA IF NOT EXISTS cannot include schema elements"
                 ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             });
         }
         Ok(Stmt::CreateSchema {
@@ -5533,13 +5877,15 @@ impl<'a> Parser<'a> {
                 return Err(ParseError {
                     at: self.peek_at,
                     message: stack_format!(
-                        96,
+                        super::PARSE_MESSAGE_BYTES,
                         "index access method \"{}\" is not supported",
                         method
                     ),
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             }
         } else {
@@ -5711,13 +6057,15 @@ impl<'a> Parser<'a> {
                 options.values_per_range = Some(value.ok_or_else(|| ParseError {
                     at: self.peek_at,
                     message: stack_format!(
-                        96,
+                        super::PARSE_MESSAGE_BYTES,
                         "value {} out of bounds for option \"values_per_range\"",
                         raw
                     ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 })?);
             } else if option.eq_ignore_ascii_case("n_distinct_per_range") {
                 if options.n_distinct_per_range.is_some() {
@@ -5740,13 +6088,15 @@ impl<'a> Parser<'a> {
                         .ok_or_else(|| ParseError {
                             at: self.peek_at,
                             message: stack_format!(
-                                96,
+                                super::PARSE_MESSAGE_BYTES,
                                 "value {} out of bounds for option \"n_distinct_per_range\"",
                                 value
                             ),
                             sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                             cursor: None,
                             hint: None,
+                            near: None,
+                            detail: None,
                         })?,
                 );
             } else if option.eq_ignore_ascii_case("false_positive_rate") {
@@ -5772,13 +6122,15 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "value {} out of bounds for option \"false_positive_rate\"",
                             raw
                         ),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 options.false_positive_rate = Some(raw);
@@ -5797,18 +6149,30 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 options.siglen = Some(value.ok_or_else(|| ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "value {} out of bounds for option \"siglen\"", raw),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "value {} out of bounds for option \"siglen\"",
+                        raw
+                    ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 })?);
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "unrecognized parameter \"{}\"",
+                        option
+                    ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -5830,23 +6194,8 @@ impl<'a> Parser<'a> {
                 if options.fillfactor.is_some() {
                     return Err(self.err_here("parameter \"fillfactor\" specified more than once"));
                 }
-                let Tok::Num(raw) = self.peeked else {
-                    return Err(self.unexpected("fillfactor must be an integer"));
-                };
-                let value = raw
-                    .parse::<u8>()
-                    .map_err(|_| self.unexpected("fillfactor is out of range"))?;
-                self.advance()?;
-                if !(10..=100).contains(&value) {
-                    return Err(ParseError {
-                        at: self.peek_at,
-                        message: stack_format!(96, "fillfactor must be between 10 and 100"),
-                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                        cursor: None,
-                        hint: None,
-                    });
-                }
-                options.fillfactor = Some(value);
+                let value = self.integer_reloption("fillfactor", 10, 100)?;
+                options.fillfactor = Some(value as u8);
             } else if option.eq_ignore_ascii_case("deduplicate_items") {
                 if options.deduplicate_items.is_some() {
                     return Err(
@@ -5860,35 +6209,8 @@ impl<'a> Parser<'a> {
                         self.err_here("parameter \"pages_per_range\" specified more than once")
                     );
                 }
-                let Tok::Num(raw) = self.peeked else {
-                    return Err(self.unexpected("pages_per_range must be an integer"));
-                };
-                let value = raw.parse::<u32>().map_err(|_| ParseError {
-                    at: self.peek_at,
-                    message: stack_format!(
-                        96,
-                        "value {} out of bounds for option \"pages_per_range\"",
-                        raw
-                    ),
-                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                    cursor: None,
-                    hint: None,
-                })?;
-                self.advance()?;
-                if !(1..=131_072).contains(&value) {
-                    return Err(ParseError {
-                        at: self.peek_at,
-                        message: stack_format!(
-                            96,
-                            "value {} out of bounds for option \"pages_per_range\"",
-                            value
-                        ),
-                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                        cursor: None,
-                        hint: None,
-                    });
-                }
-                options.pages_per_range = Some(value);
+                let value = self.integer_reloption("pages_per_range", 1, 131_072)?;
+                options.pages_per_range = Some(value as u32);
             } else if option.eq_ignore_ascii_case("autosummarize") {
                 if options.autosummarize.is_some() {
                     return Err(
@@ -5914,13 +6236,15 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "invalid value for enum option \"buffering\": {}",
                             raw
                         ),
                         sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 });
                 self.advance()?;
@@ -5935,42 +6259,21 @@ impl<'a> Parser<'a> {
                         "parameter \"gin_pending_list_limit\" specified more than once",
                     ));
                 }
-                let Tok::Num(raw) = self.peeked else {
-                    return Err(self.unexpected("gin_pending_list_limit must be an integer"));
-                };
-                let value = raw.parse::<u32>().map_err(|_| ParseError {
+                let value = self.integer_reloption("gin_pending_list_limit", 64, i32::MAX)?;
+                options.gin_pending_list_limit = Some(value as u32);
+            } else {
+                return Err(ParseError {
                     at: self.peek_at,
                     message: stack_format!(
-                        96,
-                        "invalid value for integer option \"gin_pending_list_limit\": {}",
-                        raw
+                        super::PARSE_MESSAGE_BYTES,
+                        "unrecognized parameter \"{}\"",
+                        option
                     ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
-                })?;
-                self.advance()?;
-                if !(64..=i32::MAX as u32).contains(&value) {
-                    return Err(ParseError {
-                        at: self.peek_at,
-                        message: stack_format!(
-                            96,
-                            "value {} out of bounds for option \"gin_pending_list_limit\"",
-                            value
-                        ),
-                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                        cursor: None,
-                        hint: None,
-                    });
-                }
-                options.gin_pending_list_limit = Some(value);
-            } else {
-                return Err(ParseError {
-                    at: self.peek_at,
-                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
-                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                    cursor: None,
-                    hint: None,
+                    near: None,
+                    detail: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -6025,10 +6328,16 @@ impl<'a> Parser<'a> {
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "unrecognized parameter \"{}\"",
+                        option
+                    ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             };
             if core::mem::replace(flag, true) {
@@ -6039,6 +6348,68 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(names)
+    }
+
+    /// An integer storage parameter value, checked as PostgreSQL's
+    /// `parse_one_reloption` checks it: `parse_int` (decimal, octal, hex or a
+    /// rounded fraction), then the option's bounds.
+    pub(super) fn integer_reloption(
+        &mut self,
+        name: &str,
+        minimum: i32,
+        maximum: i32,
+    ) -> Result<i32, ParseError> {
+        let text = self.reloption_value()?;
+        let error = |message: core::fmt::Arguments<'_>, detail| ParseError {
+            at: self.peek_at,
+            message: stack_format!(super::PARSE_MESSAGE_BYTES, "{}", message),
+            sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            cursor: None,
+            hint: None,
+            near: None,
+            detail,
+        };
+        let Some(value) = parse_int_option(text) else {
+            return Err(error(
+                format_args!("invalid value for integer option \"{name}\": {text}"),
+                None,
+            ));
+        };
+        if !(minimum..=maximum).contains(&value) {
+            let detail = match name {
+                "fillfactor" => "Valid values are between \"10\" and \"100\".",
+                "pages_per_range" => "Valid values are between \"1\" and \"131072\".",
+                _ => "Valid values are between \"64\" and \"2147483647\".",
+            };
+            return Err(error(
+                format_args!("value {text} out of bounds for option \"{name}\""),
+                Some(detail),
+            ));
+        }
+        Ok(value)
+    }
+
+    /// PostgreSQL's `def_arg` for a storage parameter, as the text
+    /// `defGetString` gives it.
+    fn reloption_value(&mut self) -> Result<&'a str, ParseError> {
+        let text = match self.peeked {
+            Tok::Num(text) | Tok::Str(text) | Tok::Ident(text) | Tok::QuotedIdent(text) => text,
+            Tok::Op("-") => {
+                let Tok::Num(text) = self.lookahead(1)? else {
+                    return Err(self.syntax_error_here());
+                };
+                self.advance()?;
+                let text = self
+                    .arena
+                    .alloc_str_display(format_args!("-{text}"))
+                    .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+                self.advance()?;
+                return Ok(text);
+            }
+            _ => return Err(self.syntax_error_here()),
+        };
+        self.advance()?;
+        Ok(text)
     }
 
     pub(super) fn relation_storage_options(
@@ -6055,30 +6426,21 @@ impl<'a> Parser<'a> {
                 if options.fillfactor.is_some() {
                     return Err(self.err_here("parameter \"fillfactor\" specified more than once"));
                 }
-                let Tok::Num(raw) = self.peeked else {
-                    return Err(self.unexpected("fillfactor must be an integer"));
-                };
-                let value = raw
-                    .parse::<u8>()
-                    .map_err(|_| self.unexpected("fillfactor is out of range"))?;
-                self.advance()?;
-                if !(10..=100).contains(&value) {
-                    return Err(ParseError {
-                        at: self.peek_at,
-                        message: stack_format!(96, "fillfactor must be between 10 and 100"),
-                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                        cursor: None,
-                        hint: None,
-                    });
-                }
-                options.fillfactor = Some(value);
+                let value = self.integer_reloption("fillfactor", 10, 100)?;
+                options.fillfactor = Some(value as u8);
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
-                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
+                    message: stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "unrecognized parameter \"{}\"",
+                        option
+                    ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
                     cursor: None,
                     hint: None,
+                    near: None,
+                    detail: None,
                 });
             }
             if !self.eat_op(",")? {
@@ -6088,25 +6450,22 @@ impl<'a> Parser<'a> {
         Ok(options)
     }
 
+    /// `RESET (...)` names. PostgreSQL ignores a name the relation does
+    /// not have.
     pub(super) fn relation_storage_option_names(
         &mut self,
     ) -> Result<RelationStorageOptionNames, ParseError> {
         let mut names = RelationStorageOptionNames::EMPTY;
         loop {
             let option = self.any_ident("table storage parameter")?;
-            let flag = if option.eq_ignore_ascii_case("fillfactor") {
-                &mut names.fillfactor
-            } else {
-                return Err(ParseError {
-                    at: self.peek_at,
-                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
-                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                    cursor: None,
-                    hint: None,
-                });
-            };
-            if core::mem::replace(flag, true) {
-                return Err(self.err_here("table storage parameter specified more than once"));
+            if option.eq_ignore_ascii_case("fillfactor") {
+                names.fillfactor = true;
+            } else if option.eq_ignore_ascii_case("security_invoker") {
+                names.security_invoker = true;
+            } else if option.eq_ignore_ascii_case("security_barrier") {
+                names.security_barrier = true;
+            } else if option.eq_ignore_ascii_case("check_option") {
+                names.check_option = true;
             }
             if !self.eat_op(",")? {
                 break;
@@ -6244,13 +6603,15 @@ impl<'a> Parser<'a> {
                     return Err(ParseError {
                         at: start,
                         message: stack_format!(
-                            96,
+                            super::PARSE_MESSAGE_BYTES,
                             "rules cannot contain {} commands",
                             rule_action_name(&statement)
                         ),
                         sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
                         cursor: None,
                         hint: None,
+                        near: None,
+                        detail: None,
                     });
                 }
                 let source = self.text[start..self.peek_at].trim();
@@ -7838,21 +8199,99 @@ impl<'a> Parser<'a> {
             if n == names.len() {
                 return Err(self.limit("relations", names.len()));
             }
-            let first = self.any_ident(what)?;
-            names[n] = if self.eat_op(".")? {
-                QualName {
-                    schema: Some(first),
-                    name: self.any_ident(what)?,
-                }
-            } else {
-                QualName::bare(first)
-            };
+            names[n] = self.drop_target_name(what)?;
             n += 1;
             if !self.eat_op(",")? {
                 break;
             }
         }
         Ok((self.arena_slice(&names[..n])?, if_exists))
+    }
+
+    /// One dotted name of a DROP list. PostgreSQL resolves the list when the
+    /// command runs, so a database other than the session's, or too many
+    /// parts, is an analysis error without a cursor position.
+    fn drop_target_name(&mut self, what: &str) -> Result<QualName<'a>, ParseError> {
+        let at = self.peek_at;
+        let mut parts = [""; 4];
+        let mut n = 0usize;
+        loop {
+            let part = self.any_ident(what)?;
+            if n < parts.len() {
+                parts[n] = part;
+            }
+            n += 1;
+            if !self.eat_op(".")? {
+                break;
+            }
+        }
+        let written = || {
+            let mut written = crate::stack_format!(super::PARSE_MESSAGE_BYTES, "{}", parts[0]);
+            for part in &parts[1..n.min(parts.len())] {
+                let _ = core::fmt::Write::write_fmt(&mut written, format_args!(".{part}"));
+            }
+            written
+        };
+        let failure = |sqlstate: &'static str, message| ParseError {
+            at,
+            message,
+            sqlstate,
+            cursor: None,
+            hint: None,
+            near: None,
+            detail: None,
+        };
+        match n {
+            1 => Ok(QualName::bare(parts[0])),
+            2 => Ok(QualName {
+                schema: Some(parts[0]),
+                name: parts[1],
+            }),
+            3 => {
+                if !crate::sql::eval::funcs::system::is_current_database(parts[0]) {
+                    self.analysis_error(failure(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        crate::stack_format!(
+                            super::PARSE_MESSAGE_BYTES,
+                            "cross-database references are not implemented: \"{}\"",
+                            written()
+                        ),
+                    ))?;
+                }
+                Ok(QualName {
+                    schema: Some(parts[1]),
+                    name: parts[2],
+                })
+            }
+            _ => {
+                let kind = if matches!(
+                    what,
+                    "table name"
+                        | "view name"
+                        | "materialized view name"
+                        | "index name"
+                        | "sequence name"
+                        | "foreign table name"
+                ) {
+                    "relation"
+                } else {
+                    "qualified"
+                };
+                self.analysis_error(failure(
+                    sqlstate::SYNTAX_ERROR,
+                    crate::stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "improper {} name (too many dotted names): {}",
+                        kind,
+                        written()
+                    ),
+                ))?;
+                Ok(QualName {
+                    schema: Some(parts[n.min(parts.len()) - 2]),
+                    name: parts[n.min(parts.len()) - 1],
+                })
+            }
+        }
     }
 
     fn drop_bare_targets(
@@ -8095,6 +8534,7 @@ impl<'a> Parser<'a> {
                 }
                 // An optional CONSTRAINT <name> prefixes a table- or column-level
                 // constraint; it names the following constraint.
+                let constraint_at = self.peek_at;
                 let cons_name = if self.eat_ident("constraint")? {
                     Some(self.col_ident("constraint name")?)
                 } else {
@@ -8109,7 +8549,15 @@ impl<'a> Parser<'a> {
                         | Tok::Ident("foreign")
                         | Tok::Ident("exclude")
                 ) {
-                    let constraint = self.table_constraint(cons_name, false)?;
+                    let constraint = self.table_constraint(
+                        cons_name,
+                        SourcePosition::new(Some(constraint_at)),
+                        if foreign {
+                            ConstraintSite::CreateForeignTable
+                        } else {
+                            ConstraintSite::CreateTable
+                        },
+                    )?;
                     self.push(&mut cons, constraint)?;
                     if !self.eat_op(",")? {
                         break;
@@ -8154,124 +8602,9 @@ impl<'a> Parser<'a> {
             // a cast reports it once. Faithfully duplicated.
             for w in warnings_before..self.warnings.len() {
                 let again = self.warnings.as_slice()[w];
-                self.warn(again)?;
+                self.notice(again)?;
             }
-            let mut not_null = false;
-            let mut null_clause = None;
-            let mut not_null_name = None;
-            let mut unique = false;
-            let mut primary = false;
-            let mut not_null_inheritable = true;
-            let mut default = None;
-            let mut default_text = None;
-            let mut generated_text = None;
-            let mut identity = None;
-            loop {
-                let constraint_at = self.peek_at;
-                // Column-level constraints may carry their own CONSTRAINT name.
-                let col_cons_name = if self.eat_ident("constraint")? {
-                    Some(self.col_ident("constraint name")?)
-                } else {
-                    None
-                };
-                if self.eat_ident("not")? {
-                    self.expect_ident("null")?;
-                    if null_clause == Some(false) {
-                        return Err(self.conflicting_null_declarations(
-                            constraint_at,
-                            col_name,
-                            name.name,
-                        ));
-                    }
-                    null_clause = Some(true);
-                    not_null = true;
-                    if self.eat_ident("no")? {
-                        self.expect_ident("inherit")?;
-                        not_null_inheritable = false;
-                    }
-                    if let Some(name) = col_cons_name {
-                        if not_null_name.is_some_and(|previous| previous != name) {
-                            return Err(self.err_here("conflicting not-null constraint names"));
-                        }
-                        not_null_name = Some(name);
-                    }
-                } else if self.eat_ident("null")? {
-                    if null_clause == Some(true) {
-                        return Err(self.conflicting_null_declarations(
-                            constraint_at,
-                            col_name,
-                            name.name,
-                        ));
-                    }
-                    null_clause = Some(false);
-                    not_null = false;
-                } else if self.eat_ident("default")? {
-                    let start = self.peek_at;
-                    default = Some(self.column_default_expression()?);
-                    default_text = Some(self.text[start..self.peek_at].trim_end());
-                } else if self.eat_ident("unique")? {
-                    let nulls_not_distinct = self.unique_nulls_not_distinct()?;
-                    let timing = self.constraint_timing(false)?;
-                    // A named or deferrable single-column constraint needs a
-                    // durable key object; only the default unnamed form can use
-                    // the compact column flag.
-                    if col_cons_name.is_some() || timing.is_deferrable() || nulls_not_distinct {
-                        let key_columns = self.arena_slice(&[col_name])?;
-                        self.push(
-                            &mut cons,
-                            TableConstraint::Unique {
-                                name: col_cons_name,
-                                columns: key_columns,
-                                timing,
-                                nulls_not_distinct,
-                            },
-                        )?;
-                        continue;
-                    }
-                    unique = true;
-                } else if self.eat_ident("primary")? {
-                    self.expect_ident("key")?;
-                    let timing = self.constraint_timing(false)?;
-                    if col_cons_name.is_some() || timing.is_deferrable() {
-                        let key_columns = self.arena_slice(&[col_name])?;
-                        self.push(
-                            &mut cons,
-                            TableConstraint::PrimaryKey {
-                                name: col_cons_name,
-                                columns: key_columns,
-                                timing,
-                            },
-                        )?;
-                        // PRIMARY KEY implies NOT NULL; attach_constraints sets
-                        // it, but a `LIKE` copy reads the flag, so set it here.
-                        not_null = true;
-                        continue;
-                    }
-                    primary = true;
-                    unique = true;
-                    not_null = true;
-                } else if self.eat_ident("check")? {
-                    // Desugar a column CHECK to a table-level CHECK.
-                    let constraint = self.check_constraint(col_cons_name, false)?;
-                    self.push(&mut cons, constraint)?;
-                    continue;
-                } else if self.eat_ident("references")? {
-                    // Desugar a column REFERENCES to a single-column FK.
-                    let child = self.arena_slice(&[col_name])?;
-                    let constraint = self.references_tail(col_cons_name, child, false)?;
-                    self.push(&mut cons, constraint)?;
-                    continue;
-                } else if self.eat_ident("generated")? {
-                    match self.generated_clause()? {
-                        crate::sql::ast::ColGen::Generated(text) => generated_text = Some(text),
-                        crate::sql::ast::ColGen::Identity(spec) => identity = Some(spec),
-                    }
-                } else if col_cons_name.is_some() {
-                    return Err(self.syntax_error_here());
-                } else {
-                    break;
-                }
-            }
+            let clauses = self.column_clauses(col_name, name.name, !foreign, &mut cons)?;
             self.push(
                 &mut columns,
                 ColumnDef {
@@ -8282,15 +8615,15 @@ impl<'a> Parser<'a> {
                     foreign_options,
                     storage,
                     compression,
-                    not_null,
-                    not_null_name,
-                    not_null_inheritable,
-                    unique,
-                    primary,
-                    default,
-                    default_text,
-                    generated_text,
-                    identity,
+                    not_null: clauses.not_null,
+                    not_null_name: clauses.not_null_name,
+                    not_null_inheritable: clauses.not_null_inheritable,
+                    unique: clauses.unique,
+                    primary: clauses.primary,
+                    default: clauses.default,
+                    default_text: clauses.default_text,
+                    generated_text: clauses.generated_text,
+                    identity: clauses.identity,
                 },
             )?;
             if !self.eat_op(",")? {
@@ -8552,17 +8885,279 @@ impl<'a> Parser<'a> {
         self.arena_slice(&columns[..k])
     }
 
+    /// The constraint clauses written after a column's type in CREATE TABLE
+    /// and ALTER TABLE ... ADD COLUMN. CHECK and REFERENCES, and UNIQUE and
+    /// PRIMARY KEY unless `compact_keys` allows the unnamed immediate form to
+    /// stay a column flag, are appended to `constraints` naming `column`.
+    pub(super) fn column_clauses(
+        &mut self,
+        column: &'a str,
+        table: &str,
+        compact_keys: bool,
+        constraints: &mut ArenaList<'a, TableConstraint<'a>>,
+    ) -> Result<ColumnClauses<'a>, ParseError> {
+        let mut clauses = ColumnClauses {
+            not_null: false,
+            not_null_name: None,
+            not_null_inheritable: true,
+            unique: false,
+            primary: false,
+            default: None,
+            default_text: None,
+            generated_text: None,
+            identity: None,
+        };
+        let mut null_clause = None;
+        // An attribute before any constraint has nothing to apply to.
+        self.column_constraint_attributes(ColumnAttributeTarget::None)?;
+        loop {
+            let constraint_at = self.peek_at;
+            let source_position = SourcePosition::new(Some(constraint_at));
+            // Column-level constraints may carry their own CONSTRAINT name.
+            let name = if self.eat_ident("constraint")? {
+                Some(self.col_ident("constraint name")?)
+            } else {
+                None
+            };
+            if self.eat_ident("not")? {
+                self.expect_ident("null")?;
+                if null_clause == Some(false) {
+                    return Err(self.conflicting_null_declarations(constraint_at, column, table));
+                }
+                null_clause = Some(true);
+                clauses.not_null = true;
+                if self.eat_ident("no")? {
+                    self.expect_ident("inherit")?;
+                    clauses.not_null_inheritable = false;
+                }
+                if let Some(name) = name {
+                    if clauses
+                        .not_null_name
+                        .is_some_and(|previous| previous != name)
+                    {
+                        return Err(self.err_here("conflicting not-null constraint names"));
+                    }
+                    clauses.not_null_name = Some(name);
+                }
+            } else if self.eat_ident("null")? {
+                if null_clause == Some(true) {
+                    return Err(self.conflicting_null_declarations(constraint_at, column, table));
+                }
+                null_clause = Some(false);
+                clauses.not_null = false;
+            } else if self.eat_ident("default")? {
+                let start = self.peek_at;
+                clauses.default = Some(self.column_default_expression()?);
+                clauses.default_text = Some(self.text[start..self.peek_at].trim_end());
+            } else if self.eat_ident("unique")? {
+                let nulls_not_distinct = self.unique_nulls_not_distinct()?;
+                let (timing, _) = self.column_constraint_attributes(ColumnAttributeTarget::Key)?;
+                // A named or deferrable single-column constraint needs a
+                // durable key object; only the default unnamed form can use
+                // the compact column flag.
+                if compact_keys && name.is_none() && !timing.is_deferrable() && !nulls_not_distinct
+                {
+                    clauses.unique = true;
+                } else {
+                    let columns = self.arena_slice(&[column])?;
+                    self.push(
+                        constraints,
+                        TableConstraint::Unique {
+                            source_position,
+                            name,
+                            columns,
+                            timing,
+                            nulls_not_distinct,
+                        },
+                    )?;
+                }
+            } else if self.eat_ident("primary")? {
+                self.expect_ident("key")?;
+                let (timing, _) = self.column_constraint_attributes(ColumnAttributeTarget::Key)?;
+                // PRIMARY KEY implies NOT NULL; attaching the key sets it,
+                // but a `LIKE` copy reads the flag, so set it here.
+                clauses.not_null = true;
+                if compact_keys && name.is_none() && !timing.is_deferrable() {
+                    clauses.primary = true;
+                    clauses.unique = true;
+                } else {
+                    let columns = self.arena_slice(&[column])?;
+                    self.push(
+                        constraints,
+                        TableConstraint::PrimaryKey {
+                            source_position,
+                            name,
+                            columns,
+                            timing,
+                        },
+                    )?;
+                }
+            } else if self.eat_ident("check")? {
+                let constraint =
+                    self.check_constraint(name, source_position, ConstraintSite::Column)?;
+                self.push(constraints, constraint)?;
+            } else if self.eat_ident("references")? {
+                let child = self.arena_slice(&[column])?;
+                let constraint =
+                    self.references_tail(name, source_position, child, ConstraintSite::Column)?;
+                self.push(constraints, constraint)?;
+            } else if self.eat_ident("generated")? {
+                match self.generated_clause()? {
+                    crate::sql::ast::ColGen::Generated(text) => {
+                        clauses.generated_text = Some(text);
+                    }
+                    crate::sql::ast::ColGen::Identity(spec) => clauses.identity = Some(spec),
+                }
+            } else if name.is_some() {
+                return Err(self.syntax_error_here());
+            } else {
+                return Ok(clauses);
+            }
+            // Attributes after a constraint that takes none are misplaced;
+            // a key, CHECK or REFERENCES has consumed its own.
+            self.column_constraint_attributes(ColumnAttributeTarget::None)?;
+        }
+    }
+
+    /// The attribute elements PostgreSQL allows after a column constraint
+    /// (`DEFERRABLE`, `INITIALLY ...`, `[NOT] ENFORCED`), applied to the
+    /// constraint before them as its parse analysis does, with the same
+    /// errors at the offending attribute. The grammar accepts any sequence,
+    /// so these errors wait until the whole statement has parsed.
+    fn column_constraint_attributes(
+        &mut self,
+        target: ColumnAttributeTarget,
+    ) -> Result<(ConstraintTiming, ConstraintValidation), ParseError> {
+        let defers = matches!(
+            target,
+            ColumnAttributeTarget::Key | ColumnAttributeTarget::ForeignKey
+        );
+        let enforces = matches!(
+            target,
+            ColumnAttributeTarget::Check | ColumnAttributeTarget::ForeignKey
+        );
+        let mut saw_deferrability = false;
+        let mut deferrable = false;
+        let mut saw_initially = false;
+        let mut initially_deferred = false;
+        let mut saw_enforced = false;
+        let mut enforced = true;
+        loop {
+            let at = self.peek_at;
+            let misplaced = |clause: &str| {
+                let mut error = positioned_syntax_error(at, "");
+                error.message = stack_format!(PARSE_MESSAGE_BYTES, "misplaced {} clause", clause);
+                error
+            };
+            if self.eat_ident("deferrable")? {
+                if !defers {
+                    self.analysis_error(misplaced("DEFERRABLE"))?;
+                }
+                if saw_deferrability {
+                    self.analysis_error(multiple_deferrability(at))?;
+                }
+                saw_deferrability = true;
+                deferrable = true;
+            } else if self.peeked == Tok::Ident("not")
+                && matches!(self.lookahead(1)?, Tok::Ident("deferrable" | "enforced"))
+            {
+                self.expect_ident("not")?;
+                if self.eat_ident("deferrable")? {
+                    if !defers {
+                        self.analysis_error(misplaced("NOT DEFERRABLE"))?;
+                    }
+                    if saw_deferrability {
+                        self.analysis_error(multiple_deferrability(at))?;
+                    }
+                    saw_deferrability = true;
+                    deferrable = false;
+                    if saw_initially && initially_deferred {
+                        self.analysis_error(deferred_not_deferrable(at))?;
+                    }
+                } else {
+                    self.expect_ident("enforced")?;
+                    if !enforces {
+                        self.analysis_error(misplaced("NOT ENFORCED"))?;
+                    }
+                    if saw_enforced {
+                        self.analysis_error(multiple_enforcement(at))?;
+                    }
+                    saw_enforced = true;
+                    enforced = false;
+                }
+            } else if self.eat_ident("initially")? {
+                let deferred = if self.eat_ident("deferred")? {
+                    true
+                } else {
+                    self.expect_ident("immediate")?;
+                    false
+                };
+                if !defers {
+                    self.analysis_error(misplaced(if deferred {
+                        "INITIALLY DEFERRED"
+                    } else {
+                        "INITIALLY IMMEDIATE"
+                    }))?;
+                }
+                if saw_initially {
+                    self.analysis_error(positioned_syntax_error(
+                        at,
+                        "multiple INITIALLY IMMEDIATE/DEFERRED clauses not allowed",
+                    ))?;
+                }
+                saw_initially = true;
+                initially_deferred = deferred;
+                if deferred {
+                    // INITIALLY DEFERRED alone implies DEFERRABLE.
+                    if !saw_deferrability {
+                        deferrable = true;
+                    } else if !deferrable {
+                        self.analysis_error(deferred_not_deferrable(at))?;
+                    }
+                }
+            } else if self.eat_ident("enforced")? {
+                if !enforces {
+                    self.analysis_error(misplaced("ENFORCED"))?;
+                }
+                if saw_enforced {
+                    self.analysis_error(multiple_enforcement(at))?;
+                }
+                saw_enforced = true;
+                enforced = true;
+            } else {
+                break;
+            }
+        }
+        let timing = if deferrable {
+            ConstraintTiming::Deferrable(if initially_deferred {
+                ConstraintMode::Deferred
+            } else {
+                ConstraintMode::Immediate
+            })
+        } else {
+            ConstraintTiming::NotDeferrable
+        };
+        let validation = if enforced {
+            ConstraintValidation::EnforcedValidated
+        } else {
+            ConstraintValidation::NotEnforced
+        };
+        Ok((timing, validation))
+    }
+
     /// A table-level PRIMARY KEY / UNIQUE / CHECK / FOREIGN KEY constraint.
     pub(super) fn table_constraint(
         &mut self,
         name: Option<&'a str>,
-        allow_not_valid: bool,
+        source_position: SourcePosition,
+        site: ConstraintSite,
     ) -> Result<TableConstraint<'a>, ParseError> {
         if self.eat_ident("primary")? {
             self.expect_ident("key")?;
             let columns = self.column_name_list()?;
-            let timing = self.constraint_timing(false)?;
+            let timing = self.constraint_timing(ConstraintAttributeRules::PRIMARY_KEY)?;
             Ok(TableConstraint::PrimaryKey {
+                source_position,
                 name,
                 columns,
                 timing,
@@ -8570,23 +9165,24 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("unique")? {
             let nulls_not_distinct = self.unique_nulls_not_distinct()?;
             let columns = self.column_name_list()?;
-            let timing = self.constraint_timing(false)?;
+            let timing = self.constraint_timing(ConstraintAttributeRules::UNIQUE)?;
             Ok(TableConstraint::Unique {
+                source_position,
                 name,
                 columns,
                 timing,
                 nulls_not_distinct,
             })
         } else if self.eat_ident("check")? {
-            self.check_constraint(name, allow_not_valid)
+            self.check_constraint(name, source_position, site)
         } else if self.eat_ident("exclude")? {
-            self.exclusion_constraint(name)
+            self.exclusion_constraint(name, source_position)
         } else {
             self.expect_ident("foreign")?;
             self.expect_ident("key")?;
             let columns = self.column_name_list()?;
             self.expect_ident("references")?;
-            self.references_tail(name, columns, allow_not_valid)
+            self.references_tail(name, source_position, columns, site)
         }
     }
 
@@ -8602,11 +9198,14 @@ impl<'a> Parser<'a> {
     fn exclusion_constraint(
         &mut self,
         name: Option<&'a str>,
+        source_position: SourcePosition,
     ) -> Result<TableConstraint<'a>, ParseError> {
         if self.eat_ident("using")? {
             let method = self.col_ident("exclusion index method")?;
             if method != "gist" {
-                return Err(self.err_here("only GiST exclusion constraints are supported"));
+                let mut error = self.err_here("only GiST exclusion constraints are supported");
+                error.sqlstate = sqlstate::FEATURE_NOT_SUPPORTED;
+                return Err(error);
             }
         }
         self.expect_op("(")?;
@@ -8638,8 +9237,9 @@ impl<'a> Parser<'a> {
         } else {
             (None, None)
         };
-        let timing = self.constraint_timing(false)?;
+        let timing = self.constraint_timing(ConstraintAttributeRules::EXCLUDE)?;
         Ok(TableConstraint::Exclusion {
+            source_position,
             name,
             columns: columns.as_slice(),
             operators: operators.as_slice(),
@@ -8654,7 +9254,8 @@ impl<'a> Parser<'a> {
     fn check_constraint(
         &mut self,
         name: Option<&'a str>,
-        allow_not_valid: bool,
+        source_position: SourcePosition,
+        site: ConstraintSite,
     ) -> Result<TableConstraint<'a>, ParseError> {
         self.expect_op("(")?;
         let start = self.peek_at;
@@ -8662,11 +9263,23 @@ impl<'a> Parser<'a> {
         let text = self.text[start..self.peek_at].trim_end();
         let text = self.arena_str(text)?;
         self.expect_op(")")?;
-        // PostgreSQL accepts NO INHERIT before or after the other attributes.
-        let mut no_inherit = self.check_no_inherit(false)?;
-        let (_, validation) = self.constraint_attributes(false, true, allow_not_valid)?;
-        no_inherit = self.check_no_inherit(no_inherit)?;
+        // A column CHECK takes NO INHERIT only right after its predicate; a
+        // table CHECK lists it among its other attributes.
+        let (validation, no_inherit) = if site == ConstraintSite::Column {
+            let no_inherit = self.check_no_inherit()?;
+            let validation = self
+                .column_constraint_attributes(ColumnAttributeTarget::Check)?
+                .1;
+            (validation, no_inherit)
+        } else {
+            let attributes = self.constraint_attributes(ConstraintAttributeRules::CHECK)?;
+            (
+                site.written_validation(attributes.validation),
+                attributes.no_inherit,
+            )
+        };
         Ok(TableConstraint::Check {
+            source_position,
             name,
             expression,
             text,
@@ -8675,11 +9288,10 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// A repeated `NO INHERIT` is left unconsumed, so it fails as a syntax
-    /// error at `NO` as in PostgreSQL.
-    fn check_no_inherit(&mut self, seen: bool) -> Result<bool, ParseError> {
-        if seen || !self.eat_ident("no")? {
-            return Ok(seen);
+    /// A column CHECK's optional `NO INHERIT`.
+    fn check_no_inherit(&mut self) -> Result<bool, ParseError> {
+        if !self.eat_ident("no")? {
+            return Ok(false);
         }
         self.expect_ident("inherit")?;
         Ok(true)
@@ -8690,8 +9302,9 @@ impl<'a> Parser<'a> {
     fn references_tail(
         &mut self,
         name: Option<&'a str>,
+        source_position: SourcePosition,
         columns: &'a [&'a str],
-        allow_not_valid: bool,
+        site: ConstraintSite,
     ) -> Result<TableConstraint<'a>, ParseError> {
         let parent = self.qual_name("referenced table")?;
         let parent_cols = if self.peeked == Tok::Op("(") {
@@ -8715,8 +9328,17 @@ impl<'a> Parser<'a> {
                 on_update = action;
             }
         }
-        let (timing, validation) = self.constraint_attributes(true, true, allow_not_valid)?;
+        let (timing, validation) = if site == ConstraintSite::Column {
+            self.column_constraint_attributes(ColumnAttributeTarget::ForeignKey)?
+        } else {
+            let attributes = self.constraint_attributes(ConstraintAttributeRules::FOREIGN_KEY)?;
+            (
+                attributes.timing,
+                site.written_validation(attributes.validation),
+            )
+        };
         Ok(TableConstraint::ForeignKey {
+            source_position,
             name,
             columns,
             parent,
@@ -8728,95 +9350,134 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Parses the attributes shared by table constraints and returns only
-    /// states that execution can represent. `ENFORCED` is accepted for every
-    /// constraint; `NOT ENFORCED` is limited to CHECK and FOREIGN KEY by the
-    /// caller.
-    fn constraint_attributes(
-        &mut self,
-        can_defer: bool,
-        can_disable: bool,
-        allow_not_valid: bool,
-    ) -> Result<(ConstraintTiming, ConstraintValidation), ParseError> {
-        let mut deferrable = None;
-        let mut initial = None;
-        let mut enforced = None;
-        let mut not_valid = false;
+    /// PostgreSQL's `ConstraintAttributeSpec`: the attribute keywords after a
+    /// table constraint, checked for conflicts as the grammar does. Returns
+    /// the `CAS_*` bits and where the list starts.
+    fn constraint_attribute_bits(&mut self) -> Result<(u8, usize), ParseError> {
+        let at = self.peek_at;
+        let mut bits = 0u8;
         loop {
-            let not_attribute = if self.peeked == Tok::Ident("not") {
-                let mut lookahead = self.lexer.clone();
-                matches!(
-                    lookahead
-                        .next_token()
-                        .map_err(|error| ParseError::lexical(error, self.text))?,
-                    Tok::Ident("deferrable") | Tok::Ident("enforced") | Tok::Ident("valid")
+            let element_at = self.peek_at;
+            let bit = if self.eat_ident("deferrable")? {
+                CAS_DEFERRABLE
+            } else if self.peeked == Tok::Ident("not")
+                && matches!(
+                    self.lookahead(1)?,
+                    Tok::Ident("deferrable" | "valid" | "enforced")
                 )
-            } else {
-                false
-            };
-            if self.eat_ident("deferrable")? {
-                if !can_defer || deferrable.replace(true).is_some() {
-                    return Err(self.err_here("invalid or duplicate DEFERRABLE clause"));
-                }
-            } else if not_attribute {
+            {
                 self.expect_ident("not")?;
                 if self.eat_ident("deferrable")? {
-                    if !can_defer || deferrable.replace(false).is_some() {
-                        return Err(self.err_here("invalid or duplicate NOT DEFERRABLE clause"));
-                    }
-                } else if self.eat_ident("enforced")? {
-                    if !can_disable || enforced.replace(false).is_some() {
-                        return Err(self.err_here("invalid or duplicate NOT ENFORCED clause"));
-                    }
+                    CAS_NOT_DEFERRABLE
+                } else if self.eat_ident("valid")? {
+                    CAS_NOT_VALID
                 } else {
-                    self.expect_ident("valid")?;
-                    if !allow_not_valid || not_valid {
-                        return Err(self.err_here("invalid or duplicate NOT VALID clause"));
-                    }
-                    not_valid = true;
+                    self.expect_ident("enforced")?;
+                    CAS_NOT_ENFORCED
                 }
             } else if self.eat_ident("initially")? {
-                let mode = if self.eat_ident("deferred")? {
-                    ConstraintMode::Deferred
+                if self.eat_ident("deferred")? {
+                    CAS_INITIALLY_DEFERRED
                 } else {
                     self.expect_ident("immediate")?;
-                    ConstraintMode::Immediate
-                };
-                if !can_defer || initial.replace(mode).is_some() {
-                    return Err(self.err_here("invalid or duplicate INITIALLY clause"));
+                    CAS_INITIALLY_IMMEDIATE
                 }
+            } else if self.peeked == Tok::Ident("no") && self.lookahead(1)? == Tok::Ident("inherit")
+            {
+                self.expect_ident("no")?;
+                self.expect_ident("inherit")?;
+                CAS_NO_INHERIT
             } else if self.eat_ident("enforced")? {
-                if !can_disable || enforced.replace(true).is_some() {
-                    return Err(self.err_here("invalid or duplicate ENFORCED clause"));
-                }
+                CAS_ENFORCED
             } else {
-                break;
+                return Ok((bits, at));
+            };
+            let spec = bits | bit;
+            let both = |pair: u8| spec & pair == pair;
+            if both(CAS_NOT_DEFERRABLE | CAS_INITIALLY_DEFERRED) {
+                return Err(positioned_syntax_error(
+                    element_at,
+                    "constraint declared INITIALLY DEFERRED must be DEFERRABLE",
+                ));
             }
-        }
-        if initial.is_some() && deferrable != Some(true) {
-            return Err(self.err_here("INITIALLY requires DEFERRABLE"));
-        }
-        let timing = match deferrable {
-            Some(true) => {
-                ConstraintTiming::Deferrable(initial.unwrap_or(ConstraintMode::Immediate))
+            if both(CAS_NOT_DEFERRABLE | CAS_DEFERRABLE)
+                || both(CAS_INITIALLY_IMMEDIATE | CAS_INITIALLY_DEFERRED)
+                || both(CAS_NOT_ENFORCED | CAS_ENFORCED)
+            {
+                return Err(positioned_syntax_error(
+                    element_at,
+                    "conflicting constraint properties",
+                ));
             }
-            Some(false) | None => ConstraintTiming::NotDeferrable,
-        };
-        let validation = match (enforced, not_valid) {
-            (Some(false), _) => ConstraintValidation::NotEnforced,
-            (_, true) => ConstraintValidation::EnforcedNotValid,
-            _ => ConstraintValidation::EnforcedValidated,
-        };
-        Ok((timing, validation))
+            bits = spec;
+        }
     }
 
+    /// A table constraint's attribute list, resolved for its kind as
+    /// PostgreSQL's `processCASbits` does: an attribute the kind cannot carry
+    /// fails at the start of the list.
+    pub(super) fn constraint_attributes(
+        &mut self,
+        rules: ConstraintAttributeRules,
+    ) -> Result<ConstraintAttributes, ParseError> {
+        let (bits, at) = self.constraint_attribute_bits()?;
+        let refuse = |attribute: &str| {
+            let mut error = ParseError::new(at, "");
+            error.message = stack_format!(
+                PARSE_MESSAGE_BYTES,
+                "{} constraints cannot be marked {}",
+                rules.kind,
+                attribute
+            );
+            error.sqlstate = sqlstate::FEATURE_NOT_SUPPORTED;
+            error.cursor = Some(at);
+            error
+        };
+        let has = |bit: u8| bits & bit != 0;
+        if has(CAS_DEFERRABLE | CAS_INITIALLY_DEFERRED) && !rules.defer {
+            return Err(refuse("DEFERRABLE"));
+        }
+        if has(CAS_NOT_VALID) && !rules.not_valid {
+            return Err(refuse("NOT VALID"));
+        }
+        if has(CAS_NO_INHERIT) && !rules.no_inherit {
+            return Err(refuse("NO INHERIT"));
+        }
+        if has(CAS_NOT_ENFORCED) && !rules.enforce {
+            return Err(refuse("NOT ENFORCED"));
+        }
+        if has(CAS_ENFORCED) && !rules.enforce {
+            return Err(refuse("ENFORCED"));
+        }
+        let timing = if has(CAS_DEFERRABLE | CAS_INITIALLY_DEFERRED) {
+            ConstraintTiming::Deferrable(if has(CAS_INITIALLY_DEFERRED) {
+                ConstraintMode::Deferred
+            } else {
+                ConstraintMode::Immediate
+            })
+        } else {
+            ConstraintTiming::NotDeferrable
+        };
+        Ok(ConstraintAttributes {
+            timing,
+            // NOT ENFORCED also marks the constraint not validated.
+            validation: if has(CAS_NOT_ENFORCED) {
+                ConstraintValidation::NotEnforced
+            } else if has(CAS_NOT_VALID) {
+                ConstraintValidation::EnforcedNotValid
+            } else {
+                ConstraintValidation::EnforcedValidated
+            },
+            no_inherit: has(CAS_NO_INHERIT),
+        })
+    }
+
+    /// A key constraint's attributes: only its deferral.
     pub(super) fn constraint_timing(
         &mut self,
-        allow_not_valid: bool,
+        rules: ConstraintAttributeRules,
     ) -> Result<ConstraintTiming, ParseError> {
-        let (timing, validation) = self.constraint_attributes(true, false, allow_not_valid)?;
-        debug_assert_eq!(validation, ConstraintValidation::EnforcedValidated);
-        Ok(timing)
+        Ok(self.constraint_attributes(rules)?.timing)
     }
 
     fn fk_action(&mut self) -> Result<FkAction, ParseError> {
@@ -8854,4 +9515,90 @@ impl<'a> Parser<'a> {
             cascade,
         }))
     }
+}
+
+/// PostgreSQL's `parse_int` for an option without units: `strtol` with base
+/// 0 (decimal, `0x` hexadecimal or `0` octal), or a decimal fraction or
+/// exponent rounded half to even, surrounded by optional whitespace.
+fn parse_int_option(text: &str) -> Option<i32> {
+    let is_space = |byte: u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\x0B' | b'\x0C');
+    let bytes = text.as_bytes();
+    let mut at = bytes
+        .iter()
+        .position(|byte| !is_space(*byte))
+        .unwrap_or(bytes.len());
+    let start = at;
+    let negative = match bytes.get(at) {
+        Some(b'-') => {
+            at += 1;
+            true
+        }
+        Some(b'+') => {
+            at += 1;
+            false
+        }
+        _ => false,
+    };
+    let (radix, digits_at) = match (bytes.get(at), bytes.get(at + 1), bytes.get(at + 2)) {
+        (Some(b'0'), Some(b'x' | b'X'), Some(digit)) if digit.is_ascii_hexdigit() => (16, at + 2),
+        (Some(b'0'), _, _) => (8, at),
+        _ => (10, at),
+    };
+    let mut end = digits_at;
+    let mut value: i128 = 0;
+    let mut overflow = false;
+    while let Some(digit) = bytes
+        .get(end)
+        .and_then(|byte| char::from(*byte).to_digit(radix))
+    {
+        value = value * i128::from(radix) + i128::from(digit);
+        overflow |= value > i128::from(i64::MAX);
+        end += 1;
+    }
+    let mut rounded = if negative { -value } else { value };
+    if matches!(bytes.get(end), Some(b'.' | b'e' | b'E')) || overflow {
+        // strtod: digits, an optional fraction and an optional exponent.
+        let mut float_end = at;
+        while bytes.get(float_end).is_some_and(u8::is_ascii_digit) {
+            float_end += 1;
+        }
+        let integer_digits = float_end - at;
+        if bytes.get(float_end) == Some(&b'.') {
+            float_end += 1;
+            while bytes.get(float_end).is_some_and(u8::is_ascii_digit) {
+                float_end += 1;
+            }
+        }
+        if float_end - at == usize::from(integer_digits == 0) {
+            return None;
+        }
+        if matches!(bytes.get(float_end), Some(b'e' | b'E')) {
+            let mut exponent = float_end + 1;
+            if matches!(bytes.get(exponent), Some(b'+' | b'-')) {
+                exponent += 1;
+            }
+            if bytes.get(exponent).is_some_and(u8::is_ascii_digit) {
+                while bytes.get(exponent).is_some_and(u8::is_ascii_digit) {
+                    exponent += 1;
+                }
+                float_end = exponent;
+            }
+        }
+        let parsed: f64 = text[start..float_end].parse().ok()?;
+        if !parsed.is_finite() {
+            return None;
+        }
+        let parsed = parsed.round_ties_even();
+        if parsed.abs() > 1e30 {
+            return None;
+        }
+        rounded = parsed as i128;
+        end = float_end;
+    } else if end == digits_at && radix != 8 {
+        return None;
+    }
+    if !bytes[end..].iter().all(|byte| is_space(*byte)) {
+        return None;
+    }
+    i32::try_from(rounded).ok()
 }

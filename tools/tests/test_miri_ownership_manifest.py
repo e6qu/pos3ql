@@ -28,6 +28,15 @@ class OwnershipManifestTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     MANIFEST.read_manifest(path)
 
+    def test_longest_module_prefix_selects_the_group(self):
+        names = ["sql::exec::one", "sql::two", "storage::definition_images::three"]
+        self.assertEqual(MANIFEST.select(names, "sql-exec"), ["sql::exec::one"])
+        self.assertEqual(MANIFEST.select(names, "memory-sql"), ["sql::two"])
+        self.assertEqual(
+            MANIFEST.select(names, "storage-definitions"),
+            ["storage::definition_images::three"],
+        )
+
     def test_empty_group_cannot_succeed(self):
         with self.assertRaises(ValueError):
             MANIFEST.select(["sql::test"], "storage")

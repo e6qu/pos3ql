@@ -1154,6 +1154,14 @@ impl Server {
             None
         };
 
+        if let Some(spill) = engine.trigger_event_spill() {
+            for slot in slots.iter_mut() {
+                slot.conn.attach_trigger_event_spill(spill.clone());
+            }
+            for worker in subscriptions.iter_mut() {
+                worker.apply.attach_trigger_event_spill(spill.clone());
+            }
+        }
         let memory_reserved_bytes = budget.total();
         Ok(Self {
             reactor,
@@ -1518,7 +1526,6 @@ impl Server {
             log_io("set_nonblocking", &e);
             return;
         }
-        let _ = stream.set_nodelay(true);
         let Some(index) = self.free.pop() else {
             self.operations_metrics.postgres_refused =
                 self.operations_metrics.postgres_refused.saturating_add(1);
@@ -1536,7 +1543,11 @@ impl Server {
         let id = self.next_conn_id;
         self.next_conn_id = self.next_conn_id.wrapping_add(1).max(1);
         let fd = stream.as_raw_fd();
-        slot.conn.open(stream, id);
+        if let Err(e) = slot.conn.open(stream, id) {
+            log_io("configure connection socket", &e);
+            self.free.push(index).expect("slot was just taken");
+            return;
+        }
         slot.want_read = true;
         slot.want_write = false;
         let token = token_for(index, slot.generation);
@@ -3081,8 +3092,9 @@ impl Server {
     }
 
     fn release(&mut self, index: usize) {
-        self.engine
-            .cancel_read_owner(self.slots[index].conn.execution_identity().read_owner());
+        let owner = self.slots[index].conn.execution_identity().read_owner();
+        self.engine.cancel_read_owner(owner);
+        self.engine.forget_statement_reads(owner);
         if self.slots[index].conn.txn.staged_commit().is_some() {
             assert!(!self.slots[index].query_dispatch_pending);
             let handoff = self.query_workspaces.cancel(index);
@@ -3202,7 +3214,10 @@ impl Server {
             log_io("set operational connection nonblocking", &error);
             return;
         }
-        let _ = stream.set_nodelay(true);
+        if let Err(error) = stream.set_nodelay(true) {
+            log_io("set operational connection nodelay", &error);
+            return;
+        }
         let Some(index) = self.operations_free.pop() else {
             let _ = stream.write(
                 b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
@@ -4105,7 +4120,6 @@ mod tests {
         use crate::sql::{Engine, ExecutionIdentity, ExecutionStatus, StatementWait};
         use crate::storage::DatabaseOid;
         use std::net::TcpListener;
-        use std::time::Duration;
 
         fn execute(engine: &mut Engine, connection: &mut Conn, sql: &str) -> ExecutionStatus {
             connection.arena.reset();
@@ -4186,19 +4200,19 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             client
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(crate::test_wait::HANG))
                 .unwrap();
             let (stream, _) = listener.accept().unwrap();
             stream.set_nonblocking(true).unwrap();
-            target.open(stream, 71);
+            target.open(stream, 71).unwrap();
             let observer_client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let (stream, _) = listener.accept().unwrap();
             stream.set_nonblocking(true).unwrap();
-            observer.open(stream, 72);
+            observer.open(stream, 72).unwrap();
             let verifier_client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let (stream, _) = listener.accept().unwrap();
             stream.set_nonblocking(true).unwrap();
-            verifier.open(stream, 73);
+            verifier.open(stream, 73).unwrap();
             assert_eq!(
                 execute(
                     &mut engine,

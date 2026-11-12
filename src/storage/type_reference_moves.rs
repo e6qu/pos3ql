@@ -726,7 +726,7 @@ mod tests {
     };
     use super::*;
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     const KINDS: [TypeReferenceKind; 3] = [
         TypeReferenceKind::Domain,
@@ -958,7 +958,7 @@ mod tests {
                         crate::mem::guard::forbid_alloc(|| commit_move(&storage, kind, target))
                     });
                     let resume = ResumeScan(&storage.definition_publication.scan_pause);
-                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let deadline = crate::test_wait::deadline();
                     while storage
                         .definition_publication
                         .scan_pause
@@ -1000,7 +1000,7 @@ mod tests {
                         result
                     });
                     // Release the artificial pause before joining a blocked submitter.
-                    let progress = received.recv_timeout(Duration::from_secs(5));
+                    let progress = received.recv_timeout(crate::test_wait::HANG);
                     drop(resume);
                     let result = writer.join().unwrap();
                     let dependent = submitter.join().unwrap().unwrap();
@@ -1092,7 +1092,7 @@ mod tests {
                     };
                     let unrelated_metadata = storage.stored_query_dependencies.lock().unwrap();
                     drop(selected);
-                    let completed = received.recv_timeout(Duration::from_secs(5));
+                    let completed = received.recv_timeout(crate::test_wait::HANG);
                     drop(unrelated_metadata);
                     writer.join().unwrap().unwrap();
                     assert!(
@@ -1185,12 +1185,12 @@ mod tests {
                 // Owned worker threads let a timeout report the stalled
                 // operation instead of blocking again in a scoped join.
                 let (result, installed) = received
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv_timeout(crate::test_wait::HANG)
                     .expect("stale type publication did not complete after reader release");
                 writer.join().unwrap();
                 if let Some((worker, received)) = changed {
                     received
-                        .recv_timeout(Duration::from_secs(5))
+                        .recv_timeout(crate::test_wait::HANG)
                         .expect("competing type commit did not complete after reader release")
                         .unwrap();
                     worker.join().unwrap();
@@ -1758,7 +1758,7 @@ mod tests {
     }
 
     fn wait_until_contended(storage: &Storage) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = crate::test_wait::deadline();
         while storage
             .definition_publication
             .waits
@@ -1993,8 +1993,7 @@ mod tests {
                         });
                         finished.send(()).unwrap();
                     });
-                    let unrelated_progress =
-                        received.recv_timeout(std::time::Duration::from_secs(5));
+                    let unrelated_progress = received.recv_timeout(crate::test_wait::HANG);
                     match movement.identity.slot() {
                         NamedTypeSlot::Domain(slot) => {
                             source.domains[slot].name = movement.current.name
@@ -3189,7 +3188,7 @@ mod tests {
                     });
                     send.send(()).unwrap();
                 });
-                let progress = receive.recv_timeout(Duration::from_secs(5));
+                let progress = receive.recv_timeout(crate::test_wait::HANG);
                 drop(held);
                 writer.join().unwrap();
                 assert!(
@@ -3252,7 +3251,7 @@ mod tests {
                         });
                         done_send.send(()).unwrap();
                     });
-                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let deadline = crate::test_wait::deadline();
                     let waiting = loop {
                         if storage
                             .definition_publication
@@ -3314,7 +3313,7 @@ mod tests {
                         });
                         other_send.send(progress).unwrap();
                     });
-                    let progress = other_receive.recv_timeout(Duration::from_secs(5));
+                    let progress = other_receive.recv_timeout(crate::test_wait::HANG);
                     let completed_early = done_receive.try_recv().is_ok();
                     let retained_identity = held.columns()[0].user_type;
                     drop(held);
@@ -3451,7 +3450,7 @@ mod tests {
                     });
                     send.send(()).unwrap();
                 });
-                let progress = receive.recv_timeout(Duration::from_secs(5));
+                let progress = receive.recv_timeout(crate::test_wait::HANG);
                 let retired_identity = retired_view.columns()[0].user_type;
                 let foreign_identity = foreign_view.columns()[0].user_type;
                 drop(retired_view);

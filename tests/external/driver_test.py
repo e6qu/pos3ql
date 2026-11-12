@@ -450,7 +450,7 @@ joined_rows = cur.fetchall()
 assert sorted(joined_rows) == [(2, 200), (4, 400)], joined_rows
 cur.execute(
     "DELETE FROM drv_view AS target USING drv_view_source AS source "
-    "WHERE target.id = source.id AND source.id = %s RETURNING id",
+    "WHERE target.id = source.id AND source.id = %s RETURNING target.id",
     (2,),
 )
 assert cur.fetchone() == (2,)

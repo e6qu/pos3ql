@@ -285,7 +285,7 @@ pub(crate) fn bind_query<const N: usize>(
     );
     let select =
         super::query::expand_stored_query(select, storage, txid, path, dependencies.view(), arena)?;
-    super::param_types::infer(
+    let _ = super::param_types::infer(
         storage,
         &super::ast::Stmt::Select(*select),
         txid,

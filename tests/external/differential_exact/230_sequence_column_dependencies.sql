@@ -1,5 +1,6 @@
 -- Column-level dependencies on sequences, types named in defaults, and
--- sequence column identities.
+-- sequence column identities. Only objects created here are listed: earlier
+-- fixtures may leave objects behind.
 create sequence sq;
 create view vs as select last_value, is_called from sq;
 create view vs2 as select * from sq;
@@ -9,7 +10,7 @@ create table td (a int default 1::dd);
 create function fd() returns int language sql as 'select 1::dd';
 create function fd2() returns int language sql begin atomic select 1::dd; end;
 create view vd as select 1::dd as x;
-select classid::regclass, objsubid, refclassid::regclass, refobjsubid, deptype, pg_describe_object(classid,objid,objsubid) obj, pg_describe_object(refclassid,refobjid,refobjsubid) ref from pg_depend where objid >= 16384 and refobjid >= 16384 order by obj, ref;
+select * from (select classid::regclass, objsubid, refclassid::regclass, refobjsubid, deptype, pg_describe_object(classid,objid,objsubid) obj, pg_describe_object(refclassid,refobjid,refobjsubid) ref from pg_depend where objid >= 16384 and refobjid >= 16384) d where obj ~ '\m(sq|vs|vs2|vs3|dd|td|fd|fd2|vd)\M' order by obj, ref;
 DROP DOMAIN dd;
 create view vs4 as select s.last_value from sq s;
 create view vs5 as select sq.is_called, nextval('sq') from sq;

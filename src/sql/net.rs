@@ -630,11 +630,11 @@ pub fn format_cidr_abbrev(net: &NetAddr, out: &mut impl fmt::Write) -> fmt::Resu
         return format_addr(net, true, out);
     }
     let octets = usize::from(net.bits.div_ceil(8)).max(1);
-    for i in 0..octets {
+    for (i, octet) in net.addr[..octets].iter().enumerate() {
         if i > 0 {
             out.write_char('.')?;
         }
-        write!(out, "{}", net.addr[i])?;
+        write!(out, "{}", octet)?;
     }
     write!(out, "/{}", net.bits)
 }

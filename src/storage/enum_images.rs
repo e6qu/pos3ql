@@ -1060,7 +1060,7 @@ mod tests {
         use crate::storage::UserTypeName;
         use crate::storage::tests::make_def;
         use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
 
         let mut storage = storage(1);
         let slot = create(&mut storage, "state");
@@ -1093,7 +1093,7 @@ mod tests {
                     let definition = storage.table_def(table, 0);
                     let selected = storage.enum_for(slot, 0);
                     ready.store(true, Ordering::Release);
-                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let deadline = crate::test_wait::deadline();
                     while !published.load(Ordering::Acquire) && Instant::now() < deadline {
                         std::thread::yield_now();
                     }
@@ -1107,7 +1107,7 @@ mod tests {
                     assert_eq!(storage.enum_for(slot, 0).sort_of("renamed"), Some(1.0));
                 });
             });
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = crate::test_wait::deadline();
             while !ready.load(Ordering::Acquire) && Instant::now() < deadline {
                 std::thread::yield_now();
             }
@@ -1291,7 +1291,7 @@ mod tests {
     #[test]
     fn enum_image_ownership_worker_view_keeps_catalog_writers_available() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
         let mut storage = storage(1);
         let slot = create(&mut storage, "state");
         let selected = storage.enum_for(slot, 0);
@@ -1299,7 +1299,7 @@ mod tests {
         std::thread::scope(|scope| {
             let flag = &published;
             let reader = scope.spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = crate::test_wait::deadline();
                 while !flag.load(Ordering::Acquire) && Instant::now() < deadline {
                     std::thread::yield_now();
                 }

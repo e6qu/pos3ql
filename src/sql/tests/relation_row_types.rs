@@ -71,6 +71,61 @@ fn relation_row_types_are_values_casts_and_whole_row_types() {
     );
 }
 
+/// Every composite, a relation row type included, binds a `record`
+/// parameter, converts to JSON objects as PostgreSQL's `composite_to_json`
+/// does, and groups under either spelling of a key.
+#[test]
+fn relation_row_types_bind_record_parameters_json_and_grouping_keys() {
+    let (mut engine, mut budget) = test_engine();
+    rows(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE orders(id int primary key, note text); \
+         INSERT INTO orders VALUES (1, 'a'), (2, 'b'); \
+         CREATE TYPE pair AS (id int, note text)",
+    );
+    for (sql, expected) in [
+        (
+            "SELECT row_to_json(o), to_json(o), to_jsonb(o) FROM orders o ORDER BY id",
+            vec![
+                "{\"id\":1,\"note\":\"a\"}|{\"id\":1,\"note\":\"a\"}|{\"id\": 1, \"note\": \"a\"}",
+                "{\"id\":2,\"note\":\"b\"}|{\"id\":2,\"note\":\"b\"}|{\"id\": 2, \"note\": \"b\"}",
+            ],
+        ),
+        (
+            "SELECT row_to_json(ROW(3, 'c')::pair, true), to_jsonb(ROW(3, NULL)::pair)",
+            vec!["{\"id\":3,\n \"note\":\"c\"}|{\"id\": 3, \"note\": null}"],
+        ),
+        (
+            "SELECT row_to_json(NULL::pair) IS NULL, row_to_json(ROW(1, 'x')::pair, NULL) IS NULL",
+            vec!["t|t"],
+        ),
+        (
+            "SELECT max(o), min(orders) FROM orders o, orders",
+            vec!["(2,b)|(1,a)"],
+        ),
+        (
+            "SELECT to_json(array_agg(o ORDER BY id)) FROM orders o",
+            vec!["[{\"id\":1,\"note\":\"a\"},{\"id\":2,\"note\":\"b\"}]"],
+        ),
+        // jsonb orders keys by length, then bytes.
+        (
+            "SELECT to_jsonb(t) FROM (SELECT 1 AS zz, 2 AS a) t",
+            vec!["{\"a\": 2, \"zz\": 1}"],
+        ),
+        (
+            "SELECT o.id FROM orders o GROUP BY id ORDER BY 1",
+            vec!["1", "2"],
+        ),
+        (
+            "SELECT id, grouping(o.id) FROM orders o GROUP BY o.id ORDER BY 1",
+            vec!["1|0", "2|0"],
+        ),
+    ] {
+        assert_eq!(rows(&mut engine, &mut budget, sql), expected, "{sql}");
+    }
+}
+
 #[test]
 fn named_composite_array_aggregates_resolve_inside_from_scopes() {
     let (mut engine, mut budget) = test_engine();

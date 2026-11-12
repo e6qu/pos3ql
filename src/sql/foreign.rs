@@ -9,7 +9,7 @@ use crate::pg::respond::Responder;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::types::Datum;
 use crate::sql_err;
-use crate::storage::foreign::{ForeignDataHandler, ForeignMappingUser, ForeignServerDefinition};
+use crate::storage::foreign::{ForeignMappingUser, ForeignServerDefinition};
 use crate::storage::{PrivilegeSet, Storage, TableDef, rowenc};
 use crate::util::StackStr;
 
@@ -719,12 +719,7 @@ fn connection_for_server(
     let wrapper = storage
         .foreign_wrapper_by_slot(server.wrapper as usize, txid)
         .ok_or_else(|| sql_err!(sqlstate::FDW_ERROR, "foreign-data wrapper does not exist"))?;
-    if wrapper.handler != ForeignDataHandler::Postgres {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "foreign-data wrapper has no executable PostgreSQL handler"
-        ));
-    }
+    wrapper.require_handler()?;
     let role = storage.current_role_slot(txid).ok_or_else(|| {
         sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,

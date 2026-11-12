@@ -93,6 +93,29 @@ Schemas and catalogs:
   binary input with `0A000`, as PostgreSQL does. Copying non-null statistics
   values, including `pg_statistic[]`, into user tables fails with `0A000`.
 
+- A `LATERAL` item, or a function's arguments in `FROM`, read only the items
+  to its left, never their own or later items' columns: in `SELECT * FROM t,
+  LATERAL (SELECT v) s`, `v` is `t.v`. On the right of a `RIGHT` or `FULL`
+  join such an item reads none of them; naming one fails with `42P10` and
+  PostgreSQL's detail, and a body that names none runs once.
+- A comma starts a new join tree: in `FROM x, a JOIN b USING (id)` the
+  `USING` and `NATURAL` columns come from `a` and `b` only, and lead their
+  tree's columns after `x`'s. `FROM x, a RIGHT JOIN b ON ...` crosses `x`
+  with `a RIGHT JOIN b`, and a join condition naming an item before the comma
+  fails with PostgreSQL's `42P01` and detail.
+
+Data-modifying statements:
+
+- A `FROM`, `USING` or `MERGE` source item cannot refer to the statement's
+  target, as in PostgreSQL. `UPDATE orders o SET n = 0 FROM generate_series(1,
+  o.n) g` and `FROM LATERAL (SELECT o.n)` fail with `42P10`; a plain subquery,
+  a join condition or a `MERGE` source fails with `42P01` (`invalid reference
+  to FROM-clause entry for table "o"`). An unqualified target column in a plain
+  subquery reports `42703` without PostgreSQL's detail line.
+- Correlated subqueries in `WHERE` and `WHEN` conditions run for every
+  candidate row: `DELETE FROM orders WHERE EXISTS (SELECT 1 FROM refunds r
+  WHERE r.order_id = orders.id)`.
+
 Identity, inheritance, and partitions:
 
 - `CREATE TABLE ... (LIKE ... INCLUDING IDENTITY)` creates independently owned
@@ -124,6 +147,213 @@ Identity, inheritance, and partitions:
   PostgreSQL reuses the constraint's index. Startup refuses (`22000`) a saved
   catalog in which a valid partitioned index lacks its copy on a partition, a
   state earlier pos3ql releases could commit.
+
+Syntax and errors:
+
+- `U&'d\0061t\+000061'` and `U&"d!0061t" UESCAPE '!'` read Unicode escapes
+  as PostgreSQL does, with its errors (`invalid Unicode escape`, `invalid
+  Unicode surrogate pair`, `invalid Unicode escape character`). The
+  `standard_conforming_strings` setting is always on, so these forms are always
+  allowed.
+- An identifier longer than 63 bytes is cut to 63 bytes at a character
+  boundary, and the server sends `NOTICE: identifier "..." will be truncated
+  to "..."` before running the query, as PostgreSQL does.
+- Errors point at their cause, as psql's `LINE 1:` and caret show: syntax
+  errors, unknown relations, columns, types, functions and operators (with
+  PostgreSQL's hints), failed constant input (`SELECT 'zap'::int`) and syntax
+  errors inside a SQL function body given to `CREATE FUNCTION`. An error
+  about a whole expression points at its start, as in PostgreSQL: the `1` of
+  `SELECT 1 WHERE 1` (`argument of WHERE must be type boolean, not type
+  integer`), a `CASE WHEN`, `AND`, `OR` or `NOT` operand.
+- Errors and notices raised inside PL/pgSQL and SQL-language functions carry
+  PostgreSQL's `CONTEXT` lines, innermost first: `PL/pgSQL function
+  f(integer) line 3 at RAISE`, `SQL statement "INSERT INTO t VALUES (1)"`,
+  `PL/pgSQL assignment "x := 1/0"` and `SQL function "f" statement 2`. An
+  error analysing a query a function runs, such as an unknown column in
+  `EXECUTE 'SELECT nocol FROM t'`, reports that query and the error's place in
+  it as psql's `QUERY:` and `LINE` lines instead of the client's statement.
+  `GET DIAGNOSTICS ... PG_CONTEXT` and `GET STACKED DIAGNOSTICS ...
+  PG_EXCEPTION_CONTEXT` return the same text, and `RAISE;` re-raises the
+  caught error with its original context. A call PostgreSQL inlines into its
+  caller's query (a SQL function whose body is one `SELECT expression`) adds
+  no line when its arguments vary; with constant arguments the body is folded
+  while it is inlined, so `SELECT f(0)` for a body `SELECT 1/$1` reports
+  `SQL function "f" during inlining`, or `SQL function "f" statement 1` when
+  `f` is `IMMUTABLE` and PostgreSQL runs it while planning. A longer context than 64 KiB is reported as a `54000` error.
+- Constraint violations carry PostgreSQL's `DETAIL` and object fields:
+  `Failing row contains (null, x).` with the schema, table and column of a
+  not-null violation; `Key (id)=(1) already exists.` with the constraint of a
+  unique, foreign-key or exclusion violation; and the schema, data type and
+  constraint of a domain violation. `RAISE ... USING COLUMN`, `CONSTRAINT`,
+  `DATATYPE`, `TABLE` and `SCHEMA` set those fields (up to 1,024 bytes each)
+  and `GET STACKED DIAGNOSTICS` reads them.
+- Checks PostgreSQL makes after parsing are reported when the statement would
+  run, with PostgreSQL's code and message: type modifiers (`numeric(2000)` is
+  `22023`, `NUMERIC precision 2000 must be between 1 and 1000`; `numeric(5,-2)`
+  and `numeric(3,5)` are accepted), COPY options, storage parameters and
+  sequence, database and large-object values. An earlier statement in the same
+  query string still runs, and a syntax error anywhere in the string is
+  reported first. In a `SELECT`, errors PostgreSQL's analysis finds earlier
+  come first: `SELECT 1::numeric(5000) FROM missing` reports the missing
+  relation, and `1::nosuch(5)` reports `type "nosuch" does not exist`.
+- Statements are analysed before they read a row, as in PostgreSQL: a `WITH`
+  query nothing reads must still be valid (`WITH x AS (SELECT * FROM missing)
+  SELECT 1` fails), a constant compared with or added to a column must convert
+  to its type (`WHERE id = 'abc'` fails even on an empty table, and so does a
+  subquery `(SELECT id FROM t WHERE id = 'abc')` of a `SELECT`, `INSERT`,
+  `UPDATE` or `DELETE`, including one in `RETURNING`), and
+  `CREATE FUNCTION` checks a SQL body's queries, target relations, target
+  columns and assigned value types unless `check_function_bodies` is off
+  (always for a `BEGIN ATOMIC` body).
+- A value written to a column must convert to the column's type with an
+  implicit or assignment cast, as PostgreSQL checks before any row is read.
+  An untyped literal (`'5'`) is read by the column type's input, and any
+  value converts to a text column, but `INSERT INTO t (id) VALUES
+  ('5'::text)` fails with `42804` (`column "id" is of type integer but
+  expression is of type text`, hint `You will need to rewrite or cast the
+  expression.`) pointing at the value. A subscripted target checks the
+  element, or the whole array for a slice: `UPDATE t SET m[1] = 'x'::text`
+  reports `subscripted assignment to "m" requires type integer but expression
+  is of type text` at `m`. `INSERT ... SELECT` checks the query's output
+  types, so a `UNION` of untyped literals is text. A `SELECT *` mismatch has
+  no cursor position.
+- PL/pgSQL converts a value to a variable's, array element's, `OUT`
+  parameter's or result's type with an assignment cast when one exists, and
+  otherwise through text, as PostgreSQL does: `x := true` for an integer `x`,
+  or `x[1] := true` for an integer array, fails with `invalid input syntax for
+  type integer: "t"`. `CREATE FUNCTION` checks that a SQL
+  function's final query returns one column of a type that converts to a
+  scalar result (`return type mismatch in function declared to return
+  integer`, detail `Actual return type is text.`), with context `SQL function
+  "f"`; an untyped literal there is text.
+- A routine's `INSERT`, `UPDATE` or `DELETE` on a view or on a table with
+  rules goes through the view's triggers and the rules, as at top level:
+  static PL/pgSQL, `EXECUTE` and SQL-language functions alike. A static
+  statement reads the routine's variables and a trigger's `NEW` and `OLD`
+  rows, so `INSERT INTO active_orders VALUES (id)` works in a body, also in a
+  `BEFORE` row trigger and in a trigger of a write that another trigger made.
+- A `BEFORE` or `INSTEAD OF` row trigger whose body runs DDL (`CREATE TABLE`,
+  `EXECUTE 'CREATE ...'`), writes a view or a table with rules, calls a
+  procedure that does, or calls a function that reads the trigger's own
+  earlier writes, runs once for its row as in PostgreSQL: the write stops at
+  that row, the whole trigger body runs, and the write continues with the
+  row the body returned. Its notices, sequence values and writes appear once.
+- A trigger's `NEW` and `OLD` have the table's row type in every firing. One
+  without a row (`OLD` in an `INSERT` trigger, `NEW` in a `DELETE` trigger,
+  both in a statement trigger) is NULL, and so are its fields; a field the
+  table lacks fails with `42703` (`record "new" has no field "x"`).
+- An exception handler accepts every PostgreSQL condition name, such as
+  `duplicate_table` or `invalid_text_representation`; a name that belongs to
+  two codes (`null_value_not_allowed`) catches both. An unknown name fails with
+  `42704` (`unrecognized exception condition "x"`).
+- A `WITH` query of a static PL/pgSQL statement's main query cannot read
+  the routine's variables: `INSERT INTO t WITH c AS (SELECT id_var) SELECT *
+  FROM c` fails with `42703` (`column "id_var" does not exist`), where
+  PostgreSQL reads the variable. Move the query into a derived table
+  (`SELECT * FROM (SELECT id_var) c`), which reads routine variables.
+- A rule on a data-modifying `WITH` sub-statement's target must leave one
+  statement, as in PostgreSQL: `DO ALSO`, conditional, multi-statement,
+  `NOTHING` and `NOTIFY` `INSTEAD` rules fail with `0A000` before anything
+  runs. The command tag of a statement an unconditional `INSTEAD` rule
+  replaces counts the last `INSTEAD` action of the same command.
+- `INSERT`, `UPDATE`, `DELETE` and `MERGE ... RETURNING ... INTO [STRICT]
+  targets` in PL/pgSQL store the returned row and set `FOUND` and
+  `ROW_COUNT`. A routine called in the statement's rows or `RETURNING` list
+  sees the rows the statement changed before it, as at top level. More than
+  one row fails with `P0003` (`query returned more than one row`) even without
+  `STRICT`; no row fails with `P0002` only under `STRICT` and otherwise stores
+  NULLs. `RETURNING` without `INTO` fails with `query has no destination for
+  result data`, and `INTO` without `RETURNING` with `INTO used with a command
+  that cannot return data`. As in PostgreSQL, extra result columns are
+  ignored and targets without a column become NULL.
+- `FOR target IN INSERT | UPDATE | DELETE | MERGE ... RETURNING ... LOOP`
+  and the same through `FOR ... IN EXECUTE` run the statement to completion
+  before the first iteration, as PostgreSQL does, so the loop body sees
+  every changed row. Without `RETURNING` the loop fails with `42P11`
+  (`cannot open INSERT query as cursor`). A scalar target takes the first
+  returned column. For example, `FOR r IN DELETE FROM jobs WHERE done
+  RETURNING id LOOP ... END LOOP` visits each deleted job once.
+- A function's name qualifies its parameters, as in PostgreSQL: in
+  `CREATE FUNCTION f(a int)`, `f.a` is the parameter `a` in SQL and
+  PL/pgSQL bodies, even when a table in the query has a column `a`.
+- PL/pgSQL blocks nest with their own `DECLARE` sections, and a label
+  (`<<outer>>`) names a block or loop as in PostgreSQL. `outer.x` reads or
+  assigns the `x` that block declares even where an inner block or an integer
+  `FOR` counter shadows it; `EXIT outer` leaves a labelled block or loop and
+  `CONTINUE outer` resumes a labelled loop. A nested block's variables are
+  initialized in order each time it is entered, outside its own exception
+  handlers. `END outer` and `END LOOP outer` must repeat the label (`end label
+  "b" differs from block's label "a"`).
+- A name in a PL/pgSQL statement that is both a variable and a column is
+  ambiguous, as in PostgreSQL: with parameter `a`, `UPDATE t SET b = 1/(a-15)`
+  fails with `42702` (`column reference "a" is ambiguous`, detail `It could
+  refer to either a PL/pgSQL variable or a table column.`) before any row is
+  read, at any query level, including a cursor's query at `OPEN`.
+  `#variable_conflict use_column` at the start of the body, or the superuser
+  setting `plpgsql.variable_conflict = use_column`, reads the column instead;
+  `use_variable` reads the variable everywhere, so with variable `a = 2`,
+  `SELECT sum(a) FROM t` adds 2 per row and `GROUP BY a` makes one group. The
+  setting exists from startup, as if PL/pgSQL were preloaded.
+- A PL/pgSQL function keeps the `plpgsql.variable_conflict` and
+  `plpgsql.print_strict_params` values it was compiled under, as PostgreSQL's
+  per-session function cache does: the creating session compiles it at
+  `CREATE FUNCTION` for calls without collatable inputs, and other calls
+  compile it at their session's first call. A body's `#variable_conflict` or
+  `#print_strict_params` option overrides the setting; `#option dump` is
+  accepted. With `print_strict_params` on, a `STRICT` failure's detail lists
+  the variables the statement reads, in declaration order (`parameters: p =
+  '1', q = NULL`), or an `EXECUTE`'s `USING` values as `$1 = '1'`.
+- Each query of a volatile PL/pgSQL function, procedure, trigger or `DO` block
+  sees the rows its earlier statements changed; a stable or immutable
+  function reads its caller's snapshot.
+- Data-changing `WITH` queries run exactly once and share the main query's
+  snapshot, as in PostgreSQL: in `WITH d AS (DELETE FROM t) INSERT INTO t
+  VALUES (9)`, the delete removes only the rows that existed before the
+  statement, and the main query sees a `WITH` query's changes only through
+  its `RETURNING` rows. Each runs when the statement first reads its rows,
+  so in `WITH w AS (INSERT INTO t VALUES (1) RETURNING a) SELECT f(), (SELECT
+  a FROM w), f()` the first call of a volatile `f` does not see the new row
+  and the second does. One that nothing reads runs after the main query, the
+  last written first.
+- A subquery (scalar, `EXISTS`, `ARRAY`, `IN`, `ANY` or `ALL`) that calls a
+  volatile function or reads a `WITH` query not yet run, or any subquery of a
+  statement with a data-changing `WITH`, runs where evaluation reaches it,
+  once when it is uncorrelated, so its notices, sequence values and writes
+  interleave with the rest of the expression as in PostgreSQL; an untaken
+  `CASE` arm never runs it. Such an `IN`, `ANY` or `ALL` list is held in
+  statement memory rather than spilled.
+- A subquery or derived table reads the columns of every query that encloses
+  it, however deeply nested: in `SELECT (SELECT (SELECT a.x + b.y FROM c)
+  FROM b) FROM a` the innermost query reads both `a` and `b`. A derived table
+  in FROM reads the FROM items before it only when marked `LATERAL`; `SELECT
+  * FROM a, (SELECT * FROM b WHERE b.y = a.x) s` fails with PostgreSQL's
+  `invalid reference to FROM-clause entry for table "a"` and its hint to mark
+  the subquery `LATERAL`. `UPDATE ... FROM` and `DELETE ... USING` items
+  cannot read the target table, even when `LATERAL`.
+- A materialized `WITH` query runs when its rows are first read, as
+  PostgreSQL's CTE scan runs it; one that nothing reads never runs.
+- `UPDATE` and `INSERT` assign through composite fields and array elements:
+  `UPDATE t SET pair.x = 1, pair.y = 'a'`, `SET n.inner.x = 3`, `SET
+  a[2].x = 5`, `SET bag.arr[1:2] = '{1,2}'` and `INSERT INTO t (pair.x,
+  pair.y) VALUES (1, 'a')`. A NULL composite becomes a row of NULL fields
+  first. Several targets through one column apply left to right; any other
+  repeated target fails (`multiple assignments to same column "pair"`, or
+  `column "pair" specified more than once` in an `INSERT`). Values convert
+  as assignments do, and PostgreSQL's analysis errors are reported at the
+  target (`subfield "x" is of type integer but expression is of type
+  timestamp with time zone`, `cannot set a subfield to DEFAULT`).
+- A PL/pgSQL condition of another type converts through its text form as in
+  PostgreSQL: `IF 1` is true and `IF 5` fails with `invalid input syntax for
+  type boolean`.
+- An unsupported cast reports `42846` with both types as `format_type` names
+  them (`cannot cast type integer to timestamp without time zone`).
+- Array elements and slices can be assigned (`UPDATE t SET a[2] = 9`,
+  `a[1:2] = '{1,2}'`, `INSERT INTO t (a[1]) VALUES (5)`, `INSERT INTO t (a[1])
+  SELECT 5`): a one-dimensional array grows with NULLs, other arrays stay
+  within their bounds, and a slice anywhere in a subscript list makes the whole
+  list a slice (`a[1:1][1]`). A subscripted jsonb target in an `INSERT` starts
+  from a jsonb NULL (`INSERT INTO t (j['x']) VALUES ('1')` stores
+  `{"x": 1}`).
 
 Row types:
 
@@ -217,13 +447,16 @@ Functions and expressions:
   Procedure output parameters take the final statement's first row.
   Transaction control in a quoted SQL body (`AS 'COMMIT'`) is stored, and a
   call that reaches it fails with `0A000`, as in PostgreSQL. A `BEGIN ATOMIC`
-  body accepts only queries, data changes and `CALL`; anything else fails at
-  `CREATE` (`0A000`, `COMMIT is not yet supported in unquoted SQL function
-  body`). `pg_get_function_sqlbody` returns a `RETURN` or `BEGIN ATOMIC` body
-  (`RETURN (x * 2)`; `BEGIN ATOMIC` then one statement per line) and NULL for
-  a quoted body; a `SELECT` of expressions without `FROM` is printed in
-  PostgreSQL's analyzed form with each column's name (`SELECT (x + 1);`,
-  `SELECT abs(x) AS abs;`), other statements as written.
+  body accepts only queries and data changes; anything else, `CALL` included,
+  fails at `CREATE` (`0A000`, `COMMIT is not yet supported in unquoted SQL
+  function body`). A quoted SQL body cannot `CALL` a procedure with output
+  parameters (`0A000`, `calling procedures with output arguments is not
+  supported in SQL functions`). `pg_get_function_sqlbody`
+  returns a `RETURN` or `BEGIN ATOMIC` body (`RETURN (x * 2)`; `BEGIN ATOMIC`
+  then one statement per line) and NULL for a quoted body; a `SELECT` of
+  expressions without `FROM` is printed in PostgreSQL's analyzed form with
+  each column's name (`SELECT (x + 1);`, `SELECT abs(x) AS abs;`), other
+  statements as written.
 - PL/pgSQL `CALL` assigns output parameters to the variables written as
   their arguments: `CALL doubled(x, y)` updates `x` and `y`, and a constant in
   an output position fails with `42601` (`procedure parameter "b" is an output
@@ -232,13 +465,32 @@ Functions and expressions:
   when every caller up to the top-level `CALL` or `DO` could; from a function,
   an explicit transaction block, an exception block, or a `SECURITY DEFINER`
   or `SET` procedure it fails with `2D000` (`invalid transaction
-  termination`). `CALL` in a trigger function fails with `0A000`.
+  termination`). A trigger function may `CALL` a procedure; the call is
+  atomic, so its `COMMIT` fails with `2D000`. A trigger fired inside a write
+  (a BEFORE row trigger, or a deferred constraint trigger at `COMMIT`) can
+  call PL/pgSQL and SQL-language procedures, with arguments such as
+  `NEW.id + 1`. A SQL procedure that a deferred constraint trigger calls at
+  `COMMIT` runs its queries, `INSERT`, `UPDATE`, `DELETE` and nested `CALL`
+  statements; any other statement in its body, such as `CREATE TABLE`, fails
+  with `0A000` (`a SQL procedure called during a write cannot run CREATE
+  TABLE`) where PostgreSQL runs it. From a `BEFORE` row trigger it runs.
+- A procedure or `DO` block that waits for a lock or storage, before or after
+  its own `COMMIT`, continues at the waiting statement as in PostgreSQL. A
+  PL/pgSQL statement whose function call waits continues at that call,
+  including statements with several expressions (`FOR` bounds, `CASE`,
+  `RAISE` arguments and `USING` options, `IF ... ELSIF`, `ASSERT`, `CALL`
+  arguments, `EXECUTE` command and `USING` values): expressions that finished
+  before the wait are not evaluated again. For example, in
+  `FOR i IN next_batch()..last_batch() LOOP`, `next_batch()` runs once even
+  when `last_batch()` waits for a lock. A dynamic `EXECUTE` that writes rolls
+  back to its own start and evaluates its expressions again.
 - A built-in function cannot implement `CREATE CAST` or `CREATE OPERATOR`
   (`0A000`). Aggregate support functions can name supported built-ins.
-- A missing-function message that does not fit the fixed 192-byte error
-  message returns `54000`. This includes the signature that `DROP`, `ALTER`,
+- A missing-function message names the whole signature however long it is,
+  as PostgreSQL does, including the signature that `DROP`, `ALTER`,
   `COMMENT ON` and `GRANT` quote for a routine they cannot find, such as
-  `function f(integer) does not exist`.
+  `function f(integer) does not exist`. Messages up to 100 arguments of
+  schema-qualified type names fit; a longer one fails with `54000`.
 - Each database has its own copy of a built-in function's catalog row, as in
   PostgreSQL. `ALTER FUNCTION lower(text) STABLE` changes volatility,
   `PARALLEL`, `LEAKPROOF`, `COST`, `ROWS`, `STRICT`, `SECURITY`, `SET`/`RESET`
@@ -412,6 +664,18 @@ Functions and expressions:
   with `42883` (`operator does not exist: integer ~~ unknown`).
 - An unmatched PL/pgSQL `CASE` without `ELSE` raises `20000` (`case not found`,
   hint `CASE statement is missing ELSE part.`).
+- PL/pgSQL bound cursors (`c [NO] [SCROLL] CURSOR [(lo int, hi int)] FOR
+  query` in `DECLARE`) open with `OPEN c` or `OPEN c(2, hi := 3)`; arguments
+  convert to their declared types and the query reads them by name. As in
+  PostgreSQL 18 the variable stays NULL until `OPEN` names the portal, and
+  argument mistakes fail with `42601` when the routine is created.
+  `FOR rec IN c LOOP` (or `FOR rec IN c(2) LOOP`) opens the cursor as a
+  portal listed in `pg_cursors`, fetches one row per iteration into its own
+  record `rec`, and closes the portal when the loop ends by any route. While
+  the loop runs, `CLOSE c` fails with `24000` (`cannot drop pinned portal`)
+  and an already open cursor fails with `42P03`; a variable that was NULL is
+  NULL again after the loop. `COMMIT` or `ROLLBACK` inside a procedure's
+  cursor loop keeps the loop reading, as PostgreSQL holds the portal.
 - User error codes such as `PZ001` behave as ordinary errors: `WHEN SQLSTATE
   'PZ001'`, `'PZ000'` (category match), or `WHEN OTHERS` catch them.
 - `pg_input_is_valid` and `pg_input_error_info` report invalid values, but an
@@ -445,6 +709,23 @@ Domains and checked inputs:
   integer parameter fails at Bind. `PREPARE saved AS SELECT
   '{paid}'::checked_status[]` checks the literal once at `PREPARE`;
   `ARRAY['paid']::checked_status[]` checks when executed.
+- `PREPARE` types every parameter as PostgreSQL does: declared types first,
+  then the type its use selects. `PREPARE q AS SELECT round($1)` records
+  `double precision` in `pg_prepared_statements`, so `EXECUTE q(2.5)` returns
+  2. A parameter that is never used (`SELECT $2::int` leaves `$1` unused) or
+  only passed where any type is accepted (`pg_typeof($1)`) fails with `42P18`;
+  an otherwise untyped one is `text`. An untyped operand of a built-in
+  operator takes the type PostgreSQL's operator selection picks
+  (`jsonb -> $1` reads `text`); when it cannot pick one (`current_date + $1`)
+  `PREPARE` fails with `operator is not unique` (`42725`). User-defined types
+  are recorded exactly: `PREPARE q(positive)` and `PREPARE q AS SELECT
+  $1::mood` list `positive` and `mood`, and `EXECUTE` checks a domain's
+  constraints. `EXECUTE` converts each argument with PostgreSQL's assignment
+  rules, so `EXECUTE q(2.7)` passes 3 to an integer domain and
+  `EXECUTE q('happy'::text)` fails with `42804` (`parameter $1 of type text
+  cannot be coerced to the expected type mood`). A protocol Parse fixes its
+  parameter types and reports an undeterminable one with `42P18` at Parse;
+  later Bind and Describe messages reuse those types.
 - SQL functions are validated at `CREATE`, then each backend checks and keeps
   the first call's inputs for that definition and argument types. PL/pgSQL keeps
   one instance per resolved argument types and collation. Views, rules,
@@ -482,12 +763,13 @@ PostgreSQL). Current `0A000` messages:
 
 | Message | Example cause |
 |---|---|
-| `expression wait requires an owned invocation log` | A wait inside an assignment, `RETURN`, loop bound, or message expression of a PL/pgSQL function running in retained AFTER-trigger work |
+| `expression wait requires an owned invocation log` | A routine call that waits inside an expression that no saved statement owns, such as a SQL-language function body replayed by its caller in retained AFTER-trigger work |
 | `SQL row expression requires retained write progress` | A multirow UPDATE that changes one row, then calls a function for the next row that must wait |
 | `expression restart requires owned volatile values` | Restarting would repeat an unsaved `random()` or clock value |
 
-Data-change triggers also return `0A000` for a reached literal of an array of a
-named domain, such as `PERFORM cardinality('{1}'::positive_integer[])`. Owned
+Constraint triggers deferred to `COMMIT` also return `0A000` for a reached
+literal of an array of a named domain, such as
+`PERFORM cardinality('{1}'::positive_integer[])`. Owned
 `PERFORM`/`SELECT ... INTO` calls, SQL-language function bodies, and nested
 AFTER-trigger results already survive waits. Closing these gaps is tracked in
 [PLAN.md](../PLAN.md#pause-and-resume-every-query-path).
@@ -564,13 +846,14 @@ why none of these numbers is a throughput rate.
 | LIST partition bounds, inheritance parents, trigger arguments, routine configuration entries | 64 each | named error |
 | Constraint and other catalog creation numbers (statistics, extensions, FDW objects, publications, subscriptions) | 1–9,999,999 | `54000` |
 | Stored default expression, including saved display text | 120 bytes | `54000` |
-| Identifier length | 63 bytes | `42622` (PostgreSQL truncates with a notice instead) |
+| Identifier length | 63 bytes | Truncated at a character boundary with PostgreSQL's `NOTICE` (`42622`) |
 | `search_path` | 128 bytes | `22023` |
 | `application_name` after PostgreSQL's [ASCII cleaning](https://github.com/postgres/postgres/blob/REL_18_6/src/common/string.c#L81) (`\xhh` escapes) | 64 bytes | `22023`, prior value kept |
 | Connection startup option word | 256 bytes | `54000` |
 | Timeout settings | 2,147,483,647 ms | `22023`; enabling a disabled-only timeout is `0A000` |
 | Simultaneously tracked function calls (`track_functions`) per SQL worker | 1,024 | `54000` |
-| Missing-function error text | 192 bytes | `54000` |
+| Error message text, including a `RAISE` message | 27,824 bytes | `54000` |
+| `RAISE ... USING DETAIL` or `HINT` text | 12,288 bytes each | `54000` |
 | Built-in function NOTICE/WARNING messages raised before the next output message; one message's text | 64; 256 bytes | `54000` |
 | Transaction identities and command counters | 32-bit, checked | `54000` before reuse |
 | JSON nesting / jsonpath depth | 1,000 / 128 | see [SQL/JSON](sql-json.md) |
@@ -585,7 +868,7 @@ Exhaustion returns `54000` naming the pool, before any partial effect.
 
 | Setting(s) | Bounds |
 |---|---|
-| `sql_arena_bytes` (per-connection statement memory), `work_arena_bytes` (per query workspace, like PostgreSQL's `work_mem`) | Row images, joins, lists, programs, JSON/XML work, table-function rows, sorts and aggregates, retained scan/COPY/validation records (32 bytes per resident row) |
+| `sql_arena_bytes` (per-connection statement memory), `work_arena_bytes` (per query workspace; see [`work_mem`](#work_mem)) | Row images, joins, lists, programs, JSON/XML work, table-function rows, sorts and aggregates, retained scan/COPY/validation records (32 bytes per resident row) |
 | `max_tables`, `max_extended_statistics`, other catalog `max_*` | One capacity per catalog family; omitting `max_extended_statistics` derives it from `max_tables`, so set it explicitly |
 | `max_connections`, `max_prepared_transactions`, `max_subscriptions` | Transaction identity registry has `max_connections + max_prepared_transactions` entries |
 | `max_catalog_versions_per_object`, `max_ddl_per_transaction` | Retained definition/undo versions. Enum label images use `max_enums + P` slots, `P = min(max_enums * max_catalog_versions_per_object, (max_connections + max_prepared_transactions + max_subscriptions) * max_ddl_per_transaction)`, each holding `max_enum_labels_per_type` labels |
@@ -595,23 +878,44 @@ Exhaustion returns `54000` naming the pool, before any partial effect.
 | `table_metadata_bytes`, `table_metadata_leases` | Schema images and routine input values (starter 64 MiB, 8,192) |
 | `statistics_bytes`, `statistics_leases` | Column statistics (starter 1 MiB, 1,024) |
 | `index_statistics_slots` | Index counters (starter 4,096) |
+| `deferred_trigger_bytes`, `trigger_event_spill_bytes` (required; `0` disables spilling) | Queued `AFTER` trigger and foreign key events: per-connection memory pages, then a local file shared by all connections |
 | `definition_image_slots` | Schema pins held by executing statements |
-| `execution_control_bytes`, `execution_control_leases` | PL/pgSQL source images, locals, loop frames, saved outputs, caught errors |
+| `execution_control_bytes`, `execution_control_leases` | PL/pgSQL source images, locals, loop frames, saved outputs, caught errors, and the step records of a running multi-step write |
+| `write_step_levels` (optional, default 4, at most 64) | Levels of multi-step statements (rule actions on tables with rules, rules on `WITH` targets) nested in one another's steps whose progress a write keeps; a routine call after rows changed one level deeper fails with `54000` naming the setting |
 | `routine_input_slots` | Per-backend routine plan instances |
 | `max_prepared`, `prepared_bytes` | Prepared statements per namespace and bytes per statement, shared with bound portals |
 | `cursor_bytes`, `cursor_query_bytes` | See [cursors](#cursor-capacity) |
-| `conn_send_buffer_bytes`, `result_spool_bytes`, `result_spool_leases` | Result output: the send buffer, then rows queued in the shared spool for a slow client (a private reserve of the send-buffer size holds closing messages). Only a client lagging by more than the spool gets `54000`; the largest single message must fit the send buffer. A paged portal (`Execute` with a row limit) still buffers its result in `portal_result_bytes` |
-| `result_stream_bytes` (required; starter 256 KiB, minimum 64 KiB) | Per-connection read position of a large single-table `SELECT` that resumes row by row; a larger estimate spools the result instead, and a stream that still outgrows it fails with `54000` naming the setting |
+| `conn_send_buffer_bytes`, `result_spool_bytes`, `result_spool_leases` | Result output: the send buffer, then rows queued in the shared spool for a slow client (a private reserve of the send-buffer size holds closing messages). Only a client lagging by more than the spool gets `54000`; the largest single message must fit the send buffer. A paged portal (`Execute` with a row limit) that cannot stream (another shape, or suspended portals hold every `result_stream_slots` stream) buffers its result in `portal_result_bytes` and fails with `54000` naming it when full |
+| `plan_build_bytes`, `plan_build_leases` (required; starter 16 MiB and 64) | Shared build sides of streamed sorts and streamed or cursor-read hash joins; a build that does not fit runs the statement as it ran without streaming (the result spools; a cursor saves its rows at `DECLARE`) |
+| `result_stream_bytes` (required; starter 256 KiB, minimum 64 KiB) | Read position of each large `SELECT` from one table, builtin set-returning functions or a join of them that resumes row by row, including a paged portal between its `Execute` messages; a larger estimate, or a stream that outgrows it while opening, spools the result instead; a stream that outgrows it after its first row fails with `54000` naming the setting |
+| `result_stream_slots` (required; starter 2, at least 1) | Result streams per connection: one running statement plus suspended paged portals. A paged portal opened while every slot is held buffers in `portal_result_bytes` |
 | `txn_rows`, `copy_transition_bytes` (256 KiB default) | Streamed COPY statement-trigger inputs per connection |
 | `commit_queue_slots` | Commits waiting for durability |
 | `memtable_bytes` (≤ `u32::MAX`) | Two heap buffers are reserved; reclamation returns `54000` while both are retained |
 | `object_store_get_slots`, `object_store_put_slots`, `object_store_block_put_slots`, `wal_upload_buffer_bytes` | Concurrent object-store requests; see [object storage](object-storage.md) |
+| `statement_restart_waits` (optional, default 64) | Blocks one statement's restarts may download, per read owner, before a restart without progress reads the rest synchronously; see [execution model](architecture.md#execution-model) |
 | `checkpoint_manifest_bytes` and backup/merge/cleanup rosters | Maintenance work per step |
 
 Fixed per-query-workspace limits: 1,024 snapshot and file-owner slots, 64 scan
 sources, 64 point-read sources, and 64 copied point reads. At 85% heap use,
 writing commands wait for cache reclamation before taking effect; reads,
 commits, and cancellation proceed.
+
+### `work_mem`
+
+PostgreSQL's `work_mem` is a per-session hint: how much memory a sort or hash
+may use before it spills to temporary files. It never changes query results.
+pos3ql accepts and reports it exactly like PostgreSQL 18, with the same units
+(`B`, `kB`, `MB`, `GB`, `TB`), rounding, range (64 kB to 2,147,483,647 kB),
+default (`4MB`), errors, `SHOW`, `pg_settings` row and routine `SET` clause.
+For example, `CREATE PROCEDURE nightly() ... SET work_mem = '256MB'` works,
+and `SHOW work_mem` inside it reports `256MB`.
+
+The value does not size memory in pos3ql. Each query runs in a workspace of
+`work_arena_bytes`, fixed at startup, and pos3ql never spills to temporary
+files: a sort, grouping or hash table that outgrows the workspace fails with
+`54000` whatever `work_mem` says. Raise `work_arena_bytes` in the configuration
+file and restart to let larger sorts run.
 
 ### Cursor capacity
 
@@ -621,15 +925,32 @@ description, and `floor(cursor_bytes / 6)` row positions. Each saved row costs
 its data plus six bytes. Long column names can fill the description even when
 rows fit; raising `cursor_bytes` does not help there.
 
-- `NO SCROLL`: `cursor_bytes` bounds one fetched batch and is reused.
-- `SCROLL`: every visited row stays in `cursor_bytes`, so history can exhaust it.
-  When revisited rows are evaluated again, the history holds each row's input
+- `NO SCROLL` (and forward-only by shape): a top-level forward `FETCH n` or
+  `FETCH ALL` from a cursor that reads as you fetch streams its rows to the
+  client without saving them, so any count works; other fetches, such as a
+  `FETCH` inside a routine, `RELATIVE`/`ABSOLUTE` or one over a row-locking
+  cursor, buffer one batch in `cursor_bytes`, which is reused.
+- `SCROLL` without volatile functions, unordered and not locking: only the
+  current fetch's rows stay in `cursor_bytes`; a top-level forward fetch
+  streams, and moving back reads the input again from its first row.
+- Other `SCROLL` cursors keep every visited row in `cursor_bytes`, so history
+  can exhaust it. When revisited rows are evaluated again, the history holds each row's input
   columns plus 17 bytes of row identity, and a volatile filter adds the rows it
   rejected; the current fetch's output shares the same bytes.
-- Ordered row-locking cursors save every qualifying row's input columns (plus
-  17 bytes) at the first `FETCH`.
+- Ordered cursors save every qualifying row's input columns (plus 17 bytes)
+  at the first `FETCH`: the columns the query reads, or every column of a
+  row-locking cursor.
 - `WITH HOLD`: the unread suffix (plus history when scrolling) must fit; a
   scrollable cursor whose rows are evaluated again saves its whole result.
+- A trigger fired inside a writing statement (`INSERT`, `UPDATE`, `DELETE`,
+  `MERGE`, `COPY`, `TRUNCATE`, deferred constraints) can read a cursor whose
+  query runs whole at its first read. One that evaluates its rows as they are
+  fetched, or whose data-modifying `WITH` queries have not run yet, raises
+  `0A000` there.
+- A PL/pgSQL `OPEN` query with data-modifying `WITH` queries runs once, at
+  the cursor's first `FETCH` or `MOVE` as in PostgreSQL, and its whole result
+  must fit; a cursor closed unread never writes. A full store raises `54000`
+  (`cursor result exceeds cursor_bytes`).
 
 Destructive changes to a table an open cursor reads raise `55006`, as in
 [PostgreSQL](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/commands/tablecmds.c).
@@ -648,6 +969,9 @@ PostgreSQL physical standby cannot replay pos3ql's journal.
 - Heap layout, `ctid`, system columns (`xmin`, `xmax`, `cmin`, `cmax`), HOT,
   physical vacuum, physical/streaming replication, hot standby, and binary-WAL
   tools are not provided. Row identities are not exposed as fake heap addresses.
+  A query naming one of these columns of a table fails with `0A000` (`system
+  column "ctid" is not supported`); as in PostgreSQL, a table column cannot
+  take a system column's name (`42701`).
 - PostgreSQL parallel query, JIT, and planner/executor hooks do not exist.
   Cost estimates and `EXPLAIN` text differ from PostgreSQL.
 - Logical copies are separate durable databases updated asynchronously; there

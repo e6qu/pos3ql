@@ -63,6 +63,29 @@ pub(super) fn capture<'a, T>(
 }
 
 pub(super) fn record(kind: Kind, key: usize, text: &str, original: &str) -> Result<(), SqlError> {
+    record_with(kind, key, text, original, None)
+}
+
+/// [`record`] for a query rewritten into `arena`, the arena the program is
+/// parsed in: the site keeps the parsed text itself, so the positions of its
+/// parsed names locate in the text a procedural error reports.
+pub(super) fn record_rewritten(
+    kind: Kind,
+    key: usize,
+    text: &str,
+    original: &str,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    record_with(kind, key, text, original, Some(arena))
+}
+
+fn record_with(
+    kind: Kind,
+    key: usize,
+    text: &str,
+    original: &str,
+    text_arena: Option<&Arena>,
+) -> Result<(), SqlError> {
     CAPTURE.with(|slot| {
         let pointer = slot.get();
         if pointer.is_null() {
@@ -80,6 +103,10 @@ pub(super) fn record(kind: Kind, key: usize, text: &str, original: &str) -> Resu
         let original = frame.body.get(start..end).ok_or_else(invalid_source)?;
         let text = if text == original {
             original
+        } else if text_arena.is_some_and(|arena| core::ptr::eq(arena, frame.arena)) {
+            // SAFETY: `text` lives in the capture's own arena, which outlives
+            // every site the capture returns.
+            unsafe { core::mem::transmute::<&str, &str>(text) }
         } else {
             frame
                 .arena
@@ -216,10 +243,10 @@ pub(super) fn reject_atomic<'a>(
         if parser.type_input_candidates().iter().any(|candidate| {
             super::type_inputs::candidate_target_oid(storage, txid, candidate).is_some()
         }) {
-            return Err(sql_err!(
+            return Err(super::exec::engine_required(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "checked type inputs in data-change triggers require a resumable execution context"
-            ));
+            )));
         }
         Ok(())
     })();

@@ -250,11 +250,14 @@ fn routine_lookup_diagnostics_keep_static_types_without_argument_effects() {
             &format!("SELECT diag_missing({arguments})"),
             true,
         );
-        assert_eq!(error_sqlstates(&output), ["54000"]);
-        assert!(
-            String::from_utf8_lossy(&output)
-                .contains("function diagnostic exceeds SQL error message capacity (192 bytes)")
-        );
+        // The whole signature is reported, as PostgreSQL reports it.
+        assert_eq!(error_sqlstates(&output), ["42883"]);
+        let signature = std::iter::repeat_n("bigint", 24)
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(String::from_utf8_lossy(&output).contains(&format!(
+            "function diag_missing({signature}) does not exist"
+        )));
         assert_eq!(
             data_rows(&session.success(&mut engine, "SELECT nextval('diagnostic_effects')", true)),
             ["1"]

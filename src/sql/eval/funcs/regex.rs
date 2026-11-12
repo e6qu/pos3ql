@@ -32,12 +32,11 @@ fn start_byte(source: &str, one_based: i64) -> Option<usize> {
         .or_else(|| (source.chars().count() == wanted).then_some(source.len()))
 }
 
-fn invalid_parameter(name: &str, parameter: &str, value: i64) -> SqlError {
+fn invalid_parameter(parameter: &str, value: i64) -> SqlError {
     sql_err!(
         sqlstate::INVALID_PARAMETER_VALUE,
-        "invalid value for parameter \"{}\" in {}(): {}",
+        "invalid value for parameter \"{}\": {}",
         parameter,
-        name,
         value
     )
 }
@@ -275,7 +274,9 @@ pub(crate) fn dispatch<'a>(
                             Datum::Int4(value) => i64::from(value),
                             Datum::Int8(value) => value,
                             Datum::Oid(value) => i64::from(value),
-                            other => return Err(super::super::type_mismatch_pub(name, &other)),
+                            other => {
+                                return Err(super::super::function_argument_mismatch(name, &other));
+                            }
                         }
                     } else {
                         let Some(value) = int_arg(name, args, 3, arena, params, row, hooks)? else {
@@ -284,7 +285,7 @@ pub(crate) fn dispatch<'a>(
                         value
                     };
                     if value <= 0 {
-                        return Err(invalid_parameter(name, "start", value));
+                        return Err(invalid_parameter("start", value));
                     }
                     value
                 } else {
@@ -297,7 +298,7 @@ pub(crate) fn dispatch<'a>(
                     };
                     occurrence = value;
                     if occurrence < 0 {
-                        return Err(invalid_parameter(name, "n", occurrence));
+                        return Err(invalid_parameter("n", occurrence));
                     }
                 }
                 let flags = if legacy_flags {
@@ -382,7 +383,7 @@ pub(crate) fn dispatch<'a>(
                 let start_char = if args.len() >= 3 {
                     match int_arg(name, args, 2, arena, params, row, hooks)? {
                         Some(v) if v > 0 => v,
-                        Some(v) => return Err(invalid_parameter(name, "start", v)),
+                        Some(v) => return Err(invalid_parameter("start", v)),
                         None => return Ok(Datum::Null),
                     }
                 } else {
@@ -400,7 +401,7 @@ pub(crate) fn dispatch<'a>(
                         return Ok(Datum::Null);
                     };
                     if value <= 0 {
-                        return Err(invalid_parameter(name, "n", value));
+                        return Err(invalid_parameter("n", value));
                     }
                     value
                 } else {
@@ -411,7 +412,7 @@ pub(crate) fn dispatch<'a>(
                         return Ok(Datum::Null);
                     };
                     if !matches!(value, 0 | 1) {
-                        return Err(invalid_parameter(name, "endoption", value));
+                        return Err(invalid_parameter("endoption", value));
                     }
                     value
                 } else {
@@ -441,7 +442,7 @@ pub(crate) fn dispatch<'a>(
                         return Ok(Datum::Null);
                     };
                     if value < 0 {
-                        return Err(invalid_parameter(name, "subexpr", value));
+                        return Err(invalid_parameter("subexpr", value));
                     }
                     value as usize
                 } else {
@@ -544,23 +545,12 @@ pub(crate) fn dispatch<'a>(
                 else {
                     return Ok(Datum::Null);
                 };
-                let mut elements = [Datum::Null; regex::MAX_GROUPS];
-                let count = if groups == 0 {
-                    elements[0] = Datum::Text(&src[start..end]);
-                    1
-                } else {
-                    for (index, (group_start, group_end)) in spans[..groups].iter().enumerate() {
-                        if *group_start >= 0 {
-                            elements[index] =
-                                Datum::Text(&src[*group_start as usize..*group_end as usize]);
-                        }
-                    }
-                    groups
-                };
-                Ok(Datum::Array {
-                    element: ArrElem::Text,
-                    raw: array::build(&elements[..count], arena)?,
-                })
+                super::super::pattern::regexp_match_array(
+                    src,
+                    (start, end),
+                    &spans[..groups],
+                    arena,
+                )
             }
             // `regexp_split_to_array(source, pattern [, flags])`: split on matches.
             "regexp_split_to_array" => {
@@ -604,7 +594,7 @@ pub(crate) fn dispatch<'a>(
                     match eval_full(args[i], arena, params, row, hooks)? {
                         Datum::Null => Ok(None),
                         Datum::Text(s) | Datum::Bpchar(s) => Ok(Some(s)),
-                        other => Err(super::super::type_mismatch_pub(name, &other)),
+                        other => Err(super::super::function_argument_mismatch(name, &other)),
                     }
                 };
                 let (Some(text), Some(pattern)) = (raw_text(0)?, raw_text(1)?) else {

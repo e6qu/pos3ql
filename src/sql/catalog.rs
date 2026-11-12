@@ -4009,34 +4009,46 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     intrinsic!(6274, "generate_series", 1184, "1184 1184 1186 25", 4, "i"),
 ];
 
+/// Whether `name`, as written, names an intrinsic routine. Expression
+/// evaluation asks this for every call it evaluates, so the spelling is
+/// parsed and folded once rather than once per intrinsic.
 pub(crate) fn intrinsic_routine_has_name(name: &str) -> bool {
-    // Evaluation asks this for every call it runs, so the written name is
-    // split and checked once rather than once per intrinsic routine.
     let Some((schema, written)) = split_qualified_name(name) else {
         return false;
     };
     if schema.is_some_and(|schema| !identifier_spelling_matches(schema, "pg_catalog")) {
         return false;
     }
-    let mut buffer = [0u8; 128];
-    let Some(written) = canonical_identifier(written, &mut buffer) else {
-        return false;
-    };
-    INTRINSIC_ROUTINES
-        .iter()
-        .any(|routine| routine.name.as_bytes() == written)
+    let mut folded = [0u8; MAX_INTRINSIC_NAME_BYTES];
+    // A spelling longer than every intrinsic's name names none of them.
+    folded_identifier(written, &mut folded).is_some_and(|folded| {
+        INTRINSIC_ROUTINES
+            .iter()
+            .any(|routine| routine.name.as_bytes() == folded)
+    })
 }
 
-/// The catalog spelling of one written identifier, as
-/// [`identifier_spelling_matches`] compares it: a quoted identifier with its
-/// doubled quotes undone, otherwise the ASCII-lowercased bare word. `None`
-/// when the spelling is malformed or longer than `buffer`, which no built-in
-/// name is.
-fn canonical_identifier<'b>(written: &str, buffer: &'b mut [u8; 128]) -> Option<&'b [u8]> {
+/// Bytes in the longest intrinsic routine name.
+const MAX_INTRINSIC_NAME_BYTES: usize = {
+    let mut longest = 0;
+    let mut index = 0;
+    while index < INTRINSIC_ROUTINES.len() {
+        if INTRINSIC_ROUTINES[index].name.len() > longest {
+            longest = INTRINSIC_ROUTINES[index].name.len();
+        }
+        index += 1;
+    }
+    longest
+};
+
+/// The identifier `written` denotes, as [`identifier_spelling_matches`]
+/// compares it: a quoted spelling with doubled quotes undone, or an unquoted
+/// one folded to lower case. None if it is malformed or exceeds `into`.
+fn folded_identifier<'b>(written: &str, into: &'b mut [u8]) -> Option<&'b [u8]> {
     let written = written.trim();
     let mut length = 0;
-    let mut push = |byte: u8| {
-        *buffer.get_mut(length)? = byte;
+    let mut push = |byte: u8| -> Option<()> {
+        *into.get_mut(length)? = byte;
         length += 1;
         Some(())
     };
@@ -4052,18 +4064,17 @@ fn canonical_identifier<'b>(written: &str, buffer: &'b mut [u8; 128]) -> Option<
             push(byte)?;
         }
     } else {
-        if written.is_empty()
-            || written.bytes().any(|byte| {
-                byte.is_ascii_whitespace() || matches!(byte, b'"' | b'.' | b'(' | b')' | b',')
-            })
-        {
+        if written.is_empty() {
             return None;
         }
         for byte in written.bytes() {
+            if byte.is_ascii_whitespace() || matches!(byte, b'"' | b'.' | b'(' | b')' | b',') {
+                return None;
+            }
             push(byte.to_ascii_lowercase())?;
         }
     }
-    Some(&buffer[..length])
+    Some(&into[..length])
 }
 
 /// Catalog properties describe execution order, not routine acceptance.
@@ -4221,36 +4232,326 @@ pub(crate) fn builtin_operator_procedure(
     left: Option<i32>,
     right: Option<i32>,
 ) -> Option<i32> {
+    match builtin_operator_choice(name, left, right) {
+        BuiltinOperatorChoice::Unique(procedure) => Some(procedure),
+        BuiltinOperatorChoice::NotUnique | BuiltinOperatorChoice::Missing => None,
+    }
+}
+
+/// The outcome of PostgreSQL's operator resolution over the built-in
+/// operators: one operator, several equally good ones (`operator is not
+/// unique`), or none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BuiltinOperatorChoice {
+    Unique(i32),
+    NotUnique,
+    Missing,
+}
+
+/// Built-in operators sharing one name; a unit test keeps every name within it.
+const MAX_BUILTIN_OPERATOR_CANDIDATES: usize = 128;
+
+/// PostgreSQL's type category and preferred flag (`typcategory`,
+/// `typispreferred`) for a built-in type.
+fn builtin_type_category(type_oid: i32) -> (u8, bool) {
+    use super::types::oid;
+    if type_oid == oid::UNKNOWN {
+        return (b'X', false);
+    }
+    let preferred = matches!(
+        type_oid,
+        oid::BOOL
+            | oid::TEXT
+            | oid::OID
+            | oid::FLOAT8
+            | oid::INET
+            | oid::TIMESTAMPTZ
+            | oid::INTERVAL
+            | oid::VARBIT
+    );
+    let category = match ColType::from_oid(type_oid) {
+        Some(ctype) => super::types::type_category(ctype).as_bytes()[0],
+        None if is_polymorphic_pseudo_type(type_oid) => b'P',
+        None => b'U',
+    };
+    (category, preferred)
+}
+
+pub(crate) fn is_polymorphic_pseudo_type(type_oid: i32) -> bool {
+    use super::types::oid;
+    matches!(
+        type_oid,
+        oid::ANYELEMENT
+            | oid::ANYCOMPATIBLE
+            | oid::ANYARRAY
+            | oid::ANYCOMPATIBLEARRAY
+            | oid::ANYNONARRAY
+            | oid::ANYCOMPATIBLENONARRAY
+            | oid::ANYENUM
+            | oid::ANYRANGE
+            | oid::ANYCOMPATIBLERANGE
+            | oid::ANYMULTIRANGE
+            | oid::ANYCOMPATIBLEMULTIRANGE
+            | oid::RECORD
+    )
+}
+
+/// PostgreSQL's `check_generic_type_consistency` for a candidate's
+/// polymorphic inputs: every `any*` position binds one element type, and every
+/// `anycompatible*` position binds element types with a common implicit type.
+/// Unknown and absent inputs bind nothing.
+fn builtin_polymorphic_consistent(actual: [i32; 2], declared: [i32; 2]) -> bool {
+    use super::types::oid;
+    let mut exact = None;
+    let mut compatible = None;
+    for (actual, declared) in actual.into_iter().zip(declared) {
+        if actual == 0 || actual == oid::UNKNOWN {
+            continue;
+        }
+        let element = match declared {
+            oid::ANYARRAY | oid::ANYCOMPATIBLEARRAY => match ColType::from_oid(actual) {
+                Some(ColType::Array(element)) => element.to_coltype().oid(),
+                _ => return false,
+            },
+            oid::ANYELEMENT
+            | oid::ANYNONARRAY
+            | oid::ANYENUM
+            | oid::ANYCOMPATIBLE
+            | oid::ANYCOMPATIBLENONARRAY => actual,
+            // A range binds the element family to its subtype.
+            oid::ANYRANGE | oid::ANYMULTIRANGE => {
+                let subtype = |kind: super::types::RangeKind| match kind {
+                    super::types::RangeKind::Int4 => oid::INT4,
+                    super::types::RangeKind::Int8 => oid::INT8,
+                    super::types::RangeKind::Num => oid::NUMERIC,
+                    super::types::RangeKind::Date => oid::DATE,
+                    super::types::RangeKind::Ts => oid::TIMESTAMP,
+                    super::types::RangeKind::Tstz => oid::TIMESTAMPTZ,
+                };
+                match (declared, ColType::from_oid(actual)) {
+                    (oid::ANYRANGE, Some(ColType::Range(kind)))
+                    | (oid::ANYMULTIRANGE, Some(ColType::Multirange(kind))) => subtype(kind),
+                    _ => return false,
+                }
+            }
+            _ => continue,
+        };
+        let family = if matches!(
+            declared,
+            oid::ANYCOMPATIBLEARRAY | oid::ANYCOMPATIBLE | oid::ANYCOMPATIBLENONARRAY
+        ) {
+            &mut compatible
+        } else {
+            &mut exact
+        };
+        match *family {
+            None => *family = Some(element),
+            Some(bound) if bound == element => {}
+            Some(bound) if family_is_compatible(declared) => {
+                if builtin_argument_properties(element, bound).is_some() {
+                    continue;
+                }
+                if builtin_argument_properties(bound, element).is_some() {
+                    *family = Some(element);
+                    continue;
+                }
+                return false;
+            }
+            Some(_) => return false,
+        }
+    }
+    true
+}
+
+fn family_is_compatible(declared: i32) -> bool {
+    use super::types::oid;
+    matches!(
+        declared,
+        oid::ANYCOMPATIBLEARRAY | oid::ANYCOMPATIBLE | oid::ANYCOMPATIBLENONARRAY
+    )
+}
+
+/// PostgreSQL's `oper_select_candidate` over the built-in operators: an exact
+/// match (an unknown operand first tries the other operand's type), then the
+/// implicitly coercible candidates narrowed by `func_select_candidate`: most
+/// exact matches, then most preferred types where coercion is needed, then
+/// the type category each unknown operand resolves to (string wins), and
+/// finally the one known operand type assumed for the unknown ones.
+pub(crate) fn builtin_operator_choice(
+    name: &str,
+    left: Option<i32>,
+    right: Option<i32>,
+) -> BuiltinOperatorChoice {
+    use super::types::oid;
     let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
     if let Some(procedure) = builtin_operator_exact(name, left, right) {
-        return Some(procedure);
+        return BuiltinOperatorChoice::Unique(procedure);
     }
-    let mut best = None;
-    let mut best_score = None;
-    let mut ambiguous = false;
-    for &(candidate, expected_left, expected_right, procedure) in builtin_properties::OPERATORS {
-        if candidate != name {
-            continue;
-        }
-        let Some((left_rank, _, _)) = builtin_argument_properties(left.unwrap_or(0), expected_left)
-        else {
-            continue;
-        };
-        let Some((right_rank, _, _)) =
-            builtin_argument_properties(right.unwrap_or(0), expected_right)
-        else {
-            continue;
-        };
-        let score = left_rank + right_rank;
-        if best_score.is_none_or(|prior| score > prior) {
-            best_score = Some(score);
-            best = Some(procedure);
-            ambiguous = false;
-        } else if best_score == Some(score) && best != Some(procedure) {
-            ambiguous = true;
+    let inputs = [left.unwrap_or(0), right.unwrap_or(0)];
+    let arguments = |row: usize| {
+        let (_, left, right, _) = builtin_properties::OPERATORS[row];
+        [left, right]
+    };
+    let mut candidates = [0usize; MAX_BUILTIN_OPERATOR_CANDIDATES];
+    let mut count = 0;
+    for (row, &(candidate, expected_left, expected_right, _)) in
+        builtin_properties::OPERATORS.iter().enumerate()
+    {
+        if candidate == name
+            && builtin_argument_properties(inputs[0], expected_left).is_some()
+            && builtin_argument_properties(inputs[1], expected_right).is_some()
+            && builtin_polymorphic_consistent(inputs, [expected_left, expected_right])
+        {
+            candidates[count] = row;
+            count += 1;
         }
     }
-    if ambiguous { None } else { best }
+    let unique = |count: usize, candidates: &[usize]| match count {
+        0 => Some(BuiltinOperatorChoice::Missing),
+        1 => Some(BuiltinOperatorChoice::Unique(
+            builtin_properties::OPERATORS[candidates[0]].3,
+        )),
+        _ => None,
+    };
+    if let Some(choice) = unique(count, &candidates) {
+        return choice;
+    }
+    // Keep the candidates that score best; keep all when none scores.
+    let narrow = |candidates: &mut [usize; MAX_BUILTIN_OPERATOR_CANDIDATES],
+                  count: &mut usize,
+                  score: &dyn Fn(usize) -> usize| {
+        let best = candidates[..*count]
+            .iter()
+            .map(|row| score(*row))
+            .max()
+            .unwrap_or(0);
+        let mut kept = 0;
+        for index in 0..*count {
+            if score(candidates[index]) == best {
+                candidates[kept] = candidates[index];
+                kept += 1;
+            }
+        }
+        *count = kept;
+    };
+    let known = |position: usize| inputs[position] != 0 && inputs[position] != oid::UNKNOWN;
+    narrow(&mut candidates, &mut count, &|row| {
+        let arguments = arguments(row);
+        (0..2)
+            .filter(|position| known(*position) && arguments[*position] == inputs[*position])
+            .count()
+    });
+    if let Some(choice) = unique(count, &candidates) {
+        return choice;
+    }
+    narrow(&mut candidates, &mut count, &|row| {
+        let arguments = arguments(row);
+        (0..2)
+            .filter(|position| {
+                known(*position)
+                    && (arguments[*position] == inputs[*position] || {
+                        let (category, _) = builtin_type_category(inputs[*position]);
+                        let (candidate_category, preferred) =
+                            builtin_type_category(arguments[*position]);
+                        preferred && candidate_category == category
+                    })
+            })
+            .count()
+    });
+    if let Some(choice) = unique(count, &candidates) {
+        return choice;
+    }
+    let unknowns = (0..2)
+        .filter(|position| inputs[*position] == oid::UNKNOWN)
+        .count();
+    if unknowns == 0 {
+        return BuiltinOperatorChoice::NotUnique;
+    }
+    let mut slot_category = [0u8; 2];
+    let mut slot_preferred = [false; 2];
+    let mut resolved = true;
+    for position in 0..2 {
+        if inputs[position] != oid::UNKNOWN {
+            continue;
+        }
+        let mut conflict = false;
+        for (index, row) in candidates[..count].iter().enumerate() {
+            let (category, preferred) = builtin_type_category(arguments(*row)[position]);
+            if index == 0 {
+                slot_category[position] = category;
+                slot_preferred[position] = preferred;
+            } else if category == slot_category[position] {
+                slot_preferred[position] |= preferred;
+            } else if category == b'S' {
+                slot_category[position] = category;
+                slot_preferred[position] = preferred;
+            } else {
+                conflict = true;
+            }
+        }
+        if conflict && slot_category[position] != b'S' {
+            resolved = false;
+            break;
+        }
+    }
+    if resolved {
+        let keep = |row: usize| {
+            (0..2).all(|position| {
+                if inputs[position] != oid::UNKNOWN {
+                    return true;
+                }
+                let (category, preferred) = builtin_type_category(arguments(row)[position]);
+                category == slot_category[position] && (preferred || !slot_preferred[position])
+            })
+        };
+        let kept = candidates[..count].iter().filter(|row| keep(**row)).count();
+        if kept > 0 {
+            let mut next = 0;
+            for index in 0..count {
+                if keep(candidates[index]) {
+                    candidates[next] = candidates[index];
+                    next += 1;
+                }
+            }
+            count = next;
+        }
+        if let Some(choice) = unique(count, &candidates) {
+            return choice;
+        }
+    }
+    if unknowns < 2 {
+        let known_type = inputs
+            .iter()
+            .copied()
+            .find(|input| *input != 0 && *input != oid::UNKNOWN);
+        if let Some(known_type) = known_type {
+            let assumed = inputs.map(|input| {
+                if input == oid::UNKNOWN {
+                    known_type
+                } else {
+                    input
+                }
+            });
+            let mut accepted = None;
+            let mut accepted_count = 0;
+            for row in &candidates[..count] {
+                let arguments = arguments(*row);
+                if (0..2).all(|position| {
+                    builtin_argument_properties(assumed[position], arguments[position]).is_some()
+                }) && builtin_polymorphic_consistent(assumed, arguments)
+                {
+                    accepted_count += 1;
+                    accepted = Some(builtin_properties::OPERATORS[*row].3);
+                }
+            }
+            if accepted_count == 1
+                && let Some(procedure) = accepted
+            {
+                return BuiltinOperatorChoice::Unique(procedure);
+            }
+        }
+    }
+    BuiltinOperatorChoice::NotUnique
 }
 
 /// Operator support procedures need not be exposed as SQL-callable routines.
@@ -4372,6 +4673,99 @@ pub(crate) fn builtin_nullif_input_oids(left: i32, right: i32) -> Result<(i32, i
             )
         })
     }
+}
+
+/// PostgreSQL's `can_coerce_type` in assignment context for one concrete
+/// (non-polymorphic) target: whether a value of `source` can be stored in
+/// `target`. An UNKNOWN source is a literal that the target's input reads.
+pub(crate) fn can_coerce_assignment(
+    storage: &Storage,
+    txid: u32,
+    source: i32,
+    target: i32,
+) -> bool {
+    use super::types::oid;
+    if source == target || source == oid::UNKNOWN {
+        return true;
+    }
+    let composite = |type_oid: i32| {
+        storage
+            .routine_result_for_oid(type_oid, txid)
+            .is_some_and(|result| matches!(result.ctype, ColType::Composite(_)))
+    };
+    let composite_array = |type_oid: i32| {
+        storage
+            .routine_result_for_oid(type_oid, txid)
+            .is_some_and(|result| {
+                matches!(result.ctype, ColType::Array(element)
+                    if matches!(element.to_coltype(), ColType::Composite(_)))
+            })
+    };
+    if (source == oid::RECORD && composite(target))
+        || (target == oid::RECORD && composite(source))
+        || (source == oid::RECORD_ARRAY && composite_array(target))
+        || (target == oid::RECORD_ARRAY && composite_array(source))
+    {
+        return true;
+    }
+    coercion_pathway_exists(storage, txid, source, target)
+}
+
+/// PostgreSQL's `find_coercion_pathway` in assignment context, reduced to
+/// whether a path exists. Domains coerce through their base types; a declared
+/// cast decides alone; otherwise arrays coerce element-wise, and any value's
+/// text output feeds a string target.
+fn coercion_pathway_exists(storage: &Storage, txid: u32, source: i32, target: i32) -> bool {
+    use super::types::oid;
+    let base = |type_oid: i32| {
+        storage
+            .domain_base_type_for_oid(type_oid, txid)
+            .map_or(type_oid, |base| {
+                storage
+                    .routine_type_oid(base, None, txid)
+                    .unwrap_or_else(|| base.oid())
+            })
+    };
+    let source = base(source);
+    let target = base(target);
+    if source == target {
+        return true;
+    }
+    let declared = storage
+        .cast_for_oids(source, target, txid)
+        .map(|(_, cast)| cast.context)
+        .or_else(|| builtin_cast_context(source, target));
+    if let Some(declared) = declared {
+        return declared.permits_assignment();
+    }
+    let result = |type_oid: i32| storage.routine_result_for_oid(type_oid, txid);
+    let source_type = result(source).map(|result| result.ctype);
+    let target_type = result(target).map(|result| result.ctype);
+    if target != oid::OIDVECTOR
+        && target != oid::INT2VECTOR
+        && let (Some(ColType::Array(source_element)), Some(ColType::Array(target_element))) =
+            (source_type, target_type)
+        && coercion_pathway_exists(
+            storage,
+            txid,
+            source_element.element_oid(),
+            target_element.element_oid(),
+        )
+    {
+        return true;
+    }
+    target_type.map(super::types::type_category) == Some("S")
+}
+
+/// The name PostgreSQL's `format_type_be` prints for a type OID.
+pub(crate) fn format_type_name(
+    storage: &Storage,
+    txid: u32,
+    type_oid: i32,
+) -> Result<StackStr<260>, SqlError> {
+    user_type_name_fixed(storage, txid, type_oid)?
+        .or_else(|| super::exec::builtin_type_name_fixed(type_oid))
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "type identity is unavailable"))
 }
 
 /// Resolve a user-defined conversion, including PostgreSQL's element-wise
@@ -4779,6 +5173,32 @@ fn builtin_argument_properties(actual: i32, expected: i32) -> Option<(usize, boo
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod builtin_property_tests {
     use super::*;
+
+    #[test]
+    fn builtin_operator_names_fit_the_candidate_workspace() {
+        for (name, ..) in builtin_properties::OPERATORS {
+            let count = builtin_properties::OPERATORS
+                .iter()
+                .filter(|(candidate, ..)| candidate == name)
+                .count();
+            assert!(count <= MAX_BUILTIN_OPERATOR_CANDIDATES, "{name}: {count}");
+        }
+    }
+
+    #[test]
+    fn unknown_operator_operands_follow_postgresql_candidate_selection() {
+        use super::super::types::oid;
+        // A string-category overload wins an unknown operand.
+        assert_eq!(
+            builtin_operator_input_oids("->", Some(oid::JSONB), Some(oid::UNKNOWN)),
+            Some((Some(oid::JSONB), Some(oid::TEXT)))
+        );
+        // Several categories with no string overload cannot be resolved.
+        assert_eq!(
+            builtin_operator_choice("+", Some(oid::DATE), Some(oid::UNKNOWN)),
+            BuiltinOperatorChoice::NotUnique
+        );
+    }
 
     #[test]
     fn unknown_operator_operands_try_the_known_types_exact_overload_first() {
@@ -6978,7 +7398,7 @@ pub(crate) fn synthesize_current<'a>(
         (false, "pg_partitioned_table") => pg_partitioned_table(storage, txid, arena),
         (false, "pg_settings") => pg_settings(arena),
         (false, "pg_prepared_xacts") => pg_prepared_xacts(storage, txid, arena),
-        (false, "pg_proc") => pg_proc(storage, txid, arena),
+        (false, "pg_proc") => pg_proc(storage, txid, purpose, arena),
         (false, "pg_aggregate") => pg_aggregate(storage, txid, arena),
         (false, "pg_operator") => pg_operator(storage, txid, arena),
         (false, "pg_opclass") => pg_opclass(storage, txid, arena),
@@ -10845,9 +11265,61 @@ fn routine_name_matches(written: &str, schema: &str, name: &str) -> bool {
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod routine_name_tests {
     use super::{
-        ACCESS_METHODS, PROCEDURAL_LANGUAGES, access_method_name, access_method_oid,
-        procedural_language_name, procedural_language_oid, routine_name_matches,
+        ACCESS_METHODS, INTRINSIC_ROUTINES, PROCEDURAL_LANGUAGES, access_method_name,
+        access_method_oid, intrinsic_routine_has_name, procedural_language_name,
+        procedural_language_oid, routine_name_matches,
     };
+
+    /// The folded lookup agrees with matching each intrinsic's spelling.
+    #[test]
+    fn intrinsic_names_fold_like_routine_spellings() {
+        let per_routine = |written: &str| {
+            INTRINSIC_ROUTINES
+                .iter()
+                .any(|routine| routine_name_matches(written, "pg_catalog", routine.name))
+        };
+        let longest = INTRINSIC_ROUTINES
+            .iter()
+            .map(|routine| routine.name)
+            .max_by_key(|name| name.len())
+            .unwrap();
+        let too_long = format!("{longest}x");
+        for written in [
+            "nextval",
+            "NEXTVAL",
+            " nextval ",
+            "\"nextval\"",
+            "\"NEXTVAL\"",
+            "pg_catalog.nextval",
+            "PG_CATALOG.\"nextval\"",
+            "public.nextval",
+            "\"next\"\"val\"",
+            "next val",
+            "nextval(",
+            "",
+            "\"\"",
+            "a.b.c",
+            longest,
+            too_long.as_str(),
+            "no_such_intrinsic",
+        ] {
+            assert_eq!(
+                intrinsic_routine_has_name(written),
+                per_routine(written),
+                "{written:?}"
+            );
+        }
+        for routine in INTRINSIC_ROUTINES {
+            let quoted = format!("\"{}\"", routine.name.replace('"', "\"\""));
+            assert!(intrinsic_routine_has_name(&quoted), "{quoted}");
+            assert_eq!(
+                intrinsic_routine_has_name(routine.name),
+                per_routine(routine.name),
+                "{}",
+                routine.name
+            );
+        }
+    }
 
     #[test]
     fn modeled_operator_contracts_match_generated_postgresql_rows() {
@@ -14465,52 +14937,43 @@ pub(crate) fn table_constraint_identity_by_oid(
     txid: u32,
     oid: i32,
 ) -> Option<(usize, StackStr<128>)> {
+    // Constraint OIDs are unique, so each kind is matched by its own OID:
+    // one pass over the indexes and one over the tables, not a name lookup
+    // per constraint (which revisits every table's indexes).
+    let mut index_constraint = None;
+    visit_indexes(storage, txid, None, |index| {
+        if index_constraint.is_none()
+            && index
+                .constraint_identity
+                .is_some_and(|identity| identity.oid() == oid)
+        {
+            index_constraint = Some((index.table_slot, StackStr::from_str(index.name.as_str())));
+        }
+    });
+    if index_constraint.is_some() {
+        return index_constraint;
+    }
     for table_slot in 0..storage.table_count() {
         if !storage.table_slot_visible_to(table_slot, txid) {
             continue;
         }
         let table = storage.table_def(table_slot, txid);
-        let candidate = |name: &str| {
-            (table_constraint_oid(storage, txid, table_slot, name) == Some(oid))
-                .then(|| (table_slot, StackStr::from_str(name)))
-        };
-        if let Some(found) = table
-            .partition
-            .detached_bound
-            .and_then(|constraint| candidate(constraint.name.as_str()))
+        let found = |name: &str| Some((table_slot, StackStr::from_str(name)));
+        if let Some(constraint) = table.partition.detached_bound
+            && constraint.oid() == oid
         {
-            return Some(found);
+            return found(constraint.name.as_str());
         }
-        for check in table.checks() {
-            if let Some(found) = candidate(check.name.as_str()) {
-                return Some(found);
-            }
+        if let Some(check) = table.checks().iter().find(|check| check.oid() == oid) {
+            return found(check.name.as_str());
         }
-        for foreign_key in table.fkeys() {
-            if let Some(found) = candidate(foreign_key.name.as_str()) {
-                return Some(found);
-            }
+        if let Some(foreign_key) = table.fkeys().iter().find(|key| key.oid() == oid) {
+            return found(foreign_key.name.as_str());
         }
-        for column in table.columns() {
-            if column.not_null.is_required() {
-                let name = not_null_constraint_name(&table, column);
-                if let Some(found) = candidate(name.as_str()) {
-                    return Some(found);
-                }
+        for (position, column) in table.columns().iter().enumerate() {
+            if column.not_null.is_required() && table.not_null_constraint_oid(position) == oid {
+                return found(not_null_constraint_name(&table, column).as_str());
             }
-        }
-        let mut index_name = None;
-        visit_indexes(storage, txid, None, |index| {
-            if index.table_slot == table_slot
-                && index
-                    .constraint_identity
-                    .is_some_and(|identity| identity.oid() == oid)
-            {
-                index_name = Some(StackStr::from_str(index.name.as_str()));
-            }
-        });
-        if let Some(name) = index_name {
-            return Some((table_slot, name));
         }
     }
     None
@@ -14706,9 +15169,11 @@ pub fn constraint_def_text<'a>(
             write_identifier(&mut s, child.columns()[c as usize].name.as_str());
         }
         let _ = s.write_str(") REFERENCES ");
-        // Like PostgreSQL's generate_relation_name, qualify the referenced
-        // table only when the search path does not find it by its bare name.
-        if relation_oid_visibility(storage, txid, user_table_oid(storage, pslot)) != Some(true) {
+        // PostgreSQL qualifies the referenced table only when the search
+        // path does not find it by its bare name.
+        if !relation_oid_for_name(storage, txid, None, parent.name.as_str())
+            .matches_oid(user_table_oid(storage, pslot))
+        {
             write_identifier(&mut s, parent.schema.as_str());
             let _ = s.write_char('.');
         }
@@ -15588,16 +16053,14 @@ pub fn index_def_text<'a>(
         let _ = s.write_str(")");
         if info.n_include_cols != 0 {
             let _ = s.write_str(" INCLUDE (");
-            for k in 0..info.n_include_cols {
+            for (k, column) in info.include_columns[..info.n_include_cols]
+                .iter()
+                .enumerate()
+            {
                 if k > 0 {
                     let _ = s.write_str(", ");
                 }
-                write_identifier(
-                    &mut s,
-                    def.columns()[info.include_columns[k] as usize]
-                        .name
-                        .as_str(),
-                );
+                write_identifier(&mut s, def.columns()[*column as usize].name.as_str());
             }
             let _ = s.write_str(")");
         }
@@ -19794,34 +20257,17 @@ fn pg_constraint_values<'a>(
                 text("s", arena)?,
                 Datum::Bool(constraint_parent_oid == 0),
                 Datum::Int4(i32::from(constraint_parent_oid != 0)),
-                Datum::Bool(false),
-                foreign_key_equality_operators(
-                    storage,
-                    txid,
-                    info.child_slot,
-                    info.parent_slot,
-                    &fk,
-                    ForeignKeyEquality::ReferencingReferenced,
-                    arena,
-                )?,
-                foreign_key_equality_operators(
-                    storage,
-                    txid,
-                    info.child_slot,
-                    info.parent_slot,
-                    &fk,
-                    ForeignKeyEquality::Referenced,
-                    arena,
-                )?,
-                foreign_key_equality_operators(
-                    storage,
-                    txid,
-                    info.child_slot,
-                    info.parent_slot,
-                    &fk,
-                    ForeignKeyEquality::Referencing,
-                    arena,
-                )?,
+                // A foreign key is not inherited, except down a partition tree.
+                Datum::Bool(
+                    constraint_parent_oid == 0
+                        && !storage
+                            .table_def(info.child_slot, txid)
+                            .partition
+                            .is_partitioned(),
+                ),
+                foreign_key_operator_array(storage, txid, info, &fk, 0, arena)?,
+                foreign_key_operator_array(storage, txid, info, &fk, 1, arena)?,
+                foreign_key_operator_array(storage, txid, info, &fk, 2, arena)?,
                 Datum::Null,
                 Datum::Null,
                 Datum::Null,
@@ -20705,85 +21151,31 @@ fn empty_int_array<'a>(arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     })
 }
 
-/// The three equality-operator lists of a foreign key's `pg_constraint` row.
-#[derive(Clone, Copy)]
-enum ForeignKeyEquality {
-    /// `conpfeqop`: referenced = referencing.
-    ReferencingReferenced,
-    /// `conppeqop`: referenced = referenced.
-    Referenced,
-    /// `conffeqop`: referencing = referencing.
-    Referencing,
-}
-
-/// The type a column's default B-tree operator class compares
-/// (`opcintype`): enums, arrays, composites, ranges and multiranges share a
-/// polymorphic class, and `varchar` and `cidr` use those of `text` and `inet`.
-fn btree_input_type(ctype: ColType) -> i32 {
-    match ctype {
-        ColType::Enum(_) => super::types::oid::ANYENUM,
-        ColType::Array(_) => super::types::oid::ANYARRAY,
-        ColType::Composite(_) | ColType::Record => super::types::oid::RECORD,
-        ColType::Range(_) => super::types::oid::ANYRANGE,
-        ColType::Multirange(_) => super::types::oid::ANYMULTIRANGE,
-        ColType::Varchar => super::types::oid::TEXT,
-        ColType::Cidr => super::types::oid::INET,
-        other => other.oid(),
-    }
-}
-
-/// The built-in B-tree `=` operator comparing `left` with `right`.
-fn builtin_equality_operator(left: i32, right: i32) -> Option<i32> {
-    super::catalog_operator_rows::OPERATOR_ROWS
-        .iter()
-        .find(|row| row.1 == "=" && row.2 == b'b' && row.5 == left && row.6 == right && row.3)
-        .map(|row| row.0)
-}
-
-/// PostgreSQL's `ATAddForeignKeyConstraint` choice: the referenced key's
-/// operator family member for (referenced, referencing) when it and the
-/// referencing type's own member exist, otherwise the referenced type's
-/// equality operator after implicit coercion.
-fn foreign_key_equality_operators<'a>(
+/// One of a foreign key's `conpfeqop`, `conppeqop` or `conffeqop` arrays
+/// (`which` 0, 1 or 2).
+fn foreign_key_operator_array<'a>(
     storage: &Storage,
     txid: u32,
-    child_slot: usize,
-    parent_slot: usize,
+    info: &FkInfo,
     fk: &crate::storage::ForeignKey,
-    selected: ForeignKeyEquality,
+    which: usize,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let child = storage.table_def(child_slot, txid);
-    let parent = storage.table_def(parent_slot, txid);
+    let child = storage.table_def(info.child_slot, txid);
+    let parent = storage.table_def(info.parent_slot, txid);
     let mut values = [Datum::Null; crate::storage::MAX_INDEX_COLS];
-    for (index, (&referencing, &referenced)) in fk.columns[..fk.n_cols]
-        .iter()
-        .zip(&fk.parent_cols[..fk.n_parent_cols])
-        .enumerate()
+    for (index, (&child_column, &parent_column)) in
+        fk.columns().iter().zip(fk.parent_cols()).enumerate()
     {
-        let referencing = child.columns()[usize::from(referencing)].ctype;
-        let referenced = btree_input_type(parent.columns()[usize::from(referenced)].ctype);
-        let referenced_equality = builtin_equality_operator(referenced, referenced);
-        let cross = builtin_equality_operator(referenced, referencing.oid()).zip(
-            builtin_equality_operator(referencing.oid(), referencing.oid()),
+        values[index] = Datum::Int4(
+            super::exec::foreign_key_operators(
+                child.columns()[usize::from(child_column)].ctype,
+                parent.columns()[usize::from(parent_column)].ctype,
+            )[which],
         );
-        let operator = match (selected, cross) {
-            (ForeignKeyEquality::Referenced, _) => referenced_equality,
-            (ForeignKeyEquality::ReferencingReferenced, Some((cross, _))) => Some(cross),
-            (ForeignKeyEquality::Referencing, Some((_, own))) => Some(own),
-            (_, None) => referenced_equality,
-        };
-        let Some(operator) = operator else {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "foreign key column type {} has no built-in equality operator",
-                referenced
-            ));
-        };
-        values[index] = Datum::Oid(operator as u32);
     }
     Ok(Datum::Array {
-        element: super::types::ArrElem::Oid,
+        element: super::types::ArrElem::Int4,
         raw: super::array::build(&values[..fk.n_cols], arena)?,
     })
 }
@@ -23545,10 +23937,21 @@ fn builtin_proconfig<'a>(
     })
 }
 
-fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_proc<'a>(
+    storage: &Storage,
+    txid: u32,
+    purpose: Materialization,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_proc", false);
-    let row_capacity = callable_signatures::CALLABLES
-        .len()
+    let builtin_capacity = match purpose {
+        Materialization::Query => callable_signatures::CALLABLES.len(),
+        // Entries can be added concurrently; the fixed capacity bounds them.
+        Materialization::History => storage
+            .builtin_routine_capacity()
+            .min(callable_signatures::CALLABLES.len()),
+    };
+    let row_capacity = builtin_capacity
         .checked_add(storage.routine_count())
         .ok_or_else(|| catalog_capacity_exceeded("pg_proc"))?;
     let rows = arena
@@ -23556,9 +23959,21 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         .map_err(|_| arena_full())?;
     let mut count = 0;
     for signature in callable_signatures::CALLABLES {
-        // A retained stored definition is the executable owner of its OID.
-        if storage.routine_slot_by_oid(signature.oid, txid).is_some() {
+        // Stored routines take OIDs from their own band, never a built-in's.
+        // A built-in's row changes only through its per-database entry, so
+        // history captures just the built-ins that have one.
+        if matches!(purpose, Materialization::History)
+            && storage
+                .builtin_routine_slot(
+                    crate::storage::BuiltinRoutineOid::parse(signature.oid)
+                        .expect("callable signatures name built-in routines"),
+                )
+                .is_none()
+        {
             continue;
+        }
+        if count == rows.len() {
+            return Err(catalog_capacity_exceeded("pg_proc"));
         }
         rows[count] = builtin_proc_row(signature, storage, txid, arena)?;
         count += 1;
@@ -25851,7 +26266,7 @@ fn pg_prepared_statements<'a>(
                 if found_error.is_some() {
                     return;
                 }
-                let type_array = |types: crate::sql::prep::PreparedTypes<'_>| {
+                let type_array = |types: crate::sql::prep::PreparedTypeOids<'_>| {
                     let mut names = [Datum::Null; super::exec::MAX_PROJ];
                     let values = if types.len() <= names.len() {
                         &mut names[..types.len()]
@@ -27638,7 +28053,10 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "server_version_num" => crate::pg::REPORTED_SERVER_VERSION_NUM,
             "synchronize_seqscans" => "on",
             "track_functions" => "none",
+            "plpgsql.variable_conflict" => "error",
+            "plpgsql.print_strict_params" => "off",
             "TimeZone" => "UTC",
+            "work_mem" => "4096",
             "transaction_isolation" => "read committed",
             "transaction_deferrable" | "transaction_read_only" => "off",
             "xmloption" => "content",
@@ -27649,6 +28067,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "check_function_bodies"
                 | "event_triggers"
                 | "integer_datetimes"
+                | "plpgsql.print_strict_params"
                 | "is_superuser"
                 | "row_security"
                 | "standard_conforming_strings"
@@ -27666,6 +28085,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 | "bytea_output"
                 | "password_encryption"
                 | "track_functions"
+                | "plpgsql.variable_conflict"
                 | "xmloption"
         ) {
             "enum"
@@ -27676,7 +28096,8 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 | "max_connections"
                 | "max_locks_per_transaction"
                 | "max_prepared_transactions"
-        ) {
+        ) || crate::sql::guc::int_setting_metadata(name).is_some()
+        {
             "integer"
         } else {
             "string"
@@ -27696,12 +28117,15 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "max_connections" | "max_locks_per_transaction" | "max_prepared_transactions"
         ) {
             "postmaster"
-        } else if matches!(name, "event_triggers" | "track_functions") {
+        } else if matches!(
+            name,
+            "event_triggers" | "track_functions" | "plpgsql.variable_conflict"
+        ) {
             "superuser"
         } else {
             "user"
         };
-        let unit = if name.ends_with("timeout") { "ms" } else { "" };
+        let unit = crate::sql::guc::int_setting_metadata(name).map_or("", |(unit, ..)| unit);
         (boot, vartype, context, unit)
     }
     let mut count = 0;
@@ -27740,18 +28164,45 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         let (reset_value, source) = crate::sql::eval::funcs::system::session_setting_metadata(name)
             .unwrap_or((value, "default"));
         let (boot, vartype, context, unit) = metadata(name);
-        let enum_values = if name == "track_functions" {
-            let values = [
-                text("none", arena)?,
-                text("pl", arena)?,
-                text("all", arena)?,
-            ];
+        let base_value = |shown: &str| {
+            crate::sql::guc::int_setting_base_value(name, shown).map_or_else(
+                || crate::util::StackStr::<256>::from_str(shown),
+                |base| {
+                    let mut value = crate::util::StackStr::<256>::new();
+                    let _ = core::fmt::Write::write_fmt(&mut value, format_args!("{base}"));
+                    value
+                },
+            )
+        };
+        let (value, reset_value) = (base_value(value.as_str()), base_value(reset_value.as_str()));
+        let (min_value, max_value) = match crate::sql::guc::int_setting_metadata(name) {
+            Some((_, min, max)) => {
+                let mut bounds = [crate::util::StackStr::<16>::new(); 2];
+                let _ = core::fmt::Write::write_fmt(&mut bounds[0], format_args!("{min}"));
+                let _ = core::fmt::Write::write_fmt(&mut bounds[1], format_args!("{max}"));
+                (
+                    text(bounds[0].as_str(), arena)?,
+                    text(bounds[1].as_str(), arena)?,
+                )
+            }
+            None => (Datum::Null, Datum::Null),
+        };
+        let enum_names: &[&str] = match name {
+            "track_functions" => &["none", "pl", "all"],
+            "plpgsql.variable_conflict" => &crate::sql::guc::VariableConflict::NAMES,
+            _ => &[],
+        };
+        let enum_values = if enum_names.is_empty() {
+            Datum::Null
+        } else {
+            let mut values = [Datum::Null; 3];
+            for (value, name) in values.iter_mut().zip(enum_names) {
+                *value = text(name, arena)?;
+            }
             Datum::Array {
                 element: super::types::ArrElem::Text,
-                raw: super::array::build(&values, arena)?,
+                raw: super::array::build(&values[..enum_names.len()], arena)?,
             }
-        } else {
-            Datum::Null
         };
         output[count] = row(
             &[
@@ -27763,20 +28214,34 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                     text(unit, arena)?
                 },
                 text(
-                    if name == "track_functions" {
-                        "Statistics / Monitoring"
-                    } else {
-                        "Client Connection Defaults"
+                    match name {
+                        "track_functions" => "Statistics / Monitoring",
+                        "plpgsql.variable_conflict" | "plpgsql.print_strict_params" => {
+                            "Customized Options"
+                        }
+                        "work_mem" => "Resource Usage / Memory",
+                        _ => "Client Connection Defaults",
                     },
                     arena,
                 )?,
-                text("", arena)?,
+                text(
+                    match name {
+                        "plpgsql.variable_conflict" => {
+                            "Sets handling of conflicts between PL/pgSQL variable names and table column names."
+                        }
+                        "plpgsql.print_strict_params" => {
+                            "Print information about parameters in the DETAIL part of the error messages generated on INTO ... STRICT failures."
+                        }
+                        _ => "",
+                    },
+                    arena,
+                )?,
                 Datum::Null,
                 text(context, arena)?,
                 text(vartype, arena)?,
                 text(source, arena)?,
-                Datum::Null,
-                Datum::Null,
+                min_value,
+                max_value,
                 enum_values,
                 text(boot, arena)?,
                 text(reset_value.as_str(), arena)?,

@@ -308,7 +308,7 @@ fn procedural_for_queries_execute_source_effects_once() {
 // PostgreSQL 18.6 event-trigger visibility reference SQL SHA256:
 // 88cbb1c2ca5aad8e5b7883ef3cda840d008be0f3f790f60cdcf620435a6e8cfe.
 #[test]
-fn checked_before_trigger_inputs_reject_before_constraint_effects_and_events_see_rows() {
+fn checked_before_trigger_inputs_run_on_the_executor_and_events_see_rows() {
     for mode in [
         crate::config::TransactionMode::Mvcc,
         crate::config::TransactionMode::Locking,
@@ -332,23 +332,17 @@ fn checked_before_trigger_inputs_reject_before_constraint_effects_and_events_see
              CREATE TRIGGER checked_row_input BEFORE INSERT ON trigger_input_rows \
                FOR EACH ROW EXECUTE FUNCTION checked_row_input(); \
              INSERT INTO trigger_input_rows VALUES(0)", true);
-        let rejected = session.execute(
+        // The trigger body moves to the statement executor, which checks the
+        // domain input once, as PostgreSQL's cached plan does.
+        session.success(
             &mut engine,
             "INSERT INTO trigger_input_rows VALUES(2),(3)",
             true,
         );
-        let diagnostic = String::from_utf8_lossy(&rejected);
-        assert!(diagnostic.contains("0A000"), "{diagnostic}");
-        assert!(
-            diagnostic.contains(
-                "checked type inputs in data-change triggers require a resumable execution context"
-            ),
-            "{diagnostic}"
-        );
         assert_eq!(data_rows(&session.success(&mut engine,
             "SELECT id FROM trigger_input_rows ORDER BY id; \
-             SELECT count(*) FROM trigger_input_audit; SELECT last_value,is_called FROM trigger_input_checks", true)),
-            ["0", "1", "0", "1|f"]);
+             SELECT observed FROM trigger_input_audit; SELECT last_value,is_called FROM trigger_input_checks", true)),
+            ["0", "1", "2", "3", "2", "1|t"]);
         session.success(&mut engine,
             "DROP TRIGGER checked_row_input ON trigger_input_rows; \
              CREATE FUNCTION checked_event_input() RETURNS event_trigger LANGUAGE plpgsql AS $$BEGIN \
@@ -360,9 +354,9 @@ fn checked_before_trigger_inputs_reject_before_constraint_effects_and_events_see
             "BEGIN; INSERT INTO trigger_input_rows VALUES(2); \
              CREATE TABLE checked_event_one(id integer); CREATE TABLE checked_event_two(id integer); COMMIT", true);
         assert_eq!(data_rows(&session.success(&mut engine,
-            "SELECT observed FROM trigger_input_audit; SELECT last_value FROM trigger_input_checks; \
+            "SELECT observed FROM trigger_input_audit ORDER BY observed; SELECT last_value FROM trigger_input_checks; \
              SELECT count(*) FROM event_input_audit; SELECT count(*) FROM trigger_input_rows", true)),
-            ["3", "1", "2", "3"]);
+            ["2", "5", "2", "2", "5"]);
         drop((session, engine));
     }
 }

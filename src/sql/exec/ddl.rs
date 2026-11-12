@@ -209,10 +209,13 @@ pub(super) fn build_column(
                     let result = storage.relation_row_type_result(relation, true, txid)?;
                     (result.ctype, -1, result.user_type, None)
                 } else {
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "type \"{}\" does not exist",
-                        c.type_name
+                    return Err(crate::sql::error_position::at_subject(
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "type \"{}\" does not exist",
+                            c.type_name
+                        ),
+                        c.type_name,
                     ));
                 }
             } else {
@@ -256,10 +259,13 @@ pub(super) fn build_column(
                                     (result.ctype, -1, result.user_type, None)
                                 }
                                 None => {
-                                    return Err(sql_err!(
-                                        sqlstate::UNDEFINED_OBJECT,
-                                        "type \"{}\" does not exist",
-                                        c.type_name
+                                    return Err(crate::sql::error_position::at_subject(
+                                        sql_err!(
+                                            sqlstate::UNDEFINED_OBJECT,
+                                            "type \"{}\" does not exist",
+                                            c.type_name
+                                        ),
+                                        c.type_name,
                                     ));
                                 }
                             },
@@ -1237,6 +1243,7 @@ fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
         | Expr::BoundLiteral { .. }
         | Expr::BitLit(_)
         | Expr::Param(_)
+        | Expr::OuterAggregate { .. }
         | Expr::DefaultMarker => {}
         Expr::Array(items) => {
             for e in *items {
@@ -1282,6 +1289,28 @@ fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
 /// Applies each parsed table constraint to `def`: single-column PK/UNIQUE set
 /// column flags; multi-column PK/UNIQUE become entries in `def.uniques`; CHECK
 /// predicates and FOREIGN KEYs are validated and recorded.
+/// PostgreSQL's rejection of a key, foreign key or exclusion constraint on a
+/// foreign table, positioned where the constraint was written.
+pub(super) fn reject_foreign_table_constraint(
+    constraint: &TableConstraint,
+) -> Result<(), SqlError> {
+    let kind = match constraint {
+        TableConstraint::PrimaryKey { .. } => "primary key",
+        TableConstraint::Unique { .. } => "unique",
+        TableConstraint::ForeignKey { .. } => "foreign key",
+        TableConstraint::Exclusion { .. } => "exclusion",
+        TableConstraint::Check { .. } => return Ok(()),
+    };
+    Err(crate::sql::error_position::at_source_position(
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "{} constraints are not supported on foreign tables",
+            kind
+        ),
+        constraint.source_position(),
+    ))
+}
+
 pub(super) fn attach_constraints(
     storage: &Storage,
     def: &mut TableDefBuilder,
@@ -1299,8 +1328,12 @@ pub(super) fn attach_constraints(
             .iter()
             .any(|k| k.kind.is_primary());
     for con in constraints {
+        if def.kind == crate::storage::TableKind::Foreign {
+            reject_foreign_table_constraint(con)?;
+        }
         match con {
             TableConstraint::PrimaryKey {
+                source_position: _,
                 name,
                 columns,
                 timing,
@@ -1360,6 +1393,7 @@ pub(super) fn attach_constraints(
                 }
             }
             TableConstraint::Unique {
+                source_position: _,
                 name,
                 columns,
                 timing,
@@ -1420,6 +1454,7 @@ pub(super) fn attach_constraints(
                 }
             }
             TableConstraint::Check {
+                source_position: _,
                 name,
                 expression,
                 text,
@@ -1479,6 +1514,7 @@ pub(super) fn attach_constraints(
                 def.n_checks += 1;
             }
             TableConstraint::ForeignKey {
+                source_position: _,
                 name,
                 columns,
                 parent,
@@ -1516,6 +1552,7 @@ pub(super) fn attach_constraints(
                 )?;
             }
             TableConstraint::Exclusion {
+                source_position: _,
                 name,
                 columns,
                 operators,
@@ -1529,10 +1566,13 @@ pub(super) fn attach_constraints(
                         def.columns[column as usize].ctype,
                         crate::sql::types::ColType::Range(_)
                     ) {
-                        return Err(sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "data type {} has no default operator class for access method \"gist\"",
-                            def.columns[column as usize].ctype.name()
+                        return Err(crate::sql::error_position::with_hint(
+                            sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "data type {} has no default operator class for access method \"gist\"",
+                                def.columns[column as usize].ctype.name()
+                            ),
+                            crate::sql::error_position::DEFAULT_OPERATOR_CLASS_HINT,
                         ));
                     }
                 }
@@ -1909,20 +1949,6 @@ fn attach_fkey(
             parent.name
         ));
     }
-    // Types must match between each child and parent column.
-    for i in 0..n_child {
-        let column_type = def.columns()[child_idxs[i] as usize].ctype;
-        let parent_type = parent_def.columns()[parent_idxs[i] as usize].ctype;
-        if column_type.storage() != parent_type.storage() {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::DATATYPE_MISMATCH,
-                "foreign key constraint cannot be implemented: column types {} and {} are incompatible",
-                column_type.name(),
-                parent_type.name()
-            ));
-        }
-    }
-
     let fname = match name {
         Some(n) => SqlName::parse(n)?,
         None => auto_key_name(
@@ -1935,6 +1961,18 @@ fn attach_fkey(
             crate::storage::GeneratedNameClass::Constraint,
         )?,
     };
+    for i in 0..n_child {
+        check_foreign_key_column_types(
+            storage,
+            txid,
+            fname.as_str(),
+            (child_cols[i], &def.columns()[child_idxs[i] as usize]),
+            (
+                pcol_names[i],
+                &parent_def.columns()[parent_idxs[i] as usize],
+            ),
+        )?;
+    }
     let mut fk = ForeignKey::EMPTY;
     fk.name = fname;
     fk.columns[..n_child].copy_from_slice(&child_idxs[..n_child]);
@@ -1949,6 +1987,136 @@ fn attach_fkey(
     fk.validation = storage_validation(validation);
     def.fkeys[def.n_fkeys] = fk;
     def.n_fkeys += 1;
+    Ok(())
+}
+
+/// After a column type change, every foreign key from or to `altered` must
+/// still be implementable, as PostgreSQL checks when it re-adds them.
+pub(super) fn check_altered_foreign_key_types(
+    storage: &Storage,
+    txid: u32,
+    altered: &TableDefBuilder,
+) -> Result<(), SqlError> {
+    let is_altered =
+        |schema: &SqlName, name: &SqlName| *schema == altered.schema && *name == altered.name;
+    let check = |child: &TableDefBuilder, foreign_key: &ForeignKey, parent: &TableDefBuilder| {
+        for (&child_column, &parent_column) in
+            foreign_key.columns().iter().zip(foreign_key.parent_cols())
+        {
+            let referencing = &child.columns()[usize::from(child_column)];
+            let referenced = &parent.columns()[usize::from(parent_column)];
+            check_foreign_key_column_types(
+                storage,
+                txid,
+                foreign_key.name.as_str(),
+                (referencing.name.as_str(), referencing),
+                (referenced.name.as_str(), referenced),
+            )?;
+        }
+        Ok::<(), SqlError>(())
+    };
+    for foreign_key in altered.fkeys() {
+        if is_altered(&foreign_key.parent_schema, &foreign_key.parent) {
+            check(altered, foreign_key, altered)?;
+        } else if let Some(parent) = storage.find_visible(
+            foreign_key.parent_schema.as_str(),
+            foreign_key.parent.as_str(),
+            txid,
+        ) {
+            let parent = TableDefBuilder::from_definition(&storage.table_def(parent, txid));
+            check(altered, foreign_key, &parent)?;
+        }
+    }
+    for table in 0..storage.table_count() {
+        if !storage.table(table).visible_to(txid) {
+            continue;
+        }
+        let child = storage.table_def(table, txid);
+        if is_altered(&child.schema, &child.name) {
+            continue;
+        }
+        if !child
+            .fkeys()
+            .iter()
+            .any(|foreign_key| is_altered(&foreign_key.parent_schema, &foreign_key.parent))
+        {
+            continue;
+        }
+        let child = TableDefBuilder::from_definition(&child);
+        for foreign_key in child.fkeys() {
+            if is_altered(&foreign_key.parent_schema, &foreign_key.parent) {
+                check(&child, foreign_key, altered)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a referencing and a referenced key column can be compared, as
+/// PostgreSQL's `ATAddForeignKeyConstraint` decides (see
+/// [`super::foreign_key_equality`]).
+fn check_foreign_key_column_types(
+    storage: &Storage,
+    txid: u32,
+    constraint: &str,
+    (referencing_name, referencing): (&str, &crate::storage::ColumnMeta),
+    (referenced_name, referenced): (&str, &crate::storage::ColumnMeta),
+) -> Result<(), SqlError> {
+    if super::foreign_key_equality::dissimilar_composites(referencing.ctype, referenced.ctype) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "foreign key constraint \"{}\" between different composite types is not supported",
+            constraint
+        ));
+    }
+    if super::foreign_key_equality::key_equality(referencing.ctype, referenced.ctype).is_none() {
+        let type_oid = |column: &crate::storage::ColumnMeta| {
+            storage
+                .routine_type_oid(column.ctype, column.user_type, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "column type identity is unavailable"
+                    )
+                })
+        };
+        let (referencing_oid, referenced_oid) = (type_oid(referencing)?, type_oid(referenced)?);
+        if let Some(input) = super::foreign_key_equality::operator_class_input(referenced.ctype)
+            .and_then(ColType::try_oid)
+            && let Some(from) = referencing.ctype.try_oid()
+            && storage
+                .cast_for_oids(from, input, txid)
+                .is_some_and(|(_, cast)| cast.context.permits_implicit())
+        {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "foreign key constraint \"{}\" through a user-defined implicit cast is not supported",
+                constraint
+            ));
+        }
+        let detail = crate::stack_format!(
+            crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+            "Key columns \"{}\" of the referencing table and \"{}\" of the referenced table are of incompatible types: {} and {}.",
+            referencing_name,
+            referenced_name,
+            crate::sql::catalog::format_type_name(storage, txid, referencing_oid)?.as_str(),
+            crate::sql::catalog::format_type_name(storage, txid, referenced_oid)?.as_str()
+        );
+        crate::sql::eval::stash_diagnostic(Some(detail), None);
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "foreign key constraint \"{}\" cannot be implemented",
+            constraint
+        ));
+    }
+    // PostgreSQL reports this as an internal error after accepting the types
+    // (a `"char"` key referencing `text`).
+    if referencing.ctype.is_collatable() != referenced.ctype.is_collatable() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "key columns are not both collatable"
+        ));
+    }
     Ok(())
 }
 

@@ -212,8 +212,9 @@ pub(crate) use row_images::{
 };
 use row_images::{RowByteSource, RowVersionIdentity, VisibleRowBytes};
 pub(crate) use row_map::{RowEntries, RowMap, RowOverlayPool};
+use row_reads::RowReadView;
+pub(crate) use row_reads::RowReadVisitor;
 pub(crate) use row_reads::{LockedRowRecheck, RowRead, RowSelfChange};
-use row_reads::{RowReadView, RowReadVisitor};
 pub(crate) use row_scans::cursor::{CursorRow, RowCursor, RowCursorBuffers};
 pub(crate) use row_scans::{CapturedRowScan, ValidationRead};
 #[cfg(test)]
@@ -2931,6 +2932,22 @@ impl TableDefView<'_> {
     }
 }
 
+/// PostgreSQL's system columns, which a table's own columns cannot be named.
+pub(crate) const SYSTEM_COLUMN_NAMES: [&str; 6] =
+    ["tableoid", "cmax", "xmax", "cmin", "xmin", "ctid"];
+
+/// Rejects a table column named like a system column (`CheckAttributeNamesTypes`).
+pub(crate) fn reject_system_column_name(name: &str) -> Result<(), SqlError> {
+    if SYSTEM_COLUMN_NAMES.contains(&name) {
+        return Err(sql_err!(
+            sqlstate::DUPLICATE_COLUMN,
+            "column name \"{}\" conflicts with a system column name",
+            name
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn partition_bound_matches(
     strategy: PartitionStrategy,
     keys: [u16; MAX_PARTITION_KEYS],
@@ -3124,6 +3141,9 @@ pub struct RowState {
     /// generations; WAL/SST objects, not this metadata, are the durable copy.
     pub history: CommittedHistory,
     pub pending: PendingVersions,
+    /// The committed deletion moved the row to another partition; only set
+    /// while `committed` is `None`.
+    pub(crate) committed_moved_out: bool,
 }
 
 /// Where a committed row's bytes live: the RAM heap, or spilled to the
@@ -3202,6 +3222,10 @@ pub(crate) struct PendingChange {
     /// Insert and delete change index membership even when an index expression
     /// or predicate references no table column.
     pub changes_existence: bool,
+    /// The deletion half of an `UPDATE` or `MERGE` that moved the row to
+    /// another partition. Never set with an image. PostgreSQL marks such a
+    /// version so a later locker fails instead of treating it as deleted.
+    pub moved_out: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3273,6 +3297,7 @@ impl RowState {
             checkpoint_change_lsn: commit_lsn,
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
+            committed_moved_out: false,
         }
     }
 }
@@ -16442,10 +16467,14 @@ pub struct Storage {
     row_versions: RowVersionPools,
     pub(crate) row_work: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     pub(crate) execution_control: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    /// Step records a write leases from `execution_control` for its
+    /// multi-step progress (`write_step_levels`).
+    pub(crate) write_step_levels: usize,
     metadata_pool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     statistics_pool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     /// Client result output queued behind slow readers.
     result_spool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    plan_build: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     row_overlay: std::sync::Arc<RowOverlayPool>,
     row_walks: RowWalkPool,
     snapshot_reclamation: SnapshotReclamation,
@@ -16549,11 +16578,16 @@ pub struct Storage {
     /// The lock retains one allocation frontier through nested evaluation;
     /// every use rewinds to its entry mark.
     index_arena: Mutex<Arena>,
+    /// Decoded fields of stored named composites while one comparison orders
+    /// them; each comparison rewinds to its entry mark.
+    comparison_arena: Mutex<Arena>,
     /// The process-independent locale state selected at engine startup.
     collation: Option<CollationRuntime>,
 }
 
 const INDEX_ARENA_BYTES: usize = 2 * crate::store::MAX_PAYLOAD;
+/// Two decoded composite values of one stored row's size, with their fields.
+const COMPARISON_ARENA_BYTES: usize = 4 * crate::store::MAX_PAYLOAD;
 
 struct CollationScratch {
     left: FixedBuf,
@@ -21703,6 +21737,7 @@ impl Storage {
     pub fn extra_budget_bytes(config: &Config) -> usize {
         [
             INDEX_ARENA_BYTES,
+            COMPARISON_ARENA_BYTES,
             CatalogHistory::budget_bytes(
                 config.catalog_history_bytes,
                 catalog_transaction_capacity(config),
@@ -21750,6 +21785,10 @@ impl Storage {
             crate::mem::lease_pool::LeasePool::budget_bytes(
                 config.result_spool_bytes,
                 config.result_spool_leases,
+            ),
+            crate::mem::lease_pool::LeasePool::budget_bytes(
+                config.plan_build_bytes,
+                config.plan_build_leases,
             ),
             SnapshotReclamation::budget_bytes(),
             row_ownership::HeapRowOwnership::budget_bytes(config),
@@ -22041,6 +22080,12 @@ impl Storage {
             crate::mem::lease_pool::Purpose::RESULT_SPOOL,
             config.result_spool_bytes,
             config.result_spool_leases,
+        )?;
+        let plan_build = crate::mem::lease_pool::LeasePool::new(
+            budget,
+            crate::mem::lease_pool::Purpose::PLAN_BUILD,
+            config.plan_build_bytes,
+            config.plan_build_leases,
         )?;
         let table_definition_images =
             definition_images::TableDefinitionImagePool::new(config, budget, &metadata_pool)?;
@@ -22776,6 +22821,8 @@ impl Storage {
         let value_indexes =
             ValueIndexPool::new(budget, config.max_value_indexes, config.value_index_rows)?;
         let index_arena = Arena::new(budget, "index expression evaluation", INDEX_ARENA_BYTES)?;
+        let comparison_arena =
+            Arena::new(budget, "named composite comparison", COMPARISON_ARENA_BYTES)?;
         let transaction_capacity =
             config.max_connections as usize + config.max_prepared_transactions;
         budget.draw(snapshot_owner_bytes(), "snapshot and lock owners")?;
@@ -22880,9 +22927,11 @@ impl Storage {
             row_versions,
             row_work,
             execution_control,
+            write_step_levels: config.write_step_levels,
             metadata_pool,
             statistics_pool,
             result_spool,
+            plan_build,
             row_overlay,
             row_walks,
             snapshot_reclamation,
@@ -23079,6 +23128,7 @@ impl Storage {
             spill: None,
             value_indexes,
             index_arena: Mutex::new(index_arena),
+            comparison_arena: Mutex::new(comparison_arena),
             collation: None,
         };
         crate::sql::reset_execution_query_workspace();
@@ -23395,6 +23445,24 @@ impl Storage {
         })?;
         self.observe_role_oid(entry.owner);
         Ok(())
+    }
+
+    /// Runs one comparison of stored named composites with the reserved
+    /// decoding scratch, released when the comparison returns.
+    pub(crate) fn with_comparison_scratch<R>(
+        &self,
+        compare: impl for<'s> FnOnce(&'s Arena) -> R,
+    ) -> R {
+        let arena = self
+            .comparison_arena
+            .lock()
+            .expect("composite comparison arena lock poisoned");
+        let mark = arena.mark();
+        let result = compare(&arena);
+        // SAFETY: `R` cannot borrow the arena, so nothing allocated above the
+        // entry mark outlives the comparison.
+        unsafe { arena.rewind_to(mark) };
+        result
     }
 
     /// Installs the configured database-default collation before recovery or
@@ -37646,6 +37714,7 @@ impl Storage {
         table_index: usize,
         rowid: u64,
         image: Option<RowLoc>,
+        moved_out: bool,
         commit_lsn: u64,
     ) -> Result<(), SqlError> {
         self.tables[table_index]
@@ -37661,6 +37730,7 @@ impl Storage {
                 checkpoint_change_lsn: 0,
                 history: CommittedHistory::empty(),
                 pending: PendingVersions::empty(),
+                committed_moved_out: false,
             },
         };
         if state.pending.is_some() {
@@ -37681,6 +37751,7 @@ impl Storage {
             return Ok(());
         }
         state.committed = image.map(RowHome::Heap);
+        state.committed_moved_out = moved_out;
         state.committed_lsn = commit_lsn;
         state.committed_generation = Some(generation);
         state.checkpoint_change_lsn = commit_lsn;
@@ -38108,6 +38179,7 @@ impl Storage {
             }
         }
         state.committed = pending.loc.map(RowHome::Heap);
+        state.committed_moved_out = pending.moved_out;
         state.committed_lsn = commit_lsn;
         state.committed_generation = Some(generation);
         state.checkpoint_change_lsn = commit_lsn;
@@ -41447,6 +41519,9 @@ impl Storage {
     /// A name already visible to `txid` is a duplicate (42P07); a name held by
     /// another transaction's uncommitted DDL joins the shared wait graph.
     pub fn create_table_in(&self, mut def: TableDefBuilder, txid: u32) -> Result<usize, SqlError> {
+        for column in def.columns() {
+            reject_system_column_name(column.name.as_str())?;
+        }
         def.has_toast |= def
             .columns()
             .iter()
@@ -47539,6 +47614,19 @@ impl Storage {
         self.has_routine_candidate(name, arity, txid, |_, _| true)
     }
 
+    /// Whether a visible routine other than an aggregate could answer `name`
+    /// with `arity` arguments, such as a `sum(integer)` function.
+    pub(crate) fn has_non_aggregate_routine_candidate(
+        &self,
+        name: &str,
+        arity: usize,
+        txid: u32,
+    ) -> bool {
+        self.has_routine_candidate(name, arity, txid, |kind, _| {
+            !matches!(kind, RoutineKind::Aggregate(_))
+        })
+    }
+
     pub(crate) fn has_volatile_function_routine_candidate(
         &self,
         name: &str,
@@ -47553,6 +47641,19 @@ impl Storage {
                     | RoutineKind::RecordFunction { .. }
                     | RoutineKind::TableFunction
             ) && attributes.volatility == RoutineVolatility::Volatile
+        })
+    }
+
+    /// Whether a visible user-defined aggregate could be what `name` with
+    /// `arity` arguments calls; built-in aggregates are known by name.
+    pub(crate) fn has_aggregate_routine_candidate(
+        &self,
+        name: &str,
+        arity: usize,
+        txid: u32,
+    ) -> bool {
+        self.has_routine_candidate(name, arity, txid, |kind, _| {
+            matches!(kind, RoutineKind::Aggregate(_))
         })
     }
 
@@ -47979,6 +48080,11 @@ impl Storage {
             Some(expected) => expected,
             None => return false,
         };
+        // PostgreSQL's IsBinaryCoercible: every composite, including a
+        // relation row type or a domain over one, coerces to `record`.
+        if expected_oid == oid::RECORD && matches!(actual.ctype, ColType::Composite(_)) {
+            return true;
+        }
         // Resolve domain candidates through their base types. Execution still
         // checks the declared domain before the routine receives the value.
         let actual_base = actual.ctype.oid();
@@ -48120,6 +48226,26 @@ impl Storage {
             }
         }
         Ok(found)
+    }
+
+    /// Whether a visible user routine of any schema with this name is volatile.
+    pub(crate) fn has_volatile_routine_named(&self, name: &str, txid: u32) -> bool {
+        self.routine_entries().any(|(slot, routine)| {
+            routine.database == current_database()
+                && routine.visible_to(txid)
+                && routine.name_for(txid).as_str() == name
+                && self.routine_for(slot, txid).attributes.volatility == RoutineVolatility::Volatile
+        })
+    }
+
+    /// Whether a visible routine with this name returns a set.
+    pub(crate) fn has_set_returning_routine_named(&self, name: &str, txid: u32) -> bool {
+        self.routine_entries().any(|(slot, routine)| {
+            routine.database == current_database()
+                && routine.visible_to(txid)
+                && routine.name_for(txid).as_str() == name
+                && self.routine_for(slot, txid).kind.is_set_returning()
+        })
     }
 
     /// Visible routines with this schema and name, in catalog order.
@@ -48981,10 +49107,12 @@ impl Storage {
             .iter()
             .any(|trigger| same_identity(trigger) && trigger.visible_to(txid))
         {
+            drop(catalog);
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
-                "trigger \"{}\" for relation already exists",
-                spec.name.as_str()
+                "trigger \"{}\" for relation \"{}\" already exists",
+                spec.name.as_str(),
+                self.trigger_target_name(spec.target, txid).as_str()
             ));
         }
         let Some(slot) = catalog
@@ -49101,10 +49229,13 @@ impl Storage {
                     && candidate.name_to(txid) == name
             })
         {
+            let target = trigger.target;
+            drop(catalog);
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
-                "trigger \"{}\" for relation already exists",
-                name.as_str()
+                "trigger \"{}\" for relation \"{}\" already exists",
+                name.as_str(),
+                self.trigger_target_name(target, txid).as_str()
             ));
         }
         let trigger = &mut catalog.definitions[slot];
@@ -49472,7 +49603,12 @@ impl Storage {
         let capacity = self.trigger_capacity();
         for slot in 0..capacity {
             let trigger = self.trigger(slot);
-            if trigger.ddl_state != CatalogDdlState::Absent && trigger.target == target {
+            // A trigger the transaction dropped commits through its own drop
+            // record, which may come after the view's.
+            if trigger.ddl_state != CatalogDdlState::Absent
+                && trigger.ddl_state.pending_drop_txid().is_none()
+                && trigger.target == target
+            {
                 self.clear_trigger_slot(slot);
                 self.clear_trigger_dependents(slot, trigger);
             }
@@ -52709,6 +52845,43 @@ impl Storage {
         }
     }
 
+    /// Reads as a cursor's opening statement did: its own transaction's
+    /// changes made before `command`, and commits through `commit_lsn`.
+    pub(crate) fn cursor_snapshot(&self, command: u32, commit_lsn: u64) -> ReadSnapshotScope {
+        let previous = execution_visibility();
+        replace_execution_visibility(VisibilityContext {
+            read_snapshot: command,
+            commit_snapshot: commit_lsn,
+            ..previous
+        });
+        ReadSnapshotScope {
+            previous,
+            thread: core::marker::PhantomData,
+        }
+    }
+
+    /// Keeps the running statement's visibility and restores it on drop.
+    pub(crate) fn same_statement_snapshot(&self) -> ReadSnapshotScope {
+        ReadSnapshotScope {
+            previous: execution_visibility(),
+            thread: core::marker::PhantomData,
+        }
+    }
+
+    /// Lets a referential check see every change of its own transaction,
+    /// including those of the running command, as PostgreSQL's checks do.
+    pub(crate) fn own_changes_snapshot(&self) -> ReadSnapshotScope {
+        let previous = execution_visibility();
+        replace_execution_visibility(VisibilityContext {
+            read_snapshot: SNAPSHOT_ALL,
+            ..previous
+        });
+        ReadSnapshotScope {
+            previous,
+            thread: core::marker::PhantomData,
+        }
+    }
+
     pub(crate) fn dml_expression_snapshot(&self, command: u32) -> ReadSnapshotScope {
         let previous = execution_visibility();
         replace_execution_visibility(VisibilityContext {
@@ -53022,6 +53195,15 @@ impl Storage {
                     "aborted"
                 }
             }))
+    }
+
+    /// Whether `txid` reads one snapshot for its whole life (repeatable read
+    /// or serializable), which registers it here at its first statement.
+    pub(crate) fn keeps_transaction_snapshot(&self, txid: u32) -> bool {
+        self.snapshot_state()
+            .active
+            .iter()
+            .any(|(owner, _)| *owner == txid)
     }
 
     pub fn register_snapshot(&self, txid: u32, snapshot: u64) -> Result<(), SqlError> {
@@ -53459,6 +53641,11 @@ impl Storage {
 
     pub(crate) fn result_spool(&self) -> &std::sync::Arc<crate::mem::lease_pool::LeasePool> {
         &self.result_spool
+    }
+
+    /// The shared pool holding retained plan nodes' build sides.
+    pub(crate) fn plan_build(&self) -> &std::sync::Arc<crate::mem::lease_pool::LeasePool> {
+        &self.plan_build
     }
 
     pub(crate) fn lock_mark(&self) -> u64 {
@@ -54492,6 +54679,53 @@ impl Storage {
                     && operator.visible_to(txid)
                     && operator.definition_for(txid).name.as_str() == name
             })
+    }
+
+    /// Whether a visible operator of this database named `name` lives in a
+    /// schema on the search path. Builtin operator evaluation asks this per
+    /// row, so it scans under one lock and copies only matching names.
+    pub(crate) fn has_operator_named_on_path(&self, name: &str, txid: u32) -> bool {
+        const BATCH: usize = 16;
+        let database = current_database();
+        let mut next = 0;
+        loop {
+            let mut schemas = [None; BATCH];
+            let mut found = 0;
+            let mut resume = None;
+            {
+                let catalog = self
+                    .operator_catalog
+                    .lock()
+                    .expect("operator catalog lock poisoned");
+                for (slot, operator) in catalog.operators.iter().enumerate().skip(next) {
+                    if !(operator.database == database && operator.visible_to(txid)) {
+                        continue;
+                    }
+                    let definition = operator.definition_for(txid);
+                    if definition.name.as_str() != name {
+                        continue;
+                    }
+                    if found == BATCH {
+                        resume = Some(slot);
+                        break;
+                    }
+                    schemas[found] = Some(definition.schema);
+                    found += 1;
+                }
+            }
+            // The search path is read without the operator catalog's lock.
+            if schemas[..found]
+                .iter()
+                .flatten()
+                .any(|schema| self.schema_is_on_path(*schema, txid))
+            {
+                return true;
+            }
+            match resume {
+                Some(slot) => next = slot,
+                None => return false,
+            }
+        }
     }
 
     pub(crate) fn operator_count(&self) -> usize {
@@ -55978,6 +56212,8 @@ impl Storage {
         txid: u32,
     ) -> Result<RulePublication, SqlError> {
         validate_stored_search_path(&definition.creation_path)?;
+        // Named before the rule catalog lock, which the view's names share.
+        let (_, target_name) = self.rule_target_names(definition.target, txid);
         let target = self.query_rule_target(definition.target, txid)?;
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
@@ -55995,8 +56231,9 @@ impl Storage {
             if !or_replace {
                 return Err(sql_err!(
                     sqlstate::DUPLICATE_OBJECT,
-                    "rule \"{}\" for relation already exists",
-                    definition.name.as_str()
+                    "rule \"{}\" for relation \"{}\" already exists",
+                    definition.name.as_str(),
+                    target_name.as_str()
                 ));
             }
             let prior = catalog.rules[slot].pending;
@@ -56353,6 +56590,14 @@ impl Storage {
                 let view = self.view(usize::from(slot));
                 view.names_for(txid)
             }
+        }
+    }
+
+    /// The relation name PostgreSQL's duplicate-trigger errors print.
+    pub(crate) fn trigger_target_name(&self, target: TriggerTarget, txid: u32) -> SqlName {
+        match target {
+            TriggerTarget::Table(slot) => self.table_def(usize::from(slot), txid).name,
+            TriggerTarget::View(slot) => self.view(usize::from(slot)).names_for(txid).1,
         }
     }
 
@@ -58035,11 +58280,14 @@ impl Storage {
             }
         };
         class.ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "data type {} has no default operator class for access method \"{}\"",
-                input.ctype.name(),
-                method.name()
+            crate::sql::error_position::with_hint(
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "data type {} has no default operator class for access method \"{}\"",
+                    input.ctype.name(),
+                    method.name()
+                ),
+                crate::sql::error_position::DEFAULT_OPERATOR_CLASS_HINT,
             )
         })
     }

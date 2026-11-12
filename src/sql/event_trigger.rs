@@ -534,6 +534,12 @@ enum EventObjectRef {
     ViewArrayType(u16),
     ViewRule(u16),
     MatviewRule(u16),
+    /// A row trigger's clone on a partition of its table.
+    PartitionTrigger {
+        trigger: u16,
+        table: u16,
+        oid: i32,
+    },
     DomainArray(u16),
     DomainConstraint {
         domain: u16,
@@ -721,6 +727,36 @@ impl EventObjectRef {
                 rule.address_names[2] = StackStr::from_str("_RETURN");
                 rule.address_name_count = 3;
                 rule
+            }
+            Self::PartitionTrigger {
+                trigger,
+                table,
+                oid,
+            } => {
+                let name = storage.trigger(usize::from(trigger)).name_to(txid);
+                let table = storage.table_def(usize::from(table), txid);
+                let mut identity = EventIdentity::new();
+                write!(
+                    identity,
+                    "{} on {}",
+                    identifier(name.as_str()).as_str(),
+                    qualified(table.schema.as_str(), table.name.as_str())?.as_str()
+                )
+                .map_err(|_| graph_full())?;
+                let mut object = base_object(
+                    catalog::PG_TRIGGER_OID,
+                    oid,
+                    "trigger",
+                    Some(table.schema.as_str()),
+                    Some(name.as_str()),
+                    identity,
+                    false,
+                );
+                object.address_names[0] = StackStr::from_str(table.schema.as_str());
+                object.address_names[1] = StackStr::from_str(table.name.as_str());
+                object.address_names[2] = StackStr::from_str(name.as_str());
+                object.address_name_count = 3;
+                object
             }
             Self::DomainArray(slot) => {
                 let slot = usize::from(slot);
@@ -3178,14 +3214,17 @@ fn existing_catalog_object(
                 })
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
-        catalog::PG_TRIGGER_OID => EventObjectRef::Primary(ObjectRef::Trigger(
-            storage
+        catalog::PG_TRIGGER_OID => {
+            match storage
                 .triggers_with_slots_visible_to(txid)
                 .find_map(|(slot, trigger)| {
                     (crate::storage::trigger_oid(&trigger) == object_id).then_some(slot)
-                })
-                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
-        )),
+                }) {
+                Some(slot) => EventObjectRef::Primary(ObjectRef::Trigger(slot)),
+                None => partition_trigger_object(storage, txid, object_id)?
+                    .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+            }
+        }
         catalog::PG_REWRITE_OID => {
             if let Some(slot) = storage.matview_slot_by_rule_oid(object_id, txid) {
                 EventObjectRef::MatviewRule(u16::try_from(slot).map_err(|_| graph_full())?)
@@ -4807,4 +4846,40 @@ pub(crate) fn collect<'a>(
         commands: commands.as_slice(),
         drops: order_drops(storage, txid, drops.as_slice(), arena)?,
     })
+}
+
+/// The partition clone of a row trigger whose OID is `oid`, if any.
+fn partition_trigger_object(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Result<Option<EventObjectRef>, SqlError> {
+    for (slot, trigger) in storage.triggers_with_slots_visible_to(txid) {
+        let crate::storage::TriggerTarget::Table(parent) = trigger.target else {
+            continue;
+        };
+        if !matches!(trigger.level, crate::sql::ast::TriggerLevel::Row) {
+            continue;
+        }
+        for child in 0..storage.table_count() {
+            if !storage.table_slot_visible_to(child, txid)
+                || !storage.partition_descends_from(child, usize::from(parent), txid)
+            {
+                continue;
+            }
+            let clone = storage.partition_trigger_oid_to(
+                trigger.position(slot),
+                storage.table_position(child),
+                txid,
+            )?;
+            if clone == oid {
+                return Ok(Some(EventObjectRef::PartitionTrigger {
+                    trigger: u16::try_from(slot).map_err(|_| graph_full())?,
+                    table: u16::try_from(child).map_err(|_| graph_full())?,
+                    oid,
+                }));
+            }
+        }
+    }
+    Ok(None)
 }

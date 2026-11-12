@@ -74,6 +74,11 @@ SELECT pg_describe_object(classid, objid, objsubid) AS dependent,
   FROM pg_depend
  WHERE classid IN ('pg_rewrite'::regclass, 'pg_trigger'::regclass)
    AND objid >= 16384 AND refobjid >= 16384
+   AND objid IN (SELECT oid FROM pg_rewrite
+                  WHERE ev_class IN (SELECT oid FROM pg_class WHERE relnamespace = 'vct2'::regnamespace)
+                 UNION ALL
+                 SELECT oid FROM pg_trigger
+                  WHERE tgrelid IN (SELECT oid FROM pg_class WHERE relnamespace = 'vct2'::regnamespace))
  ORDER BY 1, 2;
 RESET search_path;
 DROP SCHEMA vct2 CASCADE;

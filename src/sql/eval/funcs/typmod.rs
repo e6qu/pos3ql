@@ -7,7 +7,9 @@ use crate::sql::ast::Expr;
 use crate::sql::types::{ArrElem, Datum, INTERVAL_FULL_RANGE, IntervalRange};
 use crate::sql_err;
 
-use super::super::{ColumnLookup, EvalHooks, SqlError, eval_full, sqlstate, type_mismatch};
+use super::super::{
+    ColumnLookup, EvalHooks, SqlError, eval_full, sqlstate, type_name_of_pub as type_name_of,
+};
 
 /// The largest modifier list a type accepts; a longer list is invalid for
 /// every type here.
@@ -71,7 +73,14 @@ pub(crate) fn dispatch<'a>(
             Datum::Text(text) if matches!(args[0], Expr::Str(_) | Expr::Param(_)) => {
                 crate::sql::array::parse_literal(text, ArrElem::Cstring, arena)?
             }
-            other => return Err(type_mismatch(name, &other)),
+            other => {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "function {}({}) does not exist",
+                    name,
+                    type_name_of(&other)
+                ));
+            }
         };
         let mut typmods = [0i32; MAX_TYPMODS];
         let count = integer_typmods(raw, &mut typmods)?;
@@ -105,7 +114,10 @@ fn integer_typmods(raw: &[u8], out: &mut [i32; MAX_TYPMODS]) -> Result<usize, Sq
     }
     for element in crate::sql::array::elements(raw, ArrElem::Cstring) {
         let Datum::Text(text) = element else {
-            return Err(type_mismatch("typmod array", &element));
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "typmod array element is not a cstring"
+            ));
         };
         let value = super::super::cast::parse_int_bounded(
             text,

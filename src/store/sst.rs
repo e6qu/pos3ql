@@ -974,13 +974,9 @@ impl SstWriter {
                 }
             }
         }
-        for column in 0..self.pax_columns {
+        for (column, data_ref) in self.pax_refs[..self.pax_columns].iter().enumerate() {
             let at = refs_base + column * PACKED_DATA_REF_BYTES;
-            write_data_ref(
-                self.pax_refs[column],
-                &mut output[at..at + PACKED_DATA_REF_BYTES],
-                true,
-            )?;
+            write_data_ref(*data_ref, &mut output[at..at + PACKED_DATA_REF_BYTES], true)?;
         }
         Ok(total)
     }

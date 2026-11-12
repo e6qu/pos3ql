@@ -27,7 +27,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 29;
+pub(crate) const RECORD_VERSION: u8 = 30;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -1520,6 +1520,8 @@ pub(crate) enum WalOp<'a> {
         /// identity tuple.
         old_row: Option<&'a [u8]>,
         command_id: u32,
+        /// The deletion half of a partition move; see `PendingChange`.
+        moved_out: bool,
     },
     /// Statement-level logical change. Heap rows remain separate DELETE WAL
     /// records for recovery; the command lets pgoutput publish the protocol's
@@ -5276,11 +5278,12 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             rowid,
             old_row,
             command_id,
+            moved_out,
         } => {
             name_bytes(buffer, table)
                 && buffer.append(&rowid.to_le_bytes())
                 && name_bytes(buffer, schema)
-                && buffer.append(&[u8::from(old_row.is_some())])
+                && buffer.append(&[u8::from(old_row.is_some()) | (u8::from(*moved_out) << 1)])
                 && old_row.is_none_or(|old| {
                     buffer.append(&(old.len() as u32).to_le_bytes()) && buffer.append(old)
                 })
@@ -8452,7 +8455,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             def.n_checks = n_checks;
-            for k in 0..n_checks {
+            for slot in &mut def.checks[..n_checks] {
                 let constraint_name = take_name(&mut at)?;
                 let validation =
                     crate::storage::ConstraintValidation::from_code(*payload.get(at)?)?;
@@ -8476,7 +8479,7 @@ fn decode_op_inner<'a>(
                 if check.expression.is_truncated() {
                     return None;
                 }
-                def.checks[k] = check;
+                *slot = check;
             }
             // FOREIGN KEY constraints.
             let n_fkeys = *payload.get(at)? as usize;
@@ -8485,7 +8488,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             def.n_fkeys = n_fkeys;
-            for f in 0..n_fkeys {
+            for slot in &mut def.fkeys[..n_fkeys] {
                 let fname = take_name(&mut at)?;
                 let nc = *payload.get(at)? as usize;
                 at += 1;
@@ -8517,7 +8520,7 @@ fn decode_op_inner<'a>(
                 fk.on_update = FkAction::from_code(acts[1])?;
                 fk.timing = crate::storage::ConstraintTiming::from_code(acts[2])?;
                 fk.validation = crate::storage::ConstraintValidation::from_code(acts[3])?;
-                def.fkeys[f] = fk;
+                *slot = fk;
             }
             let n_exclusions = *payload.get(at)? as usize;
             at += 1;
@@ -8525,7 +8528,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             def.n_exclusions = n_exclusions;
-            for index in 0..n_exclusions {
+            for slot in &mut def.exclusions[..n_exclusions] {
                 let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
                 exclusion.name = SqlName::parse(take_name(&mut at)?).ok()?;
                 let meta = payload.get(at..at + 2)?;
@@ -8555,7 +8558,7 @@ fn decode_op_inner<'a>(
                     }
                     exclusion.predicate = Some(predicate);
                 }
-                def.exclusions[index] = exclusion;
+                *slot = exclusion;
             }
             def.schema = SqlName::parse(take_name(&mut at)?).ok()?;
             for f in 0..def.n_fkeys {
@@ -8756,21 +8759,21 @@ fn decode_op_inner<'a>(
             let rowid = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
             at += 8;
             let schema = take_name(&mut at)?;
-            let old_row = match *payload.get(at)? {
-                0 => {
-                    at += 1;
-                    None
-                }
-                1 => {
-                    at += 1;
-                    let length =
-                        u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?) as usize;
-                    at += 4;
-                    let old = payload.get(at..at + length)?;
-                    at += length;
-                    Some(old)
-                }
-                _ => return None,
+            // Bit 0: the old image follows; bit 1: the deletion moved the
+            // row to another partition.
+            let flags = *payload.get(at)?;
+            if flags > 3 {
+                return None;
+            }
+            at += 1;
+            let old_row = if flags & 1 == 1 {
+                let length = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?) as usize;
+                at += 4;
+                let old = payload.get(at..at + length)?;
+                at += length;
+                Some(old)
+            } else {
+                None
             };
             let command_id = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
             at += 4;
@@ -8780,6 +8783,7 @@ fn decode_op_inner<'a>(
                 rowid,
                 old_row,
                 command_id,
+                moved_out: flags & 2 == 2,
             })
         }),
         KIND_TRUNCATE | KIND_TRUNCATE_WIDE => decode_large_op(|| {
@@ -16641,6 +16645,7 @@ mod tests {
                     rowid: 1,
                     old_row: None,
                     command_id: 0,
+                    moved_out: false,
                 },
             )
             .unwrap();
@@ -18245,6 +18250,53 @@ mod tests {
     }
 
     #[test]
+    fn deletion_records_keep_the_partition_move_flag_and_reject_unknown_flags() {
+        let mut budget = Budget::new(1 << 16);
+        let mut payload = FixedBuf::new(&mut budget, "deletion flags", 256).unwrap();
+        for (old_row, moved_out) in [
+            (None, false),
+            (None, true),
+            (Some(&b"OLD"[..]), false),
+            (Some(&b"OLD"[..]), true),
+        ] {
+            let operation = WalOp::Delete {
+                schema: "public",
+                table: "pt1",
+                rowid: 7,
+                old_row,
+                command_id: 3,
+                moved_out,
+            };
+            payload.clear();
+            assert!(append_payload(&mut payload, &operation));
+            assert_eq!(payload.len(), encoded_payload_len(&operation));
+            let Some(WalOp::Delete {
+                old_row: decoded_old,
+                moved_out: decoded_moved,
+                ..
+            }) = decode_op(KIND_DELETE, payload.readable())
+            else {
+                panic!("deletion record must decode");
+            };
+            assert_eq!((decoded_old, decoded_moved), (old_row, moved_out));
+        }
+        let operation = WalOp::Delete {
+            schema: "public",
+            table: "pt1",
+            rowid: 7,
+            old_row: None,
+            command_id: 3,
+            moved_out: false,
+        };
+        payload.clear();
+        assert!(append_payload(&mut payload, &operation));
+        let mut bytes = payload.readable().to_vec();
+        let flags = bytes.len() - 5;
+        bytes[flags] = 4;
+        assert!(decode_op(KIND_DELETE, &bytes).is_none());
+    }
+
+    #[test]
     fn transaction_stages_publish_independently_in_commit_order() {
         let dir = temp_dir("transaction-stages");
         let config = test_config(&dir);
@@ -18260,6 +18312,7 @@ mod tests {
                     rowid: 1,
                     old_row: None,
                     command_id: 0,
+                    moved_out: false,
                 },
             )
             .unwrap();
@@ -18273,6 +18326,7 @@ mod tests {
                     rowid: 2,
                     old_row: None,
                     command_id: 0,
+                    moved_out: false,
                 },
             )
             .unwrap();
@@ -18286,6 +18340,7 @@ mod tests {
                     rowid: 20,
                     old_row: None,
                     command_id: 0,
+                    moved_out: false,
                 },
             )
             .unwrap();
@@ -18298,6 +18353,7 @@ mod tests {
                     rowid: 30,
                     old_row: None,
                     command_id: 0,
+                    moved_out: false,
                 },
             )
             .unwrap();
@@ -18524,6 +18580,7 @@ mod tests {
             rowid: 1,
             old_row: None,
             command_id: 0,
+            moved_out: false,
         };
         wal.stage(1, 1, &operation).unwrap();
         wal.stage(2, 2, &operation).unwrap();
@@ -18692,6 +18749,7 @@ mod tests {
                     rowid: 1,
                     old_row: None,
                     command_id: 0,
+                    moved_out: false,
                 },
             )
             .unwrap();
@@ -18773,6 +18831,7 @@ mod tests {
                     rowid: 1,
                     old_row: None,
                     command_id: 0,
+                    moved_out: false,
                 },
             )
             .unwrap();
@@ -18794,6 +18853,7 @@ mod tests {
                         rowid: lsn,
                         old_row: None,
                         command_id: 0,
+                        moved_out: false,
                     },
                 )
                 .unwrap();
@@ -18819,6 +18879,7 @@ mod tests {
                 rowid: 1,
                 old_row: None,
                 command_id: 0,
+                moved_out: false,
             });
         let commit_len = HEADER_LEN
             + encoded_payload_len(&WalOp::Commit {
@@ -18855,6 +18916,7 @@ mod tests {
                         rowid: lsn,
                         old_row: None,
                         command_id: 0,
+                        moved_out: false,
                     },
                 )
                 .unwrap();
@@ -18894,6 +18956,7 @@ mod tests {
                         rowid: lsn,
                         old_row: None,
                         command_id: 0,
+                        moved_out: false,
                     },
                 )
                 .unwrap();
@@ -18918,6 +18981,7 @@ mod tests {
                     rowid: 12,
                     old_row: None,
                     command_id: 0,
+                    moved_out: false,
                 },
             )
             .unwrap();
@@ -18929,6 +18993,7 @@ mod tests {
                     rowid: 13,
                     old_row: None,
                     command_id: 0,
+                    moved_out: false,
                 },
             )
             .unwrap();
@@ -19025,6 +19090,7 @@ mod tests {
                         rowid: lsn,
                         old_row: None,
                         command_id: 0,
+                        moved_out: false,
                     },
                 )
                 .unwrap();
@@ -19049,6 +19115,7 @@ mod tests {
                 rowid: 1,
                 old_row: None,
                 command_id: 0,
+                moved_out: false,
             },
         )
         .unwrap();

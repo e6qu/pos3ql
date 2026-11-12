@@ -1,6 +1,7 @@
 //! Ordered AFTER work and its single write-completion response.
 
 use super::*;
+use crate::sql::{query, sequence};
 
 pub(super) enum WriteCompletion {
     Insert {
@@ -29,51 +30,95 @@ pub(super) enum CompletionReply {
 
 /// The next event belongs to this statement's trigger depth. Its completion
 /// marker is installed by the firing, before recursive trigger SQL can run.
+#[derive(Clone, Copy)]
 pub(super) struct QueuedFiring {
-    pub(super) index: usize,
-    pub(super) trigger_slot: u16,
+    pub(super) index: u64,
+    /// The row trigger to run, or `None` for a foreign key check.
+    pub(super) trigger_slot: Option<u16>,
     pub(super) table: u16,
     pub(super) event: u8,
 }
 
 pub(super) struct AfterRowCursor {
     depth: u16,
-    next: usize,
+    command: u32,
+    next: Option<u64>,
 }
 
 impl AfterRowCursor {
-    pub(super) fn new(depth: u16) -> Self {
-        Self { depth, next: 0 }
+    /// The events of the statement at `depth` running as `command`.
+    pub(super) fn new(depth: u16, command: u32) -> Self {
+        Self {
+            depth,
+            command,
+            next: None,
+        }
     }
 
     pub(super) fn next(
         &mut self,
         context: &mut TriggerExecContext<'_, '_, '_>,
     ) -> Result<Option<QueuedFiring>, SqlError> {
-        while self.next < context.txn.deferred_trigger_events().len() {
-            let index = self.next;
-            self.next += 1;
-            if context.txn.deferred_trigger_is_complete(index) {
+        context.txn.queue_all_pending_row_events()?;
+        let mut cursor = self
+            .next
+            .unwrap_or_else(|| context.txn.trigger_events_from(self.command));
+        while cursor < context.txn.trigger_events_end() {
+            let index = cursor;
+            let (event, next, fired) = context.txn.trigger_event(index)?;
+            cursor = next;
+            self.next = Some(next);
+            if fired {
                 continue;
             }
-            let event = context.txn.deferred_trigger_events()[index];
             let selected = match event.kind {
                 crate::sql::txn::DeferredTriggerKind::AfterRow {
                     trigger_slot,
                     effective_table,
                     trigger_depth,
-                } if trigger_depth == self.depth => Some((trigger_slot, effective_table)),
+                    command,
+                } if trigger_depth == self.depth && command == self.command => {
+                    Some((Some(trigger_slot), effective_table))
+                }
+                crate::sql::txn::DeferredTriggerKind::ForeignKey {
+                    identity,
+                    check,
+                    effective_table,
+                    trigger_depth,
+                    command,
+                    ..
+                } if trigger_depth == self.depth
+                    && command == self.command
+                    && context.txn.with_sub_statement != Some((self.depth, self.command)) =>
+                {
+                    match constraints::foreign_key_event_mode(
+                        context.host.storage(),
+                        context.txn,
+                        identity,
+                        check,
+                    ) {
+                        None => {
+                            context.txn.fire_trigger_event(index)?;
+                            continue;
+                        }
+                        Some(crate::sql::ast::ConstraintMode::Deferred) => None,
+                        Some(crate::sql::ast::ConstraintMode::Immediate) => {
+                            Some((None, effective_table))
+                        }
+                    }
+                }
                 crate::sql::txn::DeferredTriggerKind::Constraint {
                     identity,
                     effective_table,
                     trigger_depth,
-                } if trigger_depth == self.depth => {
+                    command,
+                } if trigger_depth == self.depth && command == self.command => {
                     let Some(timing) = constraints::constraint_timing(
                         context.storage(),
                         identity,
                         context.txn.txid,
                     ) else {
-                        context.txn.complete_deferred_trigger(index)?;
+                        context.txn.fire_trigger_event(index)?;
                         continue;
                     };
                     if context.txn.constraint_mode(identity, timing)
@@ -83,7 +128,7 @@ impl AfterRowCursor {
                     } else if let crate::sql::txn::ConstraintIdentity::Trigger { slot, .. } =
                         identity
                     {
-                        Some((slot, effective_table))
+                        Some((Some(slot), effective_table))
                     } else {
                         None
                     }
@@ -119,8 +164,8 @@ impl StatementTriggerCursor {
         event: u8,
         before: bool,
         columns: ColumnSet,
-    ) -> Option<crate::storage::TriggerDef> {
-        while let Some(trigger) = context
+    ) -> Option<(u16, crate::storage::TriggerDef)> {
+        while let Some((slot, trigger)) = context
             .storage()
             .triggers_for_target(target, context.txn.txid)
             .filter(|(_, trigger)| {
@@ -132,7 +177,6 @@ impl StatementTriggerCursor {
                     .as_str()
                     .cmp(right.name_to(context.txn.txid).as_str())
             })
-            .map(|(_, trigger)| trigger)
         {
             self.last_name = Some(trigger.name_to(context.txn.txid));
             if !(if context.txn.replication_apply {
@@ -153,7 +197,7 @@ impl StatementTriggerCursor {
             {
                 continue;
             }
-            return Some(trigger);
+            return Some((slot as u16, trigger));
         }
         None
     }
@@ -161,6 +205,9 @@ impl StatementTriggerCursor {
 
 enum AfterPhase {
     Rows(AfterRowCursor),
+    /// A top-level statement's immediate constraint checks, after its row
+    /// events and before its statement triggers, as PostgreSQL queues them.
+    Constraints,
     Statements {
         event: usize,
         trigger: StatementTriggerCursor,
@@ -173,8 +220,10 @@ enum AfterPhase {
     clippy::large_enum_variant,
     reason = "selected trigger definitions stay inline without heap allocation"
 )]
+#[derive(Clone, Copy)]
 enum AfterFiring {
     Row(QueuedFiring),
+    Constraints,
     Statement {
         trigger: crate::storage::TriggerDef,
         event: u8,
@@ -183,6 +232,7 @@ enum AfterFiring {
 
 enum SavedAfterFiring {
     Row(QueuedFiring),
+    Constraints,
     Statement {
         trigger: MutableSlice<crate::storage::TriggerDef>,
         event: u8,
@@ -196,6 +246,7 @@ impl SavedAfterFiring {
     ) -> Result<Self, SqlError> {
         match firing {
             AfterFiring::Row(row) => Ok(Self::Row(row)),
+            AfterFiring::Constraints => Ok(Self::Constraints),
             AfterFiring::Statement { trigger, event } => {
                 let mut saved = controls.lease(1).map_err(control_flow::execution_full)?;
                 saved
@@ -209,12 +260,13 @@ impl SavedAfterFiring {
         }
     }
 
-    fn into_firing(self) -> AfterFiring {
+    fn firing(&self) -> AfterFiring {
         match self {
-            Self::Row(row) => AfterFiring::Row(row),
+            Self::Row(row) => AfterFiring::Row(*row),
+            Self::Constraints => AfterFiring::Constraints,
             Self::Statement { trigger, event } => AfterFiring::Statement {
                 trigger: trigger[0],
-                event,
+                event: *event,
             },
         }
     }
@@ -224,6 +276,12 @@ struct CompletionCursor {
     completion: WriteCompletion,
     reply: CompletionReply,
     phase: AfterPhase,
+    /// The completion ends a top-level statement: it runs the immediate
+    /// constraint checks.
+    statement_end: bool,
+    /// Its owner keeps it across a wait, so its reads yield again at each
+    /// event: a top-level statement, or a write in a `CALL` or `DO` body.
+    reopen_reads: bool,
 }
 
 pub(crate) struct SuspendedWriteCompletion {
@@ -240,6 +298,9 @@ pub(super) enum NestedWriteOutput {
     Rows {
         values: local_values::SavedValues,
         rows: u64,
+        /// A dynamic statement's `USING` values, which a `STRICT` failure
+        /// lists after the write resumes.
+        arguments: local_values::SavedValues,
     },
     NoResult,
 }
@@ -261,6 +322,7 @@ impl PendingNestedWrite {
         &mut self,
         values: Option<&[Datum<'_>]>,
         rows: u64,
+        arguments: &[Datum<'_>],
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<(), SqlError> {
         if self.output.is_some() {
@@ -273,9 +335,12 @@ impl PendingNestedWrite {
             Some(values) => {
                 let mut saved = local_values::SavedValues::new(pool)?;
                 saved.replace(values)?;
+                let mut saved_arguments = local_values::SavedValues::new(pool)?;
+                saved_arguments.replace(arguments)?;
                 NestedWriteOutput::Rows {
                     values: saved,
                     rows,
+                    arguments: saved_arguments,
                 }
             }
             None => NestedWriteOutput::NoResult,
@@ -306,6 +371,8 @@ impl PendingNestedWrite {
             mark: self.completion.boundary(),
             command: command.command_id(),
             depth: command.trigger_depth(),
+            retained: prior.is_some_and(|boundary| boundary.retained),
+            statement_end: false,
         });
         let result = self.completion.poll(&mut TriggerExecContext {
             host: context.host.reborrow(),
@@ -354,6 +421,9 @@ struct WriteCompletionState {
     command: u32,
     depth: u16,
     boundary: super::super::txn::StatementMark,
+    /// The statement's sequence replay position where the selected event
+    /// started: an event that runs again replays its own calls from here.
+    event_replay: Option<sequence::StatementReplayStart>,
 }
 
 impl SuspendedWriteCompletion {
@@ -373,7 +443,8 @@ impl SuspendedWriteCompletion {
             .map_err(control_flow::execution_full)?;
         let selected = SavedAfterFiring::capture(selected, &context.storage().execution_control)?;
         let definitions = context.storage().table_definition_images();
-        let mut row_cursor = AfterRowCursor::new(context.txn.trigger_depth());
+        let mut row_cursor =
+            AfterRowCursor::new(context.txn.trigger_depth(), context.txn.command_id());
         while let Some(firing) = row_cursor.next(context)? {
             definitions.definition(
                 context.storage(),
@@ -401,6 +472,7 @@ impl SuspendedWriteCompletion {
                 command: context.txn.command_id(),
                 depth: context.txn.trigger_depth(),
                 boundary,
+                event_replay: sequence::begin_replay_cursor()?,
             })
             .map_err(control_flow::execution_full)?;
         Ok(Self { state })
@@ -444,24 +516,55 @@ impl WriteCompletionState {
             .definitions
             .retained_relation(self.definition)
             .expect("unfinished write retains its selected relation");
+        if self.firing.is_none()
+            && self.selected.is_some()
+            && let Err(error) = sequence::rewind_replay_cursor(self.event_replay)
+        {
+            return sql_fail(error);
+        }
         loop {
             if let Some(firing) = &mut self.firing {
+                if self.cursor.reopen_reads {
+                    query::reopen_reads_after_kept_work();
+                }
                 match firing.poll(context) {
                     Ok(trigger_firing::FiringProgress::Waiting { control }) => {
                         return sql_fail(sql_err!(control, "unfinished trigger is waiting"));
                     }
-                    Ok(trigger_firing::FiringProgress::Complete { .. }) => self.firing = None,
+                    Ok(trigger_firing::FiringProgress::Complete { .. }) => {
+                        self.firing = None;
+                        self.selected = None;
+                    }
                     Err(error) => return sql_fail(error),
                 }
             }
-            let selected = match self.selected.take() {
-                Some(selected) => selected.into_firing(),
+            // The selected event stays saved until it completes, so a wait
+            // anywhere in it runs or resumes that same event again.
+            let selected = match &self.selected {
+                Some(selected) => selected.firing(),
                 None => match self.cursor.next(context, self.target) {
-                    Ok(Some(selected)) => selected,
+                    Ok(Some(selected)) => {
+                        match SavedAfterFiring::capture(
+                            selected,
+                            &context.storage().execution_control,
+                        )
+                        .and_then(|saved| Ok((saved, sequence::begin_replay_cursor()?)))
+                        {
+                            Ok((saved, replay)) => {
+                                self.selected = Some(saved);
+                                self.event_replay = replay;
+                            }
+                            Err(error) => return sql_fail(error),
+                        }
+                        selected
+                    }
                     Ok(None) => return self.cursor.complete(context.responder),
                     Err(error) => return sql_fail(error),
                 },
             };
+            if self.cursor.reopen_reads {
+                query::reopen_reads_after_kept_work();
+            }
             let mark = arena.mark();
             let result = run_selected_firing(
                 context,
@@ -475,11 +578,13 @@ impl WriteCompletionState {
             // execution into the returned owner before temporary syntax leaves.
             unsafe { arena.rewind_to(mark) };
             match result {
-                Ok(None) => {}
+                Ok(None) => self.selected = None,
                 Ok(Some((firing, wait))) => {
                     self.firing = Some(firing);
                     return sql_fail(wait);
                 }
+                // A wait before the firing could keep its own progress runs
+                // the same event again on resume.
                 Err(error) => return sql_fail(error),
             }
         }
@@ -506,6 +611,8 @@ pub(in crate::sql) fn resume(
         mark: completion.boundary(),
         command: txn.command_id(),
         depth: txn.trigger_depth(),
+        retained: true,
+        statement_end: true,
     });
     let result = completion.poll(&mut TriggerExecContext {
         host: PlpgsqlExecHost::Routine {
@@ -543,6 +650,15 @@ fn run_selected_firing<'run>(
 ) -> Result<Option<(trigger_firing::SuspendedTriggerFiring, SqlError)>, SqlError> {
     let mut context = context.for_trigger();
     let firing = match selected {
+        AfterFiring::Constraints => {
+            constraints::validate_deferred_constraints(
+                context.host.storage(),
+                context.txn,
+                true,
+                context.arena,
+            )?;
+            return Ok(None);
+        }
         AfterFiring::Statement { trigger, event } => {
             if !row_trigger_when_passes(&context, &trigger, definition, None, None)? {
                 return Ok(None);
@@ -563,8 +679,24 @@ fn run_selected_firing<'run>(
                 transitions.for_event(event),
             )?
         }
+        AfterFiring::Row(QueuedFiring {
+            index,
+            trigger_slot: None,
+            ..
+        }) => {
+            let arena = context.arena;
+            let (storage, txn, _, services) = context.dml_parts();
+            constraints::fire_queued_foreign_key_event(
+                storage,
+                txn,
+                index,
+                arena,
+                services.seq_session,
+            )?;
+            return Ok(None);
+        }
         AfterFiring::Row(selected) => {
-            let event = context.txn.deferred_trigger_events()[selected.index];
+            let (event, _, _) = context.txn.trigger_event(selected.index)?;
             let definition = definitions.definition(
                 context.storage(),
                 usize::from(selected.table),
@@ -573,14 +705,11 @@ fn run_selected_firing<'run>(
             let relation = crate::storage::RelationDefinition::from_definition(definition);
             let mut schema = [ColType::Bool; MAX_COLUMNS];
             definition.schema(&mut schema);
-            let decode = |tuple| -> Result<Option<&'run mut [Datum<'run>]>, SqlError> {
+            let mut decode = |tuple| -> Result<Option<&'run mut [Datum<'run>]>, SqlError> {
                 let Some(tuple) = tuple else {
                     return Ok(None);
                 };
-                let bytes = context
-                    .arena
-                    .alloc_slice_copy(context.txn.deferred_trigger_bytes(tuple))
-                    .map_err(|_| super::super::query::arena_full_pub())?;
+                let bytes = context.txn.trigger_event_tuple(tuple, context.arena)?;
                 let values = context
                     .arena
                     .alloc_slice_with(definition.n_columns, |_| Datum::Null)
@@ -590,10 +719,14 @@ fn run_selected_firing<'run>(
             };
             let old = decode(event.old)?;
             let new = decode(event.new)?;
-            let trigger = context
-                .storage()
-                .trigger(usize::from(selected.trigger_slot));
-            context.txn.complete_deferred_trigger(selected.index)?;
+            let trigger_slot = selected.trigger_slot.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "a row trigger event lost its trigger"
+                )
+            })?;
+            let trigger = context.storage().trigger(usize::from(trigger_slot));
+            context.txn.fire_trigger_event(selected.index)?;
             prepare_trigger_firing(
                 &context,
                 &trigger,
@@ -625,11 +758,20 @@ fn run_selected_firing<'run>(
 }
 
 impl CompletionCursor {
-    fn new(completion: WriteCompletion, reply: CompletionReply, depth: u16) -> Self {
+    fn new(
+        completion: WriteCompletion,
+        reply: CompletionReply,
+        depth: u16,
+        command: u32,
+        boundary: Option<super::super::txn::WriteCompletionBoundary>,
+    ) -> Self {
         Self {
             completion,
             reply,
-            phase: AfterPhase::Rows(AfterRowCursor::new(depth)),
+            phase: AfterPhase::Rows(AfterRowCursor::new(depth, command)),
+            statement_end: boundary.is_some_and(|boundary| boundary.statement_end),
+            reopen_reads: boundary
+                .is_some_and(|boundary| boundary.statement_end || boundary.retained),
         }
     }
 
@@ -647,10 +789,21 @@ impl CompletionCursor {
                     {
                         return Ok(Some(AfterFiring::Row(firing)));
                     }
+                    self.phase = if self.statement_end {
+                        AfterPhase::Constraints
+                    } else {
+                        AfterPhase::Statements {
+                            event: 0,
+                            trigger: StatementTriggerCursor::new(),
+                        }
+                    };
+                }
+                AfterPhase::Constraints => {
                     self.phase = AfterPhase::Statements {
                         event: 0,
                         trigger: StatementTriggerCursor::new(),
                     };
+                    return Ok(Some(AfterFiring::Constraints));
                 }
                 AfterPhase::Statements { event, trigger } => {
                     if *event == events.len() {
@@ -658,8 +811,9 @@ impl CompletionCursor {
                         continue;
                     }
                     if let Some((operation, columns)) = events[*event]
-                        && let Some(selected) =
-                            trigger.next(context, target, operation, false, columns)
+                        && let Some(selected) = trigger
+                            .next(context, target, operation, false, columns)
+                            .map(|(_, trigger)| trigger)
                     {
                         return Ok(Some(AfterFiring::Statement {
                             trigger: selected,
@@ -738,11 +892,12 @@ impl WriteCompletion {
         reply: CompletionReply,
     ) -> Outcome {
         let depth = context.txn.trigger_depth();
-        let mut cursor = CompletionCursor::new(self, reply, depth);
-        if let Some(boundary) = context.txn.write_completion_boundary
-            && boundary.command == context.txn.command_id()
-            && boundary.depth == depth
-        {
+        let boundary = context.txn.write_completion_boundary.filter(|boundary| {
+            boundary.command == context.txn.command_id() && boundary.depth == depth
+        });
+        let mut cursor =
+            CompletionCursor::new(self, reply, depth, context.txn.command_id(), boundary);
+        if let Some(boundary) = boundary {
             let selected = match cursor.next(&mut context, target) {
                 Ok(Some(selected)) => selected,
                 Ok(None) => return cursor.complete(context.responder),
@@ -779,15 +934,16 @@ impl WriteCompletion {
                 Err(error) => return sql_fail(error),
             };
             let result = match firing {
-                AfterFiring::Row(firing) => execute_deferred_trigger_event(
-                    &mut context,
-                    firing.index,
-                    firing.trigger_slot,
-                    firing.table,
-                    transitions.for_event(firing.event),
-                ),
+                AfterFiring::Row(firing) => {
+                    execute_queued_firing(&mut context, firing, transitions.for_event(firing.event))
+                }
+                AfterFiring::Constraints => Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "an inline write completion runs no constraint checks"
+                )),
                 AfterFiring::Statement { trigger, event } => execute_statement_trigger(
                     &mut context,
+                    None,
                     &trigger,
                     target,
                     crate::storage::RelationDefinition::from_definition(definition),
@@ -820,6 +976,8 @@ mod ownership_tests {
                 },
                 CompletionReply::Command,
                 0,
+                0,
+                None,
             );
             let mut responder = Responder::new(&mut buffer);
             assert!(responder.buffer.append(&[0xa5; 50]));
@@ -874,6 +1032,8 @@ mod ownership_tests {
                 },
                 reply: CompletionReply::CountOnly,
                 phase: AfterPhase::Reply,
+                statement_end: false,
+                reopen_reads: false,
             };
             nested.complete(&mut responder).unwrap().unwrap();
             assert_eq!(responder.buffer.len(), completed_bytes);

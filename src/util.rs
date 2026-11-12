@@ -8,6 +8,41 @@ pub(crate) fn stderr_line(message: &str) {
     crate::logging::warn("runtime_warning", message.trim_end());
 }
 
+/// Sorts in place without allocating (heap sort, not stable); the first
+/// comparison error stops it and is returned. Use this rather than
+/// `sort_unstable_by` whenever a comparison can fail, so a failure is
+/// reported instead of being folded into an ordering.
+pub(crate) fn try_sort_unstable_by<T, E>(
+    items: &mut [T],
+    mut compare: impl FnMut(&T, &T) -> Result<core::cmp::Ordering, E>,
+) -> Result<(), E> {
+    let mut sift = |items: &mut [T], mut root: usize, end: usize| -> Result<(), E> {
+        loop {
+            let mut child = 2 * root + 1;
+            if child >= end {
+                return Ok(());
+            }
+            if child + 1 < end && compare(&items[child], &items[child + 1])?.is_lt() {
+                child += 1;
+            }
+            if !compare(&items[root], &items[child])?.is_lt() {
+                return Ok(());
+            }
+            items.swap(root, child);
+            root = child;
+        }
+    };
+    let len = items.len();
+    for root in (0..len / 2).rev() {
+        sift(items, root, len)?;
+    }
+    for end in (1..len).rev() {
+        items.swap(0, end);
+        sift(items, 0, end)?;
+    }
+    Ok(())
+}
+
 /// A fixed-capacity string on the stack; `fmt::Write` that truncates
 /// (marked) instead of failing, for error messages and number formatting
 /// on paths that must not allocate.
@@ -114,8 +149,8 @@ impl<const N: usize> fmt::Write for StackStr<N> {
 /// Formats any Display value into a StackStr.
 #[macro_export]
 macro_rules! stack_format {
-    ($n:literal, $($arg:tt)*) => {{
-        let mut s = $crate::util::StackStr::<$n>::new();
+    ($n:expr, $($arg:tt)*) => {{
+        let mut s = $crate::util::StackStr::<{ $n }>::new();
         let _ = core::fmt::Write::write_fmt(&mut s, format_args!($($arg)*));
         s
     }};

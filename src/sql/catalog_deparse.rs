@@ -1445,7 +1445,7 @@ pub(crate) fn view_definition<'a>(
             join.on.is_none()
                 || join.using.is_some()
                 || join.natural
-                || join.kind == crate::sql::ast::JoinKind::Cross
+                || join.kind.is_cross()
                 || plain_table(&join.table).is_none()
         })
         || !select.with.is_empty()
@@ -1456,11 +1456,11 @@ pub(crate) fn view_definition<'a>(
         || select.with_ties
         || plain_table(&from.base).is_none()
         || (!from.joins.is_empty()
-            && matches!(select.items, [crate::sql::ast::SelectItem::Wildcard]))
+            && matches!(select.items, [crate::sql::ast::SelectItem::Wildcard(_)]))
     {
         return Ok(None);
     }
-    let wildcard = matches!(select.items, [crate::sql::ast::SelectItem::Wildcard]);
+    let wildcard = matches!(select.items, [crate::sql::ast::SelectItem::Wildcard(_)]);
     if !wildcard && select.items.len() != column_names.len() {
         return Ok(None);
     }

@@ -250,7 +250,7 @@ mod tests {
     use crate::storage::RowState;
     use crate::storage::tests::{make_def, test_budget, test_config};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     #[test]
     fn row_lock_owners_release_prefix_before_wait_and_mutate_once() {
@@ -312,7 +312,7 @@ mod tests {
                 });
                 start.wait();
                 crate::mem::guard::forbid_alloc(|| {
-                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let deadline = crate::test_wait::deadline();
                     while !waiting.load(Ordering::Acquire) && Instant::now() < deadline {
                         std::thread::yield_now();
                     }
@@ -497,6 +497,7 @@ mod tests {
                             checkpoint_change_lsn: 7,
                             history: super::super::CommittedHistory::empty(),
                             pending: super::super::PendingVersions::empty(),
+                            committed_moved_out: false,
                         },
                     )
                     .unwrap();

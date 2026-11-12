@@ -8,6 +8,7 @@ fn layout_locals<'a>(
     // Capacity uses names only; native execution supplies resolved types.
     arena
         .alloc_slice_with(program.locals.len(), |index| TriggerLocalDecl {
+            label: None,
             name: program.locals[index].name,
             ..empty_plpgsql_local()
         })
@@ -210,17 +211,23 @@ fn every_procedural_branch_reserves_exact_numeric_scope_capacity() {
             "DECLARE n integer; BEGIN FOREACH n IN ARRAY ARRAY[1] LOOP FOR j IN 1..2 LOOP NULL; END LOOP; END LOOP; END",
             &[2],
         ),
+        // A counter is a new slot even when it shadows a variable.
         (
             "DECLARE i integer; BEGIN FOR i IN 1..2 LOOP FOR i IN 1..2 LOOP NULL; END LOOP; END LOOP; END",
-            &[1, 1],
+            &[2, 3],
         ),
         (
             "DECLARE i integer; BEGIN FOR i IN 1..2 LOOP FOR j IN 1..2 LOOP NULL; END LOOP; END LOOP; END",
-            &[1, 2],
+            &[2, 3],
         ),
         (
             "DECLARE i integer; BEGIN FOR j IN 1..2 LOOP FOR i IN 1..2 LOOP NULL; END LOOP; END LOOP; END",
-            &[2, 2],
+            &[2, 3],
+        ),
+        // A nested block's declarations take one level for all of them.
+        (
+            "BEGIN DECLARE a int; b int; BEGIN FOR i IN 1..2 LOOP NULL; END LOOP; END; DECLARE c int; BEGIN NULL; END; END",
+            &[2, 3],
         ),
     ] {
         parse.reset();
@@ -270,9 +277,17 @@ fn reservation_failure_names_statement_memory_without_heap_growth() {
     )
     .unwrap();
     crate::mem::guard::forbid_alloc(|| {
-        let empty =
-            NumericLoopFrames::new(&arena, TriggerBlock { statements: &[] }, &[], &pool, &pool)
-                .unwrap();
+        let empty = NumericLoopFrames::new(
+            &arena,
+            TriggerBlock {
+                statements: &[],
+                sources: &[],
+            },
+            &[],
+            &pool,
+            &pool,
+        )
+        .unwrap();
         assert_eq!(empty.active, 0);
         assert_eq!(arena.used(), 0);
         drop(empty);

@@ -6,7 +6,7 @@ use crate::sql::types::ColType;
 use crate::util::StackStr;
 
 mod expression_copy;
-pub(crate) use expression_copy::duplicate_expression;
+pub(crate) use expression_copy::{duplicate_expression, rewrite_expression, rewrite_expressions};
 
 /// A normalized PostgreSQL configuration parameter identity.  Configuration
 /// parameters are not SQL objects: they may be dotted and their spelling is
@@ -176,6 +176,9 @@ pub enum AlterViewAction<'a> {
     SetSchema(&'a str),
     SetOptions(&'a [ViewOption]),
     ResetOptions(&'a [ViewOptionName]),
+    /// `ALTER TABLE` subcommands; execution rejects those PostgreSQL does
+    /// not perform on a view.
+    TableActions(&'a [AlterAction<'a>]),
 }
 
 /// `ALTER MATERIALIZED VIEW` deliberately exposes only operations whose
@@ -1397,6 +1400,27 @@ pub enum Stmt<'a> {
         roles: &'a [&'a str],
         cascade: bool,
     },
+}
+
+impl Stmt<'_> {
+    /// Whether PostgreSQL runs parse analysis on this statement as a query
+    /// or query-bearing command, positioning relation and column errors.
+    pub(crate) fn is_analyzed_query(&self) -> bool {
+        matches!(
+            self,
+            Stmt::Select(_)
+                | Stmt::SetQuery(_)
+                | Stmt::With { .. }
+                | Stmt::Insert(_)
+                | Stmt::Update(_)
+                | Stmt::Delete(_)
+                | Stmt::Merge(_)
+                | Stmt::Explain { .. }
+                | Stmt::CreateView { .. }
+                | Stmt::CreateTableAs { .. }
+                | Stmt::DeclareCursor { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3175,6 +3199,10 @@ pub struct Select<'a> {
     /// `DISTINCT ON (exprs)`: keep the first row per distinct value of these
     /// expressions (in ORDER BY order). Empty = plain DISTINCT or none.
     pub distinct_on: &'a [&'a Expr<'a>],
+    /// The `WINDOW` clause's definitions in written order. PostgreSQL numbers
+    /// their sort keys before those of inline `OVER (...)` specifications,
+    /// which decides the order its window evaluation leaves rows in.
+    pub windows: &'a [&'a WindowSpec<'a>],
     pub from: Option<FromClause<'a>>,
     pub where_clause: Option<&'a Expr<'a>>,
     pub group_by: &'a [&'a Expr<'a>],
@@ -3201,6 +3229,29 @@ pub struct Select<'a> {
     /// `FOR UPDATE`/`FOR SHARE`/… row-locking clauses, in written order. Empty
     /// when the query carries none.
     pub locking: &'a [LockClause<'a>],
+}
+
+impl Select<'_> {
+    /// A query level with no items or clauses, for building one field by field.
+    pub const EMPTY: Self = Self {
+        items: &[],
+        distinct: false,
+        distinct_on: &[],
+        windows: &[],
+        from: None,
+        where_clause: None,
+        group_by: &[],
+        grouping_set_quantifier: GroupingSetQuantifier::All,
+        grouping_sets: &[],
+        having: None,
+        order_by: &[],
+        limit: None,
+        offset: None,
+        with_ties: false,
+        with: &[],
+        set_body: None,
+        locking: &[],
+    };
 }
 
 /// A variable-width bitmap over a query's flat `GROUP BY` expression list.
@@ -3327,6 +3378,10 @@ pub enum CteCycleMark<'a> {
     },
 }
 
+/// The derived-table alias of the query `INSERT INTO t (a[1]) SELECT ...`
+/// assigns subscripted targets from; it cannot be written in SQL.
+pub const INSERT_SUBSCRIPT_SOURCE: &str = "*INSERT source*";
+
 /// One `WITH name [(col, ...)] AS (SELECT ...)` common table expression.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Cte<'a> {
@@ -3382,6 +3437,33 @@ pub(crate) enum MaterializedCteSource<'a> {
     External(Option<crate::sql::external::ExternalRun>),
     RecursiveInline(&'a core::sync::atomic::AtomicUsize),
     RecursiveExternal(&'a core::sync::atomic::AtomicUsize),
+    /// A data-modifying `WITH` query that runs when its rows are first read.
+    Write(WriteQuerySource<'a>),
+    /// An ordinary `WITH` query evaluated once, when a scan first reads it,
+    /// as PostgreSQL's CTE scan runs it: a query that is never read never
+    /// runs, and its calls happen after the main query's earlier ones.
+    Deferred(DeferredCteQuery<'a>),
+}
+
+/// The query of a [`MaterializedCteSource::Deferred`] source and its rows
+/// once read. The rows live in the statement arena's persistent tail, which
+/// per-row rewinds cannot reclaim.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeferredCteQuery<'a> {
+    pub tree: &'a SetTree<'a>,
+    /// Zero until read, then the address of the persistent
+    /// [`MaterializedCteInlineSource`] naming the rows.
+    pub rows: &'a core::sync::atomic::AtomicUsize,
+}
+
+/// A data-modifying `WITH` query bound into one statement attempt. The
+/// statement that owns `with` and its parameters outlives every attempt and
+/// every pending run of the query, so the run can borrow them again.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WriteQuerySource<'a> {
+    pub with: &'a [Cte<'a>],
+    pub index: usize,
+    pub params: (usize, usize),
 }
 
 #[derive(Clone, Copy)]
@@ -3401,6 +3483,49 @@ impl PartialEq for MaterializedCteSource<'_> {
             (Self::RecursiveExternal(left), Self::RecursiveExternal(right)) => {
                 core::ptr::eq(left, right)
             }
+            (Self::Write(left), Self::Write(right)) => {
+                core::ptr::eq(left.with, right.with) && left.index == right.index
+            }
+            (Self::Deferred(left), Self::Deferred(right)) => core::ptr::eq(left.rows, right.rows),
+            _ => false,
+        }
+    }
+}
+
+impl Expr<'_> {
+    /// A `ROW(...)` or `(a, b, ...)` constructor. PostgreSQL compares two of
+    /// these field by field with SQL-standard NULL semantics, while every
+    /// other composite comparison uses the record operators.
+    pub(crate) fn is_row_constructor(&self) -> bool {
+        matches!(
+            self,
+            Expr::Call {
+                kind: CallKind::SqlSyntax,
+                name,
+                ..
+            } if name.eq_ignore_ascii_case("row")
+        )
+    }
+
+    /// Whether PostgreSQL's planner folds this expression to a constant, as
+    /// it does a literal, a parameter of a custom plan, and operators and
+    /// casts over them.
+    pub(crate) fn folds_to_constant(&self) -> bool {
+        match self {
+            Expr::Null
+            | Expr::Bool(_)
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::NumericLit(_)
+            | Expr::Str(_)
+            | Expr::Param(_)
+            | Expr::BoundLiteral { .. } => true,
+            Expr::Unary { operand, .. }
+            | Expr::Cast { operand, .. }
+            | Expr::Collate { operand, .. } => operand.folds_to_constant(),
+            Expr::Binary { left, right, .. } => {
+                left.folds_to_constant() && right.folds_to_constant()
+            }
             _ => false,
         }
     }
@@ -3410,19 +3535,30 @@ impl<'a> MaterializedCte<'a> {
     pub(crate) fn rows(&self) -> &'a [&'a [u8]] {
         match self.source {
             MaterializedCteSource::Inline(rows) => rows,
-            MaterializedCteSource::RecursiveInline(source) => {
-                let source = source.load(core::sync::atomic::Ordering::Relaxed);
-                if source == 0 {
-                    return &[];
-                }
-                // The selector names one immutable arena-owned descriptor, so
-                // an update cannot expose a pointer/length from different rows.
-                let source = unsafe { &*(source as *const MaterializedCteInlineSource) };
-                unsafe {
-                    core::slice::from_raw_parts(source.address as *const &'a [u8], source.length)
-                }
+            MaterializedCteSource::RecursiveInline(source) => inline_rows(source),
+            // Only a read runs the query; see `read_rows`.
+            MaterializedCteSource::Write(_)
+            | MaterializedCteSource::Deferred(_)
+            | MaterializedCteSource::External(_)
+            | MaterializedCteSource::RecursiveExternal(_) => &[],
+        }
+    }
+
+    /// The rows a scan reads. A data-modifying `WITH` query runs here, when its
+    /// rows are first read, as PostgreSQL's CTE scan runs it.
+    pub(crate) fn read_rows(
+        &self,
+        arena: &'a crate::mem::arena::Arena,
+        query: Option<crate::sql::query::DeferredCteRead<'_, 'a>>,
+    ) -> Result<&'a [&'a [u8]], crate::sql::SqlError> {
+        match self.source {
+            MaterializedCteSource::Write(source) => {
+                crate::sql::query::read_write_query(&source, arena)
             }
-            MaterializedCteSource::External(_) | MaterializedCteSource::RecursiveExternal(_) => &[],
+            MaterializedCteSource::Deferred(deferred) => {
+                crate::sql::query::read_deferred_cte(deferred, arena, query)
+            }
+            _ => Ok(self.rows()),
         }
     }
 
@@ -3438,9 +3574,23 @@ impl<'a> MaterializedCte<'a> {
                     Some(unsafe { *(address as *const crate::sql::external::ExternalRun) })
                 }
             }
-            MaterializedCteSource::Inline(_) | MaterializedCteSource::RecursiveInline(_) => None,
+            MaterializedCteSource::Inline(_)
+            | MaterializedCteSource::RecursiveInline(_)
+            | MaterializedCteSource::Write(_)
+            | MaterializedCteSource::Deferred(_) => None,
         }
     }
+}
+
+fn inline_rows<'a>(source: &core::sync::atomic::AtomicUsize) -> &'a [&'a [u8]] {
+    let source = source.load(core::sync::atomic::Ordering::Relaxed);
+    if source == 0 {
+        return &[];
+    }
+    // The selector names one immutable arena-owned descriptor, so an update
+    // cannot expose a pointer/length from different rows.
+    let source = unsafe { &*(source as *const MaterializedCteInlineSource) };
+    unsafe { core::slice::from_raw_parts(source.address as *const &'a [u8], source.length) }
 }
 
 /// A base table plus a chain of joins (nested-loop order).
@@ -3545,6 +3695,24 @@ pub struct TableRef<'a> {
     /// Source view retained across expansion so projected column privileges
     /// remain enforceable after its body becomes a derived table.
     pub view_access: Option<u16>,
+    /// A parenthesized join, `(a JOIN b ON ...)`, runs as the derived table
+    /// in `subquery`. Unaliased, its member tables (and `USING` aliases)
+    /// stay addressable by these names outside it: the subquery's output is
+    /// the join's own columns, then each member's columns (`m.*`), then one
+    /// `num_nulls(m)` per table member marking whether that member was
+    /// null-extended. An alias hides the members, which then only name
+    /// what an error reports as out of reach, and the output is the join's
+    /// own columns.
+    pub join_members: Option<&'a [JoinMember<'a>]>,
+}
+
+/// A name a parenthesized join exposes to its enclosing FROM clause.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JoinMember<'a> {
+    pub name: &'a str,
+    /// A `USING (...) AS alias` name qualifies merged columns only; it has
+    /// no row presence of its own.
+    pub using_alias: bool,
 }
 
 impl TableRef<'_> {
@@ -3584,12 +3752,29 @@ pub enum JoinKind {
     Right,
     Full,
     Cross,
+    /// A comma in the FROM list: a cross join that also starts a new FROM
+    /// item, so later USING, NATURAL and ON clauses cannot see the tables
+    /// before it.
+    Comma,
+}
+
+impl JoinKind {
+    /// Whether the join pairs every left row with every right row.
+    pub const fn is_cross(self) -> bool {
+        matches!(self, Self::Cross | Self::Comma)
+    }
+
+    /// Whether the join keeps unmatched rows of its right side, so a
+    /// `LATERAL` right side cannot read its left side.
+    pub const fn is_right_or_full(self) -> bool {
+        matches!(self, Self::Right | Self::Full)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SelectItem<'a> {
-    /// `*`
-    Wildcard,
+    /// `*`, with the position of the star where the statement was parsed.
+    Wildcard(SourcePosition),
     /// `t.*`: every column of the named FROM item (its own copies, even for
     /// USING/NATURAL-merged columns).
     TableWildcard(&'a str),
@@ -3715,10 +3900,19 @@ impl RelationStorageOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelationStorageOptionNames {
     pub fillfactor: bool,
+    /// View options; resetting one a relation lacks changes nothing.
+    pub security_invoker: bool,
+    pub security_barrier: bool,
+    pub check_option: bool,
 }
 
 impl RelationStorageOptionNames {
-    pub const EMPTY: Self = Self { fillfactor: false };
+    pub const EMPTY: Self = Self {
+        fillfactor: false,
+        security_invoker: false,
+        security_barrier: false,
+        check_option: false,
+    };
 }
 
 /// Parsed access-method spelling; only an executable variant can reach a
@@ -4030,22 +4224,27 @@ impl ColumnStatisticsOptionNames {
     };
 }
 
-/// A table-level constraint, or a column-level CHECK/REFERENCES desugared to
-/// name its single column.
+/// A table-level constraint, or a column-level constraint desugared to name
+/// its single column. `source_position` is where the constraint was written
+/// (its `CONSTRAINT name` prefix when named), which PostgreSQL's errors about
+/// the constraint point at.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TableConstraint<'a> {
     PrimaryKey {
+        source_position: SourcePosition,
         name: Option<&'a str>,
         columns: &'a [&'a str],
         timing: ConstraintTiming,
     },
     Unique {
+        source_position: SourcePosition,
         name: Option<&'a str>,
         columns: &'a [&'a str],
         timing: ConstraintTiming,
         nulls_not_distinct: bool,
     },
     Check {
+        source_position: SourcePosition,
         name: Option<&'a str>,
         expression: &'a Expr<'a>,
         /// Source text of the predicate, stored durably and re-parsed at
@@ -4056,6 +4255,7 @@ pub enum TableConstraint<'a> {
         no_inherit: bool,
     },
     ForeignKey {
+        source_position: SourcePosition,
         name: Option<&'a str>,
         columns: &'a [&'a str],
         parent: QualName<'a>,
@@ -4067,6 +4267,7 @@ pub enum TableConstraint<'a> {
         validation: ConstraintValidation,
     },
     Exclusion {
+        source_position: SourcePosition,
         name: Option<&'a str>,
         columns: &'a [&'a str],
         operators: &'a [ExclusionOperator],
@@ -4074,6 +4275,28 @@ pub enum TableConstraint<'a> {
         predicate_text: Option<&'a str>,
         timing: ConstraintTiming,
     },
+}
+
+impl TableConstraint<'_> {
+    pub const fn source_position(&self) -> SourcePosition {
+        match self {
+            Self::PrimaryKey {
+                source_position, ..
+            }
+            | Self::Unique {
+                source_position, ..
+            }
+            | Self::Check {
+                source_position, ..
+            }
+            | Self::ForeignKey {
+                source_position, ..
+            }
+            | Self::Exclusion {
+                source_position, ..
+            } => *source_position,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4814,8 +5037,12 @@ pub struct CopyOptions<'a> {
     /// CSV input: columns whose empty unquoted field is the empty string, not
     /// NULL, even when it matches the NULL string.
     pub force_not_null: &'a [&'a str],
+    /// CSV input: `FORCE_NOT_NULL *`, every column.
+    pub force_not_null_all: bool,
     /// CSV input: columns whose quoted value matching the NULL string is NULL.
     pub force_null: &'a [&'a str],
+    /// CSV input: `FORCE_NULL *`, every column.
+    pub force_null_all: bool,
 }
 
 impl CopyOptions<'_> {
@@ -4834,7 +5061,9 @@ impl CopyOptions<'_> {
         force_quote_all: false,
         force_quote: &[],
         force_not_null: &[],
+        force_not_null_all: false,
         force_null: &[],
+        force_null_all: false,
     };
 
     /// The effective field delimiter (text/CSV; unused for binary).
@@ -4916,6 +5145,9 @@ impl<'a> Returning<'a> {
 pub struct Insert<'a> {
     pub source_position: SourcePosition,
     pub table: QualName<'a>,
+    /// `INSERT INTO t AS alias`: the target's only name in ON CONFLICT and
+    /// RETURNING once given.
+    pub alias: Option<&'a str>,
     /// Empty means "all columns in table order".
     pub columns: &'a [&'a str],
     /// `VALUES` rows. Empty when the source is a `SELECT` (`select` is set).
@@ -4927,6 +5159,11 @@ pub struct Insert<'a> {
     pub returning: Returning<'a>,
     /// `OVERRIDING { SYSTEM | USER } VALUE` for identity columns.
     pub overriding: Overriding,
+    /// A rewrite rule's multi-row `VALUES` action run over its source rows:
+    /// when non-empty, the `select` source's last output column is the
+    /// zero-based `VALUES` row, and entry `n` holds the target positions row
+    /// `n` writes as `DEFAULT`.
+    pub values_defaults: &'a [crate::storage::ColumnSet],
 }
 
 /// `OVERRIDING` mode for `INSERT` into a table with identity columns.
@@ -5294,6 +5531,12 @@ pub enum AlterAction<'a> {
     SetRowLevelSecurity(RowLevelSecurityAlteration),
     SetPersistence(RelationPersistence),
     SetStorageOptions(RelationStorageOptions),
+    /// `SET (...)` naming view options, with any table storage parameters
+    /// written beside them; each relation kind rejects the ones it lacks.
+    SetViewOptions {
+        options: &'a [ViewOption],
+        storage: RelationStorageOptions,
+    },
     ResetStorageOptions(RelationStorageOptionNames),
     SetInheritance {
         parent: QualName<'a>,
@@ -5648,7 +5891,30 @@ pub enum ParameterSource {
     /// reference is field `f` (the node's `name`) of parameter `index`, as
     /// PostgreSQL's `sql_fn_post_column_ref` resolves it.
     SqlRoutineField,
-    PlpgsqlCursor,
+    /// A PL/pgSQL variable captured by a cursor query, with the body's
+    /// `plpgsql.variable_conflict` rule for a column of the same name.
+    PlpgsqlCursor(crate::sql::guc::VariableConflict),
+}
+
+/// What a parameter reference means when a column has the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParameterCollision {
+    Column,
+    Parameter,
+    Ambiguous,
+}
+
+impl ParameterSource {
+    pub(crate) const fn collision(self) -> ParameterCollision {
+        use crate::sql::guc::VariableConflict;
+        match self {
+            Self::SqlRoutine
+            | Self::SqlRoutineField
+            | Self::PlpgsqlCursor(VariableConflict::UseColumn) => ParameterCollision::Column,
+            Self::PlpgsqlCursor(VariableConflict::UseVariable) => ParameterCollision::Parameter,
+            Self::PlpgsqlCursor(VariableConflict::Error) => ParameterCollision::Ambiguous,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5703,6 +5969,14 @@ pub enum Expr<'a> {
         source: ParameterSource,
     },
     Param(u32),
+    /// An aggregate call inside a subquery whose arguments read only columns
+    /// of the query `levels_up` levels out, which therefore computes it per
+    /// group (PostgreSQL's `agglevelsup`). Here it reads that query's value
+    /// for the current group; `call` is the node the owning query folds.
+    OuterAggregate {
+        call: &'a Expr<'a>,
+        levels_up: u32,
+    },
     Unary {
         source_position: SourcePosition,
         operator: UnaryOp,
@@ -6149,6 +6423,7 @@ impl<'a> Expr<'a> {
             | Expr::RecursiveState { .. }
             | Expr::RoutineParam { .. }
             | Expr::Param(_)
+            | Expr::OuterAggregate { .. }
             | Expr::Subquery(_)
             | Expr::RowSubquery { .. }
             | Expr::InSubquery { .. }
@@ -6243,7 +6518,7 @@ impl<'a> Expr<'a> {
     /// evaluated per inserted row rather than folded once.
     pub fn contains_call(&self) -> bool {
         match self {
-            Expr::Call { .. } => true,
+            Expr::Call { .. } | Expr::OuterAggregate { .. } => true,
             Expr::Null
             | Expr::Bool(_)
             | Expr::Int(_)
@@ -6348,6 +6623,7 @@ impl<'a> Expr<'a> {
             | Expr::SchemaColumn { .. }
             | Expr::RecursiveState { .. }
             | Expr::Param(_)
+            | Expr::OuterAggregate { .. }
             | Expr::DefaultMarker => false,
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
@@ -6469,6 +6745,7 @@ impl<'a> Expr<'a> {
                 }
                 args.iter().find_map(|a| a.find_function(matches))
             }
+            Expr::OuterAggregate { call, .. } => call.find_function(matches),
             Expr::Null
             | Expr::Bool(_)
             | Expr::Int(_)
@@ -6568,6 +6845,7 @@ impl<'a> Expr<'a> {
             | Expr::SchemaColumn { .. }
             | Expr::RecursiveState { .. }
             | Expr::Param(_)
+            | Expr::OuterAggregate { .. }
             | Expr::DefaultMarker
             | Expr::Subquery(_)
             | Expr::RowSubquery { .. }
@@ -6668,6 +6946,7 @@ impl<'a> Expr<'a> {
             | Expr::SchemaColumn { .. }
             | Expr::RecursiveState { .. }
             | Expr::Param(_)
+            | Expr::OuterAggregate { .. }
             | Expr::RoutineParam { .. }
             | Expr::DefaultMarker
             | Expr::Subquery(_)

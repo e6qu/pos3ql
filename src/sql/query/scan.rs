@@ -372,6 +372,73 @@ impl<'a> ColumnLookup<'a> for NoColumns {
     }
 }
 
+/// The latest version of a locked source row, in the source's column order.
+/// `None` when the row is gone, which a held lock rules out except for the
+/// locking transaction's own deletion.
+pub(super) fn latest_locked_source<'a>(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'a>,
+    table: usize,
+    slot: usize,
+    rowid: u64,
+    arena: &'a Arena,
+) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
+    let Some(state) = storage.row_state(slot, rowid)? else {
+        return Ok(None);
+    };
+    let Some(home) = storage.uniqueness_row_home(slot, rowid, state, txid)? else {
+        return Ok(None);
+    };
+    let bytes = storage.row_bytes(slot, rowid, home, arena)?;
+    let definitions = storage.table_definition_images();
+    let physical = definitions.definition(storage, slot, txid)?;
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    physical.schema(&mut schema);
+    let mut physical_values = [Datum::Null; MAX_COLUMNS];
+    rowenc::decode(bytes, &schema[..physical.n_columns], &mut physical_values)?;
+    let logical = scope
+        .defs
+        .stored(table)
+        .expect("locked source is a stored relation");
+    let values = arena
+        .alloc_slice_with(logical.n_columns, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    crate::storage::RelationColumnMap::new(logical, physical, arena)?
+        .project(&physical_values[..physical.n_columns], values);
+    refresh_catalog_object_names(storage, txid, values, arena)?;
+    Ok(Some(values))
+}
+
+/// The SELECT row-security policy a stored source's scan applies.
+pub(super) fn source_select_security<'a>(
+    storage: &Storage,
+    scope: &QueryScope<'a>,
+    table: usize,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<RowSecurityPlan<'a>>, SqlError> {
+    if scope.derived[table].is_some() {
+        return Ok(None);
+    }
+    let current_role = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        )
+    })?;
+    let role = scope.authorization_roles[table].map_or(current_role, usize::from);
+    plan_row_security(
+        storage,
+        scope.slots[table],
+        role,
+        PolicyCommandKind::Select,
+        RowSecurityExpression::Using,
+        txid,
+        arena,
+    )
+}
+
 fn refresh_catalog_object_names<'a>(
     storage: &Storage,
     txid: u32,
@@ -807,6 +874,7 @@ pub(super) enum PaxFullRowReason {
     UnprovableExpression,
     RowSecurityPolicy,
     WideColumn,
+    RetainedJoinRow,
 }
 
 /// The only two legal physical read modes for a source scan.
@@ -1019,7 +1087,7 @@ fn pax_column_demand_bounded(
             }
             // A wildcard belongs to the nested select's own output. It cannot
             // name an enclosing physical column.
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => true,
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => true,
         }) && select
             .distinct_on
             .iter()
@@ -1057,8 +1125,7 @@ fn pax_column_demand_bounded(
                 Err(error)
                     if error.sqlstate == sqlstate::UNDEFINED_COLUMN
                         && qualifier.is_none()
-                        && (scope.table_index(name).is_ok()
-                            || scope.using_alias(name).is_some()) =>
+                        && (scope.source(name).is_ok() || scope.using_alias(name).is_some()) =>
                 {
                     // A bare local relation name reads its complete row, just
                     // like WholeRow; it is not an unresolved outer column.
@@ -2534,10 +2601,12 @@ pub(crate) fn parameterized_index_access_plan<'a>(
             .is_some_and(|(tables, _)| tables & target_bit == 0 && tables & !bound_tables == 0)
     };
     if (outer_available
-        || from
-            .joins
-            .iter()
-            .all(|join| matches!(join.kind, JoinKind::Inner | JoinKind::Cross)))
+        || from.joins.iter().all(|join| {
+            matches!(
+                join.kind,
+                JoinKind::Inner | JoinKind::Cross | JoinKind::Comma
+            )
+        }))
         && let Some(predicate) = where_clause
     {
         collect_index_constraints(
@@ -3942,7 +4011,6 @@ fn indexed_candidates_for_plan<'a>(
             candidates[live] = candidate;
             live += 1;
         }
-        let mut comparison_error = None;
         if let Some((knn, origin)) = knn_origin {
             for candidate in &mut candidates[..live] {
                 let key = &encoded[candidate.key_at..candidate.key_at + candidate.key_len];
@@ -3983,26 +4051,16 @@ fn indexed_candidates_for_plan<'a>(
                 }
             });
         } else {
-            candidates[..live].sort_unstable_by(|left, right| {
-                if comparison_error.is_some() {
-                    return core::cmp::Ordering::Equal;
-                }
+            crate::util::try_sort_unstable_by(&mut candidates[..live], |left, right| {
                 let left_key = &encoded[left.key_at..left.key_at + left.key_len];
                 let right_key = &encoded[right.key_at..right.key_at + right.key_len];
-                match compare_ordered_index_keys(
-                    storage, txid, &plan, &ordered, left_key, right_key,
-                ) {
-                    Ok(core::cmp::Ordering::Equal) => left.rowid.cmp(&right.rowid),
-                    Ok(ordering) => ordering,
-                    Err(error) => {
-                        comparison_error = Some(error);
-                        core::cmp::Ordering::Equal
-                    }
-                }
-            });
-        }
-        if let Some(error) = comparison_error {
-            return Err(error);
+                Ok(
+                    compare_ordered_index_keys(
+                        storage, txid, &plan, &ordered, left_key, right_key,
+                    )?
+                    .then_with(|| left.rowid.cmp(&right.rowid)),
+                )
+            })?;
         }
         for (output, candidate) in rowids.iter_mut().zip(candidates[..live].iter()) {
             *output = candidate.rowid;
@@ -4131,9 +4189,30 @@ pub struct JoinRow<'s, 'v, 'd> {
     /// Stable MVCC identities for physical base-table contributors. Derived
     /// rows, function rows, and outer-join null sides carry `None`.
     pub rowids: &'s [Option<u64>],
+    /// Names resolve over the first `visible` FROM items. A `LATERAL` item's
+    /// body sees only the items to its left, not its own or later columns.
+    pub(crate) visible: usize,
 }
 
 impl<'s, 'v> JoinRow<'s, 'v, '_> {
+    /// The row as the body of the `LATERAL` item at FROM position `table`
+    /// reads it: only the items to its left.
+    pub(crate) fn left_of(self, table: usize) -> Self {
+        Self {
+            visible: table,
+            ..self
+        }
+    }
+
+    /// The column a name resolves to among the visible items.
+    fn visible_column(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ResolvedColumn, SqlError> {
+        self.scope.find_column_among(self.visible, qualifier, name)
+    }
+
     /// None means the source has not joined yet. A present zero-column row
     /// remains distinct from an outer join's absent source.
     pub(crate) fn table_present(&self, table: usize) -> Option<bool> {
@@ -4182,15 +4261,48 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
             }
             JoinRowValues::Flat { values, offsets } => {
                 let start = *offsets.get(table)?;
-                let width = self.scope.defs.get(table).expect("resolved").n_columns;
+                let width = self.scope.stored_width(table);
                 Some(&values[start..start + width])
             }
         }
     }
 }
 
+impl<'v> JoinRow<'_, 'v, '_> {
+    /// The value of one join-tree output column: a merged USING column is its
+    /// first non-null contributor.
+    pub(crate) fn output_value(&self, entry: ResolvedColumn) -> Datum<'v> {
+        let one = |(table, column): (usize, usize)| {
+            self.table_values(table)
+                .and_then(|values| values.get(column))
+                .copied()
+                .unwrap_or(Datum::Null)
+        };
+        match entry {
+            ResolvedColumn::Table(table, column) => one((table, column)),
+            ResolvedColumn::Merged(merged) => self.scope.merged[merged]
+                .parts
+                .iter()
+                .map(|&part| one(part))
+                .find(|value| !value.is_null())
+                .unwrap_or(Datum::Null),
+        }
+    }
+}
+
 impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        if self.visible < self.scope.n {
+            return match self.visible_column(qualifier, name) {
+                Ok(ResolvedColumn::Table(table, column)) => self
+                    .scope
+                    .defs
+                    .get(table)
+                    .and_then(|definition| definition.columns.get(column))
+                    .map_or(-1, |column| column.type_mod),
+                _ => -1,
+            };
+        }
         super::ScopeSchema(self.scope).column_type_mod(qualifier, name)
     }
     fn whole_row_field_metadata(
@@ -4206,11 +4318,16 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<crate::sql::types::ColType, SqlError> {
+        if self.visible < self.scope.n {
+            return self
+                .visible_column(qualifier, name)
+                .map(|entry| self.scope.output_type(entry));
+        }
         super::ScopeSchema(self.scope).resolve_column_type(qualifier, name)
     }
 
     fn is_empty_scope(&self) -> bool {
-        self.scope.n == 0
+        self.visible == 0
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
@@ -4224,7 +4341,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
                 name
             )),
         };
-        match self.scope.find_column(qualifier, name)? {
+        match self.visible_column(qualifier, name)? {
             ResolvedColumn::Table(t, c) => one(t, c),
             // Merged USING/NATURAL column: the first non-null contributor.
             ResolvedColumn::Merged(m) => {
@@ -4241,7 +4358,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     }
 
     fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'v>, SqlError> {
-        let table = self.scope.table_index(qualifier)?;
+        let table = self.scope.source(qualifier)?.table;
         let visible = self.scope.defs.get(table).expect("resolved").n_columns;
         self.table_values(table)
             .and_then(|values| values.get(visible + index))
@@ -4256,12 +4373,12 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
-        let entry = self.scope.find_column(qualifier, name).ok()?;
+        let entry = self.visible_column(qualifier, name).ok()?;
         Some(self.scope.output_type(entry))
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
-        match self.scope.find_column(qualifier, name).ok() {
+        match self.visible_column(qualifier, name).ok() {
             Some(ResolvedColumn::Table(table, column)) => self
                 .scope
                 .defs
@@ -4289,7 +4406,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        match self.scope.find_column(qualifier, name).ok()? {
+        match self.visible_column(qualifier, name).ok()? {
             ResolvedColumn::Table(t, c) => self
                 .scope
                 .defs
@@ -4312,14 +4429,25 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         if self.scope.using_alias(table).is_some() {
             return Ok(true);
         }
-        let t = self.scope.table_index(table)?;
-        match self.table_present(t) {
-            Some(present) => Ok(present),
-            None => Err(sql_err!(
-                sqlstate::INVALID_COLUMN_REFERENCE,
-                "whole-row reference to \"{}\" before its table is joined",
-                table
-            )),
+        let source = self.scope.source(table)?;
+        let present = match self.table_present(source.table) {
+            Some(present) => present,
+            None => {
+                return Err(sql_err!(
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                    "whole-row reference to \"{}\" before its table is joined",
+                    table
+                ));
+            }
+        };
+        match source.presence.filter(|_| present) {
+            Some(column) => super::scope::member_present(
+                self.table_values(source.table)
+                    .and_then(|values| values.get(column))
+                    .copied()
+                    .unwrap_or(Datum::Null),
+            ),
+            None => Ok(present),
         }
     }
 
@@ -4346,32 +4474,31 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
                 .map(|fields| Some(&*fields))
                 .map_err(|_| arena_full());
         }
-        let t = self.scope.table_index(table)?;
-        let def = self.scope.defs.get(t).expect("resolved");
+        let source = self.scope.source(table)?;
         if !self.whole_row_present(table)? {
             return Ok(None);
         }
         let vals = self
-            .table_values(t)
+            .table_values(source.table)
             .expect("present source has bound values");
         // Copy field names into the arena so the record does not borrow the
         // catalog (its lifetime is unrelated to the row's `'v`).
-        let cols = def.columns();
+        let cols = self.scope.source_columns(source);
         let mut fields = [crate::sql::types::RecordField {
             name: "",
             type_oid: 0,
             value: Datum::Null,
         }; MAX_COLUMNS];
-        for (i, field) in fields.iter_mut().enumerate().take(def.n_columns) {
+        for (i, field) in fields.iter_mut().enumerate().take(source.n_columns) {
             let name = arena
                 .alloc_str(cols[i].name.as_str())
                 .map_err(|_| arena_full())?;
             field.name = name;
             field.type_oid = cols[i].ctype.oid();
-            field.value = vals.get(i).copied().unwrap_or(Datum::Null);
+            field.value = vals.get(source.first + i).copied().unwrap_or(Datum::Null);
         }
         let out = arena
-            .alloc_slice_copy(&fields[..def.n_columns])
+            .alloc_slice_copy(&fields[..source.n_columns])
             .map_err(|_| arena_full())?;
         Ok(Some(&*out))
     }
@@ -4384,16 +4511,13 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         if let Some(fields) = self.whole_row_fields(table, arena)? {
             return Ok(fields);
         }
-        let table = self.scope.table_index(table)?;
-        let definition = self.scope.defs.get(table).expect("resolved");
-        let columns = definition.columns();
+        let source = self.scope.source(table)?;
+        let columns = self.scope.source_columns(source);
         let fields = arena
-            .alloc_slice_with(definition.n_columns, |index| {
-                crate::sql::types::RecordField {
-                    name: "",
-                    type_oid: columns[index].ctype.oid(),
-                    value: Datum::Null,
-                }
+            .alloc_slice_with(source.n_columns, |index| crate::sql::types::RecordField {
+                name: "",
+                type_oid: columns[index].ctype.oid(),
+                value: Datum::Null,
             })
             .map_err(|_| arena_full())?;
         for (field, column) in fields.iter_mut().zip(columns) {
@@ -4412,9 +4536,59 @@ pub(crate) struct Chained<'r, 'a> {
     pub(crate) inner: &'r dyn ColumnLookup<'a>,
     pub(crate) outer: Option<&'r dyn ColumnLookup<'a>>,
 }
+impl Chained<'_, '_> {
+    /// Whether the inner row's column named `qualifier.name` answers a
+    /// reference, rather than an enclosing PL/pgSQL variable of that name.
+    fn inner_column_wins(&self, qualifier: Option<&str>, name: &str) -> bool {
+        crate::sql::eval::column_precedes_variable_quietly(self.outer, qualifier, name)
+    }
+}
+
 impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
+    fn outer_aggregate(&self, call: *const Expr<'_>) -> Option<Datum<'a>> {
+        self.inner
+            .outer_aggregate(call)
+            .or_else(|| self.outer?.outer_aggregate(call))
+    }
+
+    fn check_unassigned_row_field(
+        &self,
+        qualifier: &str,
+        name: &str,
+        catalog: Option<&dyn super::super::eval::CatalogAccess>,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        // The scope that answered the lookup checks its row variable.
+        match self.inner.lookup(Some(qualifier), name) {
+            Ok(_)
+                if crate::sql::eval::column_precedes_variable(
+                    self.outer,
+                    Some(qualifier),
+                    name,
+                )? =>
+            {
+                self.inner
+                    .check_unassigned_row_field(qualifier, name, catalog, arena)
+            }
+            _ => self.outer.map_or(Ok(()), |outer| {
+                outer.check_unassigned_row_field(qualifier, name, catalog, arena)
+            }),
+        }
+    }
+
+    fn procedural_variable(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::sql::guc::VariableConflict> {
+        self.inner
+            .procedural_variable(qualifier, name)
+            .or_else(|| self.outer?.procedural_variable(qualifier, name))
+    }
+
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
-        if self.inner.col_type(qualifier, name).is_some() {
+        if self.inner.col_type(qualifier, name).is_some() && self.inner_column_wins(qualifier, name)
+        {
             self.inner.column_type_mod(qualifier, name)
         } else {
             self.outer
@@ -4454,6 +4628,15 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
                         outer.resolve_column_type(qualifier, name)
                     }
                     _ => Err(error),
+                }
+            }
+            Ok(ctype) => {
+                if crate::sql::eval::column_precedes_variable(self.outer, qualifier, name)? {
+                    Ok(ctype)
+                } else {
+                    self.outer
+                        .expect("a variable answers only through an enclosing scope")
+                        .resolve_column_type(qualifier, name)
                 }
             }
             result => result,
@@ -4514,7 +4697,15 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
 
     fn lookup(&self, q: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         match self.inner.lookup(q, name) {
-            Ok(v) => Ok(v),
+            Ok(v) => {
+                if crate::sql::eval::column_precedes_variable(self.outer, q, name)? {
+                    Ok(v)
+                } else {
+                    self.outer
+                        .expect("a variable answers only through an enclosing scope")
+                        .lookup(q, name)
+                }
+            }
             Err(e)
                 if !matches!(
                     e.sqlstate.as_str(),
@@ -4541,7 +4732,8 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
         match self.inner.resolve_column_type(q, name) {
-            Ok(_) => self.inner.column_user_type(q, name),
+            Ok(_) if self.inner_column_wins(q, name) => self.inner.column_user_type(q, name),
+            Ok(_) => self.outer.and_then(|outer| outer.column_user_type(q, name)),
             Err(error)
                 if matches!(
                     error.sqlstate.as_str(),
@@ -4567,7 +4759,8 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
 
     fn column_type_oid(&self, q: Option<&str>, name: &str) -> Option<i32> {
         match self.inner.resolve_column_type(q, name) {
-            Ok(_) => self.inner.column_type_oid(q, name),
+            Ok(_) if self.inner_column_wins(q, name) => self.inner.column_type_oid(q, name),
+            Ok(_) => self.outer.and_then(|outer| outer.column_type_oid(q, name)),
             Err(error)
                 if matches!(
                     error.sqlstate.as_str(),
@@ -4583,7 +4776,12 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
 
     fn collation(&self, q: Option<&str>, name: &str) -> crate::sql::ast::Collation {
         match self.inner.resolve_column_type(q, name) {
-            Ok(_) => self.inner.collation(q, name),
+            Ok(_) if self.inner_column_wins(q, name) => self.inner.collation(q, name),
+            Ok(_) => self
+                .outer
+                .map_or(crate::sql::ast::Collation::None, |outer| {
+                    outer.collation(q, name)
+                }),
             Err(error)
                 if matches!(
                     error.sqlstate.as_str(),
@@ -4625,6 +4823,17 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
         self.inner
             .whole_row_type(table)
             .or_else(|| self.outer.and_then(|outer| outer.whole_row_type(table)))
+    }
+
+    /// Grouping keys match by this identity (`a` and `t.a` are one key). Only
+    /// this query level's columns have one; an enclosing row's columns and a
+    /// winning PL/pgSQL variable are never this level's grouping keys.
+    fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
+        if self.inner_column_wins(qualifier, name) {
+            self.inner.column_identity(qualifier, name)
+        } else {
+            None
+        }
     }
 }
 
@@ -4963,11 +5172,51 @@ fn materialize_lateral_source<'a, C: ColumnLookup<'a>>(
     Ok(LateralRows::External(run))
 }
 
+/// The first row a `LATERAL` source yields for `outer`, decoded, as a locked
+/// row's recheck runs the source again with the row's latest version.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn first_lateral_row<'a, C: ColumnLookup<'a>>(
+    storage: &'a Storage,
+    txid: u32,
+    tref: &'a crate::sql::ast::TableRef<'a>,
+    width: usize,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    outer: &C,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
+    let first = match materialize_lateral_source(
+        storage, txid, tref, width, arena, params, outer, hooks,
+    )? {
+        LateralRows::Local(rows) => rows.first().copied(),
+        LateralRows::External(None) => None,
+        LateralRows::External(Some(run)) => {
+            let mut first = None;
+            consume_external_lateral_run(storage, run, arena, false, None, &mut |_, bytes| {
+                first = Some(bytes);
+                Ok(false)
+            })?;
+            first
+        }
+    };
+    let Some(bytes) = first else {
+        return Ok(None);
+    };
+    let values = arena
+        .alloc_slice_with(width, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    for (column, value) in values.iter_mut().enumerate() {
+        *value = crate::sql::exec::decode_projected_col_record(bytes, column, arena)?;
+    }
+    Ok(Some(values))
+}
+
 fn consume_external_lateral_run<'a>(
     storage: &'a Storage,
     run: crate::sql::external::ExternalRun,
     arena: &'a Arena,
     recycle_rows: bool,
+    retain_match: Option<&core::cell::Cell<bool>>,
     visit: &mut impl FnMut(usize, &'a [u8]) -> Result<bool, SqlError>,
 ) -> Result<bool, SqlError> {
     let mut reader = storage.external_run_reader()?;
@@ -4981,9 +5230,12 @@ fn consume_external_lateral_run<'a>(
         let owned = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
         let keep_scanning = visit(index, owned)?;
         index += 1;
-        if let Some(mark) = mark {
+        if let Some(mark) = mark
+            && !retain_match.is_some_and(core::cell::Cell::get)
+        {
             // SAFETY: the candidate and every evaluator result derived from it
-            // were consumed synchronously by `visit`.
+            // were consumed synchronously by `visit`. A retained match (a
+            // joined DML source row) keeps its copy for the statement.
             unsafe { arena.rewind_to(mark) };
         }
         if !keep_scanning {
@@ -5350,13 +5602,33 @@ fn join_key_types_compatible(a: ColType, b: ColType) -> bool {
 /// generate candidates — the full ON and WHERE still run at the leaf, so a
 /// missed extraction never changes a result, only the access path.
 #[allow(clippy::type_complexity)]
+/// The scope column a join key names, written `column`, `table.column` or
+/// `schema.table.column`; `None` for any other expression.
+fn key_column(scope: &QueryScope<'_>, expression: &Expr<'_>) -> Option<ResolvedColumn> {
+    match *expression {
+        Expr::Column { qualifier, name } => scope.find_column(qualifier, name).ok(),
+        Expr::SchemaColumn {
+            schema,
+            table,
+            name,
+        } => {
+            let qualifier = crate::stack_format!(130, "{}.{}", schema, table);
+            scope.find_column(Some(qualifier.as_str()), name).ok()
+        }
+        _ => None,
+    }
+}
+
+/// Up to eight (probe column, build column) join key pairs and their count.
+type JoinKeyPairs = ([(usize, usize); 8], usize);
+
 fn hash_join_keys<'a>(
     scope: &QueryScope<'a>,
     on: Option<&'a Expr<'a>>,
     where_clause: Option<&'a Expr<'a>>,
     probe_t: usize,
     build_t: usize,
-) -> Result<Option<([(usize, usize); 8], usize)>, SqlError> {
+) -> Result<Option<JoinKeyPairs>, SqlError> {
     let mut conjuncts: [&Expr; MAX_CONJUNCTS] = [&Expr::Null; MAX_CONJUNCTS];
     let mut nc = 0usize;
     for source in [on, where_clause].into_iter().flatten() {
@@ -5386,22 +5658,8 @@ fn hash_join_keys<'a>(
         else {
             continue;
         };
-        let Expr::Column {
-            qualifier: lq,
-            name: ln,
-        } = **left
-        else {
-            continue;
-        };
-        let Expr::Column {
-            qualifier: rq,
-            name: rn,
-        } = **right
-        else {
-            continue;
-        };
-        let (Ok(ResolvedColumn::Table(lt, lc)), Ok(ResolvedColumn::Table(rt, rc))) =
-            (scope.find_column(lq, ln), scope.find_column(rq, rn))
+        let (Some(ResolvedColumn::Table(lt, lc)), Some(ResolvedColumn::Table(rt, rc))) =
+            (key_column(scope, left), key_column(scope, right))
         else {
             continue;
         };
@@ -5496,7 +5754,7 @@ pub(crate) fn derived_key_plan<'a>(
         let join = &from.joins[depth - 1];
         if !matches!(
             join.kind,
-            JoinKind::Inner | JoinKind::Cross | JoinKind::Left
+            JoinKind::Inner | JoinKind::Cross | JoinKind::Comma | JoinKind::Left
         ) {
             return None;
         }
@@ -5544,7 +5802,7 @@ pub(crate) fn derived_key_plan<'a>(
                 // Only a name this scope cannot see is an outer reference;
                 // an ambiguous or misspelled one stays an error of the scan.
                 let unseen = match qualifier {
-                    Some(qualifier) => scope.table_index(qualifier).is_err(),
+                    Some(qualifier) => !scope.has_entry_named(qualifier),
                     None => error.sqlstate == sqlstate::UNDEFINED_COLUMN,
                 };
                 let outer = outer.filter(|_| unseen)?;
@@ -5685,6 +5943,29 @@ pub(crate) struct HashJoinPlan<'a> {
     build_capacity: usize,
 }
 
+/// A hash plan's sources and keys, as a retained reader rebuilds it.
+pub(crate) struct HashKeyLayout<'p> {
+    pub(crate) probe_table: usize,
+    pub(crate) build_table: usize,
+    /// Equi-key column pairs (probe, build).
+    pub(crate) keys: &'p [(usize, usize)],
+    pub(crate) collations: &'p [Collation],
+    /// The planned build row count.
+    pub(crate) capacity: usize,
+}
+
+impl HashJoinPlan<'_> {
+    pub(crate) fn key_layout(&self) -> HashKeyLayout<'_> {
+        HashKeyLayout {
+            probe_table: self.probe_table,
+            build_table: self.build_table,
+            keys: &self.keys[..self.key_count],
+            collations: &self.key_collations[..self.key_count],
+            capacity: self.build_capacity,
+        }
+    }
+}
+
 /// Selects the hash implementation only when its fixed build table and
 /// equi-key representation can execute this join exactly. Every other shape
 /// selects the ordinary nested-loop implementation before execution.
@@ -5720,7 +6001,7 @@ pub(crate) fn select_hash_join_plan<'a>(
     let join = &from.joins[0];
     if !matches!(
         join.kind,
-        JoinKind::Inner | JoinKind::Cross | JoinKind::Left
+        JoinKind::Inner | JoinKind::Cross | JoinKind::Comma | JoinKind::Left
     ) {
         return Ok(None);
     }
@@ -5733,8 +6014,10 @@ pub(crate) fn select_hash_join_plan<'a>(
     // source is derived. Otherwise probe the first source in its own row order.
     let (probe_table, build_table) = if scope.derived[first_table].is_some()
         && scope.derived[second_table].is_none()
-        && matches!(join.kind, JoinKind::Inner | JoinKind::Cross)
-    {
+        && matches!(
+            join.kind,
+            JoinKind::Inner | JoinKind::Cross | JoinKind::Comma
+        ) {
         (second_table, first_table)
     } else {
         (first_table, second_table)
@@ -5950,6 +6233,111 @@ pub(super) fn admit_sources(
     Ok(current_role)
 }
 
+/// Evaluates once, before any row, each `WHERE` conjunct that reads an
+/// uncorrelated subquery and no column of this query, as PostgreSQL's
+/// one-time filter does: one that is false or null leaves the scan empty
+/// without reading a row, and its error surfaces even over an empty source.
+/// The scan still applies the whole condition per row.
+pub(super) fn one_time_filter_passes<'a>(
+    where_clause: Option<&'a Expr<'a>>,
+    scope: &QueryScope<'_>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<bool, SqlError> {
+    let Some(predicate) = where_clause else {
+        return Ok(true);
+    };
+    let mut conjuncts = [&Expr::Null; MAX_ONE_TIME_CONJUNCTS];
+    let mut count = 0;
+    if !super::plan::flatten_and(predicate, &mut conjuncts, &mut count) {
+        // Longer conditions keep per-row evaluation only.
+        count = 0;
+    }
+    let row = Chained {
+        inner: &NoColumns,
+        outer,
+    };
+    for conjunct in &conjuncts[..count] {
+        // Only a conjunct reading an uncorrelated subquery can behave
+        // differently once than per row: that subquery runs when first read.
+        if !conjunct.contains_subquery()
+            || conjunct.contains_volatile_function().is_some()
+            || !reads_no_query_column(conjunct, scope, hooks)
+        {
+            continue;
+        }
+        // A value that is not boolean is left to the per-row evaluation,
+        // which reports it.
+        if matches!(
+            eval_full(conjunct, arena, params, &row, hooks)?,
+            Datum::Bool(false) | Datum::Null
+        ) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+const MAX_ONE_TIME_CONJUNCTS: usize = 64;
+
+/// Whether an expression reads no column of `scope`, and every subquery in it
+/// is one the query prepared without a row (an uncorrelated one).
+fn reads_no_query_column(
+    expression: &Expr<'_>,
+    scope: &QueryScope<'_>,
+    hooks: &EvalHooks<'_, '_>,
+) -> bool {
+    let prepared = |node: &Expr<'_>| {
+        let address = (node as *const Expr<'_>).cast::<()>();
+        hooks.subs.is_some_and(|subs| {
+            subs.scalars
+                .iter()
+                .any(|(candidate, _, _)| core::ptr::eq(candidate.cast::<()>(), address))
+                || subs
+                    .lists
+                    .iter()
+                    .any(|list| core::ptr::eq(list.node.cast::<()>(), address))
+                || subs
+                    .deferred
+                    .iter()
+                    .any(|deferred| core::ptr::eq(deferred.node, address))
+        })
+    };
+    match expression {
+        // A name this query binds as a column or a whole row, or one it would
+        // reject, is the query's.
+        Expr::Column { qualifier, name } => {
+            matches!(
+                scope.find_column(*qualifier, name),
+                Err(error) if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                )
+            ) && scope.source(qualifier.unwrap_or(name)).is_err()
+        }
+        Expr::WholeRow(name) => scope.source(name).is_err(),
+        Expr::SchemaColumn { .. } | Expr::RecursiveState { .. } | Expr::OuterAggregate { .. } => {
+            false
+        }
+        Expr::Subquery(_) | Expr::Exists(_) | Expr::ArraySubquery(_) | Expr::RowSubquery { .. } => {
+            prepared(expression)
+        }
+        Expr::InSubquery { operand, .. } | Expr::QuantifiedSubquery { operand, .. } => {
+            prepared(expression) && reads_no_query_column(operand, scope, hooks)
+        }
+        _ => {
+            let mut free = true;
+            let _ = super::subquery::walk_children(expression, &mut |child| {
+                free &= reads_no_query_column(child, scope, hooks);
+                Ok(())
+            });
+            free
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_source_mode<'a>(
     storage: &'a Storage,
@@ -5970,6 +6358,9 @@ fn scan_source_mode<'a>(
 ) -> Result<(), SqlError> {
     let current_role = admit_sources(storage, scope, txid, pax_demand)?;
     validate_materialized_view_reads(storage, scope, where_clause, arena, txid)?;
+    if !one_time_filter_passes(where_clause, scope, arena, params, hooks, outer)? {
+        return Ok(());
+    }
     let sample_plans = arena
         .alloc_slice_with(scope.n, |_| None::<TableSamplePlan>)
         .map_err(|_| arena_full())?;
@@ -6269,6 +6660,7 @@ fn scan_source_mode<'a>(
                 buffer_offsets: buffers.offsets,
             },
             rowids: &bound_rowids[..scope.n],
+            visible: scope.n,
         })
     }
 
@@ -6296,9 +6688,10 @@ fn scan_source_mode<'a>(
         Ok(())
     }
 
-    /// Executes a previously selected two-table hash plan. Its fixed capacity
-    /// is a plan invariant: stale statistics that exceed it raise 54000 rather
-    /// than changing the execution strategy after query execution begins.
+    /// Executes a previously selected two-table hash plan. Its capacity is
+    /// the planner's estimate; a build side larger than that estimate (rows
+    /// spilled to object storage are estimated, not counted) grows the table
+    /// in the statement arena instead of changing the execution strategy.
     #[allow(clippy::too_many_arguments)]
     fn execute_hash_join_plan<'a>(
         storage: &'a Storage,
@@ -6329,14 +6722,14 @@ fn scan_source_mode<'a>(
         let build_external_run = scope.external_runs[build_t];
         let build_count = plan.build_capacity;
         let completed = (|| -> Result<bool, SqlError> {
-            let buckets_len = (build_count * 2).next_power_of_two().max(16);
-            let entries = arena
+            let mut buckets_len = (build_count * 2).next_power_of_two().max(16);
+            let mut entries = arena
                 .alloc_slice_with(build_count, |_| EMPTY_HASH_ENTRY)
                 .map_err(|_| arena_full())?;
-            let next = arena
+            let mut next = arena
                 .alloc_slice_with(build_count, |_| 0u32)
                 .map_err(|_| arena_full())?;
-            let buckets = arena
+            let mut buckets = arena
                 .alloc_slice_with(buckets_len, |_| u32::MAX)
                 .map_err(|_| arena_full())?;
             let mut build_schema = [ColType::Bool; MAX_COLUMNS];
@@ -6350,6 +6743,33 @@ fn scan_source_mode<'a>(
             let hash_cols: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
             let mut key_vals = [Datum::Null; 8];
             let mut n = 0usize;
+            // Doubles the entries and rehashes them into twice as many
+            // buckets. Chains keep their order: later rows first.
+            macro_rules! grow_build {
+                () => {{
+                    if n == entries.len() {
+                        let grown = entries.len().checked_mul(2).ok_or_else(arena_full)?;
+                        let old_entries = &*entries;
+                        entries = arena
+                            .alloc_slice_with(grown, |index| {
+                                old_entries.get(index).copied().unwrap_or(EMPTY_HASH_ENTRY)
+                            })
+                            .map_err(|_| arena_full())?;
+                        next = arena
+                            .alloc_slice_with(grown, |_| 0u32)
+                            .map_err(|_| arena_full())?;
+                        buckets_len = (grown * 2).next_power_of_two().max(16);
+                        buckets = arena
+                            .alloc_slice_with(buckets_len, |_| u32::MAX)
+                            .map_err(|_| arena_full())?;
+                        for index in 0..n {
+                            let bucket = (entries[index].hash as usize) & (buckets_len - 1);
+                            next[index] = buckets[bucket];
+                            buckets[bucket] = index as u32;
+                        }
+                    }
+                }};
+            }
             macro_rules! insert_build {
                 ($rowid:expr, $row:expr, $values:expr) => {{
                     let values = $values;
@@ -6362,9 +6782,7 @@ fn scan_source_mode<'a>(
                         }
                     }
                     if !any_null {
-                        if n == entries.len() {
-                            return Err(arena_full());
-                        }
+                        grow_build!();
                         let hash = hash_key_collated_catalog(
                             storage,
                             txid,
@@ -6428,15 +6846,25 @@ fn scan_source_mode<'a>(
                 scan.for_each_spilled_row_batch(arena, false, Some(demand), &mut |rows| {
                     for spilled in rows {
                         storage.record_relation_tuple_read(txid, build_slot, None)?;
-                        let crate::storage::SpilledRowRepresentation::Values(values) =
-                            spilled.representation
-                        else {
-                            return Err(sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "PAX scan did not return selected values"
-                            ));
-                        };
-                        insert_build!(Some(spilled.rowid), BoundRow::Values(values), values);
+                        // Rows not yet in column blocks arrive encoded.
+                        match spilled.representation {
+                            crate::storage::SpilledRowRepresentation::Values(values) => {
+                                insert_build!(
+                                    Some(spilled.rowid),
+                                    BoundRow::Values(values),
+                                    values
+                                );
+                            }
+                            crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
+                                let mut decoded = [Datum::Null; MAX_COLUMNS];
+                                rowenc::decode(bytes, build_schema, &mut decoded)?;
+                                insert_build!(
+                                    Some(spilled.rowid),
+                                    BoundRow::Encoded(bytes),
+                                    &decoded[..build_schema.len()]
+                                );
+                            }
+                        }
                     }
                     Ok(ControlFlow::Continue(()))
                 })?;
@@ -6468,9 +6896,7 @@ fn scan_source_mode<'a>(
                     if any_null {
                         return Ok(ControlFlow::Continue(()));
                     }
-                    if n == entries.len() {
-                        return Err(arena_full());
-                    }
+                    grow_build!();
                     let hash = hash_key_collated_catalog(
                         storage,
                         txid,
@@ -6522,13 +6948,16 @@ fn scan_source_mode<'a>(
                     for spilled in rows {
                         check_timeout()?;
                         storage.record_relation_tuple_read(txid, probe_slot, None)?;
-                        let crate::storage::SpilledRowRepresentation::Values(values) =
-                            spilled.representation
-                        else {
-                            return Err(sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "PAX scan did not return selected values"
-                            ));
+                        // Rows not yet in column blocks arrive encoded.
+                        let values = match spilled.representation {
+                            crate::storage::SpilledRowRepresentation::Values(values) => values,
+                            crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
+                                let mut decoded = [Datum::Null; MAX_COLUMNS];
+                                rowenc::decode(bytes, probe_schema, &mut decoded)?;
+                                &*arena
+                                    .alloc_slice_copy(&decoded[..probe_schema.len()])
+                                    .map_err(|_| arena_full())?
+                            }
                         };
                         let mut any_null = false;
                         for i in 0..nkeys {
@@ -7242,7 +7671,8 @@ fn scan_source_mode<'a>(
                 depth,
                 decode_buffers,
                 arena,
-            )?;
+            )?
+            .left_of(t);
             let chained = Chained {
                 inner: &outer_row,
                 outer,
@@ -7251,7 +7681,7 @@ fn scan_source_mode<'a>(
                 storage,
                 txid,
                 tref,
-                scope.defs.get(t).expect("resolved").n_columns,
+                scope.stored_width(t),
                 arena,
                 params,
                 &chained,
@@ -7264,6 +7694,7 @@ fn scan_source_mode<'a>(
                             run,
                             arena,
                             recycle_rows,
+                            retain_match,
                             &mut |index, bytes| {
                                 visit_candidate!(index, BoundRow::Encoded(bytes), None)
                             },
@@ -7817,10 +8248,12 @@ fn scan_source_mode<'a>(
     // LEFT join's nullable side waits for the leaf, since a null-padded row
     // is produced only after that level's matches are known. RIGHT and FULL
     // joins null-pad their left side, so no conjunct is pushed past them.
-    let pushdown_allowed = from
-        .joins
-        .iter()
-        .all(|j| matches!(j.kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Left));
+    let pushdown_allowed = from.joins.iter().all(|j| {
+        matches!(
+            j.kind,
+            JoinKind::Inner | JoinKind::Cross | JoinKind::Comma | JoinKind::Left
+        )
+    });
     let nullable_tables = from
         .joins
         .iter()
@@ -7836,17 +8269,40 @@ fn scan_source_mode<'a>(
     // item depends on the tables to its left, so any lateral entry also pins the
     // order to FROM order (reordering could bind a dependency after it).
     let any_lateral = scope.lateral[..scope.n].iter().any(|&l| l);
-    // A LATERAL item references the tables to its left, so it cannot be the
-    // right side of a RIGHT/FULL join (PostgreSQL rejects this too).
-    for j in from.joins {
-        if j.table.lateral && matches!(j.kind, JoinKind::Right | JoinKind::Full) {
+    // Joins run as one left-deep chain. That equals PostgreSQL's tree for a
+    // RIGHT or FULL join only within the first comma-separated FROM item;
+    // the parser runs any later such item as a parenthesized join.
+    if let Some(after_comma) = from
+        .joins
+        .iter()
+        .position(|join| join.kind == JoinKind::Comma)
+        && from.joins[after_comma..]
+            .iter()
+            .any(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full))
+    {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "RIGHT or FULL join after a comma was not grouped"
+        ));
+    }
+    // The scope materializes the right side of a RIGHT or FULL join once:
+    // a LATERAL item there reads only FROM items outside the join.
+    for (index, j) in from.joins.iter().enumerate() {
+        if scope.lateral[index + 1] && matches!(j.kind, JoinKind::Right | JoinKind::Full) {
             return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "a LATERAL item cannot be on the right side of a RIGHT or FULL join"
+                sqlstate::INTERNAL_ERROR,
+                "the right side of a RIGHT or FULL join was not materialized"
             ));
         }
     }
-    let all_cross = from.joins.iter().all(|j| matches!(j.kind, JoinKind::Cross));
+    for (index, join) in from.joins.iter().enumerate() {
+        if join.kind == JoinKind::Full
+            && let Some(on) = join.on
+        {
+            super::plan::check_full_join_condition(on, scope, index + 1)?;
+        }
+    }
+    let all_cross = from.joins.iter().all(|j| j.kind.is_cross());
     let order = arena
         .alloc_slice_with(scope.n, |index| index)
         .map_err(|_| arena_full())?;

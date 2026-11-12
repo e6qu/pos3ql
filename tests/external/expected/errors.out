@@ -8,23 +8,40 @@ SELECT 1.0/0;
 psql:tests/external/sql/errors.sql:7: ERROR:  22012: division by zero
 SELECT * FROM missing_table;
 psql:tests/external/sql/errors.sql:8: ERROR:  42P01: relation "missing_table" does not exist
+LINE 1: SELECT * FROM missing_table;
+                      ^
 CREATE TABLE t_err (id int NOT NULL, v text);
 SELECT no_such_column FROM t_err;
 psql:tests/external/sql/errors.sql:10: ERROR:  42703: column "no_such_column" does not exist
+LINE 1: SELECT no_such_column FROM t_err;
+               ^
 INSERT INTO t_err VALUES (NULL, 'x');
 psql:tests/external/sql/errors.sql:11: ERROR:  23502: null value in column "id" of relation "t_err" violates not-null constraint
+DETAIL:  Failing row contains (null, x).
+SCHEMA NAME:  public
+TABLE NAME:  t_err
+COLUMN NAME:  id
 INSERT INTO t_err (no_col) VALUES (1);
 psql:tests/external/sql/errors.sql:12: ERROR:  42703: column "no_col" of relation "t_err" does not exist
+LINE 1: INSERT INTO t_err (no_col) VALUES (1);
+                           ^
 CREATE TABLE t_err (id int);
 psql:tests/external/sql/errors.sql:13: ERROR:  42P07: relation "t_err" already exists
 SELECT 'zap'::int;
 psql:tests/external/sql/errors.sql:14: ERROR:  22P02: invalid input syntax for type integer: "zap"
+LINE 1: SELECT 'zap'::int;
+               ^
 SELECT 1::nosuchtype;
 psql:tests/external/sql/errors.sql:15: ERROR:  42704: type "nosuchtype" does not exist
+LINE 1: SELECT 1::nosuchtype;
+                  ^
 SELECT 9223372036854775807 + 1;
 psql:tests/external/sql/errors.sql:16: ERROR:  22003: bigint out of range
 SELECT nosuchfunc(1);
 psql:tests/external/sql/errors.sql:17: ERROR:  42883: function nosuchfunc(integer) does not exist
+LINE 1: SELECT nosuchfunc(1);
+               ^
+HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
 SELECT 1 +;
 psql:tests/external/sql/errors.sql:18: ERROR:  42601: syntax error at or near ";"
 LINE 1: SELECT 1 +;
@@ -37,8 +54,29 @@ LINE 2:   'ü' FROM WHERE;
                    ^
 SELECT count(*), id FROM t_err;
 psql:tests/external/sql/errors.sql:22: ERROR:  42803: column "t_err.id" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: SELECT count(*), id FROM t_err;
+                         ^
 DROP TABLE missing_table;
 psql:tests/external/sql/errors.sql:23: ERROR:  42P01: table "missing_table" does not exist
+-- Unicode escapes, type modifiers checked after parsing, operator and cast
+-- errors with PostgreSQL's position and hint.
+SELECT U&'\D83D';
+psql:tests/external/sql/errors.sql:26: ERROR:  42601: invalid Unicode surrogate pair
+LINE 1: SELECT U&'\D83D';
+                       ^
+SELECT 1::numeric(2000);
+psql:tests/external/sql/errors.sql:27: ERROR:  22023: NUMERIC precision 2000 must be between 1 and 1000
+LINE 1: SELECT 1::numeric(2000);
+                  ^
+SELECT '{}'::jsonb ? 1;
+psql:tests/external/sql/errors.sql:28: ERROR:  42883: operator does not exist: jsonb ? integer
+LINE 1: SELECT '{}'::jsonb ? 1;
+                           ^
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+SELECT 1::int::timestamp;
+psql:tests/external/sql/errors.sql:29: ERROR:  42846: cannot cast type integer to timestamp without time zone
+LINE 1: SELECT 1::int::timestamp;
+                     ^
 -- psql sends each ;-separated statement as its own Query message and
 -- (with ON_ERROR_STOP off) continues after errors; the wire_probe covers
 -- true multi-statement strings in one message.
@@ -48,7 +86,7 @@ SELECT 'before'; SELECT 1/0; SELECT 'after';
  before
 (1 row)
 
-psql:tests/external/sql/errors.sql:27: ERROR:  22012: division by zero
+psql:tests/external/sql/errors.sql:33: ERROR:  22012: division by zero
  ?column? 
 ----------
  after

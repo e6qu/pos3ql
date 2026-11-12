@@ -41,6 +41,7 @@ struct SequenceEffect {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatementEffectKind {
     StatisticsVoid,
+    FunctionCall,
     Cursor,
     RoutineInput,
     PlanAllocation,
@@ -59,6 +60,7 @@ struct StatementEffectError {
     message: crate::util::StackStr<192>,
     detail: Option<ArenaSliceHandle<u8>>,
     hint: Option<ArenaSliceHandle<u8>>,
+    objects: super::eval::ErrorObjects,
 }
 
 #[derive(Clone, Copy)]
@@ -264,6 +266,42 @@ pub(super) fn enter_statement<'arena, 'session>(
 pub(crate) fn finish_statement(session: &SeqSession) {
     session.statement_replay.set(StatementSequenceReplay::EMPTY);
     session.set_sleep_until(None);
+    session.set_database_wait_since(None);
+}
+
+/// How long PostgreSQL's `CountOtherDBBackends` waits for other sessions to
+/// leave a database (50 checks, 100 ms apart) before reporting it in use.
+const DATABASE_SESSION_WAIT_MICROS: i64 = 5_000_000;
+const DATABASE_SESSION_POLL_MICROS: i64 = 100_000;
+
+/// Waits, as PostgreSQL does, for other sessions to leave a database that a
+/// statement must use exclusively. While `in_use` holds and the five-second
+/// window is open, it records a wake time and reports a wait, so the
+/// connection parks on a timer and the statement re-checks the count when it
+/// resumes. `Ok` means the database is free or the window has closed; the
+/// caller then reports the database as in use.
+pub(crate) fn wait_for_database_sessions(
+    session: &SeqSession,
+    in_use: bool,
+) -> Result<(), SqlError> {
+    session.set_sleep_until(None);
+    if !in_use {
+        session.set_database_wait_since(None);
+        return Ok(());
+    }
+    super::query::check_timeout()?;
+    let now = super::datetime::now_micros();
+    let started = session.database_wait_since().unwrap_or(now);
+    session.set_database_wait_since(Some(started));
+    if now.saturating_sub(started) >= DATABASE_SESSION_WAIT_MICROS {
+        session.set_database_wait_since(None);
+        return Ok(());
+    }
+    session.set_sleep_until(Some(now.saturating_add(DATABASE_SESSION_POLL_MICROS)));
+    Err(sql_err!(
+        sqlstate::INTERNAL_LOCK_WAIT,
+        "statement is waiting for other sessions to leave the database"
+    ))
 }
 
 /// `pg_sleep` and its variants. The first attempt records the wake time in the
@@ -378,7 +416,8 @@ fn statement_call(
         call.operation,
         SequenceOperation::Next | SequenceOperation::Set { .. }
     ) {
-        super::query::protect_statement_effects();
+        // The statement's replay log returns the same value after a wait.
+        super::query::protect_replayable_effect();
     }
     STATEMENT_ARENA.with(|active| {
         let pointer = active.get();
@@ -486,7 +525,7 @@ pub(crate) fn record_caught_cancellation(session: &SeqSession) {
     let mut replay = session.statement_replay.get();
     replay.nonreplayable = true;
     session.statement_replay.set(replay);
-    super::query::protect_statement_effects();
+    super::query::protect_unreplayable_effect();
 }
 
 fn effect_full() -> SqlError {
@@ -1094,6 +1133,9 @@ fn retain_effect_error(
             .retain_slice_with(value.len(), |at| value.as_bytes()[at])
             .map_err(|_| effect_full())
     };
+    let objects = diagnostic
+        .map(|diagnostic| diagnostic.objects)
+        .unwrap_or_default();
     let (detail, hint) = match diagnostic {
         Some(diagnostic) => (
             diagnostic
@@ -1113,10 +1155,11 @@ fn retain_effect_error(
             message: error.message,
             detail,
             hint,
+            objects,
         })
         .map_err(|_| effect_full())?;
     if let Some(diagnostic) = diagnostic {
-        super::eval::stash_diagnostic(diagnostic.detail, diagnostic.hint);
+        super::eval::stash_full_diagnostic(diagnostic);
     }
     Ok(saved)
 }
@@ -1148,8 +1191,12 @@ fn restore_effect_error(
     } else {
         None
     };
-    if detail.is_some() || hint.is_some() {
-        super::eval::stash_diagnostic(detail, hint);
+    if detail.is_some() || hint.is_some() || !saved.objects.is_empty() {
+        super::eval::stash_full_diagnostic(super::eval::Diagnostic {
+            detail,
+            hint,
+            objects: saved.objects,
+        });
     }
     Ok(SqlError {
         sqlstate: saved.state,
@@ -1620,6 +1667,10 @@ pub(crate) fn next_cached(
 }
 
 impl SequenceAccess for SeqEval<'_> {
+    fn has_effects(&self) -> bool {
+        !self.dry
+    }
+
     fn nextval(&self, name: SequenceReference<'_>) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
         self.require_any(slot, PrivilegeSet::USAGE, Some(PrivilegeSet::UPDATE))?;

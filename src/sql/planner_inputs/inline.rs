@@ -880,7 +880,7 @@ fn known_null(
     })
 }
 
-fn simple_expression<'a>(statements: &'a [Stmt<'a>]) -> Option<&'a Expr<'a>> {
+pub(super) fn simple_expression<'a>(statements: &'a [Stmt<'a>]) -> Option<&'a Expr<'a>> {
     let [Stmt::Select(select)] = statements else {
         return None;
     };
@@ -1274,6 +1274,7 @@ fn expression_properties(
         Expr::Column { .. }
         | Expr::SchemaColumn { .. }
         | Expr::WholeRow(_)
+        | Expr::OuterAggregate { .. }
         | Expr::RoutineParam { .. }
         | Expr::Param(_) => Properties {
             constant: false,

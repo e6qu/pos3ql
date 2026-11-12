@@ -339,8 +339,8 @@ impl ExternalSorter {
                 runs[count] = Some(run);
                 count += 1;
             }
-            for slot in 0..self.level_counts[level] {
-                runs[count] = self.levels[level][slot];
+            for run in &self.levels[level][..self.level_counts[level]] {
+                runs[count] = *run;
                 count += 1;
             }
             self.level_counts[level] = 0;
@@ -410,28 +410,14 @@ impl ExternalSorter {
         compare: &mut impl FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
     ) -> Result<(), SqlError> {
         let chunk = &self.chunk;
-        let mut comparison_error = None;
-        self.rows[..self.row_count].sort_unstable_by(|a, b| {
-            if comparison_error.is_some() {
-                return Ordering::Equal;
-            }
+        crate::util::try_sort_unstable_by(&mut self.rows[..self.row_count], |a, b| {
             let row = |entry: &BufferedRow| {
                 let start = entry.offset as usize + ORDINAL_BYTES;
                 let end = entry.offset as usize + entry.length as usize;
                 &chunk[start..end]
             };
-            match compare(row(a), row(b)) {
-                Ok(order) => order.then_with(|| a.ordinal.cmp(&b.ordinal)),
-                Err(error) => {
-                    comparison_error = Some(error);
-                    Ordering::Equal
-                }
-            }
-        });
-        if let Some(error) = comparison_error {
-            return Err(error);
-        }
-        Ok(())
+            Ok(compare(row(a), row(b))?.then_with(|| a.ordinal.cmp(&b.ordinal)))
+        })
     }
 
     fn add_run(

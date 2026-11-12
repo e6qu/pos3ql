@@ -425,7 +425,7 @@ mod tests {
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .set_read_timeout(Some(crate::test_wait::HANG))
                     .unwrap();
                 let mut head = Vec::new();
                 let mut part = [0u8; 4096];
@@ -439,7 +439,7 @@ mod tests {
                 assert!(head.contains("/writer-fence HTTP/1.1\r\n"));
                 assert!(head.contains("authorization: AWS4-HMAC-SHA256 "));
                 ready.send(()).unwrap();
-                held.recv_timeout(Duration::from_secs(5)).unwrap();
+                held.recv_timeout(crate::test_wait::HANG).unwrap();
                 let record = writer_fence_record("active", WriterToken(1));
                 let _ = write!(
                     stream,
@@ -453,7 +453,7 @@ mod tests {
             assert_eq!(budget.remaining(), 0);
             let ticket = probe.request(0).unwrap().unwrap();
             crate::mem::guard::forbid_alloc(|| {
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = crate::test_wait::deadline();
                 loop {
                     assert!(
                         Instant::now() < deadline,
@@ -485,7 +485,7 @@ mod tests {
             release.send(()).unwrap();
             if !timeout {
                 crate::mem::guard::forbid_alloc(|| {
-                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let deadline = crate::test_wait::deadline();
                     loop {
                         assert!(Instant::now() < deadline, "released probe did not complete");
                         probe.advance(Instant::now());

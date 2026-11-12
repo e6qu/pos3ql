@@ -121,12 +121,12 @@ fn assert_unrelated_lookup_progress(storage: &Storage, unrelated: usize, target:
             });
             send.send(result).unwrap();
         });
-        let progress = receive.recv_timeout(Duration::from_secs(5));
+        let progress = receive.recv_timeout(crate::test_wait::HANG);
         let before_release = progress.is_ok();
         drop(held);
         let result = match progress {
             Ok(result) => result,
-            Err(_) => receive.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Err(_) => receive.recv_timeout(crate::test_wait::HANG).unwrap(),
         };
         assert_eq!(result, (Some(target), Some(target), None, None));
         assert!(
@@ -171,7 +171,7 @@ fn table_name_lookup_selected_writer_revalidates_name_and_incarnation() {
             send.send(result).unwrap();
         });
         started_receive
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(crate::test_wait::HANG)
             .unwrap();
         let premature = receive.recv_timeout(Duration::from_millis(100));
         held.edit_committed(storage.reserve_table_definition_revision().unwrap())
@@ -183,7 +183,7 @@ fn table_name_lookup_selected_writer_revalidates_name_and_incarnation() {
         let selected = if let Some(result) = result {
             result
         } else {
-            receive.recv_timeout(Duration::from_secs(5)).unwrap()
+            receive.recv_timeout(crate::test_wait::HANG).unwrap()
         };
         assert!(
             waited,

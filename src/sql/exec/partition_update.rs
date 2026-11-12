@@ -15,8 +15,7 @@ pub(super) fn prepare_move<'arena>(
     generated: &[Option<&'arena Expr<'arena>>],
     values: &mut [Datum<'arena>],
     arena: &'arena Arena,
-    params: &[Datum<'arena>],
-    seq_session: &crate::sql::guc::SeqSession,
+    services: &mut TriggerServices<'_>,
     responder: &mut Responder,
 ) -> Result<bool, SqlError> {
     let (old_table, rowid, _) = selected.local_parts();
@@ -24,7 +23,7 @@ pub(super) fn prepare_move<'arena>(
         storage,
         txn,
         arena,
-        seq_session,
+        services,
         responder,
         old_table,
         old_definition,
@@ -40,12 +39,11 @@ pub(super) fn prepare_move<'arena>(
     if !dml_row_available(storage, txn, selected, "updated")? {
         return Ok(false);
     }
-    txn.write_row(
+    txn.move_row_out(
         storage,
         old_target,
         rowid,
         txn.command_id(),
-        None,
         crate::storage::RowWriteStatistics::Tracked,
     )?;
 
@@ -58,7 +56,7 @@ pub(super) fn prepare_move<'arena>(
         storage,
         txn,
         arena,
-        seq_session,
+        services,
         responder,
         target,
         definition,
@@ -83,16 +81,13 @@ pub(super) fn prepare_move<'arena>(
                 old_values,
                 None,
                 arena,
-                params,
-                seq_session,
-                MAX_FK_CASCADE_DEPTH,
             )?;
         }
         fire_partition_row_triggers(
             storage,
             txn,
             arena,
-            seq_session,
+            services,
             responder,
             old_table,
             old_definition,
@@ -121,14 +116,14 @@ pub(super) fn fire_after_move<'arena>(
     definition: &TableDef,
     values: &mut [Datum<'arena>],
     arena: &'arena Arena,
-    seq_session: &crate::sql::guc::SeqSession,
+    services: &mut TriggerServices<'_>,
     responder: &mut Responder,
 ) -> Result<(), SqlError> {
     fire_partition_row_triggers(
         storage,
         txn,
         arena,
-        seq_session,
+        services,
         responder,
         old_table,
         old_definition,
@@ -143,7 +138,7 @@ pub(super) fn fire_after_move<'arena>(
         storage,
         txn,
         arena,
-        seq_session,
+        services,
         responder,
         target,
         definition,

@@ -180,7 +180,7 @@ impl LockManager {
                 .map_err(|_| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "row-lock registry is full ({} locks)",
+                        "row-lock registry is full ({} locks, sized by txn_rows)",
                         self.locks.capacity()
                     )
                 })?;

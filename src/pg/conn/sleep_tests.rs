@@ -19,10 +19,12 @@ struct Fixture {
     config: Config,
 }
 
-fn fixture() -> Fixture {
+/// Each test owns its data directory: tests run concurrently in one process,
+/// and the first to finish removes its directory.
+fn fixture(name: &str) -> Fixture {
     let mut config = Config::default_dev();
     config.data_dir = std::env::temp_dir()
-        .join(format!("pos3ql-sleep-statements-{}", std::process::id()))
+        .join(format!("pos3ql-sleep-{name}-{}", std::process::id()))
         .to_string_lossy()
         .into_owned();
     config.remove_test_data_dir_on_drop();
@@ -41,12 +43,11 @@ fn connection(fixture: &mut Fixture, id: i32) -> (Conn, TcpStream) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let server = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (client, _) = listener.accept().unwrap();
-    server.set_nonblocking(true).unwrap();
     client.set_nonblocking(true).unwrap();
     let mut conn = Conn::new(&fixture.config, &mut fixture.budget).unwrap();
-    conn.open(server, id);
+    conn.open(server, id).unwrap();
     conn.auth_database = fixture.engine.database_login("postgres");
-    conn.phase = Phase::Ready;
+    conn.enter_ready_for_tests(&fixture.engine);
     (conn, client)
 }
 
@@ -80,24 +81,49 @@ fn retry(conn: &mut Conn, engine: &mut Engine) -> bool {
     }
 }
 
-/// Every complete backend message the client has received so far.
+/// The backend messages of one complete response, through its
+/// ReadyForQuery. Waits for the client socket rather than for a fixed time:
+/// a loaded host may deliver the response at any point before the hang bound.
 fn received(conn: &mut Conn, client: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
     assert_eq!(conn.on_writable(), After::Continue);
-    std::thread::sleep(Duration::from_millis(20));
+    let deadline = crate::test_wait::deadline();
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
+        let messages = complete_messages(&bytes);
+        if messages.last().is_some_and(|(kind, _)| *kind == b'Z') {
+            return messages;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "no ReadyForQuery: {}",
+            describe(&messages)
+        );
+        let mut poll = libc::pollfd {
+            fd: client.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let wait = remaining.as_millis().min(i32::MAX as u128) as i32;
+        assert!(unsafe { libc::poll(&mut poll, 1, wait) } >= 0);
         match client.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) => panic!("server closed the connection: {}", describe(&messages)),
             Ok(n) => bytes.extend_from_slice(&chunk[..n]),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => panic!("client read: {error}"),
         }
     }
+}
+
+/// The complete backend messages at the front of `bytes`.
+fn complete_messages(mut rest: &[u8]) -> Vec<(u8, Vec<u8>)> {
     let mut messages = Vec::new();
-    let mut rest = &bytes[..];
     while rest.len() >= 5 {
         let total = 1 + u32::from_be_bytes(rest[1..5].try_into().unwrap()) as usize;
+        if total > rest.len() {
+            break;
+        }
         messages.push((rest[0], rest[5..total].to_vec()));
         rest = &rest[total..];
     }
@@ -129,6 +155,15 @@ fn rows(messages: &[(u8, Vec<u8>)]) -> Vec<String> {
         .collect()
 }
 
+/// Each message's kind and printable payload, for assertion failures.
+fn describe(messages: &[(u8, Vec<u8>)]) -> String {
+    messages
+        .iter()
+        .map(|(kind, payload)| format!("{}:{}", *kind as char, String::from_utf8_lossy(payload)))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 fn sqlstates(messages: &[(u8, Vec<u8>)]) -> Vec<String> {
     messages
         .iter()
@@ -143,7 +178,7 @@ fn sqlstates(messages: &[(u8, Vec<u8>)]) -> Vec<String> {
 
 #[test]
 fn sleeping_statement_parks_on_a_timer_while_other_sessions_run() {
-    let mut fixture = fixture();
+    let mut fixture = fixture("timer");
     let (mut sleeper, mut sleeper_client) = connection(&mut fixture, 1);
     let (mut other, mut other_client) = connection(&mut fixture, 2);
     send(
@@ -202,7 +237,7 @@ fn sleeping_statement_parks_on_a_timer_while_other_sessions_run() {
 
 #[test]
 fn statement_timeout_and_cancellation_end_a_sleep() {
-    let mut fixture = fixture();
+    let mut fixture = fixture("timeout");
     let (mut sleeper, mut sleeper_client) = connection(&mut fixture, 1);
     send(
         &mut sleeper,
@@ -225,10 +260,8 @@ fn statement_timeout_and_cancellation_end_a_sleep() {
         retry(&mut sleeper, &mut fixture.engine);
     }
     assert!(started.elapsed() < Duration::from_secs(10));
-    assert_eq!(
-        sqlstates(&received(&mut sleeper, &mut sleeper_client)),
-        ["57014"]
-    );
+    let response = received(&mut sleeper, &mut sleeper_client);
+    assert_eq!(sqlstates(&response), ["57014"], "{}", describe(&response));
     send(
         &mut sleeper,
         &mut fixture.engine,
@@ -240,10 +273,9 @@ fn statement_timeout_and_cancellation_end_a_sleep() {
         Some(crate::sql::StatementWait::Timer)
     );
     assert!(sleeper.cancel_parked(&mut fixture.engine));
-    assert_eq!(
-        sqlstates(&received(&mut sleeper, &mut sleeper_client)),
-        ["57014"]
-    );
+    // The rest of the Query is skipped: RESET's completion, then the error.
+    let response = received(&mut sleeper, &mut sleeper_client);
+    assert_eq!(sqlstates(&response), ["57014"], "{}", describe(&response));
     send(
         &mut sleeper,
         &mut fixture.engine,
@@ -251,4 +283,46 @@ fn statement_timeout_and_cancellation_end_a_sleep() {
         "SELECT 1",
     );
     assert_eq!(rows(&received(&mut sleeper, &mut sleeper_client)), ["1"]);
+}
+
+/// A parked statement resumes in its own database even after the worker
+/// served a session connected to another database meanwhile.
+#[test]
+fn parked_statement_resumes_in_its_own_database() {
+    let mut fixture = fixture("database");
+    let (mut admin, mut admin_client) = connection(&mut fixture, 1);
+    send(
+        &mut admin,
+        &mut fixture.engine,
+        &mut admin_client,
+        "CREATE DATABASE sleep_elsewhere",
+    );
+    assert!(sqlstates(&received(&mut admin, &mut admin_client)).is_empty());
+    let (mut sleeper, mut sleeper_client) = connection(&mut fixture, 2);
+    sleeper.auth_database = fixture.engine.database_login("sleep_elsewhere");
+    send(
+        &mut sleeper,
+        &mut fixture.engine,
+        &mut sleeper_client,
+        "SELECT pg_sleep(0.1), current_database()",
+    );
+    assert_eq!(
+        sleeper.parked_wait(),
+        Some(crate::sql::StatementWait::Timer)
+    );
+    send(
+        &mut admin,
+        &mut fixture.engine,
+        &mut admin_client,
+        "SELECT current_database()",
+    );
+    assert_eq!(rows(&received(&mut admin, &mut admin_client)), ["postgres"]);
+    while sleeper.parked_wait().is_some() {
+        std::thread::sleep(sleeper.parked_wait_remaining().unwrap());
+        retry(&mut sleeper, &mut fixture.engine);
+    }
+    assert_eq!(
+        rows(&received(&mut sleeper, &mut sleeper_client)),
+        ["|sleep_elsewhere"]
+    );
 }

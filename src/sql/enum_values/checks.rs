@@ -196,7 +196,7 @@ fn bind_expression<const N: usize>(
         .alloc_slice_with(count, |_| oid::TEXT)
         .map_err(|_| crate::sql::query::arena_full_pub())?;
     let statement = Stmt::Select(*select);
-    crate::sql::param_types::infer(storage, &statement, txid, arena, oids);
+    let _ = crate::sql::param_types::infer(storage, &statement, txid, arena, oids);
     let mut output = StackStr::<N>::new();
     let _ = output.write_str(HEADER);
     let mut bound = false;

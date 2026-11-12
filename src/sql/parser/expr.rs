@@ -15,6 +15,16 @@ use super::{ParseError, Parser, is_base_prefixed, is_reserved_keyword};
 use crate::sql::ast::{BinaryOp, CallKind, CastBinding, Expr, SourcePosition, UnaryOp};
 use crate::sql::types::ColType;
 
+/// The SQL/JSON function whose `RETURNING` clause is parsed.
+#[derive(Clone, Copy)]
+enum SqlJsonReturning {
+    /// `JSON_OBJECT`, `JSON_ARRAY` and their aggregates, whose `json`
+    /// result is cast to the returned type.
+    Constructor,
+    Query,
+    Serialize,
+}
+
 // Parsing bounds recursion; array dimensionality is checked when evaluated.
 const MAX_ARRAY_BRACKET_NESTING: usize = 64;
 
@@ -359,13 +369,15 @@ impl<'a> Parser<'a> {
                         return Err(ParseError {
                             at: self.peek_at,
                             message: crate::stack_format!(
-                                96,
+                                super::PARSE_MESSAGE_BYTES,
                                 "quantified operator {} is not supported",
                                 operator
                             ),
                             sqlstate: crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
                             cursor: None,
                             hint: None,
+                            near: None,
+                            detail: None,
                         });
                     };
                     let all = self.peeked == Tok::Ident("all");
@@ -390,6 +402,8 @@ impl<'a> Parser<'a> {
                         return Ok(left);
                     }
                 }
+                // A sublink is located at its keyword, NOT included.
+                let keyword_at = self.peek_at;
                 let negated = if self.peeked == Tok::Ident("not") {
                     self.advance()?;
                     // Infix NOT must introduce one of these forms.
@@ -416,11 +430,14 @@ impl<'a> Parser<'a> {
                             .arena
                             .alloc(select)
                             .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
-                        left = self.arena_expr(Expr::InSubquery {
-                            operand: left,
-                            select: boxed,
-                            negated,
-                        })?;
+                        left = self.arena_expr_at(
+                            Expr::InSubquery {
+                                operand: left,
+                                select: boxed,
+                                negated,
+                            },
+                            keyword_at,
+                        )?;
                         continue;
                     }
                     let mut list = ArenaList::new(self.arena);
@@ -637,6 +654,7 @@ impl<'a> Parser<'a> {
             if operator.precedence() < min_prec {
                 return Ok(left);
             }
+            let operator_at = self.peek_at;
             self.advance()?;
             // Quantified comparison: `operand operator ANY/ALL (array)` or
             // `... (subquery)`.
@@ -658,24 +676,33 @@ impl<'a> Parser<'a> {
                     // quantify over the subquery's collected result column
                     // (same truth table as the array forms, per PostgreSQL).
                     left = if operator == BinaryOp::Eq && !all {
-                        self.arena_expr(Expr::InSubquery {
-                            operand: left,
-                            select: boxed,
-                            negated: false,
-                        })?
+                        self.arena_expr_at(
+                            Expr::InSubquery {
+                                operand: left,
+                                select: boxed,
+                                negated: false,
+                            },
+                            operator_at,
+                        )?
                     } else if operator == BinaryOp::NotEq && all {
-                        self.arena_expr(Expr::InSubquery {
-                            operand: left,
-                            select: boxed,
-                            negated: true,
-                        })?
+                        self.arena_expr_at(
+                            Expr::InSubquery {
+                                operand: left,
+                                select: boxed,
+                                negated: true,
+                            },
+                            operator_at,
+                        )?
                     } else {
-                        self.arena_expr(Expr::QuantifiedSubquery {
-                            operand: left,
-                            operator,
-                            select: boxed,
-                            all,
-                        })?
+                        self.arena_expr_at(
+                            Expr::QuantifiedSubquery {
+                                operand: left,
+                                operator,
+                                select: boxed,
+                                all,
+                            },
+                            operator_at,
+                        )?
                     };
                     continue;
                 }
@@ -690,6 +717,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             let right = self.expression(operator.precedence() + 1)?;
+            let right = self.row_subquery_operand(left, operator, right, operator_at)?;
             left = self.arena_expr(Expr::Binary {
                 source_position,
                 operator,
@@ -697,6 +725,86 @@ impl<'a> Parser<'a> {
                 right,
             })?;
         }
+    }
+
+    /// `(a, b) op (SELECT x, y ...)` compares a row constructor with the
+    /// subquery's single row field by field: the subquery becomes a row of
+    /// its fields, NULL for no row, and more than one row is an error.
+    fn row_subquery_operand(
+        &mut self,
+        left: &'a Expr<'a>,
+        operator: BinaryOp,
+        right: &'a Expr<'a>,
+        operator_at: usize,
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        let Expr::Subquery(select) = right else {
+            return Ok(right);
+        };
+        let Expr::Call { args, .. } = left else {
+            return Ok(right);
+        };
+        if !left.is_row_constructor()
+            || !matches!(
+                operator,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+            )
+        {
+            return Ok(right);
+        }
+        let leaf = {
+            let mut leaf = *select;
+            while let Some(tree) = leaf.set_body {
+                let mut node = tree;
+                while let crate::sql::ast::SetTree::Op { left, .. } = node {
+                    node = left;
+                }
+                let crate::sql::ast::SetTree::Select(first) = node else {
+                    unreachable!("a set tree ends in a leaf")
+                };
+                leaf = first;
+            }
+            leaf
+        };
+        if leaf
+            .items
+            .iter()
+            .all(|item| matches!(item, crate::sql::ast::SelectItem::Expr { .. }))
+            && leaf.items.len() != args.len()
+        {
+            return Err(ParseError {
+                at: operator_at,
+                message: crate::util::StackStr::from_str(if leaf.items.len() < args.len() {
+                    "subquery has too few columns"
+                } else {
+                    "subquery has too many columns"
+                }),
+                sqlstate: sqlstate::SYNTAX_ERROR,
+                cursor: Some(operator_at),
+                hint: None,
+                near: None,
+                detail: None,
+            });
+        }
+        let arity = u8::try_from(args.len()).map_err(|_| self.err_here("row is too wide"))?;
+        let record = self.arena_expr_at(Expr::RowSubquery { select, arity }, operator_at)?;
+        let mut fields = ArenaList::new(self.arena);
+        for index in 0..args.len() {
+            let field = self.arena_expr(Expr::RecordFieldIndex {
+                base: record,
+                index: index as u16,
+            })?;
+            self.push(&mut fields, field)?;
+        }
+        let mut row = *left;
+        if let Expr::Call { args, .. } = &mut row {
+            *args = fields.as_slice();
+        }
+        self.arena_expr(row)
     }
 
     pub(super) fn collation_name(
@@ -795,7 +903,7 @@ impl<'a> Parser<'a> {
                         .alloc(select)
                         .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
                     self.parenthesized_primary = Some(source_position_at);
-                    return self.arena_expr(Expr::Subquery(boxed));
+                    return self.arena_expr_at(Expr::Subquery(boxed), source_position_at);
                 }
                 let inner = self.expression(0)?;
                 // A parenthesized comma list is either an OVERLAPS period pair
@@ -856,6 +964,25 @@ impl<'a> Parser<'a> {
                         return self.arena_expr(Expr::Field { base, field: "*" });
                     }
                     let field = self.any_ident("field name")?;
+                    // A field of a bound procedural record variable is
+                    // bound like `variable.field`, with the field's type.
+                    if let Expr::RoutineParam {
+                        qualifier: None,
+                        name,
+                        source: crate::sql::ast::ParameterSource::PlpgsqlCursor(_),
+                        ..
+                    } = base
+                        && let Some((index, source)) = self.qualified_routine_parameter(name, field)
+                    {
+                        self.max_param = self.max_param.max(index);
+                        base = self.arena_expr(Expr::RoutineParam {
+                            qualifier: Some(name),
+                            name: field,
+                            index,
+                            source,
+                        })?;
+                        continue;
+                    }
                     base = self.arena_expr(Expr::Field { base, field })?;
                 }
                 // An implicit row `(1, 2)` is not a parenthesized expression.
@@ -989,6 +1116,7 @@ impl<'a> Parser<'a> {
                 })
             }
             Tok::Ident("exists") => {
+                let exists_at = self.peek_at;
                 self.advance()?;
                 self.expect_op("(")?;
                 let select = self.query_select()?;
@@ -997,10 +1125,13 @@ impl<'a> Parser<'a> {
                     .arena
                     .alloc(select)
                     .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
-                self.arena_expr(Expr::Exists(boxed))
+                self.arena_expr_at(Expr::Exists(boxed), exists_at)
             }
             Tok::Ident("default") => {
+                let at = self.peek_at;
                 self.advance()?;
+                self.last_default = at;
+                self.misplaced_default.get_or_insert(at);
                 self.arena_expr(Expr::DefaultMarker)
             }
             Tok::Ident("case") => {
@@ -1014,8 +1145,15 @@ impl<'a> Parser<'a> {
                     Some(self.expression(0)?)
                 };
                 let mut whens = ArenaList::new(self.arena);
-                while self.eat_ident("when")? {
+                loop {
+                    let when_at = self.peek_at;
+                    if !self.eat_ident("when")? {
+                        break;
+                    }
                     let cond = self.expression(0)?;
+                    if operand.is_some() {
+                        self.record_case_when(cond, when_at)?;
+                    }
                     self.expect_ident("then")?;
                     let result = self.expression(0)?;
                     self.push(&mut whens, (cond, result))?;
@@ -1084,6 +1222,7 @@ impl<'a> Parser<'a> {
                 }
                 // `ARRAY(SELECT ...)` array-from-subquery constructor.
                 if name.eq_ignore_ascii_case("array") && self.peeked == Tok::Op("(") {
+                    let array_at = self.previous_token.map_or(self.peek_at, |token| token.1);
                     self.advance()?;
                     let select = self.query_select()?;
                     self.expect_op(")")?;
@@ -1091,7 +1230,7 @@ impl<'a> Parser<'a> {
                         .arena
                         .alloc(select)
                         .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
-                    return self.arena_expr(Expr::ArraySubquery(boxed));
+                    return self.arena_expr_at(Expr::ArraySubquery(boxed), array_at);
                 }
                 if name.eq_ignore_ascii_case("json") && self.peeked == Tok::Op("(") {
                     return self.sql_json_constructor();
@@ -1141,7 +1280,7 @@ impl<'a> Parser<'a> {
                 // first. A `can be function or type name` keyword may continue:
                 // it is exactly the category PostgreSQL allows to name one.
                 if self.peeked == Tok::Op("(") && self.typed_literal_with_modifier_ahead(name)? {
-                    return self.modified_typed_literal(name);
+                    return self.modified_typed_literal(name, true, name_at);
                 }
                 if self.peeked == Tok::Op("(")
                     && matches!(
@@ -1217,7 +1356,7 @@ impl<'a> Parser<'a> {
                     // that field, so it is folded into the literal before
                     // the cast rather than left dangling.
                     let (lit, type_mod) = if name.eq_ignore_ascii_case("interval") {
-                        self.interval_with_qualifier(lit)?
+                        self.interval_with_qualifier(lit, Some(name_at))?
                     } else {
                         (lit, -1)
                     };
@@ -1241,7 +1380,9 @@ impl<'a> Parser<'a> {
                         return self.arena_expr(Expr::WholeRow(name));
                     }
                     let column = self.any_ident("column name")?;
-                    if let Some(literal) = self.qualified_builtin_type_literal(name, column)? {
+                    if let Some(literal) =
+                        self.qualified_builtin_type_literal(name, column, name_at)?
+                    {
                         self.record_namespace(namespace_source)?;
                         return Ok(literal);
                     }
@@ -1264,6 +1405,9 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         let third = self.any_ident("column name")?;
+                        if self.peeked == Tok::Op(".") {
+                            return self.catalog_qualified_column(name_at, name, column, third);
+                        }
                         // `routine.parameter.field` names a field of a
                         // composite parameter unless a relation answers.
                         if self.routine_name == Some(name)
@@ -1365,7 +1509,9 @@ impl<'a> Parser<'a> {
                         return self.arena_expr(Expr::WholeRow(name));
                     }
                     let column = self.any_ident("column name")?;
-                    if let Some(literal) = self.qualified_builtin_type_literal(name, column)? {
+                    if let Some(literal) =
+                        self.qualified_builtin_type_literal(name, column, name_at)?
+                    {
                         self.record_namespace(namespace_source)?;
                         return Ok(literal);
                     }
@@ -1384,6 +1530,9 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         let third = self.any_ident("column name")?;
+                        if self.peeked == Tok::Op(".") {
+                            return self.catalog_qualified_column(name_at, name, column, third);
+                        }
                         // `routine.parameter.field` names a field of a
                         // composite parameter unless a relation answers.
                         if self.routine_name == Some(name)
@@ -1705,19 +1854,29 @@ impl<'a> Parser<'a> {
 
     /// Parses a SQL/JSON `RETURNING` clause into the internal result family.
     /// Character typmods are retained as an outer cast after construction.
-    fn sql_json_returning(&mut self) -> Result<(&'a str, &'a str, i32), ParseError> {
+    /// A type the `function` cannot return fails as PostgreSQL's analysis
+    /// fails; a type PostgreSQL accepts but pos3ql lacks is rejected.
+    fn sql_json_returning(
+        &mut self,
+        function: SqlJsonReturning,
+    ) -> Result<(&'a str, &'a str, i32), ParseError> {
+        let default = match function {
+            SqlJsonReturning::Serialize => ("text", "text", -1),
+            SqlJsonReturning::Constructor | SqlJsonReturning::Query => ("json", "json", -1),
+        };
         if !self.eat_ident("returning")? {
-            return Ok(("json", "json", -1));
+            return Ok(default);
         }
         let (type_name, type_mod) = self.type_name_mod()?;
-        let result = match crate::sql::types::ColType::from_sql_name(type_name) {
-            Some(crate::sql::types::ColType::Json) => "json",
-            Some(crate::sql::types::ColType::Jsonb) => "jsonb",
+        let column_type = crate::sql::types::ColType::from_sql_name(type_name);
+        let result = match column_type {
+            Some(crate::sql::types::ColType::Json) => Some("json"),
+            Some(crate::sql::types::ColType::Jsonb) => Some("jsonb"),
             Some(crate::sql::types::ColType::Text)
             | Some(crate::sql::types::ColType::Varchar)
-            | Some(crate::sql::types::ColType::Bpchar) => "text",
-            Some(crate::sql::types::ColType::Bytea) => "bytea",
-            _ => return Err(self.unexpected("unsupported SQL/JSON RETURNING type")),
+            | Some(crate::sql::types::ColType::Bpchar) => Some("text"),
+            Some(crate::sql::types::ColType::Bytea) => Some("bytea"),
+            _ => None,
         };
         if self.eat_ident("format")? {
             self.expect_ident("json")?;
@@ -1725,7 +1884,51 @@ impl<'a> Parser<'a> {
         if self.eat_ident("encoding")? {
             self.expect_ident("utf8")?;
         }
-        Ok((result, type_name, type_mod))
+        let failure = |sqlstate, message: core::fmt::Arguments<'_>, hint| ParseError {
+            at: self.peek_at,
+            message: crate::stack_format!(super::PARSE_MESSAGE_BYTES, "{}", message),
+            sqlstate,
+            cursor: None,
+            hint,
+            near: None,
+            detail: None,
+        };
+        let Some(column_type) = column_type else {
+            return Err(failure(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                format_args!("SQL/JSON RETURNING type \"{type_name}\" is not supported"),
+                None,
+            ));
+        };
+        let name = column_type.name();
+        match (function, result) {
+            (SqlJsonReturning::Serialize, Some("text" | "bytea")) => {}
+            (SqlJsonReturning::Serialize, _) => {
+                self.analysis_error(failure(
+                    sqlstate::DATATYPE_MISMATCH,
+                    format_args!("cannot use type {name} in RETURNING clause of JSON_SERIALIZE()"),
+                    Some("Try returning a string type or bytea."),
+                ))?;
+                return Ok(default);
+            }
+            (_, Some(_)) => {}
+            (SqlJsonReturning::Constructor, None) => {
+                self.analysis_error(failure(
+                    sqlstate::CANNOT_COERCE,
+                    format_args!("cannot cast type json to {name}"),
+                    None,
+                ))?;
+                return Ok(default);
+            }
+            (SqlJsonReturning::Query, None) => {
+                return Err(failure(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    format_args!("JSON_QUERY RETURNING {name} is not supported"),
+                    None,
+                ));
+            }
+        }
+        Ok((result.expect("checked above"), type_name, type_mod))
     }
 
     fn sql_json_result_call(
@@ -1828,7 +2031,8 @@ impl<'a> Parser<'a> {
         } else {
             true
         };
-        let (result, type_name, type_mod) = self.sql_json_returning()?;
+        let (result, type_name, type_mod) =
+            self.sql_json_returning(SqlJsonReturning::Constructor)?;
         self.expect_op(")")?;
         self.sql_json_result_call(
             "array",
@@ -1883,7 +2087,8 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let (result, type_name, type_mod) = self.sql_json_returning()?;
+        let (result, type_name, type_mod) =
+            self.sql_json_returning(SqlJsonReturning::Constructor)?;
         self.expect_op(")")?;
         // The object evaluator reads the final marker as ABSENT ON NULL while
         // the call-name option remains the uniqueness requirement.
@@ -1909,14 +2114,7 @@ impl<'a> Parser<'a> {
                 self.expect_ident("utf8")?;
             }
         }
-        let (result, type_name, type_mod) = if self.peeked == Tok::Ident("returning") {
-            self.sql_json_returning()?
-        } else {
-            ("text", "text", -1)
-        };
-        if !matches!(result, "text" | "bytea") {
-            return Err(self.unexpected("JSON_SERIALIZE requires a character or bytea result"));
-        }
+        let (result, type_name, type_mod) = self.sql_json_returning(SqlJsonReturning::Serialize)?;
         self.expect_op(")")?;
         let call = self.plain_call(
             if result == "bytea" {
@@ -2083,7 +2281,7 @@ impl<'a> Parser<'a> {
             }
         }
         let (result, type_name, type_mod) = if self.peeked == Tok::Ident("returning") {
-            self.sql_json_returning()?
+            self.sql_json_returning(SqlJsonReturning::Query)?
         } else {
             ("jsonb", "jsonb", -1)
         };
@@ -2187,7 +2385,7 @@ impl<'a> Parser<'a> {
 
     /// Builds a simple function call `name(args)` (no star/distinct/over).
     pub(super) fn plain_call(
-        &mut self,
+        &self,
         name: &'a str,
         args: &[&'a Expr<'a>],
     ) -> Result<&'a Expr<'a>, ParseError> {
@@ -2567,7 +2765,8 @@ impl<'a> Parser<'a> {
             }
             true
         };
-        let (result, type_name, type_mod) = self.sql_json_returning()?;
+        let (result, type_name, type_mod) =
+            self.sql_json_returning(SqlJsonReturning::Constructor)?;
         self.expect_op(")")?;
         let filter = self.parse_filter()?;
         let over = self.parse_over()?;
@@ -2624,7 +2823,8 @@ impl<'a> Parser<'a> {
             }
             false
         };
-        let (result, type_name, type_mod) = self.sql_json_returning()?;
+        let (result, type_name, type_mod) =
+            self.sql_json_returning(SqlJsonReturning::Constructor)?;
         self.expect_op(")")?;
         let filter = self.parse_filter()?;
         let over = self.parse_over()?;
@@ -2945,6 +3145,7 @@ impl<'a> Parser<'a> {
     pub(super) fn interval_with_qualifier(
         &mut self,
         lit: &'a str,
+        type_at: Option<usize>,
     ) -> Result<(&'a str, i32), ParseError> {
         let Some((word, _)) = self.peek_interval_field() else {
             return Ok((lit, -1));
@@ -2959,7 +3160,7 @@ impl<'a> Parser<'a> {
                     "interval precision is allowed only when SECOND is the trailing field",
                 ));
             }
-            precision = Some(self.interval_precision()?);
+            precision = Some(self.interval_precision(type_at)?);
         }
         // PostgreSQL's grammar starts a range only at YEAR, DAY, HOUR or
         // MINUTE, and ends it at a finer field; anything else fails at the
@@ -3007,7 +3208,7 @@ impl<'a> Parser<'a> {
                         "interval precision is allowed only when SECOND is the trailing field",
                     ));
                 }
-                precision = Some(self.interval_precision()?);
+                precision = Some(self.interval_precision(type_at)?);
             }
             let last = crate::sql::types::IntervalField::parse(end_word)
                 .expect("interval keyword maps to a typed field");
@@ -3042,10 +3243,10 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    fn interval_precision(&mut self) -> Result<u8, ParseError> {
+    fn interval_precision(&mut self, type_at: Option<usize>) -> Result<u8, ParseError> {
         match crate::sql::types::TypeMod::decode(
             crate::sql::types::ColType::Interval,
-            self.type_modifier("interval")?,
+            self.type_modifier("interval", true, type_at)?,
         ) {
             crate::sql::types::TypeMod::IntervalMod {
                 precision: Some(precision),
@@ -3061,6 +3262,7 @@ impl<'a> Parser<'a> {
         &mut self,
         schema: &str,
         name: &'a str,
+        type_at: usize,
     ) -> Result<Option<&'a Expr<'a>>, ParseError> {
         let source_position = SourcePosition::new(Some(self.peek_at));
         if schema != "pg_catalog" || crate::sql::types::ColType::from_sql_name(name).is_none() {
@@ -3073,14 +3275,20 @@ impl<'a> Parser<'a> {
         {
             return Err(ParseError {
                 at: self.peek_at,
-                message: crate::stack_format!(96, "type \"pg_catalog.{}\" does not exist", name),
+                message: crate::stack_format!(
+                    super::PARSE_MESSAGE_BYTES,
+                    "type \"pg_catalog.{}\" does not exist",
+                    name
+                ),
                 sqlstate: crate::sql::eval::sqlstate::UNDEFINED_OBJECT,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             });
         }
         if modified {
-            return self.modified_typed_literal(name).map(Some);
+            return self.modified_typed_literal(name, false, type_at).map(Some);
         }
         let Tok::Str(literal) = self.peeked else {
             return Ok(None);
@@ -3158,19 +3366,33 @@ impl<'a> Parser<'a> {
         Ok(matches!(token, Tok::Str(_)))
     }
 
-    fn modified_typed_literal(&mut self, mut name: &'a str) -> Result<&'a Expr<'a>, ParseError> {
+    /// `name(modifiers) 'literal'`, with `name` starting at `type_at`; a
+    /// keyword spelling (`varchar(3) 'x'`) takes PostgreSQL's keyword grammar.
+    fn modified_typed_literal(
+        &mut self,
+        mut name: &'a str,
+        keyword_spelling: bool,
+        type_at: usize,
+    ) -> Result<&'a Expr<'a>, ParseError> {
         let source_position = SourcePosition::new(Some(self.peek_at));
-        let type_mod = if name.eq_ignore_ascii_case("float") {
+        let float = keyword_spelling && name.eq_ignore_ascii_case("float");
+        let typmods = if float {
             name = self.float_precision_type()?;
-            -1
+            None
         } else {
-            self.type_modifier(name)?
+            Some(self.written_typmods(
+                keyword_spelling
+                    && matches!(
+                        name,
+                        "varchar" | "char" | "character" | "timestamp" | "time" | "interval"
+                    ),
+            )?)
         };
-        if name.eq_ignore_ascii_case("timestamp") || name.eq_ignore_ascii_case("time") {
+        if keyword_spelling && matches!(name, "timestamp" | "time") {
             if self.eat_ident("with")? {
                 self.expect_ident("time")?;
                 self.expect_ident("zone")?;
-                name = if name.eq_ignore_ascii_case("timestamp") {
+                name = if name == "timestamp" {
                     "timestamptz"
                 } else {
                     "timetz"
@@ -3180,21 +3402,20 @@ impl<'a> Parser<'a> {
                 self.expect_ident("zone")?;
             }
         }
+        let type_mod = match typmods {
+            Some(typmods) => {
+                self.checked_typmod(name, typmods, Some(type_at), format_args!("{name}"))?
+            }
+            None => -1,
+        };
         let Tok::Str(literal) = self.peeked else {
             return Err(self.syntax_error_here());
         };
         self.advance()?;
-        let (literal, type_mod) = if name.eq_ignore_ascii_case("interval") {
-            let (literal, qualifier_mod) = self.interval_with_qualifier(literal)?;
-            if qualifier_mod != -1 {
-                return Err(
-                    self.unexpected("an interval qualifier cannot follow INTERVAL precision")
-                );
-            }
-            (literal, type_mod)
-        } else {
-            (literal, type_mod)
-        };
+        // PostgreSQL's `INTERVAL (p) 'literal'` takes no trailing field.
+        if name == "interval" && self.peek_interval_field().is_some() {
+            return Err(self.syntax_error_here());
+        }
         let operand = self.arena_expr(Expr::Str(literal))?;
         self.arena_expr(Expr::Cast {
             source_position,
@@ -3213,23 +3434,31 @@ impl<'a> Parser<'a> {
     fn year_to_month(&mut self, lit: &'a str) -> Result<&'a str, ParseError> {
         let out_of_range = || ParseError {
             at: self.peek_at,
-            message: crate::stack_format!(96, "interval field value out of range: \"{}\"", lit),
+            message: crate::stack_format!(
+                super::PARSE_MESSAGE_BYTES,
+                "interval field value out of range: \"{}\"",
+                lit
+            ),
             sqlstate: sqlstate::INTERVAL_FIELD_OVERFLOW,
             cursor: None,
             hint: None,
+            near: None,
+            detail: None,
         };
         // A part that is not a number at all is malformed input (22007); a
         // number that is simply too large for its field is out of range (22015).
         let bad_syntax = || ParseError {
             at: self.peek_at,
             message: crate::stack_format!(
-                96,
+                super::PARSE_MESSAGE_BYTES,
                 "invalid input syntax for type interval: \"{}\"",
                 lit
             ),
             sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
             cursor: None,
             hint: None,
+            near: None,
+            detail: None,
         };
         let value = lit.trim();
         let (sign, rest) = match value.strip_prefix('-') {
@@ -3280,13 +3509,15 @@ impl<'a> Parser<'a> {
         let bad = || ParseError {
             at: self.peek_at,
             message: crate::stack_format!(
-                96,
+                super::PARSE_MESSAGE_BYTES,
                 "invalid input syntax for type interval: \"{}\"",
                 lit
             ),
             sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
             cursor: None,
             hint: None,
+            near: None,
+            detail: None,
         };
         let value = lit.trim();
 
@@ -3380,7 +3611,7 @@ impl<'a> Parser<'a> {
         // fractional-only negative second (`-0.5`) keeps its sign.
         let sec_sign = if clock_neg { "-" } else { "" };
         let combined = crate::stack_format!(
-            96,
+            super::PARSE_MESSAGE_BYTES,
             "{} day {} hour {} minute {}{}.{} second",
             days,
             hours,
@@ -3411,13 +3642,15 @@ impl<'a> Parser<'a> {
             return Err(ParseError {
                 at: self.peek_at,
                 message: crate::stack_format!(
-                    96,
+                    super::PARSE_MESSAGE_BYTES,
                     "invalid input syntax for type interval: \"{}\"",
                     lit
                 ),
                 sqlstate: sqlstate::INVALID_DATETIME_FORMAT,
                 cursor: None,
                 hint: None,
+                near: None,
+                detail: None,
             });
         }
         let (word, keep_fraction) = clock_field_word(field);
@@ -3456,6 +3689,20 @@ impl<'a> Parser<'a> {
         negated: bool,
     ) -> Result<&'a Expr<'a>, ParseError> {
         let source_position = SourcePosition::new(Some(self.peek_at));
+        if left.is_row_constructor() && right.is_row_constructor() {
+            // Row constructors are never NULL themselves; their fields are
+            // compared pairwise, so NULL fields make neither side unknown.
+            let same = self.plain_call(crate::sql::parser::ROWS_NOT_DISTINCT, &[left, right])?;
+            return if negated {
+                Ok(same)
+            } else {
+                self.arena_expr(Expr::Unary {
+                    source_position,
+                    operator: UnaryOp::Not,
+                    operand: same,
+                })
+            };
+        }
         let l_null = self.arena_expr(Expr::IsNull {
             operand: left,
             negated: false,

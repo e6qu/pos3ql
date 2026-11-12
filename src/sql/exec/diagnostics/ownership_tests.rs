@@ -17,20 +17,19 @@ fn pending_errors_own_metadata_before_cleanup_and_release_it_after_handler_captu
             Some(StackStr::from_str("original é detail")),
             Some(StackStr::from_str("")),
         );
-        let error = PendingError::capture(
-            sql_err!(
-                crate::sql::eval::InternalControl::RoutineInvocation.diagnostic_code(),
-                "original error"
-            ),
-            &pool,
+        let original = sql_err!(
+            crate::sql::eval::InternalControl::RoutineInvocation.diagnostic_code(),
+            "original error"
         );
+        crate::sql::error_context::restore(&original, "original call", None);
+        let error = PendingError::capture(original, &pool);
         assert!(crate::sql::eval::take_diagnostic().is_none());
         crate::sql::eval::stash_diagnostic(
             Some(StackStr::from_str("cleanup detail")),
             Some(StackStr::from_str("cleanup hint")),
         );
         let mut handlers = DiagnosticBuffers::new(&pool, 1).unwrap();
-        error.catch(&mut handlers, "original call").unwrap();
+        error.catch(&mut handlers).unwrap();
         let caught = handlers.current().unwrap();
         assert_eq!(caught.sqlstate, "PZ003");
         assert!(caught.sqlstate.internal_control().is_none());
@@ -142,6 +141,7 @@ fn repeated_diagnostics_reuse_owned_capacity_and_keep_independent_copies() {
                 Some(&crate::sql::eval::Diagnostic {
                     detail: Some(detail),
                     hint: None,
+                    objects: Default::default(),
                 }),
                 "outer",
             )
@@ -173,6 +173,7 @@ fn repeated_diagnostics_reuse_owned_capacity_and_keep_independent_copies() {
                     Some(&crate::sql::eval::Diagnostic {
                         detail: Some(detail),
                         hint: Some(StackStr::from_str("")),
+                        objects: Default::default(),
                     }),
                     "inner",
                 )
@@ -209,6 +210,7 @@ fn nested_diagnostic_failure_preserves_the_outer_handler_and_reuses_the_inner_sl
     let too_large = crate::sql::eval::Diagnostic {
         detail: Some(StackStr::from_str(&"x".repeat(4096))),
         hint: None,
+        objects: Default::default(),
     };
     crate::mem::guard::forbid_alloc(|| {
         let mut buffers = DiagnosticBuffers::new(&pool, 2).unwrap();
@@ -423,10 +425,12 @@ fn diagnostic_growth_moves_bytes_and_recovers_after_fragmented_exhaustion() {
     let medium = crate::sql::eval::Diagnostic {
         detail: Some(StackStr::from_str(&"m".repeat(300))),
         hint: None,
+        objects: Default::default(),
     };
     let large = crate::sql::eval::Diagnostic {
         detail: Some(StackStr::from_str(&"l".repeat(700))),
         hint: None,
+        objects: Default::default(),
     };
     crate::mem::guard::forbid_alloc(|| {
         let mut buffers = DiagnosticBuffers::new(&pool, 1).unwrap();

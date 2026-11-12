@@ -348,7 +348,7 @@ pub(super) mod tests {
         io: &mut MetadataIo,
         listener: &TcpListener,
     ) -> (TcpStream, String) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         let (mut stream, _) = loop {
             io.advance(Instant::now());
             match listener.accept() {
@@ -366,7 +366,7 @@ pub(super) mod tests {
         stream.set_nonblocking(false).unwrap();
         io.advance(Instant::now());
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(crate::test_wait::HANG))
             .unwrap();
         let mut bytes = Vec::new();
         while !bytes.ends_with(b"\r\n\r\n") {
@@ -379,7 +379,7 @@ pub(super) mod tests {
     }
 
     pub(in crate::checkpoint) fn finish(io: &mut MetadataIo) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         while !io.ready() {
             crate::mem::guard::forbid_alloc(|| io.advance(Instant::now()));
             assert!(

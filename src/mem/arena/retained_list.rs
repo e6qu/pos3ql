@@ -53,6 +53,11 @@ impl<T: Copy + 'static> RetainedList<T> {
         }
     }
 
+    /// Forgets the entries from `len` on; later pushes reuse their slots.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
+    }
+
     pub(crate) fn get(&self, arena: &Arena, index: usize) -> Result<Option<T>, ArenaSliceError> {
         self.with_slice(arena, |values| values.get(index).copied())
     }

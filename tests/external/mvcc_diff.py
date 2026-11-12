@@ -3,6 +3,7 @@
 
 import os
 import sys
+import threading
 
 import psycopg
 
@@ -274,9 +275,13 @@ def merge_lock_transcript(reader, writer) -> list[str]:
         reader.execute("SET lock_timeout = '50ms'")
         changed = reader.execute("MERGE INTO merge_lock_diff t USING (VALUES (1)) AS s(id) ON t.id = s.id WHEN MATCHED THEN UPDATE SET amount = 11 RETURNING t.id, t.amount").fetchall()
         results = [f"merge_key_share_compatible={changed}"]
-        for label, action in [("key", "UPDATE SET id = 2"), ("delete", "DELETE")]:
+        for label, action in [("key", "UPDATE SET id = 2"), ("delete", "DELETE"), ("same_key", "UPDATE SET id = t.id, amount = 12")]:
             error = sqlstate(reader, f"MERGE INTO merge_lock_diff t USING (VALUES (1)) AS s(id) ON t.id = s.id WHEN MATCHED THEN {action}")
             results.append(f"merge_key_share_{label}={error}")
+        # Only a changed key value conflicts with a key share lock.
+        for label, assignment in [("same", "id = id"), ("computed_same", "id = id + 0, amount = 13"), ("changed", "id = 3")]:
+            error = sqlstate(reader, f"UPDATE merge_lock_diff SET {assignment} WHERE id = 1")
+            results.append(f"update_key_share_{label}={error}")
         writer.execute("ROLLBACK")
         rows = reader.execute("SELECT id, amount FROM merge_lock_diff").fetchall()
         results.append(f"merge_locked_rows={rows}")
@@ -286,6 +291,78 @@ def merge_lock_transcript(reader, writer) -> list[str]:
         writer.execute("ROLLBACK")
         reader.execute("RESET lock_timeout")
         writer.execute("DROP TABLE merge_lock_diff")
+
+
+def after_concurrent_change(reader, writer, change: str, statement: str) -> str:
+    """Runs `statement` while `change` holds its row locks, then commits the
+    change; the statement waits and rechecks the rows it locked."""
+    writer.execute("BEGIN")
+    writer.execute(change)
+    outcome = {}
+
+    def run():
+        try:
+            cursor = reader.execute(statement)
+            rows = cursor.fetchall() if cursor.description else None
+            outcome["result"] = f"{cursor.statusmessage}:{rows}"
+        except psycopg.Error as error:
+            outcome["result"] = error.sqlstate or "none"
+
+    waiting = threading.Thread(target=run)
+    waiting.start()
+    # Whether it waited depends on timing, so only the outcome is compared.
+    waiting.join(0.3)
+    writer.execute("COMMIT")
+    waiting.join(10)
+    return outcome.get("result", "hung")
+
+
+def locked_row_recheck_transcript(reader, writer) -> list[str]:
+    writer.execute("CREATE TABLE recheck_items_diff(id integer PRIMARY KEY, qty integer, note text)")
+    writer.execute("CREATE TABLE recheck_stock_diff(id integer, qty integer)")
+    reset = [
+        "DELETE FROM recheck_items_diff",
+        "DELETE FROM recheck_stock_diff",
+        "INSERT INTO recheck_items_diff VALUES (1, 1, 'a'), (2, 2, 'b'), (3, 3, 'c')",
+        "INSERT INTO recheck_stock_diff VALUES (1, 1), (2, 2), (4, 4)",
+    ]
+    changes = [
+        "UPDATE recheck_items_diff SET qty = qty + 1 WHERE id = 1",
+        "UPDATE recheck_items_diff SET qty = 100 WHERE id = 1",
+        "DELETE FROM recheck_items_diff WHERE id = 1",
+        "UPDATE recheck_items_diff SET id = 5 WHERE id = 1",
+        "UPDATE recheck_items_diff SET note = 'z' WHERE id = 1",
+        "UPDATE recheck_items_diff SET qty = qty + 1 WHERE id = 3",
+    ]
+    statements = [
+        "SELECT * FROM recheck_items_diff WHERE id = 1 FOR UPDATE",
+        "SELECT * FROM recheck_items_diff WHERE qty = 1 FOR NO KEY UPDATE",
+        "SELECT id, qty * 10 FROM recheck_items_diff WHERE qty < 50 ORDER BY id LIMIT 1 FOR UPDATE",
+        "SELECT * FROM recheck_items_diff WHERE id = 1 FOR KEY SHARE",
+        "SELECT i.id, i.qty, s.qty FROM recheck_items_diff i JOIN recheck_stock_diff s ON s.id = i.id AND s.qty = i.qty ORDER BY i.id FOR UPDATE OF i",
+        "SELECT i.id, i.qty, s.qty FROM recheck_items_diff i LEFT JOIN recheck_stock_diff s ON s.id = i.id AND s.qty = i.qty ORDER BY i.id FOR SHARE OF i",
+        "WITH locked AS (SELECT * FROM recheck_items_diff WHERE id = 1 FOR UPDATE) SELECT * FROM locked",
+        "SELECT * FROM recheck_items_diff WHERE qty IN (SELECT qty FROM recheck_stock_diff) ORDER BY id FOR UPDATE",
+        "MERGE INTO recheck_items_diff t USING recheck_stock_diff s ON s.id = t.id WHEN MATCHED AND t.qty = 1 THEN UPDATE SET qty = t.qty + 10 WHEN MATCHED THEN UPDATE SET note = 'm' WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.qty, 'i') RETURNING merge_action(), t.*",
+        "MERGE INTO recheck_items_diff t USING recheck_stock_diff s ON s.id = t.id AND t.qty = 1 WHEN MATCHED THEN UPDATE SET qty = t.qty + 10 WHEN NOT MATCHED BY SOURCE THEN UPDATE SET note = 's' WHEN NOT MATCHED THEN INSERT VALUES (s.id + 20, s.qty, 'n') RETURNING merge_action(), s.*, t.*",
+        "MERGE INTO recheck_items_diff t USING recheck_stock_diff s ON s.id = t.id WHEN NOT MATCHED BY SOURCE AND t.qty = 3 THEN DELETE WHEN NOT MATCHED BY SOURCE THEN UPDATE SET note = 't'",
+    ]
+    results = []
+    try:
+        for isolation in ["READ COMMITTED", "REPEATABLE READ"]:
+            reader.execute(f"SET default_transaction_isolation = '{isolation.lower()}'")
+            for statement_index, statement in enumerate(statements):
+                for change_index, change in enumerate(changes):
+                    for command in reset:
+                        writer.execute(command)
+                    outcome = after_concurrent_change(reader, writer, change, statement)
+                    rows = writer.execute("SELECT * FROM recheck_items_diff ORDER BY id, qty").fetchall()
+                    results.append(f"recheck_{isolation}_{statement_index}_{change_index}={outcome},rows:{rows}")
+        return results
+    finally:
+        reader.execute("RESET default_transaction_isolation")
+        writer.execute("DROP TABLE recheck_items_diff")
+        writer.execute("DROP TABLE recheck_stock_diff")
 
 
 def merge_write_transcript(reader, writer) -> list[str]:
@@ -1219,6 +1296,7 @@ def exercise(port: int) -> list[str]:
                 generated_write_transcript(reader, writer),
                 merge_write_transcript(reader, writer),
                 merge_lock_transcript(reader, writer),
+                locked_row_recheck_transcript(reader, writer),
                 partition_move_transcript(reader, writer),
                 partition_move_transcript(reader, writer, reordered=True),
                 partition_attachment_transcript(reader, writer),

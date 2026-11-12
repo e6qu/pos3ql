@@ -1151,7 +1151,7 @@ fn restartable_statements_finish_without_block_caches() {
              RETURNING id",
             &["39", "40"],
         ),
-        // The rule action's selection is a later step: it yields too.
+        // A rule action's selection is a later step: it yields too.
         ("INSERT INTO ruled VALUES (3) RETURNING id", &["3"]),
     ];
     for mode in [

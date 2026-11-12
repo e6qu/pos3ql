@@ -1040,8 +1040,13 @@ impl BlockStore for OwnedObjectStore {
 
     fn prefetch(&mut self, id: &BlockId) -> Result<PrefetchState, StoreError> {
         let owner = self.request_owner()?;
-        if owner.is_none() || self.statement_reads_synchronously(owner) {
+        if owner.is_none() {
             return Ok(PrefetchState::Unavailable);
+        }
+        // A statement reading synchronously schedules no read-ahead; the
+        // optional window stops as when every slot is busy.
+        if self.statement_reads_synchronously(owner) {
+            return Ok(PrefetchState::Saturated);
         }
         if self.slots.iter().any(|slot| {
             !slot.packed
@@ -1056,15 +1061,22 @@ impl BlockStore for OwnedObjectStore {
         if self.admission == crate::object_store::RequestAdmission::Draining {
             return Err(StoreError::NotReady);
         }
+        // A read-ahead download counts like a demand one; a repeat leaves the
+        // block to the synchronous demand read.
+        if self.statement_repeats_download(owner, id) {
+            return Ok(PrefetchState::Saturated);
+        }
         let mut key_buffer = [0u8; 128];
         let key = key_of(self.prefix, id, &mut key_buffer);
         let started = Instant::now();
         let completed = {
-            let Some(slot) = self.slots.iter_mut().find(|slot| Self::slot_is_free(slot)) else {
+            let Some(index) = self.slots.iter().position(Self::slot_is_free) else {
                 self.stats.object_prefetch_saturated =
                     self.stats.object_prefetch_saturated.saturating_add(1);
                 return Ok(PrefetchState::Saturated);
             };
+            self.record_statement_download(owner, id)?;
+            let slot = &mut self.slots[index];
             Self::join_owner(slot, owner)?;
             match slot.client.get(key, None) {
                 Ok(result) => {
@@ -1552,6 +1564,52 @@ mod tests {
             assert_eq!(store.slots.capacity(), slots);
             assert_eq!(store.scratch.len(), super::super::BLOCK_SIZE);
         }
+    }
+
+    /// A restarted attempt reads synchronously when it would download a
+    /// block a third time or one block past `statement_restart_waits`;
+    /// progress, a new statement and the session's end reset the history.
+    #[test]
+    fn restarted_statements_repeat_downloads_at_most_twice() {
+        let mut config = network_config(9, "restart-downloads");
+        config.statement_restart_waits = 2;
+        let mut budget = Budget::new(OwnedObjectStore::budget_bytes(&config));
+        let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
+        let owner = Some(ReadOwner(1));
+        let (a, b, c) = (BlockId([1; 32]), BlockId([2; 32]), BlockId([3; 32]));
+        store.begin_statement_reads(ReadOwner(1), false, 0).unwrap();
+        for _ in 0..3 {
+            // The first attempt never reads synchronously.
+            assert!(!store.statement_repeats_download(owner, &a));
+            store.record_statement_download(owner, &a).unwrap();
+        }
+        store.begin_statement_reads(ReadOwner(1), false, 0).unwrap();
+        store.record_statement_download(owner, &a).unwrap();
+        store.begin_statement_reads(ReadOwner(1), true, 0).unwrap();
+        assert!(!store.statement_repeats_download(owner, &a));
+        store.record_statement_download(owner, &a).unwrap();
+        assert!(!store.statement_repeats_download(owner, &b));
+        store.record_statement_download(owner, &b).unwrap();
+        // A third download of `a`, and a third distinct block, repeat.
+        assert!(store.statement_repeats_download(owner, &a));
+        assert!(store.statement_reads_synchronously(owner));
+        store.statement_progressed(ReadOwner(1));
+        assert!(!store.statement_reads_synchronously(owner));
+        store.record_statement_download(owner, &a).unwrap();
+        store.record_statement_download(owner, &b).unwrap();
+        assert!(store.statement_repeats_download(owner, &c));
+        // Moving progress between attempts forgets the downloads too.
+        store.begin_statement_reads(ReadOwner(1), true, 1).unwrap();
+        assert!(!store.statement_repeats_download(owner, &c));
+        // Other owners and ended sessions keep separate histories.
+        assert!(!store.statement_repeats_download(Some(ReadOwner(2)), &a));
+        store.forget_statement_reads(ReadOwner(1));
+        assert!(
+            store
+                .restart_reads
+                .iter()
+                .all(|entry| entry.owner.is_none())
+        );
     }
 
     #[test]

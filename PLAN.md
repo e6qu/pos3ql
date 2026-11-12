@@ -117,8 +117,9 @@ is owned.
   constraint checks yield; reads after an event's first effect block until that event ends,
   so a trigger body that writes and then reads cold data still blocks.
   Writes in `CALL` and `DO` bodies keep their `AFTER` work the same way. The
-  next step's selection in a multi-step write (a rule action, a statement of
-  a data-modifying `WITH`) yields and rolls back to the step's start; a
+  selection of a rule action after the rule's earlier steps yields and rolls
+  back to the step's start (a data-modifying `WITH` main statement after its
+  sub-statements still reads synchronously); a
   statement whose restarts repeat downloads without progress reads the rest
   synchronously (`statement_restart_waits`), so it finishes with empty
   caches. The `AFTER` work (foreign key checks included) of those steps and
@@ -389,6 +390,10 @@ A `RETURNING` list routed through a rule's `RETURNING` list reads the rule's
 relation only: `UPDATE v ... FROM o RETURNING o.label`, `*` beside `FROM` or
 `USING` sources, and subqueries in that list fail with `0A000` where
 PostgreSQL evaluates them.
+A foreign key whose child and parent columns are stored differently
+(`integer` referencing `bigint`) fails with `42804` where PostgreSQL accepts
+it through the cross-type equality operator: every check, action and the
+parent key lookup compare same-typed keys.
 A user table's `tableoid` system column fails with `0A000`
 (`SELECT tableoid::regclass FROM partitioned` names no partition); catalogs
 expose it. COPY to or from a server file or program,

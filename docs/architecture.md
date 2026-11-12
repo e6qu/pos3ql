@@ -276,8 +276,8 @@ BY id` sorts first, so its output queues in the spool instead.
 | Writes after their first row change, also in a `CALL` or `DO` body: each row's index maintenance, constraint checks, trigger bodies and `RETURNING`, until an effect a rerun would not repeat identically | Yields; only the unfinished row rolls back (see above) |
 | A write's row after an effect a rerun would not repeat, or every row when such an effect ran in its scan | Blocks until the next step's rows or the statement's end |
 | A top-level write's `AFTER ROW` events, immediate constraint checks and `AFTER STATEMENT` triggers | Yields; finished events are kept (see above). An event's reads after its first effect block until that event ends |
-| The next step's row selection in a multi-step write (a rule action, a data-modifying `WITH` statement) after earlier rows that could resume | Yields; the step rolls back to its start and the finished steps are kept |
-| `AFTER` triggers between the steps of a rule-rewritten write, and `AFTER` work of writes inside routine bodies | Blocks until the next step's rows or that work ends |
+| A rule action's row selection after the rule's earlier steps, when their rows could resume | Yields; the step rolls back to its start and the finished steps are kept |
+| A data-modifying `WITH` main statement's row selection; `AFTER` triggers between the steps of a rule-rewritten write, and `AFTER` work of writes inside routine bodies | Blocks until the next step's rows or that work ends |
 | Routine calls inside a write's rows (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, rule actions, `INSTEAD OF` view triggers): row expressions, row triggers, `RETURNING`; `BEFORE` and `INSTEAD OF` trigger bodies that need the engine | Run on the engine between attempts; the write keeps its changed rows and finished steps and continues at the unfinished row (see above). A storage or lock wait inside the call restarts the whole statement |
 | DDL and `COPY FROM` | Blocks for the whole statement |
 | Top-level `CALL` and `DO` bodies: queries and write scans before the statement's first effect | Yields; the body resumes at its waiting statement |

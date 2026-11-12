@@ -5915,9 +5915,12 @@ fn reads_no_query_column(
                     .lists
                     .iter()
                     .any(|list| core::ptr::eq(list.node.cast::<()>(), address))
-                || subs
-                    .initplans
-                    .is_some_and(|plans| plans.plans.iter().any(|plan| plan.sublink.is(node)))
+                || subs.initplans.is_some_and(|plans| {
+                    plans
+                        .plans
+                        .iter()
+                        .any(|plan| core::ptr::eq(plan.node.cast::<()>(), address))
+                })
         })
     };
     match expression {

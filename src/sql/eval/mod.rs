@@ -2850,6 +2850,8 @@ pub struct InitPlans<'a> {
 
 #[derive(Clone, Copy)]
 pub struct InitPlan<'a> {
+    /// The expression this slot serves in the query that reads it.
+    pub(crate) node: *const Expr<'a>,
     pub(crate) sublink: Sublink,
     /// Once run, the value kept in `keep`'s persistent tail. Raw extents keep
     /// hooks covariant; the handle rejects a reset arena.
@@ -2859,6 +2861,30 @@ pub struct InitPlan<'a> {
     pub(crate) keep: &'a Arena,
     /// Runs the subquery as of the statement that owns the slot.
     pub(crate) runner: &'a dyn InitPlanRunner,
+}
+
+impl<'a> InitPlan<'a> {
+    /// The statement slot in `slots` for `node`: the slot made for that very
+    /// node, or else the one slot for the same sublink, which `node` copies
+    /// after a per-row rewrite. A sublink written twice (a `BETWEEN` operand
+    /// is compared twice) has a slot per copy, as PostgreSQL plans one
+    /// subquery per copy, so a rewritten copy of it matches none.
+    pub(crate) fn find(slots: &[Self], node: &Expr<'_>) -> Option<Self> {
+        let address = (node as *const Expr<'_>).cast::<()>();
+        if let Some(plan) = slots
+            .iter()
+            .find(|plan| core::ptr::eq(plan.node.cast::<()>(), address))
+        {
+            return Some(*plan);
+        }
+        let sublink = Sublink::of(node)?;
+        let mut same = slots.iter().filter(|plan| plan.sublink == sublink);
+        let plan = same.next()?;
+        same.next().is_none().then(|| Self {
+            node: address.cast(),
+            ..*plan
+        })
+    }
 }
 
 impl InitPlan<'_> {
@@ -4973,7 +4999,10 @@ fn eval_full_inner<'a>(
             .lists
             .iter()
             .any(|list| core::ptr::eq(list.node, (expression as *const Expr).cast()))
-        && let Some(plan) = plans.plans.iter().find(|plan| plan.sublink.is(expression))
+        && let Some(plan) = plans
+            .plans
+            .iter()
+            .find(|plan| core::ptr::eq(plan.node, expression))
     {
         let mut scalars = [(expression as *const Expr, Datum::Null, Datum::Null)];
         let values = match plan

@@ -1449,8 +1449,8 @@ pub fn prepare_subqueries<'a>(
     let mut now = ArenaList::new(arena);
     let mut kept = ArenaList::new(arena);
     for &node in nodes.as_slice() {
-        match nested.iter().find(|plan| plan.sublink.is(node)) {
-            Some(plan) => kept.push(*plan).map_err(|_| arena_full())?,
+        match InitPlan::find(nested, node) {
+            Some(plan) => kept.push(plan).map_err(|_| arena_full())?,
             None => now.push(node).map_err(|_| arena_full())?,
         }
     }
@@ -1509,7 +1509,7 @@ pub(super) fn eval_subquery_nodes<'a>(
         .and_then(|outer| outer.statement_initplans())
         .unwrap_or(&[]);
     for node in nodes {
-        if let Some(plan) = slots.iter().find(|plan| plan.sublink.is(node)) {
+        if let Some(plan) = InitPlan::find(slots, node) {
             match plan
                 .value(node, arena, params, sequences)?
                 .read(*node, arena)?
@@ -2471,8 +2471,8 @@ impl UncorrelatedSubqueries {
         let nested = nested.unwrap_or(&[]);
         let mut plans = ArenaList::new(arena);
         for &node in nodes {
-            let plan = match nested.iter().find(|plan| plan.sublink.is(node)) {
-                Some(plan) => *plan,
+            let plan = match InitPlan::find(nested, node) {
+                Some(plan) => plan,
                 None => new_initplan(node, runner, arena)?,
             };
             plans.push(plan).map_err(|_| arena_full())?;
@@ -2491,6 +2491,7 @@ fn new_initplan<'a>(
     arena: &'a Arena,
 ) -> Result<InitPlan<'a>, SqlError> {
     Ok(InitPlan {
+        node,
         sublink: Sublink::of(node).ok_or_else(|| {
             sql_err!(
                 sqlstate::INTERNAL_ERROR,

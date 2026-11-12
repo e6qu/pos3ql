@@ -342,7 +342,9 @@ not each keep a copy of its value. A slot is keyed by the sublink's kind and
 its `SELECT` (`Sublink` in `src/sql/eval/mod.rs`), not by the expression
 node, because rewriting a query for an outer row (merging a FROM subquery,
 pushing a restriction into one) copies the nodes around substituted columns
-but never an uncorrelated subquery's own `SELECT`. Every way a nested query
+but never an uncorrelated subquery's own `SELECT`; a sublink written twice
+(a `BETWEEN` operand is compared twice) keeps a slot per copy, as PostgreSQL
+plans one subquery per copy. Every way a nested query
 prepares its subqueries consults the slots carried by its outer row lookup. A grouped query whose aggregates keep only
 running values (`count`, `sum`, `avg`, `min`, `max`, the boolean, bitwise and
 statistical aggregates, without `DISTINCT` or `ORDER BY`) copies a

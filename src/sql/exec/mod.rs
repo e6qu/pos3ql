@@ -241,6 +241,17 @@ impl<'arena> DmlRowImages<'arena> {
         Ok(self)
     }
 
+    /// A read committed recheck continues with the row's latest version.
+    /// Rows selected without bytes keep none.
+    fn replace(&mut self, table: usize, rowid: u64, bytes: &'arena [u8]) -> Result<(), SqlError> {
+        let rows = self.rows.as_mut_slice().map_err(|_| arena_full())?;
+        if let Ok(index) = rows.binary_search_by_key(&(table, rowid), |row| (row.table, row.rowid))
+        {
+            rows[index].bytes = bytes;
+        }
+        Ok(())
+    }
+
     pub(super) fn bytes(&self, table: usize, rowid: u64) -> Result<&'arena [u8], SqlError> {
         let rows = self.rows.as_slice();
         let index = rows
@@ -335,6 +346,173 @@ fn dml_row_available(
             }
         },
     )
+}
+
+/// The statement conditions a row selected by `UPDATE` or `DELETE` must still
+/// meet in its latest version (PostgreSQL's EvalPlanQual recheck).
+struct DmlRequalify<'q, 'a, Definition: crate::storage::DefinitionBacking> {
+    def: &'q crate::storage::TableDefinition<Definition>,
+    alias: Option<&'q str>,
+    from: Option<&'a crate::sql::ast::FromClause<'a>>,
+    where_clause: Option<&'a Expr<'a>>,
+    params: &'q [Datum<'a>],
+    hooks: &'q super::eval::EvalHooks<'q, 'a>,
+    row_security: Option<super::query::RowSecurityPlan<'a>>,
+    outer: Option<&'q dyn ColumnLookup<'a>>,
+    sequences: Option<&'q dyn crate::sql::eval::SequenceAccess>,
+}
+
+impl<'a, Definition: crate::storage::DefinitionBacking> DmlRequalify<'_, 'a, Definition> {
+    /// The latest version's bytes when it still qualifies.
+    #[allow(clippy::too_many_arguments)]
+    fn latest(
+        &self,
+        storage: &Storage,
+        txid: u32,
+        layout: DmlTableLayout<'a>,
+        table: usize,
+        rowid: u64,
+        latest: crate::storage::VisibleRowHome,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a [u8]>, SqlError> {
+        let bytes = storage.row_bytes(table, rowid, latest, arena)?;
+        let mut physical = [Datum::Null; MAX_COLUMNS];
+        rowenc::decode(bytes, layout.schema, &mut physical)?;
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        layout.project(&physical, &mut values);
+        let Some(from) = self.from else {
+            let matched = row_matches_values(
+                storage,
+                txid,
+                self.def,
+                self.alias,
+                &values,
+                self.where_clause,
+                arena,
+                self.params,
+                self.hooks,
+                self.row_security,
+                self.outer,
+            )?;
+            return Ok(matched.then_some(bytes));
+        };
+        let context = RowCtx {
+            def: crate::storage::RelationDefinition::from_definition(self.def),
+            values: &values[..self.def.n_columns],
+            alias: self.alias,
+        };
+        if let Some(plan) = self.row_security
+            && !super::query::row_security_passes(
+                plan,
+                &context,
+                storage,
+                txid,
+                arena,
+                self.params,
+                self.hooks,
+            )?
+        {
+            return Ok(None);
+        }
+        let joined = self.outer.map(|outer| JoinedTriggerDmlScope {
+            row: &context,
+            outer,
+        });
+        let target: &dyn ColumnLookup<'_> = match joined.as_ref() {
+            Some(joined) => joined,
+            None => &context,
+        };
+        let matched = super::query::first_from_match(
+            storage,
+            from,
+            txid,
+            self.where_clause,
+            &[],
+            arena,
+            self.params,
+            target,
+            &mut |_| Ok(()),
+            self.sequences,
+        )?;
+        Ok(matched.then_some(bytes))
+    }
+}
+
+/// Locks every selected row before any row changes, as PostgreSQL does. A
+/// row another transaction changed after the statement's snapshot fails the
+/// statement with `40001` under repeatable read and serializable; under read
+/// committed the statement continues with the row's latest version when it
+/// still meets the statement's conditions, and skips the row otherwise.
+#[allow(clippy::too_many_arguments)]
+fn lock_selected_dml_rows<'a, Definition: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    txn: &TxnState,
+    scratch: &mut DmlScratch,
+    retained_rows: &mut DmlRowImages<'a>,
+    strength: &mut dyn FnMut(
+        usize,
+        DmlTableLayout<'a>,
+    ) -> Result<crate::sql::ast::LockStrength, SqlError>,
+    requalify: &DmlRequalify<'_, 'a, Definition>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let repeatable = row_conflicts::uses_transaction_snapshot(txn.isolation);
+    let mut kept = 0usize;
+    for index in 0..scratch.len() {
+        let row = scratch[index];
+        let PhysicalRow::Local {
+            table_index: table,
+            rowid,
+            home,
+        } = row
+        else {
+            scratch.as_mut_slice()[kept] = row;
+            kept += 1;
+            continue;
+        };
+        let locked = row_conflicts::lock_selected_row(
+            storage,
+            txn.txid,
+            table,
+            rowid,
+            home,
+            strength(table, retained_rows.layout(table)?)?,
+            crate::sql::ast::LockWait::Wait,
+        )?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "data modification skipped a locked row"
+            )
+        })?;
+        let row = match locked {
+            row_conflicts::LockedVersion::Selected => Some(row),
+            row_conflicts::LockedVersion::Deleted if repeatable => {
+                return Err(row_conflicts::concurrent_change(true));
+            }
+            row_conflicts::LockedVersion::Updated(_) if repeatable => {
+                return Err(row_conflicts::concurrent_change(false));
+            }
+            row_conflicts::LockedVersion::Deleted => None,
+            row_conflicts::LockedVersion::Updated(latest) => {
+                let snapshot = latest.snapshot();
+                let layout = retained_rows.layout(table)?;
+                match requalify.latest(storage, txn.txid, layout, table, rowid, latest, arena)? {
+                    Some(bytes) => {
+                        retained_rows.replace(table, rowid, bytes)?;
+                        Some(PhysicalRow::local(table, rowid, snapshot))
+                    }
+                    None => None,
+                }
+            }
+        };
+        if let Some(row) = row {
+            scratch.as_mut_slice()[kept] = row;
+            kept += 1;
+        }
+    }
+    scratch.truncate(kept);
+    Ok(())
 }
 
 /// The role whose privileges and row-security policies authorize a DML
@@ -827,6 +1005,7 @@ mod row_conflicts;
 mod row_progress;
 mod trigger_firing;
 mod write_attempts;
+pub(crate) use row_conflicts::{concurrent_change, lock_selected_row, locked_result_row_current};
 pub(crate) use row_progress::{
     RetainedWrite, RowProgress, StepRecord, begin_main_step, cte_step_records, is_wait,
     settle_main_step,
@@ -68751,6 +68930,9 @@ fn emit_merge_progress_returning<'a, Definition0: crate::storage::DefinitionBack
     }
 }
 
+/// Locks a `MERGE` target row before its action. Under repeatable read and
+/// serializable, a row another transaction changed after the snapshot fails
+/// with `40001`, as PostgreSQL's `ExecMergeMatched` does.
 fn lock_merge_row(
     storage: &Storage,
     txn: &TxnState,
@@ -68758,20 +68940,47 @@ fn lock_merge_row(
     rowid: u64,
     strength: crate::sql::ast::LockStrength,
 ) -> Result<(), SqlError> {
-    match storage.acquire_row_lock(
+    let seen = match storage.row_state(table, rowid)? {
+        Some(state) => storage
+            .visible_row_home_at(
+                table,
+                rowid,
+                state,
+                txn.txid,
+                crate::storage::SNAPSHOT_ALL,
+                storage.commit_snapshot(),
+            )?
+            .map(|home| home.snapshot()),
+        None => None,
+    };
+    let Some(seen) = seen else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a MERGE target row is not visible to its statement"
+        ));
+    };
+    let locked = row_conflicts::lock_selected_row(
+        storage,
+        txn.txid,
         table,
         rowid,
-        txn.txid,
+        seen,
         strength,
         crate::sql::ast::LockWait::Wait,
-    )? {
-        crate::sql::lock::LockDecision::Acquired => Ok(()),
-        crate::sql::lock::LockDecision::Waiting => Err(sql_err!(
-            sqlstate::INTERNAL_LOCK_WAIT,
-            "MERGE is waiting for a row lock"
-        )),
-        crate::sql::lock::LockDecision::Skipped => unreachable!("MERGE waits for its selected row"),
+    )?
+    .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "MERGE skipped its locked row"))?;
+    if row_conflicts::uses_transaction_snapshot(txn.isolation) {
+        match locked {
+            row_conflicts::LockedVersion::Selected => {}
+            row_conflicts::LockedVersion::Deleted => {
+                return Err(row_conflicts::concurrent_change(true));
+            }
+            row_conflicts::LockedVersion::Updated(_) => {
+                return Err(row_conflicts::concurrent_change(false));
+            }
+        }
     }
+    Ok(())
 }
 
 /// The 21000 error PostgreSQL raises when a MERGE would affect a target row a
@@ -72677,48 +72886,38 @@ pub(crate) fn update<'a>(
     // PostgreSQL obtains a row lock before it computes or publishes any new
     // image. Collecting all target rowids first makes a default wait
     // suspendable without partially executing the statement.
-    for row in scratch.iter().copied() {
-        let PhysicalRow::Local {
-            table_index: row_table,
-            rowid,
-            ..
-        } = row
-        else {
-            continue;
-        };
-        let layout = match retained_rows.layout(row_table) {
-            Ok(layout) => layout,
-            Err(error) => return sql_fail(error),
-        };
-        let physical = match definitions.definition(storage, row_table, txn.txid) {
-            Ok(definition) => definition,
-            Err(error) => return sql_fail(error),
-        };
-        let lock_strength = update_lock_strength(
+    let mut retained_rows = retained_rows;
+    let lock_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+    let requalify = DmlRequalify {
+        def,
+        alias: statement.alias,
+        from: statement.from,
+        where_clause: statement.where_clause,
+        params,
+        hooks: &hooks,
+        row_security,
+        outer,
+        sequences: Some(&lock_sequences),
+    };
+    let mut strength = |row_table: usize, layout: DmlTableLayout<'a>| {
+        let physical = definitions.definition(storage, row_table, txn.txid)?;
+        Ok(update_lock_strength(
             storage,
             physical,
             layout.column_set(updated_columns),
             txn.txid,
-        );
-        match storage.acquire_row_lock(
-            row_table,
-            rowid,
-            txn.txid,
-            lock_strength,
-            crate::sql::ast::LockWait::Wait,
-        ) {
-            Ok(crate::sql::lock::LockDecision::Acquired) => {}
-            Ok(crate::sql::lock::LockDecision::Waiting) => {
-                return sql_fail(sql_err!(
-                    sqlstate::INTERNAL_LOCK_WAIT,
-                    "statement is waiting for a row lock"
-                ));
-            }
-            Ok(crate::sql::lock::LockDecision::Skipped) => {
-                unreachable!("data modification does not request SKIP LOCKED")
-            }
-            Err(error) => return sql_fail(error),
-        }
+        ))
+    };
+    if let Err(error) = lock_selected_dml_rows(
+        storage,
+        txn,
+        scratch,
+        &mut retained_rows,
+        &mut strength,
+        &requalify,
+        arena,
+    ) {
+        return sql_fail(error);
     }
     // Row changes start here; a wait before them restarts the statement.
     row_progress::enter_rows(progress.as_deref_mut());
@@ -73904,34 +74103,29 @@ pub(crate) fn delete<'a>(
         Ok(rows) => rows,
         Err(error) => return sql_fail(error),
     };
-    for row in scratch.iter().copied() {
-        let PhysicalRow::Local {
-            table_index: row_table,
-            rowid,
-            ..
-        } = row
-        else {
-            continue;
-        };
-        match storage.acquire_row_lock(
-            row_table,
-            rowid,
-            txn.txid,
-            crate::sql::ast::LockStrength::Update,
-            crate::sql::ast::LockWait::Wait,
-        ) {
-            Ok(crate::sql::lock::LockDecision::Acquired) => {}
-            Ok(crate::sql::lock::LockDecision::Waiting) => {
-                return sql_fail(sql_err!(
-                    sqlstate::INTERNAL_LOCK_WAIT,
-                    "statement is waiting for a row lock"
-                ));
-            }
-            Ok(crate::sql::lock::LockDecision::Skipped) => {
-                unreachable!("data modification does not request SKIP LOCKED")
-            }
-            Err(error) => return sql_fail(error),
-        }
+    let mut retained_rows = retained_rows;
+    let lock_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+    let requalify = DmlRequalify {
+        def,
+        alias: statement.alias,
+        from: statement.using,
+        where_clause: statement.where_clause,
+        params,
+        hooks: &hooks,
+        row_security,
+        outer,
+        sequences: Some(&lock_sequences),
+    };
+    if let Err(error) = lock_selected_dml_rows(
+        storage,
+        txn,
+        scratch,
+        &mut retained_rows,
+        &mut |_, _| Ok(crate::sql::ast::LockStrength::Update),
+        &requalify,
+        arena,
+    ) {
+        return sql_fail(error);
     }
     // Row changes start here; a wait before them restarts the statement.
     row_progress::enter_rows(progress.as_deref_mut());

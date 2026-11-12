@@ -9741,15 +9741,52 @@ pub(crate) fn lock_clauses_row(
             } else {
                 scope.slots[table]
             };
-            match storage.acquire_row_lock(slot, rowid, txid, clause.strength, clause.wait)? {
-                crate::sql::lock::LockDecision::Acquired => {}
-                crate::sql::lock::LockDecision::Skipped => return Ok(false),
-                crate::sql::lock::LockDecision::Waiting => {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_LOCK_WAIT,
-                        "statement is waiting for a row lock"
-                    ));
-                }
+            // The version this statement read, compared with the latest
+            // once the lock is held.
+            let seen = match storage.row_state(slot, rowid)? {
+                Some(state) => storage
+                    .visible_row_home_at(
+                        slot,
+                        rowid,
+                        state,
+                        txid,
+                        crate::storage::SNAPSHOT_ALL,
+                        storage.commit_snapshot(),
+                    )?
+                    .map(|home| home.snapshot()),
+                None => None,
+            };
+            // A cursor fetching under a newer statement snapshot can meet a
+            // row deleted since it was read.
+            let Some(seen) = seen else {
+                return if storage.keeps_transaction_snapshot(txid) {
+                    Err(crate::sql::exec::concurrent_change(false))
+                } else {
+                    Ok(false)
+                };
+            };
+            let Some(locked) = crate::sql::exec::lock_selected_row(
+                storage,
+                txid,
+                slot,
+                rowid,
+                seen,
+                clause.strength,
+                clause.wait,
+            )?
+            else {
+                return Ok(false);
+            };
+            if !crate::sql::exec::locked_result_row_current(
+                storage,
+                txid,
+                slot,
+                rowid,
+                seen,
+                locked,
+                clause.strength,
+            )? {
+                return Ok(false);
             }
         }
     }

@@ -3296,23 +3296,10 @@ fn parent_has_key(
         LockedVersion::Updated(home) if uses_transaction_snapshot(isolation) => {
             // A key share lock survives a committed change that kept every
             // unique key column, as PostgreSQL's tuple lock does.
-            let latest = storage.row_bytes(row_table, rowid, home, arena)?;
-            let selected = storage.row_bytes(row_table, rowid, seen, arena)?;
-            let mut schema = [ColType::Bool; MAX_COLUMNS];
-            physical.schema(&mut schema);
-            let schema = &schema[..physical.n_columns];
-            let mut latest_values = [Datum::Null; MAX_COLUMNS];
-            let mut selected_values = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(latest, schema, &mut latest_values)?;
-            rowenc::decode(selected, schema, &mut selected_values)?;
-            let key_changed = (0..physical.n_columns).any(|column| {
-                latest_values[column] != selected_values[column]
-                    && super::row_conflicts::is_key_column(storage, &physical, column, txid)
-            });
-            if key_changed {
-                Err(concurrent_change(false))
-            } else {
+            if super::row_conflicts::key_unchanged(storage, txid, row_table, rowid, seen, home)? {
                 Ok(true)
+            } else {
+                Err(concurrent_change(false))
             }
         }
         LockedVersion::Updated(home) => {

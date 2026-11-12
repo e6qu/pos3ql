@@ -24236,10 +24236,11 @@ impl Engine {
                         "could not serialize access due to concurrent update"
                     ));
                 }
+                // PostgreSQL's row lock reports a deletion as an update too.
                 query::LockedRow::Deleted if repeatable => {
                     return Err(sql_err!(
                         sqlstate::SERIALIZATION_FAILURE,
-                        "could not serialize access due to concurrent delete"
+                        "could not serialize access due to concurrent update"
                     ));
                 }
                 query::LockedRow::Updated => {

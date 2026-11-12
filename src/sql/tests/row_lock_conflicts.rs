@@ -321,3 +321,139 @@ fn parent_row_locks_fill_the_row_lock_registry_with_a_named_error() {
     drop((session, engine));
     let _ = std::fs::remove_dir_all(config.data_dir);
 }
+
+const ACCOUNTS: &str = "CREATE TABLE accounts (id int PRIMARY KEY, balance int); \
+     INSERT INTO accounts VALUES (1, 100), (2, 200)";
+
+#[test]
+fn read_committed_write_after_a_wait_uses_the_latest_committed_row() {
+    for mode in MODES {
+        let mut sessions = sessions("read-committed-recheck", mode, ACCOUNTS);
+        // The waiting update adds to the committed balance, not the one it
+        // first read (no lost update).
+        sessions.first("BEGIN; UPDATE accounts SET balance = balance + 1 WHERE id = 1");
+        let update = "UPDATE accounts SET balance = balance + 10 WHERE id = 1";
+        let parked = sessions.second_waits(update);
+        sessions.first("COMMIT");
+        let output = sessions.resume_second(update, parked);
+        assert!(error_sqlstates(&output).is_empty(), "{mode:?}");
+        assert_eq!(
+            sessions.rows("SELECT balance FROM accounts WHERE id = 1"),
+            ["111"]
+        );
+
+        // A row that no longer meets the condition is skipped.
+        sessions.first("BEGIN; UPDATE accounts SET balance = 0 WHERE id = 2");
+        let update = "UPDATE accounts SET balance = balance + 10 WHERE balance = 200";
+        let parked = sessions.second_waits(update);
+        sessions.first("COMMIT");
+        let output = sessions.resume_second(update, parked);
+        assert!(
+            String::from_utf8_lossy(&output).contains("UPDATE 0"),
+            "{mode:?}"
+        );
+
+        // A deleted row is neither updated back nor deleted twice.
+        sessions.first("BEGIN; DELETE FROM accounts WHERE id = 2");
+        let update = "UPDATE accounts SET balance = 5 WHERE id = 2";
+        let parked = sessions.second_waits(update);
+        sessions.first("COMMIT");
+        let output = sessions.resume_second(update, parked);
+        assert!(
+            String::from_utf8_lossy(&output).contains("UPDATE 0"),
+            "{mode:?}"
+        );
+        assert_eq!(
+            sessions.rows("SELECT id, balance FROM accounts ORDER BY id"),
+            ["1|111"]
+        );
+
+        // A key change moves the row out of `id = 1`.
+        sessions.first("BEGIN; UPDATE accounts SET id = 5 WHERE id = 1");
+        let delete = "DELETE FROM accounts WHERE id = 1";
+        let parked = sessions.second_waits(delete);
+        sessions.first("COMMIT");
+        let output = sessions.resume_second(delete, parked);
+        assert!(
+            String::from_utf8_lossy(&output).contains("DELETE 0"),
+            "{mode:?}"
+        );
+        assert_eq!(
+            sessions.rows("SELECT id, balance FROM accounts ORDER BY id"),
+            ["5|111"]
+        );
+
+        // SELECT ... FOR UPDATE skips a row deleted while it waited.
+        sessions.first("BEGIN; DELETE FROM accounts WHERE id = 5");
+        let select = "SELECT id FROM accounts WHERE id = 5 FOR UPDATE";
+        let parked = sessions.second_waits(select);
+        sessions.first("COMMIT");
+        let output = sessions.resume_second(select, parked);
+        assert!(data_rows(&output).is_empty(), "{mode:?}");
+        sessions.finish();
+    }
+}
+
+#[test]
+fn repeatable_read_writes_fail_on_rows_changed_after_the_snapshot() {
+    let mut sessions = sessions("repeatable-read-writes", TransactionMode::Mvcc, ACCOUNTS);
+    for (concurrent, statement, sqlstate_message) in [
+        (
+            "UPDATE accounts SET balance = balance + 1 WHERE id = 1",
+            "UPDATE accounts SET balance = 9 WHERE id = 1",
+            "concurrent update",
+        ),
+        (
+            "DELETE FROM accounts WHERE id = 1",
+            "UPDATE accounts SET balance = 9 WHERE id = 1",
+            "concurrent delete",
+        ),
+        (
+            "UPDATE accounts SET balance = balance + 1 WHERE id = 1",
+            "DELETE FROM accounts WHERE id = 1",
+            "concurrent update",
+        ),
+        (
+            "DELETE FROM accounts WHERE id = 1",
+            "MERGE INTO accounts USING (SELECT 1 AS id) s ON accounts.id = s.id \
+             WHEN MATCHED THEN UPDATE SET balance = 9",
+            "concurrent delete",
+        ),
+        (
+            "UPDATE accounts SET balance = balance + 1 WHERE id = 1",
+            "SELECT id FROM accounts WHERE id = 1 FOR UPDATE",
+            "concurrent update",
+        ),
+        (
+            "DELETE FROM accounts WHERE id = 1",
+            "SELECT id FROM accounts WHERE id = 1 FOR KEY SHARE",
+            "concurrent update",
+        ),
+    ] {
+        sessions.first("DELETE FROM accounts; INSERT INTO accounts VALUES (1, 100), (2, 200)");
+        sessions.second("BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM accounts");
+        sessions.first(concurrent);
+        let output = sessions.second(statement);
+        assert_eq!(
+            error_sqlstates(&output),
+            ["40001"],
+            "{concurrent} | {statement}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output).contains(&format!(
+                "could not serialize access due to {sqlstate_message}"
+            )),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        sessions.second("ROLLBACK");
+    }
+    // A key share lock survives a change that kept every key column.
+    sessions.first("DELETE FROM accounts; INSERT INTO accounts VALUES (1, 100)");
+    sessions.second("BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM accounts");
+    sessions.first("UPDATE accounts SET balance = 7 WHERE id = 1");
+    let output = sessions.second("SELECT balance FROM accounts WHERE id = 1 FOR KEY SHARE");
+    assert_eq!(data_rows(&output), ["100"]);
+    sessions.second("ROLLBACK");
+    sessions.finish();
+}

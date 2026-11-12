@@ -59,6 +59,21 @@ referencing rows they check or rewrite. Each locked row takes one entry of the
 row-lock registry, (`max_connections` + `max_prepared_transactions`) ×
 `txn_rows` entries in total; a full registry fails the statement with `54000`.
 
+**Writes that meet a concurrently changed row.** `UPDATE`, `DELETE`,
+`MERGE` and `SELECT ... FOR UPDATE` (or `FOR SHARE`, `FOR KEY SHARE`, `FOR NO
+KEY UPDATE`) lock each row they select. When another transaction changed that
+row after the statement's snapshot, `READ COMMITTED` continues with the row's
+latest committed version, as PostgreSQL does: `UPDATE accounts SET balance =
+balance + 10` that waited for another session's `+ 1` stores the sum of both,
+a row that no longer meets the `WHERE` condition is skipped, and a deleted row
+is neither updated nor deleted again. `REPEATABLE READ` and `SERIALIZABLE`
+fail such a statement with `40001` (`could not serialize access due to
+concurrent update`, or `concurrent delete` for an `UPDATE`, `DELETE` or
+`MERGE` of a deleted row); `FOR KEY SHARE` still succeeds when the change kept
+every unique key column. Under `READ COMMITTED`, `MERGE` and `SELECT ... FOR`
+outside a cursor do not yet re-evaluate a row that was updated: they act on or
+return the version they read (see [PLAN.md](../PLAN.md#close-application-compatibility-gaps)).
+
 A commit becomes visible all at once, and only after it is durable: new
 statements never see half of an order-and-invoice update. If commit waits for
 storage, completed work is not repeated; a default that issued an order number

@@ -263,13 +263,9 @@ streams only once its output overflows.
 
 A statement that does not stream restarts from its start after each cold
 read, finding the objects its earlier attempts read only in the block
-caches. Once it has restarted more times than the caches and the object
-read slots hold blocks (`block_cache_bytes`, `disk_cache_bytes` and
-`object_store_get_slots`), its next attempt reads storage synchronously,
-blocking the worker, instead of restarting again: its input may have
-outgrown the caches, so each attempt could evict blocks the next one needs
-and it would never finish. A result stream resumes from its read position
-and never restarts this way.
+caches; one whose input outgrows those caches can keep restarting (see the
+[plan](../PLAN.md)). A result stream resumes from its read position and never
+restarts this way.
 
 A forward `FETCH n` or `FETCH ALL` (simple Query or unpaged `Execute`) from
 a cursor that reads as it fetches and saves no history opens such a stream

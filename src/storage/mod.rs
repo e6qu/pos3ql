@@ -47130,6 +47130,19 @@ impl Storage {
         self.has_routine_candidate(name, arity, txid, |_, _| true)
     }
 
+    /// Whether a visible routine other than an aggregate could answer `name`
+    /// with `arity` arguments, such as a `sum(integer)` function.
+    pub(crate) fn has_non_aggregate_routine_candidate(
+        &self,
+        name: &str,
+        arity: usize,
+        txid: u32,
+    ) -> bool {
+        self.has_routine_candidate(name, arity, txid, |kind, _| {
+            !matches!(kind, RoutineKind::Aggregate(_))
+        })
+    }
+
     pub(crate) fn has_volatile_function_routine_candidate(
         &self,
         name: &str,

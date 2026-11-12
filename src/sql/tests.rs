@@ -101245,3 +101245,37 @@ fn pseudo_type_columns_fail_like_postgresql() {
     let output = session.execute(&mut engine, "CREATE TABLE p(c anyelement[])", false);
     assert_eq!(error_sqlstates(&output), ["42704"]);
 }
+
+#[test]
+fn spilled_grouping_keys_read_enclosing_aggregates() {
+    for external in [false, true] {
+        let mut config = test_config(if external {
+            "outer-aggregate-key-external"
+        } else {
+            "outer-aggregate-key-inline"
+        });
+        config.object_store_on = external;
+        config.object_store_sim = external;
+        config.object_store_bucket =
+            format!("outer-aggregate-key-{}-{external}", std::process::id());
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        assert_eq!(engine.storage.spill_attached(), external);
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE oak_t (id int); CREATE TABLE oak_u (x int); \
+             INSERT INTO oak_t VALUES (1),(2),(3); INSERT INTO oak_u VALUES (5),(6)",
+        );
+        assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+        // The inner query groups by the outer query's aggregate.
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT (SELECT count(*) FROM oak_u GROUP BY max(oak_t.id)) FROM oak_t",
+            )),
+            ["2"]
+        );
+    }
+}

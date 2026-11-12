@@ -135,13 +135,15 @@ pub(super) fn admit_grouping<'a>(
             return Ok(None);
         }
     }
-    // A user routine that could answer an aggregate's name, such as a
+    // A user function that could answer an aggregate's name, such as a
     // `sum(integer)` function, is resolved by the general executor.
     if aggregates
         .as_slice()
         .iter()
         .any(|&(_, aggregate)| match aggregate {
-            Expr::Call { name, args, .. } => storage.has_callable_candidate(name, args.len(), txid),
+            Expr::Call { name, args, .. } => {
+                storage.has_non_aggregate_routine_candidate(name, args.len(), txid)
+            }
             _ => false,
         })
     {

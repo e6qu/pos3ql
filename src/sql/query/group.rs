@@ -287,6 +287,9 @@ pub(super) fn groups_for_mask<'a>(
                     };
                     &row_hooks_store
                 };
+                // Outer references, such as an enclosing query's aggregate,
+                // read the caller's row.
+                let row = &super::scan::Chained { inner: row, outer };
                 let mut key_vals = [Datum::Null; crate::sql::parser::MAX_GROUP_TERMS];
                 for (k, g) in statement.group_by.iter().enumerate() {
                     if mask.contains(k) {

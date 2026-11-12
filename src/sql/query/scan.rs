@@ -867,6 +867,7 @@ pub(super) enum PaxFullRowReason {
     UnprovableExpression,
     RowSecurityPolicy,
     WideColumn,
+    RetainedJoinRow,
 }
 
 /// The only two legal physical read modes for a source scan.

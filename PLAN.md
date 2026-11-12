@@ -380,11 +380,7 @@ table's or view's row type cannot
 appear in a routine signature: `CREATE FUNCTION f(orders)` fails with `0A000`
 where PostgreSQL accepts it. Under `READ COMMITTED`, a locked row's recheck
 fails with `0A000` for a simple `LATERAL` subquery that reads tables (PostgreSQL
-keeps the rows it first joined); an `UPDATE ... FROM` or `DELETE ... USING`
-recheck runs its join again instead of keeping the joined rows; under
-`REPEATABLE READ`, a foreign key check against a partitioned parent that
-waited for the parent row's deletion or move reports `23503` where PostgreSQL
-fails with `40001`. `RETURNING`
+keeps the rows it first joined). `RETURNING`
 of `UPDATE ... FROM` and `DELETE ... USING` cannot read the `FROM`/`USING`
 items (`42P01`). The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current

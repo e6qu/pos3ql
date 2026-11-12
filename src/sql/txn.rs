@@ -447,6 +447,9 @@ pub struct TxnState {
     /// The top-level write waiting inside its rows; its next run continues
     /// at the unfinished row. Ending or canceling the statement releases it.
     retained_write: Option<super::exec::RetainedWrite>,
+    /// The snapshot of the foreign key check that made the running statement
+    /// wait for a parent row's lock; that check runs again under it.
+    awaited_parent_read: Option<(ConstraintIdentity, crate::storage::ValidationRead)>,
     /// Saved procedure bodies currently running, and whether a wait inside
     /// one reached a position no saved frame can own, so the whole statement
     /// must instead roll back and run again.
@@ -1166,6 +1169,7 @@ impl TxnState {
             pending_write_completion: None,
             pending_procedure: None,
             retained_write: None,
+            awaited_parent_read: None,
             running_procedures: 0,
             procedure_restart: false,
             cache_capacity_wait: None,
@@ -1706,6 +1710,7 @@ impl TxnState {
     pub(crate) fn release_suspended_statement(&mut self) {
         self.suspended_statement = None;
         self.retained_write = None;
+        self.awaited_parent_read = None;
         self.cache_capacity_wait = None;
         self.checkpoint_request = None;
     }
@@ -1721,7 +1726,30 @@ impl TxnState {
         let command = self.next_command_identity()?;
         self.command_counter = command;
         self.command_id = command;
+        self.awaited_parent_read = None;
         Ok(())
+    }
+
+    /// Keeps the snapshot of the foreign key check `constraint` that waits for
+    /// a parent row's lock.
+    pub(crate) fn await_parent_read(
+        &mut self,
+        constraint: ConstraintIdentity,
+        read: crate::storage::ValidationRead,
+    ) {
+        self.awaited_parent_read = Some((constraint, read));
+    }
+
+    /// The snapshot the waiting foreign key check `constraint` started with.
+    pub(crate) fn take_awaited_parent_read(
+        &mut self,
+        constraint: ConstraintIdentity,
+    ) -> Option<crate::storage::ValidationRead> {
+        let (awaited, read) = self.awaited_parent_read?;
+        (awaited == constraint).then(|| {
+            self.awaited_parent_read = None;
+            read
+        })
     }
 
     #[cfg(test)]
@@ -3352,6 +3380,7 @@ impl TxnState {
         self.pending_write_completion = None;
         self.pending_procedure = None;
         self.retained_write = None;
+        self.awaited_parent_read = None;
         self.procedure_restart = false;
         self.write_completion_boundary = None;
         self.concurrent_index = None;

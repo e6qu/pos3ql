@@ -126,6 +126,9 @@ impl DmlTableLayout<'_> {
 pub(super) struct DmlRowImages<'arena> {
     rows: ArenaList<'arena, DmlRowImage<'arena>>,
     tables: ArenaList<'arena, DmlTableLayout<'arena>>,
+    /// The FROM row each selected target row of `UPDATE ... FROM` joined,
+    /// keyed by the target row's `PhysicalRow::sort_key`.
+    joined: ArenaList<'arena, ((usize, u64), super::query::JoinedFromRow<'arena>)>,
 }
 
 impl<'arena> DmlRowImages<'arena> {
@@ -133,7 +136,47 @@ impl<'arena> DmlRowImages<'arena> {
         Self {
             rows: ArenaList::new(arena),
             tables: ArenaList::new(arena),
+            joined: ArenaList::new(arena),
         }
+    }
+
+    fn push_joined(
+        &mut self,
+        row: PhysicalRow,
+        joined: super::query::JoinedFromRow<'arena>,
+    ) -> Result<(), SqlError> {
+        self.joined.push((row.sort_key(), joined)).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "joined FROM rows exceed the statement arena"
+            )
+        })
+    }
+
+    /// A read committed recheck continues with the FROM row that still meets
+    /// the statement's conditions for the target row's latest version.
+    fn replace_joined(
+        &mut self,
+        row: PhysicalRow,
+        joined: super::query::JoinedFromRow<'arena>,
+    ) -> Result<(), SqlError> {
+        let rows = self.joined.as_mut_slice().map_err(|_| arena_full())?;
+        if let Ok(index) = rows.binary_search_by_key(&row.sort_key(), |(key, _)| *key) {
+            rows[index].1 = joined;
+        }
+        Ok(())
+    }
+
+    fn joined(&self, row: PhysicalRow) -> Result<super::query::JoinedFromRow<'arena>, SqlError> {
+        let rows = self.joined.as_slice();
+        rows.binary_search_by_key(&row.sort_key(), |(key, _)| *key)
+            .map(|index| rows[index].1)
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "selected DML row has no retained FROM row"
+                )
+            })
     }
 
     #[expect(
@@ -238,6 +281,10 @@ impl<'arena> DmlRowImages<'arena> {
             .as_mut_slice()
             .map_err(|_| arena_full())?
             .sort_unstable_by_key(|row| (row.table, row.rowid));
+        self.joined
+            .as_mut_slice()
+            .map_err(|_| arena_full())?
+            .sort_unstable_by_key(|(key, _)| *key);
         Ok(self)
     }
 
@@ -273,6 +320,11 @@ pub(super) enum DmlCapture {
 }
 
 impl DmlCapture {
+    /// `UPDATE ... FROM` assignments read the FROM row each target row joined.
+    fn retains_joined(self) -> bool {
+        matches!(self, Self::Update { .. })
+    }
+
     fn command(self) -> u32 {
         match self {
             Self::Update { command } | Self::Delete { command, .. } => command,
@@ -375,7 +427,7 @@ impl<'a, Definition: crate::storage::DefinitionBacking> DmlRequalify<'_, 'a, Def
         seen: crate::storage::RowSnapshot,
         latest: crate::storage::VisibleRowHome,
         arena: &'a Arena,
-    ) -> Result<Option<&'a [u8]>, SqlError> {
+    ) -> Result<Option<RequalifiedRow<'a>>, SqlError> {
         let bytes = storage.row_bytes(table, rowid, latest, arena)?;
         let mut physical = [Datum::Null; MAX_COLUMNS];
         rowenc::decode(bytes, layout.schema, &mut physical)?;
@@ -397,8 +449,12 @@ impl<'a, Definition: crate::storage::DefinitionBacking> DmlRequalify<'_, 'a, Def
             )? {
                 return Ok(None);
             }
+            let unjoined = RequalifiedRow {
+                bytes,
+                joined: None,
+            };
             let Some(predicate) = self.where_clause else {
-                return Ok(Some(bytes));
+                return Ok(Some(unjoined));
             };
             // The version the statement selected, for the semi-joins whose
             // recheck keeps the subquery row it first matched.
@@ -442,7 +498,7 @@ impl<'a, Definition: crate::storage::DefinitionBacking> DmlRequalify<'_, 'a, Def
                 self.params,
                 self.hooks,
             )?;
-            return Ok(matched.then_some(bytes));
+            return Ok(matched.then_some(unjoined));
         };
         let context = RowCtx {
             def: crate::storage::RelationDefinition::from_definition(self.def),
@@ -462,28 +518,54 @@ impl<'a, Definition: crate::storage::DefinitionBacking> DmlRequalify<'_, 'a, Def
         {
             return Ok(None);
         }
-        let joined = self.outer.map(|outer| JoinedTriggerDmlScope {
+        let first_bytes = storage.row_bytes(table, rowid, seen, arena)?;
+        let mut first_physical = [Datum::Null; MAX_COLUMNS];
+        rowenc::decode(first_bytes, layout.schema, &mut first_physical)?;
+        let mut first_values = [Datum::Null; MAX_COLUMNS];
+        layout.project(&first_physical, &mut first_values);
+        let first_row = RowCtx {
+            values: &first_values[..self.def.n_columns],
+            ..context
+        };
+        let first_joined = self.outer.map(|outer| JoinedTriggerDmlScope {
+            row: &first_row,
+            outer,
+        });
+        let latest_joined = self.outer.map(|outer| JoinedTriggerDmlScope {
             row: &context,
             outer,
         });
-        let target: &dyn ColumnLookup<'_> = match joined.as_ref() {
-            Some(joined) => joined,
-            None => &context,
-        };
-        let matched = super::query::first_from_match(
+        let joined = super::query::recheck_joined_from_match(
             storage,
             from,
             txid,
             self.where_clause,
-            &[],
             arena,
             self.params,
-            target,
-            &mut |_| Ok(()),
+            match first_joined.as_ref() {
+                Some(joined) => joined,
+                None => &first_row,
+            },
+            match latest_joined.as_ref() {
+                Some(joined) => joined,
+                None => &context,
+            },
             self.sequences,
+            arena,
         )?;
-        Ok(matched.then_some(bytes))
+        Ok(joined.map(|joined| RequalifiedRow {
+            bytes,
+            joined: Some(joined),
+        }))
     }
+}
+
+/// A selected row's latest version that still meets the statement's
+/// conditions, with the FROM row an `UPDATE ... FROM` or `DELETE ... USING`
+/// recheck joined it to.
+struct RequalifiedRow<'a> {
+    bytes: &'a [u8],
+    joined: Option<super::query::JoinedFromRow<'a>>,
 }
 
 /// Locks every selected row before any row changes, as PostgreSQL does. A
@@ -545,9 +627,13 @@ fn lock_selected_dml_rows<'a, Definition: crate::storage::DefinitionBacking>(
                 match requalify
                     .latest(storage, txn.txid, layout, table, rowid, home, latest, arena)?
                 {
-                    Some(bytes) => {
-                        retained_rows.replace(table, rowid, bytes)?;
-                        Some(PhysicalRow::local(table, rowid, snapshot))
+                    Some(requalified) => {
+                        retained_rows.replace(table, rowid, requalified.bytes)?;
+                        let row = PhysicalRow::local(table, rowid, snapshot);
+                        if let Some(joined) = requalified.joined {
+                            retained_rows.replace_joined(row, joined)?;
+                        }
+                        Some(row)
                     }
                     None => None,
                 }
@@ -73378,11 +73464,7 @@ pub(crate) fn update<'a>(
                 let expression_snapshot = storage.dml_expression_snapshot(txn.command_id());
                 if let Some(from) = statement.from {
                     // UPDATE ... FROM: evaluate the assignments against the target
-                    // row joined with the first matching FROM row.
-                    let mut observed = [&Expr::Null; MAX_COLUMNS];
-                    for (index, (_, expression)) in statement.assignments.iter().enumerate() {
-                        observed[index] = expression;
-                    }
+                    // row joined with the FROM row its selection retained.
                     let joined_scope = outer.map(|outer| JoinedTriggerDmlScope {
                         row: &context,
                         outer,
@@ -73412,17 +73494,26 @@ pub(crate) fn update<'a>(
                             };
                         }
                     }
-                    let matched = {
-                        let r = super::query::first_from_match(
+                    let joined_row = match retained_rows.joined(scratch[i]) {
+                        Ok(joined) => joined,
+                        Err(error) => return sql_fail(error),
+                    };
+                    {
+                        let r = super::query::with_joined_from_row(
                             storage,
                             from,
                             txn.txid,
                             statement.where_clause,
-                            &observed[..statement.assignments.len()],
                             arena,
                             params,
+                            Some(&crate::sql::sequence::SeqEval::new(
+                                storage,
+                                seq_session,
+                                txn.txid,
+                            )),
                             joined_target,
-                            &mut |combined| {
+                            joined_row,
+                            |combined| {
                                 for (a, (_, expression)) in statement.assignments.iter().enumerate()
                                 {
                                     // A generated target's `= DEFAULT` is a no-op here; it
@@ -73494,18 +73585,11 @@ pub(crate) fn update<'a>(
                                 }
                                 Ok(())
                             },
-                            Some(&crate::sql::sequence::SeqEval::new(
-                                storage,
-                                seq_session,
-                                txn.txid,
-                            )),
                         );
-                        match r {
-                            Ok(matched) => matched,
-                            Err(error) => return sql_fail(error),
+                        if let Err(error) = r {
+                            return sql_fail(error);
                         }
-                    };
-                    debug_assert!(matched, "the joined row collector selected this target");
+                    }
                 } else {
                     // `nextval`/`setval` in a SET expression advance once per updated
                     // row; a scoped sequence evaluator (shared `&storage`) supplies
@@ -82242,30 +82326,50 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                 {
                     return Ok(());
                 }
-                if super::query::first_from_match(
-                    storage,
-                    from,
-                    txid,
-                    where_clause,
-                    &[],
-                    arena,
-                    params,
-                    &context,
-                    &mut |_| Ok(()),
-                    None,
-                )? {
-                    scratch
-                        .push(PhysicalRow::Foreign {
-                            table_index,
-                            tuple_id,
-                        })
-                        .map_err(|error| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement row selection: {}",
-                                error
-                            )
-                        })?;
+                let row = PhysicalRow::Foreign {
+                    table_index,
+                    tuple_id,
+                };
+                let matched = if capture.retains_joined() {
+                    match super::query::joined_from_match(
+                        storage,
+                        from,
+                        txid,
+                        where_clause,
+                        arena,
+                        params,
+                        &context,
+                        None,
+                        arena,
+                    )? {
+                        Some(joined) => {
+                            images.push_joined(row, joined)?;
+                            true
+                        }
+                        None => false,
+                    }
+                } else {
+                    super::query::first_from_match(
+                        storage,
+                        from,
+                        txid,
+                        where_clause,
+                        &[],
+                        arena,
+                        params,
+                        &context,
+                        &mut |_| Ok(()),
+                        None,
+                    )?
+                };
+                if matched {
+                    scratch.push(row).map_err(|error| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "statement row selection: {}",
+                            error
+                        )
+                    })?;
                 }
                 Ok(())
             },
@@ -82291,6 +82395,7 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                 // Consume-in-place, as in row_matches: the joined-row probe reads
                 // this row's values only while it runs.
                 let snapshot = loc.snapshot();
+                let mut joined = None;
                 let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
                     let mark = arena.mark();
                     let found = (|| -> Result<bool, SqlError> {
@@ -82310,18 +82415,33 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                         {
                             return Ok(false);
                         }
-                        super::query::first_from_match(
-                            storage,
-                            from,
-                            txid,
-                            where_clause,
-                            &[],
-                            arena,
-                            params,
-                            &context,
-                            &mut |_| Ok(()),
-                            None,
-                        )
+                        if capture.retains_joined() {
+                            joined = super::query::joined_from_match(
+                                storage,
+                                from,
+                                txid,
+                                where_clause,
+                                arena,
+                                params,
+                                &context,
+                                None,
+                                arena,
+                            )?;
+                            Ok(joined.is_some())
+                        } else {
+                            super::query::first_from_match(
+                                storage,
+                                from,
+                                txid,
+                                where_clause,
+                                &[],
+                                arena,
+                                params,
+                                &context,
+                                &mut |_| Ok(()),
+                                None,
+                            )
+                        }
                     })();
                     // SAFETY: joined predicates retain no decoded values or front scratch.
                     unsafe { arena.rewind_to(mark) };
@@ -82338,15 +82458,17 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                     if let MatchedDmlRow::Bytes(bytes) = image {
                         images.push(leaf, rowid, bytes)?;
                     }
-                    scratch
-                        .push(PhysicalRow::local(leaf, rowid, snapshot))
-                        .map_err(|error| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement row selection: {}",
-                                error
-                            )
-                        })?;
+                    let row = PhysicalRow::local(leaf, rowid, snapshot);
+                    if let Some(joined) = joined {
+                        images.push_joined(row, joined)?;
+                    }
+                    scratch.push(row).map_err(|error| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "statement row selection: {}",
+                            error
+                        )
+                    })?;
                 }
                 Ok(ControlFlow::Continue(()))
             },
@@ -82411,30 +82533,50 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                     row: &context,
                     outer,
                 };
-                if super::query::first_from_match(
-                    storage,
-                    from,
-                    txid,
-                    where_clause,
-                    &[],
-                    arena,
-                    params,
-                    &scope,
-                    &mut |_| Ok(()),
-                    None,
-                )? {
-                    scratch
-                        .push(PhysicalRow::Foreign {
-                            table_index,
-                            tuple_id,
-                        })
-                        .map_err(|error| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement row selection: {}",
-                                error
-                            )
-                        })?;
+                let row = PhysicalRow::Foreign {
+                    table_index,
+                    tuple_id,
+                };
+                let matched = if capture.retains_joined() {
+                    match super::query::joined_from_match(
+                        storage,
+                        from,
+                        txid,
+                        where_clause,
+                        arena,
+                        params,
+                        &scope,
+                        None,
+                        arena,
+                    )? {
+                        Some(joined) => {
+                            images.push_joined(row, joined)?;
+                            true
+                        }
+                        None => false,
+                    }
+                } else {
+                    super::query::first_from_match(
+                        storage,
+                        from,
+                        txid,
+                        where_clause,
+                        &[],
+                        arena,
+                        params,
+                        &scope,
+                        &mut |_| Ok(()),
+                        None,
+                    )?
+                };
+                if matched {
+                    scratch.push(row).map_err(|error| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "statement row selection: {}",
+                            error
+                        )
+                    })?;
                 }
                 Ok(())
             },
@@ -82458,6 +82600,7 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                 };
                 storage.record_relation_tuple_read(txid, leaf, None)?;
                 let snapshot = loc.snapshot();
+                let mut joined = None;
                 let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
                     let mark = arena.mark();
                     let found = (|| -> Result<bool, SqlError> {
@@ -82481,18 +82624,33 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                             row: &context,
                             outer,
                         };
-                        super::query::first_from_match(
-                            storage,
-                            from,
-                            txid,
-                            where_clause,
-                            &[],
-                            arena,
-                            params,
-                            &scope,
-                            &mut |_| Ok(()),
-                            None,
-                        )
+                        if capture.retains_joined() {
+                            joined = super::query::joined_from_match(
+                                storage,
+                                from,
+                                txid,
+                                where_clause,
+                                arena,
+                                params,
+                                &scope,
+                                None,
+                                arena,
+                            )?;
+                            Ok(joined.is_some())
+                        } else {
+                            super::query::first_from_match(
+                                storage,
+                                from,
+                                txid,
+                                where_clause,
+                                &[],
+                                arena,
+                                params,
+                                &scope,
+                                &mut |_| Ok(()),
+                                None,
+                            )
+                        }
                     })();
                     // SAFETY: joined predicates retain no decoded values or front scratch.
                     unsafe { arena.rewind_to(mark) };
@@ -82509,15 +82667,17 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                     if let MatchedDmlRow::Bytes(bytes) = image {
                         images.push(leaf, rowid, bytes)?;
                     }
-                    scratch
-                        .push(PhysicalRow::local(leaf, rowid, snapshot))
-                        .map_err(|error| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement row selection: {}",
-                                error
-                            )
-                        })?;
+                    let row = PhysicalRow::local(leaf, rowid, snapshot);
+                    if let Some(joined) = joined {
+                        images.push_joined(row, joined)?;
+                    }
+                    scratch.push(row).map_err(|error| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "statement row selection: {}",
+                            error
+                        )
+                    })?;
                 }
                 Ok(ControlFlow::Continue(()))
             },

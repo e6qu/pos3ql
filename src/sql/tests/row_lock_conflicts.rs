@@ -1020,5 +1020,89 @@ fn foreign_key_checks_follow_partitioned_parents_as_postgresql_does() {
         assert_eq!(error_sqlstates(&output), expected, "{change}");
         sessions.second("ROLLBACK");
     }
+    // A check that waited for the parent's deletion or move keeps the
+    // snapshot it started with: repeatable read fails with 40001, and read
+    // committed does not find a parent inserted again under the same key.
+    for (isolation, change, expected) in [
+        ("REPEATABLE READ", "DELETE FROM fp WHERE id = 6", "40001"),
+        ("SERIALIZABLE", "UPDATE fp SET id = 7 WHERE id = 6", "40001"),
+        (
+            "READ COMMITTED",
+            "DELETE FROM fp WHERE id = 6; INSERT INTO fp VALUES (6, 1)",
+            "23503",
+        ),
+    ] {
+        sessions.first("DELETE FROM fp; INSERT INTO fp VALUES (6, 1)");
+        sessions.second(&format!(
+            "BEGIN ISOLATION LEVEL {isolation}; SELECT count(*) FROM fc"
+        ));
+        sessions.first(&format!("BEGIN; {change}"));
+        let insert = "INSERT INTO fc VALUES (6, 6, 1)";
+        let parked = sessions.second_waits(insert);
+        sessions.first("COMMIT");
+        let output = sessions.resume_second(insert, parked);
+        assert_eq!(error_sqlstates(&output), [expected], "{isolation} {change}");
+        sessions.second("ROLLBACK");
+    }
+    sessions.finish();
+}
+
+const JOINED: &str = "CREATE TABLE ut (id int PRIMARY KEY, k int, v int); \
+     CREATE TABLE uf (k int, label text); \
+     CREATE TABLE ug (k int, n int); \
+     INSERT INTO uf VALUES (1, 'one'), (2, 'two'), (3, 'three'); \
+     INSERT INTO ug VALUES (1, 10), (2, 20)";
+
+#[test]
+fn read_committed_from_rechecks_keep_the_joined_from_rows() {
+    let mut sessions = sessions("joined-from-recheck", TransactionMode::Mvcc, JOINED);
+    // PostgreSQL rechecks the target's latest version against the FROM
+    // row it joined; it does not join the new key to another FROM row.
+    // The second FROM row the first version joined still qualifies, and
+    // the assignments read it.
+    for (statement, tag, rows) in [
+        (
+            "UPDATE ut SET v = v + 1 FROM uf WHERE ut.k = uf.k AND ut.id = 1",
+            "UPDATE 0",
+            &["1|2|0", "2|2|0"][..],
+        ),
+        (
+            "UPDATE ut SET v = length(uf.label) FROM uf WHERE ut.k = uf.k OR uf.k = 3",
+            "UPDATE 2",
+            &["1|2|5", "2|2|3"][..],
+        ),
+        (
+            "UPDATE ut SET v = s.n FROM (SELECT k, n FROM ug) s WHERE ut.k = s.k",
+            "UPDATE 1",
+            &["1|2|0", "2|2|20"][..],
+        ),
+        (
+            "UPDATE ut SET v = coalesce(g.n, -1) FROM uf LEFT JOIN ug g ON g.k = uf.k + 1 \
+             WHERE ut.k = uf.k",
+            "UPDATE 1",
+            &["1|2|0", "2|2|-1"][..],
+        ),
+        (
+            "DELETE FROM ut USING uf WHERE ut.k = uf.k AND uf.label = 'one'",
+            "DELETE 0",
+            &["1|2|0", "2|2|0"][..],
+        ),
+    ] {
+        sessions.first("DELETE FROM ut; INSERT INTO ut VALUES (1, 1, 0), (2, 2, 0)");
+        sessions.first("BEGIN; UPDATE ut SET k = 2 WHERE id = 1");
+        let parked = sessions.second_waits(statement);
+        sessions.first("COMMIT");
+        let output = sessions.resume_second(statement, parked);
+        assert!(
+            String::from_utf8_lossy(&output).contains(tag),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(
+            sessions.rows("SELECT * FROM ut ORDER BY id"),
+            rows,
+            "{statement}"
+        );
+    }
     sessions.finish();
 }

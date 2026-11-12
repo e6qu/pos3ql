@@ -56,7 +56,12 @@ READ` and `SERIALIZABLE`, an insert whose parent was deleted or had its key
 changed after the transaction's snapshot fails with `40001`; a partitioned
 parent table is read with a current snapshot instead, as PostgreSQL's check
 does, so a parent inserted after the snapshot counts and one deleted after it
-fails the insert with `23503`. Changing other
+fails the insert with `23503`. A check that waited for the parent row keeps
+the snapshot it started with, as PostgreSQL's check query does: under read
+committed a parent deleted and inserted again with the same key while the
+check waited does not count (`23503`), and under repeatable read a parent
+deleted or moved while a check of a partitioned parent waited fails it with
+`40001`. Changing other
 parent columns does not conflict, nor does an assignment that keeps the key
 value, such as `UPDATE customers SET id = id`. `ON DELETE`/`ON UPDATE` actions lock the
 referencing rows they check or rewrite. Each locked row takes one entry of the
@@ -117,6 +122,16 @@ PostgreSQL's for a sequential scan of one table; a different join plan in
 PostgreSQL can pick a different first row. Other conditions, and correlated
 subqueries PostgreSQL keeps as subplans (under `OR`, with aggregates or
 volatile functions), run again over the latest version.
+
+`UPDATE ... FROM` and `DELETE ... USING` keep the `FROM` row each target row
+joined. A target row that another transaction changed is rechecked against
+that row, and the assignments read it; the statement does not join the new
+version to other `FROM` rows. When that row no longer meets the conditions,
+the next `FROM` row the first version joined is tried, as PostgreSQL tries
+each joined row in turn. For example, `UPDATE accounts SET rate = r.rate FROM
+rates r WHERE accounts.tier = r.tier` that waited for another session to move
+an account from tier 1 to tier 2 skips the account instead of giving it tier
+2's rate.
 
 A `LATERAL` source follows the same plan rules: a simple subquery without
 `FROM` (`LATERAL (SELECT t.qty * 10 AS x)`) runs again over the latest row; a

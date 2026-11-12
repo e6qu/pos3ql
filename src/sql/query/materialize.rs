@@ -410,7 +410,7 @@ impl<'a> LockedOutput<'a> {
 }
 
 /// A source row assembled from per-source values in scope order.
-fn sources_row<'s, 'a>(
+pub(super) fn sources_row<'s, 'a>(
     scope: &'s QueryScope<'a>,
     bound: &'s [Option<super::scan::BoundRow<'a>>],
     order: &'s [usize],

@@ -40,6 +40,10 @@ pub use setops::set_query;
 pub(crate) use setops::set_query_into_rows;
 
 pub(crate) mod generator;
+mod joined_from;
+pub(crate) use joined_from::{
+    JoinedFromRow, joined_from_match, recheck_joined_from_match, with_joined_from_row,
+};
 mod materialize;
 pub(crate) use materialize::{ScopeSchema, locked_row_where_passes};
 use materialize::{external_materialized_into, materialized_rows, materialized_select};
@@ -14561,83 +14565,20 @@ pub fn first_from_match<'a>(
     on_match: &mut dyn FnMut(&dyn ColumnLookup<'a>) -> Result<(), SqlError>,
     sequences: Option<&dyn SequenceAccess>,
 ) -> Result<bool, SqlError> {
-    let scope = QueryScope::resolve_exec_outer(
-        storage,
-        from,
-        where_clause,
-        txid,
-        arena,
-        params,
-        sequences,
-        Some(target),
-    )?;
-    let subquery_expressions = arena
-        .alloc_slice_with(1 + 2 * scope.n, |_| None)
-        .map_err(|_| arena_full())?;
-    subquery_expressions[0] = where_clause;
-    collect_table_sample_expressions(from, &mut subquery_expressions[1..]);
-    // A subquery reading the target or a FROM row runs per joined row.
-    let subs = uncorrelated_subquery_hooks(
-        subquery_expressions,
-        storage,
-        txid,
-        arena,
-        params,
-        Some(target),
-        sequences,
-    )?;
-    let correlated_subqueries = ProceduralSubqueries { storage, txid };
-    let catalog = StorageCatalog {
-        storage,
-        routine_workspace: arena,
-        txid,
-        invocations: None,
-        statement_arena: None,
-    };
-    let hooks = EvalHooks {
-        group: None,
-        aggs: None,
-        subs: Some(&subs),
-        subquery_executor: Some(&correlated_subqueries),
-        windows: None,
-        catalog: Some(&catalog),
-        srf_index: None,
-        project_sets: None,
-        sequences,
-        merge_action: None,
-    };
     let mut found = false;
-    let mut expressions = [&Expr::Null; MAX_PROJ + 1];
-    let mut expression_count = 0usize;
-    if let Some(predicate) = where_clause {
-        expressions[expression_count] = predicate;
-        expression_count += 1;
-    }
-    for &expression in observed {
-        expressions[expression_count] = expression;
-        expression_count += 1;
-    }
-    let pax_columns = pax_column_demand(&scope, from, &expressions[..expression_count]);
-    let retain_match = core::cell::Cell::new(false);
-    scan_source_recycling_retaining_match_with_pax_columns(
+    joined_from::scan_from_matches(
         storage,
-        &scope,
         from,
         txid,
         where_clause,
+        observed,
+        false,
         arena,
         params,
-        &hooks,
-        Some(target),
-        pax_columns,
-        &retain_match,
-        &mut |jr| {
-            let chained_row = Chained {
-                inner: jr,
-                outer: Some(target),
-            };
-            on_match(&chained_row)?;
-            retain_match.set(true);
+        target,
+        sequences,
+        &mut |_, joined, _| {
+            on_match(joined)?;
             found = true;
             Ok(false) // stop at the first match (PostgreSQL uses one arbitrary row)
         },

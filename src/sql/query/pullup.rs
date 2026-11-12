@@ -66,12 +66,19 @@ pub(super) fn pull_up_subqueries<'a>(
 ) -> Result<&'a Select<'a>, SqlError> {
     let mut current = select;
     let mut next = 0usize;
+    // A grouped query names a subquery's columns in its ungrouped-column
+    // errors, which merging the subquery would rename; there a subquery that
+    // only renames columns stays in place, as merging it changes no result.
+    let grouped = grouped_query(select, storage, txid, arena);
     while let Some(from) = current.from.as_ref()
         && candidate_query(current)
     {
         let count = 1 + from.joins.len();
-        let Some(position) = (next..count).find(|&index| item(from, index).subquery.is_some())
-        else {
+        let Some(position) = (next..count).find(|&index| {
+            item(from, index)
+                .subquery
+                .is_some_and(|body| !grouped || computes_outputs(body))
+        }) else {
             break;
         };
         let mark = arena.mark();
@@ -382,6 +389,34 @@ fn item<'f, 'a>(from: &'f FromClause<'a>, index: usize) -> &'f TableRef<'a> {
 }
 
 /// Outer-query shapes the merge keeps exact.
+fn grouped_query(select: &Select<'_>, storage: &Storage, txid: u32, arena: &Arena) -> bool {
+    if !select.group_by.is_empty() || !select.grouping_sets.is_empty() || select.having.is_some() {
+        return true;
+    }
+    let columns = crate::sql::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    select
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                Some(*expression)
+            }
+            _ => None,
+        })
+        .chain(select.order_by.iter().map(|order| order.expression))
+        // An expression whose calls do not resolve here is treated as grouped.
+        .any(|expression| {
+            super::expr_has_aggregate(expression, storage, txid, &columns).unwrap_or(true)
+        })
+}
+
 fn candidate_query(select: &Select<'_>) -> bool {
     select.set_body.is_none()
         && select.with.is_empty()
@@ -544,6 +579,14 @@ fn simple_subquery<'a>(
         .chain(from.joins.iter().map(|join| &join.table))
         .any(|table| table.join_members.is_some())
     {
+        return None;
+    }
+    // A view's output column carries its collation as implicit; merging an
+    // explicit `COLLATE` into the outer query would make it explicit there.
+    if body.items.iter().any(|item| match item {
+        SelectItem::Expr { expression, .. } => has_collate(expression),
+        _ => false,
+    }) {
         return None;
     }
     if from.joins.iter().any(|join| {
@@ -1840,4 +1883,26 @@ fn option_same(left: Option<&Expr<'_>>, right: Option<&Expr<'_>>) -> bool {
         (Some(left), Some(right)) => core::ptr::eq(left, right),
         _ => false,
     }
+}
+
+fn has_collate(expression: &Expr<'_>) -> bool {
+    if matches!(expression, Expr::Collate { .. }) {
+        return true;
+    }
+    let mut found = false;
+    let _ = super::walk_children(expression, &mut |child| {
+        found |= has_collate(child);
+        Ok::<(), SqlError>(())
+    });
+    found
+}
+
+/// Whether a subquery computes an output beyond naming a column.
+fn computes_outputs(body: &Select<'_>) -> bool {
+    body.items.iter().any(|item| match item {
+        SelectItem::Expr { expression, .. } => {
+            !matches!(expression, Expr::Column { .. } | Expr::SchemaColumn { .. })
+        }
+        _ => false,
+    })
 }

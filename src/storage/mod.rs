@@ -2912,6 +2912,22 @@ impl TableDefView<'_> {
     }
 }
 
+/// PostgreSQL's system columns, which a table's own columns cannot be named.
+pub(crate) const SYSTEM_COLUMN_NAMES: [&str; 6] =
+    ["tableoid", "cmax", "xmax", "cmin", "xmin", "ctid"];
+
+/// Rejects a table column named like a system column (`CheckAttributeNamesTypes`).
+pub(crate) fn reject_system_column_name(name: &str) -> Result<(), SqlError> {
+    if SYSTEM_COLUMN_NAMES.contains(&name) {
+        return Err(sql_err!(
+            sqlstate::DUPLICATE_COLUMN,
+            "column name \"{}\" conflicts with a system column name",
+            name
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn partition_bound_matches(
     strategy: PartitionStrategy,
     keys: [u16; MAX_PARTITION_KEYS],
@@ -40312,6 +40328,9 @@ impl Storage {
     /// A name already visible to `txid` is a duplicate (42P07); a name held by
     /// another transaction's uncommitted DDL joins the shared wait graph.
     pub fn create_table_in(&self, mut def: TableDefBuilder, txid: u32) -> Result<usize, SqlError> {
+        for column in def.columns() {
+            reject_system_column_name(column.name.as_str())?;
+        }
         def.has_toast |= def
             .columns()
             .iter()

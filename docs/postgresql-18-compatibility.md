@@ -585,6 +585,9 @@ PostgreSQL physical standby cannot replay pos3ql's journal.
 - Heap layout, `ctid`, system columns (`xmin`, `xmax`, `cmin`, `cmax`), HOT,
   physical vacuum, physical/streaming replication, hot standby, and binary-WAL
   tools are not provided. Row identities are not exposed as fake heap addresses.
+  A query naming one of these columns of a table fails with `0A000` (`system
+  column "ctid" is not supported`); as in PostgreSQL, a table column cannot
+  take a system column's name (`42701`).
 - PostgreSQL parallel query, JIT, and planner/executor hooks do not exist.
   Cost estimates and `EXPLAIN` text differ from PostgreSQL.
 - Logical copies are separate durable databases updated asynchronously; there

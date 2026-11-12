@@ -2165,6 +2165,47 @@ impl<'d> QueryScope<'d> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ResolvedColumn, SqlError> {
+        self.find_relation_column(qualifier, name).map_err(|error| {
+            if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                && self.names_system_column(qualifier, name)
+            {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "system column \"{}\" is not supported",
+                    name
+                )
+            } else {
+                error
+            }
+        })
+    }
+
+    /// Whether `name` is a PostgreSQL system column of a relation the
+    /// reference can name: a table, foreign table or catalog, but not a view,
+    /// subquery or function. Only a catalog's `tableoid` is exposed.
+    fn names_system_column(&self, qualifier: Option<&str>, name: &str) -> bool {
+        if !crate::storage::SYSTEM_COLUMN_NAMES.contains(&name) {
+            return false;
+        }
+        let has_system_columns = |table: usize| {
+            self.derived[table].is_none()
+                || matches!(
+                    self.defs.sources[table],
+                    Some(ScopeDefinition::Relation { .. })
+                )
+        };
+        match qualifier {
+            Some(qualifier) if self.using_alias(qualifier).is_some() => false,
+            Some(qualifier) => self.table_index(qualifier).is_ok_and(has_system_columns),
+            None => (0..self.n).any(has_system_columns),
+        }
+    }
+
+    fn find_relation_column(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ResolvedColumn, SqlError> {
         match qualifier {
             Some(q) => {
                 if let Some(alias) = self.using_alias(q) {

@@ -369,7 +369,9 @@ A `RETURNING` list routed through a rule's `RETURNING` list reads the rule's
 relation only: `UPDATE v ... FROM o RETURNING o.label`, `*` beside `FROM` or
 `USING` sources, and subqueries in that list fail with `0A000` where
 PostgreSQL evaluates them.
-COPY to or from a server file or program,
+A user table's `tableoid` system column fails with `0A000`
+(`SELECT tableoid::regclass FROM partitioned` names no partition); catalogs
+expose it. COPY to or from a server file or program,
 `COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
 RETURNING` a non-JSON, non-string type are rejected with `0A000`.
 A SQL-language procedure called from a trigger fired inside a write (a BEFORE

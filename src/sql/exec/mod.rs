@@ -79282,6 +79282,9 @@ fn alter_table_relation(
                 let Some(i) = new_def.column_index(from) else {
                     return sql_fail(undefined_column(from));
                 };
+                if let Err(error) = crate::storage::reject_system_column_name(to) {
+                    return sql_fail(error);
+                }
                 if new_def.column_index(to).is_some() {
                     return sql_fail(sql_err!(
                         sqlstate::DUPLICATE_COLUMN,
@@ -79305,6 +79308,9 @@ fn alter_table_relation(
                 definition: c,
                 if_not_exists,
             } => {
+                if let Err(error) = crate::storage::reject_system_column_name(c.name) {
+                    return sql_fail(error);
+                }
                 if new_def.column_index(c.name).is_some() {
                     if *if_not_exists {
                         responder.notice(

@@ -1304,3 +1304,59 @@ fn subquery_constants_convert_before_rows_are_read() {
         assert_eq!(data_rows(&output), ["NULL|NULL"]);
     });
 }
+
+#[test]
+fn unsupported_system_columns_fail_loudly_and_tables_cannot_take_their_names() {
+    with_engine("system-columns", |engine, budget| {
+        run_with(
+            engine,
+            budget,
+            "CREATE TABLE st (a int); CREATE VIEW sv AS SELECT 1 AS ctid",
+        );
+        for (sql, expected) in [
+            (
+                "SELECT ctid FROM st",
+                "ERROR 0A000 system column \"ctid\" is not supported",
+            ),
+            (
+                "SELECT s.xmin FROM st s",
+                "ERROR 0A000 system column \"xmin\" is not supported",
+            ),
+            (
+                "SELECT tableoid FROM st",
+                "ERROR 0A000 system column \"tableoid\" is not supported",
+            ),
+            // Views and subqueries have no system columns.
+            (
+                "SELECT xmin FROM sv",
+                "ERROR 42703 column \"xmin\" does not exist @8",
+            ),
+            (
+                "SELECT ctid FROM (SELECT 1) s",
+                "ERROR 42703 column \"ctid\" does not exist @8",
+            ),
+            (
+                "CREATE TABLE sc (cmin int)",
+                "ERROR 42701 column name \"cmin\" conflicts with a system column name",
+            ),
+            (
+                "ALTER TABLE st ADD COLUMN IF NOT EXISTS xmax int",
+                "ERROR 42701 column name \"xmax\" conflicts with a system column name",
+            ),
+            (
+                "ALTER TABLE st RENAME COLUMN a TO ctid",
+                "ERROR 42701 column name \"ctid\" conflicts with a system column name",
+            ),
+        ] {
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, sql)),
+                [expected],
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            data_rows(&run_with(engine, budget, "SELECT ctid FROM sv")),
+            ["1"]
+        );
+    });
+}

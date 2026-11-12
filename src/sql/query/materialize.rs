@@ -1766,6 +1766,7 @@ pub(super) fn prepare_materialization<'a>(
                 storage,
                 txid,
                 super::predicate_safety::AnalysisStage::RuntimeProjection,
+                arena,
             )?;
             let sorted_expensive =
                 statement.limit.is_some() && postpone_cost(expression, scope, arena) > 20;

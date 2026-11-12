@@ -68,6 +68,7 @@ use scan::{
 pub(crate) use scan::{
     IndexAccessPlan, OrderedIndexAccessPlan, dml_index_access_plan, dml_indexed_candidates,
     index_access_plan, ordered_index_access_plan, parameterized_index_access_plan,
+    rowless_one_time_filter_passes,
 };
 pub(crate) use scan::{
     RowSecurityExpression, RowSecurityPlan, conjoin_row_security, plan_row_security,
@@ -852,7 +853,9 @@ pub(crate) use plan::join_order;
 use plan::{postpone_cost, reorder_qual, simplify_qual, where_passes};
 
 mod subquery;
-pub(crate) use subquery::{ProceduralSubqueries, subquery_expression_type};
+pub(crate) use subquery::{
+    DmlSubqueries, ProceduralSubqueries, check_sublink_columns, subquery_expression_type,
+};
 use subquery::{
     correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, merge_correlated,
     prepare_outer_subqueries, subquery_witness,
@@ -10782,6 +10785,18 @@ fn check_select_types<'a>(
             txid,
         )?)?;
     }
+    for expression in statement
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } => Some(*expression),
+            _ => None,
+        })
+        .chain(statement.where_clause)
+        .chain(statement.having)
+    {
+        subquery::check_compared_literals(expression, Some(scope), storage, txid, arena)?;
+    }
     Ok(())
 }
 
@@ -11947,7 +11962,8 @@ fn prepare_fromless_projection<'a, R: ColumnLookup<'a>>(
         super::eval::require_expression_builtin_execute(expression, row, hooks)?;
     }
     if let Some(predicate) = statement.where_clause
-        && !where_passes(predicate, arena, params, row, hooks)?
+        && (!scan::rowless_one_time_filter_passes(Some(predicate), arena, params, hooks)?
+            || !where_passes(predicate, arena, params, row, hooks)?)
     {
         return Ok(srf::ProjectSet::empty());
     }
@@ -15860,6 +15876,7 @@ pub(crate) fn semi_join_first_match_passes<'a>(
         &[where_clause],
         storage,
         txid,
+        None,
         arena,
         params,
         Some(first),

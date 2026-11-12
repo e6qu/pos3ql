@@ -147,6 +147,22 @@ impl SubqueryListProbe for ExternalSubqueryList {
             Datum::Bool(all)
         })
     }
+
+    fn persist(
+        &self,
+        owner: &Arena,
+    ) -> Result<core::ptr::NonNull<dyn SubqueryListProbe>, SqlError> {
+        let kept = owner
+            .alloc_persistent_slice_with(1, |_| *self)
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "an uncorrelated subquery's value exceeds the statement's memory"
+                )
+            })?;
+        let kept: &mut dyn SubqueryListProbe = &mut kept[0];
+        Ok(core::ptr::NonNull::from(kept))
+    }
 }
 
 /// The type witness for a spooled subquery run's single result column. A
@@ -781,7 +797,119 @@ pub(super) fn check_subquery_literals<'a>(
         };
         check_select_literals(select, outer, storage, txid, arena)?;
     }
-    Ok(())
+    check_compared_literals(expression, outer, storage, txid, arena)
+}
+
+/// A string constant compared with a subquery's column converts to that
+/// column's type while PostgreSQL analyses the query, so `'zz' IN (SELECT
+/// int_column ...)` and `'zz' = (SELECT int_column ...)` fail before the
+/// subquery runs, even when no row reaches the comparison.
+pub(super) fn check_compared_literals<'a>(
+    expression: &'a Expr<'a>,
+    outer: Option<&QueryScope<'a>>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let check = |operand: &'a Expr<'a>, select: &'a Select<'a>| -> Result<(), SqlError> {
+        let literals: &[&Expr<'_>] = match operand {
+            Expr::Str(_) => core::slice::from_ref(&operand),
+            Expr::Call { args, .. } if operand.is_row_constructor() => args,
+            _ => return Ok(()),
+        };
+        if !literals
+            .iter()
+            .any(|literal| matches!(literal, Expr::Str(_)))
+        {
+            return Ok(());
+        }
+        let outer_columns = outer.map(super::ScopeSchema);
+        let mut column = 0usize;
+        let mut failure = None;
+        // A subquery whose output does not resolve reports that itself.
+        let _ = crate::sql::error_position::preserving_pending(|| {
+            super::visit_projection_types(
+                select,
+                storage,
+                txid,
+                arena,
+                outer_columns
+                    .as_ref()
+                    .map(|columns| columns as &dyn ColumnLookup<'_>),
+                &mut |type_oid, _| {
+                    if failure.is_none()
+                        && let Some(Expr::Str(literal)) = literals.get(column)
+                        && let Some(ctype) = ColType::from_oid(type_oid)
+                        && compared_literal_converts(ctype)
+                        && let Err(error) =
+                            crate::sql::eval::cast_to(Datum::Text(literal), ctype, arena)
+                    {
+                        failure = Some(crate::sql::error_position::at_subject(error, literal));
+                    }
+                    column += 1;
+                    Ok(())
+                },
+            )
+        });
+        failure.map_or(Ok(()), Err)
+    };
+    match expression {
+        Expr::InSubquery {
+            operand, select, ..
+        }
+        | Expr::QuantifiedSubquery {
+            operand, select, ..
+        } => {
+            check(operand, select)?;
+            check_compared_literals(operand, outer, storage, txid, arena)
+        }
+        Expr::Binary {
+            operator:
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq,
+            left,
+            right,
+            ..
+        } => {
+            match (left, right) {
+                (Expr::Str(_), Expr::Subquery(select)) => check(left, select)?,
+                (Expr::Subquery(select), Expr::Str(_)) => check(right, select)?,
+                _ => {}
+            }
+            check_compared_literals(left, outer, storage, txid, arena)?;
+            check_compared_literals(right, outer, storage, txid, arena)
+        }
+        // A subquery's own expressions are checked against its own scope.
+        Expr::Subquery(_) | Expr::RowSubquery { .. } | Expr::Exists(_) | Expr::ArraySubquery(_) => {
+            Ok(())
+        }
+        _ => walk_children(expression, &mut |child| {
+            check_compared_literals(child, outer, storage, txid, arena)
+        }),
+    }
+}
+
+/// The column types whose input functions a compared string constant runs
+/// through during analysis here; others keep their comparison-time checks.
+fn compared_literal_converts(ctype: ColType) -> bool {
+    matches!(
+        ctype,
+        ColType::Int2
+            | ColType::Int4
+            | ColType::Int8
+            | ColType::Float4
+            | ColType::Float8
+            | ColType::Numeric
+            | ColType::Bool
+            | ColType::Date
+            | ColType::Timestamp
+            | ColType::Timestamptz
+            | ColType::Uuid
+    )
 }
 
 pub(super) fn check_select_literals<'a>(
@@ -1413,12 +1541,29 @@ fn row_subquery_witness<'a>(
     Ok(Datum::Record(&*fields))
 }
 
+/// Checks that an `IN`, `ANY` or `ALL` subquery returns as many columns as
+/// its operand compares, as PostgreSQL does while analysing the sublink.
+pub(crate) fn check_sublink_columns(
+    node: &Expr<'_>,
+    operand: &Expr<'_>,
+    select: &Select<'_>,
+) -> Result<(), SqlError> {
+    sublink_arity(operand, select)
+        .map(|_| ())
+        .map_err(|error| subquery_shape_position(error, node))
+}
+
 /// Resolves a comparison subquery's row arity before execution.
 fn row_projected<'a>(
     operand: &'a Expr<'a>,
     select: &'a Select<'a>,
     _arena: &'a Arena,
 ) -> Result<(&'a Select<'a>, usize), SqlError> {
+    Ok((select, sublink_arity(operand, select)?))
+}
+
+/// The number of columns an `IN`, `ANY` or `ALL` subquery must return.
+fn sublink_arity(operand: &Expr<'_>, select: &Select<'_>) -> Result<usize, SqlError> {
     fn arity(operand: &Expr) -> usize {
         match operand {
             Expr::Call {
@@ -1440,7 +1585,7 @@ fn row_projected<'a>(
     }
     let arity = arity(operand);
     if arity > 1 {
-        return Ok((select, arity));
+        return Ok(arity);
     }
     // A set-operation body carries its columns in the leaves, all of equal
     // arity (checked where the branches are combined), so the first one speaks
@@ -1461,7 +1606,7 @@ fn row_projected<'a>(
             "subquery has too many columns"
         ));
     }
-    Ok((select, arity))
+    Ok(arity)
 }
 
 /// The leftmost leaf of a set tree, which fixes the arity of the whole tree.
@@ -1498,7 +1643,10 @@ pub fn prepare_subqueries<'a>(
         depth,
         outer,
         sequences,
-        SubqueryTiming::WhereReached,
+        SubqueryTiming::FirstRead {
+            uncorrelated: false,
+            command: None,
+        },
     )
 }
 
@@ -1517,19 +1665,7 @@ fn eval_subquery_nodes<'a>(
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     timing: SubqueryTiming,
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
-    let defers = |node: &Expr<'_>| match timing {
-        SubqueryTiming::Now | SubqueryTiming::Retained => false,
-        SubqueryTiming::WhereReached => subquery_has_effects(node, storage, txid),
-        SubqueryTiming::FirstRead => {
-            matches!(
-                node,
-                Expr::Subquery(_)
-                    | Expr::RowSubquery { .. }
-                    | Expr::ArraySubquery(_)
-                    | Expr::Exists(_)
-            ) || subquery_has_effects(node, storage, txid)
-        }
-    };
+    let defers = |_: &Expr<'_>| matches!(timing, SubqueryTiming::FirstRead { .. });
     let n_list_nodes = nodes
         .iter()
         .filter(|node| {
@@ -1551,23 +1687,49 @@ fn eval_subquery_nodes<'a>(
     let deferred = if n_deferred == 0 {
         &mut []
     } else {
-        let executor: &'a dyn super::super::eval::SubqueryExecution = arena
-            .alloc(ProceduralSubqueries { storage, txid })
-            .map_err(|_| arena_full())?;
+        let executor: &'a dyn super::super::eval::SubqueryExecution = match timing {
+            SubqueryTiming::FirstRead {
+                command: Some(command),
+                ..
+            } => arena
+                .alloc(DmlSubqueries::new(storage, txid, command))
+                .map_err(|_| arena_full())?,
+            _ => arena
+                .alloc(ProceduralSubqueries { storage, txid })
+                .map_err(|_| arena_full())?,
+        };
         let mut entries = nodes.iter().filter(|node| defers(node));
         let mut failed = false;
         let deferred = arena
             .alloc_slice_with(n_deferred, |_| {
                 let node = entries.next().copied();
-                let cache = match arena.alloc(super::super::eval::DeferredSubqueryCache::default())
-                {
-                    Ok(cache) => {
-                        let cache: &core::cell::Cell<_> = core::cell::Cell::from_mut(cache);
-                        Some(cache)
-                    }
-                    Err(_) => {
-                        failed = true;
-                        None
+                // An uncorrelated subquery runs once and keeps its result for
+                // the rest of these expressions' evaluations; one that reads
+                // a row runs each time it is reached. A correlation that
+                // cannot be read here counts as one.
+                let once = match timing {
+                    SubqueryTiming::FirstRead {
+                        uncorrelated: true, ..
+                    } => true,
+                    _ => node.is_some_and(|node| {
+                        matches!(
+                            subquery_node_correlated(node, storage, txid, arena),
+                            Ok(false)
+                        )
+                    }),
+                };
+                let cache = if !once {
+                    None
+                } else {
+                    match arena.alloc(super::super::eval::DeferredSubqueryCache::default()) {
+                        Ok(cache) => {
+                            let cache: &core::cell::Cell<_> = core::cell::Cell::from_mut(cache);
+                            Some(cache)
+                        }
+                        Err(_) => {
+                            failed = true;
+                            None
+                        }
                     }
                 };
                 super::super::eval::DeferredSubquery {
@@ -1683,7 +1845,7 @@ fn eval_subquery_nodes<'a>(
                         arena,
                         outer,
                     )?;
-                    if storage.spill_attached() && !matches!(timing, SubqueryTiming::Retained) {
+                    if storage.spill_attached() {
                         lists[n_lists] = external_list_subquery(
                             node,
                             select,
@@ -1750,15 +1912,16 @@ pub(super) fn subquery_shape_position(error: SqlError, node: &Expr<'_>) -> SqlEr
 enum SubqueryTiming {
     /// Before the expressions that contain them.
     Now,
-    /// Now, gathering a list in memory so its result can be saved for
-    /// later rows instead of spooled.
-    Retained,
-    /// One with effects runs where evaluation reaches it.
-    WhereReached,
-    /// As `WhereReached`, and every scalar subquery also runs when an
-    /// expression first reads it, as PostgreSQL's initPlans do: an
-    /// expression no row reaches never runs its subquery.
-    FirstRead,
+    /// Each subquery runs where evaluation reaches it, as PostgreSQL's
+    /// initPlans and subplans do: an expression no row reaches never runs its
+    /// subquery. An uncorrelated one runs once and keeps its result;
+    /// `uncorrelated` says every node is known to be one.
+    /// `command` is the data-modifying command whose own writes these
+    /// subqueries do not see, however late they first run.
+    FirstRead {
+        uncorrelated: bool,
+        command: Option<u32>,
+    },
 }
 
 /// Whether running a scalar subquery early would reorder its effects: it
@@ -2385,7 +2548,10 @@ pub(super) fn prepare_outer_subqueries<'a>(
         SUBQUERY_DEPTH,
         None,
         sequences,
-        SubqueryTiming::FirstRead,
+        SubqueryTiming::FirstRead {
+            uncorrelated: true,
+            command: None,
+        },
     )?;
     Ok(OuterSubs {
         base,
@@ -2393,7 +2559,39 @@ pub(super) fn prepare_outer_subqueries<'a>(
     })
 }
 
-/// Uncorrelated scalar subqueries `nodes` that run when an expression first
+/// Whether `node` is a subquery that reads no column of its query and calls
+/// no volatile or user-defined function, so it has one result for the
+/// statement, run when first read. Correlation is read from its FROM items
+/// as written; one that cannot be resolved that way (a view, which the
+/// general executor expands as it runs the subquery) is not stable here.
+pub(super) fn stable_uncorrelated<'a>(
+    node: &'a Expr<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> bool {
+    let (Expr::Subquery(select)
+    | Expr::Exists(select)
+    | Expr::ArraySubquery(select)
+    | Expr::RowSubquery { select, .. }
+    | Expr::InSubquery { select, .. }
+    | Expr::QuantifiedSubquery { select, .. }) = node
+    else {
+        return false;
+    };
+    if super::cte::select_contains_function(select, &|name, arguments| {
+        crate::sql::ast::is_volatile_function(name)
+            || storage.has_callable_candidate(name, arguments, txid)
+    }) {
+        return false;
+    }
+    matches!(
+        subquery_node_correlated(node, storage, txid, arena),
+        Ok(false)
+    )
+}
+
+/// Uncorrelated subqueries `nodes` that run when an expression first
 /// reads them, as PostgreSQL's initPlans do. Nothing runs here. Their state
 /// and results live in `arena`'s persistent tail and retained bytes, which a
 /// reader's per-row rewinds and resumed attempts do not reclaim.
@@ -2403,10 +2601,6 @@ pub(super) fn first_read_subqueries<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
-    debug_assert!(nodes.iter().all(|node| matches!(
-        node,
-        Expr::Subquery(_) | Expr::RowSubquery { .. } | Expr::ArraySubquery(_) | Expr::Exists(_)
-    )));
     // SAFETY: the engine's storage outlives every statement and reader that
     // keeps these subqueries, and each run detaches its result before any
     // borrow of storage escapes.
@@ -2451,7 +2645,6 @@ impl super::super::eval::SubqueryExecution for StatementSubqueries<'_> {
         params: &[Datum<'a>],
         _outer: &dyn ColumnLookup<'a>,
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-        retained: bool,
     ) -> Result<super::super::eval::SubqueryResult<'a>, SqlError> {
         self.0.evaluate(
             expression,
@@ -2459,7 +2652,6 @@ impl super::super::eval::SubqueryExecution for StatementSubqueries<'_> {
             params,
             &crate::sql::eval::NoColumns,
             sequences,
-            retained,
         )
     }
 }
@@ -4439,13 +4631,16 @@ pub fn subquery_hooks<'a>(
     subquery_hooks_with_outer(exprs, storage, txid, arena, params, None, sequences)
 }
 
-/// [`subquery_hooks`] for a data change's WHERE: only the subqueries that
-/// read no column of the target row run once; a correlated one runs for each
-/// row through the evaluator's subquery executor.
+/// [`subquery_hooks`] for a data change's expressions: a subquery that reads
+/// no column of the target row runs once, when first read; a correlated one
+/// runs for each row that reaches it through the evaluator's subquery
+/// executor ([`DmlSubqueries`]). Both read as of `command`, so a subquery
+/// first run after the statement wrote rows does not see them.
 pub(crate) fn uncorrelated_subquery_hooks<'a>(
     exprs: &[Option<&'a Expr<'a>>],
     storage: &Storage,
     txid: u32,
+    command: Option<u32>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     outer: Option<&dyn ColumnLookup<'a>>,
@@ -4472,7 +4667,10 @@ pub(crate) fn uncorrelated_subquery_hooks<'a>(
         SUBQUERY_DEPTH,
         outer,
         sequences,
-        SubqueryTiming::WhereReached,
+        SubqueryTiming::FirstRead {
+            uncorrelated: true,
+            command,
+        },
     )?;
     detach_subquery_values(borrowed, arena)
 }
@@ -4565,6 +4763,49 @@ pub(super) fn detach_subquery_values<'a>(
     })
 }
 
+/// Runs a data-modifying statement's subqueries as of its command, so one
+/// first run after the statement has written rows does not see them.
+#[derive(Clone, Copy)]
+pub(crate) struct DmlSubqueries {
+    /// The engine's storage, which outlives every statement. The statement
+    /// writes through its own exclusive borrow between evaluations; this
+    /// executor reads only while an expression is evaluated, when no write
+    /// is in progress.
+    storage: *const Storage,
+    txid: u32,
+    command: u32,
+}
+
+impl DmlSubqueries {
+    pub(crate) fn new(storage: &Storage, txid: u32, command: u32) -> Self {
+        Self {
+            storage,
+            txid,
+            command,
+        }
+    }
+}
+
+impl super::super::eval::SubqueryExecution for DmlSubqueries {
+    fn evaluate<'a>(
+        &self,
+        expression: &Expr<'a>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        outer: &dyn ColumnLookup<'a>,
+        sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    ) -> Result<super::super::eval::SubqueryResult<'a>, SqlError> {
+        // SAFETY: see the field invariant; an expression is being evaluated.
+        let storage: &Storage = unsafe { &*self.storage };
+        let _snapshot = storage.dml_expression_snapshot(self.command);
+        ProceduralSubqueries {
+            storage,
+            txid: self.txid,
+        }
+        .evaluate(expression, arena, params, outer, sequences)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct ProceduralSubqueries<'s> {
     pub storage: &'s Storage,
@@ -4579,7 +4820,6 @@ impl super::super::eval::SubqueryExecution for ProceduralSubqueries<'_> {
         params: &[Datum<'a>],
         outer: &dyn ColumnLookup<'a>,
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-        retained: bool,
     ) -> Result<super::super::eval::SubqueryResult<'a>, SqlError> {
         // SAFETY: storage remains immutable and live for this call; the
         // result is detached before the borrow can escape.
@@ -4593,11 +4833,7 @@ impl super::super::eval::SubqueryExecution for ProceduralSubqueries<'_> {
             SUBQUERY_DEPTH,
             Some(outer),
             sequences,
-            if retained {
-                SubqueryTiming::Retained
-            } else {
-                SubqueryTiming::Now
-            },
+            SubqueryTiming::Now,
         )?;
         let values = detach_subquery_values(borrowed, arena)?;
         match (values.scalars, values.lists) {

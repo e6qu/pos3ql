@@ -6150,6 +6150,33 @@ pub(super) fn one_time_filter_passes<'a>(
     hooks: &EvalHooks<'_, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<bool, SqlError> {
+    one_time_conjuncts_pass(where_clause, arena, params, hooks, outer, &|conjunct| {
+        reads_no_query_column(conjunct, scope, hooks)
+    })
+}
+
+/// [`one_time_filter_passes`] for a condition without a query scope (a data
+/// change's target and `FROM` rows, a FROM-less `SELECT`): a one-time
+/// conjunct reads no column at all.
+pub(crate) fn rowless_one_time_filter_passes<'a>(
+    where_clause: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<bool, SqlError> {
+    one_time_conjuncts_pass(where_clause, arena, params, hooks, None, &|conjunct| {
+        reads_no_row(conjunct, hooks)
+    })
+}
+
+fn one_time_conjuncts_pass<'a>(
+    where_clause: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+    one_time: &dyn Fn(&Expr<'_>) -> bool,
+) -> Result<bool, SqlError> {
     let Some(predicate) = where_clause else {
         return Ok(true);
     };
@@ -6163,12 +6190,26 @@ pub(super) fn one_time_filter_passes<'a>(
         inner: &NoColumns,
         outer,
     };
+    // PostgreSQL folds constant conjuncts while planning and runs its
+    // cheaper one-time filters first, so a constant false one leaves every
+    // subquery of the condition unrun.
+    for conjunct in &conjuncts[..count] {
+        if !conjunct.folds_to_constant() {
+            continue;
+        }
+        if matches!(
+            eval_full(conjunct, arena, params, &row, hooks)?,
+            Datum::Bool(false) | Datum::Null
+        ) {
+            return Ok(false);
+        }
+    }
     for conjunct in &conjuncts[..count] {
         // Only a conjunct reading an uncorrelated subquery can behave
         // differently once than per row: that subquery runs when first read.
         if !conjunct.contains_subquery()
             || conjunct.contains_volatile_function().is_some()
-            || !reads_no_query_column(conjunct, scope, hooks)
+            || !one_time(conjunct)
         {
             continue;
         }
@@ -6182,6 +6223,44 @@ pub(super) fn one_time_filter_passes<'a>(
         }
     }
     Ok(true)
+}
+
+/// Whether an expression reads no column, parameter or aggregate, and every
+/// subquery in it is one its statement runs once (an uncorrelated one).
+fn reads_no_row(expression: &Expr<'_>, hooks: &EvalHooks<'_, '_>) -> bool {
+    let once = |node: &Expr<'_>| {
+        let address = (node as *const Expr<'_>).cast::<()>();
+        hooks.subs.is_some_and(|subs| {
+            subs.deferred
+                .iter()
+                .any(|deferred| core::ptr::eq(deferred.node, address) && deferred.cache.is_some())
+        })
+    };
+    match expression {
+        Expr::Subquery(_) | Expr::Exists(_) | Expr::ArraySubquery(_) | Expr::RowSubquery { .. } => {
+            once(expression)
+        }
+        Expr::InSubquery { operand, .. } | Expr::QuantifiedSubquery { operand, .. } => {
+            once(expression) && reads_no_row(operand, hooks)
+        }
+        Expr::Column { .. }
+        | Expr::WholeRow(_)
+        | Expr::SchemaColumn { .. }
+        | Expr::RecursiveState { .. }
+        | Expr::OuterAggregate { .. }
+        | Expr::RoutineParam { .. }
+        | Expr::Param(_) => false,
+        Expr::Call { .. } if expression.is_aggregate_use() => false,
+        Expr::Call { over: Some(_), .. } => false,
+        _ => {
+            let mut free = true;
+            let _ = super::subquery::walk_children(expression, &mut |child| {
+                free &= reads_no_row(child, hooks);
+                Ok(())
+            });
+            free
+        }
+    }
 }
 
 const MAX_ONE_TIME_CONJUNCTS: usize = 64;

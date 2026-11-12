@@ -1363,6 +1363,7 @@ pub(crate) fn validate_dml_assignment_casts(
                 validate_assignment_expression(
                     expression,
                     Some(name),
+                    AssignmentTarget::Update,
                     &target.columns()[index],
                     &columns,
                     storage,
@@ -1384,6 +1385,7 @@ pub(crate) fn validate_dml_assignment_casts(
                     validate_assignment_expression(
                         expression,
                         names.get(index).copied(),
+                        AssignmentTarget::Insert,
                         column,
                         &columns,
                         storage,
@@ -1671,6 +1673,7 @@ fn validate_insert_projection(
             if validate_subscript_assignment(
                 expression,
                 target_name,
+                AssignmentTarget::Insert,
                 column,
                 &mut source_of,
                 storage,
@@ -2239,6 +2242,7 @@ fn assigned_literal(
 fn validate_assignment_expression(
     expression: &Expr<'_>,
     target_name: Option<&str>,
+    target: AssignmentTarget,
     column: &crate::storage::ColumnMeta,
     columns: &dyn ColTypeResolver,
     storage: &Storage,
@@ -2252,6 +2256,7 @@ fn validate_assignment_expression(
     if validate_subscript_assignment(
         expression,
         target_name,
+        target,
         column,
         &mut source_of,
         storage,
@@ -2268,11 +2273,21 @@ fn validate_assignment_expression(
     .map_err(|error| crate::sql::error_position::at_expression(error, expression))
 }
 
+/// Which statement assigns a column. PostgreSQL positions an error about the
+/// assigned column's own container only for `UPDATE`, whose target is a
+/// column reference; an `INSERT` target is not.
+#[derive(Clone, Copy)]
+enum AssignmentTarget {
+    Insert,
+    Update,
+}
+
 /// Checks the values of a parsed subscripted assignment; false when
 /// `expression` is not one.
 fn validate_subscript_assignment(
     expression: &Expr<'_>,
     target_name: Option<&str>,
+    target: AssignmentTarget,
     column: &crate::storage::ColumnMeta,
     source_of: &mut dyn FnMut(&Expr<'_>) -> Result<i32, SqlError>,
     storage: &Storage,
@@ -2284,7 +2299,7 @@ fn validate_subscript_assignment(
         ..
     } = expression
     {
-        validate_subscript_assignment(base, target_name, column, source_of, storage, txid)?;
+        validate_subscript_assignment(base, target_name, target, column, source_of, storage, txid)?;
         validate_assignment_path(
             value,
             kinds,
@@ -2305,7 +2320,7 @@ fn validate_subscript_assignment(
     else {
         return Ok(false);
     };
-    validate_subscript_assignment(base, target_name, column, source_of, storage, txid)?;
+    validate_subscript_assignment(base, target_name, target, column, source_of, storage, txid)?;
     // A domain over a container assigns into its base type.
     let declared = storage.routine_type_oid(column.ctype, column.user_type, txid);
     let (container, container_oid) =
@@ -2313,13 +2328,42 @@ fn validate_subscript_assignment(
             Some(base) => (base, storage.routine_type_oid(base, None, txid)),
             None => (column.ctype, declared),
         };
-    let target = match (container, *name) {
+    let assigned = match (container, *name) {
         (ColType::Array(element), "__jsonb_subscript_set") => element.element_oid(),
         (ColType::Array(_) | ColType::Jsonb, _) => container_oid.unwrap_or_else(|| container.oid()),
-        _ => return Ok(true),
+        (
+            ColType::Int2Vector
+            | ColType::OidVector
+            | ColType::Name
+            | ColType::Geometry(
+                crate::sql::types::GeometryKind::Point
+                | crate::sql::types::GeometryKind::Line
+                | crate::sql::types::GeometryKind::Box
+                | crate::sql::types::GeometryKind::Lseg,
+            ),
+            _,
+        ) => return Ok(true),
+        _ => {
+            let error = sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "cannot subscript type {} because it does not support subscripting",
+                crate::sql::catalog::format_type_name(
+                    storage,
+                    txid,
+                    container_oid.unwrap_or_else(|| container.oid())
+                )?
+                .as_str()
+            );
+            return Err(match (target, target_name) {
+                (AssignmentTarget::Update, Some(name)) => {
+                    crate::sql::error_position::at_reference(error, name)
+                }
+                _ => error,
+            });
+        }
     };
     let source = source_of(value)?;
-    if crate::sql::catalog::can_coerce_assignment(storage, txid, source, target) {
+    if crate::sql::catalog::can_coerce_assignment(storage, txid, source, assigned) {
         return Ok(true);
     }
     let error = crate::sql::error_position::with_hint(
@@ -2327,7 +2371,7 @@ fn validate_subscript_assignment(
             sqlstate::DATATYPE_MISMATCH,
             "subscripted assignment to \"{}\" requires type {} but expression is of type {}",
             column.name.as_str(),
-            crate::sql::catalog::format_type_name(storage, txid, target)?.as_str(),
+            crate::sql::catalog::format_type_name(storage, txid, assigned)?.as_str(),
             crate::sql::catalog::format_type_name(storage, txid, source)?.as_str()
         ),
         "You will need to rewrite or cast the expression.",
@@ -2433,11 +2477,11 @@ fn validate_assignment_path(
                 operands.next();
             }
             let Some(element) = crate::sql::assignment_path::element_type_oid(container) else {
-                return Err(sql_err!(
+                return Err(at_target(sql_err!(
                     sqlstate::DATATYPE_MISMATCH,
                     "cannot subscript type {} because it does not support subscripting",
                     type_name(container)?.as_str()
-                ));
+                )));
             };
             // A slice assigns an array of the container's type.
             if kind == b'e' {

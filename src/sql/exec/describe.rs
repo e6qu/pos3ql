@@ -5042,6 +5042,70 @@ pub(crate) fn builtin_binary_type(
     })
 }
 
+/// PostgreSQL's `transformContainerSubscripts` error for a container whose
+/// type has no subscripting handler, positioned at the container.
+fn not_subscriptable(container: &Expr, type_oid: i32, columns: &dyn ColTypeResolver) -> SqlError {
+    let error = match columns.type_name_fixed(type_oid) {
+        Ok(name) => sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "cannot subscript type {} because it does not support subscripting",
+            name.as_ref().map_or_else(
+                || coltype_of_oid(type_oid).map_or("unknown", ColType::name),
+                |name| name.as_str()
+            )
+        ),
+        Err(error) => error,
+    };
+    crate::sql::error_position::at_expression(error, container)
+}
+
+/// The type of a subscript list holding a slice: the container's own type.
+/// Only variable-length arrays have slices.
+fn sliced_container_type(
+    subscripted: &Expr,
+    columns: &dyn ColTypeResolver,
+) -> Result<(i32, i16), SqlError> {
+    let mut container = subscripted;
+    let mut first_slice = None;
+    while let Expr::Subscript { base, .. } | Expr::Slice { base, .. } = container {
+        if let Expr::Slice { lower, upper, .. } = container {
+            first_slice = Some(upper.or(*lower));
+        }
+        container = base;
+    }
+    let (type_oid, length) = infer_type_res(container, columns)?;
+    let domain_base = columns.domain_base_type(type_oid);
+    let base_oid = domain_base.map_or(type_oid, ColType::oid);
+    match coltype_of_oid(type_oid).or(domain_base) {
+        Some(ColType::Array(_) | ColType::Int2Vector | ColType::OidVector) | None => {
+            Ok((type_oid, length))
+        }
+        Some(ColType::Jsonb) => {
+            let error = sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "jsonb subscript does not support slices"
+            );
+            Err(match first_slice.flatten() {
+                Some(bound) => crate::sql::error_position::at_expression(error, bound),
+                None => error,
+            })
+        }
+        Some(
+            ColType::Name
+            | ColType::Geometry(
+                crate::sql::types::GeometryKind::Point
+                | crate::sql::types::GeometryKind::Line
+                | crate::sql::types::GeometryKind::Box
+                | crate::sql::types::GeometryKind::Lseg,
+            ),
+        ) => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "slices of fixed-length arrays not implemented"
+        )),
+        Some(_) => Err(not_subscriptable(container, base_oid, columns)),
+    }
+}
+
 pub fn infer_type_res(
     expression: &Expr,
     columns: &dyn ColTypeResolver,
@@ -5638,11 +5702,7 @@ fn infer_type_unpositioned(
                 sliced
             } =>
         {
-            let mut node = &**base;
-            while let Expr::Subscript { base, .. } | Expr::Slice { base, .. } = node {
-                node = base;
-            }
-            infer_type_res(node, columns)?
+            sliced_container_type(expression, columns)?
         }
         Expr::Subscript { base, .. } => {
             // A catalog-backed column retains its array element identity here:
@@ -5668,7 +5728,14 @@ fn infer_type_unpositioned(
                 let ctype = element.to_coltype();
                 (element.element_oid(), ctype.typlen())
             } else {
-                match coltype_of_oid(infer_type_res(base, columns)?.0) {
+                let mut base_oid = infer_type_res(base, columns)?.0;
+                // A domain is subscripted as its base type.
+                let container = coltype_of_oid(base_oid).or_else(|| {
+                    let domain_base = columns.domain_base_type(base_oid)?;
+                    base_oid = domain_base.oid();
+                    Some(domain_base)
+                });
+                match container {
                     Some(ColType::Array(e)) => of(e.to_coltype()),
                     Some(ColType::Int2Vector) => of(ColType::Int2),
                     Some(ColType::OidVector) => of(ColType::Oid),
@@ -5683,19 +5750,14 @@ fn infer_type_unpositioned(
                         | crate::sql::types::GeometryKind::Lseg,
                     )) => of(ColType::Geometry(crate::sql::types::GeometryKind::Point)),
                     Some(ctype) if matches!(base, Expr::Subscript { .. }) => of(ctype),
+                    Some(_) => return Err(not_subscriptable(base, base_oid, columns)),
                     _ => (oid::UNKNOWN, -2),
                 }
             }
         }
         // An array slice keeps the array type (unlike a subscript, which yields
         // the element type).
-        Expr::Slice { base, .. } => {
-            let mut node = &**base;
-            while let Expr::Subscript { base, .. } | Expr::Slice { base, .. } = node {
-                node = base;
-            }
-            infer_type_res(node, columns)?
-        }
+        Expr::Slice { .. } => sliced_container_type(expression, columns)?,
         // `(record).field`: the field's type from the record's shape.
         Expr::Field { base, field } => match record_field_metadata(base, field, columns) {
             Ok(meta) => (meta.type_oid, meta.ctype.typlen()),

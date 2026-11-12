@@ -13,6 +13,64 @@ use super::super::{
     ColumnLookup, EvalHooks, SqlError, arity_err, eval_full, sqlstate, static_type,
 };
 
+/// The type an unknown-type literal argument of `coalesce`, `greatest` or
+/// `least` takes: the arguments' common numeric type, or else the first typed
+/// argument's type. None leaves the literal as text.
+pub(crate) fn literal_argument_type<'e, 'a: 'e>(
+    args: &'e [&'e Expr<'a>],
+    infer: &dyn Fn(&'e Expr<'a>) -> Option<ColType>,
+) -> Option<ColType> {
+    let rank = |t: ColType| match t {
+        ColType::Int2 => 1,
+        ColType::Int4 => 2,
+        ColType::Int8 => 3,
+        ColType::Numeric => 4,
+        ColType::Float4 => 5,
+        ColType::Float8 => 6,
+        _ => 0,
+    };
+    let mut first = None;
+    let mut widest: Option<ColType> = None;
+    for argument in args {
+        if matches!(argument, Expr::Str(_) | Expr::Null) {
+            continue;
+        }
+        let Some(ctype) = infer(argument) else {
+            continue;
+        };
+        first.get_or_insert(ctype);
+        if rank(ctype) > widest.map_or(0, rank) {
+            widest = Some(ctype);
+        }
+    }
+    widest.or(first).filter(|ctype| {
+        !matches!(
+            ctype,
+            ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name
+        )
+    })
+}
+
+/// Evaluates one argument of `coalesce`, `greatest` or `least`, converting
+/// an unknown-type literal to the arguments' type as PostgreSQL's analysis does.
+fn eval_argument<'a>(
+    argument: &Expr<'a>,
+    literal_type: Option<ColType>,
+    arena: &'a crate::mem::arena::Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    let value = eval_full(argument, arena, params, row, hooks)?;
+    match (argument, literal_type) {
+        (Expr::Str(text), Some(target)) => {
+            crate::sql::eval::cast_to(Datum::Text(text), target, arena)
+                .map_err(|error| crate::sql::error_position::at_subject(error, text))
+        }
+        _ => Ok(value),
+    }
+}
+
 /// Handles the conditional/null-handling family. Returns `None` if `name` is not
 /// one of these functions, leaving the router to keep matching.
 #[allow(clippy::too_many_arguments)]
@@ -65,8 +123,10 @@ pub(crate) fn dispatch<'a>(
                 }
             }
             "coalesce" => {
+                let literal_type =
+                    literal_argument_type(args, &|argument| static_type(argument, row));
                 for arg in args {
-                    let v = eval_full(arg, arena, params, row, hooks)?;
+                    let v = eval_argument(arg, literal_type, arena, params, row, hooks)?;
                     if !v.is_null() {
                         return Ok(v);
                     }
@@ -118,11 +178,13 @@ pub(crate) fn dispatch<'a>(
                 };
                 let mut best: Option<Datum> = None;
                 let mut widest = 0u8;
+                let literal_type =
+                    literal_argument_type(args, &|argument| static_type(argument, row));
                 for a in args {
                     if let Some(t) = static_type(a, row) {
                         widest = widest.max(static_rank(t));
                     }
-                    let v = eval_full(a, arena, params, row, hooks)?;
+                    let v = eval_argument(a, literal_type, arena, params, row, hooks)?;
                     widest = widest.max(rank(&v));
                     if v.is_null() {
                         continue;

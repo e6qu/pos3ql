@@ -45851,13 +45851,169 @@ fn rule_target(
     }
 }
 
+/// Where a rule's OLD and NEW are visible, as PostgreSQL's rule analysis
+/// adds them to each part's namespace.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuleNameScope {
+    /// The WHERE condition sees the event's rows by name and unqualified
+    /// columns resolve to them.
+    Condition,
+    /// An action may name OLD and NEW, but its unqualified columns never
+    /// resolve to them; using the row an event lacks fails afterwards.
+    Action,
+}
+
 struct RuleConditionColumns<'a> {
     names: [&'a str; crate::storage::MAX_COLUMNS],
     metadata: [StaticTypeMeta; crate::storage::MAX_COLUMNS],
     count: usize,
+    /// The relation the rule is defined on.
+    relation: &'a str,
+    /// The event has an OLD (not INSERT) or a NEW (not DELETE) row.
     old: bool,
     new: bool,
+    scope: core::cell::Cell<RuleNameScope>,
+    used_old: core::cell::Cell<bool>,
+    used_new: core::cell::Cell<bool>,
     catalog: CatalogCols<'a>,
+}
+
+impl RuleConditionColumns<'_> {
+    /// Whether `qualifier` names a rule row the current part of the rule
+    /// can reference.
+    fn row_visible(&self, qualifier: &str) -> Option<bool> {
+        let (present, used) = match qualifier {
+            "old" => (self.old, &self.used_old),
+            "new" => (self.new, &self.used_new),
+            _ => return None,
+        };
+        Some(match self.scope.get() {
+            RuleNameScope::Condition => present,
+            RuleNameScope::Action => {
+                used.set(true);
+                true
+            }
+        })
+    }
+
+    /// The rule row column `qualifier.name` names, or PostgreSQL's error for
+    /// a name this part of the rule cannot reference.
+    fn column(&self, qualifier: Option<&str>, name: &str) -> Result<usize, SqlError> {
+        let index = self.names[..self.count]
+            .iter()
+            .position(|column| *column == name);
+        let error = match qualifier {
+            Some(qualifier) => match self.row_visible(qualifier) {
+                Some(true) => match index {
+                    Some(index) => return Ok(index),
+                    None => sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column {}.{} does not exist",
+                        qualifier,
+                        name
+                    ),
+                },
+                Some(false) => crate::sql::error_position::with_detail(
+                    sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "invalid reference to FROM-clause entry for table \"{}\"",
+                        qualifier
+                    ),
+                    format_args!(
+                        "There is an entry for table \"{}\", but it cannot be referenced from this part of the query.",
+                        qualifier
+                    ),
+                ),
+                None if qualifier == self.relation => {
+                    let error = sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "invalid reference to FROM-clause entry for table \"{}\"",
+                        qualifier
+                    );
+                    // PostgreSQL names the rule's first entry for the
+                    // relation, OLD, and whether it can be referenced here.
+                    if self.scope.get() == RuleNameScope::Action || self.old {
+                        crate::sql::error_position::with_computed_hint(
+                            error,
+                            format_args!("Perhaps you meant to reference the table alias \"old\"."),
+                        )
+                    } else {
+                        crate::sql::error_position::with_detail(
+                            error,
+                            format_args!(
+                                "There is an entry for table \"old\", but it cannot be referenced from this part of the query."
+                            ),
+                        )
+                    }
+                }
+                None => sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "missing FROM-clause entry for table \"{}\"",
+                    qualifier
+                ),
+            },
+            None => match (self.scope.get(), index) {
+                (RuleNameScope::Condition, Some(_)) if self.old && self.new => sql_err!(
+                    sqlstate::AMBIGUOUS_COLUMN,
+                    "column reference \"{}\" is ambiguous",
+                    name
+                ),
+                (RuleNameScope::Condition, Some(index)) => {
+                    if self.old {
+                        self.used_old.set(true);
+                    } else {
+                        self.used_new.set(true);
+                    }
+                    return Ok(index);
+                }
+                (RuleNameScope::Action, Some(_)) => crate::sql::error_position::with_hint(
+                    crate::sql::error_position::with_detail(
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column \"{}\" does not exist",
+                            name
+                        ),
+                        format_args!(
+                            "There are columns named \"{}\", but they are in tables that cannot be referenced from this part of the query.",
+                            name
+                        ),
+                    ),
+                    "Try using a table-qualified name.",
+                ),
+                (_, None) => sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" does not exist",
+                    name
+                ),
+            },
+        };
+        Err(crate::sql::error_position::at_reference(
+            error,
+            qualifier.unwrap_or(name),
+        ))
+    }
+
+    /// PostgreSQL's check, after analysing one action, that it uses only the
+    /// rows its event has.
+    fn check_action_rows(&self) -> Result<(), SqlError> {
+        if self.used_old.get() && !self.old {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "ON INSERT rule cannot use OLD"
+            ));
+        }
+        if self.used_new.get() && !self.new {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "ON DELETE rule cannot use NEW"
+            ));
+        }
+        Ok(())
+    }
+
+    fn whole_row_visible(&self, name: &str) -> bool {
+        self.row_visible(name).unwrap_or(false)
+    }
 }
 
 impl<'value> ColumnLookup<'value> for RuleConditionColumns<'_> {
@@ -45870,40 +46026,12 @@ impl<'value> ColumnLookup<'value> for RuleConditionColumns<'_> {
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
-        self.col_type(qualifier, name)
-            .map(|_| Datum::Null)
-            .ok_or_else(|| {
-                if qualifier.is_some_and(|value| {
-                    !value.eq_ignore_ascii_case("old") && !value.eq_ignore_ascii_case("new")
-                }) {
-                    sql_err!(
-                        sqlstate::UNDEFINED_TABLE,
-                        "missing FROM-clause entry for table \"{}\"",
-                        qualifier.unwrap_or("")
-                    )
-                } else {
-                    sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" does not exist",
-                        name
-                    )
-                }
-            })
+        self.column(qualifier, name).map(|_| Datum::Null)
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        let available = match qualifier {
-            Some(value) if value.eq_ignore_ascii_case("old") => self.old,
-            Some(value) if value.eq_ignore_ascii_case("new") => self.new,
-            _ => false,
-        };
-        available
-            .then(|| {
-                self.names[..self.count]
-                    .iter()
-                    .position(|column| *column == name)
-            })
-            .flatten()
+        self.column(qualifier, name)
+            .ok()
             .map(|column| self.metadata[column].ctype)
     }
 }
@@ -46011,56 +46139,18 @@ impl ColTypeResolver for RuleConditionColumns<'_> {
     }
 
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
-        if let Some(qualifier) = qualifier {
-            let old = qualifier.eq_ignore_ascii_case("old");
-            let new = qualifier.eq_ignore_ascii_case("new");
-            if old && !self.old || new && !self.new {
-                return Err(sql_err!(
-                    sqlstate::INVALID_OBJECT_DEFINITION,
-                    "ON {} rule cannot reference {}",
-                    if old { "INSERT" } else { "DELETE" },
-                    if old { "OLD" } else { "NEW" }
-                ));
-            }
-        }
-        self.col_type(qualifier, name).ok_or_else(|| {
-            if qualifier.is_some_and(|value| {
-                !value.eq_ignore_ascii_case("old") && !value.eq_ignore_ascii_case("new")
-            }) {
-                sql_err!(
-                    sqlstate::UNDEFINED_TABLE,
-                    "missing FROM-clause entry for table \"{}\"",
-                    qualifier.unwrap_or("")
-                )
-            } else {
-                sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
-                    name
-                )
-            }
-        })
+        self.column(qualifier, name)
+            .map(|column| self.metadata[column].ctype)
     }
 
     fn column_meta(&self, qualifier: Option<&str>, name: &str) -> Option<StaticTypeMeta> {
-        let available = match qualifier {
-            Some(value) if value.eq_ignore_ascii_case("old") => self.old,
-            Some(value) if value.eq_ignore_ascii_case("new") => self.new,
-            _ => false,
-        };
-        available
-            .then(|| {
-                self.names[..self.count]
-                    .iter()
-                    .position(|column| *column == name)
-            })
-            .flatten()
+        self.column(qualifier, name)
+            .ok()
             .map(|column| self.metadata[column])
     }
 
     fn is_whole_row(&self, name: &str) -> bool {
-        (name.eq_ignore_ascii_case("old") && self.old)
-            || (name.eq_ignore_ascii_case("new") && self.new)
+        self.whole_row_visible(name)
     }
 
     fn whole_row_field(
@@ -46068,7 +46158,7 @@ impl ColTypeResolver for RuleConditionColumns<'_> {
         name: &str,
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
-        if !self.is_whole_row(name) || index >= self.count {
+        if !self.whole_row_visible(name) || index >= self.count {
             return None;
         }
         Some((
@@ -46076,6 +46166,57 @@ impl ColTypeResolver for RuleConditionColumns<'_> {
             self.metadata[index],
         ))
     }
+}
+
+/// PostgreSQL's check that a rule's `RETURNING` list matches the rule's
+/// relation, entry by entry, as the statement's own `RETURNING` list reads
+/// the returned rows as that relation's rows.
+fn check_rule_returning<'a>(
+    statement: &'a Stmt<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    columns: &RuleConditionColumns<'a>,
+) -> Result<(), SqlError> {
+    let mut types = [0i32; MAX_PROJ];
+    let Some(count) =
+        super::query::rule_returning_types(statement, storage, txid, arena, columns, &mut types)?
+    else {
+        return Ok(());
+    };
+    for (index, entry) in types[..count].iter().enumerate() {
+        if index >= columns.count {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "RETURNING list has too many entries"
+            ));
+        }
+        let column = columns.metadata[index].type_oid;
+        if *entry != column {
+            let entry = super::catalog::format_type_name(storage, txid, *entry)?;
+            let column_type = super::catalog::format_type_name(storage, txid, column)?;
+            return Err(crate::sql::error_position::with_detail(
+                sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "RETURNING list's entry {} has different type from column \"{}\"",
+                    index + 1,
+                    columns.names[index]
+                ),
+                format_args!(
+                    "RETURNING list entry has type {}, but column has type {}.",
+                    entry.as_str(),
+                    column_type.as_str()
+                ),
+            ));
+        }
+    }
+    if count < columns.count {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "RETURNING list has too few entries"
+        ));
+    }
+    Ok(())
 }
 
 fn stored_rule_definition(
@@ -46119,8 +46260,12 @@ fn stored_rule_definition(
             collation: crate::sql::ast::Collation::Default,
         }; crate::storage::MAX_COLUMNS],
         count: 0,
+        relation: rule.table.name,
         old: !matches!(event, crate::storage::RewriteEvent::Insert),
         new: !matches!(event, crate::storage::RewriteEvent::Delete),
+        scope: core::cell::Cell::new(RuleNameScope::Condition),
+        used_old: core::cell::Cell::new(false),
+        used_new: core::cell::Cell::new(false),
         catalog: CatalogCols {
             definition: None,
             alias: None,
@@ -46261,70 +46406,52 @@ fn stored_rule_definition(
                 "cannot use subquery in rule condition"
             ));
         }
-        if super::query::expr_has_aggregate(condition, storage, txn.txid, &condition_columns)? {
-            return Err(sql_err!(
-                sqlstate::GROUPING_ERROR,
-                "aggregate functions are not allowed in rule conditions"
-            ));
-        }
-        let mut invalid = None;
-        condition.for_each_column_reference(&mut |qualifier, column| {
-            if invalid.is_some() {
-                return;
-            }
-            let Some(qualifier) = qualifier else {
-                invalid = Some(sql_err!(
-                    sqlstate::INVALID_OBJECT_DEFINITION,
-                    "rule condition column \"{}\" must be qualified with OLD or NEW",
-                    column
-                ));
-                return;
-            };
-            let old = qualifier.eq_ignore_ascii_case("old");
-            let new = qualifier.eq_ignore_ascii_case("new");
-            if !old && !new {
-                invalid = Some(sql_err!(
-                    sqlstate::INVALID_OBJECT_DEFINITION,
-                    "rule condition may only reference OLD or NEW"
-                ));
-            } else if old && matches!(event, crate::storage::RewriteEvent::Insert) {
-                invalid = Some(sql_err!(
-                    sqlstate::INVALID_OBJECT_DEFINITION,
-                    "ON INSERT rule cannot reference OLD"
-                ));
-            } else if new && matches!(event, crate::storage::RewriteEvent::Delete) {
-                invalid = Some(sql_err!(
-                    sqlstate::INVALID_OBJECT_DEFINITION,
-                    "ON DELETE rule cannot reference NEW"
-                ));
-            } else if condition_columns.names[..condition_columns.count]
-                .iter()
-                .all(|candidate| *candidate != column)
-            {
-                invalid = Some(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
-                    column
-                ));
-            }
-        });
-        if let Some(error) = invalid {
-            return Err(error);
-        }
         let catalog = super::query::storage_catalog(storage, arena, txn.txid);
         let hooks = super::eval::EvalHooks {
             catalog: Some(&catalog),
             ..super::eval::NO_HOOKS
         };
-        if super::eval::expression_type_identity(condition, &condition_columns, &hooks)?
-            .record_field_oid()
-            != ColType::Bool.oid()
+        super::eval::expression_type_identity(condition, &condition_columns, &hooks)?;
+        if let Some(aggregate) =
+            super::query::first_aggregate(condition, storage, txn.txid, &condition_columns, arena)?
         {
-            return Err(sql_err!(
-                sqlstate::DATATYPE_MISMATCH,
-                "rule WHERE condition must be type boolean"
+            return Err(crate::sql::error_position::at_expression(
+                sql_err!(
+                    sqlstate::GROUPING_ERROR,
+                    "aggregate functions are not allowed in WHERE"
+                ),
+                aggregate,
             ));
         }
+        super::query::check_rule_condition_type(
+            condition,
+            &condition_columns,
+            storage,
+            txn.txid,
+            arena,
+        )?;
+    }
+    condition_columns.scope.set(RuleNameScope::Action);
+    for action in rule.actions {
+        condition_columns.used_old.set(false);
+        condition_columns.used_new.set(false);
+        super::query::analyse_rule_action(
+            action.statement,
+            storage,
+            txn.txid,
+            arena,
+            &condition_columns,
+        )?;
+        condition_columns.check_action_rows()?;
+    }
+    if let Some(index) = returning_action {
+        check_rule_returning(
+            rule.actions[usize::from(index)].statement,
+            storage,
+            txn.txid,
+            arena,
+            &condition_columns,
+        )?;
     }
     let mut source = crate::util::StackStr::<{ crate::storage::RULE_SQL_MAX }>::new();
     let mut source_inputs = ArenaList::new(arena);
@@ -46608,11 +46735,12 @@ pub fn create_rule(
     if let Err(error) = storage.require_owner(target.access_object(), txn.txid, "relation") {
         return sql_fail(error);
     }
-    let (definition, dependencies) =
-        match stored_rule_definition(storage, txn, rule, target, raw_path, arena) {
-            Ok(definition) => definition,
-            Err(error) => return sql_fail(error),
-        };
+    let (definition, dependencies) = match crate::sql::error_position::with_analysis(|| {
+        stored_rule_definition(storage, txn, rule, target, raw_path, arena)
+    }) {
+        Ok(definition) => definition,
+        Err(error) => return sql_fail(error),
+    };
     let publication =
         match storage.create_rule(definition, dependencies.view(), rule.or_replace, txn.txid) {
             Ok(publication) => publication,
@@ -69448,6 +69576,7 @@ where
     let seq_session = services.seq_session;
     let coercion_txid = txn.txid;
     let logical_table_index = logical_target.table();
+
     match partition_insert::with_partition_insert_row(
         storage,
         logical_target,
@@ -71744,6 +71873,141 @@ fn emit_conflict_returning<Definition0: crate::storage::DefinitionBacking>(
         capture,
         seq_session,
     )
+}
+
+/// The statement's own `RETURNING` list over the rows a rewrite rule's
+/// action returned: PostgreSQL reads each returned row as a row of the
+/// rule's relation, so the list names that relation's columns.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_rule_returning(
+    storage: &Storage,
+    txn: &TxnState,
+    target: crate::storage::RuleTarget,
+    statement: &Stmt<'_>,
+    rows: &[&[u8]],
+    arena: &Arena,
+    params: &[Datum],
+    responder: &mut Responder,
+    capture: &mut Option<&mut super::ReturningCapture<'_>>,
+    seq_session: &crate::sql::guc::SeqSession,
+) -> Result<Result<(), SqlError>, WireFull> {
+    match target {
+        crate::storage::RuleTarget::Table(slot) => {
+            let definition = storage.table_def(usize::from(slot), txn.txid);
+            emit_relation_returning(
+                storage,
+                txn,
+                &*definition,
+                statement,
+                rows,
+                arena,
+                params,
+                responder,
+                capture,
+                seq_session,
+            )
+        }
+        crate::storage::RuleTarget::View(slot) => {
+            let definition =
+                match view_trigger_definition(storage, usize::from(slot), txn.txid, arena) {
+                    Ok(definition) => definition,
+                    Err(error) => return Ok(Err(error)),
+                };
+            emit_relation_returning(
+                storage,
+                txn,
+                &definition,
+                statement,
+                rows,
+                arena,
+                params,
+                responder,
+                capture,
+                seq_session,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_relation_returning<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    txn: &TxnState,
+    definition: &crate::storage::TableDefinition<Definition0>,
+    statement: &Stmt<'_>,
+    rows: &[&[u8]],
+    arena: &Arena,
+    params: &[Datum],
+    responder: &mut Responder,
+    capture: &mut Option<&mut super::ReturningCapture<'_>>,
+    seq_session: &crate::sql::guc::SeqSession,
+) -> Result<Result<(), SqlError>, WireFull> {
+    let (alias, returning, deleted) = match statement {
+        Stmt::Insert(insert) => (insert.alias, insert.returning, false),
+        Stmt::Update(update) => (update.alias, update.returning, false),
+        Stmt::Delete(delete) => (delete.alias, delete.returning, true),
+        _ => return Ok(Ok(())),
+    };
+    if returning.is_empty() {
+        return Ok(Ok(()));
+    }
+    if capture.is_none() {
+        let mut description = [ColDesc::new("", 0, 0); MAX_PROJ];
+        let count = match super::query::describe_catalog_items_as(
+            returning.items,
+            Some(crate::storage::RelationDefinition::from_definition(
+                definition,
+            )),
+            alias,
+            storage,
+            txn.txid,
+            arena,
+            &mut description,
+            crate::sql::exec::DescriptionTarget::Wire,
+        ) {
+            Ok(count) => count,
+            Err(error) => return Ok(Err(error)),
+        };
+        responder.row_description(&description[..count])?;
+    }
+    let width = definition.n_columns;
+    for bytes in rows {
+        if projected_row_width(bytes) != width {
+            return Ok(Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "rule RETURNING row does not match its relation"
+            )));
+        }
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        for (index, value) in values[..width].iter_mut().enumerate() {
+            *value = decode_projected_pub(bytes, index);
+        }
+        let values = &values[..width];
+        let (old, new) = if deleted {
+            (Some(values), None)
+        } else {
+            (None, Some(values))
+        };
+        if let Err(error) = emit_projected(
+            storage,
+            txn,
+            definition,
+            alias,
+            values,
+            returning,
+            old,
+            new,
+            None,
+            arena,
+            params,
+            responder,
+            capture,
+            seq_session,
+        )? {
+            return Ok(Err(error));
+        }
+    }
+    Ok(Ok(()))
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]

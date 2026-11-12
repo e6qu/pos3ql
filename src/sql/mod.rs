@@ -10788,6 +10788,14 @@ impl Engine {
                                 &self.storage,
                                 txn.txid,
                                 arena,
+                                None,
+                            )?;
+                            query::validate_dml_assignment_casts(
+                                statement,
+                                &self.storage,
+                                txn.txid,
+                                arena,
+                                None,
                             )?;
                             Ok(count)
                         }
@@ -14908,6 +14916,7 @@ impl Engine {
                 Ok(())
             };
         storage.set_read_snapshot(txn.command_id());
+        reject_with_query_rules(storage, dml, txn)?;
         let outcome = match dml {
             Stmt::Merge(_) => Self::execute_merge(
                 storage,
@@ -15194,6 +15203,9 @@ impl Engine {
             }
         };
         let outer_returns_rows = query::statement_returns_rows(statement);
+        // A data-modifying WITH query reads the rows and counts them; it has
+        // no command tag of its own.
+        let capturing = capture.is_some();
         let resolved = match storage.resolve_relation(relation.schema, relation.name, txn.txid) {
             Some(resolved) => resolved,
             None => {
@@ -15679,6 +15691,9 @@ impl Engine {
         // Without the original, PostgreSQL's command tag counts the rows of
         // the last INSTEAD rule action with the original's command type.
         let mut rewritten_rows = 0u64;
+        // The rows the RETURNING rule action returns, read afterwards as rows
+        // of the rule's relation by the statement's own RETURNING list.
+        let mut returned_rows = crate::mem::arena::ArenaList::new_persistent(arena);
         loop {
             let selected = storage
                 .firing_rules_for(target, event, txn.replication_apply, txn.txid)
@@ -15816,6 +15831,15 @@ impl Engine {
                             Err(_) => return Ok(Err(query::arena_full_pub())),
                         }
                     };
+                    if let Err(error) = query::check_rule_insert_values(
+                        action,
+                        &transition.source,
+                        storage,
+                        txn.txid,
+                        arena,
+                    ) {
+                        return Ok(Err(error));
+                    }
                     let action = match query::attach_rule_source(
                         action,
                         transition.source,
@@ -15825,6 +15849,14 @@ impl Engine {
                     ) {
                         Ok(action) => action,
                         Err(error) => return Ok(Err(error)),
+                    };
+                    let mut collect = |_: &Storage,
+                                       _: u32,
+                                       _: &dyn SequenceAccess,
+                                       values: &[Datum<'_>]|
+                     -> Result<(), SqlError> {
+                        let row = exec::encode_projected_persistent_pub(values, arena)?;
+                        returned_rows.push(row).map_err(|_| query::arena_full_pub())
                     };
                     let outcome = Self::execute_rule_action(
                         storage,
@@ -15838,8 +15870,14 @@ impl Engine {
                         cursors,
                         row_buffers,
                         responder,
-                        if use_returning { capture.take() } else { None },
+                        if use_returning {
+                            Some(&mut collect)
+                        } else {
+                            None
+                        },
                         use_returning,
+                        // A statement returning rows sends only those.
+                        outer_returns_rows && !use_returning,
                         connection_id,
                     )?;
                     if let Err(error) = outcome {
@@ -15872,6 +15910,23 @@ impl Engine {
                 Ok(None) => {}
                 Err(error) => return Ok(Err(error)),
             }
+        }
+        if outer_returns_rows
+            && suppress_original
+            && let Err(error) = exec::emit_rule_returning(
+                storage,
+                txn,
+                target,
+                statement,
+                returned_rows.as_slice(),
+                arena,
+                params,
+                responder,
+                &mut capture,
+                guc.seq_session(),
+            )?
+        {
+            return Ok(Err(error));
         }
 
         if !insert_event && !suppress_original {
@@ -15908,7 +15963,9 @@ impl Engine {
             Stmt::Delete(_) => stack_format!(48, "DELETE {}", affected),
             _ => unreachable!(),
         };
-        responder.command_complete(tag.as_str())?;
+        if !capturing {
+            responder.command_complete(tag.as_str())?;
+        }
         Ok(Ok(()))
     }
 
@@ -15927,8 +15984,30 @@ impl Engine {
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
         returning: bool,
+        quiet: bool,
         connection_id: i32,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if quiet {
+            return responder.without_query_output(|responder| {
+                Self::execute_rule_action(
+                    storage,
+                    scratch,
+                    arena,
+                    action,
+                    authorization,
+                    txn,
+                    params,
+                    guc,
+                    cursors,
+                    row_buffers,
+                    responder,
+                    capture,
+                    returning,
+                    false,
+                    connection_id,
+                )
+            });
+        }
         match action {
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) if returning => responder
                 .without_command_complete(|responder| {
@@ -15948,8 +16027,9 @@ impl Engine {
                         connection_id,
                     )
                 }),
-            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
-                responder.without_query_output(|responder| {
+            // Rules on the action's own target may send SELECT rows.
+            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => responder
+                .without_command_complete(|responder| {
                     Self::execute_data_modification(
                         storage,
                         scratch,
@@ -15965,9 +16045,10 @@ impl Engine {
                         None,
                         connection_id,
                     )
-                })
-            }
-            Stmt::Select(select) => responder.without_query_output(|responder| {
+                }),
+            // PostgreSQL sends a SELECT action's rows before the statement's
+            // command tag.
+            Stmt::Select(select) => responder.without_command_complete(|responder| {
                 let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
                 if select.from.is_some() {
                     query::select_query(
@@ -15991,7 +16072,7 @@ impl Engine {
                     )
                 }
             }),
-            Stmt::SetQuery(query) => responder.without_query_output(|responder| {
+            Stmt::SetQuery(query) => responder.without_command_complete(|responder| {
                 let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
                 query::set_query(
                     storage,
@@ -30496,6 +30577,61 @@ pub(crate) fn analyze_dml_cte<'a>(
     ))
 }
 
+/// PostgreSQL rewrites a data-modifying `WITH` query only into exactly one
+/// statement: rules that would leave none, several, or a conditional one are
+/// rejected before anything runs.
+fn reject_with_query_rules(
+    storage: &Storage,
+    statement: &Stmt<'_>,
+    txn: &TxnState,
+) -> Result<(), SqlError> {
+    let (relation, event) = match statement {
+        Stmt::Insert(insert) => (insert.table, crate::storage::RewriteEvent::Insert),
+        Stmt::Update(update) => (update.table, crate::storage::RewriteEvent::Update),
+        Stmt::Delete(delete) => (delete.table, crate::storage::RewriteEvent::Delete),
+        _ => return Ok(()),
+    };
+    let target = match storage.resolve_relation(relation.schema, relation.name, txn.txid) {
+        Some(crate::storage::ResolvedRelation::Table(slot)) => {
+            crate::storage::RuleTarget::Table(slot as u16)
+        }
+        Some(crate::storage::ResolvedRelation::View(slot)) => {
+            crate::storage::RuleTarget::View(slot as u16)
+        }
+        _ => return Ok(()),
+    };
+    let mut statements = 1usize;
+    let mut conditional_instead = false;
+    let mut also = false;
+    let mut unconditional_instead = false;
+    for (_, rule) in storage.firing_rules_for(target, event, txn.replication_apply, txn.txid) {
+        let definition = rule.definition_for(txn.txid);
+        statements += definition.action_sql().count();
+        match definition.mode {
+            crate::storage::RewriteMode::Also => also = true,
+            crate::storage::RewriteMode::Instead if definition.condition.is_some() => {
+                conditional_instead = true;
+            }
+            crate::storage::RewriteMode::Instead => unconditional_instead = true,
+        }
+    }
+    if unconditional_instead {
+        statements -= 1;
+    }
+    let message = match statements {
+        1 => return Ok(()),
+        0 => "DO INSTEAD NOTHING rules are not supported for data-modifying statements in WITH",
+        _ if conditional_instead => {
+            "conditional DO INSTEAD rules are not supported for data-modifying statements in WITH"
+        }
+        _ if also => "DO ALSO rules are not supported for data-modifying statements in WITH",
+        _ => {
+            "multi-statement DO INSTEAD rules are not supported for data-modifying statements in WITH"
+        }
+    };
+    Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "{}", message))
+}
+
 /// The column names, in order, of the table a rule's INSERT action writes.
 /// The columns and declared types of a rule `INSERT` action's target table
 /// or view.
@@ -30536,7 +30672,15 @@ fn rule_insert_target<'a>(
     let type_oids = arena
         .alloc_slice_with(columns.len(), |_| 0)
         .map_err(|_| crate::sql::eval::arena_full())?;
-    for ((name, type_oid), column) in names.iter_mut().zip(type_oids.iter_mut()).zip(columns) {
+    let type_names = arena
+        .alloc_slice_with(columns.len(), |_| "")
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    for (((name, type_oid), type_name), column) in names
+        .iter_mut()
+        .zip(type_oids.iter_mut())
+        .zip(type_names.iter_mut())
+        .zip(columns)
+    {
         *name = arena
             .alloc_str(column.name.as_str())
             .map_err(|_| crate::sql::eval::arena_full())?;
@@ -30549,6 +30693,12 @@ fn rule_insert_target<'a>(
                     column.name.as_str()
                 )
             })?;
+        *type_name = catalog::user_type_name_text(storage, txid, *type_oid, arena)?
+            .unwrap_or_else(|| column.ctype.name());
     }
-    Ok(query::RuleInsertTarget { names, type_oids })
+    Ok(query::RuleInsertTarget {
+        names,
+        type_oids,
+        type_names,
+    })
 }

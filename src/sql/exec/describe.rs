@@ -4206,12 +4206,18 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
         self.definition
             .column_index(name)
             .map(|index| self.definition.columns()[index].ctype)
-            .ok_or_else(|| {
-                sql_err!(
+            .ok_or_else(|| match qualifier {
+                Some(qualifier) => sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column {}.{} does not exist",
+                    qualifier,
+                    name
+                ),
+                None => sql_err!(
                     sqlstate::UNDEFINED_COLUMN,
                     "column \"{}\" does not exist",
                     name
-                )
+                ),
             })
     }
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {

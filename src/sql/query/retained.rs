@@ -1828,12 +1828,12 @@ impl<'a> RetainedSelect<'a> {
         };
         check_select_types(statement, &scope, storage, txid, arena, None)?;
         check_select_constants(statement, arena, storage, txid)?;
+        super::check_key_types(statement, &scope, arena, storage, txid)?;
         let locking = if locks {
             if table.is_none() {
                 return Ok(None);
             }
             super::validate_locking(statement, storage, txid, arena)?;
-            super::check_key_types(statement, &scope, arena, storage, txid)?;
             arena
                 .alloc_slice_copy(statement.locking)
                 .map_err(|_| arena_full())?

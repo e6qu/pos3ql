@@ -30,6 +30,9 @@ struct CollectionContext<'a> {
     bindings: Option<crate::storage::StoredQueryDependencyView<'a>>,
     /// The query levels enclosing a subquery, which its outer references name.
     enclosing: Option<&'a dyn EnclosingColumns>,
+    /// A rewrite rule's action, whose `RETURNING` list names the rule's OLD
+    /// and NEW rather than the written row's images.
+    rule_action: bool,
 }
 
 /// The columns of the query levels around a subquery.
@@ -85,6 +88,7 @@ impl<'a> CollectionContext<'a> {
             transition: None,
             bindings,
             enclosing: None,
+            rule_action: false,
         }
     }
 
@@ -94,6 +98,7 @@ impl<'a> CollectionContext<'a> {
             transition: Some(transition),
             bindings: None,
             enclosing: None,
+            rule_action: false,
         }
     }
 
@@ -490,7 +495,10 @@ pub(super) fn collect_rule_actions(
             txid,
             &mut dependencies,
             arena,
-            CollectionContext::with_columns(&path, transition),
+            CollectionContext {
+                rule_action: true,
+                ..CollectionContext::with_columns(&path, transition)
+            },
         )?;
     }
     Ok(dependencies)
@@ -946,6 +954,11 @@ fn collect_statement(
                     if let SelectItem::Expr { expression, .. }
                     | SelectItem::RecordStar(expression) = item
                     {
+                        // In a rule action, OLD and NEW name the rule's rows.
+                        if context.rule_action {
+                            collect_expr!(expression, Some(&scope), no_excluded)?;
+                            continue;
+                        }
                         collect_returning_expression(
                             expression,
                             update.returning,
@@ -1009,6 +1022,11 @@ fn collect_statement(
                     if let SelectItem::Expr { expression, .. }
                     | SelectItem::RecordStar(expression) = item
                     {
+                        // In a rule action, OLD and NEW name the rule's rows.
+                        if context.rule_action {
+                            collect_expr!(expression, Some(&scope), no_excluded)?;
+                            continue;
+                        }
                         collect_returning_expression(
                             expression,
                             delete.returning,
@@ -1349,7 +1367,8 @@ pub(crate) fn validate_dml_assignment_casts(
                     &columns,
                     storage,
                     txid,
-                )
+                )?;
+                assigned_literal(expression, &target.columns()[index], arena)
             };
         let insert_values = |names: &[&str], values: &[&Expr<'_>]| -> Result<(), SqlError> {
             for (index, expression) in values.iter().enumerate() {
@@ -1370,6 +1389,7 @@ pub(crate) fn validate_dml_assignment_casts(
                         storage,
                         txid,
                     )?;
+                    assigned_literal(expression, column, arena)?;
                 }
             }
             Ok(())
@@ -1706,8 +1726,8 @@ fn validate_insert_projection(
             let Some(column) = target else {
                 return Ok(());
             };
-            validate_assignment_type(source, column, storage, txid).map_err(
-                |error| match expression {
+            validate_assignment_type(source, column, storage, txid).map_err(|error| {
+                match expression {
                     Some(expression) => {
                         crate::sql::error_position::at_expression(error, expression)
                     }
@@ -1716,8 +1736,15 @@ fn validate_insert_projection(
                         Some(item) => crate::sql::error_position::at_item(error, item),
                         None => error,
                     },
-                },
-            )
+                }
+            })?;
+            // An unknown-type literal converts to its target as analysed.
+            match expression {
+                Some(Expr::Str(literal)) => {
+                    super::convert_literal(literal, Some(column.ctype), arena)
+                }
+                _ => Ok(()),
+            }
         },
     )
 }
@@ -2196,6 +2223,19 @@ pub(crate) fn visit_projection_types(
 /// the value must coerce to the column's type in assignment context. A
 /// subscripted target checks each assigned value against the element type
 /// (or the container type for a slice or jsonb), positioned at the target.
+/// An unknown-type literal assigned to a column converts to the column's
+/// type while the statement is analysed.
+fn assigned_literal(
+    expression: &Expr<'_>,
+    column: &crate::storage::ColumnMeta,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    match expression {
+        Expr::Str(literal) => super::convert_literal(literal, Some(column.ctype), arena),
+        _ => Ok(()),
+    }
+}
+
 fn validate_assignment_expression(
     expression: &Expr<'_>,
     target_name: Option<&str>,

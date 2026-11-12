@@ -11,7 +11,7 @@
 pub(crate) mod acl;
 pub(crate) mod array;
 pub(crate) mod bytea;
-pub(super) mod conditional;
+pub(crate) mod conditional;
 pub(super) mod datetime;
 pub(super) mod full_text;
 pub(crate) mod geometry;

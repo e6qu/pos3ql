@@ -2123,9 +2123,61 @@ impl ConstraintRow {
     }
 }
 
-/// Enforces constraints using the exact identity that the caller will store.
+/// Enforces constraints using the exact identity that the caller will store,
+/// in PostgreSQL's order: the row's own CHECK and domain constraints before
+/// its index keys and foreign keys.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn enforce_row_constraints(
+    storage: &Storage,
+    table_index: usize,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    schema: &[ColType],
+    values: &[Datum],
+    row: ConstraintRow,
+    txid: u32,
+    txn: Option<&mut TxnState>,
+    checks: &ParsedChecks,
+    arena: &Arena,
+    params: &[Datum],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<(), SqlError> {
+    enforce_row_checks(storage, def, values, txid, checks, arena, params, sequences)?;
+    enforce_row_keys(
+        storage,
+        table_index,
+        def,
+        schema,
+        values,
+        row,
+        txid,
+        txn,
+        checks,
+        arena,
+    )
+}
+
+/// The row's CHECK, partition bound and domain constraints, which
+/// PostgreSQL's `ExecConstraints` tests before the row is stored.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn enforce_row_checks(
+    storage: &Storage,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    values: &[Datum],
+    txid: u32,
+    checks: &ParsedChecks,
+    arena: &Arena,
+    params: &[Datum],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<(), SqlError> {
+    check_detached_partition_bound(def, values)?;
+    check_row_checks(storage, def, checks, values, txid, arena, params, sequences)?;
+    check_domain_constraints(storage, def, values, txid, arena, params, sequences)
+}
+
+/// The row's unique, exclusion and foreign key constraints, which PostgreSQL
+/// tests while and after it stores the row.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn enforce_row_keys(
     storage: &Storage,
     table_index: usize,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
@@ -2136,9 +2188,8 @@ pub(crate) fn enforce_row_constraints(
     mut txn: Option<&mut TxnState>,
     checks: &ParsedChecks,
     arena: &Arena,
-    params: &[Datum],
-    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
+    check_index_tuple_sizes(storage, def, values, txid, arena)?;
     let self_rowid = row.excluded();
     // Existing rows meeting a new key are its index being built.
     let duplicate = if matches!(row, ConstraintRow::Existing { .. }) {
@@ -2146,7 +2197,6 @@ pub(crate) fn enforce_row_constraints(
     } else {
         DuplicateKey::Write
     };
-    check_index_tuple_sizes(storage, def, values, txid, arena)?;
     let constraint_table = storage
         .find_visible(def.schema.as_str(), def.name.as_str(), txid)
         .unwrap_or(table_index);
@@ -2227,9 +2277,6 @@ pub(crate) fn enforce_row_constraints(
             arena,
         )?;
     }
-    check_detached_partition_bound(def, values)?;
-    check_row_checks(storage, def, checks, values, txid, arena, params, sequences)?;
-    check_domain_constraints(storage, def, values, txid, arena, params, sequences)?;
     check_or_defer_fk_child(
         storage,
         constraint_table,

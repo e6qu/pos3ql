@@ -54,7 +54,8 @@ customer 7, the order insert waits; when the delete commits the insert fails
 with `23503`, and when it rolls back the insert succeeds. Under `REPEATABLE
 READ` and `SERIALIZABLE`, an insert whose parent was deleted or had its key
 changed after the transaction's snapshot fails with `40001`. Changing other
-parent columns does not conflict. `ON DELETE`/`ON UPDATE` actions lock the
+parent columns does not conflict, nor does an assignment that keeps the key
+value, such as `UPDATE customers SET id = id`. `ON DELETE`/`ON UPDATE` actions lock the
 referencing rows they check or rewrite. Each locked row takes one entry of the
 row-lock registry, (`max_connections` + `max_prepared_transactions`) ×
 `txn_rows` entries in total; a full registry fails the statement with `54000`.
@@ -70,9 +71,28 @@ is neither updated nor deleted again. `REPEATABLE READ` and `SERIALIZABLE`
 fail such a statement with `40001` (`could not serialize access due to
 concurrent update`, or `concurrent delete` for an `UPDATE`, `DELETE` or
 `MERGE` of a deleted row); `FOR KEY SHARE` still succeeds when the change kept
-every unique key column. Under `READ COMMITTED`, `MERGE` and `SELECT ... FOR`
-outside a cursor do not yet re-evaluate a row that was updated: they act on or
-return the version they read (see [PLAN.md](../PLAN.md#close-application-compatibility-gaps)).
+every unique key column.
+
+Under `READ COMMITTED`, `SELECT ... FOR UPDATE` returns the locked row's latest
+version: the join conditions, `WHERE` and output list run again over it, while
+the other tables in the join keep the rows first read. For example, a job
+queue's `SELECT id FROM jobs WHERE state = 'new' ORDER BY id LIMIT 1 FOR
+UPDATE` that waited for another worker skips the job that worker claimed and
+returns the next one. The result keeps its original order. `MERGE` chooses the
+action again for the target row's latest version: a `WHEN MATCHED` pair whose
+`ON` condition still holds checks its `WHEN` conditions from the first one; a
+pair whose `ON` condition no longer holds runs the `WHEN NOT MATCHED BY SOURCE`
+actions on the target row and the `WHEN NOT MATCHED` action for the source
+row; a deleted target row leaves only the `WHEN NOT MATCHED` action, as in
+PostgreSQL 15 and later. An `IN (subquery)` condition that does not refer to
+the outer query is rechecked against the subquery row it first matched, as
+PostgreSQL's semi-join does: the row stays only if the tested value did not
+change. Three differences remain: PostgreSQL rechecks a correlated `EXISTS
+(subquery)` against the subquery row it first matched, where pos3ql runs the
+subquery again; a row another transaction moved to a
+different partition is skipped where PostgreSQL fails with `40001`; and a
+query with a `LATERAL` source fails such a recheck with `0A000` where
+PostgreSQL runs the `LATERAL` source again.
 
 A commit becomes visible all at once, and only after it is durable: new
 statements never see half of an order-and-invoice update. If commit waits for

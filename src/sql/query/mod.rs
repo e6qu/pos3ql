@@ -10583,6 +10583,13 @@ pub fn validate_locking(
                 }
             }
         }
+        if has_project_set(statement.items, storage, txid) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "{} is not allowed with set-returning functions in the target list",
+                keyword
+            ));
+        }
         for of in clause.of {
             if !from_binds_relation(statement.from.as_ref(), of) {
                 return Err(sql_err!(
@@ -10594,30 +10601,119 @@ pub fn validate_locking(
             }
         }
     }
+    // The planner rejects a lock on a relation an outer join can null.
+    if let Some(from) = statement.from.as_ref() {
+        for clause in statement.locking {
+            let relations = core::iter::once(&from.base).chain(from.joins.iter().map(|j| &j.table));
+            for (index, relation) in relations.enumerate() {
+                let locked = if clause.of.is_empty() {
+                    relation.subquery.is_none() && relation.func_args.is_none()
+                } else {
+                    let name = relation.alias.unwrap_or(relation.table);
+                    clause.of.iter().any(|of| of.eq_ignore_ascii_case(name))
+                };
+                if locked && outer_join_nulls(from, index) {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "{} cannot be applied to the nullable side of an outer join",
+                        clause.strength.keyword()
+                    ));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
-/// Acquires every row lock contributed by one result row. Returns `false`
-/// when `SKIP LOCKED` removes the row. A default-wait conflict becomes a
-/// private control-flow error which the engine turns into a parked execution;
-/// it is never serialized to the client.
+/// Whether an outer join can null FROM item `index` (the base is item 0,
+/// each join adds the next).
+fn outer_join_nulls(from: &FromClause<'_>, index: usize) -> bool {
+    from.joins.iter().enumerate().any(|(join_index, join)| {
+        let right = join_index + 1;
+        match join.kind {
+            crate::sql::ast::JoinKind::Left => index == right,
+            crate::sql::ast::JoinKind::Right => index < right,
+            crate::sql::ast::JoinKind::Full => index <= right,
+            crate::sql::ast::JoinKind::Inner
+            | crate::sql::ast::JoinKind::Cross
+            | crate::sql::ast::JoinKind::Comma => false,
+        }
+    })
+}
+
+/// What locking one result row found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ResultRowLock {
+    /// `SKIP LOCKED` passed the row over, or under read committed another
+    /// transaction deleted a locked row.
+    Skip,
+    /// Every locked row is still the version the statement read.
+    Current,
+    /// Under read committed another transaction replaced a locked row; the
+    /// row must be evaluated again over the latest versions (PostgreSQL's
+    /// EvalPlanQual). `changed` names each replaced source's physical slot.
+    Changed,
+}
+
+/// Acquires every row lock contributed by one result row. A default-wait
+/// conflict becomes a private control-flow error which the engine turns into
+/// a parked execution; it is never serialized to the client.
 pub(crate) fn lock_result_row(
     storage: &Storage,
     txid: u32,
     statement: &Select<'_>,
     scope: &QueryScope<'_>,
     rowids: &[Option<u64>],
-) -> Result<bool, SqlError> {
-    lock_clauses_row(storage, txid, statement.locking, scope, rowids)
+    changed: &mut [Option<usize>],
+) -> Result<ResultRowLock, SqlError> {
+    lock_clauses_row(storage, txid, statement.locking, scope, rowids, changed)
 }
 
+/// The physical slot holding `rowid` of a locked source. A partitioned
+/// source's rows live in its leaves, and an inheritance parent's scan also
+/// returns its children's rows; row identifiers are cluster-wide.
+fn locked_source_slot(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'_>,
+    table: usize,
+    rowid: u64,
+) -> Result<usize, SqlError> {
+    let root = scope.slots[table];
+    let owner = if storage.table_def(root, txid).partition.is_partitioned() {
+        storage.partition_row_owner(root, rowid, txid)?
+    } else if storage.row_state(root, rowid)?.is_some() {
+        Some(root)
+    } else {
+        let mut owner = None;
+        for candidate in 0..storage.table_count() {
+            if storage.relation_descends_from(candidate, root, txid)
+                && storage.row_state(candidate, rowid)?.is_some()
+            {
+                owner = Some(candidate);
+                break;
+            }
+        }
+        owner
+    };
+    // A row pruned since the statement read it has no owner left; the
+    // root then reports it as gone.
+    Ok(owner.unwrap_or(root))
+}
+
+/// Locks the rows `clauses` target in one result row. `changed` (one entry
+/// per source) receives the slot of each source whose latest version
+/// replaced the one read.
 pub(crate) fn lock_clauses_row(
     storage: &Storage,
     txid: u32,
     clauses: &[crate::sql::ast::LockClause<'_>],
     scope: &QueryScope<'_>,
     rowids: &[Option<u64>],
-) -> Result<bool, SqlError> {
+    changed: &mut [Option<usize>],
+) -> Result<ResultRowLock, SqlError> {
+    changed.fill(None);
+    let repeatable = storage.keeps_transaction_snapshot(txid);
     for clause in clauses {
         for (table, rowid) in rowids.iter().copied().enumerate().take(scope.n) {
             let targeted = if clause.of.is_empty() {
@@ -10634,24 +10730,7 @@ pub(crate) fn lock_clauses_row(
             let Some(rowid) = rowid else {
                 continue;
             };
-            let slot = if scope
-                .defs
-                .stored(table)
-                .expect("locked source is resolved")
-                .partition
-                .is_partitioned()
-            {
-                storage
-                    .partition_row_owner(scope.slots[table], rowid, txid)?
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "partitioned scan returned a row without a physical owner"
-                        )
-                    })?
-            } else {
-                scope.slots[table]
-            };
+            let slot = locked_source_slot(storage, txid, scope, table, rowid)?;
             // The version this statement read, compared with the latest
             // once the lock is held.
             let seen = match storage.row_state(slot, rowid)? {
@@ -10670,10 +10749,10 @@ pub(crate) fn lock_clauses_row(
             // A cursor fetching under a newer statement snapshot can meet a
             // row deleted since it was read.
             let Some(seen) = seen else {
-                return if storage.keeps_transaction_snapshot(txid) {
+                return if repeatable {
                     Err(crate::sql::exec::concurrent_change(false))
                 } else {
-                    Ok(false)
+                    Ok(ResultRowLock::Skip)
                 };
             };
             let Some(locked) = crate::sql::exec::lock_selected_row(
@@ -10686,8 +10765,9 @@ pub(crate) fn lock_clauses_row(
                 clause.wait,
             )?
             else {
-                return Ok(false);
+                return Ok(ResultRowLock::Skip);
             };
+            let updated = matches!(locked, crate::sql::exec::LockedVersion::Updated(_));
             if !crate::sql::exec::locked_result_row_current(
                 storage,
                 txid,
@@ -10697,11 +10777,18 @@ pub(crate) fn lock_clauses_row(
                 locked,
                 clause.strength,
             )? {
-                return Ok(false);
+                return Ok(ResultRowLock::Skip);
+            }
+            if updated && !repeatable {
+                changed[table] = Some(slot);
             }
         }
     }
-    Ok(true)
+    Ok(if changed.iter().any(Option::is_some) {
+        ResultRowLock::Changed
+    } else {
+        ResultRowLock::Current
+    })
 }
 
 fn expand_select_record_calls<'a>(
@@ -11249,9 +11336,6 @@ pub(crate) fn select_query_resumable<'a>(
                 for k in 1..=project_set.count {
                     if emitted >= limit {
                         break;
-                    }
-                    if !lock_result_row(storage, txid, statement, &scope, row.rowids)? {
-                        continue;
                     }
                     if skipped < offset {
                         skipped += 1;
@@ -12845,6 +12929,9 @@ fn select_into_rows_mode<'a>(
             &scope,
             txid,
             statement,
+            from,
+            correlated,
+            &outer_subs.base,
             rows,
             width,
             deferred.as_ref(),

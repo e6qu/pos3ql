@@ -392,6 +392,433 @@ fn materialized_value_at<'a>(
     unreachable!("raw projected column is within scope width")
 }
 
+/// A materialized row after its locks.
+pub(super) enum LockedOutput<'a> {
+    /// The row leaves the result.
+    Skip,
+    /// The row is returned as read.
+    Unchanged,
+    /// A locked source changed; the row evaluated again.
+    Rebuilt(&'a [u8]),
+}
+
+impl<'a> LockedOutput<'a> {
+    fn row<'b>(self, read: &'b [u8]) -> Option<&'b [u8]>
+    where
+        'a: 'b,
+    {
+        match self {
+            LockedOutput::Skip => None,
+            LockedOutput::Unchanged => Some(read),
+            LockedOutput::Rebuilt(row) => Some(row),
+        }
+    }
+}
+
+/// A source row assembled from per-source values in scope order.
+fn sources_row<'s, 'a>(
+    scope: &'s QueryScope<'a>,
+    bound: &'s [Option<super::scan::BoundRow<'a>>],
+    order: &'s [usize],
+    rowids: &'s [Option<u64>],
+) -> JoinRow<'s, 'a, 'a> {
+    JoinRow {
+        scope,
+        values: super::scan::JoinRowValues::Bound {
+            bound,
+            order,
+            count: scope.n,
+            buffers: &[],
+            buffer_offsets: &[],
+        },
+        rowids: &rowids[..scope.n],
+    }
+}
+
+/// Where a materialized row stores each kind of column.
+struct MaterializedLayout<'p> {
+    width: usize,
+    n_keys: usize,
+    identities_at: usize,
+    stored_width: usize,
+    raw_columns: Option<&'p super::scan::PaxReadDemand>,
+}
+
+/// Encodes one projected source row into the statement arena's persistent
+/// tail, which survives the scan's per-row rewinds.
+fn encode_materialized_row<'a>(
+    scope: &QueryScope<'a>,
+    row: &JoinRow<'_, 'a, '_>,
+    projected: &[Datum<'a>],
+    keys: &[Datum<'a>],
+    layout: &MaterializedLayout<'_>,
+    arena: &'a Arena,
+) -> Result<&'a [u8], SqlError> {
+    let value = |index| {
+        materialized_value_at(
+            scope,
+            row,
+            projected,
+            keys,
+            layout.width,
+            layout.n_keys,
+            layout.identities_at,
+            layout.raw_columns,
+            index,
+        )
+    };
+    let row_bytes = crate::sql::exec::projected_row_len_by(layout.stored_width, value)?;
+    let output = arena
+        .alloc_persistent_slice_with(row_bytes, |_| 0u8)
+        .map_err(|_| arena_full())?;
+    let len = crate::sql::exec::encode_projected_by_into(layout.stored_width, value, output)?;
+    Ok(&output[..len])
+}
+
+/// Evaluates a locked result row again when another transaction replaced
+/// one of its locked source rows, as PostgreSQL's EvalPlanQual does under
+/// read committed: replaced sources contribute their latest versions, the
+/// others keep the values read, and the join conditions, WHERE clause, and
+/// projection run again. PostgreSQL's LockRows node sits above Sort, so the
+/// row keeps its place in the result.
+pub(super) struct LockedRowRecheck<'r, 'a> {
+    plan: MaterializationPlan<'a>,
+    statement: &'a Select<'a>,
+    scope: &'r QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    correlated: &'a [&'a Expr<'a>],
+    base: &'r SubqueryValues<'a, 'a>,
+    params: &'r [Datum<'a>],
+    hooks: &'r EvalHooks<'r, 'a>,
+    outer: Option<&'r dyn ColumnLookup<'a>>,
+    scalars: &'a mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)],
+    lists: &'a mut [crate::sql::eval::SubqueryList<'a>],
+    changed: &'a mut [Option<usize>],
+}
+
+impl<'r, 'a> LockedRowRecheck<'r, 'a> {
+    #[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
+    pub(super) fn new(
+        storage: &Storage,
+        txid: u32,
+        statement: &'a Select<'a>,
+        scope: &'r QueryScope<'a>,
+        from: &'a FromClause<'a>,
+        correlated: &'a [&'a Expr<'a>],
+        base: &'r SubqueryValues<'a, 'a>,
+        params: &'r [Datum<'a>],
+        hooks: &'r EvalHooks<'r, 'a>,
+        outer: Option<&'r dyn ColumnLookup<'a>>,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        let plan =
+            prepare_materialization(storage, txid, statement, scope, correlated, outer, arena)?;
+        let (n_where_scalars, n_where_lists) =
+            super::subquery::merge_scratch_lens(Some(base), plan.where_correlated);
+        let (n_row_scalars, n_row_lists) =
+            super::subquery::merge_scratch_lens(Some(base), correlated);
+        let scalars = arena
+            .alloc_slice_with(n_where_scalars.max(n_row_scalars), |_| {
+                (core::ptr::null(), Datum::Null, Datum::Null)
+            })
+            .map_err(|_| arena_full())?;
+        let lists = arena
+            .alloc_slice_with(n_where_lists.max(n_row_lists), |_| {
+                super::subquery::empty_subquery_list()
+            })
+            .map_err(|_| arena_full())?;
+        let changed = arena
+            .alloc_slice_with(scope.n, |_| None)
+            .map_err(|_| arena_full())?;
+        Ok(Self {
+            plan,
+            statement,
+            scope,
+            from,
+            correlated,
+            base,
+            params,
+            hooks,
+            outer,
+            scalars,
+            lists,
+            changed,
+        })
+    }
+
+    /// Locks the sources of materialized `row`.
+    pub(super) fn lock(
+        &mut self,
+        storage: &'a Storage,
+        txid: u32,
+        row: &[u8],
+        rowids: &[Option<u64>],
+        arena: &'a Arena,
+    ) -> Result<LockedOutput<'a>, SqlError> {
+        match super::lock_result_row(
+            storage,
+            txid,
+            self.statement,
+            self.scope,
+            rowids,
+            self.changed,
+        )? {
+            super::ResultRowLock::Skip => Ok(LockedOutput::Skip),
+            super::ResultRowLock::Current => Ok(LockedOutput::Unchanged),
+            super::ResultRowLock::Changed => {
+                let mark = arena.mark();
+                let rebuilt = arena
+                    .alloc_slice_copy(row)
+                    .map_err(|_| arena_full())
+                    .and_then(|row| self.rebuild(storage, txid, row, rowids, arena));
+                // Only the rebuilt row, in the persistent tail, outlives the
+                // recheck.
+                unsafe { arena.rewind_to(mark) };
+                Ok(match rebuilt? {
+                    Some(row) => LockedOutput::Rebuilt(row),
+                    None => LockedOutput::Skip,
+                })
+            }
+        }
+    }
+
+    fn rebuild(
+        &mut self,
+        storage: &'a Storage,
+        txid: u32,
+        row: &'a [u8],
+        rowids: &[Option<u64>],
+        arena: &'a Arena,
+    ) -> Result<Option<&'a [u8]>, SqlError> {
+        use super::scan::BoundRow;
+        let scope = self.scope;
+        if scope.lateral[..scope.n].iter().any(|lateral| *lateral) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a concurrently updated row locked with a LATERAL source cannot be rechecked"
+            ));
+        }
+        let raw_at = self.plan.width + self.plan.n_keys;
+        let presence_at = raw_at + scope.stored_columns();
+        // `read` holds every source as the statement read it; `bound` swaps in
+        // the latest versions of the changed sources.
+        let read = arena
+            .alloc_slice_with(scope.n, |_| None::<BoundRow<'a>>)
+            .map_err(|_| arena_full())?;
+        let bound = arena
+            .alloc_slice_with(scope.n, |_| None::<BoundRow<'a>>)
+            .map_err(|_| arena_full())?;
+        let mut column_at = raw_at;
+        for table in 0..scope.n {
+            // Raw rows lay each source out at its stored width.
+            let n_columns = scope.stored_width(table);
+            if matches!(
+                crate::sql::exec::decode_projected_pub(row, presence_at + table),
+                Datum::Bool(true)
+            ) {
+                let values = arena
+                    .alloc_slice_with(n_columns, |_| Datum::Null)
+                    .map_err(|_| arena_full())?;
+                for (column, value) in values.iter_mut().enumerate() {
+                    *value = crate::sql::exec::decode_projected_col_record(
+                        row,
+                        column_at + column,
+                        arena,
+                    )?;
+                }
+                read[table] = Some(BoundRow::Values(values));
+            }
+            column_at += n_columns;
+            bound[table] = read[table];
+            if let Some(slot) = self.changed[table] {
+                let rowid = rowids[table].ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "a changed locked row has no identity"
+                    )
+                })?;
+                let Some(values) = super::scan::latest_locked_source(
+                    storage, txid, scope, table, slot, rowid, arena,
+                )?
+                else {
+                    return Ok(None);
+                };
+                bound[table] = Some(BoundRow::Values(values));
+            }
+        }
+        let order = arena
+            .alloc_slice_with(scope.n, |table| table)
+            .map_err(|_| arena_full())?;
+        for (table, slot) in self.changed.iter().enumerate() {
+            if slot.is_none() {
+                continue;
+            }
+            let Some(policy) =
+                super::scan::source_select_security(storage, scope, table, txid, arena)?
+            else {
+                continue;
+            };
+            let Some(BoundRow::Values(values)) = bound[table] else {
+                unreachable!("a changed source is bound");
+            };
+            let context = crate::sql::exec::RowCtx {
+                def: scope.defs.get(table).expect("resolved"),
+                values,
+                alias: None,
+            };
+            if !super::row_security_passes(
+                policy,
+                &context,
+                storage,
+                txid,
+                arena,
+                self.params,
+                self.hooks,
+            )? {
+                return Ok(None);
+            }
+        }
+        // Each join condition runs again in join order. A join that no
+        // longer matches drops an inner join's row and null-extends an outer
+        // join's nullable side, as the re-run join plan would.
+        for (join_index, join) in self.from.joins.iter().enumerate() {
+            let Some(condition) = join.on.or(self.scope.join_on[join_index]) else {
+                continue;
+            };
+            let right = join_index + 1;
+            let left_present = bound[..right].iter().any(Option::is_some);
+            let right_present = bound[right].is_some();
+            if !left_present || !right_present {
+                continue;
+            }
+            let joined = sources_row(scope, bound, order, rowids);
+            let passes = super::plan::where_passes(
+                condition,
+                arena,
+                self.params,
+                &Chained {
+                    inner: &joined,
+                    outer: self.outer,
+                },
+                self.hooks,
+            )?;
+            if passes {
+                continue;
+            }
+            match join.kind {
+                crate::sql::ast::JoinKind::Inner
+                | crate::sql::ast::JoinKind::Cross
+                | crate::sql::ast::JoinKind::Comma => {
+                    return Ok(None);
+                }
+                crate::sql::ast::JoinKind::Left => bound[right] = None,
+                crate::sql::ast::JoinKind::Right => bound[..right].fill(None),
+                crate::sql::ast::JoinKind::Full => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "a locked row changed on the nullable side of a full join"
+                    ));
+                }
+            }
+        }
+        let joined = sources_row(scope, bound, order, rowids);
+        if self.plan.where_correlated.is_empty()
+            && let Some(predicate) = self.statement.where_clause
+        {
+            let read_row = sources_row(scope, read, order, rowids);
+            let latest = Chained {
+                inner: &joined,
+                outer: self.outer,
+            };
+            let first = Chained {
+                inner: &read_row,
+                outer: self.outer,
+            };
+            let mut conjuncts = [predicate; super::plan::MAX_CONJUNCTS];
+            let mut count = 0;
+            if !super::plan::flatten_and(predicate, &mut conjuncts, &mut count) {
+                conjuncts[0] = predicate;
+                count = 1;
+            }
+            for conjunct in &conjuncts[..count] {
+                // PostgreSQL turns an uncorrelated `IN (subquery)` into a
+                // semi-join whose recheck keeps the subquery row first
+                // matched: the operand must still equal its first value.
+                let passes = if let Expr::InSubquery {
+                    operand,
+                    negated: false,
+                    ..
+                } = conjunct
+                {
+                    let before = eval_full(operand, arena, self.params, &first, self.hooks)?;
+                    let after = eval_full(operand, arena, self.params, &latest, self.hooks)?;
+                    !before.is_null()
+                        && !after.is_null()
+                        && crate::sql::eval::compare_datums_collated(
+                            storage,
+                            txid,
+                            scope.expression_collation(storage, arena, operand)?,
+                            &before,
+                            &after,
+                        )?
+                        .is_eq()
+                } else {
+                    super::plan::conjunct_passes(conjunct, arena, self.params, &latest, self.hooks)?
+                };
+                if !passes {
+                    return Ok(None);
+                }
+            }
+        }
+        let layout = MaterializedLayout {
+            width: self.plan.width,
+            n_keys: self.plan.n_keys,
+            identities_at: self.plan.identities_at,
+            stored_width: self.plan.width
+                + self.plan.n_keys
+                + self.plan.n_raw
+                + self.plan.n_identities,
+            raw_columns: self.plan.raw_columns.as_ref(),
+        };
+        // The re-run plan's first row stands for the locked row, also when a
+        // set-returning projection expands it.
+        let mut rebuilt = None;
+        for_each_materialized_projection(
+            storage,
+            scope,
+            self.statement,
+            &joined,
+            txid,
+            arena,
+            self.params,
+            self.hooks,
+            self.correlated,
+            self.base,
+            self.plan.where_correlated,
+            &self.plan.order_exprs,
+            self.plan.n_keys,
+            if self.plan.any_postponed {
+                Some(&self.plan.postponed)
+            } else {
+                None
+            },
+            self.plan.has_srf,
+            self.outer,
+            &mut *self.scalars,
+            &mut *self.lists,
+            &mut |row, projected, keys| {
+                if rebuilt.is_none() {
+                    rebuilt = Some(encode_materialized_row(
+                        scope, row, projected, keys, &layout, arena,
+                    )?);
+                }
+                Ok(())
+            },
+        )?;
+        Ok(rebuilt)
+    }
+}
+
 /// A schema-only lookup for aggregate and grouped projections: it exposes the
 /// scope's column *types* — so static type inference (e.g. `pg_typeof`) still
 /// names a column's type when an aggregate over an empty or all-NULL group
@@ -836,7 +1263,23 @@ pub(super) fn prepare_materialization<'a>(
             }
         }
     }
-    let raw_columns = if raw_needed {
+    let locking = !statement.locking.is_empty();
+    let raw_columns = if locking {
+        // A locked row whose latest version replaced the one read is
+        // evaluated again from its sources, so rows keep every observed
+        // source column.
+        let from = statement
+            .from
+            .as_ref()
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "locked query has no source"))?;
+        Some(observed_source_columns(
+            statement,
+            scope,
+            from,
+            &order_exprs,
+            n_keys,
+        ))
+    } else if raw_needed {
         let expressions = arena
             .alloc_slice_with(statement.items.len(), |_| &Expr::Null)
             .map_err(|_| arena_full())?;
@@ -858,7 +1301,7 @@ pub(super) fn prepare_materialization<'a>(
         None
     };
     // Presence is independent of field NULLs, including zero-column rows.
-    let n_raw = if raw_needed {
+    let n_raw = if raw_needed || locking {
         scope.stored_columns() + scope.n
     } else {
         0
@@ -899,6 +1342,17 @@ fn materialization_pax_columns<'a>(
     from: &'a FromClause<'a>,
     plan: &MaterializationPlan<'a>,
 ) -> super::scan::PaxReadDemand {
+    observed_source_columns(statement, scope, from, &plan.order_exprs, plan.n_keys)
+}
+
+/// The source columns a query's projection, WHERE, and sort keys observe.
+fn observed_source_columns<'a>(
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    order_exprs: &[Option<super::ResolvedSortKey<'a>>; MAX_PROJ],
+    n_keys: usize,
+) -> super::scan::PaxReadDemand {
     if statement
         .items
         .iter()
@@ -909,7 +1363,7 @@ fn materialization_pax_columns<'a>(
         );
     }
     let mut expressions = [&Expr::Null; MAX_PROJ * 2 + 1];
-    if statement.items.len() + 1 + plan.n_keys > expressions.len() {
+    if statement.items.len() + 1 + n_keys > expressions.len() {
         return super::scan::PaxReadDemand::full_row(
             super::scan::PaxFullRowReason::WildcardProjection,
         );
@@ -930,7 +1384,7 @@ fn materialization_pax_columns<'a>(
         expressions[count] = predicate;
         count += 1;
     }
-    for expression in plan.order_exprs.iter().take(plan.n_keys) {
+    for expression in order_exprs.iter().take(n_keys) {
         expressions[count] = expression.expect("resolved").expression;
         count += 1;
     }
@@ -1061,40 +1515,21 @@ pub(crate) fn materialized_rows<'a>(
             &mut *merge_scalars,
             &mut *merge_lists,
             &mut |row, projected, keys| {
-                let row_bytes = crate::sql::exec::projected_row_len_by(stored_width, |index| {
-                    materialized_value_at(
-                        scope,
-                        row,
-                        projected,
-                        keys,
+                let output = encode_materialized_row(
+                    scope,
+                    row,
+                    projected,
+                    keys,
+                    &MaterializedLayout {
                         width,
                         n_keys,
                         identities_at,
-                        raw_columns.as_ref(),
-                        index,
-                    )
-                })?;
-                let output = arena
-                    .alloc_persistent_slice_with(row_bytes, |_| 0u8)
-                    .map_err(|_| arena_full())?;
-                let len = crate::sql::exec::encode_projected_by_into(
-                    stored_width,
-                    |index| {
-                        materialized_value_at(
-                            scope,
-                            row,
-                            projected,
-                            keys,
-                            width,
-                            n_keys,
-                            identities_at,
-                            raw_columns.as_ref(),
-                            index,
-                        )
+                        stored_width,
+                        raw_columns: raw_columns.as_ref(),
                     },
-                    output,
+                    arena,
                 )?;
-                rows.push(&output[..len]).map_err(|_| arena_full())?;
+                rows.push(output).map_err(|_| arena_full())?;
                 Ok(())
             },
         )?;
@@ -1391,6 +1826,20 @@ fn distinct_on_keys_equal(
     Ok(true)
 }
 
+/// Keeps the WITH TIES boundary row in the reader's fixed buffer.
+fn keep_boundary(boundary: &mut [u8], row: &[u8]) -> Result<(), SqlError> {
+    boundary
+        .get_mut(..row.len())
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "query row exceeds the external sort payload limit"
+            )
+        })?
+        .copy_from_slice(row);
+    Ok(())
+}
+
 fn decode_source_rowids(
     row: &[u8],
     identities_at: usize,
@@ -1414,17 +1863,18 @@ fn decode_source_rowids(
 }
 
 #[expect(clippy::too_many_arguments, reason = "external lock-pass plumbing")]
-fn prelock_external_run(
-    storage: &Storage,
+fn prelock_external_run<'a>(
+    storage: &'a Storage,
     reader: &mut crate::sql::external::ExternalRunReader,
     run: crate::sql::external::ExternalRun,
     txid: u32,
     statement: &Select<'_>,
     scope: &QueryScope<'_>,
     plan: &MaterializationPlan<'_>,
+    recheck: &mut LockedRowRecheck<'_, 'a>,
     limit: u64,
     offset: u64,
-    arena: &Arena,
+    arena: &'a Arena,
 ) -> Result<(), SqlError> {
     let window = offset.saturating_add(limit);
     let mut logical_index = 0u64;
@@ -1472,21 +1922,8 @@ fn prelock_external_run(
             if duplicate {
                 true
             } else {
-                let in_ties = statement.with_ties
-                    && limit > 0
-                    && logical_index >= window
-                    && boundary_len > 0
-                    && order_keys_equal_collated(
-                        storage,
-                        txid,
-                        &plan.key_collations[..plan.n_order],
-                        &boundary[..boundary_len],
-                        row,
-                        plan.width,
-                        plan.n_order,
-                    )?;
-                let lookahead = logical_index >= window && !in_ties;
-                if lookahead && !(statement.with_ties && limit > 0) {
+                let past_window = logical_index >= window;
+                if past_window && !(statement.with_ties && limit > 0) {
                     false
                 } else {
                     decode_source_rowids(
@@ -1495,15 +1932,31 @@ fn prelock_external_run(
                         plan.n_identities,
                         source_rowids,
                     )?;
-                    if !super::lock_result_row(storage, txid, statement, scope, source_rowids)? {
-                        true
-                    } else {
-                        if statement.with_ties && limit > 0 && logical_index + 1 == window {
-                            boundary[..row.len()].copy_from_slice(row);
-                            boundary_len = row.len();
+                    match recheck
+                        .lock(storage, txid, row, source_rowids, arena)?
+                        .row(row)
+                    {
+                        None => true,
+                        Some(row) => {
+                            let in_ties = past_window
+                                && boundary_len > 0
+                                && order_keys_equal_collated(
+                                    storage,
+                                    txid,
+                                    &plan.key_collations[..plan.n_order],
+                                    &boundary[..boundary_len],
+                                    row,
+                                    plan.width,
+                                    plan.n_order,
+                                )?;
+                            let lookahead = past_window && !in_ties;
+                            if statement.with_ties && limit > 0 && logical_index + 1 == window {
+                                keep_boundary(boundary, row)?;
+                                boundary_len = row.len();
+                            }
+                            logical_index += 1;
+                            !lookahead
                         }
-                        logical_index += 1;
-                        !lookahead
                     }
                 }
             }
@@ -1620,9 +2073,6 @@ pub(crate) fn external_materialized_into<'a>(
             pax_columns,
             indexed,
             &mut |row| {
-                if !super::lock_result_row(storage, txid, statement, scope, row.rowids)? {
-                    return Ok(true);
-                }
                 source_rowids.fill(None);
                 source_rowids[..row.rowids.len()].copy_from_slice(row.rowids);
                 for_each_materialized_projection(
@@ -1777,7 +2227,14 @@ pub(crate) fn external_materialized_into<'a>(
     let mut logical_index = 0u64;
     let mut emitted = 0u64;
     let mut boundary_len = 0usize;
-    if !statement.locking.is_empty() {
+    let mut recheck = if statement.locking.is_empty() {
+        None
+    } else {
+        Some(LockedRowRecheck::new(
+            storage, txid, statement, scope, from, correlated, base, params, hooks, outer, arena,
+        )?)
+    };
+    if let Some(recheck) = recheck.as_mut() {
         prelock_external_run(
             storage,
             &mut reader,
@@ -1786,6 +2243,7 @@ pub(crate) fn external_materialized_into<'a>(
             statement,
             scope,
             &plan,
+            recheck,
             limit,
             offset,
             arena,
@@ -1833,25 +2291,8 @@ pub(crate) fn external_materialized_into<'a>(
             if duplicate {
                 true
             } else {
-                let in_ties = if statement.with_ties
-                    && limit > 0
-                    && logical_index >= window
-                    && boundary_len > 0
-                {
-                    order_keys_equal_collated(
-                        storage,
-                        txid,
-                        &plan.key_collations[..plan.n_order],
-                        &boundary[..boundary_len],
-                        row,
-                        plan.width,
-                        plan.n_order,
-                    )?
-                } else {
-                    false
-                };
-                let lookahead = logical_index >= window && !in_ties;
-                if lookahead && !(statement.with_ties && limit > 0) {
+                let past_window = logical_index >= window;
+                if past_window && !(statement.with_ties && limit > 0) {
                     false
                 } else {
                     decode_source_rowids(
@@ -1860,11 +2301,25 @@ pub(crate) fn external_materialized_into<'a>(
                         plan.n_identities,
                         source_rowids,
                     )?;
-                    if !super::lock_result_row(storage, txid, statement, scope, source_rowids)? {
-                        // SKIP LOCKED removes this tuple below Limit, so it
-                        // consumes neither OFFSET nor LIMIT.
-                        true
-                    } else {
+                    let locked = match recheck.as_mut() {
+                        Some(recheck) => recheck
+                            .lock(storage, txid, row, source_rowids, arena)?
+                            .row(row),
+                        None => Some(row),
+                    };
+                    if let Some(row) = locked {
+                        let in_ties = past_window
+                            && boundary_len > 0
+                            && order_keys_equal_collated(
+                                storage,
+                                txid,
+                                &plan.key_collations[..plan.n_order],
+                                &boundary[..boundary_len],
+                                row,
+                                plan.width,
+                                plan.n_order,
+                            )?;
+                        let lookahead = past_window && !in_ties;
                         let mark = arena.mark();
                         let encoded = if deferred.is_some() {
                             (|| {
@@ -1923,7 +2378,7 @@ pub(crate) fn external_materialized_into<'a>(
                             }
                         };
                         if statement.with_ties && limit > 0 && logical_index + 1 == window {
-                            boundary[..row.len()].copy_from_slice(row);
+                            keep_boundary(boundary, row)?;
                             boundary_len = row.len();
                         }
                         logical_index += 1;
@@ -1933,6 +2388,10 @@ pub(crate) fn external_materialized_into<'a>(
                         unsafe { arena.rewind_to(mark) };
                         staged_len = encoded;
                         !lookahead
+                    } else {
+                        // SKIP LOCKED removes this tuple below Limit, so it
+                        // consumes neither OFFSET nor LIMIT.
+                        true
                     }
                 }
             }
@@ -2092,6 +2551,9 @@ pub(crate) fn materialized_select<'a>(
         scope,
         txid,
         statement,
+        from,
+        correlated,
+        base,
         rows,
         width,
         deferred.as_ref(),
@@ -2131,6 +2593,9 @@ pub(crate) fn materialized_rows_into<'a>(
     scope: &QueryScope<'a>,
     txid: u32,
     statement: &'a Select<'a>,
+    from: &'a FromClause<'a>,
+    correlated: &'a [&'a Expr<'a>],
+    base: &SubqueryValues<'a, 'a>,
     rows: &'a [&'a [u8]],
     width: usize,
     deferred: Option<&PostponedProjection>,
@@ -2163,35 +2628,22 @@ pub(crate) fn materialized_rows_into<'a>(
         // Acquire returned rows and any WITH TIES lookahead before the first
         // DataRow. A later conflict can therefore park and retry the statement
         // without having leaked a partial result to a flushing responder.
-        let mut preflight_accepted = 0u64;
-        let mut preflight_emitted = 0u64;
-        let mut preflight_boundary: Option<&[u8]> = None;
-        for row in rows {
-            let mut lookahead = false;
-            if preflight_emitted >= limit {
-                let tied = if statement.with_ties {
-                    match preflight_boundary {
-                        Some(boundary) => order_keys_equal_collated(
-                            storage,
-                            txid,
-                            &order_collations[..statement.order_by.len()],
-                            boundary,
-                            row,
-                            width,
-                            statement.order_by.len(),
-                        )?,
-                        None => false,
-                    }
-                } else {
-                    false
-                };
-                if !tied {
-                    if !statement.with_ties || limit == 0 {
-                        break;
-                    }
-                    lookahead = true;
-                }
-            }
+        let mut recheck = LockedRowRecheck::new(
+            storage, txid, statement, scope, from, correlated, base, params, hooks, outer, arena,
+        )?;
+        let tied = |boundary: Option<&[u8]>, row: &[u8]| match boundary {
+            Some(boundary) if statement.with_ties => order_keys_equal_collated(
+                storage,
+                txid,
+                &order_collations[..statement.order_by.len()],
+                boundary,
+                row,
+                width,
+                statement.order_by.len(),
+            ),
+            _ => Ok(false),
+        };
+        let mut lock = |row: &'a [u8], rowids: &mut [Option<u64>]| {
             rowids.fill(None);
             for (table, identity) in rowids.iter_mut().enumerate().take(scope.n) {
                 *identity = match crate::sql::exec::decode_projected_pub(row, identities_at + table)
@@ -2206,10 +2658,21 @@ pub(crate) fn materialized_rows_into<'a>(
                     }
                 };
             }
-            if !super::lock_result_row(storage, txid, statement, scope, rowids)? {
-                continue;
+            Ok(recheck.lock(storage, txid, row, rowids, arena)?.row(row))
+        };
+        // The Limit node reads one row past a WITH TIES window, which the
+        // LockRows node below it locks.
+        let mut preflight_accepted = 0u64;
+        let mut preflight_emitted = 0u64;
+        let mut preflight_boundary: Option<&[u8]> = None;
+        for &row in rows {
+            if preflight_emitted >= limit && (!statement.with_ties || limit == 0) {
+                break;
             }
-            if lookahead {
+            let Some(row) = lock(row, rowids)? else {
+                continue;
+            };
+            if preflight_emitted >= limit && !tied(preflight_boundary, row)? {
                 break;
             }
             if preflight_accepted >= offset {
@@ -2223,50 +2686,14 @@ pub(crate) fn materialized_rows_into<'a>(
 
         let mut accepted = 0u64;
         let mut boundary: Option<&[u8]> = None;
-        for row in rows {
-            let mut lookahead = false;
-            if emitted >= limit {
-                let tied = if statement.with_ties {
-                    match boundary {
-                        Some(boundary) => order_keys_equal_collated(
-                            storage,
-                            txid,
-                            &order_collations[..statement.order_by.len()],
-                            boundary,
-                            row,
-                            width,
-                            statement.order_by.len(),
-                        )?,
-                        None => false,
-                    }
-                } else {
-                    false
-                };
-                if !tied {
-                    if !statement.with_ties || limit == 0 {
-                        break;
-                    }
-                    lookahead = true;
-                }
+        for &row in rows {
+            if emitted >= limit && (!statement.with_ties || limit == 0) {
+                break;
             }
-            rowids.fill(None);
-            for (table, identity) in rowids.iter_mut().enumerate().take(scope.n) {
-                *identity = match crate::sql::exec::decode_projected_pub(row, identities_at + table)
-                {
-                    Datum::Int8(rowid) if rowid >= 0 => Some(rowid as u64),
-                    Datum::Null => None,
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "invalid row identity in materialized query"
-                        ));
-                    }
-                };
-            }
-            let lock = super::lock_result_row(storage, txid, statement, scope, rowids)?;
-            if !lock {
+            let Some(row) = lock(row, rowids)? else {
                 continue;
-            }
+            };
+            let lookahead = emitted >= limit && !tied(boundary, row)?;
             let mut out = [Datum::Null; MAX_PROJ];
             finalize_projected_row(
                 row, width, deferred, statement, scope, storage, txid, arena, params, hooks, outer,

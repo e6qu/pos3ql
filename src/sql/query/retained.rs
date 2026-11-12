@@ -2132,7 +2132,16 @@ impl<'a> RetainedSelect<'a> {
     /// over; a conflicting lock is a lock wait.
     pub(crate) fn lock_pending(&self, storage: &Storage, txid: u32) -> Result<bool, SqlError> {
         let (rowid, _) = self.pending_identity()?;
-        super::lock_clauses_row(storage, txid, self.locking, &self.scope, &[Some(rowid)])
+        // `recheck_pending` follows a replaced row to its latest version.
+        let mut changed = [None; 1];
+        Ok(super::lock_clauses_row(
+            storage,
+            txid,
+            self.locking,
+            &self.scope,
+            &[Some(rowid)],
+            &mut changed,
+        )? != super::ResultRowLock::Skip)
     }
 
     /// Rechecks a locked row against its latest version, as PostgreSQL's

@@ -961,7 +961,7 @@ impl Context<'_> {
                 over: None,
                 ..
             } => output.push("count(*)"),
-            Expr::Call { name, args, .. } if self.selected_builtin(expression)?.is_none() => {
+            Expr::Call { args, .. } if self.selected_builtin(expression)?.is_none() => {
                 let Some((slot, routine)) = self.selected_routine(expression)? else {
                     return output.unsupported();
                 };
@@ -981,7 +981,7 @@ impl Context<'_> {
                     *target = found;
                 }
                 if self.storage.select_routine_call(
-                    name,
+                    routine.name.as_str(),
                     &[],
                     &parameter_oids[..args.len()],
                     false,

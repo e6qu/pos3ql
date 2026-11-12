@@ -4100,36 +4100,310 @@ pub(crate) fn builtin_operator_procedure(
     left: Option<i32>,
     right: Option<i32>,
 ) -> Option<i32> {
+    match builtin_operator_choice(name, left, right) {
+        BuiltinOperatorChoice::Unique(procedure) => Some(procedure),
+        BuiltinOperatorChoice::NotUnique | BuiltinOperatorChoice::Missing => None,
+    }
+}
+
+/// The outcome of PostgreSQL's operator resolution over the built-in
+/// operators: one operator, several equally good ones (`operator is not
+/// unique`), or none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BuiltinOperatorChoice {
+    Unique(i32),
+    NotUnique,
+    Missing,
+}
+
+/// Built-in operators sharing one name; a unit test keeps every name within it.
+const MAX_BUILTIN_OPERATOR_CANDIDATES: usize = 128;
+
+/// PostgreSQL's type category and preferred flag (`typcategory`,
+/// `typispreferred`) for a built-in type.
+fn builtin_type_category(type_oid: i32) -> (u8, bool) {
+    use super::types::oid;
+    if type_oid == oid::UNKNOWN {
+        return (b'X', false);
+    }
+    let preferred = matches!(
+        type_oid,
+        oid::BOOL
+            | oid::TEXT
+            | oid::OID
+            | oid::FLOAT8
+            | oid::INET
+            | oid::TIMESTAMPTZ
+            | oid::INTERVAL
+            | oid::VARBIT
+    );
+    let category = match ColType::from_oid(type_oid) {
+        Some(ctype) => super::types::type_category(ctype).as_bytes()[0],
+        None if is_polymorphic_pseudo_type(type_oid) => b'P',
+        None => b'U',
+    };
+    (category, preferred)
+}
+
+pub(crate) fn is_polymorphic_pseudo_type(type_oid: i32) -> bool {
+    use super::types::oid;
+    matches!(
+        type_oid,
+        oid::ANYELEMENT
+            | oid::ANYCOMPATIBLE
+            | oid::ANYARRAY
+            | oid::ANYCOMPATIBLEARRAY
+            | oid::ANYNONARRAY
+            | oid::ANYCOMPATIBLENONARRAY
+            | oid::ANYENUM
+            | oid::ANYRANGE
+            | oid::ANYCOMPATIBLERANGE
+            | oid::ANYMULTIRANGE
+            | oid::ANYCOMPATIBLEMULTIRANGE
+            | oid::RECORD
+    )
+}
+
+/// PostgreSQL's `check_generic_type_consistency` for a candidate's
+/// polymorphic inputs: every `any*` position binds one element type, and every
+/// `anycompatible*` position binds element types with a common implicit type.
+/// Unknown and absent inputs bind nothing.
+fn builtin_polymorphic_consistent(actual: [i32; 2], declared: [i32; 2]) -> bool {
+    use super::types::oid;
+    let mut exact = None;
+    let mut compatible = None;
+    for (actual, declared) in actual.into_iter().zip(declared) {
+        if actual == 0 || actual == oid::UNKNOWN {
+            continue;
+        }
+        let element = match declared {
+            oid::ANYARRAY | oid::ANYCOMPATIBLEARRAY => match ColType::from_oid(actual) {
+                Some(ColType::Array(element)) => element.to_coltype().oid(),
+                _ => return false,
+            },
+            oid::ANYELEMENT
+            | oid::ANYNONARRAY
+            | oid::ANYENUM
+            | oid::ANYCOMPATIBLE
+            | oid::ANYCOMPATIBLENONARRAY => actual,
+            _ => continue,
+        };
+        let family = if matches!(
+            declared,
+            oid::ANYCOMPATIBLEARRAY | oid::ANYCOMPATIBLE | oid::ANYCOMPATIBLENONARRAY
+        ) {
+            &mut compatible
+        } else {
+            &mut exact
+        };
+        match *family {
+            None => *family = Some(element),
+            Some(bound) if bound == element => {}
+            Some(bound) if family_is_compatible(declared) => {
+                if builtin_argument_properties(element, bound).is_some() {
+                    continue;
+                }
+                if builtin_argument_properties(bound, element).is_some() {
+                    *family = Some(element);
+                    continue;
+                }
+                return false;
+            }
+            Some(_) => return false,
+        }
+    }
+    true
+}
+
+fn family_is_compatible(declared: i32) -> bool {
+    use super::types::oid;
+    matches!(
+        declared,
+        oid::ANYCOMPATIBLEARRAY | oid::ANYCOMPATIBLE | oid::ANYCOMPATIBLENONARRAY
+    )
+}
+
+/// PostgreSQL's `oper_select_candidate` over the built-in operators: an exact
+/// match (an unknown operand first tries the other operand's type), then the
+/// implicitly coercible candidates narrowed by `func_select_candidate`: most
+/// exact matches, then most preferred types where coercion is needed, then
+/// the type category each unknown operand resolves to (string wins), and
+/// finally the one known operand type assumed for the unknown ones.
+pub(crate) fn builtin_operator_choice(
+    name: &str,
+    left: Option<i32>,
+    right: Option<i32>,
+) -> BuiltinOperatorChoice {
+    use super::types::oid;
     let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
     if let Some(procedure) = builtin_operator_exact(name, left, right) {
-        return Some(procedure);
+        return BuiltinOperatorChoice::Unique(procedure);
     }
-    let mut best = None;
-    let mut best_score = None;
-    let mut ambiguous = false;
-    for &(candidate, expected_left, expected_right, procedure) in builtin_properties::OPERATORS {
-        if candidate != name {
-            continue;
-        }
-        let Some((left_rank, _, _)) = builtin_argument_properties(left.unwrap_or(0), expected_left)
-        else {
-            continue;
-        };
-        let Some((right_rank, _, _)) =
-            builtin_argument_properties(right.unwrap_or(0), expected_right)
-        else {
-            continue;
-        };
-        let score = left_rank + right_rank;
-        if best_score.is_none_or(|prior| score > prior) {
-            best_score = Some(score);
-            best = Some(procedure);
-            ambiguous = false;
-        } else if best_score == Some(score) && best != Some(procedure) {
-            ambiguous = true;
+    let inputs = [left.unwrap_or(0), right.unwrap_or(0)];
+    let arguments = |row: usize| {
+        let (_, left, right, _) = builtin_properties::OPERATORS[row];
+        [left, right]
+    };
+    let mut candidates = [0usize; MAX_BUILTIN_OPERATOR_CANDIDATES];
+    let mut count = 0;
+    for (row, &(candidate, expected_left, expected_right, _)) in
+        builtin_properties::OPERATORS.iter().enumerate()
+    {
+        if candidate == name
+            && builtin_argument_properties(inputs[0], expected_left).is_some()
+            && builtin_argument_properties(inputs[1], expected_right).is_some()
+            && builtin_polymorphic_consistent(inputs, [expected_left, expected_right])
+        {
+            candidates[count] = row;
+            count += 1;
         }
     }
-    if ambiguous { None } else { best }
+    let unique = |count: usize, candidates: &[usize]| match count {
+        0 => Some(BuiltinOperatorChoice::Missing),
+        1 => Some(BuiltinOperatorChoice::Unique(
+            builtin_properties::OPERATORS[candidates[0]].3,
+        )),
+        _ => None,
+    };
+    if let Some(choice) = unique(count, &candidates) {
+        return choice;
+    }
+    // Keep the candidates that score best; keep all when none scores.
+    let narrow = |candidates: &mut [usize; MAX_BUILTIN_OPERATOR_CANDIDATES],
+                  count: &mut usize,
+                  score: &dyn Fn(usize) -> usize| {
+        let best = candidates[..*count]
+            .iter()
+            .map(|row| score(*row))
+            .max()
+            .unwrap_or(0);
+        let mut kept = 0;
+        for index in 0..*count {
+            if score(candidates[index]) == best {
+                candidates[kept] = candidates[index];
+                kept += 1;
+            }
+        }
+        *count = kept;
+    };
+    let known = |position: usize| inputs[position] != 0 && inputs[position] != oid::UNKNOWN;
+    narrow(&mut candidates, &mut count, &|row| {
+        let arguments = arguments(row);
+        (0..2)
+            .filter(|position| known(*position) && arguments[*position] == inputs[*position])
+            .count()
+    });
+    if let Some(choice) = unique(count, &candidates) {
+        return choice;
+    }
+    narrow(&mut candidates, &mut count, &|row| {
+        let arguments = arguments(row);
+        (0..2)
+            .filter(|position| {
+                known(*position)
+                    && (arguments[*position] == inputs[*position] || {
+                        let (category, _) = builtin_type_category(inputs[*position]);
+                        let (candidate_category, preferred) =
+                            builtin_type_category(arguments[*position]);
+                        preferred && candidate_category == category
+                    })
+            })
+            .count()
+    });
+    if let Some(choice) = unique(count, &candidates) {
+        return choice;
+    }
+    let unknowns = (0..2)
+        .filter(|position| inputs[*position] == oid::UNKNOWN)
+        .count();
+    if unknowns == 0 {
+        return BuiltinOperatorChoice::NotUnique;
+    }
+    let mut slot_category = [0u8; 2];
+    let mut slot_preferred = [false; 2];
+    let mut resolved = true;
+    for position in 0..2 {
+        if inputs[position] != oid::UNKNOWN {
+            continue;
+        }
+        let mut conflict = false;
+        for (index, row) in candidates[..count].iter().enumerate() {
+            let (category, preferred) = builtin_type_category(arguments(*row)[position]);
+            if index == 0 {
+                slot_category[position] = category;
+                slot_preferred[position] = preferred;
+            } else if category == slot_category[position] {
+                slot_preferred[position] |= preferred;
+            } else if category == b'S' {
+                slot_category[position] = category;
+                slot_preferred[position] = preferred;
+            } else {
+                conflict = true;
+            }
+        }
+        if conflict && slot_category[position] != b'S' {
+            resolved = false;
+            break;
+        }
+    }
+    if resolved {
+        let keep = |row: usize| {
+            (0..2).all(|position| {
+                if inputs[position] != oid::UNKNOWN {
+                    return true;
+                }
+                let (category, preferred) = builtin_type_category(arguments(row)[position]);
+                category == slot_category[position] && (preferred || !slot_preferred[position])
+            })
+        };
+        let kept = candidates[..count].iter().filter(|row| keep(**row)).count();
+        if kept > 0 {
+            let mut next = 0;
+            for index in 0..count {
+                if keep(candidates[index]) {
+                    candidates[next] = candidates[index];
+                    next += 1;
+                }
+            }
+            count = next;
+        }
+        if let Some(choice) = unique(count, &candidates) {
+            return choice;
+        }
+    }
+    if unknowns < 2 {
+        let known_type = inputs
+            .iter()
+            .copied()
+            .find(|input| *input != 0 && *input != oid::UNKNOWN);
+        if let Some(known_type) = known_type {
+            let assumed = inputs.map(|input| {
+                if input == oid::UNKNOWN {
+                    known_type
+                } else {
+                    input
+                }
+            });
+            let mut accepted = None;
+            let mut accepted_count = 0;
+            for row in &candidates[..count] {
+                let arguments = arguments(*row);
+                if (0..2).all(|position| {
+                    builtin_argument_properties(assumed[position], arguments[position]).is_some()
+                }) && builtin_polymorphic_consistent(assumed, arguments)
+                {
+                    accepted_count += 1;
+                    accepted = Some(builtin_properties::OPERATORS[*row].3);
+                }
+            }
+            if accepted_count == 1
+                && let Some(procedure) = accepted
+            {
+                return BuiltinOperatorChoice::Unique(procedure);
+            }
+        }
+    }
+    BuiltinOperatorChoice::NotUnique
 }
 
 /// Operator support procedures need not be exposed as SQL-callable routines.
@@ -4747,6 +5021,32 @@ fn builtin_argument_properties(actual: i32, expected: i32) -> Option<(usize, boo
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod builtin_property_tests {
     use super::*;
+
+    #[test]
+    fn builtin_operator_names_fit_the_candidate_workspace() {
+        for (name, ..) in builtin_properties::OPERATORS {
+            let count = builtin_properties::OPERATORS
+                .iter()
+                .filter(|(candidate, ..)| candidate == name)
+                .count();
+            assert!(count <= MAX_BUILTIN_OPERATOR_CANDIDATES, "{name}: {count}");
+        }
+    }
+
+    #[test]
+    fn unknown_operator_operands_follow_postgresql_candidate_selection() {
+        use super::super::types::oid;
+        // A string-category overload wins an unknown operand.
+        assert_eq!(
+            builtin_operator_input_oids("->", Some(oid::JSONB), Some(oid::UNKNOWN)),
+            Some((Some(oid::JSONB), Some(oid::TEXT)))
+        );
+        // Several categories with no string overload cannot be resolved.
+        assert_eq!(
+            builtin_operator_choice("+", Some(oid::DATE), Some(oid::UNKNOWN)),
+            BuiltinOperatorChoice::NotUnique
+        );
+    }
 
     #[test]
     fn unknown_operator_operands_try_the_known_types_exact_overload_first() {

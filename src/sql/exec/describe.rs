@@ -1047,6 +1047,28 @@ impl ColTypeResolver for CatalogCols<'_> {
 
 /// Emits one `ColDesc` per field of a `(record).*` expansion, resolving field
 /// names and types at the caller's `'q` lifetime (single-table describe path).
+/// PostgreSQL expands `(expression).*` only for a composite or record value;
+/// any other type is rejected by name before its fields are looked up.
+pub(crate) fn reject_scalar_expansion(
+    base: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+    storage: &crate::storage::Storage,
+    txid: u32,
+) -> Result<(), SqlError> {
+    if let Ok((type_oid, _)) = infer_type_res(base, columns)
+        && type_oid != oid::UNKNOWN
+        && ColType::from_oid(type_oid)
+            .is_some_and(|ctype| !matches!(ctype, ColType::Record | ColType::Composite(_)))
+    {
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "type {} is not composite",
+            crate::sql::catalog::format_type_name(storage, txid, type_oid)?.as_str()
+        ));
+    }
+    Ok(())
+}
+
 fn describe_record_star<'q>(
     base: &Expr<'q>,
     context: DescribeContext<'q, '_>,
@@ -1080,6 +1102,9 @@ fn describe_record_star<'q>(
     } else {
         &NoCols
     };
+    if let Some(storage) = storage {
+        reject_scalar_expansion(base, columns, storage, txid)?;
+    }
     match base {
         Expr::Call {
             kind: crate::sql::ast::CallKind::SqlSyntax,
@@ -3517,6 +3542,7 @@ pub(crate) fn expand_record_call_items<'a>(
         let SelectItem::RecordStar(base) = item else {
             unreachable!()
         };
+        reject_scalar_expansion(base, columns, storage, txid)?;
         let mut shared = crate::mem::arena::ArenaList::new(arena);
         collect_shared(base, columns, storage, txid, &mut shared)?;
         let mut failure = None;
@@ -4031,6 +4057,14 @@ pub fn record_field_metadata(
             }
             _ => expr_record_handle(base, columns)
                 .and_then(|handle| record_shape_field_metadata(handle, field).map(|value| value.0)),
+        },
+        Expr::Param(index) => match bound_parameter_type_oid(*index).and_then(coltype_of_oid) {
+            Some(ColType::Composite(slot)) => {
+                return columns
+                    .composite_field(slot, field)
+                    .ok_or_else(|| could_not_identify(field));
+            }
+            _ => None,
         },
         Expr::Cast { type_name, .. } => {
             let mut found = None;
@@ -4575,6 +4609,55 @@ fn builtin_binary_type_named(
     ro: i32,
     columns: &dyn ColTypeResolver,
 ) -> Result<(i32, i16), SqlError> {
+    // An unknown operand takes the type of the built-in operator PostgreSQL's
+    // candidate selection chooses for it, or the choice is ambiguous.
+    let (lo, ro) = match operator.operator_name() {
+        Some(name) if lo == oid::UNKNOWN || ro == oid::UNKNOWN => {
+            match crate::sql::catalog::builtin_operator_choice(name, Some(lo), Some(ro)) {
+                crate::sql::catalog::BuiltinOperatorChoice::NotUnique => {
+                    let named = |type_oid: i32| {
+                        if type_oid == oid::UNKNOWN {
+                            Some(crate::util::StackStr::<260>::from_str("unknown"))
+                        } else {
+                            builtin_type_name_fixed(type_oid)
+                                .or_else(|| columns.type_name_fixed(type_oid).ok().flatten())
+                        }
+                    };
+                    if let (Some(left), Some(right)) = (named(lo), named(ro)) {
+                        return Err(sql_err!(
+                            sqlstate::AMBIGUOUS_FUNCTION,
+                            "operator is not unique: {} {} {}",
+                            left.as_str(),
+                            name,
+                            right.as_str()
+                        ));
+                    }
+                    (lo, ro)
+                }
+                crate::sql::catalog::BuiltinOperatorChoice::Unique(_) => {
+                    match crate::sql::catalog::builtin_operator_input_oids(name, Some(lo), Some(ro))
+                    {
+                        Some((Some(left), Some(right))) => {
+                            let concrete = |actual: i32, declared: i32| {
+                                if actual == oid::UNKNOWN
+                                    && !crate::sql::catalog::is_polymorphic_pseudo_type(declared)
+                                    && coltype_of_oid(declared).is_some()
+                                {
+                                    declared
+                                } else {
+                                    actual
+                                }
+                            };
+                            (concrete(lo, left), concrete(ro, right))
+                        }
+                        _ => (lo, ro),
+                    }
+                }
+                crate::sql::catalog::BuiltinOperatorChoice::Missing => (lo, ro),
+            }
+        }
+        _ => (lo, ro),
+    };
     builtin_binary_type(operator, lo, ro).map_err(|error| {
         let user = |oid: i32| builtin_type_name_fixed(oid).is_none();
         if error.sqlstate != sqlstate::UNDEFINED_FUNCTION
@@ -5736,7 +5819,10 @@ fn infer_type_unpositioned(
                         infer_routine_argument_oid(operand, columns)?,
                         infer_routine_argument_oid(when, columns)?,
                         columns,
-                    )?;
+                    )
+                    .map_err(|error| {
+                        crate::sql::error_position::operator_at_case_when(error, when)
+                    })?;
                     let right_oid = infer_type_res(when, columns)?.0;
                     if let Some(error) = untyped_comparison_undefined(left_oid, "=", right_oid) {
                         return Err(error);
@@ -5745,7 +5831,10 @@ fn infer_type_unpositioned(
                     if let (Some(left), Some(right)) = (left, right)
                         && !comparable(left, right)
                     {
-                        return Err(operator_undefined(left, "=", right));
+                        return Err(crate::sql::error_position::operator_at_case_when(
+                            operator_undefined(left, "=", right),
+                            when,
+                        ));
                     }
                 }
             }

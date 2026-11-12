@@ -216,10 +216,12 @@ is owned.
     function arguments that are not constants, user-defined and other builtin
     set-returning functions, and column definition lists such as
     `jsonb_to_recordset(...) AS t(a int)`.
-    Cursors over those shapes run at `DECLARE`: a scrollable cursor ordered by
-    an expression that is not a source column returns saved values where
+    A cursor over those shapes runs its query whole at its first read, with
+    the snapshot taken when it opened: a scrollable cursor ordered by an
+    expression that is not a source column returns saved values where
     PostgreSQL evaluates a volatile output list again, and a row-locking cursor
-    over a join, or ordered by such an expression, locks its rows at `DECLARE`.
+    over a join, or ordered by such an expression, locks all its rows at that
+    first read.
     Cursors over retained joins already read as they fetch; declared cursors
     do not yet use the retained sort.
   - Scrollable cursors whose revisited rows are evaluated again (volatile
@@ -461,9 +463,9 @@ PostgreSQL's cursor position (the `P` field that psql shows as `LINE 1:` and a
 caret) for syntax errors and for unknown relations, columns, types, functions
 and operators, failed constant input and non-boolean conditions, except a
 folded or quoted identifier in a statement that waited for typed inputs and a
-constant written inside a routine body. `INSERT INTO t (a[1], b) SELECT 1` reports PostgreSQL's
-`INSERT has more target columns than expressions` without its position; other
-target and expression count errors are positioned. PL/pgSQL statements, writes, `EXECUTE` and FOR queries run their `WITH`
+constant written inside a routine body. Target and expression count errors of an `INSERT`, also with subscripted
+targets (`INSERT INTO t (a[1], b) VALUES (1)`), are positioned and come
+before type errors, as PostgreSQL checks them. PL/pgSQL statements, writes, `EXECUTE` and FOR queries run their `WITH`
 queries, including data-modifying ones, in one new command as PostgreSQL
 does; a cursor's query with data-modifying `WITH` queries runs at its first
 read. Remaining: a PL/pgSQL write with `WITH` queries whose nested AFTER
@@ -478,14 +480,13 @@ IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 set, and omits an explicit `security_invoker=false`. A `CHECK` constraint
 marked `NO INHERIT` fails with `0A000`, and exclusion constraints support only
 GiST over range columns (`EXCLUDE USING btree (a WITH =)` fails with `0A000`).
-`pg_constraint` omits the system catalogs' own not-null constraints. A
-misplaced column constraint attribute (`a int NOT NULL DEFERRABLE`) is
-reported before a later syntax error in the same statement, where PostgreSQL
-reports the syntax error first. A rewrite rule `INSERT` action whose `VALUES` rows write
-`DEFAULT` in different columns runs as one insert per pattern, so `RETURNING`
-from such an action fails with `0A000`. A cursor whose query
-cannot stream runs it at `DECLARE` or `OPEN`, so a volatile function's side
-effects happen before the first `FETCH` rather than at it. A derived table computes output
+`pg_constraint` omits the system catalogs' own not-null constraints. A rewrite rule's multi-row `INSERT ... VALUES` action
+resolves each column's type across its rows as a `VALUES` list does, so
+`VALUES ('1'::text, 3), (2, DEFAULT)` into a `text` column fails with `VALUES
+types text and integer cannot be matched` where PostgreSQL converts each value
+to the target column's type; and a rule action's `RETURNING` list that reads
+`NEW` or `OLD` fails with `missing FROM-clause entry` when the triggering
+statement asks for rows. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1
 FROM (SELECT 10 / t.x) s)` fails with division by zero on a zero `x` where
 PostgreSQL, which drops unread subquery outputs, returns the row. A
@@ -494,13 +495,18 @@ PostgreSQL types it as the table's row type `t`. A row constructor casts to a ta
 (`ROW(1, 'a')::t`) but not to a view's, and an array of a table's row type
 (`ARRAY[ROW(1, 'a')::t]`) fails with `0A000`, where PostgreSQL accepts both.
 A PL/pgSQL variable declared with a view's row type (`r v;` or
-`r v%ROWTYPE`) fails with `0A000`; a table's works. In a trigger function, `OLD` and `NEW` are
-assignable records with the table's row structure, as in PostgreSQL;
-assigning a row of another structure to one fails at the assignment with
-PostgreSQL's `returned row structure does not match` error, where PostgreSQL
-accepts it and fails only if a BEFORE trigger returns it. A `CONSTANT`
-assignment error has no cursor position: PL/pgSQL assignment targets do not
-keep their place in the routine body.
+`r v%ROWTYPE`) fails with `0A000`; a table's works. A `CONSTANT` assignment
+error has no cursor position: PL/pgSQL assignment targets do not keep their
+place in the routine body. A trigger fired inside a writing statement cannot
+`FETCH` from a session cursor that locks its rows or calls a user-defined
+routine for each fetched row, or first read one whose data-modifying `WITH`
+queries have not run (`0A000`). A protocol-level `Parse` message checks only
+syntax and parameter types, so analysis errors (`SELECT current_date + $1`,
+`SELECT 1 WHERE 'x'`) arrive at `Bind` or `Execute` where PostgreSQL reports
+them at `Parse`, and `pg_prepared_statements` lists only SQL `PREPARE`
+statements, not protocol ones. `PREPARE` checks a `SELECT` without `FROM` and
+the types of every query, but constant inputs of a query with `FROM`
+(`SELECT 'a'::int FROM t`) are converted when it runs.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,
 SQL/JSON result types) are reported when the statement would run. In a

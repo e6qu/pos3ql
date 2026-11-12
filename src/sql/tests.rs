@@ -561,11 +561,11 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
                     &mut editor.transaction,
                     &editor.guc,
                     crate::sql::txn::CommitTarget::Ordinary,
-                    Some(CursorCommitContext {
+                    CursorCommitContext {
                         cursors: &mut editor.cursors,
-                        plans: &mut editor.pool,
+                        plans: Some(&mut editor.pool),
                         arena: &editor.arena,
-                    }),
+                    },
                     &editor.arena,
                     &mut Responder::new(&mut editor.send),
                 )
@@ -8087,13 +8087,7 @@ fn postgresql_18_refcursor_type_catalog_and_native_plpgsql_cursors() {
          BEGIN; SELECT returned_cursor_probe(); \
          SELECT name, statement, is_holdable, is_binary, is_scrollable \
            FROM pg_cursors WHERE name = 'returned'; \
-         FETCH NEXT FROM returned; CLOSE returned; COMMIT; \
-         BEGIN; \
-         DECLARE visible SCROLL CURSOR FOR SELECT 1; \
-         SELECT name, statement, is_holdable, is_binary, is_scrollable, creation_time IS NOT NULL \
-           FROM pg_cursors; \
-         SELECT count(*) FROM pg_cursor(); \
-         CLOSE visible; COMMIT",
+         FETCH NEXT FROM returned; CLOSE returned; COMMIT",
     );
     assert_eq!(
         data_rows(&output),
@@ -8109,11 +8103,21 @@ fn postgresql_18_refcursor_type_catalog_and_native_plpgsql_cursors() {
             "returned",
             "returned|SELECT 11::integer AS value|f|f|f",
             "11",
-            "visible|DECLARE visible SCROLL CURSOR FOR SELECT 1|f|f|t|t",
-            "1",
         ],
         "{}",
         String::from_utf8_lossy(&output),
+    );
+    // A declared cursor shows the client's whole query string.
+    const DECLARED: &str = "BEGIN; DECLARE visible SCROLL CURSOR FOR SELECT 1; \
+         SELECT name, statement, is_holdable, is_binary, is_scrollable, creation_time IS NOT NULL \
+           FROM pg_cursors; \
+         SELECT count(*) FROM pg_cursor(); CLOSE visible; COMMIT";
+    let declared = run_with(&mut engine, &mut budget, DECLARED);
+    assert_eq!(
+        data_rows(&declared),
+        [format!("visible|{DECLARED}|f|f|t|t"), "1".to_string()],
+        "{}",
+        String::from_utf8_lossy(&declared),
     );
     assert_eq!(copy_data_rows(&output), ["saved\t{left,right}"]);
     for query in [
@@ -18338,7 +18342,14 @@ fn copy_line(
     engine.copy_row_line(
         setup,
         line,
-        super::CopyRowContext::new(txn, guc, arena, &mut responder, inserted),
+        super::CopyRowContext::new(
+            txn,
+            guc,
+            &mut super::cursor::CursorPool::for_tests(),
+            arena,
+            &mut responder,
+            inserted,
+        ),
     )
 }
 
@@ -18361,7 +18372,14 @@ fn copy_binary_row(
     engine.copy_row_binary(
         setup,
         row,
-        super::CopyRowContext::new(txn, guc, arena, &mut responder, inserted),
+        super::CopyRowContext::new(
+            txn,
+            guc,
+            &mut super::cursor::CursorPool::for_tests(),
+            arena,
+            &mut responder,
+            inserted,
+        ),
     )
 }
 
@@ -18374,11 +18392,16 @@ fn finish_copy(
     inserted: &mut crate::sql::exec::CopyTransitionRows,
 ) -> Result<(), SqlError> {
     let mut send = crate::mem::FixedBuf::new(budget, "copy finish response", 1 << 16).unwrap();
+    let arena = Arena::new(budget, "copy finish arena", 1 << 12).unwrap();
     let result = engine.copy_finish(
         setup,
         txn,
         guc,
-        None,
+        CursorCommitContext {
+            cursors: &mut super::cursor::CursorPool::for_tests(),
+            plans: None,
+            arena: &arena,
+        },
         &mut Responder::new(&mut send),
         inserted,
         CopyFinishMode::ImplicitTransaction,
@@ -96888,6 +96911,7 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                     &setup,
                     &mut reader.transaction,
                     &reader.guc,
+                    &mut reader.cursors,
                     &arena,
                     &mut Responder::new(&mut send),
                 )
@@ -96901,6 +96925,7 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                 let context = CopyRowContext::new(
                     &mut reader.transaction,
                     &reader.guc,
+                    &mut reader.cursors,
                     &arena,
                     &mut responder,
                     &mut transition,
@@ -96943,11 +96968,11 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                         &setup,
                         &mut reader.transaction,
                         &reader.guc,
-                        Some(CursorCommitContext {
+                        CursorCommitContext {
                             cursors: &mut reader.cursors,
-                            plans: &mut reader.pool,
+                            plans: Some(&mut reader.pool),
                             arena: &reader.arena,
-                        }),
+                        },
                         &mut Responder::new(&mut send),
                         &transition,
                         CopyFinishMode::ImplicitTransaction,

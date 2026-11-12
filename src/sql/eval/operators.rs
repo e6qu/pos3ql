@@ -2898,6 +2898,64 @@ pub(crate) fn binary<'a>(
             _ => {}
         }
     }
+    // One unknown string beside a built-in scalar takes the input type of the
+    // operator PostgreSQL's candidate selection chooses (`numeric * '2'`,
+    // `interval * '2'`, `now() - '1 day'`).
+    if let Some(name) = operator.operator_name()
+        && l_unknown != r_unknown
+    {
+        let (unknown, peer, unknown_left) = if l_unknown {
+            (l, r, true)
+        } else {
+            (r, l, false)
+        };
+        let peer_oid = peer.type_oid();
+        if matches!(unknown, Datum::Text(_))
+            && !peer.is_null()
+            && ColType::from_oid(peer_oid).is_some_and(|ctype| {
+                !matches!(
+                    ctype,
+                    ColType::Geometry(_)
+                        | ColType::Range(_)
+                        | ColType::Multirange(_)
+                        | ColType::Enum(_)
+                        | ColType::Composite(_)
+                        | ColType::Record
+                )
+            })
+        {
+            let (left_oid, right_oid) = if unknown_left {
+                (crate::sql::types::oid::UNKNOWN, peer_oid)
+            } else {
+                (peer_oid, crate::sql::types::oid::UNKNOWN)
+            };
+            if let Some((Some(left_input), Some(right_input))) =
+                crate::sql::catalog::builtin_operator_input_oids(
+                    name,
+                    Some(left_oid),
+                    Some(right_oid),
+                )
+            {
+                let target = if unknown_left {
+                    left_input
+                } else {
+                    right_input
+                };
+                if target != crate::sql::types::oid::TEXT
+                    && target != crate::sql::types::oid::ANYARRAY
+                    && !crate::sql::catalog::is_polymorphic_pseudo_type(target)
+                    && let Some(target) = ColType::from_oid(target)
+                {
+                    let cast = cast_to(unknown, target, arena)?;
+                    if unknown_left {
+                        l = cast;
+                    } else {
+                        r = cast;
+                    }
+                }
+            }
+        }
+    }
     if let Some(name) = operator.operator_name() {
         if l_unknown
             && matches!(l, Datum::Text(_))

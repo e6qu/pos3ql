@@ -56,6 +56,13 @@ impl RowCursorBuffers {
             - core::mem::size_of::<RowReadBuffers>()
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        let config = Config::default_dev();
+        let mut budget = Budget::new(Self::allocation_bytes(&config));
+        Self::new(&config, &mut budget).expect("test cursor buffers fit their budget")
+    }
+
     pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         budget.draw(Self::allocation_bytes(config), "query cursor byte buffers")?;
         Ok(Self {
@@ -288,16 +295,22 @@ mod tests {
                     crate::sql::query::RoutineExecution::StatementReplay,
                 );
                 invocations.begin_attempt();
-                if !query.evaluate_predicate(storage, txid, work, None, &invocations, work)? {
+                if !query.evaluate_predicate(storage, txid, work, None, Some(&invocations), work)? {
                     query.finish_row(false);
                     return Ok(None);
                 }
                 let skipped = query.skip_row();
                 let mut projected = crate::mem::arena::ArenaList::new(work);
                 for index in 0..query.items_len() {
-                    for value in
-                        query.evaluate_item(index, storage, txid, work, None, &invocations, work)?
-                    {
+                    for value in query.evaluate_item(
+                        index,
+                        storage,
+                        txid,
+                        work,
+                        None,
+                        Some(&invocations),
+                        work,
+                    )? {
                         projected
                             .push(*value)
                             .map_err(|_| crate::sql::eval::arena_full())?;

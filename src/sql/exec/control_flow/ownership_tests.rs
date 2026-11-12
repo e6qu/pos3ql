@@ -1269,7 +1269,7 @@ fn quoted_cursor_names_use_tokens_in_open_fetch_move_and_close() {
                     )
                     .unwrap()
                     .unwrap();
-                    assert_eq!(open.variable.as_str(), "cursor \" name");
+                    assert_eq!(open.variable.name.as_str(), "cursor \" name");
                     for source in [
                         "FETCH NEXT FROM \"cursor \"\" name\" INTO \"output value\"",
                         "MOVE NEXT FROM \"cursor \"\" name\"",
@@ -1283,7 +1283,9 @@ fn quoted_cursor_names_use_tokens_in_open_fetch_move_and_close() {
                         }
                     }
                     assert_eq!(
-                        parse_plpgsql_cursor_close("CLOSE \"cursor \"\" name\"", scratch).unwrap(),
+                        parse_plpgsql_cursor_close("CLOSE \"cursor \"\" name\"", scratch)
+                            .unwrap()
+                            .map(|close| close.variable),
                         Some(open.variable),
                     );
                 })
@@ -1450,12 +1452,18 @@ fn constant_validation_uses_the_innermost_handler_or_counter_binding() {
                     let parsed =
                         parse_plpgsql_program(source, scratch, PlpgsqlProgramKind::Anonymous)
                             .unwrap();
-                    // This pass uses names and mutability, independently of catalog types.
+                    // This pass uses names and mutability, and whether a
+                    // cursor variable is a refcursor; `c` is the only one.
                     let locals = scratch
                         .alloc_slice_with(parsed.locals.len(), |index| TriggerLocalDecl {
                             label: None,
                             name: parsed.locals[index].name,
                             constant: parsed.locals[index].constant,
+                            ctype: if parsed.locals[index].name.as_str() == "c" {
+                                ColType::Refcursor
+                            } else {
+                                empty_plpgsql_local().ctype
+                            },
                             ..empty_plpgsql_local()
                         })
                         .unwrap();
@@ -1467,7 +1475,7 @@ fn constant_validation_uses_the_innermost_handler_or_counter_binding() {
                         print_strict_params: parsed.print_strict_params,
                     };
                     let result =
-                        validate_plpgsql_constant_assignments(&program, false, &|_| false, scratch);
+                        validate_plpgsql_variable_uses(&program, false, &|_| None, scratch);
                     match expected {
                         Some(state) => assert_eq!(result.unwrap_err().sqlstate, state, "{source}"),
                         None => result.unwrap(),

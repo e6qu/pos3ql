@@ -658,9 +658,13 @@ Domains and checked inputs:
   `double precision` in `pg_prepared_statements`, so `EXECUTE q(2.5)` returns
   2. A parameter that is never used (`SELECT $2::int` leaves `$1` unused) or
   only passed where any type is accepted (`pg_typeof($1)`) fails with `42P18`;
-  an otherwise untyped one is `text`. User-defined types are recorded exactly:
-  `PREPARE q(positive)` and `PREPARE q AS SELECT $1::mood` list `positive`
-  and `mood`. `EXECUTE` converts each argument with PostgreSQL's assignment
+  an otherwise untyped one is `text`. An untyped operand of a built-in
+  operator takes the type PostgreSQL's operator selection picks
+  (`jsonb -> $1` reads `text`); when it cannot pick one (`current_date + $1`)
+  `PREPARE` fails with `operator is not unique` (`42725`). User-defined types
+  are recorded exactly: `PREPARE q(positive)` and `PREPARE q AS SELECT
+  $1::mood` list `positive` and `mood`, and `EXECUTE` checks a domain's
+  constraints. `EXECUTE` converts each argument with PostgreSQL's assignment
   rules, so `EXECUTE q(2.7)` passes 3 to an integer domain and
   `EXECUTE q('happy'::text)` fails with `42804` (`parameter $1 of type text
   cannot be coerced to the expected type mood`). A protocol Parse fixes its
@@ -880,6 +884,11 @@ rows fit; raising `cursor_bytes` does not help there.
   row-locking cursor.
 - `WITH HOLD`: the unread suffix (plus history when scrolling) must fit; a
   scrollable cursor whose rows are evaluated again saves its whole result.
+- A trigger fired inside a writing statement (`INSERT`, `UPDATE`, `DELETE`,
+  `MERGE`, `COPY`, `TRUNCATE`, deferred constraints) can read a cursor whose
+  query runs whole at its first read. One that evaluates its rows as they are
+  fetched, or whose data-modifying `WITH` queries have not run yet, raises
+  `0A000` there.
 - A PL/pgSQL `OPEN` query with data-modifying `WITH` queries runs once, at
   the cursor's first `FETCH` or `MOVE` as in PostgreSQL, and its whole result
   must fit; a cursor closed unread never writes. A full store raises `54000`

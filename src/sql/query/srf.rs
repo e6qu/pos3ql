@@ -2621,9 +2621,7 @@ fn finish_derived_definition<'a, 'd>(
     if let Some(aliases) = col_alias {
         if aliases.len() > n_cols {
             return Err(super::scope::derived_alias_mismatch(
-                exposed,
-                n_cols,
-                aliases.len(),
+                exposed, n_cols, aliases,
             ));
         }
         for (i, alias) in aliases.iter().enumerate() {
@@ -3996,11 +3994,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     if let Some(aliases) = tref.col_alias
         && aliases.len() > n_out
     {
-        return Err(super::scope::derived_alias_mismatch(
-            name,
-            n_out,
-            aliases.len(),
-        ));
+        return Err(super::scope::derived_alias_mismatch(name, n_out, aliases));
     }
     let mut columns = [ColumnMeta::EMPTY; MAX_COLUMNS];
     for (i, default) in default_cols[..n_default].iter().enumerate() {

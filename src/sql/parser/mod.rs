@@ -8047,6 +8047,27 @@ impl<'a> Parser<'a> {
         }
         let mut columns = targets.names;
         if !targets.steps.is_empty() {
+            // VALUES rows of another width than the targets read as the
+            // query the subscripted targets select from, which reports the
+            // count mismatch at the target or expression PostgreSQL names.
+            let written = rows.borrowed_slice();
+            if select.is_none()
+                && let Some(width) = written.first().map(|row| row.len())
+                && width != targets.names.len()
+                && written.iter().all(|row| {
+                    row.len() == width
+                        && !row.iter().any(|value| matches!(value, Expr::DefaultMarker))
+                })
+            {
+                let query = self.insert_values_query(written)?;
+                select = Some(
+                    self.arena
+                        .alloc(query)
+                        .map_err(|_| self.arena_full("statement too large for SQL arena"))?
+                        as &_,
+                );
+                rows = ArenaList::new(self.arena);
+            }
             if let Some(query) = select {
                 // Select the assignments from the query's output columns.
                 const SOURCE: &str = crate::sql::ast::INSERT_SUBSCRIPT_SOURCE;
@@ -8059,6 +8080,20 @@ impl<'a> Parser<'a> {
                         .arena
                         .alloc_str_display(format_args!("column{}", index + 1))
                         .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+                    // An output without a written value is reported at its
+                    // target.
+                    if let Some(copies) = &self.source_copies
+                        && copies
+                            .borrow_mut()
+                            .push(crate::sql::error_position::SourceCopy {
+                                address: name.as_ptr() as usize,
+                                len: name.len(),
+                                at: targets.positions[index],
+                            })
+                            .is_err()
+                    {
+                        return Err(self.arena_full("statement too large for SQL arena"));
+                    }
                 }
                 let names = &*names;
                 let values = self.insert_target_values(&targets, &mut |parser, target| {
@@ -8153,6 +8188,7 @@ impl<'a> Parser<'a> {
             on_conflict,
             returning,
             overriding,
+            values_defaults: &[],
         }))
     }
 
@@ -10297,6 +10333,20 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(expression)
+    }
+
+    /// Records where the `WHEN` comparing `value` with a simple `CASE`'s
+    /// operand was written.
+    pub(super) fn record_case_when(&self, value: &Expr<'a>, at: usize) -> Result<(), ParseError> {
+        if let Some(copies) = &self.source_copies
+            && copies
+                .borrow_mut()
+                .push(crate::sql::error_position::SourceCopy::case_when(value, at))
+                .is_err()
+        {
+            return Err(self.arena_full("statement too large for SQL arena"));
+        }
+        Ok(())
     }
 
     fn arena_expr(&self, e: Expr<'a>) -> Result<&'a Expr<'a>, ParseError> {

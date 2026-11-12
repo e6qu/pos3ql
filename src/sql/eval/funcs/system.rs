@@ -3255,3 +3255,20 @@ pub(crate) fn format_builtin_type(
     }
     Some(text)
 }
+
+/// PostgreSQL's `format_type_with_typemod` for a diagnostic.
+pub(crate) fn format_type_with_type_mod(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    oid: i32,
+    type_mod: i32,
+) -> Result<crate::util::StackStr<260>, SqlError> {
+    if crate::storage::NamedTypeKind::from_oid(oid).is_none()
+        && let Some(text) = format_builtin_type(oid, type_mod, true)
+    {
+        let mut name = crate::util::StackStr::<260>::new();
+        let _ = core::fmt::Write::write_str(&mut name, text.as_str());
+        return Ok(name);
+    }
+    crate::sql::catalog::format_type_name(storage, txid, oid)
+}

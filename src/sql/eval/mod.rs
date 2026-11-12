@@ -1568,6 +1568,36 @@ pub fn qualifier_answers_target(
     }
 }
 
+/// PostgreSQL's error for `qualifier`, which names no source of a DML
+/// statement whose only source is its target: the target's own name hidden
+/// by `alias` is out of reach, with a hint naming the alias.
+pub(crate) fn unknown_target_qualifier(
+    def: crate::storage::RelationDefinition<'_>,
+    alias: Option<&str>,
+    qualifier: &str,
+) -> SqlError {
+    match alias {
+        Some(alias) if qualifier_answers_single(def, qualifier) => {
+            crate::sql::error_position::with_computed_hint(
+                sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "invalid reference to FROM-clause entry for table \"{}\"",
+                    qualifier
+                ),
+                format_args!(
+                    "Perhaps you meant to reference the table alias \"{}\".",
+                    alias
+                ),
+            )
+        }
+        _ => sql_err!(
+            sqlstate::UNDEFINED_TABLE,
+            "missing FROM-clause entry for table \"{}\"",
+            qualifier
+        ),
+    }
+}
+
 pub struct NoColumns;
 
 /// The column lookup a parameter reference skips when its variable wins: it
@@ -4013,6 +4043,47 @@ fn eval_binary_expression<'a>(
         && comparison_collation.is_some()
         && let (Datum::Record(a), Datum::Record(b)) = (&left, &right)
     {
+        // An untyped literal field takes the type of the field it is
+        // compared with, as PostgreSQL resolves it, and reports invalid input.
+        if let (
+            Expr::Call {
+                args: left_args, ..
+            },
+            Expr::Call {
+                args: right_args, ..
+            },
+        ) = (expression.left, expression.right)
+            && left_args.len() == a.len()
+            && right_args.len() == b.len()
+            && (0..a.len()).any(|field| {
+                is_unknown_literal(left_args[field]) != is_unknown_literal(right_args[field])
+            })
+        {
+            let fields = |values: &[RecordField<'a>]| {
+                arena
+                    .alloc_slice_with(values.len(), |field| values[field])
+                    .map_err(|_| arena_full())
+            };
+            let (a, b) = (fields(a)?, fields(b)?);
+            for field in 0..a.len() {
+                let (left_unknown, right_unknown) = (
+                    is_unknown_literal(left_args[field]),
+                    is_unknown_literal(right_args[field]),
+                );
+                if left_unknown && !right_unknown && !b[field].value.is_null() {
+                    a[field].value = operators::coerce_unknown(a[field].value, &b[field].value)
+                        .map_err(|error| {
+                            crate::sql::error_position::at_expression(error, left_args[field])
+                        })?;
+                } else if right_unknown && !left_unknown && !a[field].value.is_null() {
+                    b[field].value = operators::coerce_unknown(b[field].value, &a[field].value)
+                        .map_err(|error| {
+                            crate::sql::error_position::at_expression(error, right_args[field])
+                        })?;
+                }
+            }
+            return operators::row_constructor_compare(expression.operator, a, b, hooks.catalog);
+        }
         return operators::row_constructor_compare(expression.operator, a, b, hooks.catalog);
     }
     Ok(eval_binary_values(

@@ -2071,7 +2071,10 @@ impl<'d> QueryScope<'d> {
             definition.name = view.name_for(txid);
         }
         self.defs.set_arena(self.n, definition);
-        if tref.lateral {
+        // On the right of a RIGHT or FULL join a LATERAL item may read only
+        // FROM items outside that join (analysis rejects the rest), which
+        // are fixed for the whole join: its rows are materialized once.
+        if tref.lateral && !self.right_of_outer_join {
             self.names[self.n] = exposed;
             self.derived[self.n] = Some(&[]);
             self.lateral[self.n] = true;
@@ -2531,6 +2534,43 @@ impl<'d> QueryScope<'d> {
         Ok(())
     }
 
+    /// A function on the right of a RIGHT or FULL join may not read the
+    /// join's other side, as PostgreSQL's analysis reports.
+    fn reject_outer_join_lateral_arguments(&self, tref: &TableRef<'_>) -> Result<(), SqlError> {
+        fn check(scope: &QueryScope<'_>, expression: &Expr<'_>) -> Result<(), SqlError> {
+            if let Expr::Column { qualifier, name } = *expression
+                && let Ok(ResolvedColumn::Table(table, _)) =
+                    scope.find_column_unpositioned(qualifier, name)
+            {
+                return Err(crate::sql::error_position::at_reference(
+                    crate::sql::error_position::with_detail(
+                        sql_err!(
+                            sqlstate::INVALID_COLUMN_REFERENCE,
+                            "invalid reference to FROM-clause entry for table \"{}\"",
+                            scope.names[table]
+                        ),
+                        format_args!(
+                            "The combining JOIN type must be INNER or LEFT for a LATERAL reference."
+                        ),
+                    ),
+                    qualifier.unwrap_or(name),
+                ));
+            }
+            super::subquery::walk_children(expression, &mut |child| check(scope, child))
+        }
+        let functions = tref
+            .rows_from
+            .unwrap_or(core::slice::from_ref(tref))
+            .iter()
+            .filter_map(|function| function.func_args);
+        for arguments in functions {
+            for argument in arguments {
+                check(self, argument)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Registers a table function (`FROM func(args) alias`) as a derived-table
     /// entry. `materialize` false = schema only (Describe / synth-def path).
     #[allow(clippy::too_many_arguments)]
@@ -2562,6 +2602,9 @@ impl<'d> QueryScope<'d> {
         } else {
             table_func_def_outer(tref, storage, txid, arena, params, &columns)?
         };
+        if self.right_of_outer_join {
+            self.reject_outer_join_lateral_arguments(tref)?;
+        }
         let exposed = tref.alias.unwrap_or(tref.table);
         if !exposed.is_empty() {
             self.duplicate_name(exposed)?;
@@ -2570,7 +2613,7 @@ impl<'d> QueryScope<'d> {
         // (the keyword is optional for functions in PostgreSQL) unless it is
         // the nullable side of a RIGHT or FULL join. Lateral rows are built
         // per left-hand row by the scan.
-        if tref.lateral || self.n > 0 && !self.right_of_outer_join {
+        if (tref.lateral || self.n > 0) && !self.right_of_outer_join {
             self.names[self.n] = exposed;
             self.defs.set_arena(self.n, def_reference);
             self.derived[self.n] = Some(&[]);

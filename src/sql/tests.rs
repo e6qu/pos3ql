@@ -28529,6 +28529,20 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
         )
         .unwrap();
     assert_eq!(inferred[..2], [domain_oid, enum_oid]);
+    // Parameters inside a data-modifying statement's own expressions take
+    // the type their target-scope operands give them, through an alias too.
+    let inferred = engine
+        .infer_param_types(
+            "UPDATE protocol_types AS t SET count = t.count + $1 \
+             WHERE t.count + $2 > 0 RETURNING t.count * $3",
+            &arena,
+            &transaction,
+            3,
+            &[],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(inferred[..3], [crate::sql::types::oid::INT4; 3]);
     let inferred = engine
         .infer_param_types(
             "SELECT p.state, count(*) FROM protocol_types p \
@@ -46536,7 +46550,9 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
         String::from_utf8_lossy(&branches)
     );
 
-    let unsupported = run_with(
+    // An AFTER trigger's NEW is a record local to the invocation, as in
+    // PostgreSQL: assigning it does not change the stored row.
+    run_with(
         &mut engine,
         &mut budget,
         "CREATE FUNCTION after_mutation() RETURNS trigger LANGUAGE plpgsql AS
@@ -46545,18 +46561,14 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
            FOR EACH ROW EXECUTE FUNCTION after_mutation();
          INSERT INTO trigger_body_target (id, value) VALUES (2, 3);",
     );
-    assert!(
-        String::from_utf8_lossy(&unsupported).contains("0A000"),
-        "{}",
-        String::from_utf8_lossy(&unsupported)
-    );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT count(*) FROM trigger_body_target WHERE id = 2"
+            "SELECT value FROM trigger_body_target WHERE id = 2"
         )),
-        ["0"]
+        // The BEFORE trigger's increment, not the AFTER trigger's assignment.
+        ["4"]
     );
 
     // As in PostgreSQL, RETURNING without INTO is accepted when the function
@@ -62716,14 +62728,15 @@ fn lateral_joins() {
         data_rows(&bytes),
         ["1|1|10", "1|2|20", "2|1|10", "2|2|20", "2|3|30"]
     );
-    // RIGHT JOIN LATERAL is rejected loudly.
-    assert!(
-        String::from_utf8_lossy(&run_with(
+    // A LATERAL item on the right of a RIGHT join that reads nothing of
+    // the join's left side runs once for the join, as in PostgreSQL.
+    assert_eq!(
+        data_rows(&run_with(
             &mut e,
             &mut b,
-            "SELECT * FROM lt t RIGHT JOIN LATERAL (SELECT 1) s ON true"
-        ))
-        .contains("0A000")
+            "SELECT t.id, s.k FROM lt t RIGHT JOIN LATERAL (SELECT 1 AS k) s ON true ORDER BY 1"
+        )),
+        ["1|1", "2|1", "3|1"]
     );
 }
 
@@ -75214,7 +75227,7 @@ fn typed_table_membership_controls_composite_attribute_and_drop_lifecycle() {
         "ALTER TABLE typed_lifecycle_rows ADD COLUMN forbidden integer",
     );
     assert!(
-        String::from_utf8_lossy(&output).contains("0A000"),
+        String::from_utf8_lossy(&output).contains("cannot add column to typed table"),
         "{}",
         String::from_utf8_lossy(&output)
     );

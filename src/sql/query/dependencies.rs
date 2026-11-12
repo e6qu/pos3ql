@@ -971,8 +971,15 @@ fn collect_statement(
             let mark = arena.mark();
             let result = (|| {
                 record_routine_target(insert.table, storage, txid, path, dependencies)?;
-                let scope =
-                    dml_dependency_scope(storage, insert.table, None, None, txid, arena, None)?;
+                let scope = dml_dependency_scope(
+                    storage,
+                    insert.table,
+                    insert.alias,
+                    None,
+                    txid,
+                    arena,
+                    None,
+                )?;
                 record_insert_targets(
                     insert,
                     &scope,
@@ -1469,7 +1476,7 @@ pub(crate) fn validate_dml_assignment_casts(
         let statement =
             super::cte::expand_dml_ctes_schema(statement, with, storage, txid, None, None, arena)?;
         let (alias, extra) = match statement {
-            Stmt::Insert(_) => (None, None),
+            Stmt::Insert(insert) => (insert.alias, None),
             Stmt::Update(update) => (update.alias, update.from),
             Stmt::Delete(delete) => (delete.alias, delete.using),
             Stmt::Merge(merge) => {
@@ -1595,7 +1602,39 @@ pub(crate) fn validate_dml_assignment_casts(
                     .into_iter()
                     .flatten()
                 {
-                    assign(name, expression, None)?;
+                    assign(name, expression, insert.alias)?;
+                }
+                // A target aliased `excluded` makes the name ambiguous where
+                // the proposed row is also in scope.
+                if let Some(alias) = insert.alias
+                    && alias == "excluded"
+                    && let Some(conflict) = insert.on_conflict
+                    && let Some(assignments) = conflict.update
+                {
+                    let mut ambiguous = None;
+                    for expression in assignments
+                        .iter()
+                        .map(|(_, expression)| *expression)
+                        .chain(conflict.update_where)
+                    {
+                        expression.for_each_column_reference(&mut |qualifier, _| {
+                            if ambiguous.is_none()
+                                && let Some(qualifier) = qualifier
+                                && qualifier == "excluded"
+                            {
+                                ambiguous = Some(crate::sql::error_position::at_subject(
+                                    sql_err!(
+                                        sqlstate::AMBIGUOUS_ALIAS,
+                                        "table reference \"excluded\" is ambiguous"
+                                    ),
+                                    qualifier,
+                                ));
+                            }
+                        });
+                    }
+                    if let Some(error) = ambiguous {
+                        return Err(error);
+                    }
                 }
             }
             Stmt::Update(update) => {
@@ -2155,7 +2194,7 @@ fn visit_dml_assignment_inputs(
         let statement =
             super::cte::expand_dml_ctes_schema(statement, with, storage, txid, None, None, arena)?;
         let (target, alias, extra) = match statement {
-            Stmt::Insert(insert) => (insert.table, None, None),
+            Stmt::Insert(insert) => (insert.table, insert.alias, None),
             Stmt::Update(update) => (update.table, update.alias, update.from),
             Stmt::Merge(merge) => {
                 let source = arena
@@ -2197,7 +2236,7 @@ pub(super) fn visit_resolved_dml_assignment_inputs(
     let mark = arena.mark();
     let result = (|| {
         let (target_name, alias) = match statement {
-            Stmt::Insert(insert) => (insert.table.name, None),
+            Stmt::Insert(insert) => (insert.table.name, insert.alias),
             Stmt::Update(update) => (update.table.name, update.alias),
             Stmt::Merge(merge) => (merge.target.name, merge.target_alias),
             _ => return Ok(()),

@@ -97,10 +97,11 @@ mod pullup;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
 pub(crate) use cte::{
-    RuleReturningRelation, RuleTransitionType, attach_rule_source, expand_set_tree,
-    expand_stored_query, expand_stored_query_exec, expand_stored_rule_action_exec,
+    RuleReturningRelation, RuleTransitionType, attach_rule_source, dml_parameter_scope_query,
+    expand_set_tree, expand_stored_query, expand_stored_query_exec, expand_stored_rule_action_exec,
     expand_stored_rule_expression_exec, expand_stored_statement_exec, restrict_rule_original,
     rule_original_transition, rule_returning_entries, rule_returning_items, rule_transition_source,
+    split_rule_insert_defaults,
 };
 pub use cte::{
     describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under, expand_dml_ctes,
@@ -851,6 +852,7 @@ use subquery::{
 };
 pub(crate) use subquery::{
     expression_has_correlated_subquery, subquery_hooks_outer, subquery_hooks_with_outer,
+    uncorrelated_subquery_hooks,
 };
 pub use subquery::{prepare_subqueries, subquery_hooks};
 pub(crate) use subquery::{type_witness, walk_children};
@@ -15399,14 +15401,17 @@ pub fn first_from_match<'a, 'r>(
         .map_err(|_| arena_full())?;
     subquery_expressions[0] = where_clause;
     collect_table_sample_expressions(from, &mut subquery_expressions[1..]);
-    let subs = subquery_hooks(
+    // A subquery reading the target or a FROM row runs for each joined row.
+    let subs = uncorrelated_subquery_hooks(
         subquery_expressions,
         storage,
         txid,
         arena,
         params,
+        None,
         sequences,
     )?;
+    let correlated_subqueries = ProceduralSubqueries { storage, txid };
     let catalog = StorageCatalog {
         storage,
         routine_workspace: arena,
@@ -15418,7 +15423,7 @@ pub fn first_from_match<'a, 'r>(
         group: None,
         aggs: None,
         subs: Some(&subs),
-        subquery_executor: None,
+        subquery_executor: Some(&correlated_subqueries),
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,

@@ -22637,7 +22637,8 @@ fn pg_constraint_values<'a>(
                 text(" ", arena)?,
                 Datum::Bool(info.constraint_parent.is_none()),
                 Datum::Int4(i32::from(info.constraint_parent.is_some())),
-                Datum::Bool(false),
+                // Only a partition's clone of its parent's key is inherited.
+                Datum::Bool(info.constraint_parent.is_none()),
                 empty_int_array(arena)?,
                 empty_int_array(arena)?,
                 empty_int_array(arena)?,
@@ -22722,7 +22723,14 @@ fn pg_constraint_values<'a>(
                 text("s", arena)?,
                 Datum::Bool(constraint_parent_oid == 0),
                 Datum::Int4(i32::from(constraint_parent_oid != 0)),
-                Datum::Bool(false),
+                // A foreign key is not inherited, except down a partition tree.
+                Datum::Bool(
+                    constraint_parent_oid == 0
+                        && !storage
+                            .table_def(info.child_slot, txid)
+                            .partition
+                            .is_partitioned(),
+                ),
                 empty_int_array(arena)?,
                 empty_int_array(arena)?,
                 empty_int_array(arena)?,

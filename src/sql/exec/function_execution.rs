@@ -678,7 +678,12 @@ fn run_body<'a>(
             seeded,
         )?;
         execution.execute_block(
-            context, definition, invocation, None, &mut None, false, None, code,
+            context,
+            definition,
+            invocation,
+            &mut TriggerRows::none(),
+            None,
+            code,
         )
     })();
     context.txn.write_completion_boundary = prior;

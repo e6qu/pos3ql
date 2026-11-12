@@ -15510,65 +15510,91 @@ impl Engine {
                         Ok(action) => action,
                         Err(error) => return Ok(Err(error)),
                     };
-                    let action = match query::attach_rule_source(
+                    let actions = match query::split_rule_insert_defaults(
                         action,
-                        transition.source,
-                        condition,
+                        || rule_insert_target_columns(storage, action, txn.txid, arena),
                         arena,
                     ) {
-                        Ok(action) => action,
+                        Ok(actions) => actions,
                         Err(error) => return Ok(Err(error)),
                     };
                     let use_returning = outer_returns_rows
                         && definition.returning_action == Some(action_index as u8);
-                    let action = if use_returning {
-                        match Self::rule_action_with_returning(
-                            storage, statement, columns, action, txn.txid, arena,
+                    if use_returning && actions.len() > 1 {
+                        return Ok(Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "RETURNING from a rule INSERT whose VALUES rows write DEFAULT in different columns is not supported"
+                        )));
+                    }
+                    // A rule INSERT split by its DEFAULT columns reports the
+                    // rows of every part.
+                    let mut instead_parts: Option<u64> = None;
+                    for action in actions {
+                        let action = match query::attach_rule_source(
+                            action,
+                            transition.source,
+                            condition,
+                            arena,
                         ) {
                             Ok(action) => action,
                             Err(error) => return Ok(Err(error)),
-                        }
-                    } else {
-                        action
-                    };
-                    let action_rows = match steps.begin(progress.as_deref_mut(), txn, responder) {
-                        Ok(Some(affected)) => affected,
-                        Ok(None) => {
-                            let outcome = Self::execute_rule_action(
-                                storage,
-                                scratch,
-                                arena,
-                                action,
-                                rule_authorization,
-                                txn,
-                                params,
-                                guc,
-                                responder,
-                                if use_returning { capture.take() } else { None },
-                                use_returning,
-                                connection_id,
-                                progress.as_deref_mut(),
-                            )?;
-                            if let Err(error) = outcome {
-                                return Ok(Err(steps.stop(
-                                    progress.as_deref_mut(),
-                                    error,
+                        };
+                        let action = if use_returning {
+                            match Self::rule_action_with_returning(
+                                storage, statement, columns, action, txn.txid, arena,
+                            ) {
+                                Ok(action) => action,
+                                Err(error) => return Ok(Err(error)),
+                            }
+                        } else {
+                            action
+                        };
+                        let action_rows = match steps.begin(progress.as_deref_mut(), txn, responder)
+                        {
+                            Ok(Some(affected)) => affected,
+                            Ok(None) => {
+                                let outcome = Self::execute_rule_action(
+                                    storage,
+                                    scratch,
                                     arena,
-                                    &storage.row_work,
-                                )));
+                                    action,
+                                    rule_authorization,
+                                    txn,
+                                    params,
+                                    guc,
+                                    responder,
+                                    if use_returning { capture.take() } else { None },
+                                    use_returning,
+                                    connection_id,
+                                    progress.as_deref_mut(),
+                                )?;
+                                if let Err(error) = outcome {
+                                    return Ok(Err(steps.stop(
+                                        progress.as_deref_mut(),
+                                        error,
+                                        arena,
+                                        &storage.row_work,
+                                    )));
+                                }
+                                let action_rows = responder.take_affected_rows().unwrap_or(0);
+                                if let Err(error) =
+                                    steps.finish(progress.as_deref_mut(), action_rows)
+                                {
+                                    return Ok(Err(error));
+                                }
+                                action_rows
                             }
-                            let action_rows = responder.take_affected_rows().unwrap_or(0);
-                            if let Err(error) = steps.finish(progress.as_deref_mut(), action_rows) {
-                                return Ok(Err(error));
-                            }
-                            action_rows
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        if definition.mode == crate::storage::RewriteMode::Instead
+                            && core::mem::discriminant(action) == core::mem::discriminant(statement)
+                        {
+                            instead_parts =
+                                Some(instead_parts.unwrap_or(0).saturating_add(action_rows));
                         }
-                        Err(error) => return Ok(Err(error)),
-                    };
-                    if definition.mode == crate::storage::RewriteMode::Instead
-                        && core::mem::discriminant(action) == core::mem::discriminant(statement)
-                    {
-                        instead_rows = Some(action_rows);
+                    }
+                    if instead_parts.is_some() {
+                        instead_rows = instead_parts;
                     }
                 }
                 Ok(Ok(()))
@@ -16140,6 +16166,7 @@ impl Engine {
                             let rewritten = match arena.alloc(Insert {
                                 source_position: rewritten.source_position,
                                 table: view.base,
+                                alias: rewritten.alias,
                                 columns,
                                 rows: rewritten.rows,
                                 select: rewritten.select,
@@ -31089,4 +31116,31 @@ pub(crate) fn analyze_dml_cte<'a>(
             source: ast::MaterializedCteSource::Inline(&[]),
         },
     ))
+}
+
+/// The column names, in order, of the table a rule's INSERT action writes.
+fn rule_insert_target_columns<'a>(
+    storage: &Storage,
+    action: &Stmt<'a>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [&'a str], SqlError> {
+    let Stmt::Insert(insert) = action else {
+        return Ok(&[]);
+    };
+    let Some(crate::storage::ResolvedRelation::Table(slot)) =
+        storage.resolve_relation(insert.table.schema, insert.table.name, txid)
+    else {
+        return Ok(&[]);
+    };
+    let definition = storage.table_def(slot, txid);
+    let names = arena
+        .alloc_slice_with(definition.columns().len(), |_| "")
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    for (name, column) in names.iter_mut().zip(definition.columns()) {
+        *name = arena
+            .alloc_str(column.name.as_str())
+            .map_err(|_| crate::sql::eval::arena_full())?;
+    }
+    Ok(names)
 }

@@ -207,6 +207,19 @@ impl ForeignDataWrapperDefinition {
         validator: ForeignDataValidator::None,
         options: ForeignOptions::EMPTY,
     };
+
+    /// PostgreSQL's error for scanning, modifying or importing through a
+    /// wrapper created without a handler.
+    pub(crate) fn require_handler(&self) -> Result<(), SqlError> {
+        match self.handler {
+            ForeignDataHandler::Postgres => Ok(()),
+            ForeignDataHandler::None => Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "foreign-data wrapper \"{}\" has no handler",
+                self.name.as_str()
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

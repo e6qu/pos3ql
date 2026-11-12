@@ -1,0 +1,46 @@
+-- Array slice assignment in UPDATE, INSERT targets and PL/pgSQL, and the
+-- position of a subscript or element constant that fails its conversion.
+CREATE TABLE t213 (id int, a int[], m int[][]);
+INSERT INTO t213 VALUES (1, '{1,2,3,4}', '{{1,2},{3,4}}'), (2, NULL, NULL), (3, '{}', '{}');
+UPDATE t213 SET a[1:2] = '{9,9}' WHERE id = 1;
+SELECT a FROM t213 WHERE id = 1;
+UPDATE t213 SET a[2:3] = ARRAY[7,8,9] WHERE id = 1;
+SELECT a FROM t213 WHERE id = 1;
+UPDATE t213 SET a[2:3] = ARRAY[7] WHERE id = 1;
+UPDATE t213 SET a[6:7] = '{5,6}' WHERE id = 1;
+SELECT a FROM t213 WHERE id = 1;
+UPDATE t213 SET a[2:3] = '{5,6}' WHERE id = 2;
+SELECT a FROM t213 WHERE id = 2;
+UPDATE t213 SET a[-1:0] = '{5,6}' WHERE id = 3;
+SELECT a, array_lower(a, 1) FROM t213 WHERE id = 3;
+UPDATE t213 SET a[:2] = '{0,0}' WHERE id = 1;
+SELECT a FROM t213 WHERE id = 1;
+UPDATE t213 SET a[6:] = '{1,1}' WHERE id = 1;
+SELECT a FROM t213 WHERE id = 1;
+UPDATE t213 SET a[:] = '{4,4,4,4,4,4,4}' WHERE id = 1;
+SELECT a FROM t213 WHERE id = 1;
+UPDATE t213 SET a[:2] = '{1,1}' WHERE id = 2;
+UPDATE t213 SET m[1:2][2] = '{{8},{9}}' WHERE id = 1;
+SELECT m FROM t213 WHERE id = 1;
+UPDATE t213 SET m[1][1:2] = '{{5,5}}' WHERE id = 1;
+SELECT m FROM t213 WHERE id = 1;
+UPDATE t213 SET a[2:1] = '{}' WHERE id = 1;
+UPDATE t213 SET a[1:2] = NULL WHERE id = 1;
+SELECT a FROM t213 WHERE id = 1;
+INSERT INTO t213 (id, a[1:3]) VALUES (4, '{1,2,3}');
+SELECT a, array_lower(a,1) FROM t213 WHERE id = 4;
+INSERT INTO t213 (id, a[2:3]) VALUES (5, '{1,2}');
+SELECT a::text FROM t213 WHERE id = 5;
+DO $$ DECLARE x int[] := '{1,2,3,4}'; y int[]; BEGIN
+  x[1:2] := '{9,9}'; RAISE NOTICE '%', x;
+  x[3:] := ARRAY[0,0]; RAISE NOTICE '%', x;
+  y[2:3] := '{5,6}'; RAISE NOTICE '%', y;
+  x[1:2] := ARRAY[1]; END $$;
+DO $$ DECLARE x int[] := '{{1,2},{3,4}}'; BEGIN x[1:2][1] := '{{7},{8}}'; RAISE NOTICE '%', x; END $$;
+UPDATE t213 SET a[1:'x'] = '{1}' WHERE id = 1;
+UPDATE t213 SET a['y'] = 1 WHERE id = 1;
+DO $$ DECLARE x int[] := '{1,2,3,4}'; BEGIN x[1:2] := ARRAY[1.6, 2.4]::numeric[]; RAISE NOTICE '%', x; x[2:3] := '{a,b}'; END $$;
+DO $$ DECLARE x text[] := '{a,b}'; BEGIN x[1:2] := ARRAY[1, 2]; RAISE NOTICE '%', x; END $$;
+DO $$ DECLARE x int[] := '{1,2,3,4}'; BEGIN x[1:'q'] := '{1}'; END $$;
+DO $$ DECLARE x int[] := '{1,2,3,4}'; BEGIN x[1] := 'a'; END $$;
+drop table t213;

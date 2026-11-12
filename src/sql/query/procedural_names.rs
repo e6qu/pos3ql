@@ -238,7 +238,7 @@ impl<'a: 's, 's> Check<'a, 's> {
         if let Some(copy) = rows {
             rebuilt.rows = copy;
         }
-        if let Some(scope) = self.dml_scope(insert.table, None, None) {
+        if let Some(scope) = self.dml_scope(insert.table, insert.alias, None) {
             let target = Level {
                 scope: Some(&scope),
                 parent: None,

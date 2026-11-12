@@ -1108,6 +1108,99 @@ fn append_rule_input_from<'a>(
     Ok(FromClause { base, joins })
 }
 
+/// A query whose FROM and expressions are those of a data-modifying
+/// statement's own scope (its target under its alias, `FROM`/`USING` sources,
+/// and `excluded` for ON CONFLICT), for parameter type inference only: its
+/// items are the assignments, conflict and RETURNING expressions and its
+/// WHERE the statement's conditions. It is never executed.
+pub(crate) fn dml_parameter_scope_query<'a>(
+    statement: &Stmt<'a>,
+    arena: &'a Arena,
+) -> Result<Option<&'a Select<'a>>, SqlError> {
+    let (target, alias, extra, assignments, condition, returning, excluded) = match statement {
+        Stmt::Update(update) => (
+            update.table,
+            update.alias,
+            update.from,
+            update.assignments,
+            update.where_clause,
+            update.returning,
+            false,
+        ),
+        Stmt::Delete(delete) => (
+            delete.table,
+            delete.alias,
+            delete.using,
+            &[][..],
+            delete.where_clause,
+            delete.returning,
+            false,
+        ),
+        Stmt::Insert(insert) => (
+            insert.table,
+            insert.alias,
+            None,
+            insert
+                .on_conflict
+                .and_then(|conflict| conflict.update)
+                .unwrap_or(&[]),
+            insert
+                .on_conflict
+                .and_then(|conflict| conflict.update_where),
+            insert.returning,
+            insert
+                .on_conflict
+                .is_some_and(|conflict| conflict.update.is_some()),
+        ),
+        _ => return Ok(None),
+    };
+    let returned = returning
+        .items
+        .iter()
+        .filter(|item| matches!(item, SelectItem::Expr { .. } | SelectItem::RecordStar(_)))
+        .count();
+    if assignments.is_empty() && condition.is_none() && returned == 0 {
+        return Ok(None);
+    }
+    let mut from = append_rule_input_from(rule_relation_ref(target, alias), extra, arena)?;
+    if excluded {
+        let joins = arena
+            .alloc_slice_with(from.joins.len() + 1, |index| {
+                if index < from.joins.len() {
+                    from.joins[index]
+                } else {
+                    Join {
+                        table: rule_relation_ref(target, Some("excluded")),
+                        kind: JoinKind::Comma,
+                        on: None,
+                        using: None,
+                        natural: false,
+                    }
+                }
+            })
+            .map_err(|_| arena_full())?;
+        from.joins = joins;
+    }
+    let mut items: ArenaList<'a, SelectItem<'a>> = ArenaList::new(arena);
+    for (_, expression) in assignments {
+        items
+            .push(SelectItem::Expr {
+                expression,
+                alias: None,
+            })
+            .map_err(|_| arena_full())?;
+    }
+    for item in returning.items {
+        if matches!(item, SelectItem::Expr { .. } | SelectItem::RecordStar(_)) {
+            items.push(*item).map_err(|_| arena_full())?;
+        }
+    }
+    let select = arena
+        .alloc(rule_select(items.as_slice(), Some(from), condition))
+        .map_err(|_| arena_full())?;
+    Ok(Some(&*select))
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct RuleTransitionSource<'a> {
     pub source: TableRef<'a>,
@@ -1784,6 +1877,109 @@ pub(crate) fn rule_returning_items<'a>(
 /// Attaches the original statement's transition-row source to one rebound
 /// action. OLD/NEW have already become columns of `source`; this step keeps
 /// the action set-oriented, so its statement triggers still fire once.
+/// A rule's `INSERT ... VALUES` action whose rows write `DEFAULT`, split
+/// into one INSERT per pattern of `DEFAULT` positions that names only the
+/// columns its rows give values for. The omitted columns take their defaults
+/// (including identity and generated values) as PostgreSQL's rewriter
+/// substitutes them; the action runs over the rule's source rows as an
+/// `INSERT ... SELECT`, which has no `DEFAULT` marker. `table_columns`
+/// names the target's columns in order for an action without a column list.
+pub(crate) fn split_rule_insert_defaults<'a>(
+    statement: &'a Stmt<'a>,
+    table_columns: impl FnOnce() -> Result<&'a [&'a str], SqlError>,
+    arena: &'a Arena,
+) -> Result<&'a [&'a Stmt<'a>], SqlError> {
+    let single = |statement: &'a Stmt<'a>| {
+        arena
+            .alloc_slice_with(1, |_| statement)
+            .map(|statements| &*statements)
+            .map_err(|_| arena_full())
+    };
+    let Stmt::Insert(insert) = statement else {
+        return single(statement);
+    };
+    let is_default = |expression: &&Expr<'_>| matches!(expression, Expr::DefaultMarker);
+    if !insert
+        .rows
+        .iter()
+        .any(|row| !row.is_empty() && row.iter().any(is_default))
+    {
+        return single(statement);
+    }
+    let width = insert.rows.iter().map(|row| row.len()).max().unwrap_or(0);
+    let columns = if insert.columns.is_empty() {
+        let columns = table_columns()?;
+        if width > columns.len() || insert.rows.iter().any(|row| row.len() != width) {
+            // The executor reports the arity error as PostgreSQL does.
+            return single(statement);
+        }
+        &columns[..width]
+    } else {
+        insert.columns
+    };
+    if columns.len() > crate::storage::MAX_COLUMNS
+        || insert.rows.iter().any(|row| row.len() != columns.len())
+    {
+        return single(statement);
+    }
+    let pattern = |row: &[&Expr<'_>]| {
+        let mut defaults = crate::storage::ColumnSet::EMPTY;
+        for (position, expression) in row.iter().enumerate() {
+            if is_default(expression) {
+                defaults.insert(position);
+            }
+        }
+        defaults
+    };
+    let mut statements: ArenaList<'a, &'a Stmt<'a>> = ArenaList::new(arena);
+    for (first, row) in insert.rows.iter().enumerate() {
+        let defaults = pattern(row);
+        if insert.rows[..first]
+            .iter()
+            .any(|earlier| pattern(earlier) == defaults)
+        {
+            continue;
+        }
+        let kept = (0..columns.len())
+            .filter(|position| !defaults.contains(*position))
+            .count();
+        let group_columns = arena
+            .alloc_slice_with(kept, |_| "")
+            .map_err(|_| arena_full())?;
+        for (slot, position) in (0..columns.len())
+            .filter(|position| !defaults.contains(*position))
+            .enumerate()
+        {
+            group_columns[slot] = columns[position];
+        }
+        let mut rows: ArenaList<'a, &'a [&'a Expr<'a>]> = ArenaList::new(arena);
+        for row in insert.rows[first..]
+            .iter()
+            .filter(|row| pattern(row) == defaults)
+        {
+            let values = arena
+                .alloc_slice_with(kept, |_| row[0])
+                .map_err(|_| arena_full())?;
+            for (slot, position) in (0..columns.len())
+                .filter(|position| !defaults.contains(*position))
+                .enumerate()
+            {
+                values[slot] = row[position];
+            }
+            rows.push(&*values).map_err(|_| arena_full())?;
+        }
+        let split = arena
+            .alloc(Stmt::Insert(Insert {
+                columns: group_columns,
+                rows: rows.as_slice(),
+                ..*insert
+            }))
+            .map_err(|_| arena_full())?;
+        statements.push(&*split).map_err(|_| arena_full())?;
+    }
+    Ok(statements.as_slice())
+}
+
 pub(crate) fn attach_rule_source<'a>(
     statement: &'a Stmt<'a>,
     source: TableRef<'a>,
@@ -6054,6 +6250,7 @@ fn subst_insert<'a>(
     Ok(Insert {
         source_position: statement.source_position,
         table: rewrite_stored_relation_name(statement.table, context, arena)?,
+        alias: statement.alias,
         columns: statement.columns,
         rows,
         select,

@@ -181,9 +181,7 @@ fn run<'a>(
             context,
             definition,
             body.invocation,
-            None,
-            &mut None,
-            false,
+            &mut TriggerRows::none(),
             None,
             body.code,
         )

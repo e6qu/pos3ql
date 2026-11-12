@@ -77,6 +77,7 @@ fn alter_pass(action: &AlterAction) -> u8 {
         AlterAction::SetForeignOptions(_)
         | AlterAction::SetColumnForeignOptions { .. }
         | AlterAction::SetStorageOptions(_)
+        | AlterAction::SetViewOptions { .. }
         | AlterAction::ResetStorageOptions(_) => 4,
         // Standalone forms; never appear in a multi-action list.
         AlterAction::RenameTable(_)
@@ -368,6 +369,10 @@ pub struct Parser<'a> {
     defer_analysis_errors: bool,
     /// The first analysis error in the statement being parsed.
     analysis_error: Option<ParseError>,
+    /// The first `DEFAULT` of the statement not written as a whole
+    /// INSERT value or assigned value, and the most recent `DEFAULT`.
+    misplaced_default: Option<usize>,
+    last_default: usize,
     /// The type a deferred "type modifier is not allowed" error names, which
     /// PostgreSQL reports as unknown instead when no such type exists.
     analysis_error_type: Option<&'a str>,
@@ -1026,6 +1031,8 @@ impl<'a> Parser<'a> {
             truncation_reported_to: 0,
             defer_analysis_errors: false,
             analysis_error: None,
+            misplaced_default: None,
+            last_default: 0,
             analysis_error_type: None,
             rejected_statement: None,
             analysis_error_reported: false,
@@ -1458,7 +1465,19 @@ impl<'a> Parser<'a> {
         if self.peeked == Tok::Eof {
             return Ok(None);
         }
+        self.misplaced_default = None;
         let statement = self.statement()?;
+        if let Some(at) = self.misplaced_default.take() {
+            self.analysis_error(ParseError {
+                at,
+                message: StackStr::from_str("DEFAULT is not allowed in this context"),
+                sqlstate: sqlstate::SYNTAX_ERROR,
+                cursor: Some(at),
+                hint: None,
+                near: None,
+                detail: None,
+            })?;
+        }
         match self.peeked {
             Tok::Op(";") | Tok::Eof => match self.analysis_error.take() {
                 Some(error) => {
@@ -6518,14 +6537,7 @@ impl<'a> Parser<'a> {
         if self.peeked == Tok::Ident("owner") {
             return self.alter_owner(AlterOwnerKind::View, name, if_exists);
         }
-        let action = if self.peeked != Tok::Ident("rename")
-            && self.peeked != Tok::Ident("set")
-            && self.peeked != Tok::Ident("reset")
-        {
-            crate::sql::ast::AlterViewAction::TableActions(
-                self.alter_view_table_actions(name, if_exists)?,
-            )
-        } else if self.eat_ident("rename")? {
+        let action = if self.eat_ident("rename")? {
             if self.eat_ident("to")? {
                 crate::sql::ast::AlterViewAction::RenameTo(self.col_ident("new view name")?)
             } else {
@@ -6535,19 +6547,12 @@ impl<'a> Parser<'a> {
                 let to = self.col_ident("new view column name")?;
                 crate::sql::ast::AlterViewAction::RenameColumn { from, to }
             }
-        } else if self.eat_ident("set")? {
-            if self.eat_ident("schema")? {
-                crate::sql::ast::AlterViewAction::SetSchema(self.col_ident("schema name")?)
-            } else if self.eat_op("(")? {
-                crate::sql::ast::AlterViewAction::SetOptions(self.view_options()?)
-            } else {
-                let action = self.alter_table_set_action()?;
-                crate::sql::ast::AlterViewAction::TableActions(self.arena_slice(&[action])?)
-            }
         } else {
-            self.expect_ident("reset")?;
-            self.expect_op("(")?;
-            crate::sql::ast::AlterViewAction::ResetOptions(self.view_option_names()?)
+            // SET SCHEMA, options and column defaults parse as ALTER TABLE
+            // subcommands, which may form a list.
+            crate::sql::ast::AlterViewAction::TableActions(
+                self.alter_view_table_actions(name, if_exists)?,
+            )
         };
         Ok(Stmt::AlterView {
             name,
@@ -6638,50 +6643,86 @@ impl<'a> Parser<'a> {
     }
 
     fn view_options(&mut self) -> Result<&'a [crate::sql::ast::ViewOption], ParseError> {
-        use crate::sql::ast::{ViewCheckOption, ViewOption};
+        let (storage, options) = self.relation_options()?;
+        if storage.fillfactor.is_some() {
+            return Err(self.unrecognized_parameter("fillfactor"));
+        }
+        Ok(options)
+    }
+
+    fn unrecognized_parameter(&self, option: &str) -> ParseError {
+        ParseError {
+            at: self.peek_at,
+            message: stack_format!(PARSE_MESSAGE_BYTES, "unrecognized parameter \"{}\"", option),
+            sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            cursor: None,
+            hint: None,
+            near: None,
+            detail: None,
+        }
+    }
+
+    /// A `SET (...)` list of table storage parameters and view options,
+    /// through `)`. Which of them a relation has is checked when the
+    /// statement runs, as PostgreSQL validates them against its kind.
+    fn relation_options(
+        &mut self,
+    ) -> Result<
+        (
+            crate::sql::ast::RelationStorageOptions,
+            &'a [crate::sql::ast::ViewOption],
+        ),
+        ParseError,
+    > {
+        use crate::sql::ast::{RelationStorageOptions, ViewCheckOption, ViewOption};
+        let mut storage = RelationStorageOptions::DEFAULT;
         let mut options = [ViewOption::SecurityInvoker(false); 3];
         let mut count = 0usize;
-        let mut seen = [false; 3];
+        let mut seen = [false; 4];
         loop {
-            if count == options.len() {
-                return Err(self.limit("view options", options.len()));
-            }
-            let option = self.any_ident("view option name")?;
-            let (index, parsed) = if option.eq_ignore_ascii_case("security_invoker") {
-                (
-                    0,
-                    ViewOption::SecurityInvoker(self.subscription_bool_option(option)?),
-                )
+            let option = self.any_ident("relation option name")?;
+            let index = if option.eq_ignore_ascii_case("security_invoker") {
+                options[count] =
+                    ViewOption::SecurityInvoker(self.subscription_bool_option(option)?);
+                0
             } else if option.eq_ignore_ascii_case("security_barrier") {
-                (
-                    1,
-                    ViewOption::SecurityBarrier(self.subscription_bool_option(option)?),
-                )
+                options[count] =
+                    ViewOption::SecurityBarrier(self.subscription_bool_option(option)?);
+                1
             } else if option.eq_ignore_ascii_case("check_option") {
                 self.expect_op("=")?;
-                let value = self.any_ident("check_option value")?;
+                let value = match self.peeked {
+                    Tok::Ident(value) | Tok::Str(value) => value,
+                    _ => return Err(self.syntax_error_here()),
+                };
                 let value = if value.eq_ignore_ascii_case("local") {
                     ViewCheckOption::Local
                 } else if value.eq_ignore_ascii_case("cascaded") {
                     ViewCheckOption::Cascaded
                 } else {
-                    return Err(self.err_here("check_option must be local or cascaded"));
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            PARSE_MESSAGE_BYTES,
+                            "invalid value for enum option \"check_option\": {}",
+                            value
+                        ),
+                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        cursor: None,
+                        hint: None,
+                        near: None,
+                        detail: Some("Valid values are \"local\" and \"cascaded\"."),
+                    });
                 };
-                (2, ViewOption::CheckOption(value))
+                self.advance()?;
+                options[count] = ViewOption::CheckOption(value);
+                2
+            } else if option.eq_ignore_ascii_case("fillfactor") {
+                self.expect_op("=")?;
+                storage.fillfactor = Some(self.integer_reloption("fillfactor", 10, 100)? as u8);
+                3
             } else {
-                return Err(ParseError {
-                    at: self.peek_at,
-                    message: stack_format!(
-                        PARSE_MESSAGE_BYTES,
-                        "unrecognized parameter \"{}\"",
-                        option
-                    ),
-                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                    cursor: None,
-                    hint: None,
-                    near: None,
-                    detail: None,
-                });
+                return Err(self.unrecognized_parameter(option));
             };
             if core::mem::replace(&mut seen[index], true) {
                 return Err(ParseError {
@@ -6698,41 +6739,7 @@ impl<'a> Parser<'a> {
                     detail: None,
                 });
             }
-            options[count] = parsed;
-            count += 1;
-            if !self.eat_op(",")? {
-                break;
-            }
-        }
-        self.expect_op(")")?;
-        self.arena_slice(&options[..count])
-    }
-
-    fn view_option_names(&mut self) -> Result<&'a [crate::sql::ast::ViewOptionName], ParseError> {
-        use crate::sql::ast::ViewOptionName;
-        let mut names = [ViewOptionName::SecurityInvoker; 3];
-        let mut count = 0usize;
-        let mut seen = [false; 3];
-        loop {
-            if count == names.len() {
-                return Err(self.limit("view options", names.len()));
-            }
-            let option = self.any_ident("view option name")?;
-            let (index, parsed) = if option.eq_ignore_ascii_case("security_invoker") {
-                (0, ViewOptionName::SecurityInvoker)
-            } else if option.eq_ignore_ascii_case("security_barrier") {
-                (1, ViewOptionName::SecurityBarrier)
-            } else if option.eq_ignore_ascii_case("check_option") {
-                (2, ViewOptionName::CheckOption)
-            } else {
-                // Resetting a parameter a view does not have changes nothing.
-                if !self.eat_op(",")? {
-                    break;
-                }
-                continue;
-            };
-            if !core::mem::replace(&mut seen[index], true) {
-                names[count] = parsed;
+            if index < 3 {
                 count += 1;
             }
             if !self.eat_op(",")? {
@@ -6740,7 +6747,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op(")")?;
-        self.arena_slice(&names[..count])
+        Ok((storage, self.arena_slice(&options[..count])?))
     }
 
     /// One `ALTER TABLE ... SET` subcommand, after `SET`.
@@ -6761,9 +6768,10 @@ impl<'a> Parser<'a> {
                 AlterAction::SetWithoutOids
             }
         } else if self.eat_op("(")? {
-            let options = self.relation_storage_options()?;
-            self.expect_op(")")?;
-            AlterAction::SetStorageOptions(options)
+            match self.relation_options()? {
+                (storage, []) => AlterAction::SetStorageOptions(storage),
+                (storage, options) => AlterAction::SetViewOptions { options, storage },
+            }
         } else {
             self.expect_ident("access")?;
             self.expect_ident("method")?;
@@ -6813,11 +6821,39 @@ impl<'a> Parser<'a> {
         if_exists: bool,
         only: bool,
     ) -> Result<Stmt<'a>, ParseError> {
-        // RENAME … and SET SCHEMA are standalone forms: PostgreSQL does not
-        // combine them with a comma-separated subcommand list, so they parse to
-        // a single-element list on their own.
+        // RENAME …, SET SCHEMA and partition attachment are standalone forms:
+        // PostgreSQL does not combine them with a comma-separated subcommand
+        // list, so they parse to a single-element list on their own.
+        let mut buffer = ArenaList::new(self.arena);
         if self.eat_ident("set")? {
+            if self.eat_ident("schema")? {
+                let action = AlterAction::SetSchema(self.col_ident("schema name")?);
+                return Ok(Self::alter_table_statement(
+                    foreign,
+                    AlterTable {
+                        table,
+                        if_exists,
+                        only,
+                        actions: self.arena_slice(&[action])?,
+                    },
+                ));
+            }
             let action = self.alter_table_set_action()?;
+            self.push(&mut buffer, action)?;
+            if !self.eat_op(",")? {
+                return Ok(Self::alter_table_statement(
+                    foreign,
+                    AlterTable {
+                        table,
+                        if_exists,
+                        only,
+                        actions: buffer.as_slice(),
+                    },
+                ));
+            }
+        } else if matches!(self.peeked, Tok::Ident("attach" | "detach")) {
+            let mut column_constraints = ArenaList::new(self.arena);
+            let action = self.alter_table_cmd(foreign, table.name, &mut column_constraints)?;
             return Ok(Self::alter_table_statement(
                 foreign,
                 AlterTable {
@@ -6825,37 +6861,6 @@ impl<'a> Parser<'a> {
                     if_exists,
                     only,
                     actions: self.arena_slice(&[action])?,
-                },
-            ));
-        }
-        if self.eat_ident("cluster")? {
-            self.expect_ident("on")?;
-            // PostgreSQL's grammar takes an unqualified name, looked up in the
-            // table's schema.
-            let index = QualName {
-                schema: None,
-                name: self.col_ident("index name")?,
-            };
-            return Ok(Self::alter_table_statement(
-                foreign,
-                AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self.arena_slice(&[AlterAction::SetCluster(index)])?,
-                },
-            ));
-        }
-        if self.eat_ident("of")? {
-            let type_name = self.qual_name("composite type name")?;
-            return Ok(Self::alter_table_statement(
-                foreign,
-                AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self
-                        .arena_slice(&[AlterAction::SetTypeMembership(Some(type_name))])?,
                 },
             ));
         }
@@ -6884,155 +6889,17 @@ impl<'a> Parser<'a> {
                 },
             ));
         }
-        if self.eat_ident("force")? {
-            self.expect_ident("row")?;
-            self.expect_ident("level")?;
-            self.expect_ident("security")?;
-            return Ok(Self::alter_table_statement(
-                foreign,
-                AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
-                        RowLevelSecurityAlteration::Force,
-                    )])?,
-                },
-            ));
-        }
-        if self.eat_ident("not")? {
-            self.expect_ident("of")?;
-            return Ok(Self::alter_table_statement(
-                foreign,
-                AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self.arena_slice(&[AlterAction::SetTypeMembership(None)])?,
-                },
-            ));
-        }
-        if self.eat_ident("no")? {
-            let action = if self.eat_ident("inherit")? {
-                AlterAction::SetInheritance {
-                    parent: self.qual_name("parent relation name")?,
-                    inherit: false,
-                }
-            } else {
-                self.expect_ident("force")?;
-                self.expect_ident("row")?;
-                self.expect_ident("level")?;
-                self.expect_ident("security")?;
-                AlterAction::SetRowLevelSecurity(RowLevelSecurityAlteration::NoForce)
-            };
-            return Ok(Self::alter_table_statement(
-                foreign,
-                AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self.arena_slice(&[action])?,
-                },
-            ));
-        }
-        let trigger_mode = if self.eat_ident("enable")? {
-            if self.eat_ident("row")? {
-                self.expect_ident("level")?;
-                self.expect_ident("security")?;
-                return Ok(Self::alter_table_statement(
-                    foreign,
-                    AlterTable {
-                        table,
-                        if_exists,
-                        only,
-                        actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
-                            RowLevelSecurityAlteration::Enable,
-                        )])?,
-                    },
-                ));
-            }
-            if self.eat_ident("replica")? {
-                Some(crate::sql::ast::TriggerEnableMode::Replica)
-            } else if self.eat_ident("always")? {
-                Some(crate::sql::ast::TriggerEnableMode::Always)
-            } else {
-                Some(crate::sql::ast::TriggerEnableMode::Origin)
-            }
-        } else if self.eat_ident("disable")? {
-            if self.eat_ident("row")? {
-                self.expect_ident("level")?;
-                self.expect_ident("security")?;
-                return Ok(Self::alter_table_statement(
-                    foreign,
-                    AlterTable {
-                        table,
-                        if_exists,
-                        only,
-                        actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
-                            RowLevelSecurityAlteration::Disable,
-                        )])?,
-                    },
-                ));
-            }
-            Some(crate::sql::ast::TriggerEnableMode::Disabled)
-        } else {
-            None
-        };
-        if let Some(enabled) = trigger_mode {
-            if self.eat_ident("rule")? {
-                if matches!(self.peeked, Tok::Ident("all" | "user")) {
-                    return Err(self.syntax_error_here());
-                }
-                let action = AlterAction::SetRuleEnabled {
-                    name: self.col_ident("rewrite rule name")?,
-                    enabled,
-                };
-                return Ok(Self::alter_table_statement(
-                    foreign,
-                    AlterTable {
-                        table,
-                        if_exists,
-                        only,
-                        actions: self.arena_slice(&[action])?,
-                    },
-                ));
-            }
-            self.expect_ident("trigger")?;
-            let target = match (enabled, self.peeked) {
-                (
-                    crate::sql::ast::TriggerEnableMode::Origin
-                    | crate::sql::ast::TriggerEnableMode::Disabled,
-                    Tok::Ident("all"),
-                ) => {
-                    self.advance()?;
-                    crate::sql::ast::TriggerEnableTarget::All
-                }
-                (
-                    crate::sql::ast::TriggerEnableMode::Origin
-                    | crate::sql::ast::TriggerEnableMode::Disabled,
-                    Tok::Ident("user"),
-                ) => {
-                    self.advance()?;
-                    crate::sql::ast::TriggerEnableTarget::User
-                }
-                _ => crate::sql::ast::TriggerEnableTarget::Name(self.col_ident("trigger name")?),
-            };
-            let action = AlterAction::SetTriggerEnabled { target, enabled };
-            return Ok(Self::alter_table_statement(
-                foreign,
-                AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self.arena_slice(&[action])?,
-                },
-            ));
-        }
-        // Otherwise a comma-separated list of ADD / DROP / ALTER subcommands.
-        let mut buffer = ArenaList::new(self.arena);
+        // Otherwise a comma-separated list of subcommands.
         loop {
-            let action = self.alter_table_cmd(foreign, table.name)?;
+            if matches!(self.peeked, Tok::Ident("attach" | "detach" | "rename")) {
+                return Err(self.syntax_error_here());
+            }
+            let mut column_constraints = ArenaList::new(self.arena);
+            let action = self.alter_table_cmd(foreign, table.name, &mut column_constraints)?;
             self.push(&mut buffer, action)?;
+            for constraint in column_constraints.as_slice() {
+                self.push(&mut buffer, AlterAction::AddConstraint(*constraint))?;
+            }
             if !self.eat_op(",")? {
                 break;
             }
@@ -7337,13 +7204,118 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The relation-level subcommands of an `ALTER TABLE` list: trigger,
+    /// rule and row-security switches, `CLUSTER ON`, `OF`, `NOT OF`, and
+    /// `NO INHERIT`.
+    fn alter_table_relation_cmd(&mut self) -> Result<Option<AlterAction<'a>>, ParseError> {
+        use crate::sql::ast::{TriggerEnableMode, TriggerEnableTarget};
+        if self.eat_ident("cluster")? {
+            self.expect_ident("on")?;
+            // PostgreSQL's grammar takes an unqualified name, looked up in the
+            // table's schema.
+            return Ok(Some(AlterAction::SetCluster(QualName {
+                schema: None,
+                name: self.col_ident("index name")?,
+            })));
+        }
+        if self.eat_ident("of")? {
+            let type_name = self.qual_name("composite type name")?;
+            return Ok(Some(AlterAction::SetTypeMembership(Some(type_name))));
+        }
+        if self.eat_ident("not")? {
+            self.expect_ident("of")?;
+            return Ok(Some(AlterAction::SetTypeMembership(None)));
+        }
+        let row_level_security = |parser: &mut Self| -> Result<(), ParseError> {
+            parser.expect_ident("row")?;
+            parser.expect_ident("level")?;
+            parser.expect_ident("security")
+        };
+        if self.eat_ident("force")? {
+            row_level_security(self)?;
+            return Ok(Some(AlterAction::SetRowLevelSecurity(
+                RowLevelSecurityAlteration::Force,
+            )));
+        }
+        if self.eat_ident("no")? {
+            if self.eat_ident("inherit")? {
+                return Ok(Some(AlterAction::SetInheritance {
+                    parent: self.qual_name("parent relation name")?,
+                    inherit: false,
+                }));
+            }
+            self.expect_ident("force")?;
+            row_level_security(self)?;
+            return Ok(Some(AlterAction::SetRowLevelSecurity(
+                RowLevelSecurityAlteration::NoForce,
+            )));
+        }
+        let enabled = if self.eat_ident("enable")? {
+            if self.peeked == Tok::Ident("row") {
+                row_level_security(self)?;
+                return Ok(Some(AlterAction::SetRowLevelSecurity(
+                    RowLevelSecurityAlteration::Enable,
+                )));
+            }
+            if self.eat_ident("replica")? {
+                TriggerEnableMode::Replica
+            } else if self.eat_ident("always")? {
+                TriggerEnableMode::Always
+            } else {
+                TriggerEnableMode::Origin
+            }
+        } else if self.eat_ident("disable")? {
+            if self.peeked == Tok::Ident("row") {
+                row_level_security(self)?;
+                return Ok(Some(AlterAction::SetRowLevelSecurity(
+                    RowLevelSecurityAlteration::Disable,
+                )));
+            }
+            TriggerEnableMode::Disabled
+        } else {
+            return Ok(None);
+        };
+        if self.eat_ident("rule")? {
+            if matches!(self.peeked, Tok::Ident("all" | "user")) {
+                return Err(self.syntax_error_here());
+            }
+            return Ok(Some(AlterAction::SetRuleEnabled {
+                name: self.col_ident("rewrite rule name")?,
+                enabled,
+            }));
+        }
+        self.expect_ident("trigger")?;
+        let target = match (enabled, self.peeked) {
+            (
+                TriggerEnableMode::Origin | TriggerEnableMode::Disabled,
+                Tok::Ident(word @ ("all" | "user")),
+            ) => {
+                self.advance()?;
+                if word == "all" {
+                    TriggerEnableTarget::All
+                } else {
+                    TriggerEnableTarget::User
+                }
+            }
+            _ => TriggerEnableTarget::Name(self.col_ident("trigger name")?),
+        };
+        Ok(Some(AlterAction::SetTriggerEnabled { target, enabled }))
+    }
+
     /// One ADD / DROP / ALTER subcommand of an ALTER TABLE (the comma-listable
     /// forms; RENAME and SET SCHEMA are handled by the caller).
+    /// One ALTER TABLE subcommand. The constraints written on an added
+    /// column are appended to `column_constraints`; PostgreSQL adds them as
+    /// separate constraint subcommands once the column exists.
     fn alter_table_cmd(
         &mut self,
         foreign: bool,
         table: &str,
+        column_constraints: &mut ArenaList<'a, TableConstraint<'a>>,
     ) -> Result<AlterAction<'a>, ParseError> {
+        if let Some(action) = self.alter_table_relation_cmd()? {
+            return Ok(action);
+        }
         if self.eat_ident("options")? {
             Ok(AlterAction::SetForeignOptions(
                 self.alter_foreign_options()?,
@@ -7369,12 +7341,6 @@ impl<'a> Parser<'a> {
                 parent: self.qual_name("parent relation name")?,
                 inherit: true,
             })
-        } else if self.eat_ident("no")? {
-            self.expect_ident("inherit")?;
-            Ok(AlterAction::SetInheritance {
-                parent: self.qual_name("parent relation name")?,
-                inherit: false,
-            })
         } else if self.eat_ident("replica")? {
             self.expect_ident("identity")?;
             let target = if self.eat_ident("default")? {
@@ -7390,36 +7356,11 @@ impl<'a> Parser<'a> {
             };
             Ok(AlterAction::SetReplicaIdentity(target))
         } else if self.eat_ident("set")? {
-            if self.eat_ident("logged")? {
-                Ok(AlterAction::SetPersistence(
-                    crate::sql::ast::RelationPersistence::Permanent,
-                ))
-            } else if self.eat_ident("unlogged")? {
-                Ok(AlterAction::SetPersistence(
-                    crate::sql::ast::RelationPersistence::Unlogged,
-                ))
-            } else if self.eat_ident("tablespace")? {
-                Ok(AlterAction::SetTablespace(
-                    self.col_ident("tablespace name")?,
-                ))
-            } else if self.eat_op("(")? {
-                let options = self.relation_storage_options()?;
-                self.expect_op(")")?;
-                Ok(AlterAction::SetStorageOptions(options))
-            } else {
-                self.expect_ident("access")?;
-                self.expect_ident("method")?;
-                if self.eat_ident("default")? {
-                    Ok(AlterAction::ResetAccessMethod)
-                } else {
-                    let method = self.any_ident("table access method")?;
-                    Ok(AlterAction::SetAccessMethod(if method == "heap" {
-                        crate::sql::ast::TableAccessMethod::Heap
-                    } else {
-                        crate::sql::ast::TableAccessMethod::Named(method)
-                    }))
-                }
+            // SET SCHEMA stands alone.
+            if self.peeked == Tok::Ident("schema") {
+                return Err(self.syntax_error_here());
             }
+            self.alter_table_set_action()
         } else if self.eat_ident("reset")? {
             self.expect_op("(")?;
             let names = self.relation_storage_option_names()?;
@@ -7427,9 +7368,10 @@ impl<'a> Parser<'a> {
             Ok(AlterAction::ResetStorageOptions(names))
         } else if self.eat_ident("add")? {
             // ADD [CONSTRAINT name] <table constraint> vs ADD [COLUMN] <def>.
+            let constraint_at = SourcePosition::new(Some(self.peek_at));
             if self.eat_ident("constraint")? {
                 let cname = self.col_ident("constraint name")?;
-                return self.alter_table_add_constraint(Some(cname));
+                return self.alter_table_add_constraint(Some(cname), constraint_at);
             }
             if matches!(
                 self.peeked,
@@ -7437,8 +7379,9 @@ impl<'a> Parser<'a> {
                     | Tok::Ident("unique")
                     | Tok::Ident("check")
                     | Tok::Ident("foreign")
+                    | Tok::Ident("exclude")
             ) {
-                return self.alter_table_add_constraint(None);
+                return self.alter_table_add_constraint(None, constraint_at);
             }
             let _ = self.eat_ident("column")?;
             let if_not_exists = if self.eat_ident("if")? {
@@ -7476,63 +7419,7 @@ impl<'a> Parser<'a> {
             } else {
                 crate::sql::ast::ParsedCollation::DEFAULT
             };
-            let mut not_null = false;
-            let mut not_null_name = None;
-            let mut null_clause = None;
-            let mut not_null_inheritable = true;
-            let mut unique = false;
-            let mut default = None;
-            let mut default_text = None;
-            let mut generated_text = None;
-            let mut identity = None;
-            loop {
-                let constraint_at = self.peek_at;
-                let constraint_name = if self.eat_ident("constraint")? {
-                    Some(self.col_ident("constraint name")?)
-                } else {
-                    None
-                };
-                if constraint_name.is_some() && !matches!(self.peeked, Tok::Ident("not")) {
-                    return Err(self.err_here("ADD COLUMN supports a named NOT NULL clause here"));
-                }
-                if self.eat_ident("not")? {
-                    self.expect_ident("null")?;
-                    if null_clause == Some(false) {
-                        return Err(self.conflicting_null_declarations(constraint_at, name, table));
-                    }
-                    null_clause = Some(true);
-                    not_null = true;
-                    if let Some(name) = constraint_name {
-                        if not_null_name.is_some_and(|previous| previous != name) {
-                            return Err(self.err_here("conflicting not-null constraint names"));
-                        }
-                        not_null_name = Some(name);
-                    }
-                    if self.eat_ident("no")? {
-                        self.expect_ident("inherit")?;
-                        not_null_inheritable = false;
-                    }
-                } else if self.eat_ident("null")? {
-                    if null_clause == Some(true) {
-                        return Err(self.conflicting_null_declarations(constraint_at, name, table));
-                    }
-                    null_clause = Some(false);
-                    not_null = false;
-                } else if self.eat_ident("default")? {
-                    let start = self.peek_at;
-                    default = Some(self.column_default_expression()?);
-                    default_text = Some(self.text[start..self.peek_at].trim_end());
-                } else if self.eat_ident("generated")? {
-                    match self.generated_clause()? {
-                        crate::sql::ast::ColGen::Generated(text) => generated_text = Some(text),
-                        crate::sql::ast::ColGen::Identity(spec) => identity = Some(spec),
-                    }
-                } else if self.eat_ident("unique")? {
-                    unique = true;
-                } else {
-                    break;
-                }
-            }
+            let clauses = self.column_clauses(name, table, false, column_constraints)?;
             Ok(AlterAction::AddColumn {
                 definition: ColumnDef {
                     name,
@@ -7542,15 +7429,15 @@ impl<'a> Parser<'a> {
                     foreign_options,
                     storage,
                     compression,
-                    not_null,
-                    not_null_name,
-                    not_null_inheritable,
-                    unique,
-                    primary: false,
-                    default,
-                    default_text,
-                    generated_text,
-                    identity,
+                    not_null: clauses.not_null,
+                    not_null_name: clauses.not_null_name,
+                    not_null_inheritable: clauses.not_null_inheritable,
+                    unique: clauses.unique,
+                    primary: clauses.primary,
+                    default: clauses.default,
+                    default_text: clauses.default_text,
+                    generated_text: clauses.generated_text,
+                    identity: clauses.identity,
                 },
                 if_not_exists,
             })
@@ -7927,6 +7814,7 @@ impl<'a> Parser<'a> {
     fn alter_table_add_constraint(
         &mut self,
         name: Option<&'a str>,
+        source_position: SourcePosition,
     ) -> Result<AlterAction<'a>, ParseError> {
         let primary = if self.eat_ident("primary")? {
             self.expect_ident("key")?;
@@ -7937,14 +7825,20 @@ impl<'a> Parser<'a> {
             None
         };
         let Some(primary) = primary else {
-            return Ok(AlterAction::AddConstraint(
-                self.table_constraint(name, true)?,
-            ));
+            return Ok(AlterAction::AddConstraint(self.table_constraint(
+                name,
+                source_position,
+                ddl::ConstraintSite::AlterTable,
+            )?));
         };
         if self.eat_ident("using")? {
             self.expect_ident("index")?;
             let index = self.qual_name("index name")?;
-            let timing = self.constraint_timing(false)?;
+            let timing = self.constraint_timing(if primary {
+                ddl::ConstraintAttributeRules::PRIMARY_KEY
+            } else {
+                ddl::ConstraintAttributeRules::UNIQUE
+            })?;
             return Ok(AlterAction::AttachIndexConstraint {
                 name,
                 index,
@@ -7958,15 +7852,21 @@ impl<'a> Parser<'a> {
             self.unique_nulls_not_distinct()?
         };
         let columns = self.column_name_list()?;
-        let timing = self.constraint_timing(false)?;
+        let timing = self.constraint_timing(if primary {
+            ddl::ConstraintAttributeRules::PRIMARY_KEY
+        } else {
+            ddl::ConstraintAttributeRules::UNIQUE
+        })?;
         Ok(AlterAction::AddConstraint(if primary {
             TableConstraint::PrimaryKey {
+                source_position,
                 name,
                 columns,
                 timing,
             }
         } else {
             TableConstraint::Unique {
+                source_position,
                 name,
                 columns,
                 timing,
@@ -8052,6 +7952,11 @@ impl<'a> Parser<'a> {
         self.expect_ident("insert")?;
         self.expect_ident("into")?;
         let table = self.qual_name("table name")?;
+        let alias = if self.eat_ident("as")? {
+            Some(self.col_ident("table alias")?)
+        } else {
+            None
+        };
         // `(` starts the column list unless it opens a parenthesized query.
         let targets = if self.peeked == Tok::Op("(")
             && !matches!(
@@ -8096,11 +8001,15 @@ impl<'a> Parser<'a> {
             self.push(&mut rows, &[])?;
         } else {
             self.expect_ident("values")?;
+            let mut first_default = None;
             loop {
                 self.expect_op("(")?;
                 let mut row = ArenaList::new(self.arena);
                 loop {
-                    let value = self.expression(0)?;
+                    let value = self.value_or_default()?;
+                    if matches!(value, Expr::DefaultMarker) {
+                        first_default.get_or_insert(self.last_default);
+                    }
                     self.push(&mut row, value)?;
                     if !self.eat_op(",")? {
                         break;
@@ -8121,6 +8030,11 @@ impl<'a> Parser<'a> {
                     "union" | "intersect" | "except" | "order" | "limit" | "offset" | "fetch"
                 )
             ) {
+                // A query's VALUES cannot hold DEFAULT.
+                if let Some(at) = first_default {
+                    self.misplaced_default =
+                        Some(self.misplaced_default.map_or(at, |first| first.min(at)));
+                }
                 let query = self.insert_values_query(rows.as_slice())?;
                 select = Some(
                     self.arena
@@ -8232,6 +8146,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Insert(Insert {
             source_position,
             table,
+            alias,
             columns,
             rows: rows.as_slice(),
             select,
@@ -8458,7 +8373,7 @@ impl<'a> Parser<'a> {
             let name_count = names.len();
             let mut values = ArenaList::new(self.arena);
             let value_count = if !multiple {
-                let value = self.expression(0)?;
+                let value = self.value_or_default()?;
                 self.push(&mut values, value)?;
                 1
             } else if self.eat_ident("row")? {
@@ -8789,12 +8704,22 @@ impl<'a> Parser<'a> {
 
     /// Parses the comma-separated body after a multi-column assignment's
     /// opening parenthesis and consumes its closing parenthesis.
+    /// One INSERT or assigned value, where a whole `DEFAULT` is allowed.
+    fn value_or_default(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        let value = self.expression(0)?;
+        if matches!(value, Expr::DefaultMarker) && self.misplaced_default == Some(self.last_default)
+        {
+            self.misplaced_default = None;
+        }
+        Ok(value)
+    }
+
     fn assignment_row_values(
         &mut self,
         values: &mut ArenaList<'a, &'a Expr<'a>>,
     ) -> Result<(), ParseError> {
         loop {
-            let value = self.expression(0)?;
+            let value = self.value_or_default()?;
             self.push(values, value)?;
             if !self.eat_op(",")? {
                 break;
@@ -9057,7 +8982,7 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         let mut vals = ArenaList::new(self.arena);
         loop {
-            let value = self.expression(0)?;
+            let value = self.value_or_default()?;
             self.push(&mut vals, value)?;
             if !self.eat_op(",")? {
                 break;
@@ -13145,17 +13070,81 @@ mod tests {
 
     #[test]
     fn constraint_attributes_reject_unrepresentable_states_at_parse_time() {
-        for sql in [
-            "CREATE TABLE t (id integer UNIQUE ENFORCED)",
-            "CREATE TABLE t (id integer CHECK (id > 0) DEFERRABLE)",
-            "CREATE TABLE t (id integer UNIQUE INITIALLY DEFERRED)",
-            "CREATE TABLE t (id integer, CHECK (id > 0) NOT VALID)",
-            "CREATE TABLE t (id integer, EXCLUDE USING btree (id WITH =))",
+        for (sql, message, sqlstate, cursor) in [
+            (
+                "CREATE TABLE t (id integer UNIQUE ENFORCED)",
+                "misplaced ENFORCED clause",
+                "42601",
+                34,
+            ),
+            (
+                "CREATE TABLE t (id integer CHECK (id > 0) DEFERRABLE)",
+                "misplaced DEFERRABLE clause",
+                "42601",
+                42,
+            ),
+            (
+                "CREATE TABLE t (id integer REFERENCES r DEFERRABLE NOT DEFERRABLE)",
+                "multiple DEFERRABLE/NOT DEFERRABLE clauses not allowed",
+                "42601",
+                51,
+            ),
+            (
+                "CREATE TABLE t (id integer REFERENCES r INITIALLY DEFERRED NOT DEFERRABLE)",
+                "constraint declared INITIALLY DEFERRED must be DEFERRABLE",
+                "42601",
+                59,
+            ),
+            (
+                "CREATE TABLE t (id integer, CHECK (id > 0) NOT VALID NO INHERIT DEFERRABLE)",
+                "CHECK constraints cannot be marked DEFERRABLE",
+                "0A000",
+                43,
+            ),
+            (
+                "CREATE TABLE t (id integer, UNIQUE (id) DEFERRABLE NOT DEFERRABLE)",
+                "conflicting constraint properties",
+                "42601",
+                51,
+            ),
+            (
+                "CREATE TABLE t (id integer, EXCLUDE USING gist (id WITH &&) NOT VALID)",
+                "EXCLUDE constraints cannot be marked NOT VALID",
+                "0A000",
+                60,
+            ),
         ] {
             with_parser(sql, |parser| {
-                assert!(parser.next_stmt().is_err(), "accepted {sql}")
+                let error = parser.next_stmt().expect_err(sql);
+                assert_eq!(error.message.as_str(), message, "{sql}");
+                assert_eq!(error.sqlstate, sqlstate, "{sql}");
+                assert_eq!(error.cursor, Some(cursor), "{sql}");
             });
         }
+        // INITIALLY DEFERRED implies DEFERRABLE, and a new ordinary table
+        // marks a NOT VALID check valid, as PostgreSQL does.
+        with_parser(
+            "CREATE TABLE t (id integer UNIQUE INITIALLY DEFERRED, \
+             CHECK (id > 0) NOT VALID)",
+            |parser| {
+                let Stmt::CreateTable(table) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!("CREATE TABLE did not parse");
+                };
+                assert!(matches!(
+                    table.constraints,
+                    [
+                        TableConstraint::Unique {
+                            timing: ConstraintTiming::Deferrable(ConstraintMode::Deferred),
+                            ..
+                        },
+                        TableConstraint::Check {
+                            validation: ConstraintValidation::EnforcedValidated,
+                            ..
+                        },
+                    ]
+                ));
+            },
+        );
         with_parser(
             "ALTER TABLE t ADD CONSTRAINT positive CHECK (id > 0) NOT VALID",
             |parser| assert!(parser.next_stmt().unwrap().is_some()),

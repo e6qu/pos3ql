@@ -1169,7 +1169,10 @@ pub(crate) fn dispatch<'a>(
                             "array assignment subscripts lack a bound"
                         )
                     })?;
-                    assignment_subscript(eval_full(expression, arena, params, row, hooks)?)
+                    positioned_subscript(
+                        expression,
+                        assignment_subscript(eval_full(expression, arena, params, row, hooks)?),
+                    )
                 };
                 for (slot, kind) in subscripts.iter_mut().zip(kinds.bytes()) {
                     use crate::sql::array_assignment::AssignmentSubscript::{Element, Slice};
@@ -1236,9 +1239,12 @@ pub(crate) fn dispatch<'a>(
                     }
                     for (slot, expression) in subscripts.iter_mut().zip(&args[2..]) {
                         *slot = crate::sql::array_assignment::AssignmentSubscript::Element(
-                            assignment_subscript(eval_full(
-                                expression, arena, params, row, hooks,
-                            )?)?,
+                            positioned_subscript(
+                                expression,
+                                assignment_subscript(eval_full(
+                                    expression, arena, params, row, hooks,
+                                )?),
+                            )?,
                         );
                     }
                     let value = enum_element_input(
@@ -2294,6 +2300,20 @@ pub(crate) fn dispatch<'a>(
 }
 
 /// An array subscript of an assignment target: an integer, never NULL.
+/// A constant subscript fails its integer conversion where it is written,
+/// as PostgreSQL coerces subscripts while analysing the assignment.
+fn positioned_subscript(
+    expression: &Expr<'_>,
+    result: Result<i32, SqlError>,
+) -> Result<i32, SqlError> {
+    result.map_err(|error| match expression {
+        Expr::Str(_) if error.sqlstate.as_str().starts_with("22") => {
+            crate::sql::error_position::at_expression(error, expression)
+        }
+        _ => error,
+    })
+}
+
 fn assignment_subscript(value: Datum<'_>) -> Result<i32, SqlError> {
     let value = match value {
         Datum::Int2(value) => i64::from(value),

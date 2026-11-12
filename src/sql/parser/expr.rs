@@ -654,6 +654,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             let right = self.expression(operator.precedence() + 1)?;
+            let right = self.row_subquery_operand(left, operator, right, operator_at)?;
             left = self.arena_expr(Expr::Binary {
                 source_position,
                 operator,
@@ -661,6 +662,86 @@ impl<'a> Parser<'a> {
                 right,
             })?;
         }
+    }
+
+    /// `(a, b) op (SELECT x, y ...)` compares a row constructor with the
+    /// subquery's single row field by field: the subquery becomes a row of
+    /// its fields, NULL for no row, and more than one row is an error.
+    fn row_subquery_operand(
+        &mut self,
+        left: &'a Expr<'a>,
+        operator: BinaryOp,
+        right: &'a Expr<'a>,
+        operator_at: usize,
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        let Expr::Subquery(select) = right else {
+            return Ok(right);
+        };
+        let Expr::Call { args, .. } = left else {
+            return Ok(right);
+        };
+        if !left.is_row_constructor()
+            || !matches!(
+                operator,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+            )
+        {
+            return Ok(right);
+        }
+        let leaf = {
+            let mut leaf = *select;
+            while let Some(tree) = leaf.set_body {
+                let mut node = tree;
+                while let crate::sql::ast::SetTree::Op { left, .. } = node {
+                    node = left;
+                }
+                let crate::sql::ast::SetTree::Select(first) = node else {
+                    unreachable!("a set tree ends in a leaf")
+                };
+                leaf = first;
+            }
+            leaf
+        };
+        if leaf
+            .items
+            .iter()
+            .all(|item| matches!(item, crate::sql::ast::SelectItem::Expr { .. }))
+            && leaf.items.len() != args.len()
+        {
+            return Err(ParseError {
+                at: operator_at,
+                message: crate::util::StackStr::from_str(if leaf.items.len() < args.len() {
+                    "subquery has too few columns"
+                } else {
+                    "subquery has too many columns"
+                }),
+                sqlstate: sqlstate::SYNTAX_ERROR,
+                cursor: Some(operator_at),
+                hint: None,
+                near: None,
+                detail: None,
+            });
+        }
+        let arity = u8::try_from(args.len()).map_err(|_| self.err_here("row is too wide"))?;
+        let record = self.arena_expr_at(Expr::RowSubquery { select, arity }, operator_at)?;
+        let mut fields = ArenaList::new(self.arena);
+        for index in 0..args.len() {
+            let field = self.arena_expr(Expr::RecordFieldIndex {
+                base: record,
+                index: index as u16,
+            })?;
+            self.push(&mut fields, field)?;
+        }
+        let mut row = *left;
+        if let Expr::Call { args, .. } = &mut row {
+            *args = fields.as_slice();
+        }
+        self.arena_expr(row)
     }
 
     pub(super) fn collation_name(
@@ -984,7 +1065,10 @@ impl<'a> Parser<'a> {
                 self.arena_expr_at(Expr::Exists(boxed), exists_at)
             }
             Tok::Ident("default") => {
+                let at = self.peek_at;
                 self.advance()?;
+                self.last_default = at;
+                self.misplaced_default.get_or_insert(at);
                 self.arena_expr(Expr::DefaultMarker)
             }
             Tok::Ident("case") => {

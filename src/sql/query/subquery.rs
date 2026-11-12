@@ -4227,6 +4227,44 @@ pub fn subquery_hooks<'a>(
     subquery_hooks_with_outer(exprs, storage, txid, arena, params, None, sequences)
 }
 
+/// [`subquery_hooks`] for a data change's WHERE: only the subqueries that
+/// read no column of the target row run once; a correlated one runs for each
+/// row through the evaluator's subquery executor.
+pub(crate) fn uncorrelated_subquery_hooks<'a>(
+    exprs: &[Option<&'a Expr<'a>>],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    outer: Option<&dyn ColumnLookup<'a>>,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+    // SAFETY: as in `subquery_hooks_with_outer`; values are detached below.
+    let storage_for_eval: &'a Storage = unsafe { &*(storage as *const Storage) };
+    let mut nodes = ArenaList::new(arena);
+    for expression in exprs.iter().flatten() {
+        collect_subqueries(expression, &mut nodes)?;
+    }
+    let mut uncorrelated = ArenaList::new(arena);
+    for &node in nodes.as_slice() {
+        if !subquery_node_correlated(node, storage_for_eval, txid, arena)? {
+            uncorrelated.push(node).map_err(|_| arena_full())?;
+        }
+    }
+    let borrowed = eval_subquery_nodes(
+        uncorrelated.as_slice(),
+        storage_for_eval,
+        txid,
+        arena,
+        params,
+        SUBQUERY_DEPTH,
+        outer,
+        sequences,
+        SubqueryTiming::WhereReached,
+    )?;
+    detach_subquery_values(borrowed, arena)
+}
+
 pub(crate) fn subquery_hooks_outer<'a>(
     exprs: &[Option<&'a Expr<'a>>],
     storage: &Storage,

@@ -428,18 +428,22 @@ read. Remaining: a PL/pgSQL write with `WITH` queries whose nested AFTER
 trigger waits fails with `0A000` instead of resuming; and a data-modifying
 `WITH` query runs whole before the main query reads it, so a trigger's or
 called function's notices arrive in a different order than PostgreSQL's
-interleaved execution. `ALTER TABLE` subcommands other than column, constraint and
-storage-option ones (`ENABLE TRIGGER`, `SET LOGGED`, `CLUSTER ON`, `INHERIT`,
-`OF`, `REPLICA IDENTITY`, row security) must be written alone, where
-PostgreSQL accepts them in a comma-separated list, and `ALTER TABLE` on a view
-rejects view options (`SET (security_barrier = true)`) as unknown storage
-parameters. A set operation's type or column-count error and a misplaced
-`DEFAULT` are reported without their cursor position. A cursor whose query
+interleaved execution. The index behind a primary key or unique
+constraint cannot be named by `CLUSTER ON`, `CLUSTER ... USING` or `REPLICA
+IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
+`reloptions` lists its options in a fixed order (`security_invoker`,
+`security_barrier`, `check_option`) where PostgreSQL keeps the order they were
+set, and omits an explicit `security_invoker=false`. A `CHECK` constraint
+marked `NO INHERIT` fails with `0A000`, and exclusion constraints support only
+GiST over range columns (`EXCLUDE USING btree (a WITH =)` fails with `0A000`).
+`pg_constraint` omits the system catalogs' own not-null constraints. A
+misplaced column constraint attribute (`a int NOT NULL DEFERRABLE`) is
+reported before a later syntax error in the same statement, where PostgreSQL
+reports the syntax error first. A rewrite rule `INSERT` action whose `VALUES` rows write
+`DEFAULT` in different columns runs as one insert per pattern, so `RETURNING`
+from such an action fails with `0A000`. A cursor whose query
 cannot stream runs it at `DECLARE` or `OPEN`, so a volatile function's side
-effects happen before the first `FETCH` rather than at it. A `LATERAL` item on the right of
-a `RIGHT` or `FULL` join that reads only FROM items outside that join
-(`SELECT * FROM b, a RIGHT JOIN LATERAL (SELECT b.y) s ON true`) fails with
-`0A000` where PostgreSQL accepts it. A derived table computes output
+effects happen before the first `FETCH` rather than at it. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1
 FROM (SELECT 10 / t.x) s)` fails with division by zero on a zero `x` where
 PostgreSQL, which drops unread subquery outputs, returns the row. A
@@ -448,12 +452,11 @@ PostgreSQL types it as the table's row type `t`. A row constructor casts to a ta
 (`ROW(1, 'a')::t`) but not to a view's, and an array of a table's row type
 (`ARRAY[ROW(1, 'a')::t]`) fails with `0A000`, where PostgreSQL accepts both.
 A PL/pgSQL variable declared with a view's row type (`r v;` or
-`r v%ROWTYPE`) fails with `0A000`; a table's works. In a trigger function,
-`FETCH ... INTO NEW.col`, any `INTO OLD.col`, and assigning `NEW` in an AFTER
-trigger fail with `0A000`, and a write's `RETURNING ... INTO NEW.col` fails
-with `42601` (`"new.a" is not a known variable`), where PostgreSQL assigns the
-field; `SELECT` and `EXECUTE ... INTO NEW.col`
-in a BEFORE trigger work. A `CONSTANT`
+`r v%ROWTYPE`) fails with `0A000`; a table's works. In a trigger function, `OLD` and `NEW` are
+assignable records with the table's row structure, as in PostgreSQL;
+assigning a row of another structure to one fails at the assignment with
+PostgreSQL's `returned row structure does not match` error, where PostgreSQL
+accepts it and fails only if a BEFORE trigger returns it. A `CONSTANT`
 assignment error has no cursor position: PL/pgSQL assignment targets do not
 keep their place in the routine body.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY

@@ -57460,11 +57460,14 @@ impl Storage {
             }
         };
         class.ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "data type {} has no default operator class for access method \"{}\"",
-                input.ctype.name(),
-                method.name()
+            crate::sql::error_position::with_hint(
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "data type {} has no default operator class for access method \"{}\"",
+                    input.ctype.name(),
+                    method.name()
+                ),
+                crate::sql::error_position::DEFAULT_OPERATOR_CLASS_HINT,
             )
         })
     }

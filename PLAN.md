@@ -214,7 +214,11 @@ is owned.
     and output type, and evaluates its operators without binding them first
     (about 1 ms per outer row for a 50-row inner scan in a debug build).
     Binding the subquery once per statement and rewinding a retained child
-    tree per row removes that,
+    tree per row removes that. A branch built these on per-statement
+    initPlans (correlated bindings, nested initPlans, `IN` lists in sorted
+    streams, `UPDATE`/`DELETE` subqueries read as of the statement, held
+    aggregate values); they must be rebuilt on the deferred subqueries that
+    run where evaluation first reaches them,
     set operations other than `UNION ALL` (and `UNION ALL` under
     `ORDER BY`, in a declared cursor, or with volatile or routine-calling
     expressions), sorts in object-store mode (external runs

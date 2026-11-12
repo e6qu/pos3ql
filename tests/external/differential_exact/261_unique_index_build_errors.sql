@@ -1,0 +1,10 @@
+CREATE TABLE ub_t(id int, v int, s text);
+INSERT INTO ub_t VALUES (1, 1, 'a'), (1, 2, 'A'), (2, 3, 'b');
+CREATE UNIQUE INDEX ub_id ON ub_t(id);
+CREATE UNIQUE INDEX ub_expr ON ub_t((id * 0));
+CREATE UNIQUE INDEX ub_lower ON ub_t(lower(s));
+CREATE UNIQUE INDEX ub_partial ON ub_t(id) WHERE v > 0;
+CREATE UNIQUE INDEX ub_pair ON ub_t(id, v);
+CREATE UNIQUE INDEX ub_partial_ok ON ub_t(id) WHERE v > 1;
+INSERT INTO ub_t VALUES (1, 5, 'c');
+SELECT indexrelid::regclass FROM pg_index WHERE indrelid = 'ub_t'::regclass ORDER BY 1;

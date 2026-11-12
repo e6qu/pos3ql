@@ -28412,7 +28412,14 @@ fn execute_plpgsql_dynamic_explain(
                 responder,
                 ..
             } = context;
-            let PlpgsqlExecHost::Routine { engine, guc, .. } = host else {
+            let PlpgsqlExecHost::Routine {
+                engine,
+                guc,
+                sqlprep,
+                cursors,
+                ..
+            } = host
+            else {
                 return Err(engine_triggers::engine_required(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "EXPLAIN ANALYZE is not available in trigger execution"
@@ -28428,6 +28435,7 @@ fn execute_plpgsql_dynamic_explain(
                 arena,
                 planned.arguments,
                 txn,
+                (sqlprep, cursors),
                 guc,
                 responder,
             );
@@ -34168,17 +34176,30 @@ fn fire_statement_row_trigger_events<'a>(
 /// has queued: those of its data-modifying `WITH` sub-statements when the
 /// main statement fired no events of its own (a `SELECT`, or a write
 /// rewritten into other statements).
+/// Fires the AFTER events a statement left queued, with the engine's
+/// executor, so a referential action may run rules, write views or run DDL in
+/// trigger bodies as at top level.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the engine host carries every per-connection execution service"
+)]
 pub(crate) fn fire_statement_after_events(
-    (storage, seq_session): (&mut Storage, &crate::sql::guc::SeqSession),
+    engine: &mut super::Engine,
+    guc: &crate::sql::guc::GucState,
+    sqlprep: &mut super::prep::SqlPreparedPool,
+    cursors: &mut super::cursor::CursorPool,
     txn: &mut TxnState,
     (depth, command): (u16, u32),
     arena: &Arena,
     responder: &mut Responder,
 ) -> Result<(), SqlError> {
     let mut context = TriggerExecContext {
-        host: PlpgsqlExecHost::Atomic {
-            storage,
-            seq_session,
+        host: PlpgsqlExecHost::Routine {
+            engine,
+            guc,
+            sqlprep,
+            cursors,
+            transaction_context: PlpgsqlTransactionContext::Atomic,
         },
         txn,
         arena,

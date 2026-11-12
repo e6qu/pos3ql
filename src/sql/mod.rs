@@ -16086,6 +16086,7 @@ impl Engine {
                 arena,
                 params,
                 txn,
+                (&mut *sqlprep, &mut *cursors),
                 guc,
                 Some(&invocations),
                 responder,
@@ -16494,7 +16495,12 @@ impl Engine {
                 }
             }
         }
-        let direct_relation = match statement {
+        // A data-modifying `WITH` hands its main write's completion over too.
+        let main_statement = match statement {
+            Stmt::With { statement, .. } => *statement,
+            statement => statement,
+        };
+        let direct_relation = match main_statement {
             Stmt::Insert(insert) => Some(insert.table),
             Stmt::Update(update) => Some(update.table),
             Stmt::Delete(delete) => Some(delete.table),
@@ -16594,6 +16600,7 @@ impl Engine {
                                 arena,
                                 params,
                                 txn,
+                                (&mut *sqlprep, &mut *cursors),
                                 guc,
                                 responder,
                                 None,
@@ -16604,6 +16611,7 @@ impl Engine {
                                 arena,
                                 params,
                                 txn,
+                                (&mut *sqlprep, &mut *cursors),
                                 guc,
                                 Some(&invocations),
                                 responder,
@@ -17168,6 +17176,7 @@ impl Engine {
         arena: &'statement Arena,
         params: &[Datum],
         txn: &mut TxnState,
+        services: StatementServices<'_>,
         guc: &GucState,
         invocations: Option<&'statement query::RoutineInvocationState>,
         responder: &mut Responder,
@@ -17243,11 +17252,13 @@ impl Engine {
                         responder,
                     )
                 };
-                let outcome = Self::fire_with_foreign_key_events(
-                    (&mut self.storage, guc.seq_session()),
+                let materialized = dml_mats.len();
+                let outcome = self.fire_with_after_events(
+                    guc,
+                    services,
                     txn,
                     statement_events,
-                    dml_mats,
+                    materialized,
                     arena,
                     responder,
                     outcome,
@@ -17261,19 +17272,28 @@ impl Engine {
     /// the sub-statements' AFTER events it did not fire itself.
     /// A failing check replaces the main statement's unsent command tag, as
     /// PostgreSQL fires them before completing the statement.
-    fn fire_with_foreign_key_events<T>(
-        (storage, seq_session): (&mut Storage, &guc::SeqSession),
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the statement's AFTER events run with every execution service"
+    )]
+    fn fire_with_after_events<T>(
+        &mut self,
+        guc: &GucState,
+        (sqlprep, cursors): StatementServices<'_>,
         txn: &mut TxnState,
         (depth, command): (u16, u32),
-        materialized: &[(&str, &ast::MaterializedCte<'_>)],
+        materialized: usize,
         arena: &Arena,
         responder: &mut Responder,
         outcome: Result<Result<(), SqlError>, T>,
     ) -> Result<Result<(), SqlError>, T> {
         match outcome {
-            Ok(Ok(())) if !materialized.is_empty() => {
+            Ok(Ok(())) if materialized != 0 => {
                 let checked = exec::fire_statement_after_events(
-                    (storage, seq_session),
+                    self,
+                    guc,
+                    sqlprep,
+                    cursors,
                     txn,
                     (depth, command),
                     arena,
@@ -18306,12 +18326,13 @@ impl Engine {
         arena: &Arena,
         params: &[Datum],
         txn: &mut TxnState,
+        services: StatementServices<'_>,
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         match statement {
             Stmt::Select(select) => {
-                self.execute_select_once(select, arena, params, txn, guc, None, responder, None)
+                self.execute_select_once(select, arena, params, txn, services, guc, None, responder, None)
             }
             Stmt::SetQuery(query) => {
                 let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
@@ -18351,7 +18372,7 @@ impl Engine {
                 None,
             ),
             Stmt::With { ctes, statement } => self.execute_with_data_modification(
-                ctes, statement, arena, params, txn, guc, responder, None, None,
+                ctes, statement, arena, params, txn, services, guc, responder, None, None,
             ),
             _ => Ok(Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -18371,6 +18392,7 @@ impl Engine {
         arena: &'a Arena,
         params: &[Datum<'a>],
         txn: &mut TxnState,
+        services: StatementServices<'_>,
         guc: &GucState,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
@@ -18446,11 +18468,13 @@ impl Engine {
                 "WITH expanded to a non-data-modifying statement"
             ))),
         };
-        let outcome = Self::fire_with_foreign_key_events(
-            (&mut self.storage, guc.seq_session()),
+        let materialized = dml_mats.len();
+        let outcome = self.fire_with_after_events(
+            guc,
+            services,
             txn,
             statement_events,
-            dml_mats,
+            materialized,
             arena,
             responder,
             outcome,
@@ -20249,6 +20273,7 @@ impl Engine {
                         arena,
                         execution_params,
                         txn,
+                        (&mut *sqlprep, &mut *cursors),
                         guc,
                         responder,
                     );
@@ -20288,7 +20313,16 @@ impl Engine {
                 statement, arena, params, txn, sqlprep, cursors, guc, responder,
             ),
             Stmt::With { ctes, statement } => self.execute_with_data_modification(
-                ctes, statement, arena, params, txn, guc, responder, capture, None,
+                ctes,
+                statement,
+                arena,
+                params,
+                txn,
+                (sqlprep, cursors),
+                guc,
+                responder,
+                capture,
+                None,
             ),
             Stmt::Select(select) => {
                 self.execute_select(select, arena, params, txn, sqlprep, cursors, guc, responder)
@@ -25047,6 +25081,10 @@ fn fixed_setting(name: &str) -> Option<&'static str> {
 /// Every setting readable through `SHOW`, `SHOW ALL`, and `current_setting` —
 /// the fixed server parameters plus the per-session GUCs. Names carry
 /// PostgreSQL's canonical case for the mixed-case ones.
+/// The per-connection prepared statements and cursors a statement's trigger
+/// bodies and referential actions may use through the engine.
+type StatementServices<'s> = (&'s mut SqlPreparedPool, &'s mut cursor::CursorPool);
+
 pub(crate) const SETTING_NAMES: &[&str] = &[
     "application_name",
     "bytea_output",

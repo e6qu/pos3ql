@@ -12499,7 +12499,8 @@ impl Checkpointer {
                     (1u8, view.schema, view.name)
                 }
             };
-            let function = storage.routine(usize::from(trigger.function));
+            let (function_schema, function_name) =
+                storage.trigger_function_name(trigger.function, 0);
             let mut hname = StackStr::<130>::new();
             let mut hschema = StackStr::<130>::new();
             let mut htable = StackStr::<130>::new();
@@ -12525,10 +12526,10 @@ impl Checkpointer {
             for byte in relation_name.as_str().as_bytes() {
                 let _ = write!(htable, "{byte:02x}");
             }
-            for byte in function.schema.as_str().as_bytes() {
+            for byte in function_schema.as_str().as_bytes() {
                 let _ = write!(hfunction_schema, "{byte:02x}");
             }
-            for byte in function.name.as_str().as_bytes() {
+            for byte in function_name.as_str().as_bytes() {
                 let _ = write!(hfunction, "{byte:02x}");
             }
             if let Some(old) = trigger.transition_tables.old() {
@@ -18550,18 +18551,8 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
         ));
     }
     let function = storage
-        .routine_slot_by_signature(&function_schema, &function_name, &[], 0)
-        .ok_or(CheckpointSetupError::Corrupt(
-            "trigger function does not exist",
-        ))?;
-    if !matches!(
-        storage.routine(function).kind,
-        crate::storage::RoutineKind::Trigger
-    ) {
-        return Err(CheckpointSetupError::Corrupt(
-            "trigger function is not trigger typed",
-        ));
-    }
+        .trigger_function_named(&function_schema, &function_name, 0)
+        .map_err(CheckpointSetupError::Corrupt)?;
     storage
         .restore_trigger(
             identity,

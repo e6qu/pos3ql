@@ -7423,6 +7423,58 @@ pub(crate) fn policy_oid(policy: &PolicyDef) -> i32 {
         .expect("policy OID range exhausted")
 }
 
+impl Storage {
+    /// Resolves a durable trigger function reference (`schema`, `name`, no
+    /// arguments) from a journal or checkpoint: a built-in trigger function,
+    /// or a stored routine returning `trigger`. The error names the defect.
+    pub(crate) fn trigger_function_named(
+        &self,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Result<TriggerFunction, &'static str> {
+        if let Some(builtin) = BuiltinTriggerFunction::named(schema, name) {
+            return Ok(TriggerFunction::Builtin(builtin));
+        }
+        let slot = self
+            .routine_slot_by_signature(schema, name, &[], txid)
+            .ok_or("trigger function does not exist")?;
+        if !matches!(self.routine(slot).kind, RoutineKind::Trigger) {
+            return Err("trigger function is not trigger typed");
+        }
+        TriggerFunction::routine_slot(slot).map_err(|_| "trigger function slot is out of range")
+    }
+
+    /// The schema and name of the function a trigger runs, as `txid` sees
+    /// them.
+    pub(crate) fn trigger_function_name(
+        &self,
+        function: TriggerFunction,
+        txid: u32,
+    ) -> (SqlName, SqlName) {
+        match function {
+            TriggerFunction::Routine(slot) => {
+                let routine = self.routine(usize::from(slot));
+                (routine.schema_for(txid), routine.name_for(txid))
+            }
+            TriggerFunction::Builtin(builtin) => (
+                SqlName::parse("pg_catalog").expect("pg_catalog is a valid name"),
+                SqlName::parse(builtin.name()).expect("built-in trigger function names are valid"),
+            ),
+        }
+    }
+}
+
+/// The `pg_proc` OID of the function a trigger runs.
+pub(crate) fn trigger_function_oid(storage: &Storage, function: TriggerFunction, txid: u32) -> i32 {
+    match function {
+        TriggerFunction::Routine(slot) => {
+            routine_oid(&storage.routine_for(usize::from(slot), txid))
+        }
+        TriggerFunction::Builtin(builtin) => builtin.oid(),
+    }
+}
+
 pub(crate) fn routine_oid(routine: &RoutineDef) -> i32 {
     ROUTINE_OID_BASE
         .checked_add(i32::try_from(routine.created_at).expect("routine OID range exhausted"))
@@ -10253,6 +10305,68 @@ impl TriggerTarget {
     }
 }
 
+/// The function a trigger runs: a stored routine, or one of PostgreSQL's
+/// built-in trigger functions in `pg_catalog`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TriggerFunction {
+    Routine(u16),
+    Builtin(BuiltinTriggerFunction),
+}
+
+impl TriggerFunction {
+    /// Builds a routine reference from a routine catalog slot.
+    pub(crate) fn routine_slot(slot: usize) -> Result<Self, SqlError> {
+        u16::try_from(slot).map(Self::Routine).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "routine slot exceeds trigger capacity"
+            )
+        })
+    }
+
+    pub(crate) const fn routine(self) -> Option<usize> {
+        match self {
+            Self::Routine(slot) => Some(slot as usize),
+            Self::Builtin(_) => None,
+        }
+    }
+}
+
+/// PostgreSQL's built-in trigger functions that pos3ql runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BuiltinTriggerFunction {
+    /// `suppress_redundant_updates_trigger()`: a `BEFORE UPDATE` row trigger
+    /// that skips an update whose new row is identical to the old one.
+    SuppressRedundantUpdates,
+}
+
+impl BuiltinTriggerFunction {
+    pub(crate) const fn oid(self) -> i32 {
+        match self {
+            Self::SuppressRedundantUpdates => 1291,
+        }
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::SuppressRedundantUpdates => "suppress_redundant_updates_trigger",
+        }
+    }
+
+    pub(crate) const fn from_oid(oid: i32) -> Option<Self> {
+        match oid {
+            1291 => Some(Self::SuppressRedundantUpdates),
+            _ => None,
+        }
+    }
+
+    /// The built-in trigger function `schema.name` names, if any.
+    pub(crate) fn named(schema: &str, name: &str) -> Option<Self> {
+        (schema == "pg_catalog" && name == Self::SuppressRedundantUpdates.name())
+            .then_some(Self::SuppressRedundantUpdates)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TriggerDef {
     pub(crate) database: DatabaseOid,
@@ -10260,7 +10374,7 @@ pub(crate) struct TriggerDef {
     pub(crate) name: SqlName,
     pub(crate) target: TriggerTarget,
     pub(crate) kind: TriggerKind,
-    pub(crate) function: u16,
+    pub(crate) function: TriggerFunction,
     pub(crate) timing: crate::sql::ast::TriggerTiming,
     pub(crate) level: crate::sql::ast::TriggerLevel,
     pub(crate) events: crate::sql::ast::TriggerEvents,
@@ -10283,7 +10397,7 @@ pub(crate) struct PendingTriggerDefinition {
 pub(crate) struct TriggerDefinition {
     pub(crate) name: SqlName,
     pub(crate) kind: TriggerKind,
-    pub(crate) function: u16,
+    pub(crate) function: TriggerFunction,
     pub(crate) timing: crate::sql::ast::TriggerTiming,
     pub(crate) level: crate::sql::ast::TriggerLevel,
     pub(crate) events: crate::sql::ast::TriggerEvents,
@@ -10354,7 +10468,7 @@ pub(crate) struct TriggerSpec {
     pub(crate) name: SqlName,
     pub(crate) target: TriggerTarget,
     pub(crate) kind: TriggerKind,
-    pub(crate) function: usize,
+    pub(crate) function: TriggerFunction,
     pub(crate) timing: crate::sql::ast::TriggerTiming,
     pub(crate) level: crate::sql::ast::TriggerLevel,
     pub(crate) events: crate::sql::ast::TriggerEvents,
@@ -10575,7 +10689,7 @@ impl TriggerDef {
         name: SqlName::EMPTY,
         target: TriggerTarget::Table(u16::MAX),
         kind: TriggerKind::Ordinary,
-        function: u16::MAX,
+        function: TriggerFunction::Routine(u16::MAX),
         timing: crate::sql::ast::TriggerTiming::Before,
         level: crate::sql::ast::TriggerLevel::Row,
         events: crate::sql::ast::TriggerEvents::from_bits(1).expect("INSERT event is valid"),
@@ -24538,16 +24652,18 @@ impl Storage {
                         )
                     }
                 };
-                let source_routine_oid =
-                    routine_oid(&self.routine(usize::from(definition.function)));
-                definition.function = self
-                    .routine_slot_by_oid(source_routine_oid, txid)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "template trigger routine was not cloned"
-                        )
-                    })? as u16;
+                if let TriggerFunction::Routine(source) = definition.function {
+                    let source_routine_oid = routine_oid(&self.routine(usize::from(source)));
+                    definition.function = TriggerFunction::routine_slot(
+                        self.routine_slot_by_oid(source_routine_oid, txid)
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "template trigger routine was not cloned"
+                                )
+                            })?,
+                    )?;
+                }
                 let mut trigger_catalog = self
                     .trigger_catalog
                     .lock()
@@ -28593,6 +28709,34 @@ impl Storage {
                     }
                 },
             )
+    }
+
+    /// Whether the current role holds `required` on the parameter `name`:
+    /// as superuser, by grant, or with no role at all (internal work such as
+    /// logical replication apply).
+    pub(crate) fn current_role_has_parameter_privilege(
+        &self,
+        name: &str,
+        required: crate::sql::ast::ParameterPrivileges,
+        txid: u32,
+    ) -> bool {
+        self.current_role_slot(txid)
+            .is_none_or(|role| self.role_has_parameter_privilege(role, name, required, txid))
+    }
+
+    /// Whether `role` holds `required` on the parameter `name`, as superuser
+    /// or by grant.
+    pub(crate) fn role_has_parameter_privilege(
+        &self,
+        role: usize,
+        name: &str,
+        required: crate::sql::ast::ParameterPrivileges,
+        txid: u32,
+    ) -> bool {
+        self.role(role).attributes_to(txid).superuser
+            || crate::sql::ast::ParameterName::parse(name).is_some_and(|parameter| {
+                self.has_parameter_privilege(parameter, role, required, txid)
+            })
     }
 
     pub(crate) fn has_parameter_privilege(
@@ -47836,12 +47980,7 @@ impl Storage {
             name: spec.name,
             target: spec.target,
             kind: spec.kind,
-            function: u16::try_from(spec.function).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "routine slot exceeds trigger capacity"
-                )
-            })?,
+            function: spec.function,
             timing: spec.timing,
             level: spec.level,
             events: spec.events,
@@ -47990,12 +48129,7 @@ impl Storage {
                 spec.name.as_str()
             ));
         }
-        let function = u16::try_from(spec.function).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "routine slot exceeds trigger capacity"
-            )
-        })?;
+        let function = spec.function;
         let prior = trigger.pending_definition;
         catalog.definitions[slot].pending_definition = Some(PendingTriggerDefinition {
             txid,
@@ -48160,12 +48294,7 @@ impl Storage {
             name: spec.name,
             target: spec.target,
             kind: spec.kind,
-            function: u16::try_from(spec.function).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "routine slot exceeds trigger capacity"
-                )
-            })?,
+            function: spec.function,
             timing: spec.timing,
             level: spec.level,
             events: spec.events,

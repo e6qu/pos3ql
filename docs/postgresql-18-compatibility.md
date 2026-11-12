@@ -199,6 +199,21 @@ Syntax and errors:
   function exit, and a non-row value fails at the `RETURN`. A whole-row
   reference such as `NEW` or `t` keeps each column's declared domain, enum or
   composite type.
+- A superuser-only parameter such as `session_replication_role` or
+  `track_functions` needs the privilege to set it (superuser, or `GRANT SET
+  ON PARAMETER`) everywhere PostgreSQL checks: `SET`, `RESET`, `set_config`,
+  connection options, a routine's `SET` clause at `CREATE` and `ALTER` and
+  again at every call (the owner's privilege under `SECURITY DEFINER`, the
+  caller's otherwise), and `ALTER ROLE ... SET` / `ALTER DATABASE ... SET`.
+  Each fails with `42501` (`permission denied to set parameter "..."`), as
+  does `ALTER SYSTEM` without `ALTER SYSTEM` on the parameter. A revoked
+  grant stops calls of a function whose `SET` clause needed it.
+- The built-in `suppress_redundant_updates_trigger()` skips an `UPDATE`
+  whose new row is stored identically to the old one, as in PostgreSQL:
+  `CREATE TRIGGER z BEFORE UPDATE ON t FOR EACH ROW EXECUTE FUNCTION
+  suppress_redundant_updates_trigger()` makes `UPDATE t SET a = a` report
+  `UPDATE 0`. Values compare as stored, so `1.5` and `1.50` differ. Any other
+  event, timing or level fails with `39P01` when it fires.
 - `session_replication_role` (superusers, or roles granted `SET` on it)
   chooses which triggers and rules fire, as in PostgreSQL: `replica` fires
   those enabled `REPLICA` or `ALWAYS`; `origin` (the default) and `local`

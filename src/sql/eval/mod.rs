@@ -455,6 +455,7 @@ pub mod sqlstate {
     pub const CANT_CHANGE_RUNTIME_PARAM: &str = "55P02";
     pub const CARDINALITY_VIOLATION: &str = "21000";
     pub const TRIGGERED_DATA_CHANGE_VIOLATION: &str = "27000";
+    pub const TRIGGER_PROTOCOL_VIOLATED: &str = "39P01";
     pub const CHECK_VIOLATION: &str = "23514";
     pub const EXCLUSION_VIOLATION: &str = "23P01";
     pub const DUPLICATE_PREPARED_STATEMENT: &str = "42P05";
@@ -2559,9 +2560,8 @@ pub trait CatalogAccess {
         Ok(None)
     }
 
-    /// Whether the current role may set the superuser-only `parameter`: a
-    /// superuser, or a role granted SET on it.
-    fn may_set_parameter(&self, _parameter: &str) -> Result<bool, SqlError> {
+    /// Fails unless the current role may set `parameter` (`set_config`).
+    fn authorize_parameter_set(&self, _parameter: &str) -> Result<(), SqlError> {
         Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
             "parameter privileges require the session catalog"
@@ -10849,6 +10849,15 @@ fn regtype_builtin_name(type_oid: i32) -> Option<&'static str> {
         oid::ANYCOMPATIBLERANGE => "anycompatiblerange",
         oid::ANYCOMPATIBLEMULTIRANGE => "anycompatiblemultirange",
         oid::FDW_HANDLER => "fdw_handler",
+        oid::TRIGGER => "trigger",
+        oid::EVENT_TRIGGER => "event_trigger",
+        oid::ANY => "\"any\"",
+        oid::UNKNOWN => "unknown",
+        2275 => "cstring",
+        2280 => "language_handler",
+        325 => "index_am_handler",
+        269 => "table_am_handler",
+        3310 => "tsm_handler",
         _ => return None,
     })
 }
@@ -10921,6 +10930,15 @@ pub(crate) fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> 
         "anycompatiblerange" => crate::sql::types::oid::ANYCOMPATIBLERANGE,
         "anycompatiblemultirange" => crate::sql::types::oid::ANYCOMPATIBLEMULTIRANGE,
         "fdw_handler" => crate::sql::types::oid::FDW_HANDLER,
+        "trigger" => crate::sql::types::oid::TRIGGER,
+        "event_trigger" => crate::sql::types::oid::EVENT_TRIGGER,
+        "\"any\"" => crate::sql::types::oid::ANY,
+        "unknown" => crate::sql::types::oid::UNKNOWN,
+        "cstring" => 2275,
+        "language_handler" => 2280,
+        "index_am_handler" => 325,
+        "table_am_handler" => 269,
+        "tsm_handler" => 3310,
         _ => return Err(unknown()),
     };
     Ok(Datum::Regtype {

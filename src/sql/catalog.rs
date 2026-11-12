@@ -15059,22 +15059,42 @@ pub fn trigger_def_text<'a>(
     output
         .write_str("EXECUTE FUNCTION ")
         .map_err(|_| super::eval::arena_full())?;
-    let routine = storage.routine_for(usize::from(trigger.function), txid);
+    // PostgreSQL qualifies the function only when its bare name would
+    // select another one.
+    let (schema, name, selected) = match trigger.function {
+        crate::storage::TriggerFunction::Routine(slot) => {
+            let routine = storage.routine_for(usize::from(slot), txid);
+            (
+                routine.schema,
+                routine.name,
+                crate::storage::RoutineCallSelection::Stored(usize::from(slot)),
+            )
+        }
+        crate::storage::TriggerFunction::Builtin(builtin) => (
+            crate::storage::SqlName::parse("pg_catalog").expect("pg_catalog is a valid name"),
+            crate::storage::SqlName::parse(builtin.name())
+                .expect("built-in trigger function names are valid"),
+            crate::storage::RoutineCallSelection::Builtin {
+                oid: builtin.oid(),
+                schema: "pg_catalog",
+            },
+        ),
+    };
     if storage.select_routine_call(
-        routine.name.as_str(),
+        name.as_str(),
         &[],
         &[],
         false,
         txid,
         crate::storage::RoutineCallKind::Trigger,
-    ) != crate::storage::RoutineCallSelection::Stored(usize::from(trigger.function))
+    ) != selected
     {
-        write_identifier(&mut output, routine.schema.as_str());
+        write_identifier(&mut output, schema.as_str());
         output
             .write_char('.')
             .map_err(|_| super::eval::arena_full())?;
     }
-    write_identifier(&mut output, routine.name.as_str());
+    write_identifier(&mut output, name.as_str());
     output
         .write_char('(')
         .map_err(|_| super::eval::arena_full())?;
@@ -23421,14 +23441,17 @@ fn pg_depend<'a>(
             }
             crate::storage::TriggerTarget::View(view) => view_oid(storage, usize::from(view)),
         };
-        push(
-            2620,
-            trigger_oid,
-            PG_PROC_OID,
-            crate::storage::routine_oid(&storage.routine_for(usize::from(trigger.function), txid)),
-            0,
-            "n",
-        )?;
+        // A built-in function is pinned, so PostgreSQL records no dependency.
+        if let crate::storage::TriggerFunction::Routine(function) = trigger.function {
+            push(
+                2620,
+                trigger_oid,
+                PG_PROC_OID,
+                crate::storage::routine_oid(&storage.routine_for(usize::from(function), txid)),
+                0,
+                "n",
+            )?;
+        }
         push(2620, trigger_oid, PG_CLASS_OID, relation_oid, 0, "a")?;
         if let crate::storage::TriggerKind::Constraint {
             referenced_table, ..
@@ -23492,16 +23515,16 @@ fn pg_depend<'a>(
                 txid,
             )?;
             let child_relation_oid = user_table_oid(storage, child);
-            push(
-                2620,
-                clone_oid,
-                PG_PROC_OID,
-                crate::storage::routine_oid(
-                    &storage.routine_for(usize::from(trigger.function), txid),
-                ),
-                0,
-                "n",
-            )?;
+            if let crate::storage::TriggerFunction::Routine(function) = trigger.function {
+                push(
+                    2620,
+                    clone_oid,
+                    PG_PROC_OID,
+                    crate::storage::routine_oid(&storage.routine_for(usize::from(function), txid)),
+                    0,
+                    "n",
+                )?;
+            }
             push(2620, clone_oid, PG_CLASS_OID, child_relation_oid, 0, "a")?;
             if let crate::storage::TriggerKind::Constraint {
                 referenced_table, ..
@@ -27419,7 +27442,7 @@ fn pg_trigger<'a>(
                 view_oid(storage, slot)
             }
         };
-        let function = storage.routine(usize::from(trigger.function));
+        let function_oid = crate::storage::trigger_function_oid(storage, trigger.function, txid);
         let (constraint_oid, constraint_timing, referenced_oid) = match trigger.kind {
             crate::storage::TriggerKind::Ordinary => {
                 (0, crate::storage::ConstraintTiming::NotDeferrable, 0)
@@ -27506,7 +27529,7 @@ fn pg_trigger<'a>(
                 Datum::Int4(relation_oid),
                 Datum::Int4(0),
                 text(trigger.name_to(txid).as_str(), arena)?,
-                Datum::Int4(crate::storage::routine_oid(&function)),
+                Datum::Int4(function_oid),
                 Datum::Int2(trigger_type),
                 Datum::Bpchar(match trigger.enabled_to(txid) {
                     crate::storage::TriggerEnabled::Origin => "O",

@@ -644,6 +644,16 @@ fn run_selected_firing<'run>(
         (decode(event.old)?, decode(event.new)?)
     };
     context.txn.fire_trigger_event(selected.index)?;
+    if let crate::storage::TriggerFunction::Builtin(builtin) = trigger.function {
+        super::fire_builtin_trigger(
+            builtin,
+            &trigger,
+            event.event,
+            old.as_deref(),
+            new.as_deref(),
+        )?;
+        return Ok(None);
+    }
     let mut firing = prepare_trigger_firing(
         &context,
         &trigger,

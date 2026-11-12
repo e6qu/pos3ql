@@ -271,12 +271,7 @@ impl Storage {
                 "invalid prepared trigger definition"
             ));
         }
-        let function = u16::try_from(spec.function).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "routine slot exceeds trigger capacity"
-            )
-        })?;
+        let function = spec.function;
         let mut catalog = self
             .trigger_catalog
             .lock()

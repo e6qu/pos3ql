@@ -247,11 +247,8 @@ pub(super) fn stage_query_record(
         } => {
             let target = trigger_target(storage, *target, table_schema, table, txid)?;
             let function = storage
-                .routine_slot_by_signature(function_schema, function, &[], txid)
-                .ok_or_else(|| invalid("trigger function"))?;
-            if !matches!(storage.routine(function).kind, RoutineKind::Trigger) {
-                return Err(invalid("trigger function result"));
-            }
+                .trigger_function_named(function_schema, function, txid)
+                .map_err(invalid)?;
             let kind = if *constraint {
                 let referenced_table = match (referenced_schema, referenced_table) {
                     (Some(schema), Some(table)) => Some(

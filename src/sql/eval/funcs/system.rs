@@ -1591,20 +1591,16 @@ pub(crate) fn dispatch<'a>(
                     }
                 };
                 if crate::sql::guc::requires_set_privilege(name) {
-                    let catalog = hooks.catalog.ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "set_config of \"{}\" has no session catalog",
-                            name
-                        )
-                    })?;
-                    if !catalog.may_set_parameter(name)? {
-                        return Err(sql_err!(
-                            sqlstate::INSUFFICIENT_PRIVILEGE,
-                            "permission denied to set parameter \"{}\"",
-                            name
-                        ));
-                    }
+                    hooks
+                        .catalog
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "set_config of \"{}\" has no session catalog",
+                                name
+                            )
+                        })?
+                        .authorize_parameter_set(name)?;
                 }
                 let configured = crate::sql::guc::set_active_config(name, value, local)?;
                 Ok(Datum::Text(

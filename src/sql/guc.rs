@@ -1147,6 +1147,70 @@ pub(crate) fn requires_set_privilege(name: &str) -> bool {
         || name.eq_ignore_ascii_case("session_replication_role")
 }
 
+/// Proof that the acting role may store or apply a value for the parameter it
+/// names. Every path that validates a value for later application (routine,
+/// role and database settings, `ALTER SYSTEM`) takes one, so none can skip
+/// PostgreSQL's privilege check.
+#[derive(Clone, Copy)]
+pub(crate) struct SettingAuthorization<'n> {
+    name: &'n str,
+}
+
+impl<'n> SettingAuthorization<'n> {
+    /// PostgreSQL's SET check: any role may set an ordinary parameter; a
+    /// superuser-only one needs a superuser or a role granted `SET` on it.
+    pub(crate) fn set(
+        storage: &crate::storage::Storage,
+        name: &'n str,
+        txid: u32,
+    ) -> Result<Self, SqlError> {
+        if requires_set_privilege(name)
+            && !storage.current_role_has_parameter_privilege(
+                name,
+                crate::sql::ast::ParameterPrivileges::SET,
+                txid,
+            )
+        {
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied to set parameter \"{}\"",
+                name
+            ));
+        }
+        Ok(Self { name })
+    }
+
+    /// `ALTER SYSTEM` on one parameter: a superuser, or a role granted
+    /// `ALTER SYSTEM` on it.
+    pub(crate) fn alter_system(
+        storage: &crate::storage::Storage,
+        name: &'n str,
+        txid: u32,
+    ) -> Result<Self, SqlError> {
+        if !storage.current_role_has_parameter_privilege(
+            name,
+            crate::sql::ast::ParameterPrivileges::ALTER_SYSTEM,
+            txid,
+        ) {
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied to set parameter \"{}\"",
+                name
+            ));
+        }
+        Ok(Self { name })
+    }
+
+    pub(crate) fn name(self) -> &'n str {
+        self.name
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unchecked(name: &'n str) -> Self {
+        Self { name }
+    }
+}
+
 fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: u32) {
     macro_rules! copy {
         ($bit:ident, $field:ident) => {
@@ -1945,7 +2009,7 @@ impl GucState {
         if name.eq_ignore_ascii_case("seed") {
             return self.assign("seed", Some("unavailable"), local);
         }
-        self.capture_setting_value(name)?;
+        self.capture_value(name)?;
         let mut state = self.store.borrow_mut();
         let values = state.current;
         finish_setting_change(&mut state, values, guc_bit(name), local, false)
@@ -2289,7 +2353,16 @@ impl GucState {
         self.store.borrow().current.check_function_bodies
     }
 
-    pub(crate) fn capture_setting_value(&self, name: &str) -> Result<StackStr<256>, SqlError> {
+    /// The current value of an authorized parameter, validated for storing in
+    /// a routine, role or database setting (`SET name FROM CURRENT`).
+    pub(crate) fn capture_setting_value(
+        &self,
+        authorization: SettingAuthorization<'_>,
+    ) -> Result<StackStr<256>, SqlError> {
+        self.capture_value(authorization.name)
+    }
+
+    fn capture_value(&self, name: &str) -> Result<StackStr<256>, SqlError> {
         let value = self.get_owned(name).ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -2297,30 +2370,64 @@ impl GucState {
                 name
             )
         })?;
-        self.validate_setting_value(name, Some(value.as_str()))?;
+        self.check_setting_value(name, Some(value.as_str()))?;
         Ok(value)
     }
 
-    pub(crate) fn validate_system_reset(&self, name: &str) -> Result<(), SqlError> {
-        match read_only_parameter_context(name) {
+    pub(crate) fn validate_system_reset(
+        &self,
+        authorization: SettingAuthorization<'_>,
+    ) -> Result<(), SqlError> {
+        match read_only_parameter_context(authorization.name) {
             Some(ReadOnlyParameterContext::Startup) => Ok(()),
             Some(ReadOnlyParameterContext::Internal) | None => {
-                self.validate_setting_value(name, None)
+                self.validate_setting_value(authorization, None)
             }
         }
     }
 
+    /// Checks a value (or a reset when `None`) for an authorized parameter
+    /// without changing the session.
     pub(crate) fn validate_setting_value(
         &self,
-        name: &str,
+        authorization: SettingAuthorization<'_>,
         value: Option<&str>,
     ) -> Result<(), SqlError> {
+        self.check_setting_value(authorization.name, value)
+    }
+
+    fn check_setting_value(&self, name: &str, value: Option<&str>) -> Result<(), SqlError> {
         let state = self.store.borrow();
         let mut values = state.current;
         change_setting(&mut values, &state.defaults, name, value)
     }
 
+    /// Applies a routine's `SET` clauses for one call. Each needs the current
+    /// role's privilege to set it, as PostgreSQL checks at every call: a
+    /// `SECURITY DEFINER` routine checks its owner, others their caller.
     pub(crate) fn enter_routine_configs(
+        &self,
+        storage: &crate::storage::Storage,
+        txid: u32,
+        configs: &[crate::storage::RoutineConfig],
+    ) -> Result<RoutineConfigScope, SqlError> {
+        for config in configs {
+            SettingAuthorization::set(storage, config.name.as_str(), txid)?;
+        }
+        self.apply_routine_configs(configs)
+    }
+
+    /// Applies routine settings whose privilege the caller does not check:
+    /// unit tests of the setting machinery alone.
+    #[cfg(test)]
+    pub(crate) fn enter_unchecked_routine_configs(
+        &self,
+        configs: &[crate::storage::RoutineConfig],
+    ) -> Result<RoutineConfigScope, SqlError> {
+        self.apply_routine_configs(configs)
+    }
+
+    fn apply_routine_configs(
         &self,
         configs: &[crate::storage::RoutineConfig],
     ) -> Result<RoutineConfigScope, SqlError> {
@@ -2370,6 +2477,8 @@ impl GucState {
 }
 
 pub(crate) fn enter_active_routine_configs(
+    storage: &crate::storage::Storage,
+    txid: u32,
     configs: &[crate::storage::RoutineConfig],
 ) -> Result<RoutineConfigScope, SqlError> {
     ACTIVE_GUC.with(|active| {
@@ -2382,7 +2491,7 @@ pub(crate) fn enter_active_routine_configs(
         }
         // SAFETY: EvalScope owns this dynamic extent and every returned scope
         // is consumed before evaluation returns.
-        unsafe { &*pointer }.enter_routine_configs(configs)
+        unsafe { &*pointer }.enter_routine_configs(storage, txid, configs)
     })
 }
 
@@ -3801,7 +3910,7 @@ mod ownership_tests {
             guc.set_config("application_name", Some("outer"), false)
                 .unwrap();
             {
-                let _scope = guc.enter_routine_configs(&configs).unwrap();
+                let _scope = guc.enter_unchecked_routine_configs(&configs).unwrap();
                 guc.set_config("bytea_output", Some("escape"), true)
                     .unwrap();
                 publish_active_setting(&guc, "bytea_output");
@@ -3887,7 +3996,7 @@ mod ownership_tests {
             guc.set_config("application_name", Some("outer"), false)
                 .unwrap();
             let mut saved = {
-                let scope = guc.enter_routine_configs(&configs).unwrap();
+                let scope = guc.enter_unchecked_routine_configs(&configs).unwrap();
                 guc.set_config("bytea_output", Some("escape"), true)
                     .unwrap();
                 publish_active_setting(&guc, "bytea_output");
@@ -4028,7 +4137,7 @@ mod ownership_tests {
             guc.set_config("application_name", Some("outer"), false)
                 .unwrap();
             {
-                let _scope = guc.enter_routine_configs(&configs).unwrap();
+                let _scope = guc.enter_unchecked_routine_configs(&configs).unwrap();
                 // Equal values are still explicit SET actions, overriding SAVE.
                 guc.set_config("application_name", Some("outer"), false)
                     .unwrap();
@@ -4044,7 +4153,7 @@ mod ownership_tests {
 
             guc.begin_transaction();
             {
-                let _scope = guc.enter_routine_configs(&configs).unwrap();
+                let _scope = guc.enter_unchecked_routine_configs(&configs).unwrap();
                 guc.savepoint();
                 guc.set_config("application_name", Some("outer"), false)
                     .unwrap();
@@ -4061,7 +4170,7 @@ mod ownership_tests {
             guc.set_session_authorization(authorization, false);
             guc.set_role(local_role, true);
             {
-                let _scope = guc.enter_routine_configs(&configs).unwrap();
+                let _scope = guc.enter_unchecked_routine_configs(&configs).unwrap();
                 guc.reset_all().unwrap();
             }
             assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "");
@@ -4076,7 +4185,7 @@ mod ownership_tests {
                 .unwrap();
             guc.restore_statement_settings(mark);
             {
-                let _scope = guc.enter_routine_configs(&configs).unwrap();
+                let _scope = guc.enter_unchecked_routine_configs(&configs).unwrap();
             }
             assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "outer");
             guc.store.borrow_mut().actions.next = u64::MAX;

@@ -6037,7 +6037,9 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 .security_definer
                 .then(|| crate::sql::eval::funcs::system::enter_current_user(owner));
             let _config = (!routine.configs().is_empty())
-                .then(|| crate::sql::guc::enter_active_routine_configs(routine.configs()))
+                .then(|| {
+                    crate::sql::guc::enter_active_routine_configs(storage, txid, routine.configs())
+                })
                 .transpose()?;
             if invocations.is_some()
                 || super::with_active_routine_invocations(|context| context.is_some())

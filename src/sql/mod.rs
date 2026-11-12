@@ -3811,14 +3811,12 @@ impl Engine {
     /// before its session starts: a superuser, or a role granted SET on it.
     pub(crate) fn login_may_set_parameter(&self, role: &RoleLogin, name: &str) -> bool {
         role.superuser
-            || crate::sql::ast::ParameterName::parse(name).is_some_and(|parameter| {
-                self.storage.has_parameter_privilege(
-                    parameter,
-                    usize::from(role.slot),
-                    crate::sql::ast::ParameterPrivileges::SET,
-                    0,
-                )
-            })
+            || self.storage.role_has_parameter_privilege(
+                usize::from(role.slot),
+                name,
+                crate::sql::ast::ParameterPrivileges::SET,
+                0,
+            )
     }
 
     pub(crate) fn database_login(&self, name: &str) -> Option<DatabaseLogin> {
@@ -9627,27 +9625,8 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        if crate::sql::guc::requires_set_privilege(name)
-            && self
-                .storage
-                .current_role_slot(txn.txid)
-                .is_some_and(|role| {
-                    !self.storage.role(role).attributes_to(txn.txid).superuser
-                        && crate::sql::ast::ParameterName::parse(name).is_none_or(|parameter| {
-                            !self.storage.has_parameter_privilege(
-                                parameter,
-                                role,
-                                crate::sql::ast::ParameterPrivileges::SET,
-                                txn.txid,
-                            )
-                        })
-                })
-        {
-            return Ok(Err(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "permission denied to set parameter \"{}\"",
-                name
-            )));
+        if let Err(error) = guc::SettingAuthorization::set(&self.storage, name, txn.txid) {
+            return Ok(Err(error));
         }
         if local && !txn.is_explicit() {
             responder.warning(
@@ -9759,29 +9738,10 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        if name.is_some_and(crate::sql::guc::requires_set_privilege)
-            && self
-                .storage
-                .current_role_slot(txn.txid)
-                .is_some_and(|role| {
-                    !self.storage.role(role).attributes_to(txn.txid).superuser
-                        && name
-                            .and_then(crate::sql::ast::ParameterName::parse)
-                            .is_none_or(|parameter| {
-                                !self.storage.has_parameter_privilege(
-                                    parameter,
-                                    role,
-                                    crate::sql::ast::ParameterPrivileges::SET,
-                                    txn.txid,
-                                )
-                            })
-                })
+        if let Some(name) = name
+            && let Err(error) = guc::SettingAuthorization::set(&self.storage, name, txn.txid)
         {
-            return Ok(Err(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "permission denied to set parameter \"{}\"",
-                name.unwrap_or("")
-            )));
+            return Ok(Err(error));
         }
         if let Some(name) = name
             && guc.transaction_reset_owned(name).is_some()
@@ -17327,7 +17287,11 @@ impl Engine {
         let check_body = guc.check_function_bodies();
         let result = (|| {
             let _config = if declaration.body_kind == crate::storage::RoutineBodyKind::String {
-                match guc.enter_routine_configs(&declaration.configs[..declaration.config_count]) {
+                match guc.enter_routine_configs(
+                    &self.storage,
+                    txn.txid,
+                    &declaration.configs[..declaration.config_count],
+                ) {
                     Ok(scope) => Some(scope),
                     Err(error) => return Ok(Err(error)),
                 }
@@ -18208,7 +18172,7 @@ impl Engine {
             .attributes
             .security_definer
             .then(|| eval::funcs::system::enter_current_user(owner));
-        let config = match guc.enter_routine_configs(routine.configs()) {
+        let config = match guc.enter_routine_configs(&self.storage, txn.txid, routine.configs()) {
             Ok(scope) => scope,
             Err(error) => return Ok(Err(error)),
         };
@@ -18770,7 +18734,7 @@ impl Engine {
             let config = if resuming {
                 None
             } else {
-                match guc.enter_routine_configs(routine.configs()) {
+                match guc.enter_routine_configs(&self.storage, txn.txid, routine.configs()) {
                     Ok(scope) => Some(scope),
                     Err(error) => return Ok(Err(error)),
                 }
@@ -19307,7 +19271,9 @@ impl Engine {
                 .security_definer
                 .then(|| eval::funcs::system::enter_current_user(owner));
             let _configuration = (!routine.configs().is_empty())
-                .then(|| guc::enter_active_routine_configs(routine.configs()))
+                .then(|| {
+                    guc::enter_active_routine_configs(&self.storage, txn.txid, routine.configs())
+                })
                 .transpose()?;
             exec::execute_event_trigger(
                 self,
@@ -27515,25 +27481,17 @@ fn apply_wal_op(
                     ));
                 }
             };
-            let Some(function_slot) =
-                storage.routine_slot_by_signature(function_schema, function, &[], 0)
-            else {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    "journal trigger references unknown function \"{}.{}\"",
-                    function_schema,
-                    function
-                ));
-            };
-            if !matches!(
-                storage.routine(function_slot).kind,
-                crate::storage::RoutineKind::Trigger
-            ) {
-                return Err(sql_err!(
-                    sqlstate::INVALID_OBJECT_DEFINITION,
-                    "journal trigger function has invalid return type"
-                ));
-            }
+            let function_slot = storage
+                .trigger_function_named(function_schema, function, 0)
+                .map_err(|defect| {
+                    sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "journal trigger references \"{}.{}\": {}",
+                        function_schema,
+                        function,
+                        defect
+                    )
+                })?;
             let kind = if constraint {
                 let referenced_table = match (referenced_schema, referenced_table) {
                     (Some(schema), Some(table)) => {

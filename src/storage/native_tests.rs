@@ -6475,7 +6475,7 @@ fn trigger_catalog_is_synchronized_and_startup_bounded() {
         name: SqlName::parse("trigger_full").unwrap(),
         target: TriggerTarget::Table(0),
         kind: TriggerKind::Ordinary,
-        function: 0,
+        function: TriggerFunction::Routine(0),
         timing: crate::sql::ast::TriggerTiming::Before,
         level: crate::sql::ast::TriggerLevel::Row,
         events: crate::sql::ast::TriggerEvents::from_bits(1).unwrap(),

@@ -4250,6 +4250,68 @@ fn row_trigger_when_passes<'a>(
     }
 }
 
+/// Runs one firing of a PostgreSQL built-in trigger function. `old` and
+/// `new` are a row firing's row images; the result says whether the row
+/// proceeds.
+fn fire_builtin_trigger(
+    builtin: crate::storage::BuiltinTriggerFunction,
+    trigger: &crate::storage::TriggerDef,
+    event: u8,
+    old: Option<&[Datum<'_>]>,
+    new: Option<&[Datum<'_>]>,
+) -> Result<bool, SqlError> {
+    match builtin {
+        crate::storage::BuiltinTriggerFunction::SuppressRedundantUpdates => {
+            // PostgreSQL's trigfuncs.c checks in this order.
+            let violation = |message| {
+                sql_err!(
+                    sqlstate::TRIGGER_PROTOCOL_VIOLATED,
+                    "suppress_redundant_updates_trigger: must be called {}",
+                    message
+                )
+            };
+            if event != TriggerEvents::UPDATE {
+                return Err(violation("on update"));
+            }
+            if trigger.timing != crate::sql::ast::TriggerTiming::Before {
+                return Err(violation("before update"));
+            }
+            if trigger.level != crate::sql::ast::TriggerLevel::Row {
+                return Err(violation("for each row"));
+            }
+            let (Some(old), Some(new)) = (old, new) else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "row UPDATE trigger firing has no old or new row"
+                ));
+            };
+            Ok(old.len() != new.len()
+                || old
+                    .iter()
+                    .zip(new)
+                    .any(|(old, new)| !same_stored_value(old, new)))
+        }
+    }
+}
+
+/// Whether two column values are stored identically, as PostgreSQL's
+/// `suppress_redundant_updates_trigger` compares tuple bytes: `1.5` and
+/// `1.50` differ, and so do `0` and `-0` as floats.
+fn same_stored_value(left: &Datum<'_>, right: &Datum<'_>) -> bool {
+    match (left, right) {
+        (Datum::Float4(left), Datum::Float4(right)) => left.to_bits() == right.to_bits(),
+        (Datum::Float8(left), Datum::Float8(right)) => left.to_bits() == right.to_bits(),
+        // Numeric equality compares values; storage keeps the display scale.
+        (Datum::Numeric(left), Datum::Numeric(right)) => {
+            left.sign == right.sign
+                && left.weight == right.weight
+                && left.dscale == right.dscale
+                && left.digits == right.digits
+        }
+        _ => left == right,
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "a trigger firing carries its complete typed transition context"
@@ -4266,6 +4328,9 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
     new: &mut Option<&mut [Datum<'a>]>,
     transition_rows: Option<TransitionRows<'a>>,
 ) -> Result<bool, SqlError> {
+    if let crate::storage::TriggerFunction::Builtin(builtin) = trigger.function {
+        return fire_builtin_trigger(builtin, trigger, event, old, new.as_deref());
+    }
     // A BEFORE or INSTEAD OF row trigger can move to the engine; an AFTER
     // row trigger fired here belongs to a write without completion handoff.
     let movable = (before && transition_rows.is_none()).then_some(engine_triggers::MovableFiring {
@@ -4351,9 +4416,15 @@ fn prepare_trigger_firing<'values, 'schema, 'rows>(
     new: Option<&'rows mut [Datum<'values>]>,
     transition_rows: Option<TransitionRows<'values>>,
 ) -> Result<trigger_firing::TriggerFiring<'values, 'schema, 'rows>, SqlError> {
+    let crate::storage::TriggerFunction::Routine(function) = trigger.function else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "built-in trigger function reached the routine firing path"
+        ));
+    };
     let routine = context
         .storage()
-        .routine_for(usize::from(trigger.function), context.txn.txid);
+        .routine_for(usize::from(function), context.txn.txid);
     let owner = crate::storage::SessionIdentity::bound(context.storage().capture_role_slot(
         routine.ownership.owner_to(context.txn.txid).into(),
         context.txn.txid,
@@ -4363,7 +4434,13 @@ fn prepare_trigger_firing<'values, 'schema, 'rows>(
         .security_definer
         .then(|| super::eval::funcs::system::enter_current_user(owner));
     let config = (!routine.configs().is_empty())
-        .then(|| super::guc::enter_active_routine_configs(routine.configs()))
+        .then(|| {
+            super::guc::enter_active_routine_configs(
+                context.storage(),
+                context.txn.txid,
+                routine.configs(),
+            )
+        })
         .transpose()?;
     let (program, code) = compile_plpgsql_execution(
         routine.body.as_str(),
@@ -9064,7 +9141,9 @@ pub fn alter_role_setting(
             };
             let value = match value {
                 crate::sql::ast::RoutineConfigValue::Current => {
-                    match guc.capture_setting_value(name.as_str()) {
+                    match super::guc::SettingAuthorization::set(storage, name.as_str(), txn.txid)
+                        .and_then(|authorization| guc.capture_setting_value(authorization))
+                    {
                         Ok(value) => Some(value),
                         Err(error) => return sql_fail(error),
                     }
@@ -9074,14 +9153,21 @@ pub fn alter_role_setting(
                     if storage
                         .role_settings()
                         .any(|(_, setting)| setting.visible_to(txn.txid) && setting.scope == scope)
-                        && let Err(error) = guc.validate_setting_value(name.as_str(), None)
+                        && let Err(error) =
+                            super::guc::SettingAuthorization::set(storage, name.as_str(), txn.txid)
+                                .and_then(|authorization| {
+                                    guc.validate_setting_value(authorization, None)
+                                })
                     {
                         return sql_fail(error);
                     }
                     None
                 }
                 crate::sql::ast::RoutineConfigValue::Value(value) => {
-                    match guc.validate_setting_value(name.as_str(), Some(value)) {
+                    match super::guc::SettingAuthorization::set(storage, name.as_str(), txn.txid)
+                        .and_then(|authorization| {
+                            guc.validate_setting_value(authorization, Some(value))
+                        }) {
                         Ok(()) => Some(crate::util::StackStr::from_str(value)),
                         Err(error) => return sql_fail(error),
                     }
@@ -9104,7 +9190,8 @@ pub fn alter_role_setting(
                 && storage
                     .role_settings()
                     .any(|(_, setting)| setting.visible_to(txn.txid) && setting.scope == scope)
-                && let Err(error) = guc.validate_setting_value(name, None)
+                && let Err(error) = super::guc::SettingAuthorization::set(storage, name, txn.txid)
+                    .and_then(|authorization| guc.validate_setting_value(authorization, None))
             {
                 return sql_fail(error);
             }
@@ -9235,31 +9322,26 @@ pub fn alter_system(
     let current = storage
         .current_role_slot(txn.txid)
         .expect("current role exists");
-    let superuser = storage.role(current).attributes_to(txn.txid).superuser;
-    if !superuser
-        && name
-            .and_then(crate::sql::ast::ParameterName::parse)
-            .is_none_or(|parameter| {
-                !storage.has_parameter_privilege(
-                    parameter,
-                    current,
-                    crate::sql::ast::ParameterPrivileges::ALTER_SYSTEM,
-                    txn.txid,
-                )
-            })
-    {
+    if name.is_none() && !storage.role(current).attributes_to(txn.txid).superuser {
         return sql_fail(sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
-            "permission denied to alter system configuration"
+            "permission denied to perform ALTER SYSTEM RESET ALL"
         ));
     }
-    match (name, raw) {
-        (Some(name), Some(raw)) => {
-            let name = match super::guc::canonical_setting_name(name) {
+    let authorization = match name
+        .map(|name| super::guc::SettingAuthorization::alter_system(storage, name, txn.txid))
+        .transpose()
+    {
+        Ok(authorization) => authorization,
+        Err(error) => return sql_fail(error),
+    };
+    match (authorization, raw) {
+        (Some(authorization), Some(raw)) => {
+            let name = match super::guc::canonical_setting_name(authorization.name()) {
                 Ok(name) => name,
                 Err(error) => return sql_fail(error),
             };
-            let value = match guc.validate_setting_value(name.as_str(), Some(raw)) {
+            let value = match guc.validate_setting_value(authorization, Some(raw)) {
                 Ok(()) => crate::util::StackStr::from_str(raw),
                 Err(error) => return sql_fail(error),
             };
@@ -9273,11 +9355,11 @@ pub fn alter_system(
                 return sql_fail(error);
             }
         }
-        (Some(name), None) => {
-            if let Err(error) = guc.validate_system_reset(name) {
+        (Some(authorization), None) => {
+            if let Err(error) = guc.validate_system_reset(authorization) {
                 return sql_fail(error);
             }
-            let name = match super::guc::canonical_setting_name(name) {
+            let name = match super::guc::canonical_setting_name(authorization.name()) {
                 Ok(name) => name,
                 Err(error) => return sql_fail(error),
             };
@@ -15007,7 +15089,7 @@ pub(crate) fn drop_schema(
                 matches!(
                     object,
                     SchemaObject::Routine(routine)
-                        if *routine == usize::from(trigger.function)
+                        if trigger.function.routine() == Some(*routine)
                 )
             })
         })
@@ -19328,7 +19410,9 @@ fn execute_atomic_procedure_call<'a>(
         .security_definer
         .then(|| super::eval::funcs::system::enter_current_user(owner));
     let _config = (!routine.configs().is_empty())
-        .then(|| super::guc::enter_active_routine_configs(routine.configs()))
+        .then(|| {
+            super::guc::enter_active_routine_configs(context.storage(), txid, routine.configs())
+        })
         .transpose()?;
     let track = match super::guc::active_track_functions() {
         super::guc::TrackFunctions::None => false,
@@ -34095,6 +34179,9 @@ fn execute_queued_firing<'a>(
     }
     // Its WHEN condition passed when it was queued.
     context.txn.fire_trigger_event(firing.index)?;
+    if let crate::storage::TriggerFunction::Builtin(builtin) = trigger.function {
+        return fire_builtin_trigger(builtin, &trigger, firing.event, None, None).map(|_| ());
+    }
     let definition = (*context
         .storage()
         .table_def(usize::from(firing.table), context.txn.txid))
@@ -34604,6 +34691,9 @@ fn execute_statement_trigger<'a>(
     before: bool,
     rows: Option<TransitionRows<'a>>,
 ) -> Result<(), SqlError> {
+    if let crate::storage::TriggerFunction::Builtin(builtin) = trigger.function {
+        return fire_builtin_trigger(builtin, trigger, event, None, None).map(|_| ());
+    }
     // A BEFORE statement trigger can move to the engine; an AFTER one fired
     // here belongs to a write without completion handoff.
     let movable =
@@ -35137,7 +35227,30 @@ pub fn create_trigger(
         txn.txid,
         crate::storage::RoutineCallKind::Trigger,
     ) {
-        crate::storage::RoutineCallSelection::Stored(slot) => slot,
+        crate::storage::RoutineCallSelection::Stored(slot) => {
+            if !matches!(
+                storage.routine_for(slot, txn.txid).kind,
+                crate::storage::RoutineKind::Trigger
+            ) {
+                return sql_fail(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "function \"{}\" must return type trigger",
+                    trigger.function.name
+                ));
+            }
+            if let Err(error) = storage.require_routine_execute(slot, txn.txid) {
+                return sql_fail(error);
+            }
+            match crate::storage::TriggerFunction::routine_slot(slot) {
+                Ok(function) => function,
+                Err(error) => return sql_fail(error),
+            }
+        }
+        crate::storage::RoutineCallSelection::Builtin { oid, .. }
+            if let Some(builtin) = crate::storage::BuiltinTriggerFunction::from_oid(oid) =>
+        {
+            crate::storage::TriggerFunction::Builtin(builtin)
+        }
         crate::storage::RoutineCallSelection::Builtin { oid, .. } => {
             let declaration = super::catalog::builtin_callable_by_oid(oid)
                 .expect("selected builtin has a callable declaration");
@@ -35177,19 +35290,6 @@ pub fn create_trigger(
             ));
         }
     };
-    if !matches!(
-        storage.routine_for(function, txn.txid).kind,
-        crate::storage::RoutineKind::Trigger
-    ) {
-        return sql_fail(sql_err!(
-            sqlstate::WRONG_OBJECT_TYPE,
-            "function \"{}\" must return type trigger",
-            trigger.function.name
-        ));
-    }
-    if let Err(error) = storage.require_routine_execute(function, txn.txid) {
-        return sql_fail(error);
-    }
     let events = trigger.events.iter().fold(0u8, |mask, event| {
         mask | match event {
             TriggerEvent::Insert => 1,
@@ -35295,8 +35395,7 @@ pub fn create_trigger(
             }
         }
     };
-    let function_schema = storage.routine(function).schema_for(txn.txid);
-    let function_name = storage.routine(function).name_for(txn.txid);
+    let (function_schema, function_name) = storage.trigger_function_name(function, txn.txid);
     let spec = crate::storage::TriggerSpec {
         name,
         target,
@@ -40954,19 +41053,18 @@ pub(crate) fn resolve_routine_declaration(
     let mut config_count = 0;
     for config in routine.configs.iter() {
         let name = super::guc::canonical_setting_name(config.name)?;
+        let authorization = super::guc::SettingAuthorization::set(storage, config.name, txn.txid)?;
         let value = match config.value {
             super::ast::RoutineConfigValue::Default => {
-                guc.validate_setting_value(config.name, None)?;
+                guc.validate_setting_value(authorization, None)?;
                 continue;
             }
             super::ast::RoutineConfigValue::Value(value) => {
-                match guc.validate_setting_value(config.name, Some(value)) {
-                    Ok(()) => StackStr::from_str(value),
-                    Err(error) => return Err(error),
-                }
+                guc.validate_setting_value(authorization, Some(value))?;
+                StackStr::from_str(value)
             }
             super::ast::RoutineConfigValue::Current => {
-                StackStr::from_str(guc.capture_setting_value(config.name)?.as_str())
+                StackStr::from_str(guc.capture_setting_value(authorization)?.as_str())
             }
         };
         if value.is_truncated() {
@@ -43741,8 +43839,13 @@ pub fn alter_routine(
                         Ok(name) => name,
                         Err(error) => return sql_fail(error),
                     };
+                    let authorization =
+                        match super::guc::SettingAuthorization::set(storage, name, txn.txid) {
+                            Ok(authorization) => authorization,
+                            Err(error) => return sql_fail(error),
+                        };
                     if value == super::ast::RoutineConfigValue::Default {
-                        if let Err(error) = guc.validate_setting_value(name, None) {
+                        if let Err(error) = guc.validate_setting_value(authorization, None) {
                             return sql_fail(error);
                         }
                         if let Some(index) = configs[..config_count]
@@ -43760,13 +43863,13 @@ pub fn alter_routine(
                             unreachable!("default removes the setting above")
                         }
                         super::ast::RoutineConfigValue::Value(value) => {
-                            match guc.validate_setting_value(name, Some(value)) {
+                            match guc.validate_setting_value(authorization, Some(value)) {
                                 Ok(()) => StackStr::from_str(value),
                                 Err(error) => return sql_fail(error),
                             }
                         }
                         super::ast::RoutineConfigValue::Current => {
-                            match guc.capture_setting_value(name) {
+                            match guc.capture_setting_value(authorization) {
                                 Ok(value) => StackStr::from_str(value.as_str()),
                                 Err(error) => return sql_fail(error),
                             }
@@ -43807,7 +43910,11 @@ pub fn alter_routine(
                                 "routine configuration state is unavailable"
                             ));
                         };
-                        if let Err(error) = guc.validate_setting_value(name, None) {
+                        if let Err(error) = super::guc::SettingAuthorization::set(
+                            storage, name, txn.txid,
+                        )
+                        .and_then(|authorization| guc.validate_setting_value(authorization, None))
+                        {
                             return sql_fail(error);
                         }
                         if let Some(index) = configs[..config_count]
@@ -44478,7 +44585,7 @@ pub fn drop_routine(
         }
         if storage
             .triggers_with_slots_visible_to(txn.txid)
-            .any(|(_, trigger)| usize::from(trigger.function) == slot)
+            .any(|(_, trigger)| trigger.function.routine() == Some(slot))
             && !cascade
         {
             return sql_fail(sql_err!(
@@ -44490,7 +44597,7 @@ pub fn drop_routine(
         loop {
             let dependency = storage.triggers_with_slots_visible_to(txn.txid).find_map(
                 |(trigger_slot, trigger)| {
-                    (usize::from(trigger.function) == slot).then_some((trigger_slot, trigger))
+                    (trigger.function.routine() == Some(slot)).then_some((trigger_slot, trigger))
                 },
             );
             let Some((trigger_slot, trigger)) = dependency else {
@@ -50518,7 +50625,11 @@ fn drop_type_dependent_routines(
             storage
                 .triggers_with_slots_visible_to(txn.txid)
                 .find_map(|(slot, trigger)| {
-                    selected[usize::from(trigger.function)].then_some((slot, trigger))
+                    trigger
+                        .function
+                        .routine()
+                        .is_some_and(|routine| selected[routine])
+                        .then_some((slot, trigger))
                 });
         let Some((slot, trigger)) = dependency else {
             break;
@@ -54227,7 +54338,11 @@ fn drop_selected_stored_queries(
             storage
                 .triggers_with_slots_visible_to(txn.txid)
                 .find_map(|(slot, trigger)| {
-                    routines[usize::from(trigger.function)].then_some((slot, trigger))
+                    trigger
+                        .function
+                        .routine()
+                        .is_some_and(|routine| routines[routine])
+                        .then_some((slot, trigger))
                 });
         let Some((slot, trigger)) = dependency else {
             break;
@@ -60159,33 +60274,40 @@ pub fn alter_database(
                 Ok(name) => name,
                 Err(error) => return sql_fail(error),
             };
-            let value = match value {
-                crate::sql::ast::RoutineConfigValue::Current => {
-                    match guc.capture_setting_value(name.as_str()) {
-                        Ok(value) => Some(value),
-                        Err(error) => return sql_fail(error),
+            let authorize =
+                || super::guc::SettingAuthorization::set(storage, name.as_str(), txn.txid);
+            let value =
+                match value {
+                    crate::sql::ast::RoutineConfigValue::Current => {
+                        match authorize()
+                            .and_then(|authorization| guc.capture_setting_value(authorization))
+                        {
+                            Ok(value) => Some(value),
+                            Err(error) => return sql_fail(error),
+                        }
                     }
-                }
-                crate::sql::ast::RoutineConfigValue::Default => {
-                    let scope = crate::storage::RoleSettingScope::AllRolesInDatabase(
-                        storage.database(slot).oid,
-                    );
-                    if storage
-                        .role_settings()
-                        .any(|(_, setting)| setting.visible_to(txn.txid) && setting.scope == scope)
-                        && let Err(error) = guc.validate_setting_value(name.as_str(), None)
-                    {
-                        return sql_fail(error);
+                    crate::sql::ast::RoutineConfigValue::Default => {
+                        let scope = crate::storage::RoleSettingScope::AllRolesInDatabase(
+                            storage.database(slot).oid,
+                        );
+                        if storage.role_settings().any(|(_, setting)| {
+                            setting.visible_to(txn.txid) && setting.scope == scope
+                        }) && let Err(error) = authorize().and_then(|authorization| {
+                            guc.validate_setting_value(authorization, None)
+                        }) {
+                            return sql_fail(error);
+                        }
+                        None
                     }
-                    None
-                }
-                crate::sql::ast::RoutineConfigValue::Value(raw) => {
-                    match guc.validate_setting_value(name.as_str(), Some(raw)) {
-                        Ok(()) => Some(crate::util::StackStr::from_str(raw)),
-                        Err(error) => return sql_fail(error),
+                    crate::sql::ast::RoutineConfigValue::Value(raw) => {
+                        match authorize().and_then(|authorization| {
+                            guc.validate_setting_value(authorization, Some(raw))
+                        }) {
+                            Ok(()) => Some(crate::util::StackStr::from_str(raw)),
+                            Err(error) => return sql_fail(error),
+                        }
                     }
-                }
-            };
+                };
             if value
                 .as_ref()
                 .is_some_and(crate::util::StackStr::is_truncated)
@@ -60215,7 +60337,10 @@ pub fn alter_database(
                 if storage
                     .role_settings()
                     .any(|(_, setting)| setting.visible_to(txn.txid) && setting.scope == scope)
-                    && let Err(error) = guc.validate_setting_value(name, None)
+                    && let Err(error) = super::guc::SettingAuthorization::set(
+                        storage, name, txn.txid,
+                    )
+                    .and_then(|authorization| guc.validate_setting_value(authorization, None))
                 {
                     return sql_fail(error);
                 }

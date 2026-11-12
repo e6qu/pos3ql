@@ -3718,7 +3718,9 @@ impl StorageCatalog<'_, '_, '_, '_> {
             .security_definer
             .then(|| super::eval::funcs::system::enter_current_user(owner));
         let _config = (!routine.configs().is_empty())
-            .then(|| super::guc::enter_active_routine_configs(routine.configs()))
+            .then(|| {
+                super::guc::enter_active_routine_configs(self.storage, self.txid, routine.configs())
+            })
             .transpose()?;
         let result_contract = match routine.kind {
             crate::storage::RoutineKind::Function { result }
@@ -6487,21 +6489,8 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         )
     }
 
-    fn may_set_parameter(&self, parameter: &str) -> Result<bool, SqlError> {
-        Ok(self
-            .storage
-            .current_role_slot(self.txid)
-            .is_none_or(|role| {
-                self.storage.role(role).attributes_to(self.txid).superuser
-                    || crate::sql::ast::ParameterName::parse(parameter).is_some_and(|parameter| {
-                        self.storage.has_parameter_privilege(
-                            parameter,
-                            role,
-                            crate::sql::ast::ParameterPrivileges::SET,
-                            self.txid,
-                        )
-                    })
-            }))
+    fn authorize_parameter_set(&self, parameter: &str) -> Result<(), SqlError> {
+        crate::sql::guc::SettingAuthorization::set(self.storage, parameter, self.txid).map(|_| ())
     }
 
     fn has_parameter_privilege(

@@ -1525,7 +1525,7 @@ impl<'a> RetainedSelect<'a> {
         }
         let columns = CatalogScopeCols {
             scope: &scope,
-            outer_scope: None,
+            outer: None,
             storage,
             txid,
             arena,
@@ -1749,7 +1749,7 @@ impl<'a> RetainedSelect<'a> {
         };
         let columns = CatalogScopeCols {
             scope: &scope,
-            outer_scope: None,
+            outer: None,
             storage,
             txid,
             arena,
@@ -2024,7 +2024,7 @@ impl<'a> RetainedSelect<'a> {
             statement,
             &CatalogScopeCols {
                 scope: &scope,
-                outer_scope: None,
+                outer: None,
                 storage,
                 txid,
                 arena,

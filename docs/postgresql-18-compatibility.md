@@ -207,6 +207,14 @@ Syntax and errors:
   interleave with the rest of the expression as in PostgreSQL; an untaken
   `CASE` arm never runs it. Such an `IN`, `ANY` or `ALL` list is held in
   statement memory rather than spilled.
+- A subquery or derived table reads the columns of every query that encloses
+  it, however deeply nested: in `SELECT (SELECT (SELECT a.x + b.y FROM c)
+  FROM b) FROM a` the innermost query reads both `a` and `b`. A derived table
+  in FROM reads the FROM items before it only when marked `LATERAL`; `SELECT
+  * FROM a, (SELECT * FROM b WHERE b.y = a.x) s` fails with PostgreSQL's
+  `invalid reference to FROM-clause entry for table "a"` and its hint to mark
+  the subquery `LATERAL`. `UPDATE ... FROM` and `DELETE ... USING` items
+  cannot read the target table, even when `LATERAL`.
 - A materialized `WITH` query runs when its rows are first read, as
   PostgreSQL's CTE scan runs it; one that nothing reads never runs.
 - `UPDATE` and `INSERT` assign through composite fields and array elements:

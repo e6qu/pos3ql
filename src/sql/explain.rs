@@ -892,7 +892,7 @@ pub(super) fn plan_select<'a>(
     let (width, output) = projected_shape(statement, scope.as_ref(), storage, txid, arena)?;
     let scoped_columns = scope.as_ref().map(|scope| query::CatalogScopeCols {
         scope,
-        outer_scope: None,
+        outer: None,
         storage,
         txid,
         arena,

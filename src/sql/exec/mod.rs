@@ -18103,6 +18103,7 @@ impl TriggerProgram<'_> {
 
 #[derive(Clone, Copy)]
 struct ParsedTriggerProgram<'a> {
+    kind: PlpgsqlProgramKind,
     /// The outermost block's label, which also labels its declarations.
     label: Option<SqlName>,
     locals: &'a [ParsedTriggerLocalDecl<'a>],
@@ -21857,6 +21858,7 @@ fn parse_plpgsql_program_inner<'a>(
         None => body,
     };
     Ok(ParsedTriggerProgram {
+        kind: program_kind,
         label,
         locals,
         body,
@@ -21877,6 +21879,7 @@ fn resolve_plpgsql_program_locals<'a>(
     arena: &'a Arena,
     has_parameter: &dyn Fn(SqlName) -> bool,
 ) -> Result<TriggerProgram<'a>, SqlError> {
+    let parsed_kind = program.kind;
     let resolved = arena
         .alloc_slice_with(program.locals.len(), |_| TriggerLocalDecl {
             label: None,
@@ -21909,7 +21912,12 @@ fn resolve_plpgsql_program_locals<'a>(
         variable_conflict: program.variable_conflict,
         print_strict_params: program.print_strict_params,
     };
-    validate_plpgsql_constant_assignments(&program, has_parameter, arena)?;
+    validate_plpgsql_constant_assignments(
+        &program,
+        parsed_kind == PlpgsqlProgramKind::Trigger,
+        has_parameter,
+        arena,
+    )?;
     Ok(program)
 }
 
@@ -22014,6 +22022,7 @@ fn compile_plpgsql_execution<'a>(
 
 fn validate_plpgsql_constant_assignments(
     program: &TriggerProgram<'_>,
+    trigger: bool,
     has_parameter: &dyn Fn(SqlName) -> bool,
     arena: &Arena,
 ) -> Result<(), SqlError> {
@@ -22050,6 +22059,7 @@ fn validate_plpgsql_constant_assignments(
         locals: &[TriggerLocalDecl],
         shadowed: Option<&ScopedLocal<'_>>,
         has_parameter: &dyn Fn(SqlName) -> bool,
+        trigger: bool,
     ) -> Result<(), SqlError> {
         match binding_constant(target, locals, shadowed, has_parameter) {
             Some(true) => Err(sql_err!(
@@ -22070,6 +22080,9 @@ fn validate_plpgsql_constant_assignments(
                     label.as_str()
                 )),
                 Some(false) => Ok(()),
+                // A trigger function assigns a field of its `NEW` or `OLD`
+                // row.
+                None if trigger && matches!(label.as_str(), "new" | "old") => Ok(()),
                 None => Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
                     "\"{}.{}\" is not a known variable",
@@ -22085,12 +22098,13 @@ fn validate_plpgsql_constant_assignments(
         locals: &[TriggerLocalDecl],
         shadowed: Option<&ScopedLocal<'_>>,
         has_parameter: &dyn Fn(SqlName) -> bool,
+        trigger: bool,
         arena: &Arena,
     ) -> Result<(), SqlError> {
         for (statement, source) in current.statements.iter().zip(current.sources) {
             // PostgreSQL positions the error at the target as written.
             let reject = |target: PlpgsqlVariableName, keyword: Option<&str>| {
-                reject(target, locals, shadowed, has_parameter).map_err(|error| {
+                reject(target, locals, shadowed, has_parameter, trigger).map_err(|error| {
                     match plpgsql_target_text(source, keyword, target, arena) {
                         Some(text) => crate::sql::error_position::at_subject(error, text),
                         None => error,
@@ -22150,18 +22164,31 @@ fn validate_plpgsql_constant_assignments(
                             locals,
                             Some(&local),
                             has_parameter,
+                            trigger,
                             arena,
                         )?;
                     } else {
                         reject(statement.target, Some("for"))?;
-                        validate_block(statement.block, locals, shadowed, has_parameter, arena)?;
+                        validate_block(
+                            statement.block,
+                            locals,
+                            shadowed,
+                            has_parameter,
+                            trigger,
+                            arena,
+                        )?;
                     }
                 }
-                TriggerStatement::While(statement) => {
-                    validate_block(statement.block, locals, shadowed, has_parameter, arena)?
-                }
+                TriggerStatement::While(statement) => validate_block(
+                    statement.block,
+                    locals,
+                    shadowed,
+                    has_parameter,
+                    trigger,
+                    arena,
+                )?,
                 TriggerStatement::Loop(block_value) => {
-                    validate_block(block_value, locals, shadowed, has_parameter, arena)?
+                    validate_block(block_value, locals, shadowed, has_parameter, trigger, arena)?
                 }
                 TriggerStatement::Block(statement) => validate_scope(
                     statement.declarations,
@@ -22170,23 +22197,45 @@ fn validate_plpgsql_constant_assignments(
                     locals,
                     shadowed,
                     has_parameter,
+                    trigger,
                     arena,
                 )?,
                 TriggerStatement::If(statement) => {
                     for branch in statement.branches {
-                        validate_block(branch.block, locals, shadowed, has_parameter, arena)?;
+                        validate_block(
+                            branch.block,
+                            locals,
+                            shadowed,
+                            has_parameter,
+                            trigger,
+                            arena,
+                        )?;
                     }
                 }
                 TriggerStatement::Case(statement) => {
                     for branch in statement.branches {
-                        validate_block(branch.block, locals, shadowed, has_parameter, arena)?;
+                        validate_block(
+                            branch.block,
+                            locals,
+                            shadowed,
+                            has_parameter,
+                            trigger,
+                            arena,
+                        )?;
                     }
                     if let TriggerCaseElse::Block(otherwise) = statement.otherwise {
-                        validate_block(otherwise, locals, shadowed, has_parameter, arena)?;
+                        validate_block(otherwise, locals, shadowed, has_parameter, trigger, arena)?;
                     }
                 }
                 TriggerStatement::Exception(statement) => {
-                    validate_block(statement.protected, locals, shadowed, has_parameter, arena)?;
+                    validate_block(
+                        statement.protected,
+                        locals,
+                        shadowed,
+                        has_parameter,
+                        trigger,
+                        arena,
+                    )?;
                     let state = ScopedLocal {
                         label: None,
                         name: SqlName::parse("sqlstate").expect("static diagnostic name"),
@@ -22205,6 +22254,7 @@ fn validate_plpgsql_constant_assignments(
                             locals,
                             Some(&message),
                             has_parameter,
+                            trigger,
                             arena,
                         )?;
                     }
@@ -22230,6 +22280,10 @@ fn validate_plpgsql_constant_assignments(
         Ok(())
     }
     /// Validates `block` with each of a nested block's declarations in scope.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "validation carries the enclosing scope and routine kind"
+    )]
     fn validate_scope(
         declarations: &[ParsedTriggerLocalDecl<'_>],
         label: Option<SqlName>,
@@ -22237,10 +22291,11 @@ fn validate_plpgsql_constant_assignments(
         locals: &[TriggerLocalDecl],
         shadowed: Option<&ScopedLocal<'_>>,
         has_parameter: &dyn Fn(SqlName) -> bool,
+        trigger: bool,
         arena: &Arena,
     ) -> Result<(), SqlError> {
         match declarations.split_first() {
-            None => validate_block(block, locals, shadowed, has_parameter, arena),
+            None => validate_block(block, locals, shadowed, has_parameter, trigger, arena),
             Some((first, rest)) => {
                 let local = ScopedLocal {
                     label,
@@ -22255,12 +22310,20 @@ fn validate_plpgsql_constant_assignments(
                     locals,
                     Some(&local),
                     has_parameter,
+                    trigger,
                     arena,
                 )
             }
         }
     }
-    validate_block(program.body, program.locals, None, has_parameter, arena)
+    validate_block(
+        program.body,
+        program.locals,
+        None,
+        has_parameter,
+        trigger,
+        arena,
+    )
 }
 
 fn resolve_plpgsql_column_type(
@@ -27952,6 +28015,9 @@ fn assign_trigger_local<'a>(
             let Some(record) = target.label.and_then(|label| {
                 trigger_local_index(locals, PlpgsqlVariableName::plain(label)).ok()
             }) else {
+                if target.label.is_some_and(|label| label.as_str() == "new") {
+                    return Err(new_field_target_unsupported(target));
+                }
                 return Err(error);
             };
             return assign_trigger_record_field(
@@ -27984,6 +28050,141 @@ fn assign_trigger_local<'a>(
         context.arena,
         &sequences,
     )?;
+    Ok(())
+}
+
+/// Where a PL/pgSQL `INTO` target stores its value.
+#[derive(Clone, Copy)]
+enum PlpgsqlIntoTarget {
+    Local(usize),
+    /// A column of a trigger's `NEW` row (`SELECT ... INTO NEW.col`).
+    NewColumn(usize),
+}
+
+/// Resolves an `INTO` target: a variable, or a field of a trigger's `NEW`
+/// row when no variable answers to it.
+fn plpgsql_into_target(
+    locals: &[TriggerLocalDecl],
+    definition: crate::storage::RelationDefinition<'_>,
+    target: PlpgsqlVariableName,
+) -> Result<PlpgsqlIntoTarget, SqlError> {
+    match trigger_local_index(locals, target) {
+        Ok(index) => Ok(PlpgsqlIntoTarget::Local(index)),
+        Err(error) => match target.label {
+            Some(label)
+                if label.as_str() == "new"
+                    && definition.n_columns > 0
+                    && trigger_local_index(locals, PlpgsqlVariableName::plain(label)).is_err() =>
+            {
+                definition
+                    .column_index(target.name.as_str())
+                    .map(PlpgsqlIntoTarget::NewColumn)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "record \"new\" has no field \"{}\"",
+                            target.name.as_str()
+                        )
+                    })
+            }
+            Some(label)
+                if label.as_str() == "old"
+                    && definition.n_columns > 0
+                    && trigger_local_index(locals, PlpgsqlVariableName::plain(label)).is_err() =>
+            {
+                Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "assigning a field of OLD is not supported"
+                ))
+            }
+            _ => Err(error),
+        },
+    }
+}
+
+/// `INTO NEW.col` outside a static `SELECT ... INTO` is not implemented.
+fn new_field_target_unsupported(target: PlpgsqlVariableName) -> SqlError {
+    sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "assigning NEW.{} here is not supported; use SELECT ... INTO or :=",
+        target.name.as_str()
+    )
+}
+
+/// The variable an `INTO` target names, rejecting a `NEW` field explicitly
+/// where only variables can receive values.
+fn plpgsql_into_local(
+    locals: &[TriggerLocalDecl],
+    definition: crate::storage::RelationDefinition<'_>,
+    target: PlpgsqlVariableName,
+) -> Result<usize, SqlError> {
+    match plpgsql_into_target(locals, definition, target)? {
+        PlpgsqlIntoTarget::Local(index) => Ok(index),
+        PlpgsqlIntoTarget::NewColumn(_) => Err(new_field_target_unsupported(target)),
+    }
+}
+
+/// Stores `value` into `target` with PL/pgSQL's assignment conversion. A
+/// `NEW` column converts as a variable of the column's type would.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "an INTO target reaches the variables and the trigger's NEW row"
+)]
+fn assign_plpgsql_into_target<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
+    definition: crate::storage::RelationDefinition<'_>,
+    new: &mut Option<&mut [Datum<'a>]>,
+    before: bool,
+    locals: &[TriggerLocalDecl],
+    values: &mut [Datum<'a>],
+    target: PlpgsqlVariableName,
+    resolved: PlpgsqlIntoTarget,
+    value: Datum<'a>,
+) -> Result<(), SqlError> {
+    let column = match resolved {
+        PlpgsqlIntoTarget::Local(_) => {
+            return assign_trigger_local(context, locals, values, target, value);
+        }
+        PlpgsqlIntoTarget::NewColumn(column) => column,
+    };
+    if !before || new.is_none() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "NEW assignments require a BEFORE INSERT or UPDATE trigger"
+        ));
+    }
+    let meta = &definition.columns()[column];
+    if meta.default.is_generated() {
+        return Err(sql_err!(
+            sqlstate::GENERATED_ALWAYS,
+            "cannot assign to generated column \"{}\"",
+            meta.name.as_str()
+        ));
+    }
+    let sequences = crate::sql::sequence::SeqEval::new(
+        context.storage(),
+        context.seq_session(),
+        context.txn.txid,
+    );
+    let value = coerce_plpgsql_local(
+        TriggerLocalDecl {
+            label: None,
+            scope: PlpgsqlScope::Invocation,
+            name: meta.name,
+            ctype: meta.ctype,
+            user_type: meta.user_type,
+            type_mod: meta.type_mod,
+            record_shape: None,
+            constant: false,
+            not_null: false,
+        },
+        value,
+        context.storage(),
+        context.txn.txid,
+        context.arena,
+        &sequences,
+    )?;
+    new.as_deref_mut().expect("checked NEW image")[column] = value;
     Ok(())
 }
 
@@ -28979,6 +29180,11 @@ fn execute_trigger_step_in<'a>(
                 let arguments = arguments.decode(context.arena)?;
                 finish_dynamic_into(
                     context,
+                    NewRowTarget {
+                        definition,
+                        new,
+                        before,
+                    },
                     locals,
                     local_values,
                     statement,
@@ -29613,7 +29819,7 @@ fn execute_trigger_step_in<'a>(
                 .alloc_slice_with(statement.targets.len(), |_| 0usize)
                 .map_err(|_| super::query::arena_full_pub())?;
             for (local, target) in changed.iter_mut().zip(statement.targets) {
-                *local = trigger_local_index(locals, *target)?;
+                *local = plpgsql_into_local(locals, definition, *target)?;
             }
             cursor_statement_effect(
                 context,
@@ -29870,9 +30076,9 @@ fn execute_trigger_step_in<'a>(
             Ok(None)
         }),
         TriggerStatement::SelectInto(statement) => execute_trigger_statement(|| {
-            let mut targets = [0usize; MAX_COLUMNS];
+            let mut targets = [PlpgsqlIntoTarget::Local(0); MAX_COLUMNS];
             for (index, target) in statement.targets.iter().enumerate() {
-                targets[index] = trigger_local_index(locals, *target)?;
+                targets[index] = plpgsql_into_target(locals, definition, *target)?;
             }
             let written = statement.query;
             let (query, dml_ctes) = bind_plpgsql_dml_ctes(context, statement.query)?;
@@ -29900,8 +30106,9 @@ fn execute_trigger_step_in<'a>(
             };
             let record_target = statement.targets.len() == 1
                 && matches!(
-                    locals[targets[0]].ctype,
-                    ColType::Record | ColType::Composite(_)
+                    targets[0],
+                    PlpgsqlIntoTarget::Local(index)
+                        if matches!(locals[index].ctype, ColType::Record | ColType::Composite(_))
                 );
             let arena = context.arena;
             let mut fields = [("", 0); MAX_PROJ];
@@ -30031,12 +30238,16 @@ fn execute_trigger_step_in<'a>(
                         _ => return Err(too_many_rows_returned(parameters, context.arena)),
                     }
                 }
-                for (index, _) in targets[..statement.targets.len()].iter().enumerate() {
-                    assign_trigger_local(
+                for (index, resolved) in targets[..statement.targets.len()].iter().enumerate() {
+                    assign_plpgsql_into_target(
                         context,
+                        definition,
+                        new,
+                        before,
                         locals,
                         local_values,
                         statement.targets[index],
+                        *resolved,
                         selected[index],
                     )?;
                 }
@@ -30046,9 +30257,9 @@ fn execute_trigger_step_in<'a>(
             Ok(None)
         }),
         TriggerStatement::DynamicSelectInto(statement) => execute_trigger_statement(|| {
-            let mut targets = [0usize; MAX_COLUMNS];
+            let mut targets = [PlpgsqlIntoTarget::Local(0); MAX_COLUMNS];
             for (index, target) in statement.targets.iter().enumerate() {
-                targets[index] = trigger_local_index(locals, *target)?;
+                targets[index] = plpgsql_into_target(locals, definition, *target)?;
             }
             let transition = TriggerTransition {
                 definition,
@@ -30081,8 +30292,9 @@ fn execute_trigger_step_in<'a>(
             with_bound_parameter_types(query.parameter_types, || {
                 let record_target = statement.targets.len() == 1
                     && matches!(
-                        locals[targets[0]].ctype,
-                        ColType::Record | ColType::Composite(_)
+                        targets[0],
+                        PlpgsqlIntoTarget::Local(index)
+                            if matches!(locals[index].ctype, ColType::Record | ColType::Composite(_))
                     );
                 let (record_width, record_names, record_type_oids) = {
                     let mut names = [StackStr::<63>::new(); MAX_PROJ];
@@ -30408,6 +30620,11 @@ fn execute_trigger_step_in<'a>(
                 prepare_empty_record(&mut selected, found)?;
                 finish_dynamic_into(
                     context,
+                    NewRowTarget {
+                        definition,
+                        new,
+                        before,
+                    },
                     locals,
                     local_values,
                     statement,
@@ -32068,6 +32285,7 @@ fn execute_trigger_statement<'a>(
 )]
 fn finish_dynamic_into<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
+    new_row: NewRowTarget<'_, '_, '_, 'a>,
     locals: &[TriggerLocalDecl],
     local_values: &mut [Datum<'a>],
     statement: PlpgsqlDynamicSelectInto<'a>,
@@ -32109,10 +32327,28 @@ fn finish_dynamic_into<'a>(
             .copied()
             .zip(selected.iter().copied())
         {
-            assign_trigger_local(context, locals, local_values, target, value)?;
+            let resolved = plpgsql_into_target(locals, new_row.definition, target)?;
+            assign_plpgsql_into_target(
+                context,
+                new_row.definition,
+                new_row.new,
+                new_row.before,
+                locals,
+                local_values,
+                target,
+                resolved,
+                value,
+            )?;
         }
         Ok(())
     })
+}
+
+/// A trigger's `NEW` row as an `INTO` target can reach it.
+struct NewRowTarget<'r, 'n, 'm, 'a> {
+    definition: crate::storage::RelationDefinition<'r>,
+    new: &'n mut Option<&'m mut [Datum<'a>]>,
+    before: bool,
 }
 
 /// The RETURNING rows of a static PL/pgSQL data change: the first row,

@@ -594,9 +594,12 @@ fn collect_stored_query_composite_field_rename_select<'a>(
         )?),
         None => None,
     };
+    let outer_schema = outer_scope.map(|scope| ScopeSchema(scope.current));
     let catalog_columns = scope.as_ref().map(|scope| CatalogScopeCols {
         scope,
-        outer_scope: outer_scope.map(|scope| scope.current),
+        outer: outer_schema
+            .as_ref()
+            .map(|schema| schema as &dyn ColumnLookup<'_>),
         storage: rename.storage,
         txid: rename.txid,
         arena: rename.arena,
@@ -7588,6 +7591,7 @@ fn correlated_row_subqueries<'a, 'scratch>(
     correlated: &[&'a Expr<'a>],
     base: &SubqueryValues<'a, 'a>,
     row: &dyn ColumnLookup<'a>,
+    enclosing: Option<&dyn ColumnLookup<'a>>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
@@ -7603,6 +7607,7 @@ fn correlated_row_subqueries<'a, 'scratch>(
             correlated,
             base,
             row,
+            enclosing,
             storage,
             txid,
             arena,
@@ -8020,7 +8025,7 @@ fn resolve_group_ordinals<'a>(
 ) -> Result<&'a Select<'a>, SqlError> {
     let scoped_columns = scope.map(|scope| CatalogScopeCols {
         scope,
-        outer_scope: None,
+        outer: None,
         storage,
         txid,
         arena,
@@ -8326,7 +8331,7 @@ fn resolve_position_target<'a>(
                     let mut index = 0usize;
                     let scoped_columns = scope.map(|scope| CatalogScopeCols {
                         scope,
-                        outer_scope: None,
+                        outer: None,
                         storage,
                         txid,
                         arena,
@@ -8720,15 +8725,18 @@ pub(crate) fn describe_stored_query<'a>(
     )
 }
 
-pub(crate) fn describe_select<'a>(
+pub(crate) fn describe_select<'a, 'o>(
     sel: &'a crate::sql::ast::Select<'a>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
     out: &mut [ColDesc<'a>],
     description_target: crate::sql::exec::DescriptionTarget,
-    outer: Option<&dyn ColumnLookup<'a>>,
-) -> Result<usize, SqlError> {
+    outer: Option<&dyn ColumnLookup<'o>>,
+) -> Result<usize, SqlError>
+where
+    'a: 'o,
+{
     let sel = if outer.is_some() || !sel.with.is_empty() {
         expand_ctes(sel, storage, txid, arena)?
     } else {
@@ -8793,16 +8801,19 @@ pub(crate) fn describe_select<'a>(
     clippy::too_many_arguments,
     reason = "procedural output uses the execution scope and explicit type boundary"
 )]
-fn describe_contextual_items<'a>(
+fn describe_contextual_items<'a, 'o>(
     items: &[SelectItem<'a>],
     scope: Option<&QueryScope<'a>>,
-    outer: &dyn ColumnLookup<'a>,
+    outer: &dyn ColumnLookup<'o>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
     out: &mut [ColDesc<'a>],
     description_target: crate::sql::exec::DescriptionTarget,
-) -> Result<usize, SqlError> {
+) -> Result<usize, SqlError>
+where
+    'a: 'o,
+{
     use crate::sql::exec::ColTypeResolver;
     let columns = subquery::SubqueryColumns {
         scope,
@@ -8821,7 +8832,7 @@ fn describe_contextual_items<'a>(
     let row = Chained {
         inner: schema
             .as_ref()
-            .map_or(&empty as &dyn ColumnLookup<'a>, |schema| schema),
+            .map_or(&empty as &dyn ColumnLookup<'o>, |schema| schema),
         outer: Some(outer),
     };
     let catalog = storage_catalog(storage, arena, txid);
@@ -9594,7 +9605,7 @@ fn check_select_types<'a>(
 ) -> Result<(), SqlError> {
     let catalog_columns = CatalogScopeCols {
         scope,
-        outer_scope: None,
+        outer: None,
         storage,
         txid,
         arena,
@@ -9759,7 +9770,7 @@ pub fn validate_locking(
         .transpose()?;
     let scoped = scope.as_ref().map(|scope| CatalogScopeCols {
         scope,
-        outer_scope: None,
+        outer: None,
         storage,
         txid,
         arena,
@@ -10005,7 +10016,7 @@ pub(crate) fn select_query_resumable<'a>(
         };
         let analysis_columns = CatalogScopeCols {
             scope: &analysis_scope,
-            outer_scope: None,
+            outer: None,
             storage,
             txid,
             arena,
@@ -10081,7 +10092,7 @@ pub(crate) fn select_query_resumable<'a>(
     // top-level wait must not leak a partial wire response.
     let resolved_columns = CatalogScopeCols {
         scope: &scope,
-        outer_scope: None,
+        outer: None,
         storage,
         txid,
         arena,
@@ -10399,6 +10410,7 @@ pub(crate) fn select_query_resumable<'a>(
                         &outer_subs.base,
                         statement.where_clause,
                         row,
+                        None,
                         storage,
                         txid,
                         arena,
@@ -10415,6 +10427,7 @@ pub(crate) fn select_query_resumable<'a>(
                     correlated,
                     &outer_subs.base,
                     row,
+                    None,
                     storage,
                     txid,
                     arena,
@@ -12067,6 +12080,7 @@ fn select_into_rows_mode<'a>(
                 &outer_subs.base,
                 statement.where_clause,
                 row,
+                outer,
                 storage,
                 txid,
                 arena,
@@ -12082,6 +12096,7 @@ fn select_into_rows_mode<'a>(
             correlated,
             &outer_subs.base,
             row,
+            outer,
             storage,
             txid,
             arena,
@@ -12417,7 +12432,7 @@ fn describe_scope_column<'q>(
 pub fn describe_scope_items<'q>(
     items: &[SelectItem<'_>],
     scope: &QueryScope<'_>,
-    outer_scope: Option<&QueryScope<'_>>,
+    outer: Option<&dyn ColumnLookup<'_>>,
     storage: &Storage,
     txid: u32,
     arena: &'q Arena,
@@ -12468,7 +12483,7 @@ pub fn describe_scope_items<'q>(
                 let name = alias.unwrap_or(super::exec::derived_name(expression));
                 let resolver = CatalogScopeCols {
                     scope,
-                    outer_scope,
+                    outer,
                     storage,
                     txid,
                     arena,
@@ -12518,7 +12533,7 @@ pub fn describe_scope_items<'q>(
                 }
                 let type_mod = match expression {
                     Expr::Column { qualifier, name } => {
-                        scope_column_type_mod(scope, outer_scope, *qualifier, name)
+                        scope_column_type_mod(scope, outer, *qualifier, name)
                     }
                     Expr::Cast { type_mod, .. } => *type_mod,
                     _ => field_meta.map_or(-1, |meta| meta.type_mod),
@@ -12715,9 +12730,16 @@ pub fn describe_select_items<'q>(
                 column += record_star_width(base, scope, storage, txid, arena)?;
             }
             SelectItem::Expr { expression, .. } => {
-                if let Some(description) =
-                    subquery_result_type(expression, scope, storage, txid, arena)?
-                {
+                if let Some(description) = subquery_result_type(
+                    expression,
+                    scope
+                        .map(ScopeSchema)
+                        .as_ref()
+                        .map(|schema| schema as &dyn ColumnLookup<'_>),
+                    storage,
+                    txid,
+                    arena,
+                )? {
                     out[column] =
                         ColDesc::new(out[column].name, description.type_oid, description.typlen)
                             .with_type_mod(description.type_mod);
@@ -12820,7 +12842,10 @@ fn array_subquery_field_type_inner<'q>(
             describe_scope_items(
                 select.items,
                 &scope,
-                outer_scope,
+                outer_scope
+                    .map(ScopeSchema)
+                    .as_ref()
+                    .map(|schema| schema as &dyn ColumnLookup<'_>),
                 storage,
                 txid,
                 arena,
@@ -12891,15 +12916,20 @@ pub(crate) struct SubqueryResultType {
     pub(crate) type_mod: i32,
 }
 
-pub(crate) fn subquery_result_type<'a>(
+/// The result type of a scalar or `ARRAY` subquery whose body may read the
+/// enclosing queries through `outer`.
+pub(crate) fn subquery_result_type<'a, 'o>(
     expression: &Expr<'a>,
-    outer_scope: Option<&QueryScope<'a>>,
+    outer: Option<&dyn ColumnLookup<'o>>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
-) -> Result<Option<SubqueryResultType>, SqlError> {
+) -> Result<Option<SubqueryResultType>, SqlError>
+where
+    'a: 'o,
+{
     let mark = arena.mark();
-    let result = subquery_result_type_inner(expression, outer_scope, storage, txid, arena)
+    let result = subquery_result_type_inner(expression, outer, storage, txid, arena)
         .map_err(|error| subquery::subquery_shape_position(error, expression));
     unsafe {
         arena.rewind_to(mark);
@@ -12907,13 +12937,16 @@ pub(crate) fn subquery_result_type<'a>(
     result
 }
 
-fn subquery_result_type_inner<'a>(
+fn subquery_result_type_inner<'a, 'o>(
     expression: &Expr<'a>,
-    outer_scope: Option<&QueryScope<'a>>,
+    outer: Option<&dyn ColumnLookup<'o>>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
-) -> Result<Option<SubqueryResultType>, SqlError> {
+) -> Result<Option<SubqueryResultType>, SqlError>
+where
+    'a: 'o,
+{
     let (select, array) = match expression {
         Expr::Subquery(select) => (select, false),
         Expr::ArraySubquery(select) => (select, true),
@@ -12929,25 +12962,16 @@ fn subquery_result_type_inner<'a>(
             arena,
             None,
             crate::sql::exec::DescriptionTarget::Sql,
-            None,
+            outer,
         )?
     } else {
         match &select.from {
             Some(from) => {
-                let scope = QueryScope::resolve_schema(
-                    storage,
-                    from,
-                    txid,
-                    arena,
-                    outer_scope
-                        .map(ScopeSchema)
-                        .as_ref()
-                        .map(|schema| schema as &dyn ColumnLookup<'_>),
-                )?;
+                let scope = QueryScope::resolve_schema(storage, from, txid, arena, outer)?;
                 describe_scope_items(
                     select.items,
                     &scope,
-                    outer_scope,
+                    outer,
                     storage,
                     txid,
                     arena,
@@ -12955,9 +12979,19 @@ fn subquery_result_type_inner<'a>(
                     crate::sql::exec::DescriptionTarget::Sql,
                 )?
             }
+            None if outer.is_some() => describe_scope_items(
+                select.items,
+                &QueryScope::singleton(storage, txid, arena)?,
+                outer,
+                storage,
+                txid,
+                arena,
+                &mut columns,
+                crate::sql::exec::DescriptionTarget::Sql,
+            )?,
             None => describe_select_items(
                 select.items,
-                outer_scope,
+                None,
                 storage,
                 txid,
                 arena,
@@ -13483,7 +13517,7 @@ fn describe_scope_record_star<'q>(
     };
     let resolver = CatalogScopeCols {
         scope,
-        outer_scope: None,
+        outer: None,
         storage,
         txid,
         arena,
@@ -13773,12 +13807,30 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
     }
 }
 
+/// Static types over one query level's FROM items, then the chain of
+/// enclosing queries (and routine variables) that `outer` resolves.
 pub(crate) struct CatalogScopeCols<'scope, 'definition, 'outer_definition, 'storage> {
     pub(crate) scope: &'scope QueryScope<'definition>,
-    pub(crate) outer_scope: Option<&'scope QueryScope<'outer_definition>>,
+    pub(crate) outer: Option<&'scope dyn ColumnLookup<'outer_definition>>,
     pub(crate) storage: &'storage Storage,
     pub(crate) txid: u32,
     pub(crate) arena: &'storage Arena,
+}
+
+impl CatalogScopeCols<'_, '_, '_, '_> {
+    /// Answers from the enclosing queries' column types, read through their
+    /// lookup, or None at the outermost query.
+    fn outer_types<R>(
+        &self,
+        read: impl FnOnce(&super::eval::RuntimeColumnTypes<'_, '_>) -> R,
+    ) -> Option<R> {
+        let outer = self.outer?;
+        let catalog = storage_catalog(self.storage, self.arena, self.txid);
+        Some(read(&super::eval::RuntimeColumnTypes {
+            row: outer,
+            catalog: Some(&catalog),
+        }))
+    }
 }
 
 impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
@@ -13793,7 +13845,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
     }
 
     fn is_empty_scope(&self) -> bool {
-        self.scope.n == 0 && self.outer_scope.is_none_or(|scope| scope.n == 0)
+        self.scope.n == 0 && self.outer.is_none_or(|outer| outer.is_empty_scope())
     }
 
     fn type_name_fixed(&self, oid: i32) -> Result<Option<crate::util::StackStr<260>>, SqlError> {
@@ -13820,12 +13872,9 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
 
     fn subquery_type(&self, expression: &Expr<'_>) -> Result<Option<(i32, i16)>, SqlError> {
         let schema = ScopeSchema(self.scope);
-        let outer_schema = self.outer_scope.map(ScopeSchema);
         let outer = Chained {
             inner: &schema,
-            outer: outer_schema
-                .as_ref()
-                .map(|schema| schema as &dyn ColumnLookup<'_>),
+            outer: self.outer,
         };
         subquery_expression_type(expression, self.storage, self.txid, self.arena, &outer)
             .map(|oid| oid.map(|oid| (oid, ColType::from_oid(oid).map_or(-1, ColType::typlen))))
@@ -13860,9 +13909,10 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
                 {
                     return Err(error);
                 }
-                let outer_scope = self.outer_scope.ok_or(error)?;
-                let entry = outer_scope.find_column(qualifier, name)?;
-                Ok(outer_scope.output_type(entry))
+                self.outer_types(|outer| {
+                    super::exec::ColTypeResolver::resolve(outer, qualifier, name)
+                })
+                .unwrap_or(Err(error))
             }
             Err(error) => Err(error),
         }
@@ -13886,13 +13936,9 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
                 {
                     return None;
                 }
-                let outer = self.outer_scope?;
-                scope_column_metadata(
-                    outer,
-                    outer.find_column(qualifier, name).ok()?,
-                    self.storage,
-                    self.txid,
-                )
+                self.outer_types(|outer| {
+                    super::exec::ColTypeResolver::column_meta(outer, qualifier, name)
+                })?
             }
             Err(_) => None,
         }
@@ -14192,24 +14238,21 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
     fn is_whole_row(&self, name: &str) -> bool {
         self.scope.qualified_star_columns(name).is_ok()
             || self
-                .outer_scope
-                .is_some_and(|scope| scope.qualified_star_columns(name).is_ok())
+                .outer
+                .is_some_and(|outer| outer.whole_row_type(name).is_some())
     }
 
     fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
         self.scope.func_scalar_type(name).or_else(|| {
-            self.outer_scope
-                .and_then(|scope| scope.func_scalar_type(name))
+            self.outer_types(|outer| {
+                super::exec::ColTypeResolver::whole_row_scalar_type(outer, name)
+            })?
         })
     }
 
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
-        if let Ok(source) = self.scope.source(name) {
-            return Some(self.scope.source_columns(source));
-        }
-        let scope = self.outer_scope?;
-        let source = scope.source(name).ok()?;
-        Some(scope.source_columns(source))
+        let source = self.scope.source(name).ok()?;
+        Some(self.scope.source_columns(source))
     }
 
     fn whole_row_field(
@@ -14233,9 +14276,9 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
         if self.scope.qualified_star_columns(name).is_ok() {
             field(self.scope, name, index, self.storage, self.txid)
         } else {
-            let outer = self.outer_scope?;
-            outer.qualified_star_columns(name).ok()?;
-            field(outer, name, index, self.storage, self.txid)
+            self.outer_types(|outer| {
+                super::exec::ColTypeResolver::whole_row_field(outer, name, index)
+            })?
         }
     }
 
@@ -14259,8 +14302,9 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
                     sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
                 ) =>
             {
-                let outer = self.outer_scope?;
-                handle(outer, outer.find_column(qualifier, name).ok()?)
+                self.outer_types(|outer| {
+                    super::exec::ColTypeResolver::record_column_handle(outer, qualifier, name)
+                })?
             }
             Err(_) => None,
         }
@@ -14294,34 +14338,22 @@ fn scope_column_metadata(
 
 fn scope_column_type_mod(
     scope: &QueryScope<'_>,
-    outer_scope: Option<&QueryScope<'_>>,
+    outer: Option<&dyn ColumnLookup<'_>>,
     qualifier: Option<&str>,
     name: &str,
 ) -> i32 {
-    fn modifier(scope: &QueryScope<'_>, entry: ResolvedColumn) -> i32 {
-        match entry {
-            ResolvedColumn::Table(table, column) => {
-                scope.defs.get(table).expect("resolved").columns[column].type_mod
-            }
-            ResolvedColumn::Merged(_) => -1,
-        }
-    }
     match scope.find_column(qualifier, name) {
-        Ok(entry) => modifier(scope, entry),
+        Ok(ResolvedColumn::Table(table, column)) => {
+            scope.defs.get(table).expect("resolved").columns[column].type_mod
+        }
+        Ok(ResolvedColumn::Merged(_)) => -1,
         Err(error)
             if matches!(
                 error.sqlstate.as_str(),
                 sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
             ) =>
         {
-            outer_scope
-                .and_then(|outer| {
-                    outer
-                        .find_column(qualifier, name)
-                        .ok()
-                        .map(|entry| modifier(outer, entry))
-                })
-                .unwrap_or(-1)
+            outer.map_or(-1, |outer| outer.column_type_mod(qualifier, name))
         }
         Err(_) => -1,
     }
@@ -14362,7 +14394,7 @@ pub(super) fn record_star_width(
         Some(scope) => {
             scoped = CatalogScopeCols {
                 scope,
-                outer_scope: None,
+                outer: None,
                 storage,
                 txid,
                 arena,

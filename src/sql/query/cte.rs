@@ -1825,7 +1825,7 @@ pub(crate) fn filter_view_rows<'a>(
     let projected = projections.as_slice();
     let source_columns = scope.as_ref().map(|scope| super::CatalogScopeCols {
         scope,
-        outer_scope: None,
+        outer: None,
         storage,
         txid,
         arena,

@@ -104,7 +104,9 @@ pub(crate) fn fold_aggregates<'a>(
         .alloc_slice_with(agg_nodes.len(), |_| AggState::default())
         .map_err(|_| arena_full())?;
     for (i, (_, node)) in agg_nodes.iter().enumerate() {
-        states[i].init(node, storage, txid, &super::ScopeCols(scope), arena)?;
+        let columns =
+            super::subquery::SubqueryColumns::of_scope(scope, outer_arg, storage, txid, arena);
+        states[i].init(node, storage, txid, &columns, arena)?;
     }
     let recycling_safe = states[..agg_nodes.len()]
         .iter()

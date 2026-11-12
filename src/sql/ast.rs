@@ -3718,6 +3718,12 @@ impl JoinKind {
     pub const fn is_cross(self) -> bool {
         matches!(self, Self::Cross | Self::Comma)
     }
+
+    /// Whether the join keeps unmatched rows of its right side, so a
+    /// `LATERAL` right side cannot read its left side.
+    pub const fn is_right_or_full(self) -> bool {
+        matches!(self, Self::Right | Self::Full)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

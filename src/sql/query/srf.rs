@@ -2274,7 +2274,9 @@ pub(super) fn preserve_projection_type_identities(
 }
 
 /// Describes a derived table without retaining a maximum-width arena image.
-/// FROM-less LATERAL projections use the preceding tables' column types.
+/// `outer` resolves the names the derived table may read from outside
+/// itself: the enclosing queries, and for a `LATERAL` item first the FROM
+/// items before it.
 pub(crate) fn describe_derived_definition<'a>(
     storage: &Storage,
     sub: &Select<'_>,
@@ -2282,7 +2284,7 @@ pub(crate) fn describe_derived_definition<'a>(
     col_alias: Option<&[&str]>,
     txid: u32,
     arena: &'a Arena,
-    outer: Option<&QueryScope<'_>>,
+    outer: Option<&dyn ColumnLookup<'_>>,
 ) -> Result<RelationDefinition<'a>, SqlError> {
     let sub = if sub.with.is_empty() {
         sub
@@ -2291,27 +2293,34 @@ pub(crate) fn describe_derived_definition<'a>(
         // columns, including during procedural input/dependency analysis.
         super::expand_ctes(sub, storage, txid, arena)?
     };
-    let outer_schema = outer.map(super::ScopeSchema);
-    let outer_columns = outer_schema
-        .as_ref()
-        .map(|schema| schema as &dyn ColumnLookup<'_>);
+    let outer_columns = outer;
     let mut descriptors = [ColDesc::new("", 0, 0); MAX_PROJ];
     let mut type_oids = [0_i32; MAX_PROJ];
     let mut output_collations = [crate::sql::ast::Collation::None; MAX_PROJ];
     let n_cols = match sub.set_body {
-        Some(tree) => describe_set_body(
-            storage,
-            tree,
-            txid,
-            &mut descriptors,
-            arena,
-            Some(&mut type_oids),
-            crate::sql::exec::DescriptionTarget::Sql,
-            None,
-        )?,
+        Some(tree) => {
+            let outer_types = outer.map(super::scope::OuterColumnTypes);
+            describe_set_body(
+                storage,
+                tree,
+                txid,
+                &mut descriptors,
+                arena,
+                Some(&mut type_oids),
+                crate::sql::exec::DescriptionTarget::Sql,
+                outer_types
+                    .as_ref()
+                    .map(|types| types as &dyn ColumnLookup<'_>),
+            )?
+        }
         None => match &sub.from {
-            Some(f) => {
-                let ss = QueryScope::resolve_schema(storage, f, txid, arena, outer_columns)?;
+            // A FROM-less body may still read the enclosing queries
+            // (`LATERAL (SELECT t.a * 2)` sees the enclosing `t`).
+            from if from.is_some() || outer.is_some() => {
+                let ss = match from {
+                    Some(f) => QueryScope::resolve_schema(storage, f, txid, arena, outer_columns)?,
+                    None => QueryScope::singleton(storage, txid, arena)?,
+                };
                 let n = describe_scope_items(
                     sub.items,
                     &ss,
@@ -2346,7 +2355,7 @@ pub(crate) fn describe_derived_definition<'a>(
                                     expression,
                                     &super::CatalogScopeCols {
                                         scope: &ss,
-                                        outer_scope: outer,
+                                        outer,
                                         storage,
                                         txid,
                                         arena,
@@ -2417,7 +2426,7 @@ pub(crate) fn describe_derived_definition<'a>(
                     Some(&ss),
                     &super::CatalogScopeCols {
                         scope: &ss,
-                        outer_scope: outer,
+                        outer,
                         storage,
                         txid,
                         arena,
@@ -2427,36 +2436,7 @@ pub(crate) fn describe_derived_definition<'a>(
                 )?;
                 n
             }
-            // A FROM-less lateral body types its projection against the outer
-            // scope (`SELECT t.a * 2` sees the enclosing `t`).
-            None if outer.is_some() => {
-                let outer = outer.expect("checked");
-                let n = describe_scope_items(
-                    sub.items,
-                    outer,
-                    None,
-                    storage,
-                    txid,
-                    arena,
-                    &mut descriptors,
-                    crate::sql::exec::DescriptionTarget::Sql,
-                )?;
-                preserve_projection_type_identities(
-                    sub.items,
-                    Some(outer),
-                    &super::CatalogScopeCols {
-                        scope: outer,
-                        outer_scope: None,
-                        storage,
-                        txid,
-                        arena,
-                    },
-                    &descriptors[..n],
-                    &mut type_oids[..n],
-                )?;
-                n
-            }
-            None => {
+            _ => {
                 let n = super::describe_catalog_items(
                     sub.items,
                     None,

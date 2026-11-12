@@ -1012,7 +1012,7 @@ fn external_set_query<'a>(
 }
 
 /// Walks a set tree collecting its SELECT leaves left-to-right.
-fn collect_set_leaves<'a>(
+pub(super) fn collect_set_leaves<'a>(
     tree: &'a SetTree<'a>,
     out: &mut ArenaList<'a, &'a Select<'a>>,
 ) -> Result<(), SqlError> {
@@ -1076,15 +1076,18 @@ fn leaf_col_unknown<'a>(
 }
 
 /// Column descriptions of a set-operation leaf (FROM-less or table-backed).
-fn describe_leaf<'a>(
+fn describe_leaf<'a, 'o>(
     storage: &'a Storage,
     s: &'a Select<'a>,
     txid: u32,
     columns: &mut [ColDesc<'a>],
     arena: &'a Arena,
     type_oids: &mut [i32],
-    outer: Option<&dyn ColumnLookup<'a>>,
-) -> Result<usize, SqlError> {
+    outer: Option<&dyn ColumnLookup<'o>>,
+) -> Result<usize, SqlError>
+where
+    'a: 'o,
+{
     let mark = arena.mark();
     let result = (|| {
         let count = describe_leaf_inner(storage, s, txid, columns, arena, type_oids, outer)?;
@@ -1105,15 +1108,18 @@ fn describe_leaf<'a>(
     Ok(count)
 }
 
-fn describe_leaf_inner<'a>(
+fn describe_leaf_inner<'a, 'o>(
     storage: &'a Storage,
     s: &'a Select<'a>,
     txid: u32,
     columns: &mut [ColDesc<'a>],
     arena: &'a Arena,
     type_oids: &mut [i32],
-    outer: Option<&dyn ColumnLookup<'a>>,
-) -> Result<usize, SqlError> {
+    outer: Option<&dyn ColumnLookup<'o>>,
+) -> Result<usize, SqlError>
+where
+    'a: 'o,
+{
     if let Some(tree) = s.set_body {
         return describe_set_body(
             storage,
@@ -1185,7 +1191,7 @@ fn describe_leaf_inner<'a>(
                 Some(&scope),
                 &super::CatalogScopeCols {
                     scope: &scope,
-                    outer_scope: None,
+                    outer: None,
                     storage,
                     txid,
                     arena,
@@ -1503,7 +1509,7 @@ fn eval_set_tree<'a>(
     clippy::too_many_arguments,
     reason = "set output uses the same outer scope as execution"
 )]
-pub(crate) fn describe_set_body<'a>(
+pub(crate) fn describe_set_body<'a, 'o>(
     storage: &'a Storage,
     tree: &'a SetTree<'a>,
     txid: u32,
@@ -1511,8 +1517,11 @@ pub(crate) fn describe_set_body<'a>(
     arena: &'a Arena,
     type_oids: Option<&mut [i32]>,
     description_target: crate::sql::exec::DescriptionTarget,
-    outer: Option<&dyn ColumnLookup<'a>>,
-) -> Result<usize, SqlError> {
+    outer: Option<&dyn ColumnLookup<'o>>,
+) -> Result<usize, SqlError>
+where
+    'a: 'o,
+{
     let mut leaves = ArenaList::new(arena);
     collect_set_leaves(tree, &mut leaves)?;
     let leaves = leaves.as_slice();

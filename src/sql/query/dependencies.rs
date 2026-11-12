@@ -2416,7 +2416,7 @@ pub(crate) fn dml_dependency_scope<'a>(
         .alloc(FromClause { base, joins })
         .map_err(|_| super::arena_full())?;
     let from = super::cte::expand_from_schema(from, storage, txid, arena)?;
-    super::QueryScope::resolve_schema(storage, from, txid, arena, None)
+    super::QueryScope::resolve_dml_schema(storage, from, txid, arena, None)
 }
 
 fn collect_select<'a>(
@@ -2899,7 +2899,7 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
             ColTypeResolver::column_meta(
                 &super::CatalogScopeCols {
                     scope,
-                    outer_scope: None,
+                    outer: None,
                     storage: self.storage,
                     txid: self.txid,
                     arena: self.arena,
@@ -3111,7 +3111,7 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
             .or_else(|| {
                 super::CatalogScopeCols {
                     scope: self.scope?,
-                    outer_scope: None,
+                    outer: None,
                     storage: self.storage,
                     txid: self.txid,
                     arena: self.arena,

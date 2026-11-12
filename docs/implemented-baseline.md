@@ -44,6 +44,23 @@ earlier status after another transaction changes it. In locking mode, a
 conflicting writer waits for the reader's relation lock, while work on
 unrelated tables continues.
 
+**Foreign keys between different types.** A referencing column may have a
+different type than the key it references whenever PostgreSQL 18 accepts the
+pair: an `integer` `customer_id` can reference a `bigint` primary key, a
+`varchar` code a `text` key, a `timestamp` a `date`. As in PostgreSQL, the
+check compares with the key type's own cross-type equality (`integer` with
+`bigint` compares exactly) or first converts the referencing value to the key's
+type (an `integer` referencing `numeric` or `real`, `text` referencing
+`char(n)`, which ignores trailing blanks); `ON UPDATE CASCADE` assigns the new
+key to the referencing column with its usual conversion, so a `bigint` key too
+large for an `integer` referencing column fails with `22003`. Other pairs fail
+with PostgreSQL's `42804` (`foreign key constraint "orders_customer_fkey"
+cannot be implemented`, with a `DETAIL` naming both types), also when
+`ALTER COLUMN ... TYPE` would leave a key in that state. `pg_constraint`
+reports the chosen operators in `conpfeqop`, `conppeqop` and `conffeqop`. Two
+different composite types, which PostgreSQL compares field by field, and keys
+that need a user-defined implicit cast fail with `0A000`.
+
 **Foreign keys and concurrent writers.** Inserting or updating a row that
 references another table locks the referenced (parent) row `FOR KEY SHARE`, as
 PostgreSQL does. A delete or key change of that parent waits for the inserting

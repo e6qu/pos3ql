@@ -1176,6 +1176,7 @@ pub(crate) use ddl::check_referenced_columns;
 use ddl::{add_unique_key, attach_constraints, auto_key_name, build_column, build_def};
 
 pub(crate) mod constraints;
+mod foreign_key_equality;
 pub use constraints::check_unique_indexes;
 use constraints::{
     ConstraintRow, MAX_FK_CASCADE_DEPTH, ParsedChecks, apply_fk_parent_actions,
@@ -1183,6 +1184,7 @@ use constraints::{
     referenced_key_changed, table_is_referenced,
 };
 pub(crate) use constraints::{coerce_domain_value, parse_defaults};
+pub(crate) use foreign_key_equality::key_operators as foreign_key_operators;
 
 #[derive(Clone, Copy)]
 struct OwnedSequencePlan {
@@ -80573,6 +80575,9 @@ fn alter_table_relation(
     if let Err(error) =
         crate::storage::constraint_names::remap_table(&def, &mut new_def, &column_mapping)
     {
+        return sql_fail(error);
+    }
+    if let Err(error) = ddl::check_altered_foreign_key_types(storage, txn.txid, &new_def) {
         return sql_fail(error);
     }
     let mut new_schema = [ColType::Bool; MAX_COLUMNS];

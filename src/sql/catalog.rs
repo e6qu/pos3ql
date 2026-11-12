@@ -21999,11 +21999,11 @@ fn pg_constraint_values<'a>(
                 Datum::Bool(constraint_parent_oid == 0),
                 Datum::Int4(i32::from(constraint_parent_oid != 0)),
                 Datum::Bool(false),
-                empty_int_array(arena)?,
-                empty_int_array(arena)?,
-                empty_int_array(arena)?,
-                empty_int_array(arena)?,
-                empty_int_array(arena)?,
+                foreign_key_operator_array(storage, txid, info, &fk, 0, arena)?,
+                foreign_key_operator_array(storage, txid, info, &fk, 1, arena)?,
+                foreign_key_operator_array(storage, txid, info, &fk, 2, arena)?,
+                Datum::Null,
+                Datum::Null,
                 Datum::Null,
             ],
             arena,
@@ -23599,6 +23599,35 @@ fn empty_int_array<'a>(arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     Ok(Datum::Array {
         element: super::types::ArrElem::Int4,
         raw: super::array::build(&[], arena)?,
+    })
+}
+
+/// One of a foreign key's `conpfeqop`, `conppeqop` or `conffeqop` arrays
+/// (`which` 0, 1 or 2).
+fn foreign_key_operator_array<'a>(
+    storage: &Storage,
+    txid: u32,
+    info: &FkInfo,
+    fk: &crate::storage::ForeignKey,
+    which: usize,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let child = storage.table_def(info.child_slot, txid);
+    let parent = storage.table_def(info.parent_slot, txid);
+    let mut values = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+    for (index, (&child_column, &parent_column)) in
+        fk.columns().iter().zip(fk.parent_cols()).enumerate()
+    {
+        values[index] = Datum::Int4(
+            super::exec::foreign_key_operators(
+                child.columns()[usize::from(child_column)].ctype,
+                parent.columns()[usize::from(parent_column)].ctype,
+            )[which],
+        );
+    }
+    Ok(Datum::Array {
+        element: super::types::ArrElem::Int4,
+        raw: super::array::build(&values[..fk.n_cols], arena)?,
     })
 }
 

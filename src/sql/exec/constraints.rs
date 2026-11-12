@@ -2288,7 +2288,7 @@ pub(crate) fn check_row_content(
     check_detached_partition_bound(def, values)?;
     check_row_checks(storage, def, checks, values, txid, arena, params, sequences)?;
     check_domain_constraints(storage, def, values, txid, arena, params, sequences)?;
-    check_fk_child(storage, def, values, txid, read)?;
+    check_fk_child(storage, def, values, txid, read, arena)?;
     Ok(())
 }
 
@@ -2381,6 +2381,7 @@ fn check_fk_child(
     values: &[Datum],
     txid: u32,
     read: ValidationRead,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     for fk in def.fkeys() {
         if fk.validation.enforced()
@@ -2396,7 +2397,7 @@ fn check_fk_child(
                 values,
                 txid,
                 ParentRead::Validation(read),
-                None,
+                arena,
             )?;
         }
     }
@@ -2680,7 +2681,7 @@ fn check_or_defer_fk_child(
                 values,
                 txid,
                 ParentRead::Validation(read),
-                Some(arena),
+                arena,
             )?;
             continue;
         }
@@ -2701,8 +2702,7 @@ fn check_or_defer_fk_child(
             isolation: transaction.isolation,
             current,
         };
-        if let Err(error) = check_fk_child_one_at(storage, def, fk, values, txid, read, Some(arena))
-        {
+        if let Err(error) = check_fk_child_one_at(storage, def, fk, values, txid, read, arena) {
             if error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT {
                 transaction.await_parent_read(identity, current);
             }
@@ -2731,7 +2731,6 @@ enum ParentRead {
     },
 }
 
-#[allow(clippy::too_many_arguments)]
 fn check_fk_child_one_at(
     storage: &Storage,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
@@ -2739,22 +2738,39 @@ fn check_fk_child_one_at(
     values: &[Datum],
     txid: u32,
     read: ParentRead,
-    arena: Option<&Arena>,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     let Some(parent_index) =
         storage.find_visible(fk.parent_schema.as_str(), fk.parent.as_str(), txid)
     else {
         return Err(missing_parent_key(def, fk, values));
     };
-    let mut child_types = [ColType::Bool; MAX_COLUMNS];
-    def.schema(&mut child_types);
+    let parent_definition = storage.table_def(parent_index, txid).clone();
+    let mut key = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+    let mut key_types = [ColType::Bool; crate::storage::MAX_INDEX_COLS];
+    for (position, (&child_column, &parent_column)) in
+        fk.columns().iter().zip(fk.parent_cols()).enumerate()
+    {
+        let referencing = def.columns()[usize::from(child_column)].ctype;
+        let referenced = parent_definition.columns()[usize::from(parent_column)].ctype;
+        let equality = super::foreign_key_equality::stored_key_equality(referencing, referenced)?;
+        key[position] = super::foreign_key_equality::comparison_value(
+            equality,
+            values[usize::from(child_column)],
+            arena,
+        )?;
+        key_types[position] = match equality {
+            super::foreign_key_equality::KeyEquality::Direct => referencing,
+            super::foreign_key_equality::KeyEquality::Cast(target) => target,
+        };
+    }
+    let n_key = fk.parent_cols().len();
     if parent_has_key(
         storage,
         parent_index,
         fk.parent_cols(),
-        fk.columns(),
-        &child_types[..def.n_columns],
-        values,
+        &key[..n_key],
+        &key_types[..n_key],
         txid,
         read,
         arena,
@@ -3058,7 +3074,7 @@ pub(crate) fn validate_constraint_obligation(
                         values,
                         txid,
                         ParentRead::Write { isolation, current },
-                        Some(arena),
+                        arena,
                     )?;
                 }
             } else if let Some(exclusion) = exclusion {
@@ -3142,7 +3158,7 @@ pub(crate) fn validate_foreign_key_constraint(
                         values,
                         txid,
                         ParentRead::Validation(read),
-                        None,
+                        arena,
                     )
                 },
             )
@@ -3472,9 +3488,8 @@ fn parent_key_candidates(
     parent_definition: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     parent_cols: &[u16],
     mapped: &[u16],
-    child_cols: &[u16],
-    child_types: &[ColType],
-    child_values: &[Datum],
+    key: &[Datum],
+    key_types: &[ColType],
     txid: u32,
     visit: &mut crate::storage::RowReadVisitor<'_>,
 ) -> Result<bool, SqlError> {
@@ -3483,15 +3498,31 @@ fn parent_key_candidates(
     if parent_cols.len() > collations.len() {
         return Ok(false);
     }
-    for (position, (&parent_column, &child_column)) in
-        parent_cols.iter().zip(child_cols).enumerate()
-    {
-        let value = child_values[usize::from(child_column)];
+    for (position, &parent_column) in parent_cols.iter().enumerate() {
+        let value = key[position];
         let column = &parent_definition.columns()[usize::from(parent_column)];
-        if value.is_null() || child_types[usize::from(child_column)] != column.ctype {
+        if value.is_null() {
             return Ok(false);
         }
-        values[usize::from(parent_column)] = value;
+        // The cache hashes the referenced column's own values; a key of
+        // another type probes with the equal value of that type.
+        let probe = if key_types[position] == column.ctype
+            || matches!(
+                (key_types[position], column.ctype),
+                (ColType::Text, ColType::Varchar)
+            ) {
+            Some(value)
+        } else {
+            match super::foreign_key_equality::referenced_probe_value(value, column.ctype) {
+                Some(probe) => probe,
+                None => return Ok(false),
+            }
+        };
+        let Some(probe) = probe else {
+            // No referenced value equals this key.
+            return Ok(true);
+        };
+        values[usize::from(parent_column)] = probe;
         collations[position] = column.collation;
     }
     let hash = crate::sql::eval::hash_key_collated_catalog(
@@ -3536,19 +3567,19 @@ fn parent_key_candidates(
     Ok(true)
 }
 
-/// Whether a parent row has, in `parent_cols`, the tuple the child row
-/// carries in `child_cols`. A write locks that parent row (see [`ParentRead`]).
+/// Whether a parent row has, in `parent_cols`, a tuple equal to `key`: the
+/// comparison values of a referencing row, of `key_types`. A write locks that
+/// parent row (see [`ParentRead`]).
 #[allow(clippy::too_many_arguments)]
 fn parent_has_key(
     storage: &Storage,
     parent_index: usize,
     parent_cols: &[u16],
-    child_cols: &[u16],
-    child_types: &[ColType],
-    child_values: &[Datum],
+    key: &[Datum],
+    key_types: &[ColType],
     txid: u32,
     read: ParentRead,
-    arena: Option<&Arena>,
+    arena: &Arena,
 ) -> Result<bool, SqlError> {
     use super::row_conflicts::{LockedVersion, concurrent_change, uses_transaction_snapshot};
     let parent_definition = storage.table_def(parent_index, txid).clone();
@@ -3575,11 +3606,8 @@ fn parent_has_key(
         physical.schema(&mut schema);
         let mut prow = [Datum::Null; MAX_COLUMNS];
         rowenc::decode(bytes, &schema[..physical.n_columns], &mut prow)?;
-        for ((&parent_column, &physical_column), &child_column) in
-            parent_cols.iter().zip(mapped).zip(child_cols)
-        {
+        for ((&parent_column, &physical_column), child) in parent_cols.iter().zip(mapped).zip(key) {
             let parent = &prow[physical_column as usize];
-            let child = &child_values[child_column as usize];
             if parent.is_null()
                 || !compare_datums_collated(
                     storage,
@@ -3655,9 +3683,8 @@ fn parent_has_key(
                 &parent_definition,
                 parent_cols,
                 &mapped[..parent_cols.len()],
-                child_cols,
-                child_types,
-                child_values,
+                key,
+                key_types,
                 txid,
                 &mut visit,
             )?
@@ -3676,12 +3703,6 @@ fn parent_has_key(
     let ParentRead::Write { isolation, .. } = read else {
         return Ok(true);
     };
-    let arena = arena.ok_or_else(|| {
-        sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "a written row's foreign key check has no statement arena"
-        )
-    })?;
     let locked = super::row_conflicts::lock_selected_row(
         storage,
         txid,
@@ -3869,9 +3890,11 @@ pub(crate) fn apply_fk_parent_actions(
                     transaction,
                     &cdef,
                     &fk,
+                    &physical_parent,
                     parent_columns,
                     old_parent,
                     child_row,
+                    arena,
                 )
             };
             let rewrite_strength = if new_parent.is_none() && action == StorageFkAction::Cascade {
@@ -4008,9 +4031,21 @@ pub(crate) fn apply_fk_parent_actions(
                 new_child[..cdef.n_columns].copy_from_slice(crow);
                 for (&cc, &pc) in fk.columns().iter().zip(parent_columns) {
                     new_child[cc as usize] = match action {
-                        StorageFkAction::Cascade => {
-                            new_parent.expect("delete-cascade handled above")[pc as usize]
-                        }
+                        // PostgreSQL assigns the new referenced value to
+                        // the referencing column, with its assignment cast,
+                        // type modifier and domain checks.
+                        StorageFkAction::Cascade => super::coerce(
+                            new_parent.expect("delete-cascade handled above")[pc as usize],
+                            &cdef.columns()[cc as usize],
+                            storage,
+                            txn.txid,
+                            arena,
+                            Some(&crate::sql::sequence::SeqEval::new(
+                                storage,
+                                seq_session,
+                                coercion_txid,
+                            )),
+                        )?,
                         StorageFkAction::SetNull => Datum::Null,
                         StorageFkAction::SetDefault => match &cdef.columns()[cc as usize].default {
                             crate::storage::ColumnDefault::None => Datum::Null,
@@ -4146,35 +4181,54 @@ fn encode_referenced_key<'a>(
     Ok(encoded)
 }
 
-/// Whether `child_row` references the parent key `old_parent` through `fk`
-/// (MATCH SIMPLE: a NULL on either side matches nothing).
+/// Whether `child_row` references the parent key `old_parent` (a row of
+/// `parent`) through `fk` (MATCH SIMPLE: a NULL on either side matches
+/// nothing).
+#[allow(clippy::too_many_arguments)]
 fn referencing_key_matches(
     storage: &Storage,
     txid: u32,
     child: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     fk: &crate::storage::ForeignKey,
+    parent: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     parent_columns: &[u16],
     old_parent: &[Datum],
     child_row: &[Datum],
+    arena: &Arena,
 ) -> Result<bool, SqlError> {
-    for (&child_column, &parent_column) in fk.columns().iter().zip(parent_columns) {
-        let referencing = &child_row[child_column as usize];
-        let parent = &old_parent[parent_column as usize];
-        if referencing.is_null()
-            || parent.is_null()
-            || !compare_datums_collated(
+    let mark = arena.mark();
+    let result = (|| {
+        for (&child_column, &parent_column) in fk.columns().iter().zip(parent_columns) {
+            let referencing = child_row[usize::from(child_column)];
+            let referenced = &old_parent[usize::from(parent_column)];
+            if referencing.is_null() || referenced.is_null() {
+                return Ok(false);
+            }
+            let parent_column = &parent.columns()[usize::from(parent_column)];
+            let equality = super::foreign_key_equality::stored_key_equality(
+                child.columns()[usize::from(child_column)].ctype,
+                parent_column.ctype,
+            )?;
+            let referencing =
+                super::foreign_key_equality::comparison_value(equality, referencing, arena)?;
+            if !compare_datums_collated(
                 storage,
                 txid,
-                child.columns()[child_column as usize].collation,
-                referencing,
-                parent,
+                parent_column.collation,
+                &referencing,
+                referenced,
             )?
             .is_eq()
-        {
-            return Ok(false);
+            {
+                return Ok(false);
+            }
         }
-    }
-    Ok(true)
+        Ok(true)
+    })();
+    // SAFETY: the comparison values allocated after the mark do not escape;
+    // only the owned answer is returned.
+    unsafe { arena.rewind_to(mark) };
+    result
 }
 
 /// A queued NO ACTION or RESTRICT check of a deleted or re-keyed parent row:
@@ -4248,20 +4302,25 @@ fn check_referenced_key(
     {
         return Ok(());
     }
+    let mut old_key = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+    let mut old_key_types = [ColType::Bool; crate::storage::MAX_INDEX_COLS];
+    for (position, &column) in parent_columns.iter().enumerate() {
+        old_key[position] = old_parent[usize::from(column)];
+        old_key_types[position] = parent_schema[usize::from(column)];
+    }
     if !restrict
         && parent_has_key(
             storage,
             declared_index,
             fk.parent_cols(),
-            parent_columns,
-            &parent_schema[..physical_parent.n_columns],
-            old_parent,
+            &old_key[..parent_columns.len()],
+            &old_key_types[..parent_columns.len()],
             txid,
             ParentRead::Write {
                 isolation: txn.isolation,
                 current: read,
             },
-            Some(arena),
+            arena,
         )?
     {
         return Ok(());
@@ -4283,9 +4342,11 @@ fn check_referenced_key(
                     txid,
                     &child,
                     &fk,
+                    &physical_parent,
                     parent_columns,
                     old_parent,
                     &row[..child.n_columns],
+                    arena,
                 )? {
                     found = Some((rowid, seen));
                     return Ok(ControlFlow::Break(()));

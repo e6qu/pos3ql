@@ -378,6 +378,12 @@ enum EventObjectRef {
     TableRowType(u16),
     TableArrayType(u16),
     ToastRelation(u16),
+    /// `chunk_id`, `chunk_seq` or `chunk_data` (attributes 1–3) of a table's
+    /// TOAST relation.
+    ToastColumn {
+        table: u16,
+        attnum: u16,
+    },
     ToastIndex(u16),
     TableConstraint {
         table: u16,
@@ -387,6 +393,7 @@ enum EventObjectRef {
     ViewRowType(u16),
     ViewArrayType(u16),
     ViewRule(u16),
+    MatviewRule(u16),
     DomainArray(u16),
     DomainConstraint {
         domain: u16,
@@ -550,6 +557,31 @@ impl EventObjectRef {
                 rule.address_name_count = 3;
                 rule
             }
+            Self::MatviewRule(slot) => {
+                let matview = storage.matview(usize::from(slot));
+                let relation = storage.table_def(usize::from(matview.backing_table), txid);
+                let mut identity = EventIdentity::new();
+                write!(
+                    identity,
+                    "\"_RETURN\" on {}",
+                    qualified(relation.schema.as_str(), relation.name.as_str())?.as_str()
+                )
+                .map_err(|_| graph_full())?;
+                let mut rule = base_object(
+                    catalog::PG_REWRITE_OID,
+                    matview.rule_oid(),
+                    "rule",
+                    None,
+                    None,
+                    identity,
+                    false,
+                );
+                rule.address_names[0] = StackStr::from_str(relation.schema.as_str());
+                rule.address_names[1] = StackStr::from_str(relation.name.as_str());
+                rule.address_names[2] = StackStr::from_str("_RETURN");
+                rule.address_name_count = 3;
+                rule
+            }
             Self::DomainArray(slot) => {
                 let slot = usize::from(slot);
                 let domain = storage.domain_for(slot, txid);
@@ -644,6 +676,23 @@ impl EventObjectRef {
                     StackStr::from_str(identity),
                     true,
                 )
+            }
+            Self::ToastColumn { table, attnum } => {
+                let mut object = Self::ToastRelation(table).materialize(storage, txid)?;
+                let relation_name = object.object_name.ok_or_else(graph_full)?;
+                let name = TOAST_COLUMNS[usize::from(attnum) - 1];
+                let mut identity = qualified("pg_toast", relation_name.as_str())?;
+                write!(identity, ".{name}").map_err(|_| graph_full())?;
+                object.sub_id = i32::from(attnum);
+                object.object_type = StackStr::from_str("toast table column");
+                object.object_name = None;
+                object.identity = identity;
+                object.address_names = [StackStr::new(); MAX_ADDRESS_PARTS];
+                object.address_names[0] = StackStr::from_str("pg_toast");
+                object.address_names[1] = StackStr::from_str(relation_name.as_str());
+                object.address_names[2] = StackStr::from_str(name);
+                object.address_name_count = 3;
+                object
             }
             Self::RelationColumn {
                 relation,
@@ -2589,6 +2638,9 @@ fn relation_object_ref(storage: &Storage, txid: u32, object_id: i32) -> Option<E
     None
 }
 
+/// A TOAST relation's attributes, by attribute number.
+const TOAST_COLUMNS: [&str; 3] = ["chunk_id", "chunk_seq", "chunk_data"];
+
 fn relation_column_ref(
     storage: &Storage,
     txid: u32,
@@ -2596,6 +2648,12 @@ fn relation_column_ref(
     attnum: i32,
 ) -> Option<EventObjectRef> {
     let index = usize::try_from(attnum.checked_sub(1)?).ok()?;
+    if let EventObjectRef::ToastRelation(table) = relation {
+        return (index < TOAST_COLUMNS.len()).then_some(EventObjectRef::ToastColumn {
+            table,
+            attnum: u16::try_from(attnum).ok()?,
+        });
+    }
     let (reference, name) = match relation {
         EventObjectRef::Primary(reference @ ObjectRef::Table(slot)) => {
             let table = storage.table_def(slot, txid);
@@ -2949,12 +3007,18 @@ fn existing_catalog_object(
                 })
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
-        catalog::PG_REWRITE_OID => EventObjectRef::Primary(ObjectRef::Rule(
-            storage
-                .rules_visible_to(txid)
-                .find_map(|(slot, rule)| (rule.oid() == object_id).then_some(slot))
-                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
-        )),
+        catalog::PG_REWRITE_OID => {
+            if let Some(slot) = storage.matview_slot_by_rule_oid(object_id, txid) {
+                EventObjectRef::MatviewRule(u16::try_from(slot).map_err(|_| graph_full())?)
+            } else {
+                EventObjectRef::Primary(ObjectRef::Rule(
+                    storage
+                        .rules_visible_to(txid)
+                        .find_map(|(slot, rule)| (rule.oid() == object_id).then_some(slot))
+                        .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+                ))
+            }
+        }
         catalog::PG_CAST_OID => {
             if let Some(slot) = storage
                 .casts_visible_to(txid)
@@ -3059,6 +3123,24 @@ pub(crate) fn catalog_object(
     match existing_catalog_object(storage, txid, class_id, object_id, sub_id) {
         Ok(object) => Ok(object),
         Err(error) if error.sqlstate == sqlstate::UNDEFINED_OBJECT => {
+            // A missing attribute of an existing relation is still typed by
+            // its relation's kind (`table column`), as in PostgreSQL.
+            if class_id == catalog::PG_CLASS_OID
+                && sub_id != 0
+                && let Some(relation) = relation_object_ref(storage, txid, object_id)
+            {
+                let relation = relation.materialize(storage, txid)?;
+                let mut object_type = StackStr::new();
+                write!(object_type, "{} column", relation.object_type.as_str())
+                    .map_err(|_| graph_full())?;
+                return Ok(EventObject {
+                    class_id,
+                    object_id,
+                    sub_id,
+                    object_type,
+                    ..EventObject::EMPTY
+                });
+            }
             let object_type = match class_id {
                 catalog::PG_CLASS_OID => "relation",
                 catalog::PG_PROC_OID => "routine",
@@ -3950,10 +4032,14 @@ fn push_table_indexes(
     Ok(())
 }
 
+/// A table's dependents, or a materialized view's (`matview` names it, and
+/// its `_RETURN` rule follows its row types; `parent_is_normal` is the
+/// rule's `normal` flag).
 fn push_table_drop_dependents(
     storage: &Storage,
     txid: u32,
     slot: usize,
+    matview: Option<(usize, bool)>,
     indexes: &[(usize, crate::storage::RelationIdentity)],
     output: &mut ArenaList<'_, DroppedObject>,
     count: &mut usize,
@@ -3991,6 +4077,15 @@ fn push_table_drop_dependents(
         false,
         false,
     )?;
+    if let Some((matview, parent_is_normal)) = matview {
+        push_drop(
+            output,
+            count,
+            EventObjectRef::MatviewRule(u16::try_from(matview).map_err(|_| graph_full())?),
+            false,
+            parent_is_normal,
+        )?;
+    }
 
     for check in table.checks() {
         push_drop(
@@ -4268,12 +4363,13 @@ fn push_drop_dependents(
 ) -> Result<(), SqlError> {
     match reference {
         ObjectRef::Table(slot) => {
-            push_table_drop_dependents(storage, txid, slot, before.indexes, output, count)
+            push_table_drop_dependents(storage, txid, slot, None, before.indexes, output, count)
         }
         ObjectRef::MaterializedView(slot) => push_table_drop_dependents(
             storage,
             txid,
             storage.matview_table(slot),
+            Some((slot, parent_is_normal)),
             before.indexes,
             output,
             count,
@@ -4374,6 +4470,23 @@ pub(crate) fn collect<'a>(
             let Some((reference, Mutation::Drop)) = mutation(storage, entry) else {
                 continue;
             };
+            // A dropped materialized view reports itself, not its backing table.
+            if let ObjectRef::Table(table) = reference
+                && undo
+                    .iter()
+                    .cloned()
+                    .zip(undo_origins)
+                    .any(|(other, &other_origin)| {
+                        other_origin == origin
+                            && matches!(
+                                mutation(storage, other),
+                                Some((ObjectRef::MaterializedView(matview), Mutation::Drop))
+                                    if usize::from(storage.matview(matview).backing_table) == table
+                            )
+                    })
+            {
+                continue;
+            }
             let original = before.original_drops.contains(&reference);
             if original != original_pass {
                 continue;

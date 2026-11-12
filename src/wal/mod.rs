@@ -519,7 +519,7 @@ impl WalStoredQueryDependencies<'_> {
                         .map(|dependency| {
                             1 + 1
                                 + dependency.identity.storage_key().len()
-                                + ColumnSet::ENCODED_BYTES
+                                + 2 * ColumnSet::ENCODED_BYTES
                                 + 1
                                 + dependency.schema.as_str().len()
                                 + 1
@@ -546,6 +546,7 @@ impl WalStoredQueryDependencies<'_> {
                             dependency.identity.storage_key().as_str(),
                         )
                         && append_column_set(buffer, dependency.referenced_columns)
+                        && append_column_set(buffer, dependency.written_columns)
                         && append_stored_dependency_name(buffer, dependency.schema.as_str())
                         && append_stored_dependency_name(buffer, dependency.name.as_str())
                         && append_stored_dependency_name(
@@ -7147,7 +7148,10 @@ fn validate_stored_query_dependencies(payload: &[u8]) -> bool {
         if StoredDependencyIdentity::from_storage(class, key).is_none() {
             return false;
         }
-        if take_column_set(payload, &mut at).is_none() {
+        // Read columns, then written columns.
+        if take_column_set(payload, &mut at).is_none()
+            || take_column_set(payload, &mut at).is_none()
+        {
             return false;
         }
         for _ in 0..4 {
@@ -7189,6 +7193,7 @@ fn decode_stored_query_dependencies(payload: &[u8]) -> Option<(StoredQueryDepend
             stored_dependency_name(payload, &mut at)?,
         )?;
         let referenced_columns = take_column_set(payload, &mut at)?;
+        let written_columns = take_column_set(payload, &mut at)?;
         let schema = SqlName::parse(stored_dependency_name(payload, &mut at)?).ok()?;
         let name = SqlName::parse(stored_dependency_name(payload, &mut at)?).ok()?;
         let referenced_schema = SqlName::parse(stored_dependency_name(payload, &mut at)?).ok()?;
@@ -7202,6 +7207,7 @@ fn decode_stored_query_dependencies(payload: &[u8]) -> Option<(StoredQueryDepend
                 referenced_schema,
                 referenced_name,
                 referenced_columns,
+                written_columns,
             })
             .ok()?;
     }
@@ -14069,6 +14075,7 @@ mod tests {
                 referenced_schema: SqlName::parse("").unwrap(),
                 referenced_name: SqlName::parse("items").unwrap(),
                 referenced_columns: ColumnSet::from_low_word(0b101),
+                written_columns: ColumnSet::EMPTY,
             })
             .unwrap();
         dependencies
@@ -14082,6 +14089,7 @@ mod tests {
                 referenced_schema: SqlName::parse("").unwrap(),
                 referenced_name: SqlName::parse("original_function").unwrap(),
                 referenced_columns: crate::storage::ColumnSet::EMPTY,
+                written_columns: crate::storage::ColumnSet::EMPTY,
             })
             .unwrap();
         let mut budget = crate::mem::budget::Budget::new(1024);
@@ -14116,6 +14124,7 @@ mod tests {
                     referenced_schema: SqlName::parse("").unwrap(),
                     referenced_name: SqlName::parse("original_type").unwrap(),
                     referenced_columns: ColumnSet::EMPTY,
+                    written_columns: ColumnSet::EMPTY,
                 })
                 .unwrap();
             encoded.clear();
@@ -14159,6 +14168,7 @@ mod tests {
                 payload.clear();
                 assert!(payload.append(&[0xfc, 1, class as u8]));
                 assert!(append_stored_dependency_name(payload, key));
+                assert!(append_column_set(payload, ColumnSet::EMPTY));
                 assert!(append_column_set(payload, ColumnSet::EMPTY));
                 for name in ["public", "items", "", "items"] {
                     assert!(append_stored_dependency_name(payload, name));

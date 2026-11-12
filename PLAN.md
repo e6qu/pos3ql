@@ -362,10 +362,10 @@ Alembic, psycopg2 and other client comparisons passing, and turn every
 unsupported case into an explicit error. Known gaps: renaming or moving a
 built-in function fails with `0A000` where PostgreSQL changes the catalog
 entry (every built-in name lookup must consult a renamed or moved row);
-arrays of `cstring` (`ARRAY['a'::cstring]`) and `cstring` operators
-(`'a'::cstring || 'b'` is `ab` in PostgreSQL) are not modeled, and a missing
-field of a PL/pgSQL `record` argument reports `column "b" does not exist`
-where PostgreSQL reports `record "r" has no field "b"`; `pg_type` lists all 473
+arrays of `cstring` (`ARRAY['a'::cstring]`, `'{a}'::cstring[]`) fail with
+`0A000`, and `SELECT DISTINCT`, `ORDER BY`, `IN` and `GREATEST` over
+`cstring` values succeed where PostgreSQL reports that `cstring` has no
+equality or ordering operator; `pg_type` lists all 473
 `pg_catalog` types but of `information_schema`'s 148 only its domains and their
 arrays (the row types of its views, whose OIDs initdb assigns after importing
 the platform's collations, need the pinned reference image); a
@@ -458,15 +458,17 @@ A SQL-language procedure called from a trigger fired inside a write (a BEFORE
 row trigger, a deferred constraint trigger at `COMMIT`) runs queries, data
 changes and nested `CALL`, but rejects DDL and other utility statements with
 `0A000` because that trigger runs without the engine's utility executor.
-Relation row types: a composite
-attribute of one (`CREATE TYPE wrap AS (o orders)`) fails with `42704` and a
-PL/pgSQL variable of one with `0A000`; dropping a relation through `DROP
-SCHEMA`, `DROP MATERIALIZED VIEW`, `DROP FOREIGN TABLE ... CASCADE` or another
-object's cascade while another table's column or a domain uses its row type
-fails with `0A000`. `ALTER COLUMN ... TYPE` is refused for columns that a
+A view
+dropped by the cascade of a function, sequence, collation, operator, text
+search object or type (`DROP FUNCTION f CASCADE` where view `v` calls `f`)
+fails with `0A000` while another table's column, a composite attribute or a
+domain uses the view's row type; PostgreSQL drops those users too. A
+subscripted field assignment in PL/pgSQL (`r.f[1] := x`) fails with `0A000`.
+`ALTER COLUMN ... TYPE` is refused for columns that a
 view, rule, trigger `WHEN` condition, policy or SQL-standard routine body
-reads, but not yet for a materialized view's columns or the target columns of
-a stored `INSERT` or `UPDATE`, whose `pg_depend` column rows are missing.
+reads or a stored `INSERT` or `UPDATE` writes (including a materialized
+view). `INSERT INTO t VALUES (1) UNION SELECT ...` fails with `42601` where
+PostgreSQL accepts a set operation over `VALUES` as the source.
 `DROP` of casts, operator
 classes and families, extensions, policies, triggers, rules, indexes and
 `DROP OWNED` still describe their dependents with their own code instead of
@@ -474,14 +476,18 @@ the `pg_depend` walk that `DROP TABLE`, `VIEW`, `MATERIALIZED VIEW`,
 `SEQUENCE`, `FUNCTION`, `TYPE`, `DOMAIN`, `SCHEMA`, `OPERATOR`, `COLLATION`,
 `SERVER`, `FOREIGN DATA WRAPPER` and text search objects share, and
 `pg_event_trigger_dropped_objects` is built by each statement rather than from
-that walk; `pg_depend` still lacks PostgreSQL's rows for TOAST tables, types
-named only inside
-expressions (a cast in a default or routine body), a materialized view's
-`_RETURN` rule and its column rows, the target columns of a rule's or
-SQL-standard routine body's `INSERT` or `UPDATE` (`INSERT INTO t (e)` depends
-on `t.e`; the stored column set also drives read-privilege checks, so it needs
-a separate written-column set), and the column-level rows of views that read a
-sequence. A partition key that is an
+that walk, so a cascade lists its objects in the order the statement drops
+them (`DROP TABLE t CASCADE` lists a view over a materialized view of `t`
+before the materialized view) where PostgreSQL follows the walk; the walk's
+objects would have to be described before they are dropped, into a fixed
+per-statement buffer; `pg_depend` still lacks PostgreSQL's rows for types named only inside
+expressions (a cast to a domain in a default or routine body) and the
+column-level rows of views that read a sequence (`SELECT last_value FROM sq`
+depends on `column last_value of sequence sq`). `pg_rewrite` lists no rules of built-in views (PostgreSQL has 145
+`_RETURN` rules, at OID `reltype + 1`, and `pg_settings_u`/`pg_settings_n`),
+and `ALTER VIEW` and `ALTER MATERIALIZED VIEW` accept only their own actions,
+so `ALTER VIEW v DISABLE RULE r` fails with `42601` where PostgreSQL reports
+`42809` `ALTER action DISABLE RULE cannot be performed on relation "v"`. A partition key that is an
 expression (`PARTITION BY LIST ((k + v))`, `PARTITION BY RANGE (lower(a))`)
 fails with `0A000`; PostgreSQL routes rows by the evaluated key and lists it
 in `pg_partitioned_table.partexprs`. A table's or view's row type cannot

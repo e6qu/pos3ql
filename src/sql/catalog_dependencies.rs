@@ -587,12 +587,6 @@ pub(crate) fn for_each_dependency(
         }
     }
 
-    let referenced_oid = |dependency: &crate::storage::StoredQueryDependency| {
-        stored_reference(storage, txid, dependency)
-    };
-    let referenced_column = |dependency: &crate::storage::StoredQueryDependency, column: usize| {
-        stored_column_number(storage, txid, dependency, column)
-    };
     for (view_slot, _) in storage.views_visible_to(txid) {
         let rewrite_oid = storage.rule(storage.view_return_rule(view_slot)).oid();
         push!(
@@ -603,37 +597,15 @@ pub(crate) fn for_each_dependency(
             0,
             "i",
         )?;
-        for dependency in storage
-            .snapshot_view_dependencies(view_slot, txid, arena)?
-            .entries()
-        {
-            let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
-                continue;
-            };
-            if dependency.referenced_columns.is_empty() {
-                push!(
-                    2618,
-                    rewrite_oid,
-                    referenced_class,
-                    referenced_object,
-                    0,
-                    "n",
-                )?;
-            } else {
-                for column in 0..MAX_COLUMNS {
-                    if dependency.referenced_columns.contains(column) {
-                        push!(
-                            2618,
-                            rewrite_oid,
-                            referenced_class,
-                            referenced_object,
-                            referenced_column(dependency, column),
-                            "n",
-                        )?;
-                    }
-                }
-            }
-        }
+        stored_query_edges(
+            storage,
+            txid,
+            ObjectAddress::new(2618, rewrite_oid, 0),
+            storage
+                .snapshot_view_dependencies(view_slot, txid, arena)?
+                .entries(),
+            visit,
+        )?;
     }
     for (slot, rule) in storage.rules_visible_to(txid) {
         let definition = rule.definition_for(txid);
@@ -670,56 +642,37 @@ pub(crate) fn for_each_dependency(
                 "n"
             )?;
         }
-        for dependency in storage
-            .snapshot_rule_dependencies(slot, txid, arena)?
-            .entries()
-        {
-            let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
-                continue;
-            };
-            if dependency.referenced_columns.is_empty() {
-                push!(
-                    2618,
-                    rule.oid(),
-                    referenced_class,
-                    referenced_object,
-                    0,
-                    "n",
-                )?;
-            } else {
-                for column in 0..MAX_COLUMNS {
-                    if dependency.referenced_columns.contains(column) {
-                        push!(
-                            2618,
-                            rule.oid(),
-                            referenced_class,
-                            referenced_object,
-                            referenced_column(dependency, column),
-                            "n",
-                        )?;
-                    }
-                }
-            }
-        }
+        stored_query_edges(
+            storage,
+            txid,
+            ObjectAddress::new(2618, rule.oid(), 0),
+            storage
+                .snapshot_rule_dependencies(slot, txid, arena)?
+                .entries(),
+            visit,
+        )?;
     }
-    for (materialized_slot, _) in storage.matviews_visible_to(txid) {
-        let table_slot = storage.matview_table(materialized_slot);
-        for dependency in storage
-            .snapshot_matview_dependencies(materialized_slot, txid, arena)?
-            .entries()
-        {
-            let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
-                continue;
-            };
-            push!(
-                PG_CLASS_OID,
-                user_table_oid(storage, table_slot),
-                referenced_class,
-                referenced_object,
-                0,
-                "n",
-            )?;
-        }
+    // As for a view, a materialized view's query belongs to its `_RETURN`
+    // rule, which the view owns internally.
+    for (materialized_slot, matview) in storage.matviews_visible_to(txid) {
+        let rewrite_oid = matview.rule_oid();
+        push!(
+            2618,
+            rewrite_oid,
+            PG_CLASS_OID,
+            user_table_oid(storage, storage.matview_table(materialized_slot)),
+            0,
+            "i",
+        )?;
+        stored_query_edges(
+            storage,
+            txid,
+            ObjectAddress::new(2618, rewrite_oid, 0),
+            storage
+                .snapshot_matview_dependencies(materialized_slot, txid, arena)?
+                .entries(),
+            visit,
+        )?;
     }
     for (trigger_slot, trigger) in storage.triggers_with_slots_visible_to(txid) {
         let trigger_oid = crate::storage::trigger_oid(&trigger);
@@ -1424,43 +1377,66 @@ fn type_dependencies(
         if routine.body_kind == crate::storage::RoutineBodyKind::String {
             continue;
         }
-        let mark = arena.mark();
-        let mut references = [(0, 0, 0); 4 * crate::storage::MAX_STORED_QUERY_DEPENDENCIES];
-        let mut count = 0;
-        for dependency in storage
-            .snapshot_routine_dependencies_for(slot, txid, arena)?
-            .entries()
-        {
-            let Some((class, object)) = stored_reference(storage, txid, dependency)
-                .filter(|(_, object)| *object >= crate::storage::FIRST_NORMAL_OBJECT_ID)
-            else {
-                continue;
-            };
-            let mut add = |sub: i32| {
-                if !references[..count].contains(&(class, object, sub)) && count < references.len()
-                {
-                    references[count] = (class, object, sub);
-                    count += 1;
-                }
-            };
-            if dependency.referenced_columns.is_empty() {
-                add(0);
-            } else {
-                for column in 0..MAX_COLUMNS {
-                    if dependency.referenced_columns.contains(column) {
-                        add(stored_column_number(storage, txid, dependency, column));
+        // The visit may allocate rows, so the snapshot stays in the arena.
+        stored_query_edges(
+            storage,
+            txid,
+            ObjectAddress::new(PG_PROC_OID, routine_oid, 0),
+            storage
+                .snapshot_routine_dependencies_for(slot, txid, arena)?
+                .entries(),
+            visit,
+        )?;
+    }
+    Ok(())
+}
+
+/// `dependent`'s normal dependencies on what a stored query reads or writes:
+/// one row per column, or one for the whole object, each once. Pinned built-in
+/// objects get no rows, as in PostgreSQL.
+fn stored_query_edges(
+    storage: &Storage,
+    txid: u32,
+    dependent: ObjectAddress,
+    entries: &[crate::storage::StoredQueryDependency],
+    visit: &mut dyn FnMut(DependencyEdge) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    let reference = |dependency| {
+        stored_reference(storage, txid, dependency)
+            .filter(|(_, object)| *object >= crate::storage::FIRST_NORMAL_OBJECT_ID)
+    };
+    for (index, dependency) in entries.iter().enumerate() {
+        let Some((class, object)) = reference(dependency) else {
+            continue;
+        };
+        // An earlier entry for the same object already recorded `column`
+        // (`None` is the whole object).
+        let recorded = |column: Option<usize>| {
+            entries[..index].iter().any(|earlier| {
+                reference(earlier) == Some((class, object))
+                    && match column {
+                        None => !earlier.names_columns(),
+                        Some(column) => earlier.uses_column(column),
                     }
-                }
-            }
-        }
-        // SAFETY: the snapshot is not used past this point.
-        unsafe { arena.rewind_to(mark) };
-        for (class, object, sub) in &references[..count] {
+            })
+        };
+        let mut edge = |sub: i32| {
             visit(DependencyEdge {
-                dependent: ObjectAddress::new(PG_PROC_OID, routine_oid, 0),
-                referenced: ObjectAddress::new(*class, *object, *sub),
+                dependent,
+                referenced: ObjectAddress::new(class, object, sub),
                 kind: b'n',
-            })?;
+            })
+        };
+        if !dependency.names_columns() {
+            if !recorded(None) {
+                edge(0)?;
+            }
+            continue;
+        }
+        for column in 0..MAX_COLUMNS {
+            if dependency.uses_column(column) && !recorded(Some(column)) {
+                edge(stored_column_number(storage, txid, dependency, column))?;
+            }
         }
     }
     Ok(())
@@ -1502,44 +1478,16 @@ fn policy_dependencies(
             ),
             kind: b'a',
         })?;
-        let mark = arena.mark();
-        let mut references = [(0, 0, 0); 4 * crate::storage::MAX_STORED_QUERY_DEPENDENCIES];
-        let mut count = 0;
-        for dependency in storage
-            .snapshot_policy_dependencies(slot, txid, arena)?
-            .entries()
-        {
-            let Some((class, object)) = stored_reference(storage, txid, dependency)
-                .filter(|(_, object)| *object >= crate::storage::FIRST_NORMAL_OBJECT_ID)
-            else {
-                continue;
-            };
-            let mut add = |sub: i32| {
-                if !references[..count].contains(&(class, object, sub)) && count < references.len()
-                {
-                    references[count] = (class, object, sub);
-                    count += 1;
-                }
-            };
-            if dependency.referenced_columns.is_empty() {
-                add(0);
-            } else {
-                for column in 0..MAX_COLUMNS {
-                    if dependency.referenced_columns.contains(column) {
-                        add(stored_column_number(storage, txid, dependency, column));
-                    }
-                }
-            }
-        }
-        // SAFETY: the snapshot is not used past this point.
-        unsafe { arena.rewind_to(mark) };
-        for (class, object, sub) in &references[..count] {
-            visit(DependencyEdge {
-                dependent,
-                referenced: ObjectAddress::new(*class, *object, *sub),
-                kind: b'n',
-            })?;
-        }
+        // The visit may allocate rows, so the snapshot stays in the arena.
+        stored_query_edges(
+            storage,
+            txid,
+            dependent,
+            storage
+                .snapshot_policy_dependencies(slot, txid, arena)?
+                .entries(),
+            visit,
+        )?;
     }
     Ok(())
 }

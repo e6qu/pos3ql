@@ -20945,9 +20945,14 @@ impl Engine {
                 new_name,
                 responder,
             ),
-            Stmt::DropRule(rule) => {
-                exec::drop_rule(&mut self.storage, &mut self.wal, txn, *rule, responder)
-            }
+            Stmt::DropRule(rule) => exec::drop_rule(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                *rule,
+                arena,
+                responder,
+            ),
             Stmt::CreateRoutine(routine) => {
                 self.execute_create_routine(routine, arena, txn, sqlprep, cursors, guc, responder)
             }
@@ -21459,8 +21464,10 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
                 command,
                 arena,
+                guc.seq_session(),
                 responder,
             ),
             Stmt::ImportForeignSchema(command) => exec::import_foreign_schema(
@@ -21768,10 +21775,12 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
                 names,
                 *if_exists,
                 *cascade,
                 arena,
+                guc.seq_session(),
                 responder,
             ),
             Stmt::CreateSequence {

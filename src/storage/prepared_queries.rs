@@ -514,6 +514,7 @@ mod tests {
                 .capture_stored_query_relation(ResolvedRelation::Table(table), 0)
                 .unwrap(),
             referenced_columns: ColumnSet::EMPTY,
+            written_columns: ColumnSet::EMPTY,
             schema: SqlName::parse("public").unwrap(),
             name: SqlName::parse("bound_items").unwrap(),
             referenced_schema: SqlName::EMPTY,
@@ -649,6 +650,7 @@ mod tests {
             slot: first_slot as u16,
             identity,
             referenced_columns: ColumnSet::EMPTY,
+            written_columns: ColumnSet::EMPTY,
             schema: SqlName::parse("public").unwrap(),
             name: SqlName::parse("same_items").unwrap(),
             referenced_schema: SqlName::EMPTY,

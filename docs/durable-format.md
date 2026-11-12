@@ -285,7 +285,7 @@ rather than collections that grow with catalog churn.
 | Casts / operators / operator families / operator classes | 720,000,000 / 740,000,000 / 760,000,000 / 780,000,000 + stamp |
 | Access methods / event triggers | 800,000,000 / 820,000,000 + stamp |
 | Default privileges / role memberships | 840,000,000 / 860,000,000 + stamp |
-| Rewrite rules | 880,000,000 + stamp |
+| Rewrite rules | 880,000,000 + stamp; a materialized view's `_RETURN` rule uses the view's own stamp |
 | Large objects | Any OID; `lo_create(oid)` accepts the client's choice, as PostgreSQL does |
 
 **User example:** an application saves the OID of `orders`, drops the table and
@@ -432,7 +432,7 @@ Labels follow PostgreSQL's
 | `pos3ql-catalog-expression-v1` | Retained CHECK, list, partition-bound and SQL routine-body nodes with source spans and bound column numbers; rendered via `pg_get_expr`. Not PostgreSQL's `pg_node_tree`. |
 | `pos3ql-bound-query-v1` | View SQL; `/*p3e:D:M*/` before each typed enum literal binds dependency D, member M. Unknown versions and invalid bindings fail. |
 | `pos3ql-enum-check-v1` | Domain CHECK/DEFAULT on enum bases: `/*p3c:M*/` member, `/*p3a*/` member array, `/*p3t:N*/` N-token cast type, `/*p3o:TEXT*/` original default text (`%25`, `%2f` escaped). |
-| Stored-query dependencies | Marker `0xfc`, length-prefixed identity, complete column set, then a four-byte length and checked input image. Types `d:`/`e:`/`c:<slot>:<creation>`; tables and views `t:<creation>`/`v:<creation>` (1–9,999,999). Name-only or wrong-kind keys are rejected. |
+| Stored-query dependencies | Marker `0xfc`, length-prefixed identity, complete read and written column sets, then a four-byte length and checked input image. Types `d:`/`e:`/`c:<slot>:<creation>`; tables and views `t:<creation>`/`v:<creation>` (1–9,999,999). Name-only or wrong-kind keys are rejected. |
 | `TIP2` | Checked literal map: four-byte identity, four-byte count, 44-byte records (two eight-byte source offsets, type OID, type modifier, input kind, collation flag, collation code, eight-byte value length) each followed by its value. Ordered by span and kind. `TIP1` rejected. |
 | `STI1` | Groups `TIP2` maps by owner fragment: eight-byte header (identity, section count); each section has a two-byte kind, two-byte parameter/attribute number and eight-byte length. Nonempty images charge `table_metadata_bytes`. |
 | Record values | Tags `19`/`202` use one-byte counts and name lengths; wide tags `51`/`204` use two bytes; `202`/`204` add a four-byte type stamp. Record array elements use the same tags inside `AR01`. |

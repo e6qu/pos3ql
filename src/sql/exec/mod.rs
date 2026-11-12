@@ -3529,12 +3529,15 @@ fn drop_foreign_data_wrappers(
     sql_ok()
 }
 
-pub fn drop_foreign_table(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drop_foreign_table(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
     statement: &DropTable<'_>,
     arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Outcome {
     let mut bindings = [usize::MAX; 16];
@@ -3556,7 +3559,7 @@ pub fn drop_foreign_table(
             }
         }
     }
-    match drop_table_kind(
+    match drop_table_kind_with_columns(
         storage,
         wal,
         txn,
@@ -3564,6 +3567,10 @@ pub fn drop_foreign_table(
         Some(crate::storage::TableKind::Foreign),
         "DROP FOREIGN TABLE",
         arena,
+        Some(RowTypeColumnCascade {
+            scratch,
+            seq_session,
+        }),
         responder,
     ) {
         Ok(Ok(())) => {}
@@ -7227,6 +7234,20 @@ fn row_type_column_users(
     Ok(())
 }
 
+/// Whether a live composite attribute has the row type `creation` (`false`)
+/// or its array type (`true`).
+fn row_type_field_use(
+    field: &crate::storage::CompositeFieldDef,
+    creation: crate::storage::TypeCreation,
+) -> Option<bool> {
+    match field.ctype {
+        _ if field.dropped => None,
+        ColType::Composite(found) if found == Some(creation) => Some(false),
+        ColType::Array(ArrElem::Composite(found)) if found == Some(creation) => Some(true),
+        _ => None,
+    }
+}
+
 /// Rejects a drop path that cannot cascade to other tables' columns of the
 /// dropped relation's row type, unless those tables are dropped with it.
 fn require_row_type_unused(
@@ -7251,6 +7272,29 @@ fn require_row_type_unused(
             "cannot drop {} because domain \"{}\" uses its row type",
             name.as_str(),
             storage.domain_for(domain, txid).name.as_str()
+        ));
+    }
+    if let Some((composite, field)) =
+        storage
+            .composites_with_slots_visible_to(txid)
+            .find_map(|(_, composite)| {
+                (!dropped_with(composite.schema))
+                    .then(|| {
+                        composite
+                            .fields()
+                            .iter()
+                            .find(|field| row_type_field_use(field, creation).is_some())
+                            .map(|field| (composite.name, field.name))
+                    })
+                    .flatten()
+            })
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot drop {} because column \"{}.{}\" uses its row type",
+            name.as_str(),
+            composite.as_str(),
+            field.as_str()
         ));
     }
     let excluded = match relation {
@@ -7340,7 +7384,7 @@ fn require_row_type_unaltered(storage: &Storage, txid: u32, table: usize) -> Res
     } else {
         "table"
     };
-    row_type_column_users(storage, txid, creation, &[], |_, user, column, _| {
+    let fail = |user: SqlName, column: SqlName| {
         Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "cannot alter {} \"{}\" because column \"{}.{}\" uses its row type",
@@ -7349,7 +7393,67 @@ fn require_row_type_unaltered(storage: &Storage, txid: u32, table: usize) -> Res
             user.as_str(),
             column.as_str()
         ))
-    })
+    };
+    row_type_column_users(storage, txid, creation, &[], |_, user, column, _| {
+        fail(user, column)
+    })?;
+    // A column of a composite type with an attribute of the row type stores
+    // the row type's values too.
+    for slot in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(slot, txid) {
+            continue;
+        }
+        let definition = storage.table_def(slot, txid);
+        for column in definition.columns() {
+            if named_composite_contains(storage, txid, column.ctype, creation, 0)? {
+                return fail(definition.name, column.name);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `ctype` is a `CREATE TYPE ... AS` composite (or an array of one)
+/// with an attribute, at any depth, of the type `creation` or its array.
+fn named_composite_contains(
+    storage: &Storage,
+    txid: u32,
+    ctype: ColType,
+    creation: crate::storage::TypeCreation,
+    depth: usize,
+) -> Result<bool, SqlError> {
+    let (ColType::Composite(Some(outer)) | ColType::Array(ArrElem::Composite(Some(outer)))) = ctype
+    else {
+        return Ok(false);
+    };
+    if outer == creation {
+        return Ok(false);
+    }
+    let Some(slot) = storage
+        .composites_with_slots_visible_to(txid)
+        .find_map(|(slot, composite)| (composite.creation() == outer).then_some(slot))
+    else {
+        return Ok(false);
+    };
+    if depth >= MAX_COLUMNS {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "composite type nesting exceeds {} levels",
+            MAX_COLUMNS
+        ));
+    }
+    let composite = storage.composite_for(slot, txid);
+    for field in composite.fields() {
+        if field.dropped {
+            continue;
+        }
+        if row_type_field_use(field, creation).is_some()
+            || named_composite_contains(storage, txid, field.ctype, creation, depth + 1)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// PostgreSQL refuses to change the type of a column that a view, rule,
@@ -7449,6 +7553,7 @@ fn drop_row_type_domains(
     txn: &mut TxnState,
     (relation_kind, relation_name): (&str, SqlName),
     creation: crate::storage::TypeCreation,
+    dropped_schema: &dyn Fn(SqlName) -> bool,
     cascade: bool,
     columns: Option<RowTypeColumnCascade<'_>>,
     arena: &Arena,
@@ -7457,6 +7562,15 @@ fn drop_row_type_domains(
     let Some(selected) = row_type_domains(storage, txn.txid, creation, arena)? else {
         return Ok(());
     };
+    // Domains in a schema the statement drops go with their schema.
+    for (slot, selected) in selected.iter_mut().enumerate() {
+        if *selected && dropped_schema(storage.domain_for(slot, txn.txid).schema) {
+            *selected = false;
+        }
+    }
+    if !selected.iter().any(|selected| *selected) {
+        return Ok(());
+    }
     if !cascade {
         return Err(sql_err!(
             sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
@@ -7492,6 +7606,51 @@ fn drop_row_type_domains(
     )
 }
 
+/// Cascades a dropped relation's row type to the composite attributes, other
+/// tables' columns and domains that use it, as PostgreSQL's dependency walk
+/// does.
+#[allow(clippy::too_many_arguments)]
+fn drop_row_type_users(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    relation_kind_name: (&str, SqlName),
+    relation: crate::storage::RowTypeRelation,
+    excluded: &[usize],
+    dropped_schema: &dyn Fn(SqlName) -> bool,
+    cascade: bool,
+    mut columns: Option<RowTypeColumnCascade<'_>>,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Result<(), SqlError> {
+    let creation = storage.relation_row_type_creation(relation);
+    drop_row_type_columns(
+        storage,
+        wal,
+        txn,
+        relation_kind_name,
+        creation,
+        excluded,
+        dropped_schema,
+        cascade,
+        columns.as_mut().map(RowTypeColumnCascade::reborrow),
+        arena,
+        responder,
+    )?;
+    drop_row_type_domains(
+        storage,
+        wal,
+        txn,
+        relation_kind_name,
+        creation,
+        dropped_schema,
+        cascade,
+        columns,
+        arena,
+        responder,
+    )
+}
+
 /// Reports or cascades to other tables' columns of a dropped relation's row type.
 #[allow(clippy::too_many_arguments)]
 fn drop_row_type_columns(
@@ -7501,15 +7660,74 @@ fn drop_row_type_columns(
     (relation_kind, relation_name): (&str, SqlName),
     creation: crate::storage::TypeCreation,
     excluded: &[usize],
+    dropped_schema: &dyn Fn(SqlName) -> bool,
     cascade: bool,
     columns: Option<RowTypeColumnCascade<'_>>,
     arena: &Arena,
     responder: &mut Responder,
 ) -> Result<(), SqlError> {
     use core::fmt::Write as _;
+    // Tables in a schema the statement drops go with their schema.
+    let schema_tables = (0..storage.table_count())
+        .filter(|slot| {
+            storage.table_slot_visible_to(*slot, txn.txid)
+                && dropped_schema(storage.table_def(*slot, txn.txid).schema)
+        })
+        .count();
+    let all_excluded = arena
+        .alloc_slice_with(excluded.len() + schema_tables, |_| usize::MAX)
+        .map_err(|_| arena_full())?;
+    all_excluded[..excluded.len()].copy_from_slice(excluded);
+    for (target, slot) in
+        all_excluded[excluded.len()..]
+            .iter_mut()
+            .zip((0..storage.table_count()).filter(|slot| {
+                storage.table_slot_visible_to(*slot, txn.txid)
+                    && dropped_schema(storage.table_def(*slot, txn.txid).schema)
+            }))
+    {
+        *target = slot;
+    }
+    let excluded = &*all_excluded;
     let mut detail =
         crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
     let mut count = 0usize;
+    // Attributes of composite types come first: PostgreSQL drops each such
+    // attribute and keeps the composite type.
+    let mut composite_users = false;
+    for (_, composite) in storage.composites_with_slots_visible_to(txn.txid) {
+        if dropped_schema(composite.schema) {
+            continue;
+        }
+        for field in composite.fields() {
+            let Some(array) = row_type_field_use(field, creation) else {
+                continue;
+            };
+            let line = if cascade {
+                stack_format!(
+                    192,
+                    "drop cascades to column {} of composite type {}",
+                    field.name.as_str(),
+                    composite.name.as_str()
+                )
+            } else {
+                stack_format!(
+                    192,
+                    "column {} of composite type {} depends on type {}{}",
+                    field.name.as_str(),
+                    composite.name.as_str(),
+                    relation_name.as_str(),
+                    if array { "[]" } else { "" }
+                )
+            };
+            if count != 0 {
+                let _ = detail.write_char('\n');
+            }
+            let _ = detail.write_str(line.as_str());
+            count += 1;
+            composite_users = true;
+        }
+    }
     row_type_column_users(
         storage,
         txn.txid,
@@ -7564,19 +7782,53 @@ fn drop_row_type_columns(
             relation_name.as_str()
         ));
     }
+    let has_columns = {
+        let mut found = false;
+        row_type_column_users(storage, txn.txid, creation, excluded, |_, _, _, _| {
+            found = true;
+            Ok(())
+        })?;
+        found
+    };
+    let columns = match columns {
+        Some(columns) => Some(columns),
+        None if !has_columns => None,
+        None => {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "this statement cannot drop columns of the row type of {} {}",
+                relation_kind,
+                relation_name.as_str()
+            ));
+        }
+    };
+    dependency_report::send_cascade_lines(responder, detail.as_str(), count)?;
+    while let Some(slot) = composite_users
+        .then(|| {
+            storage
+                .composites_with_slots_visible_to(txn.txid)
+                .find_map(|(slot, composite)| {
+                    (!dropped_schema(composite.schema)
+                        && composite
+                            .fields()
+                            .iter()
+                            .any(|field| row_type_field_use(field, creation).is_some()))
+                    .then_some(slot)
+                })
+        })
+        .flatten()
+    {
+        cascade_drop_composite_fields(storage, wal, txn, slot, |field| {
+            Ok(row_type_field_use(field, creation).is_some())
+        })?;
+    }
     let Some(RowTypeColumnCascade {
         scratch,
         seq_session,
     }) = columns
     else {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "this statement cannot drop columns of the row type of {} {}",
-            relation_kind,
-            relation_name.as_str()
-        ));
+        return Ok(());
     };
-    dependency_report::send_cascade_lines(responder, detail.as_str(), count)?;
     loop {
         let mut target = None;
         row_type_column_users(storage, txn.txid, creation, excluded, |slot, _, _, _| {
@@ -7874,32 +8126,14 @@ fn drop_table_kind_with_columns(
                             Err(error) => return Err(error),
                         }
                     }
-                    if let Err(error) = drop_row_type_columns(
+                    if let Err(error) = drop_row_type_users(
                         storage,
                         wal,
                         txn,
                         ("table", def.name),
-                        storage.relation_row_type_creation(crate::storage::RowTypeRelation::Table(
-                            index,
-                        )),
+                        crate::storage::RowTypeRelation::Table(index),
                         &selected_tables[..selected_table_count],
-                        statement.cascade,
-                        row_type_columns
-                            .as_mut()
-                            .map(RowTypeColumnCascade::reborrow),
-                        arena,
-                        responder,
-                    ) {
-                        return sql_fail(error);
-                    }
-                    if let Err(error) = drop_row_type_domains(
-                        storage,
-                        wal,
-                        txn,
-                        ("table", def.name),
-                        storage.relation_row_type_creation(crate::storage::RowTypeRelation::Table(
-                            index,
-                        )),
+                        &|_| false,
                         statement.cascade,
                         row_type_columns
                             .as_mut()
@@ -12554,14 +12788,24 @@ pub(crate) fn drop_owned(
             *selected |= *dependent;
         }
     }
-    if let Err(error) = drop_selected_stored_queries(
+    if let Err(error) = drop_selected_stored_queries_with_columns(
         storage,
         wal,
         txn,
-        views,
-        matviews,
-        routines,
-        dependent_rules,
+        StoredQuerySelectionDrop {
+            views,
+            matviews,
+            routines,
+            rules: dependent_rules,
+        },
+        Some(ViewRowTypeColumnCascade {
+            columns: RowTypeColumnCascade {
+                scratch: &mut *scratch,
+                seq_session,
+            },
+            arena,
+            responder,
+        }),
     ) {
         return sql_fail(error);
     }
@@ -14800,6 +15044,11 @@ pub(crate) fn drop_schema(
             (&[][..], false, true, Some(schema))
         }
     };
+    // Objects in the schemas being dropped go with their schema rather than
+    // through another relation's row-type cascade.
+    let dropped_schema = |schema: SqlName| {
+        names.iter().any(|name| *name == schema.as_str()) || temporary == Some(schema)
+    };
     let slots = match arena.alloc_slice_with(names.len(), |_| usize::MAX) {
         Ok(slots) => slots,
         Err(_) => return sql_fail(arena_full()),
@@ -14906,6 +15155,13 @@ pub(crate) fn drop_schema(
                     ),
                     _ => return Ok(false),
                 };
+                // A relation's row type lives in its relation's schema.
+                if kind == NamedTypeKind::Composite
+                    && let Some(relation) = storage.row_type_relation(creation, txid)
+                {
+                    let (schema, _) = storage.row_type_relation_name(relation, txid);
+                    return Ok(in_listed(storage, schema.as_str()));
+                }
                 let target =
                     crate::storage::TypeDefinitionTarget::by_creation(storage, kind, creation)?;
                 let schema = match kind {
@@ -16237,11 +16493,21 @@ pub(crate) fn drop_schema(
                             view.persistence == crate::storage::RelationPersistence::Temporary,
                         )
                     };
-                    if let Err(error) = require_row_type_unused(
+                    if let Err(error) = drop_row_type_users(
                         storage,
-                        txn.txid,
+                        wal,
+                        txn,
+                        ("view", vname),
                         crate::storage::RowTypeRelation::View(*v),
-                        |user_schema| user_schema == schema,
+                        &[],
+                        &dropped_schema,
+                        true,
+                        Some(RowTypeColumnCascade {
+                            scratch: &mut *scratch,
+                            seq_session,
+                        }),
+                        arena,
+                        responder,
                     ) {
                         return sql_fail(error);
                     }
@@ -16396,11 +16662,21 @@ pub(crate) fn drop_schema(
                     ) {
                         return sql_fail(error);
                     }
-                    if let Err(error) = require_row_type_unused(
+                    if let Err(error) = drop_row_type_users(
                         storage,
-                        txn.txid,
+                        wal,
+                        txn,
+                        ("materialized view", def.name),
                         crate::storage::RowTypeRelation::Table(*table),
-                        |user_schema| user_schema == def.schema,
+                        &[],
+                        &dropped_schema,
+                        true,
+                        Some(RowTypeColumnCascade {
+                            scratch: &mut *scratch,
+                            seq_session,
+                        }),
+                        arena,
+                        responder,
                     ) {
                         return sql_fail(error);
                     }
@@ -16743,11 +17019,21 @@ pub(crate) fn drop_schema(
                             return sql_fail(e);
                         }
                     }
-                    if let Err(error) = require_row_type_unused(
+                    if let Err(error) = drop_row_type_users(
                         storage,
-                        txn.txid,
+                        wal,
+                        txn,
+                        ("table", def.name),
                         crate::storage::RowTypeRelation::Table(*t),
-                        |user_schema| user_schema == def.schema,
+                        &[],
+                        &dropped_schema,
+                        true,
+                        Some(RowTypeColumnCascade {
+                            scratch: &mut *scratch,
+                            seq_session,
+                        }),
+                        arena,
+                        responder,
                     ) {
                         return sql_fail(error);
                     }
@@ -29535,6 +29821,7 @@ fn execute_bound_plpgsql_utility<'a>(
                     &mut engine.wal,
                     txn,
                     *rule,
+                    context.arena,
                     responder,
                 ),
                 Stmt::CreateCast(cast) => super::exec::create_cast(
@@ -30367,8 +30654,10 @@ fn execute_bound_plpgsql_utility<'a>(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
+                    &mut engine.dml_scratch,
                     command,
                     context.arena,
+                    guc.seq_session(),
                     responder,
                 ),
                 Stmt::AlterForeignTable(command) => super::exec::alter_foreign_table(
@@ -30436,10 +30725,12 @@ fn execute_bound_plpgsql_utility<'a>(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
+                    &mut engine.dml_scratch,
                     names,
                     *if_exists,
                     *cascade,
                     context.arena,
+                    guc.seq_session(),
                     responder,
                 ),
                 Stmt::CreateSequence {
@@ -49679,6 +49970,7 @@ fn publish_rewritten_view(
                 || old.slot != new.slot
                 || old.identity != new.identity
                 || old.referenced_columns != new.referenced_columns
+                || old.written_columns != new.written_columns
                 || old.referenced_schema != new.referenced_schema
                 || old.referenced_name != new.referenced_name
         })
@@ -49786,6 +50078,39 @@ fn rule_target(
             name.name
         )),
     }
+}
+
+/// The materialized view a rule DDL target names. Its only rule is the
+/// `_RETURN` rule it owns, which rule DDL cannot change.
+fn rule_target_matview(
+    storage: &Storage,
+    target: crate::storage::RuleTarget,
+    txid: u32,
+) -> Option<usize> {
+    match target {
+        crate::storage::RuleTarget::Table(table) => {
+            storage.matview_slot_for_table(usize::from(table), txid)
+        }
+        crate::storage::RuleTarget::View(_) => None,
+    }
+}
+
+/// PostgreSQL's refusal to drop a view's `_RETURN` rule apart from the view.
+fn return_rule_required(
+    storage: &Storage,
+    txid: u32,
+    rule_oid: i32,
+    relation_oid: i32,
+    arena: &Arena,
+) -> SqlError {
+    use crate::sql::catalog::dependencies::ObjectAddress;
+    dependency_report::required_by(
+        storage,
+        txid,
+        ObjectAddress::new(crate::sql::catalog::PG_REWRITE_OID, rule_oid, 0),
+        ObjectAddress::new(crate::sql::catalog::PG_CLASS_OID, relation_oid, 0),
+        arena,
+    )
 }
 
 struct RuleConditionColumns<'a> {
@@ -50517,6 +50842,12 @@ pub fn create_rule(
     ) {
         return sql_fail(error);
     }
+    if rule_target_matview(storage, target, txn.txid).is_some() {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "rules on materialized views are not supported"
+        ));
+    }
     if let Err(error) = storage.require_owner(target.access_object(), txn.txid, "relation") {
         return sql_fail(error);
     }
@@ -50583,6 +50914,16 @@ pub fn alter_rule(
         Ok(target) => target,
         Err(error) => return sql_fail(error),
     };
+    if rule_target_matview(storage, target, txn.txid).is_some() {
+        return sql_fail(crate::sql::eval::with_detail(
+            sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "relation \"{}\" cannot have rules",
+                table.name
+            ),
+            format_args!("This operation is not supported for materialized views."),
+        ));
+    }
     if let Err(error) = storage.lock_object(
         txn.txid,
         target.into(),
@@ -50697,6 +51038,7 @@ pub fn drop_rule(
     wal: &mut Wal,
     txn: &mut TxnState,
     rule: crate::sql::ast::DropRule<'_>,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     let crate::sql::ast::DropRule {
@@ -50719,6 +51061,18 @@ pub fn drop_rule(
     }
     if let Err(error) = storage.require_owner(target.access_object(), txn.txid, "relation") {
         return sql_fail(error);
+    }
+    if name == "_RETURN"
+        && let Some(matview) = rule_target_matview(storage, target, txn.txid)
+    {
+        let matview = storage.matview_for(matview, txn.txid);
+        return sql_fail(return_rule_required(
+            storage,
+            txn.txid,
+            matview.rule_oid(),
+            crate::sql::catalog::user_table_oid(storage, usize::from(matview.backing_table)),
+            arena,
+        ));
     }
     let Some(slot) = storage.rule_slot(target, name, txn.txid) else {
         if if_exists {
@@ -50743,10 +51097,18 @@ pub fn drop_rule(
         ));
     };
     if storage.rule(slot).definition_for(txn.txid).event == crate::storage::RewriteEvent::Select {
-        return sql_fail(sql_err!(
-            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-            "cannot drop rule _RETURN on view \"{}\"",
-            table.name
+        let crate::storage::RuleTarget::View(view) = target else {
+            return sql_fail(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "an ON SELECT rule belongs to a table"
+            ));
+        };
+        return sql_fail(return_rule_required(
+            storage,
+            txn.txid,
+            storage.rule(slot).oid(),
+            crate::sql::catalog::view_oid(storage, usize::from(view)),
+            arena,
         ));
     }
     let selected = match storage.prepare_rule_edit(slot, txn.txid) {
@@ -51224,7 +51586,10 @@ pub fn comment(
             if let Err(error) = storage.require_owner(target.access_object(), txid, "relation") {
                 return sql_fail(error);
             }
-            if storage.rule_slot(target, identity.name, txid).is_none() {
+            if storage.rule_slot(target, identity.name, txid).is_none()
+                && !(identity.name == "_RETURN"
+                    && rule_target_matview(storage, target, txid).is_some())
+            {
                 return sql_fail(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
                     "rule \"{}\" for relation \"{}\" does not exist",
@@ -52620,14 +52985,16 @@ pub fn refresh_materialized_view(
 /// DROP MATERIALIZED VIEW [IF EXISTS]: drops the backing table and its matview
 /// catalog entry.
 #[allow(clippy::too_many_arguments)]
-pub fn drop_materialized_view(
+pub(crate) fn drop_materialized_view(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
     names: &[crate::sql::ast::QualName],
     if_exists: bool,
     cascade: bool,
     arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Outcome {
     let report = (|| {
@@ -52793,17 +53160,45 @@ pub fn drop_materialized_view(
                 ) {
                     return sql_fail(error);
                 }
-                if let Err(error) = drop_selected_stored_queries(
+                if let Err(error) = drop_selected_stored_queries_with_columns(
                     storage,
                     wal,
                     txn,
-                    dependent_views,
-                    dependent_matviews,
-                    dependent_routines,
-                    dependent_rules,
+                    StoredQuerySelectionDrop {
+                        views: dependent_views,
+                        matviews: dependent_matviews,
+                        routines: dependent_routines,
+                        rules: dependent_rules,
+                    },
+                    Some(ViewRowTypeColumnCascade {
+                        columns: RowTypeColumnCascade {
+                            scratch,
+                            seq_session,
+                        },
+                        arena,
+                        responder,
+                    }),
                 ) {
                     return sql_fail(error);
                 }
+            }
+            if let Err(error) = drop_row_type_users(
+                storage,
+                wal,
+                txn,
+                ("materialized view", def.name),
+                crate::storage::RowTypeRelation::Table(idx),
+                &[],
+                &|_| false,
+                cascade,
+                Some(RowTypeColumnCascade {
+                    scratch,
+                    seq_session,
+                }),
+                arena,
+                responder,
+            ) {
+                return sql_fail(error);
             }
             // Drop the backing table.
             let lsn = storage.bump_lsn();
@@ -56059,6 +56454,9 @@ fn build_composite_spec(
                     definition.name,
                 )),
             )
+        } else if let Some(relation) = storage.resolve_relation_row_type(base_name, txid) {
+            let result = storage.relation_row_type_result(relation, array, txid)?;
+            (result.ctype, result.user_type)
         } else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -56720,14 +57118,24 @@ fn drop_composite_type(
             dependent_matviews,
             dependent_routines,
         )?;
-        drop_selected_stored_queries(
+        drop_selected_stored_queries_with_columns(
             storage,
             wal,
             txn,
-            dependent_views,
-            dependent_matviews,
-            dependent_routines,
-            dependent_rules,
+            StoredQuerySelectionDrop {
+                views: dependent_views,
+                matviews: dependent_matviews,
+                routines: dependent_routines,
+                rules: dependent_rules,
+            },
+            Some(ViewRowTypeColumnCascade {
+                columns: RowTypeColumnCascade {
+                    scratch: &mut *scratch,
+                    seq_session,
+                },
+                arena,
+                responder: &mut *responder,
+            }),
         )?;
         drop_domain_selection(
             storage,
@@ -57371,7 +57779,7 @@ fn dependency_references_table_column(
 ) -> bool {
     dependency.class == crate::storage::DependencyClass::Table
         && usize::from(dependency.slot) == table
-        && dependency.referenced_columns.contains(column)
+        && dependency.uses_column(column)
 }
 
 fn policy_depends_on_selected_stored_query(
@@ -58645,24 +59053,15 @@ fn drop_selected_stored_queries_with_columns(
     for slot in (0..storage.view_count()).rev() {
         if views[slot] && storage.view(slot).visible_to(txn.txid) {
             if let Some(cascade) = columns.as_mut() {
-                drop_row_type_columns(
+                let name = storage.view_column_shape(slot, txn.txid).0;
+                drop_row_type_users(
                     storage,
                     wal,
                     txn,
-                    ("view", storage.view_column_shape(slot, txn.txid).0),
-                    storage.relation_row_type_creation(crate::storage::RowTypeRelation::View(slot)),
+                    ("view", name),
+                    crate::storage::RowTypeRelation::View(slot),
                     &[],
-                    true,
-                    Some(cascade.columns.reborrow()),
-                    cascade.arena,
-                    cascade.responder,
-                )?;
-                drop_row_type_domains(
-                    storage,
-                    wal,
-                    txn,
-                    ("view", storage.view_column_shape(slot, txn.txid).0),
-                    storage.relation_row_type_creation(crate::storage::RowTypeRelation::View(slot)),
+                    &|_| false,
                     true,
                     Some(cascade.columns.reborrow()),
                     cascade.arena,
@@ -58674,6 +59073,23 @@ fn drop_selected_stored_queries_with_columns(
     }
     for slot in (0..storage.matview_count()).rev() {
         if matviews[slot] && storage.matview(slot).visible_to(txn.txid) {
+            if let Some(cascade) = columns.as_mut() {
+                let table = storage.matview_table(slot);
+                let name = storage.table_def(table, txn.txid).name;
+                drop_row_type_users(
+                    storage,
+                    wal,
+                    txn,
+                    ("materialized view", name),
+                    crate::storage::RowTypeRelation::Table(table),
+                    &[],
+                    &|_| false,
+                    true,
+                    Some(cascade.columns.reborrow()),
+                    cascade.arena,
+                    cascade.responder,
+                )?;
+            }
             drop_matview_slot(storage, wal, txn, slot)?;
         }
     }
@@ -61144,29 +61560,14 @@ pub(crate) fn drop_view(
                 }
                 // Other tables' columns of the view's row type go first, as
                 // PostgreSQL's dependency report lists them.
-                if let Err(error) = drop_row_type_columns(
+                if let Err(error) = drop_row_type_users(
                     storage,
                     wal,
                     txn,
                     ("view", view_name),
-                    storage.relation_row_type_creation(crate::storage::RowTypeRelation::View(slot)),
+                    crate::storage::RowTypeRelation::View(slot),
                     &[],
-                    cascade,
-                    Some(RowTypeColumnCascade {
-                        scratch: &mut *scratch,
-                        seq_session,
-                    }),
-                    arena,
-                    responder,
-                ) {
-                    return sql_fail(error);
-                }
-                if let Err(error) = drop_row_type_domains(
-                    storage,
-                    wal,
-                    txn,
-                    ("view", view_name),
-                    storage.relation_row_type_creation(crate::storage::RowTypeRelation::View(slot)),
+                    &|_| false,
                     cascade,
                     Some(RowTypeColumnCascade {
                         scratch: &mut *scratch,
@@ -81019,6 +81420,42 @@ enum ColSource<'a> {
     FillDefault(usize),
 }
 
+/// PostgreSQL's `ATSimplePermissions` refusal of an `ALTER TABLE` action
+/// that a relation kind (`kind`, plural) does not support.
+fn unsupported_alter_action(action: &AlterAction<'_>, relation: &str, kind: &str) -> SqlError {
+    use crate::sql::ast::{TriggerEnableMode, TriggerEnableTarget};
+    let (mode, object, target) = match action {
+        AlterAction::SetTriggerEnabled { target, enabled } => (
+            *enabled,
+            "TRIGGER",
+            match target {
+                TriggerEnableTarget::Name(_) => "",
+                TriggerEnableTarget::All => " ALL",
+                TriggerEnableTarget::User => " USER",
+            },
+        ),
+        AlterAction::SetRuleEnabled { enabled, .. } => (*enabled, "RULE", ""),
+        _ => unreachable!("only trigger and rule modes are refused by relation kind"),
+    };
+    let mode = match mode {
+        TriggerEnableMode::Origin => "ENABLE",
+        TriggerEnableMode::Replica => "ENABLE REPLICA",
+        TriggerEnableMode::Always => "ENABLE ALWAYS",
+        TriggerEnableMode::Disabled => "DISABLE",
+    };
+    crate::sql::eval::with_detail(
+        sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "ALTER action {} {}{} cannot be performed on relation \"{}\"",
+            mode,
+            object,
+            target,
+            relation
+        ),
+        format_args!("This operation is not supported for {kind}."),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn alter_table(
     storage: &mut Storage,
@@ -82937,10 +83374,10 @@ fn alter_table_relation(
                 ) {
                     return sql_fail(error);
                 }
-                return sql_fail(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "\"{}\" is not a table",
-                    statement.table.name
+                return sql_fail(unsupported_alter_action(
+                    &statement.actions[0],
+                    statement.table.name,
+                    "views",
                 ));
             }
             None if statement.if_exists => {
@@ -83016,17 +83453,24 @@ fn alter_table_relation(
     }
     let changes_rule_mode = matches!(statement.actions, [AlterAction::SetRuleEnabled { .. }]);
     let changes_trigger_mode = matches!(statement.actions, [AlterAction::SetTriggerEnabled { .. }]);
-    if (changes_rule_mode || changes_trigger_mode)
-        && (storage
+    if changes_rule_mode || changes_trigger_mode {
+        let unsupported = if storage
             .matview_slot_for_table(table_index, txn.txid)
             .is_some()
-            || changes_rule_mode && def.kind == crate::storage::TableKind::Foreign)
-    {
-        return sql_fail(sql_err!(
-            sqlstate::WRONG_OBJECT_TYPE,
-            "\"{}\" is not a table",
-            statement.table.name
-        ));
+        {
+            Some("materialized views")
+        } else if changes_rule_mode && def.kind == crate::storage::TableKind::Foreign {
+            Some("foreign tables")
+        } else {
+            None
+        };
+        if let Some(kind) = unsupported {
+            return sql_fail(unsupported_alter_action(
+                &statement.actions[0],
+                statement.table.name,
+                kind,
+            ));
+        }
     }
 
     let identity_mode_restriction = if def.partition.attachment.is_some() {

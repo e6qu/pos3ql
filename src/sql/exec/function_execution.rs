@@ -616,7 +616,6 @@ pub(crate) fn execute<'a>(
             ctype: argument.ctype,
             user_type: argument.user_type,
             type_mod: -1,
-            record_shape: None,
             constant: false,
             not_null: false,
         };
@@ -638,7 +637,6 @@ pub(crate) fn execute<'a>(
             ctype: output.ctype,
             user_type: output.user_type,
             type_mod: -1,
-            record_shape: None,
             constant: false,
             not_null: false,
         };

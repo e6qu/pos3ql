@@ -4548,6 +4548,16 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
         }
     }
 
+    /// A relation of the inner scope shadows an outer variable of its name.
+    fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
+        if self.inner.whole_row_type(name).is_some() {
+            return None;
+        }
+        self.inner
+            .row_variable(name)
+            .or_else(|| self.outer?.row_variable(name))
+    }
+
     fn column_type_oid(&self, q: Option<&str>, name: &str) -> Option<i32> {
         match self.inner.resolve_column_type(q, name) {
             Ok(_) => self.inner.column_type_oid(q, name),

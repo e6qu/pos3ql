@@ -6195,6 +6195,10 @@ where
         self.outer?.column_type_oid(qualifier, name)
     }
 
+    fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
+        self.outer?.row_variable(name)
+    }
+
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,
@@ -18723,12 +18727,6 @@ enum ParsedPlpgsqlLocalType<'a> {
     Record,
 }
 
-#[derive(Clone, Copy)]
-enum PlpgsqlRecordShape {
-    Dynamic,
-    Table(u16),
-}
-
 /// Ordering follows lexical nesting, independently of handler-buffer slots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum PlpgsqlScope {
@@ -18749,7 +18747,6 @@ struct TriggerLocalDecl {
     ctype: ColType,
     user_type: Option<crate::storage::UserTypeName>,
     type_mod: i32,
-    record_shape: Option<PlpgsqlRecordShape>,
     constant: bool,
     not_null: bool,
 }
@@ -20041,6 +20038,14 @@ impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
         self.outer.column_type_oid(qualifier, name)
     }
 
+    /// The row's own relation shadows an outer variable of its name.
+    fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
+        if self.row.whole_row_type(name).is_some() {
+            return None;
+        }
+        self.outer.row_variable(name)
+    }
+
     fn column_user_type(
         &self,
         qualifier: Option<&str>,
@@ -20111,6 +20116,14 @@ where
 
     fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
         self.outer.column_type_oid(qualifier, name)
+    }
+
+    /// The row's own relation shadows an outer variable of its name.
+    fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
+        if self.row.whole_row_type(name).is_some() {
+            return None;
+        }
+        self.outer.row_variable(name)
     }
 
     fn column_user_type(
@@ -22893,16 +22906,15 @@ fn resolve_plpgsql_program_locals<'a>(
             ctype: ColType::Bool,
             user_type: None,
             type_mod: -1,
-            record_shape: None,
             constant: false,
             not_null: false,
         })
         .map_err(|_| super::query::arena_full_pub())?;
     for (index, local) in program.locals.iter().copied().enumerate() {
-        let (ctype, user_type, type_mod, record_shape) = match local.ty {
+        let (ctype, user_type, type_mod) = match local.ty {
             ParsedPlpgsqlLocalType::Named { name, type_mod } => {
                 let result = resolve_routine_type(storage, txid, name)?;
-                (result.ctype, result.user_type, type_mod, None)
+                (result.ctype, result.user_type, type_mod)
             }
             ParsedPlpgsqlLocalType::Column { relation, column } => {
                 resolve_plpgsql_column_type(storage, txid, relation, column)?
@@ -22910,9 +22922,7 @@ fn resolve_plpgsql_program_locals<'a>(
             ParsedPlpgsqlLocalType::Row { relation } => {
                 resolve_plpgsql_rowtype(storage, txid, relation)?
             }
-            ParsedPlpgsqlLocalType::Record => {
-                (ColType::Record, None, -1, Some(PlpgsqlRecordShape::Dynamic))
-            }
+            ParsedPlpgsqlLocalType::Record => (ColType::Record, None, -1),
         };
         if ctype.is_pseudo() && ctype != ColType::Record {
             return Err(sql_err!(
@@ -22935,7 +22945,6 @@ fn resolve_plpgsql_program_locals<'a>(
             ctype,
             user_type,
             type_mod,
-            record_shape,
             constant: local.constant,
             not_null: local.not_null,
         };
@@ -23131,15 +23140,7 @@ fn resolve_plpgsql_column_type(
     txid: u32,
     relation: &str,
     column: &str,
-) -> Result<
-    (
-        ColType,
-        Option<crate::storage::UserTypeName>,
-        i32,
-        Option<PlpgsqlRecordShape>,
-    ),
-    SqlError,
-> {
+) -> Result<(ColType, Option<crate::storage::UserTypeName>, i32), SqlError> {
     if let Some(resolved) = storage.resolve_relation(
         relation.split_once('.').map(|(schema, _)| schema),
         relation.rsplit_once('.').map_or(relation, |(_, name)| name),
@@ -23162,7 +23163,7 @@ fn resolve_plpgsql_column_type(
             )
         })?;
         let field = definition.columns()[column];
-        return Ok((field.ctype, field.user_type, field.type_mod, None));
+        return Ok((field.ctype, field.user_type, field.type_mod));
     }
     let result = resolve_routine_type(storage, txid, relation)?;
     let ColType::Composite(slot) = result.ctype else {
@@ -23185,47 +23186,14 @@ fn resolve_plpgsql_column_type(
                 relation
             )
         })?;
-    Ok((field.ctype, field.user_type, field.type_mod, None))
+    Ok((field.ctype, field.user_type, field.type_mod))
 }
 
 fn resolve_plpgsql_rowtype(
     storage: &Storage,
     txid: u32,
     written: &str,
-) -> Result<
-    (
-        ColType,
-        Option<crate::storage::UserTypeName>,
-        i32,
-        Option<PlpgsqlRecordShape>,
-    ),
-    SqlError,
-> {
-    if let Some(resolved) = storage.resolve_relation(
-        written.split_once('.').map(|(schema, _)| schema),
-        written.rsplit_once('.').map_or(written, |(_, name)| name),
-        txid,
-    ) {
-        let crate::storage::ResolvedRelation::Table(slot) = resolved else {
-            return Err(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "\"{}\" is not a table row type",
-                written
-            ));
-        };
-        let slot = u16::try_from(slot).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "table catalog exceeds PL/pgSQL rowtype capacity"
-            )
-        })?;
-        return Ok((
-            ColType::Record,
-            None,
-            -1,
-            Some(PlpgsqlRecordShape::Table(slot)),
-        ));
-    }
+) -> Result<(ColType, Option<crate::storage::UserTypeName>, i32), SqlError> {
     let result = resolve_routine_type(storage, txid, written)?;
     let ColType::Composite(_) = result.ctype else {
         return Err(sql_err!(
@@ -23234,7 +23202,7 @@ fn resolve_plpgsql_rowtype(
             written
         ));
     };
-    Ok((result.ctype, result.user_type, -1, None))
+    Ok((result.ctype, result.user_type, -1))
 }
 
 fn parse_trigger_program<'a>(
@@ -23525,7 +23493,6 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
             ctype: parameter.ctype,
             user_type: parameter.user_type,
             type_mod: -1,
-            record_shape: None,
             constant: false,
             not_null: false,
         };
@@ -24101,6 +24068,31 @@ impl<'a> PlpgsqlVariable<'a> {
     }
 }
 
+/// A local's row-variable shape: a NULL row keeps its declared fields, and a
+/// `record` has none until it is assigned.
+fn plpgsql_row_variable(
+    locals: &[TriggerLocalDecl],
+    values: &[Datum<'_>],
+    name: &str,
+) -> Option<crate::sql::eval::RowVariable> {
+    use crate::sql::eval::RowVariable;
+    let index = locals
+        .iter()
+        .rposition(|local| local.name.as_str() == name)?;
+    let local = locals[index];
+    match values[index] {
+        Datum::Null => match local.ctype {
+            ColType::Composite(Some(creation)) => Some(RowVariable::Declared(creation)),
+            ColType::Record => Some(RowVariable::Unassigned),
+            _ => None,
+        },
+        Datum::Record(_) | Datum::Composite { .. } | Datum::CompositeText { .. } => {
+            Some(RowVariable::Assigned)
+        }
+        _ => None,
+    }
+}
+
 fn plpgsql_variable<'a>(
     locals: &[TriggerLocalDecl],
     values: &[Datum<'a>],
@@ -24245,6 +24237,10 @@ where
             .map(|field| field.type_oid)
     }
 
+    fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
+        plpgsql_row_variable(self.locals, self.values, name)
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
         if matches!(qualifier, Some("old" | "new")) {
             return self.transition.lookup(qualifier, name);
@@ -24261,7 +24257,12 @@ where
                 Datum::Record(fields) | Datum::Composite { fields, .. } => fields,
                 // An unassigned `record` has no field list yet; a NULL row of a
                 // declared row type reads its fields as NULL.
-                Datum::Null if self.locals[index].ctype == ColType::Record => {
+                Datum::Null
+                    if matches!(
+                        plpgsql_row_variable(self.locals, self.values, qualifier),
+                        Some(crate::sql::eval::RowVariable::Unassigned)
+                    ) =>
+                {
                     crate::sql::eval::stash_diagnostic(
                         Some(StackStr::from_str(
                             "The tuple structure of a not-yet-assigned record is indeterminate.",
@@ -24274,7 +24275,12 @@ where
                         qualifier
                     ));
                 }
-                Datum::Null if matches!(self.locals[index].ctype, ColType::Composite(_)) => {
+                Datum::Null
+                    if matches!(
+                        plpgsql_row_variable(self.locals, self.values, qualifier),
+                        Some(crate::sql::eval::RowVariable::Declared(_))
+                    ) =>
+                {
                     return Ok(Datum::Null);
                 }
                 _ => {
@@ -24531,6 +24537,10 @@ where
         self.variable(qualifier?)?
             .record_field(name)
             .map(|field| field.type_oid)
+    }
+
+    fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
+        plpgsql_row_variable(self.locals, self.values, name)
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
@@ -27965,7 +27975,6 @@ fn empty_plpgsql_local() -> TriggerLocalDecl {
         ctype: ColType::Bool,
         user_type: None,
         type_mod: -1,
-        record_shape: None,
         constant: false,
         not_null: false,
     }
@@ -27992,23 +28001,18 @@ fn coerce_plpgsql_local<'a>(
     arena: &'a Arena,
     sequences: &dyn crate::sql::eval::SequenceAccess,
 ) -> Result<Datum<'a>, SqlError> {
-    let value = match local.record_shape {
-        Some(PlpgsqlRecordShape::Table(slot)) => {
-            coerce_plpgsql_table_rowtype(slot, value, storage, txid, arena, sequences)?
-        }
-        Some(PlpgsqlRecordShape::Dynamic) | None => coerce_routine_argument(
-            value,
-            crate::storage::RoutineArgumentDef {
-                name: local.name,
-                ctype: local.ctype,
-                user_type: local.user_type,
-            },
-            storage,
-            txid,
-            arena,
-            Some(sequences),
-        )?,
-    };
+    let value = coerce_routine_argument(
+        value,
+        crate::storage::RoutineArgumentDef {
+            name: local.name,
+            ctype: local.ctype,
+            user_type: local.user_type,
+        },
+        storage,
+        txid,
+        arena,
+        Some(sequences),
+    )?;
     let value = apply_typmod(value, local.ctype, local.type_mod, arena)?;
     if local.not_null && value.is_null() {
         return Err(sql_err!(
@@ -28018,68 +28022,6 @@ fn coerce_plpgsql_local<'a>(
         ));
     }
     Ok(value)
-}
-
-fn coerce_plpgsql_table_rowtype<'a>(
-    slot: u16,
-    value: Datum<'a>,
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-    sequences: &dyn crate::sql::eval::SequenceAccess,
-) -> Result<Datum<'a>, SqlError> {
-    if value.is_null() {
-        return Ok(Datum::Null);
-    }
-    let fields = match value {
-        Datum::Record(fields) | Datum::Composite { fields, .. } => fields,
-        _ => {
-            return Err(sql_err!(
-                sqlstate::DATATYPE_MISMATCH,
-                "cannot assign a non-record value to a table row variable"
-            ));
-        }
-    };
-    let definition = storage.table_def(usize::from(slot), txid);
-    if fields.len() != definition.n_columns {
-        return Err(sql_err!(
-            sqlstate::DATATYPE_MISMATCH,
-            "record has {} fields but row type has {}",
-            fields.len(),
-            definition.n_columns
-        ));
-    }
-    let mut coerced = [RecordField {
-        name: "",
-        type_oid: 0,
-        value: Datum::Null,
-    }; MAX_COLUMNS];
-    for (index, (source, column)) in fields.iter().zip(definition.columns()).enumerate() {
-        let cast = prepare_assignment_cast(source.type_oid, column, storage, txid, arena)?;
-        coerced[index] = RecordField {
-            name: arena
-                .alloc_str(column.name.as_str())
-                .map_err(|_| super::query::arena_full_pub())?,
-            type_oid: column.ctype.oid(),
-            value: coerce_assignment(
-                source.value,
-                column,
-                PlannedAssignmentCast {
-                    input_collation: crate::sql::ast::Collation::None,
-                    defined: cast.as_ref(),
-                    site: None,
-                },
-                storage,
-                txid,
-                arena,
-                Some(sequences),
-            )?,
-        };
-    }
-    let fields = arena
-        .alloc_slice_copy(&coerced[..definition.n_columns])
-        .map_err(|_| super::query::arena_full_pub())?;
-    Ok(Datum::Record(&*fields))
 }
 
 /// `row.field := value`: the row variable's fields with one replaced, as a
@@ -28114,13 +28056,8 @@ fn replace_plpgsql_row_field<'a>(
             arena.alloc_slice_copy(fields).map_err(|_| arena_full())?
         }
         Datum::Null => {
-            let creation = match (local.ctype, local.record_shape) {
-                (_, Some(PlpgsqlRecordShape::Table(slot))) => {
-                    Some(storage.relation_row_type_creation(
-                        crate::storage::RowTypeRelation::Table(usize::from(slot)),
-                    ))
-                }
-                (ColType::Composite(Some(creation)), _) => Some(creation),
+            let creation = match local.ctype {
+                ColType::Composite(Some(creation)) => Some(creation),
                 _ => None,
             };
             let Some(creation) = creation else {
@@ -31058,7 +30995,12 @@ fn execute_trigger_step<'a>(
                                     &mut context,
                                     None,
                                     |storage, sequence| {
-                                        if locals[target].ctype == ColType::Record {
+                                        // A row or record target takes each row's
+                                        // columns as its fields.
+                                        if matches!(
+                                            locals[target].ctype,
+                                            ColType::Record | ColType::Composite(_)
+                                        ) {
                                             materialize_trigger_for_record_query(
                                                 storage, query, arena, arena, txid, params,
                                                 sequence, &scope,
@@ -31089,7 +31031,10 @@ fn execute_trigger_step<'a>(
                                     &mut context,
                                     query,
                                     &scope,
-                                    locals[target].ctype == ColType::Record,
+                                    matches!(
+                                        locals[target].ctype,
+                                        ColType::Record | ColType::Composite(_)
+                                    ),
                                 )?
                             }
                             TriggerForSource::Array { expression, slice } => {

@@ -445,6 +445,10 @@ impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
         self.0.column_type_oid(qualifier, name)
     }
 
+    fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
+        self.0.row_variable(name)
+    }
+
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         self.0.whole_row_is_scalar(table)
     }

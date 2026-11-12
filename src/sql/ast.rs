@@ -6956,7 +6956,9 @@ impl BinaryOp {
             Self::AbovePoint => ">^",
             Self::NetContainedEq => "<<=",
             Self::NetContainsEq => ">>=",
-            Self::And | Self::Or | Self::Like | Self::ILike => return None,
+            Self::Like => "~~",
+            Self::ILike => "~~*",
+            Self::And | Self::Or => return None,
         })
     }
 

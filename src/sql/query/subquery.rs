@@ -34,6 +34,7 @@ pub(super) const fn empty_subquery_list<'a>() -> SubqueryList<'a> {
         probe: None,
         saw_null: false,
         witness: Datum::Null,
+        column_types: &[],
         collations: &[],
     }
 }
@@ -364,6 +365,7 @@ fn external_list_subquery<'a>(
     depth: u32,
     row_arity: usize,
     row_witness: Option<Datum<'a>>,
+    column_types: &'a [i32],
     collations: &'a [Collation],
     outer: Option<&dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
@@ -497,8 +499,54 @@ fn external_list_subquery<'a>(
         probe,
         saw_null: false,
         witness,
+        column_types,
         collations,
     })
+}
+
+/// The declared types of the columns an `IN` or quantified subquery compares
+/// against, one per row field, independent of the rows it yields.
+fn list_column_types<'a>(
+    select: &'a Select<'a>,
+    row_witness: Option<Datum<'a>>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<&'a [i32], SqlError> {
+    if let Some(row_witness) = row_witness {
+        let Datum::Record(fields) = row_witness else {
+            unreachable!("row subquery witness is a record")
+        };
+        let types = arena
+            .alloc_slice_with(fields.len(), |index| fields[index].type_oid)
+            .map_err(|_| arena_full())?;
+        return Ok(&*types);
+    }
+    // Only the type survives; the inference's scratch allocations do not.
+    let mark = arena.mark();
+    let expression = Expr::Subquery(select);
+    let type_oid = subquery_expression_type(
+        &expression,
+        storage,
+        txid,
+        arena,
+        outer.unwrap_or(&crate::sql::eval::NoColumns),
+    );
+    // SAFETY: nothing allocated after `mark` is referenced past this point;
+    // the inferred type is a plain OID.
+    unsafe {
+        arena.rewind_to(mark);
+    }
+    let type_oid = type_oid?.ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "subquery column has no declared type"
+        )
+    })?;
+    Ok(&*arena
+        .alloc_slice_copy(&[type_oid])
+        .map_err(|_| arena_full())?)
 }
 
 /// Evaluates a scalar subquery through the row callback seam. Only the first
@@ -951,6 +999,20 @@ impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
         .column_type_oid(qualifier, name)
     }
 
+    fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
+        let schema = self.scope.map(ScopeSchema);
+        let empty = crate::sql::eval::NoColumns;
+        let inner: &dyn ColumnLookup<'_> = match &schema {
+            Some(schema) => schema,
+            None => &empty,
+        };
+        Chained {
+            inner,
+            outer: self.outer,
+        }
+        .row_variable(name)
+    }
+
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,
@@ -1228,8 +1290,8 @@ fn row_subquery_witness<'a>(
         let SelectItem::Expr { expression, alias } = item else {
             unreachable!("non-expression projections were described above")
         };
-        let value =
-            subquery_witness_with_outer(storage, txid, expression, scope.as_ref(), outer, arena)?;
+        let (type_oid, value) =
+            subquery_item_type(storage, txid, expression, scope.as_ref(), outer, arena)?;
         let generated = stack_format!(12, "f{}", index + 1);
         fields[index] = RecordField {
             name: match alias {
@@ -1238,7 +1300,7 @@ fn row_subquery_witness<'a>(
                     .alloc_str(generated.as_str())
                     .map_err(|_| arena_full())?,
             },
-            type_oid: value.type_oid(),
+            type_oid,
             value,
         };
     }
@@ -1453,6 +1515,8 @@ fn eval_subquery_nodes<'a>(
                 let row_witness = (arity > 1)
                     .then(|| row_subquery_witness(original_select, storage, txid, arena, outer))
                     .transpose()?;
+                let column_types =
+                    list_column_types(original_select, row_witness, storage, txid, arena, outer)?;
                 if storage.spill_attached() {
                     lists[n_lists] = external_list_subquery(
                         node,
@@ -1464,6 +1528,7 @@ fn eval_subquery_nodes<'a>(
                         depth,
                         arity,
                         row_witness,
+                        column_types,
                         collations,
                         outer,
                         sequences,
@@ -1480,6 +1545,7 @@ fn eval_subquery_nodes<'a>(
                     probe: None,
                     saw_null,
                     witness: row_witness.unwrap_or(witness),
+                    column_types,
                     collations,
                 };
                 n_lists += 1;
@@ -2184,6 +2250,14 @@ pub(super) fn merge_correlated<'a, 'b>(
                         row_subquery_witness(original_select, storage, txid, arena, Some(outer))
                     })
                     .transpose()?;
+                let column_types = list_column_types(
+                    original_select,
+                    row_witness,
+                    storage,
+                    txid,
+                    arena,
+                    Some(outer),
+                )?;
                 if storage.spill_attached() {
                     lists[nl] = external_list_subquery(
                         node,
@@ -2195,6 +2269,7 @@ pub(super) fn merge_correlated<'a, 'b>(
                         SUBQUERY_DEPTH,
                         arity,
                         row_witness,
+                        column_types,
                         collations,
                         Some(outer),
                         sequences,
@@ -2219,6 +2294,7 @@ pub(super) fn merge_correlated<'a, 'b>(
                     probe: None,
                     saw_null,
                     witness: row_witness.unwrap_or(witness),
+                    column_types,
                     collations,
                 };
                 nl += 1;
@@ -2428,6 +2504,20 @@ fn subquery_witness_with_outer(
     outer: Option<&dyn ColumnLookup<'_>>,
     arena: &Arena,
 ) -> Result<Datum<'static>, SqlError> {
+    subquery_item_type(storage, txid, item, scope, outer, arena).map(|(_, witness)| witness)
+}
+
+/// A subquery item's declared type and its value witness. The type survives
+/// where the witness cannot carry it: a pseudo-type such as `cstring` has
+/// none.
+fn subquery_item_type(
+    storage: &Storage,
+    txid: u32,
+    item: &Expr,
+    scope: Option<&QueryScope>,
+    outer: Option<&dyn ColumnLookup<'_>>,
+    arena: &Arena,
+) -> Result<(i32, Datum<'static>), SqlError> {
     let inferred = crate::sql::exec::infer_type_res(
         item,
         &SubqueryColumns {
@@ -2444,9 +2534,9 @@ fn subquery_witness_with_outer(
         },
     )?;
     if inferred.0 == crate::sql::types::oid::UNKNOWN {
-        return type_witness(ColType::Text);
+        return Ok((ColType::Text.oid(), type_witness(ColType::Text)?));
     }
-    catalog_type_witness(storage, txid, inferred.0)
+    Ok((inferred.0, catalog_type_witness(storage, txid, inferred.0)?))
 }
 
 /// Query and procedural subqueries resolve inner columns before outer values,
@@ -3773,6 +3863,9 @@ fn detach_subquery_values<'a>(
             probe: list.probe,
             saw_null: list.saw_null,
             witness: detach_subquery_datum(list.witness, arena)?,
+            column_types: &*arena
+                .alloc_slice_copy(list.column_types)
+                .map_err(|_| arena_full())?,
             collations: &*collations,
         };
     }

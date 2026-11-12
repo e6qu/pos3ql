@@ -89,6 +89,10 @@ impl<'a> ColumnLookup<'a> for MetadataOnly<'_, '_> {
     fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
         self.row.column_type_oid(qualifier, name)
     }
+
+    fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
+        self.row.row_variable(name)
+    }
     fn collation(&self, qualifier: Option<&str>, name: &str) -> ast::Collation {
         self.row.collation(qualifier, name)
     }

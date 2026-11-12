@@ -4397,6 +4397,65 @@ fn comparable(a: ColType, b: ColType) -> bool {
 /// An untyped literal compared with a type that has no comparison operators
 /// (`json`, `refcursor`, `cstring`) finds no operator to adopt a type from:
 /// PostgreSQL reports `json = unknown`.
+/// Resolves a quantified comparison's operator (`x op ANY/ALL (array)`, or
+/// against a subquery's column) from the declared types, as PostgreSQL does
+/// before reading any element.
+fn validate_quantified_comparison(
+    operator: crate::sql::ast::BinaryOp,
+    operand: &Expr<'_>,
+    left_oid: i32,
+    element_oid: i32,
+    columns: &dyn ColTypeResolver,
+) -> Result<(), SqlError> {
+    // A visible user-defined operator answers for its own operand types.
+    if let Some(name) = operator.operator_name()
+        && columns
+            .operator_result(name, left_oid, element_oid)
+            .is_some()
+    {
+        return Ok(());
+    }
+    let left = coltype_of_oid(left_oid);
+    let right = (element_oid != oid::UNKNOWN)
+        .then(|| coltype_of_oid(element_oid))
+        .flatten();
+    if element_oid != oid::UNKNOWN
+        && let Some(error) = untyped_comparison_undefined(
+            left_oid,
+            operator.operator_name().unwrap_or("?"),
+            element_oid,
+        )
+    {
+        return Err(error);
+    }
+    validate_declared_enum_comparison(
+        operator,
+        infer_routine_argument_oid(operand, columns)?,
+        element_oid,
+        columns,
+    )?;
+    if let (Some(left), Some(right)) = (left, right) {
+        use crate::sql::ast::BinaryOp::{Eq, Gt, GtEq, Lt, LtEq, NotEq};
+        let invalid = match operator {
+            Eq | NotEq => !comparable(left, right),
+            Lt | LtEq | Gt | GtEq => {
+                !comparable(left, right)
+                    || !left.has_builtin_ordering()
+                    || !right.has_builtin_ordering()
+            }
+            _ => false,
+        };
+        if invalid {
+            return Err(operator_undefined(
+                left,
+                operator.operator_name().unwrap_or("?"),
+                right,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn untyped_comparison_undefined(left: i32, operator: &str, right: i32) -> Option<SqlError> {
     let typed = match (left, right) {
         (oid::UNKNOWN, oid::UNKNOWN) => return None,
@@ -5640,8 +5699,26 @@ pub fn infer_type_res(
                     (metadata.type_oid, metadata.ctype.typlen())
                 })
         }
-        // `x IN (subquery)` and EXISTS are predicates: their result is boolean.
-        Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } | Expr::Exists(_) => {
+        Expr::Exists(_) => of(ColType::Bool),
+        // `x IN (subquery)` and `x op ANY (subquery)` resolve their operator
+        // from the subquery's declared column type before reading any row. A
+        // row operand compares field by field when the subquery runs.
+        Expr::InSubquery {
+            operand, select, ..
+        }
+        | Expr::QuantifiedSubquery {
+            operand, select, ..
+        } => {
+            let operator = match expression {
+                Expr::QuantifiedSubquery { operator, .. } => *operator,
+                _ => crate::sql::ast::BinaryOp::Eq,
+            };
+            if crate::sql::eval::row_constructor_fields(operand).is_none()
+                && let Some((column_oid, _)) = columns.subquery_type(&Expr::Subquery(select))?
+            {
+                let left_oid = infer_type_res(operand, columns)?.0;
+                validate_quantified_comparison(operator, operand, left_oid, column_oid, columns)?;
+            }
             of(ColType::Bool)
         }
         Expr::AnyAll {
@@ -5651,54 +5728,13 @@ pub fn infer_type_res(
             ..
         } => {
             let left_oid = infer_type_res(operand, columns)?.0;
-            let left = coltype_of_oid(left_oid);
-            let right = coltype_of_oid(infer_type_res(array, columns)?.0).and_then(|ctype| {
-                if let ColType::Array(element) = ctype {
-                    Some(element.to_coltype())
-                } else {
-                    None
-                }
-            });
             let element_oid = coltype_of_oid(infer_type_res(array, columns)?.0)
                 .and_then(|ctype| match ctype {
                     ColType::Array(element) => Some(element.element_oid()),
                     _ => None,
                 })
                 .unwrap_or(oid::UNKNOWN);
-            if element_oid != oid::UNKNOWN
-                && let Some(error) = untyped_comparison_undefined(
-                    left_oid,
-                    operator.operator_name().unwrap_or("?"),
-                    element_oid,
-                )
-            {
-                return Err(error);
-            }
-            validate_declared_enum_comparison(
-                *operator,
-                infer_routine_argument_oid(operand, columns)?,
-                element_oid,
-                columns,
-            )?;
-            if let (Some(left), Some(right)) = (left, right) {
-                use crate::sql::ast::BinaryOp::{Eq, Gt, GtEq, Lt, LtEq, NotEq};
-                let invalid = match operator {
-                    Eq | NotEq => !comparable(left, right),
-                    Lt | LtEq | Gt | GtEq => {
-                        !comparable(left, right)
-                            || !left.has_builtin_ordering()
-                            || !right.has_builtin_ordering()
-                    }
-                    _ => false,
-                };
-                if invalid {
-                    return Err(operator_undefined(
-                        left,
-                        operator.operator_name().unwrap_or("?"),
-                        right,
-                    ));
-                }
-            }
+            validate_quantified_comparison(*operator, operand, left_oid, element_oid, columns)?;
             of(ColType::Bool)
         }
         Expr::Array(items) => of(ColType::Array(

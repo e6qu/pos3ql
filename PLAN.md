@@ -269,11 +269,10 @@ Alembic, psycopg2 and other client comparisons passing, and turn every
 unsupported case into an explicit error. Known gaps: renaming or moving a
 built-in function fails with `0A000` where PostgreSQL changes the catalog
 entry (every built-in name lookup must consult a renamed or moved row);
-`x IN (SELECT c ...)` and `x = ANY (SELECT c ...)` over a `cstring` column
-`c` succeed where PostgreSQL reports `operator does not exist: cstring =
-cstring` (the subquery list carries a value witness, which has no `cstring`
-form, rather than the column's type), and the type-modifier input functions
-(`numerictypmodin(cstring[])`) fail with `0A000`; `pg_type` lists all 473
+a type-modifier input function whose precision PostgreSQL clamps to 6 with a
+`WARNING` (`timetypmodin('{7}')`) fails with `0A000`, because a function
+call has no channel for a warning; a quantified regular-expression match
+(`x ~ ANY (array['^a'])`) fails with `42883`; `pg_type` lists all 473
 `pg_catalog` types but of `information_schema`'s 148 only its domains and their
 arrays (the row types of its views, whose OIDs initdb assigns after importing
 the platform's collations, need the pinned reference image); a
@@ -339,8 +338,6 @@ PL/pgSQL `CALL` in a trigger function fails with `0A000`, and a procedure
 called from PL/pgSQL that waits for storage or a lock runs again from its
 start when its statement resumes (finished effects replay from the statement
 journal) instead of resuming at a saved position inside the procedure.
-`pg_typeof(r.f)` of a field of an unassigned row-typed PL/pgSQL variable fails
-with `42P01` where PostgreSQL reports the field's declared type.
 `ALTER COLUMN ... TYPE` is refused for columns that a
 view, rule, trigger `WHEN` condition, policy or SQL-standard routine body
 reads or a stored `INSERT` or `UPDATE` writes (including a materialized

@@ -467,30 +467,13 @@ impl<'a> Parser<'a> {
                     ) {
                         let all = self.peeked == Tok::Ident("all");
                         self.advance()?;
-                        self.expect_op("(")?;
-                        let array = self.expression(0)?;
-                        self.expect_op(")")?;
                         let operator = if ilike {
                             BinaryOp::ILike
                         } else {
                             BinaryOp::Like
                         };
-                        // NOT LIKE ANY == NOT (LIKE ALL), and vice versa.
-                        let inner = self.arena_expr(Expr::AnyAll {
-                            operand: left,
-                            operator,
-                            array,
-                            all: if negated { !all } else { all },
-                        })?;
-                        left = if negated {
-                            self.arena_expr(Expr::Unary {
-                                source_position,
-                                operator: crate::sql::ast::UnaryOp::Not,
-                                operand: inner,
-                            })?
-                        } else {
-                            inner
-                        };
+                        left =
+                            self.quantified_pattern(source_position, left, operator, negated, all)?;
                         continue;
                     }
                     let pattern = self.expression(5)?;
@@ -544,6 +527,37 @@ impl<'a> Parser<'a> {
                 if negated {
                     return Err(self.syntax_error_here());
                 }
+            }
+            // `~~`, `!~~`, `~~*` and `!~~*` are the operators `LIKE`, `NOT
+            // LIKE`, `ILIKE` and `NOT ILIKE` resolve to.
+            if min_prec <= 4
+                && let Tok::Op(o @ ("~~" | "!~~" | "~~*" | "!~~*")) = self.peeked
+            {
+                self.advance()?;
+                let negated = o.starts_with('!');
+                let operator = if o.ends_with('*') {
+                    BinaryOp::ILike
+                } else {
+                    BinaryOp::Like
+                };
+                left = if matches!(
+                    self.peeked,
+                    Tok::Ident("any") | Tok::Ident("all") | Tok::Ident("some")
+                ) {
+                    let all = self.peeked == Tok::Ident("all");
+                    self.advance()?;
+                    self.quantified_pattern(source_position, left, operator, negated, all)?
+                } else {
+                    let pattern = self.expression(5)?;
+                    self.arena_expr(Expr::Like {
+                        operand: left,
+                        pattern,
+                        negated,
+                        case_insensitive: operator == BinaryOp::ILike,
+                        escape: None,
+                    })?
+                };
+                continue;
             }
             // POSIX regex match operators bind like comparisons.
             if min_prec <= 4
@@ -2620,6 +2634,52 @@ impl<'a> Parser<'a> {
                 Ok(s)
             }
             _ => Err(self.syntax_error_here()),
+        }
+    }
+
+    /// `x [NOT] LIKE ANY/ALL (array or subquery)` after its quantifier: a
+    /// negated match is the negation of the opposite quantifier.
+    fn quantified_pattern(
+        &mut self,
+        source_position: SourcePosition,
+        operand: &'a Expr<'a>,
+        operator: BinaryOp,
+        negated: bool,
+        all: bool,
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        self.expect_op("(")?;
+        let all = if negated { !all } else { all };
+        let inner = if matches!(self.peeked, Tok::Ident("select") | Tok::Ident("with")) {
+            let select = self.query_select()?;
+            self.expect_op(")")?;
+            let select = self
+                .arena
+                .alloc(select)
+                .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+            self.arena_expr(Expr::QuantifiedSubquery {
+                operand,
+                operator,
+                select,
+                all,
+            })?
+        } else {
+            let array = self.expression(0)?;
+            self.expect_op(")")?;
+            self.arena_expr(Expr::AnyAll {
+                operand,
+                operator,
+                array,
+                all,
+            })?
+        };
+        if negated {
+            self.arena_expr(Expr::Unary {
+                source_position,
+                operator: crate::sql::ast::UnaryOp::Not,
+                operand: inner,
+            })
+        } else {
+            Ok(inner)
         }
     }
 

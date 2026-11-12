@@ -252,11 +252,14 @@ Functions and expressions:
   messages. `cstring[]` values (`'{a,b}'::cstring[]`, `ARRAY['a'::cstring]`,
   `'{a}'::_cstring`) work with the array functions that need no element
   comparison, and a SQL routine may take or return one; a table or view
-  column of either type fails with `42P16`. Limits: renaming or moving a
-  built-in fails with `0A000`; `x IN (SELECT c ...)` and `x = ANY (SELECT c
-  ...)` over a `cstring` column `c` are accepted where PostgreSQL reports
-  `42883`; the type-modifier input functions (`numerictypmodin`) fail with
-  `0A000`.
+  column of either type fails with `42P16`. `x IN (SELECT c ...)` and `x op
+  ANY (SELECT c ...)` resolve their operator from the subquery column's
+  declared type before reading a row, so a `cstring` side fails with `42883`
+  even over an empty result. The type-modifier input functions
+  (`numerictypmodin('{10,2}')` is `655366`) encode and validate modifiers as
+  PostgreSQL does. Limits: renaming or moving a built-in fails with `0A000`;
+  a temporal precision above 6, which PostgreSQL clamps with a `WARNING`
+  (`timetypmodin('{7}')`), fails with `0A000`.
   Dropping a built-in fails with `2BP01`, as in PostgreSQL.
 - PostgreSQL 18.6's predefined roles exist from the start, with their
   OIDs, and initdb's memberships of `pg_monitor` in `pg_read_all_settings`,
@@ -336,6 +339,18 @@ Functions and expressions:
   `2202E` outside its bounds. Assigning a slice (`a[1:2] = ...`) fails.
 - Point coordinates use `(point(1,2))[0]`. Converting an open path to a polygon
   fails with `22023`.
+- A PL/pgSQL row variable (`r t`, `r t%ROWTYPE`, `r composite_type`) has
+  its declared row type from the start: while it is NULL, `pg_typeof(r.a)`
+  names the field's declared type, `pg_typeof(r)` names the table, and an
+  unknown field fails with `42703` (`record "r" has no field "zz"`). A field
+  of an unassigned `record` variable fails with `55000`. `FOR r IN SELECT
+  ...` fills a row variable from each row's columns.
+- `x LIKE ANY (SELECT ...)`, `NOT LIKE ALL` and `ILIKE` match against a
+  subquery's rows as they do against an array. The operator spellings `~~`,
+  `!~~`, `~~*` and `!~~*` are `LIKE`, `NOT LIKE`, `ILIKE` and `NOT ILIKE`,
+  quantified forms included (`x ~~ ANY (array['a%'])`). A pattern match
+  between non-string operands (`1 LIKE 'a'`) fails with `42883` (`operator
+  does not exist: integer ~~ unknown`).
 - An unmatched PL/pgSQL `CASE` without `ELSE` raises `20000` (`case not found`,
   hint `CASE statement is missing ELSE part.`).
 - User error codes such as `PZ001` behave as ordinary errors: `WHEN SQLSTATE

@@ -213,6 +213,7 @@ max_extended_statistics = 512
 max_views = 64
 max_materialized_views = 64
 max_routines = 64
+max_cursors = 24
 max_casts = 64
 max_operators = 64
 max_operator_families = 64
@@ -314,7 +315,7 @@ reset_user_relations() { # port
   [[ "$1" == "$PG_PORT" ]] && database=$REFERENCE_DATABASE
   "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$database" -X -A -t -q \
     -F $'\t' \
-    -c "SELECT n.nspname, c.relname, c.relkind FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p', 'm')" |
+    -c "SELECT n.nspname, c.relname, c.relkind FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p', 'm', 'v', 'S')" |
   while IFS=$'\t' read -r schema relation relkind; do
     [[ -z "$relation" ]] && continue
     schema=${schema//\"/\"\"}
@@ -322,6 +323,8 @@ reset_user_relations() { # port
     case "$relkind" in
     m) drop='DROP MATERIALIZED VIEW' ;;
     r | p) drop='DROP TABLE' ;;
+    v) drop='DROP VIEW' ;;
+    S) drop='DROP SEQUENCE' ;;
     *)
       printf 'FAIL: unexpected reset relation kind %q\n' "$relkind"
       return 1
@@ -332,11 +335,31 @@ reset_user_relations() { # port
   done
 }
 
+reset_user_routines() { # port
+  local database=postgres
+  [[ "$1" == "$PG_PORT" ]] && database=$REFERENCE_DATABASE
+  "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$database" -X -A -t -q \
+    -F $'\t' \
+    -c "SELECT p.oid::regprocedure, p.prokind FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')" |
+  while IFS=$'\t' read -r routine kind; do
+    [[ -z "$routine" ]] && continue
+    case "$kind" in
+    a) drop='DROP AGGREGATE' ;;
+    p) drop='DROP PROCEDURE' ;;
+    *) drop='DROP FUNCTION' ;;
+    esac
+    "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$database" -X -q \
+      -c "$drop $routine CASCADE" >/dev/null 2>&1
+  done
+}
+
 reset_pair() {
   reset_user_extensions "$PG_PORT"
   reset_user_extensions "$P3_PORT"
   reset_user_relations "$PG_PORT"
   reset_user_relations "$P3_PORT"
+  reset_user_routines "$PG_PORT"
+  reset_user_routines "$P3_PORT"
 }
 
 restart_pos3ql_clean() {

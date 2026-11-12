@@ -781,9 +781,18 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         },
         ColType::TsQuery => match v {
             Datum::TsQuery(_) => v,
-            Datum::Text(text) => Datum::TsQuery(crate::sql::full_text::restore_query(
-                crate::sql::full_text::canonical_query(text, arena)?,
-            )),
+            Datum::Text(text) => {
+                let query = crate::sql::full_text::canonical_query(text, arena)?;
+                // PostgreSQL's `parse_tsquery` notices an input without operands.
+                if query.is_empty() {
+                    crate::sql::eval::raise_eval_message(
+                        crate::sql::eval::EvalMessageLevel::Notice,
+                        crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                        format_args!("text-search query doesn't contain lexemes: \"{text}\""),
+                    )?;
+                }
+                Datum::TsQuery(crate::sql::full_text::restore_query(query))
+            }
             _ => return Err(cast_unsupported(&v, "tsquery")),
         },
         ColType::Array(element) => match v {

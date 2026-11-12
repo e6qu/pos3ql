@@ -492,12 +492,6 @@ pub struct Conn {
     /// Each resource has its own wake condition; cache progress cannot retry
     /// an unrelated object download.
     parked_wait: crate::sql::StatementWait,
-    /// Times the parked message restarted after a cold read; past the
-    /// engine's bound its next attempt reads synchronously.
-    object_restarts: u32,
-    /// The objects the current message's attempts requested; a restart
-    /// counts toward `object_restarts` only once one was requested again.
-    fetch_history: crate::store::FetchHistory,
     /// Absolute deadline for the current lock acquisition. `None` means
     /// `lock_timeout = 0`; the reactor uses this to wake an otherwise idle
     /// server and retry the retained frontend message as a timeout error.
@@ -583,6 +577,15 @@ impl Conn {
             }
             crate::sql::ProtocolReset::All => self.clear_protocol_state(),
         }
+    }
+
+    /// Lets this connection's AFTER trigger queue overflow into the engine's
+    /// shared spill file.
+    pub(crate) fn attach_trigger_event_spill(
+        &mut self,
+        spill: crate::sql::trigger_events::SharedTriggerEventSpill,
+    ) {
+        self.txn.attach_trigger_event_spill(spill);
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
@@ -676,8 +679,6 @@ impl Conn {
             parked: false,
             parked_generation: 0,
             parked_wait: crate::sql::StatementWait::Lock,
-            object_restarts: 0,
-            fetch_history: crate::store::FetchHistory::new(),
             parked_deadline: None,
             resume_statement: 0,
             respool_statement: None,
@@ -1337,10 +1338,7 @@ impl Conn {
                 | Phase::AwaitSaslInit
                 | Phase::AwaitSaslFinal => self.process_auth(engine, cancel_key, auth),
                 Phase::AwaitLoginCommit => self.finish_startup(engine, cancel_key),
-                Phase::Ready | Phase::SkipToSync => {
-                    self.fetch_history.clear();
-                    self.process_message(engine)
-                }
+                Phase::Ready | Phase::SkipToSync => self.process_message(engine),
             };
             match after {
                 Step::NeedMoreData => return After::Continue,
@@ -1398,15 +1396,6 @@ impl Conn {
             return Some(PendingResponse::closed());
         }
         self.parked = false;
-        // A stream resumes from its read position; any other cold-read wait
-        // reruns the message from its start. Only a rerun after the caches
-        // evicted an object the message had already read counts.
-        if self.parked_wait == crate::sql::StatementWait::ObjectIo
-            && !self.result_streams.is_active()
-            && self.fetch_history.take_refetched()
-        {
-            self.object_restarts = self.object_restarts.saturating_add(1);
-        }
         let output_mark = self.output_mark();
         self.publication_hold = Some(output_mark);
         let mut resuming = true;
@@ -1417,21 +1406,11 @@ impl Conn {
                 self.park(crate::sql::StatementWait::ClientOutput, 0);
                 break After::Continue;
             }
-            let resumed = resuming;
             resuming = false;
-            if !resumed {
-                self.fetch_history.clear();
-            }
-            engine
-                .set_complete_reads(resumed && self.object_restarts > engine.restart_read_bound());
             let step = match self.phase {
                 Phase::AwaitLoginCommit => self.finish_startup(engine, cancel_key),
                 _ => self.process_message(engine),
             };
-            engine.set_complete_reads(false);
-            if !resumed || !matches!(step, Step::Parked) {
-                self.object_restarts = 0;
-            }
             match step {
                 Step::Close => break After::Close,
                 Step::NeedMoreData | Step::Parked => break After::Continue,
@@ -2223,9 +2202,7 @@ impl Conn {
     }
 
     fn process_message(&mut self, engine: &mut Engine) -> Step {
-        engine.exchange_fetch_history(&mut self.fetch_history);
         let step = self.process_message_inner(engine);
-        engine.exchange_fetch_history(&mut self.fetch_history);
         self.release_orphaned_portal_stream();
         step
     }
@@ -2371,11 +2348,11 @@ impl Conn {
                                     &mut self.txn,
                                     &self.guc,
                                     crate::sql::txn::CommitTarget::Ordinary,
-                                    Some(crate::sql::CursorCommitContext {
+                                    crate::sql::CursorCommitContext {
                                         cursors: &mut self.cursors,
-                                        plans: &mut self.sqlprep,
+                                        plans: Some(&mut self.sqlprep),
                                         arena: &self.arena,
-                                    }),
+                                    },
                                     &self.arena,
                                     &mut responder,
                                 )
@@ -3085,6 +3062,7 @@ impl Conn {
                             crate::sql::CopyRowContext::new(
                                 &mut self.txn,
                                 &self.guc,
+                                &mut self.cursors,
                                 &self.arena,
                                 &mut responder,
                                 &mut self.copy_transition_scratch,
@@ -3174,6 +3152,7 @@ impl Conn {
                                 crate::sql::CopyRowContext::new(
                                     &mut self.txn,
                                     &self.guc,
+                                    &mut self.cursors,
                                     &self.arena,
                                     &mut responder,
                                     &mut self.copy_transition_scratch,
@@ -3235,6 +3214,7 @@ impl Conn {
                         crate::sql::CopyRowContext::new(
                             &mut self.txn,
                             &self.guc,
+                            &mut self.cursors,
                             &self.arena,
                             &mut responder,
                             &mut self.copy_transition_scratch,
@@ -3263,11 +3243,11 @@ impl Conn {
                         &copy.setup,
                         &mut self.txn,
                         &self.guc,
-                        Some(crate::sql::CursorCommitContext {
+                        crate::sql::CursorCommitContext {
                             cursors: &mut self.cursors,
-                            plans: &mut self.sqlprep,
+                            plans: Some(&mut self.sqlprep),
                             arena: &self.arena,
-                        }),
+                        },
                         &mut responder,
                         &self.copy_transition_scratch,
                         if extended {

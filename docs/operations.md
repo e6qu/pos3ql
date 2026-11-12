@@ -41,6 +41,7 @@ tree and the packaged `/etc/pos3ql/pos3ql.conf`; physical limits are in
 | `result_stream_slots` | yes | Result streams per connection, each `result_stream_bytes` (e.g. `2`; at least 1): a running statement uses one and each suspended paged portal keeps one. With every slot held, another large result queues in the spool and another paged portal buffers in `portal_result_bytes`. |
 | `plan_build_bytes` | yes | Shared bytes for the build sides of streamed plan nodes, such as the hash table of a streamed or cursor-read hash join; a multiple of 64 (e.g. `16MiB`). A build that does not fit runs its statement the way it ran without streaming instead: a result spools (counted under `reason="capacity"`), and a cursor saves its rows at `DECLARE` in `cursor_bytes`. |
 | `plan_build_leases` | yes | Plan nodes that can hold a build side at once (e.g. `64`); each streamed or cursor-read hash join holds three while it is open. |
+| `trigger_event_spill_bytes` | yes | Local file shared by all connections for queued `AFTER` trigger and foreign key events once a connection's `deferred_trigger_bytes` (default `256KiB`) is full; recreated empty at startup. `0` keeps every queue in memory, otherwise at least `64KiB` (e.g. `1GiB`). A statement queuing past both gets `54000`. |
 | `large_object_pages` | no (default `8192`, must be nonzero) | Resident 2 KiB large-object pages. |
 
 ## Operational listener

@@ -5141,6 +5141,11 @@ pub struct Insert<'a> {
     pub returning: Returning<'a>,
     /// `OVERRIDING { SYSTEM | USER } VALUE` for identity columns.
     pub overriding: Overriding,
+    /// A rewrite rule's multi-row `VALUES` action run over its source rows:
+    /// when non-empty, the `select` source's last output column is the
+    /// zero-based `VALUES` row, and entry `n` holds the target positions row
+    /// `n` writes as `DEFAULT`.
+    pub values_defaults: &'a [crate::storage::ColumnSet],
 }
 
 /// `OVERRIDING` mode for `INSERT` into a table with identity columns.
@@ -6194,6 +6199,7 @@ pub(crate) fn is_volatile_function(name: &str) -> bool {
         "pg_blocking_pids",
         "pg_cancel_backend",
         "pg_terminate_backend",
+        "pg_log_backend_memory_contexts",
         "pg_notification_queue_usage",
         "pg_advisory_lock",
         "pg_advisory_lock_shared",

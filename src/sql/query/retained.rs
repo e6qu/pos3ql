@@ -2446,6 +2446,13 @@ impl<'a> RetainedSelect<'a> {
         })
     }
 
+    /// Whether planning proved the query returns no rows (a constant false
+    /// filter), which PostgreSQL plans as a result node that cannot scan
+    /// backward.
+    pub(crate) fn eliminated(&self) -> bool {
+        matches!(self.plan.state, ReaderState::Eliminated)
+    }
+
     pub(crate) fn default_scrollable(&self) -> bool {
         // PostgreSQL never makes a row-locking cursor scrollable by default;
         // a sort can scan backward.

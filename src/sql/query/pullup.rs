@@ -1709,12 +1709,12 @@ impl<'a> Rewrite<'_, 'a> {
                 }
                 SelectItem::Wildcard(_) => {
                     changed = true;
-                    for table in 0..scope.n {
+                    for (table, name) in scope.names[..scope.n].iter().enumerate() {
                         if table == position {
                             push_pulled(&mut rewritten)?;
                         } else {
                             rewritten
-                                .push(SelectItem::TableWildcard(scope.names[table]))
+                                .push(SelectItem::TableWildcard(name))
                                 .map_err(|_| Stop::full())?;
                         }
                     }

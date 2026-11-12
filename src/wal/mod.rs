@@ -27,7 +27,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 28;
+pub(crate) const RECORD_VERSION: u8 = 29;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -120,6 +120,13 @@ wal_record_kinds! {
     KIND_CATALOG_RESERVATION = 157;
     KIND_SET_PARTITION_TRIGGER = 158;
     KIND_SET_BUILTIN_ROUTINE = 159;
+/// Trigger alterations carry the trigger's `WHEN` condition, which a column or
+/// schema rename rewrites. Kind 57, without the condition, is rejected.
+    KIND_ALTER_TRIGGER_V2 = 160;
+/// Index alterations carry the complete key expressions and predicate, which
+/// column, table and schema renames rewrite. Kind 71, with only the mutable
+/// settings, is rejected.
+    KIND_ALTER_INDEX_DEFINITION_V2 = 161;
 // Publication records carry the typed ordinary-descendant selection added
 // after the original record layout. New kinds make older bytes fail recovery
 // loudly instead of being reinterpreted as a different catalog contract.
@@ -1756,6 +1763,8 @@ pub(crate) enum WalOp<'a> {
         table: &'a str,
         new_name: &'a str,
         enabled: u8,
+        /// The complete condition after the change.
+        when: Option<&'a str>,
     },
     SetPolicy {
         identity: crate::storage::CatalogPosition,
@@ -1864,6 +1873,9 @@ pub(crate) enum WalOp<'a> {
         schema: &'a str,
         name: &'a str,
         definition: crate::storage::IndexMutableDefinition,
+        /// The complete key expressions and predicate after the change.
+        expressions: [Option<&'a str>; MAX_INDEX_COLS],
+        predicate: Option<&'a str>,
     },
     CreateTablespace {
         created_at: u64,
@@ -3262,7 +3274,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::AlterReplicationSlot { .. } => KIND_ALTER_REPLICATION_SLOT,
         WalOp::CreateTrigger { .. } => KIND_CREATE_TRIGGER_V2,
         WalOp::DropTrigger { .. } => KIND_DROP_TRIGGER,
-        WalOp::AlterTrigger { .. } => KIND_ALTER_TRIGGER,
+        WalOp::AlterTrigger { .. } => KIND_ALTER_TRIGGER_V2,
         WalOp::SetPolicy { .. } => KIND_SET_POLICY_V2,
         WalOp::DropPolicy { .. } => KIND_DROP_POLICY,
         WalOp::Commit { .. } => KIND_COMMIT,
@@ -3275,7 +3287,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::AdvanceReplicationSlot { .. } => KIND_ADVANCE_REPLICATION_SLOT,
         WalOp::CreateIndex { .. } => KIND_CREATE_INDEX,
         WalOp::BrinMaintenance { .. } => KIND_BRIN_MAINTENANCE,
-        WalOp::AlterIndexDefinition { .. } => KIND_ALTER_INDEX_DEFINITION,
+        WalOp::AlterIndexDefinition { .. } => KIND_ALTER_INDEX_DEFINITION_V2,
         WalOp::CreateTablespace { .. } => KIND_CREATE_TABLESPACE,
         WalOp::AlterTablespace { .. } => KIND_ALTER_TABLESPACE,
         WalOp::DropTablespace { .. } => KIND_DROP_TABLESPACE,
@@ -3827,6 +3839,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             table_schema,
             table,
             new_name,
+            when,
             ..
         } => {
             crate::storage::CatalogPosition::ENCODED_BYTES
@@ -3840,6 +3853,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + new_name.len()
                 + 1
+                + 2
+                + when.map_or(0, str::len)
         }
         WalOp::SetPolicy {
             schema,
@@ -3957,8 +3972,32 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 6
         }
         WalOp::BrinMaintenance { range_count, .. } => 8 + 4 + 8 + 1 + usize::from(*range_count) * 8,
-        WalOp::AlterIndexDefinition { schema, name, .. } => {
-            1 + schema.len() + 1 + name.len() + 2 + 1 + 1 + MAX_INDEX_COLS * 2 + 2 + 4 + 8 + 6
+        WalOp::AlterIndexDefinition {
+            schema,
+            name,
+            expressions,
+            predicate,
+            ..
+        } => {
+            1 + schema.len()
+                + 1
+                + name.len()
+                + 2
+                + 1
+                + 1
+                + MAX_INDEX_COLS * 2
+                + 2
+                + 4
+                + 8
+                + 6
+                + 4
+                + expressions
+                    .iter()
+                    .flatten()
+                    .map(|text| 2 + text.len())
+                    .sum::<usize>()
+                + 1
+                + predicate.map_or(0, |text| 2 + text.len())
         }
         WalOp::CreateTablespace { name, location, .. } => {
             8 + 1 + name.len() + 2 + location.len() + 24 + 2
@@ -5850,10 +5889,33 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             schema,
             name,
             definition,
+            expressions,
+            predicate,
         } => {
+            let mask = expressions
+                .iter()
+                .enumerate()
+                .fold(0u32, |mask, (index, expression)| {
+                    mask | (u32::from(expression.is_some()) << index)
+                });
             name_bytes(buffer, schema)
                 && name_bytes(buffer, name)
                 && append_index_definition(buffer, *definition)
+                && buffer.append(&mask.to_le_bytes())
+                && expressions.iter().flatten().all(|text| {
+                    text.len() <= u16::MAX as usize
+                        && buffer.append(&(text.len() as u16).to_le_bytes())
+                        && buffer.append(text.as_bytes())
+                })
+                && match predicate {
+                    Some(text) => {
+                        text.len() <= u16::MAX as usize
+                            && buffer.append(&[1])
+                            && buffer.append(&(text.len() as u16).to_le_bytes())
+                            && buffer.append(text.as_bytes())
+                    }
+                    None => buffer.append(&[0]),
+                }
         }
         WalOp::CreateTablespace {
             created_at,
@@ -7053,7 +7115,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             table,
             new_name,
             enabled,
+            when,
         } => {
+            let when_len = when.map_or(0usize, |value| value.len() + 1);
             buffer.append(&identity.encode())
                 && name_bytes(buffer, name)
                 && buffer.append(&[target.code()])
@@ -7061,6 +7125,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, table)
                 && name_bytes(buffer, new_name)
                 && buffer.append(&[*enabled])
+                && u16::try_from(when_len)
+                    .ok()
+                    .is_some_and(|length| buffer.append(&length.to_le_bytes()))
+                && when.is_none_or(|value| buffer.append(value.as_bytes()))
         }
         WalOp::SetPolicy {
             identity,
@@ -8397,7 +8465,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             def.n_checks = n_checks;
-            for k in 0..n_checks {
+            for slot in &mut def.checks[..n_checks] {
                 let constraint_name = take_name(&mut at)?;
                 let validation =
                     crate::storage::ConstraintValidation::from_code(*payload.get(at)?)?;
@@ -8415,7 +8483,7 @@ fn decode_op_inner<'a>(
                 if check.expression.is_truncated() {
                     return None;
                 }
-                def.checks[k] = check;
+                *slot = check;
             }
             // FOREIGN KEY constraints.
             let n_fkeys = *payload.get(at)? as usize;
@@ -8424,7 +8492,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             def.n_fkeys = n_fkeys;
-            for f in 0..n_fkeys {
+            for slot in &mut def.fkeys[..n_fkeys] {
                 let fname = take_name(&mut at)?;
                 let nc = *payload.get(at)? as usize;
                 at += 1;
@@ -8456,7 +8524,7 @@ fn decode_op_inner<'a>(
                 fk.on_update = FkAction::from_code(acts[1])?;
                 fk.timing = crate::storage::ConstraintTiming::from_code(acts[2])?;
                 fk.validation = crate::storage::ConstraintValidation::from_code(acts[3])?;
-                def.fkeys[f] = fk;
+                *slot = fk;
             }
             let n_exclusions = *payload.get(at)? as usize;
             at += 1;
@@ -8464,7 +8532,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             def.n_exclusions = n_exclusions;
-            for index in 0..n_exclusions {
+            for slot in &mut def.exclusions[..n_exclusions] {
                 let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
                 exclusion.name = SqlName::parse(take_name(&mut at)?).ok()?;
                 let meta = payload.get(at..at + 2)?;
@@ -8494,7 +8562,7 @@ fn decode_op_inner<'a>(
                     }
                     exclusion.predicate = Some(predicate);
                 }
-                def.exclusions[index] = exclusion;
+                *slot = exclusion;
             }
             def.schema = SqlName::parse(take_name(&mut at)?).ok()?;
             for f in 0..def.n_fkeys {
@@ -9564,7 +9632,8 @@ fn decode_op_inner<'a>(
                 table,
             })
         }),
-        KIND_ALTER_TRIGGER => decode_large_op(|| {
+        KIND_ALTER_TRIGGER => None,
+        KIND_ALTER_TRIGGER_V2 => decode_large_op(|| {
             let identity = take_catalog_position(payload, &mut at)?;
             crate::storage::CatalogIdentity::parse(identity.created_at())?;
             let name = take_name(&mut at)?;
@@ -9576,6 +9645,16 @@ fn decode_op_inner<'a>(
             let enabled = *payload.get(at)?;
             crate::storage::TriggerEnabled::from_code(enabled)?;
             at += 1;
+            let when_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+            at += 2;
+            let when = if when_len == 0 {
+                None
+            } else {
+                let length = when_len - 1;
+                let value = core::str::from_utf8(payload.get(at..at + length)?).ok()?;
+                at += length;
+                Some(value)
+            };
             (at == payload.len()).then_some(WalOp::AlterTrigger {
                 identity,
                 name,
@@ -9584,6 +9663,7 @@ fn decode_op_inner<'a>(
                 table,
                 new_name,
                 enabled,
+                when,
             })
         }),
         KIND_SET_POLICY | KIND_SET_POLICY_V2 => decode_large_op(|| {
@@ -10147,14 +10227,47 @@ fn decode_op_inner<'a>(
                 range_count: count as u8,
             })
         }),
-        KIND_ALTER_INDEX_DEFINITION => decode_large_op(|| {
+        KIND_ALTER_INDEX_DEFINITION => None,
+        KIND_ALTER_INDEX_DEFINITION_V2 => decode_large_op(|| {
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             let definition = decode_index_definition(payload, &mut at)?;
+            let mask = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            let mut expressions = [None; MAX_INDEX_COLS];
+            for (index, expression) in expressions.iter_mut().enumerate() {
+                if mask & (1 << index) == 0 {
+                    continue;
+                }
+                let length = usize::from(u16::from_le_bytes(
+                    payload.get(at..at + 2)?.try_into().ok()?,
+                ));
+                at += 2;
+                *expression = Some(core::str::from_utf8(payload.get(at..at + length)?).ok()?);
+                at += length;
+            }
+            let predicate = match *payload.get(at)? {
+                0 => {
+                    at += 1;
+                    None
+                }
+                1 => {
+                    let length = usize::from(u16::from_le_bytes(
+                        payload.get(at + 1..at + 3)?.try_into().ok()?,
+                    ));
+                    at += 3;
+                    let text = core::str::from_utf8(payload.get(at..at + length)?).ok()?;
+                    at += length;
+                    Some(text)
+                }
+                _ => return None,
+            };
             (at == payload.len()).then_some(WalOp::AlterIndexDefinition {
                 schema,
                 name,
                 definition,
+                expressions,
+                predicate,
             })
         }),
         KIND_CREATE_TABLESPACE => decode_large_op(|| {
@@ -14013,6 +14126,36 @@ mod tests {
     }
 
     #[test]
+    fn trigger_alteration_carries_its_condition_and_rejects_the_retired_kind() {
+        let mut budget = Budget::new(1024);
+        let mut payload = FixedBuf::new(&mut budget, "trigger-alteration", 512).unwrap();
+        for when in [Some("(new.renamed > 0)"), None] {
+            payload.clear();
+            let operation = WalOp::AlterTrigger {
+                identity: crate::storage::CatalogPosition::new(3, 41).unwrap(),
+                name: "audit",
+                target: TriggerTargetKind::Table,
+                table_schema: "public",
+                table: "orders",
+                new_name: "audit",
+                enabled: b'O',
+                when,
+            };
+            assert!(append_payload(&mut payload, &operation));
+            assert_eq!(payload.len(), encoded_payload_len(&operation));
+            let encoded = payload.readable();
+            assert!(matches!(
+                decode_op(KIND_ALTER_TRIGGER_V2, encoded),
+                Some(WalOp::AlterTrigger { when: decoded, .. }) if decoded == when
+            ));
+            assert!(decode_op(KIND_ALTER_TRIGGER, encoded).is_none());
+            for truncated in 0..encoded.len() {
+                assert!(decode_op(KIND_ALTER_TRIGGER_V2, &encoded[..truncated]).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn logical_message_payload_round_trips_binary_content_strictly() {
         let mut budget = Budget::new(1024);
         let mut payload = FixedBuf::new(&mut budget, "logical-message", 256).unwrap();
@@ -16754,6 +16897,7 @@ mod tests {
                     table: "orders",
                     new_name: "audit_row_disabled",
                     enabled: b'D',
+                    when: Some("NEW.total > OLD.total"),
                 },
             )
             .unwrap();
@@ -17550,6 +17694,12 @@ mod tests {
                 immediate: false,
                 ..crate::storage::IndexMutableDefinition::DEFAULT
             },
+            expressions: {
+                let mut expressions = [None; MAX_INDEX_COLS];
+                expressions[1] = Some("lower(renamed)");
+                expressions
+            },
+            predicate: None,
         };
         let mut budget = Budget::new(4096);
         let mut payload = FixedBuf::new(
@@ -17564,7 +17714,9 @@ mod tests {
             schema,
             name,
             definition,
-        }) = decode_op(KIND_ALTER_INDEX_DEFINITION, payload.readable())
+            expressions,
+            predicate,
+        }) = decode_op(KIND_ALTER_INDEX_DEFINITION_V2, payload.readable())
         else {
             panic!("clustered index definition WAL payload must decode");
         };
@@ -17572,10 +17724,13 @@ mod tests {
         assert_eq!(name, "clustered_rows");
         assert!(definition.clustered);
         assert!(!definition.immediate);
-        let immediate_at = payload.len() - 15;
+        assert_eq!(expressions[..3], [None, Some("lower(renamed)"), None]);
+        assert_eq!(predicate, None);
+        assert!(decode_op(KIND_ALTER_INDEX_DEFINITION, payload.readable()).is_none());
+        let immediate_at = payload.len() - 4 - (2 + "lower(renamed)".len()) - 1 - 15;
         payload.filled_mut()[immediate_at] = 2;
         crate::mem::guard::forbid_alloc(|| {
-            assert!(decode_op(KIND_ALTER_INDEX_DEFINITION, payload.readable()).is_none());
+            assert!(decode_op(KIND_ALTER_INDEX_DEFINITION_V2, payload.readable()).is_none());
         });
     }
 

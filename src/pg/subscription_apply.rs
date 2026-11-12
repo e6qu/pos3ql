@@ -283,6 +283,8 @@ pub struct SubscriptionApply {
     guc: GucState,
     relations: RelationMap,
     arena: Arena,
+    /// SQL cursors that triggers fired by applied changes open.
+    cursors: crate::sql::cursor::CursorPool,
     trigger_response: FixedBuf,
     copy_transition_scratch: crate::sql::exec::CopyTransitionRows,
     remote: RemoteTransaction,
@@ -299,11 +301,19 @@ impl SubscriptionApply {
                 config.max_savepoints_per_transaction,
             ))
             .saturating_add(config.subscription_arena_bytes)
+            .saturating_add(crate::sql::cursor::CursorPool::budget_bytes(config))
             .saturating_add(TRIGGER_RESPONSE_BYTES)
             .saturating_add(crate::sql::exec::CopyTransitionRows::budget_bytes(config))
             .saturating_add(crate::sql::guc::SeqSession::extra_budget_bytes(
                 config.max_sequences,
             ))
+    }
+
+    pub(crate) fn attach_trigger_event_spill(
+        &mut self,
+        spill: crate::sql::trigger_events::SharedTriggerEventSpill,
+    ) {
+        self.txn.attach_trigger_event_spill(spill);
     }
 
     pub(crate) fn new(
@@ -331,6 +341,7 @@ impl SubscriptionApply {
                 "subscription_apply_arena",
                 config.subscription_arena_bytes,
             )?,
+            cursors: crate::sql::cursor::CursorPool::new(config, budget)?,
             trigger_response: FixedBuf::new(
                 budget,
                 "subscription_trigger_response",
@@ -389,7 +400,11 @@ impl SubscriptionApply {
             &mut self.txn,
             &self.guc,
             crate::sql::txn::CommitTarget::Ordinary,
-            None,
+            crate::sql::CursorCommitContext {
+                cursors: &mut self.cursors,
+                plans: None,
+                arena: &self.arena,
+            },
             &self.arena,
             &mut responder,
         )
@@ -485,6 +500,7 @@ impl SubscriptionApply {
                 });
             if result.is_err() && worker.txn.is_active() && worker.txn.staged_commit().is_none() {
                 engine.rollback_txn(&mut worker.txn, &worker.guc);
+                worker.cursors.on_rollback();
             }
             if result.is_ok() {
                 worker.confirmed_lsn = confirmed_lsn;
@@ -541,6 +557,7 @@ impl SubscriptionApply {
                 &setup,
                 &mut worker.txn,
                 &worker.guc,
+                &mut worker.cursors,
                 &worker.arena,
                 &mut responder,
             )?;
@@ -565,6 +582,7 @@ impl SubscriptionApply {
                     crate::sql::CopyRowContext::new(
                         &mut worker.txn,
                         &worker.guc,
+                        &mut worker.cursors,
                         &worker.arena,
                         &mut responder,
                         &mut worker.copy_transition_scratch,
@@ -593,6 +611,7 @@ impl SubscriptionApply {
                     crate::sql::CopyRowContext::new(
                         &mut worker.txn,
                         &worker.guc,
+                        &mut worker.cursors,
                         &worker.arena,
                         &mut responder,
                         &mut worker.copy_transition_scratch,
@@ -616,6 +635,7 @@ impl SubscriptionApply {
                 setup,
                 &mut worker.txn,
                 &worker.guc,
+                &mut worker.cursors,
                 &mut responder,
                 crate::sql::SubscriptionCopyWorkspace::new(
                     &mut worker.arena,
@@ -704,11 +724,13 @@ impl SubscriptionApply {
     }
 
     fn abort(&mut self, engine: &mut crate::sql::Engine) {
-        engine.cancel_read_owner(crate::store::ReadOwner(
+        let owner = crate::store::ReadOwner(
             (2u128 << 96)
                 | ((self.stream.database_oid().get() as u32 as u128) << 64)
                 | self.stream.slot() as u128,
-        ));
+        );
+        engine.cancel_read_owner(owner);
+        engine.forget_statement_reads(owner);
         if self.txn.staged_commit().is_some() {
             // The commit boundary is irreversible. Its startup queue owner
             // survives a disconnected publisher until publication resolves.
@@ -717,6 +739,7 @@ impl SubscriptionApply {
         if self.txn.is_active() {
             engine.rollback_txn(&mut self.txn, &self.guc);
         }
+        self.cursors.on_rollback();
         self.remote = RemoteTransaction::Idle;
         self.arena.reset();
         self.copy_transition_scratch.clear();
@@ -899,8 +922,9 @@ impl SubscriptionApply {
                 let mut responder = Responder::new(&mut self.trigger_response);
                 responder.begin_discard_query_output(ExplainSerialize::None);
                 let result = {
-                    let mut trigger_context = crate::sql::exec::ReplicationTriggerContext::new(
+                    let session = crate::sql::exec::ReplicationSession::new(
                         self.guc.seq_session(),
+                        &mut self.cursors,
                         &mut responder,
                     );
                     let binding = engine.resolve_subscription_relation(
@@ -914,7 +938,7 @@ impl SubscriptionApply {
                         binding,
                         new,
                         &self.arena,
-                        &mut trigger_context,
+                        session,
                     )
                 };
                 let _ = responder.finish_discard_query_output();
@@ -947,8 +971,9 @@ impl SubscriptionApply {
                 let mut responder = Responder::new(&mut self.trigger_response);
                 responder.begin_discard_query_output(ExplainSerialize::None);
                 let result = {
-                    let mut trigger_context = crate::sql::exec::ReplicationTriggerContext::new(
+                    let session = crate::sql::exec::ReplicationSession::new(
                         self.guc.seq_session(),
+                        &mut self.cursors,
                         &mut responder,
                     );
                     let binding = engine.resolve_subscription_relation(
@@ -962,7 +987,7 @@ impl SubscriptionApply {
                         binding,
                         crate::sql::exec::ReplicationUpdate { identity, new },
                         &self.arena,
-                        &mut trigger_context,
+                        session,
                     )
                 };
                 let _ = responder.finish_discard_query_output();
@@ -994,8 +1019,9 @@ impl SubscriptionApply {
                 let mut responder = Responder::new(&mut self.trigger_response);
                 responder.begin_discard_query_output(ExplainSerialize::None);
                 let result = {
-                    let mut trigger_context = crate::sql::exec::ReplicationTriggerContext::new(
+                    let session = crate::sql::exec::ReplicationSession::new(
                         self.guc.seq_session(),
+                        &mut self.cursors,
                         &mut responder,
                     );
                     let binding = engine.resolve_subscription_relation(
@@ -1009,7 +1035,7 @@ impl SubscriptionApply {
                         binding,
                         old,
                         &self.arena,
-                        &mut trigger_context,
+                        session,
                     )
                 };
                 let _ = responder.finish_discard_query_output();

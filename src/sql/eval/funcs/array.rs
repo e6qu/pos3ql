@@ -730,6 +730,8 @@ pub(crate) fn dispatch<'a>(
                         return Err(crate::sql::eval::function_argument_mismatch(name, &arr));
                     }
                 };
+                // An untyped literal that fails its element cast is positioned.
+                let untyped = matches!(args[elem_index], Expr::Str(_)) && raw.is_some();
                 let source_count = raw.map_or(0, array::len);
                 let items = array::alloc_items(arena, source_count + 1)?;
                 let mut n = 0usize;
@@ -743,8 +745,14 @@ pub(crate) fn dispatch<'a>(
                 let coerced = if elem.is_null() {
                     Datum::Null
                 } else {
+                    let cast = cast_to(elem, element.to_coltype(), arena);
                     durable_element(
-                        cast_to(elem, element.to_coltype(), arena)?,
+                        match (cast, args[elem_index]) {
+                            (Err(error), Expr::Str(literal)) if untyped => {
+                                return Err(crate::sql::error_position::at_subject(error, literal));
+                            }
+                            (cast, _) => cast?,
+                        },
                         element,
                         hooks.catalog,
                         arena,

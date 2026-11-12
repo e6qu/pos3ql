@@ -255,41 +255,44 @@ pub(crate) fn for_each_dependency(
         let table_slot = usize::from(statistics.table);
         let table_oid = user_table_oid(storage, table_slot);
         let table = storage.table_def(table_slot, txid);
-        let mut columns = crate::storage::ColumnSet::EMPTY;
-        let mut simple = false;
+        // The key columns and the columns the expressions use are recorded
+        // as two separately deduplicated sets, as `CreateStatistics` does.
+        let mut keys = crate::storage::ColumnSet::EMPTY;
+        let mut expressions = crate::storage::ColumnSet::EMPTY;
         for key in statistics.keys_for(txid) {
             match key {
                 crate::storage::ExtendedStatisticsKey::Column(name) => {
                     let column = table.column_index(name.as_str()).ok_or_else(|| {
                         sql_err!(sqlstate::INTERNAL_ERROR, "statistics key column is absent")
                     })?;
-                    columns.insert(column);
-                    simple = true;
+                    keys.insert(column);
                 }
                 crate::storage::ExtendedStatisticsKey::Expression(source) => {
                     let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
-                    columns |= crate::sql::exec::check_referenced_columns(expression, &table)?;
+                    expressions |= crate::sql::exec::check_referenced_columns(expression, &table)?;
                 }
             }
         }
-        if !simple {
+        if keys.is_empty() {
             visit(DependencyEdge {
                 dependent,
                 referenced: ObjectAddress::new(PG_CLASS_OID, table_oid, 0),
                 kind: b'a',
             })?;
         }
-        for column in 0..table.n_columns {
-            if columns.contains(column) {
-                visit(DependencyEdge {
-                    dependent,
-                    referenced: ObjectAddress::new(
-                        PG_CLASS_OID,
-                        table_oid,
-                        i32::from(table.attribute_number(column)),
-                    ),
-                    kind: b'a',
-                })?;
+        for columns in [keys, expressions] {
+            for column in 0..table.n_columns {
+                if columns.contains(column) {
+                    visit(DependencyEdge {
+                        dependent,
+                        referenced: ObjectAddress::new(
+                            PG_CLASS_OID,
+                            table_oid,
+                            i32::from(table.attribute_number(column)),
+                        ),
+                        kind: b'a',
+                    })?;
+                }
             }
         }
         namespace_edge(

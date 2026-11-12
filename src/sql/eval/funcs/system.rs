@@ -1173,6 +1173,7 @@ pub(crate) fn dispatch<'a>(
                 | "pg_blocking_pids"
                 | "pg_cancel_backend"
                 | "pg_terminate_backend"
+                | "pg_log_backend_memory_contexts"
                 | "pg_listening_channels"
                 | "pg_notification_queue_usage"
                 | "pg_advisory_lock"
@@ -1441,6 +1442,27 @@ pub(crate) fn dispatch<'a>(
                     )
                 })?;
                 Ok(Datum::Bool(catalog.signal_backend(pid, terminate)?))
+            }
+            "pg_log_backend_memory_contexts" => {
+                arity(1)?;
+                let pid = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Int2(value) => i32::from(value),
+                    Datum::Int4(value) => value,
+                    Datum::Int8(value) => i32::try_from(value).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range")
+                    })?,
+                    Datum::Null => return Ok(Datum::Null),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
+                };
+                let catalog = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "backend signaling is unavailable"
+                    )
+                })?;
+                Ok(Datum::Bool(catalog.log_backend_memory_contexts(pid)?))
             }
             "pg_listening_channels" => {
                 arity(0)?;
@@ -3254,4 +3276,21 @@ pub(crate) fn format_builtin_type(
         let _ = text.write_str("[]");
     }
     Some(text)
+}
+
+/// PostgreSQL's `format_type_with_typemod` for a diagnostic.
+pub(crate) fn format_type_with_type_mod(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    oid: i32,
+    type_mod: i32,
+) -> Result<crate::util::StackStr<260>, SqlError> {
+    if crate::storage::NamedTypeKind::from_oid(oid).is_none()
+        && let Some(text) = format_builtin_type(oid, type_mod, true)
+    {
+        let mut name = crate::util::StackStr::<260>::new();
+        let _ = core::fmt::Write::write_str(&mut name, text.as_str());
+        return Ok(name);
+    }
+    crate::sql::catalog::format_type_name(storage, txid, oid)
 }

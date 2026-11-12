@@ -44,6 +44,34 @@ earlier status after another transaction changes it. In locking mode, a
 conflicting writer waits for the reader's relation lock, while work on
 unrelated tables continues.
 
+**Referential actions.** `ON DELETE`/`ON UPDATE` `CASCADE`, `SET NULL` and
+`SET DEFAULT` run when the statement that deleted or re-keyed the referenced
+rows ends, in the order of that row's `AFTER` events, as in PostgreSQL. So
+`UPDATE tree SET k = k + 10` on a self-referencing `ON UPDATE CASCADE` table
+first renumbers every row and then repoints each child, and an `AFTER DELETE`
+trigger on `orders` already sees the cascaded `lines` gone. These actions are
+never deferred, even for a `DEFERRABLE` key. A `SET DEFAULT` whose default is
+the deleted key fails like `NO ACTION` (`23503`, `Key (...) is still
+referenced`). The rewritten rows do not yet fire the referencing table's
+triggers or rules ([plan](../PLAN.md#pause-and-resume-every-query-path)).
+
+**Foreign keys between different types.** A referencing column may have a
+different type than the key it references whenever PostgreSQL 18 accepts the
+pair: an `integer` `customer_id` can reference a `bigint` primary key, a
+`varchar` code a `text` key, a `timestamp` a `date`. As in PostgreSQL, the
+check compares with the key type's own cross-type equality (`integer` with
+`bigint` compares exactly) or first converts the referencing value to the key's
+type (an `integer` referencing `numeric` or `real`, `text` referencing
+`char(n)`, which ignores trailing blanks); `ON UPDATE CASCADE` assigns the new
+key to the referencing column with its usual conversion, so a `bigint` key too
+large for an `integer` referencing column fails with `22003`. Other pairs fail
+with PostgreSQL's `42804` (`foreign key constraint "orders_customer_fkey"
+cannot be implemented`, with a `DETAIL` naming both types), also when
+`ALTER COLUMN ... TYPE` would leave a key in that state. `pg_constraint`
+reports the chosen operators in `conpfeqop`, `conppeqop` and `conffeqop`. Two
+different composite types, which PostgreSQL compares field by field, and keys
+that need a user-defined implicit cast fail with `0A000`.
+
 **Foreign keys and concurrent writers.** Inserting or updating a row that
 references another table locks the referenced (parent) row `FOR KEY SHARE`, as
 PostgreSQL does. A delete or key change of that parent waits for the inserting
@@ -327,9 +355,11 @@ built-in operators and casts, boolean logic, `CASE`, `BETWEEN`, null tests,
 array construction, subscripts, slices, scalar function calls, `LIMIT` and
 `OFFSET`. A cursor over one table, including a row-locking cursor (`FOR
 UPDATE`, `FOR SHARE` and their variants), may also order by its columns. Other
-cursor queries, including orderings by other expressions, user-defined
-operators or row-level security, run when declared; see
-[the plan](../PLAN.md#pause-and-resume-every-query-path). The functions are
+cursor queries, including orderings by other expressions,
+user-defined operators or row-level security, are described when declared and
+run whole at their first `FETCH` or `MOVE`, as PostgreSQL first runs a portal's
+plan there; see [the plan](../PLAN.md#pause-and-resume-every-query-path). The
+functions are
 `generate_series` (integer, bigint, numeric or timestamp),
 `generate_subscripts`, a one-array `unnest`, `regexp_matches`,
 `regexp_split_to_table`, and the `json`/`jsonb` `_each`, `_each_text`,
@@ -338,7 +368,39 @@ or combined in `ROWS FROM (...)` (which `FROM unnest(a, b)` expands to), with
 or without `WITH ORDINALITY`. Such a cursor keeps only the arguments and the
 next position; argument errors, such as `jsonb_each('[1]')`, are raised by the
 first `FETCH`. Other function sources, including column definition lists such
-as `jsonb_to_recordset(...) AS t(a int)`, run when declared.
+as `jsonb_to_recordset(...) AS t(a int)`, run whole at the first read.
+
+Every cursor reads the snapshot taken when it was declared or opened: its
+transaction's changes from earlier commands, and transactions committed by
+then. A cursor a `BEFORE` trigger opens therefore reads the row its statement
+inserts after the trigger returns:
+
+```sql
+-- the trigger runs OPEN c FOR SELECT a FROM t ORDER BY a
+INSERT INTO t VALUES (3);
+FETCH ALL FROM c;  -- includes 3
+```
+
+Rows the transaction changes after `DECLARE`, and later commits, stay
+invisible. Until its query has run, the cursor holds its snapshot in a
+statement snapshot slot; each server reserves `max_connections` ×
+`max_cursors` such slots beyond those of executing statements, and a full
+table raises `54000` (`statement snapshots are exhausted`). `CLOSE`, commit
+and rollback release it.
+
+Without `SCROLL` or `NO SCROLL`, a cursor is scrollable when PostgreSQL's plan
+for it can run backward and it locks no rows. pos3ql decides from the query
+after views and inlined `WITH` queries expand: table, function, multirow
+`VALUES` and recursive `WITH` scans, an `ORDER BY` over a `FROM` clause
+(unless its first key is a column an equality join matches on, which
+PostgreSQL merge-joins already sorted), `LIMIT`, and a `UNION ALL` whose branches all scroll do; a join (other than
+with a `FROM`-less one-row subquery), grouping, aggregates, `DISTINCT`,
+`DISTINCT ON`, window functions (unless an `ORDER BY` sorts above them),
+set-returning functions in the output list, `TABLESAMPLE`, `UNION`,
+`INTERSECT`, `EXCEPT`, a `FROM`-less query, and an `IN` or correlated `EXISTS`
+condition (one whose subquery has a `WHERE` clause) at the top of `WHERE` do
+not. `pg_cursors.is_scrollable` shows the choice, and a backward fetch from a
+cursor that does not scroll raises `55000`.
 
 ```sql
 DECLARE c NO SCROLL CURSOR FOR SELECT id, label FROM orders;
@@ -364,7 +426,8 @@ FETCH 1 FROM parts;  -- produces only the "a" row
   checked by the first fetch, as in PostgreSQL. Other functions in `FROM`
   still run when the cursor is declared.
 - Type errors and constant errors such as `1/0` are reported at `DECLARE`, even
-  for empty input. Operator choices are fixed then; later `search_path` changes
+  for empty input. A cursor that does not read as you fetch runs its query at
+  the first `FETCH`, so its errors come from there. Operator choices are fixed then; later `search_path` changes
   do not affect the open cursor.
 - `LIMIT 2 OFFSET 3` skips three matching rows and returns at most two.
   Negative bounds fail when fetching starts. Skipped rows still evaluate the
@@ -396,10 +459,8 @@ the row at the edge of its window again without evaluating it, and `MOVE` and
 back rewinds and reads forward). Such a cursor's history, and an ordered
 scrollable cursor's, must fit `cursor_bytes`; exhaustion
 returns `54000` and leaves the cursor failed until closed. Without a scroll
-option, a table scan, a retained set-returning function and a list of two or
-more `VALUES` rows allow scrolling; one row, `UNION ALL` and a provably empty
-result are forward-only and return saved rows. `pg_cursors.is_scrollable`
-reports the choice made at declaration.
+option, scrolling follows PostgreSQL's plan for the query, as
+[described above](#cursors-that-read-as-you-fetch).
 
 A cursor over a join of tables, `VALUES` lists and retained set-returning
 functions (inner, cross or `LEFT`, with a non-volatile condition) also reads

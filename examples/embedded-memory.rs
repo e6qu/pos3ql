@@ -228,6 +228,7 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
     config.work_arena_bytes = 8 << 20;
     config.object_store_on = false;
     config.temporary_spill_bytes = 0;
+    config.trigger_event_spill_bytes = 0;
     config.data_dir = arguments[19].clone();
     let limit: usize = arguments[21].parse()?;
     let plan = config.memory_plan(0, Engine::extra_budget_bytes(&config));

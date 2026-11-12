@@ -313,6 +313,7 @@ plan_build_leases = 64
 result_stream_bytes = 256KiB
 result_stream_slots = 2
 index_statistics_slots = $INDEX_STATISTICS_SLOTS
+trigger_event_spill_bytes = 64MiB
 value_index_rows = $TABLE_CAPACITY
 max_value_indexes = 24
 max_large_objects = 16

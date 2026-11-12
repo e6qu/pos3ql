@@ -857,7 +857,11 @@ pub(super) fn dependencies<'a>(
         }
         let table = integer(values[table])?;
         let key = super::view_rows::integers(values[key], arena)?;
-        if key.is_empty() {
+        // A CHECK's whole-row variable is attribute 0 of `conkey`. PostgreSQL's
+        // `eliminate_duplicate_dependencies` keeps that whole-table reference
+        // only when no column of the table is referenced, and its expression
+        // walk records no normal dependency for a whole-row variable.
+        if key.iter().all(|&column| column == 0) {
             push(
                 super::PG_CONSTRAINT_OID,
                 oid,
@@ -867,7 +871,7 @@ pub(super) fn dependencies<'a>(
                 b'a',
             )?;
         }
-        for &column in key {
+        for &column in key.iter().filter(|&&column| column != 0) {
             push(
                 super::PG_CONSTRAINT_OID,
                 oid,
@@ -923,19 +927,21 @@ pub(super) fn dependencies<'a>(
             continue;
         }
         let table = storage.table_def(index.table_slot, transaction);
-        let mut referenced = crate::storage::ColumnSet::EMPTY;
+        let mut simple = crate::storage::ColumnSet::EMPTY;
         for (position, &column) in index.columns[..index.n_cols].iter().enumerate() {
             if !index.expression_keys[position] {
-                referenced.insert(usize::from(column));
+                simple.insert(usize::from(column));
             }
         }
         for &column in &index.include_columns[..index.n_include_cols] {
-            referenced.insert(usize::from(column));
+            simple.insert(usize::from(column));
         }
-        // PostgreSQL's `index_create` gives an index without a simple key or
-        // INCLUDE column an automatic dependency on the whole table, besides
-        // those on the columns its expressions and predicate use.
-        let has_simple_column = !referenced.is_empty();
+        // PostgreSQL's `index_create` records the simple key and INCLUDE
+        // columns (or the whole table when there are none), then the columns
+        // the expressions use, then those the predicate uses: three separately
+        // deduplicated sets, so a column can appear in more than one. A
+        // whole-row variable records nothing of its own.
+        let mut expressions = crate::storage::ColumnSet::EMPTY;
         for position in 0..index.n_cols {
             if index.expression_keys[position] {
                 let source = super::index_expression_source(storage, index, position, transaction)
@@ -946,14 +952,15 @@ pub(super) fn dependencies<'a>(
                         )
                     })?;
                 let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
-                referenced |= super::super::exec::check_referenced_columns(expression, &table)?;
+                expressions |= super::super::exec::check_referenced_columns(expression, &table)?;
             }
         }
+        let mut predicate = crate::storage::ColumnSet::EMPTY;
         if let Some(source) = index.predicate {
             let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
-            referenced |= super::super::exec::check_referenced_columns(expression, &table)?;
+            predicate = super::super::exec::check_referenced_columns(expression, &table)?;
         }
-        if !has_simple_column {
+        if simple.is_empty() {
             push(
                 super::PG_CLASS_OID,
                 index.oid,
@@ -963,16 +970,18 @@ pub(super) fn dependencies<'a>(
                 b'a',
             )?;
         }
-        for column in 0..table.n_columns {
-            if referenced.contains(column) {
-                push(
-                    super::PG_CLASS_OID,
-                    index.oid,
-                    super::PG_CLASS_OID,
-                    index.table_oid,
-                    i32::from(table.attribute_number(column)),
-                    b'a',
-                )?;
+        for referenced in [simple, expressions, predicate] {
+            for column in 0..table.n_columns {
+                if referenced.contains(column) {
+                    push(
+                        super::PG_CLASS_OID,
+                        index.oid,
+                        super::PG_CLASS_OID,
+                        index.table_oid,
+                        i32::from(table.attribute_number(column)),
+                        b'a',
+                    )?;
+                }
             }
         }
     }

@@ -26,7 +26,7 @@ schema changes follow a different procedure; see
 | Object | Identity | Read | Write | Notes |
 |---|---|---:|---:|---|
 | Checkpoint manifest | `pos3ql-manifest-v39` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
-| Journal record | Version `28` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
+| Journal record | Version `29` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | Identity is SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; the LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process's writer token. |
@@ -61,6 +61,11 @@ changing the code, this table and the tests together.
   records leave the manifest, commit head and writer fence unchanged.
 - Missing, duplicate, zero, out-of-range or truncated identities are rejected;
   recovery never guesses or regenerates a missing identity.
+- Recovery fails with `22000` when a valid partitioned index lacks exactly one
+  attached index on a partition that can hold one, or an index is attached to
+  a parent index outside its table's partition parent. Earlier releases could
+  save partitions without their copy of a partitioned unique index, leaving
+  duplicates unchecked there; such a state is refused, not repaired.
 
 ### Change checklist
 
@@ -82,7 +87,7 @@ Do not keep a decoder or add a conversion solely for an older pos3ql version.
 ### Journal records
 
 Framing is 24 bytes: CRC32C, payload length and LSN in bytes 0–15; byte 16 is
-the operation kind; byte 17 is the version (`28`); bytes 18–23 are zero.
+the operation kind; byte 17 is the version (`29`); bytes 18–23 are zero.
 Field-width changes use new kind bytes. Kinds with special rules:
 
 | Kind | Meaning | Rule |
@@ -105,6 +110,8 @@ Field-width changes use new kind bytes. Kinds with special rules:
 | 157 | Catalog reservation | Eight-byte nonzero creation-counter reservation, kept even when a transaction creates and removes all its images. |
 | 158 | Inherited trigger change | Flags byte, then expected/replacement images: four-byte clone stamp, ten-byte trigger position, ten-byte table position, one-byte enabled mode. |
 | 159 | Built-in routine attributes | Four-byte database identifier, four-byte built-in routine OID, then strict, volatility, parallel, security-definer and leakproof bytes, cost and rows as IEEE-754 bits, a settings count (at most 16) and each `SET` setting's name and value, each after a one-byte length. Owner and privileges use the object owner and ACL kinds with the routine OID. |
+| 160 | Trigger alteration | Ten-byte position, prior name, target kind, table schema and name, new name, enabled mode, then the complete `WHEN` condition (two-byte length plus one, zero when absent). Kind 57, without the condition, is rejected. |
+| 161 | Index alteration | Schema, index name and mutable settings, then the complete key expressions (four-byte presence mask over the 32 key positions; each present expression as a two-byte length and text) and predicate (flag byte, then two-byte length and text). Kind 71, without the expressions, is rejected. |
 
 Other payload rules:
 
@@ -435,7 +442,7 @@ Labels follow PostgreSQL's
 | Format | Rule |
 |---|---|
 | `pos3ql-catalog-expression-v1` | Retained CHECK, list, partition-bound and SQL routine-body nodes with source spans and bound column numbers; rendered via `pg_get_expr`. Not PostgreSQL's `pg_node_tree`. |
-| `pos3ql-bound-query-v1` | View SQL; `/*p3e:D:M*/` before each typed enum literal binds dependency D, member M. Unknown versions and invalid bindings fail. |
+| `pos3ql-bound-query-v1` | View SQL with its written spacing and comments dropped; `/*p3e:D:M*/` before each typed enum literal binds dependency D, member M, and a literal the query did not cast is followed by a cast to its type. Unknown versions and invalid bindings fail. |
 | `pos3ql-enum-check-v1` | Domain CHECK/DEFAULT on enum bases: `/*p3c:M*/` member, `/*p3a*/` member array, `/*p3t:N*/` N-token cast type, `/*p3o:TEXT*/` original default text (`%25`, `%2f` escaped). |
 | Stored-query dependencies | Marker `0xfc`, length-prefixed identity, complete read and written column sets, then a four-byte length and checked input image. Types `d:`/`e:`/`c:<slot>:<creation>`; tables and views `t:<creation>`/`v:<creation>` (1–9,999,999). Name-only or wrong-kind keys are rejected. |
 | `TIP2` | Checked literal map: four-byte identity, four-byte count, 44-byte records (two eight-byte source offsets, type OID, type modifier, input kind, collation flag, collation code, eight-byte value length) each followed by its value. Ordered by span and kind. `TIP1` rejected. |

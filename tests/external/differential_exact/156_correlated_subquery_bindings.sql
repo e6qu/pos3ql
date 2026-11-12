@@ -1,0 +1,13 @@
+CREATE DOMAIN csb_posint AS int CHECK (VALUE > 0);
+CREATE TABLE csb_t(id int, d csb_posint, s text COLLATE "C", n numeric(5,2));
+CREATE TABLE csb_u(k int, w int, s text);
+INSERT INTO csb_t VALUES (1, 1, 'a', 1.5), (2, 2, 'b', 2.25), (3, 3, 'c', NULL);
+INSERT INTO csb_u VALUES (1, 10, 'x'), (1, 11, 'y'), (2, 20, 'z');
+SELECT id, (SELECT t.d), (SELECT max(w) + t.id FROM csb_u u WHERE u.k = t.id), (SELECT string_agg(u.s, ',' ORDER BY u.s) FROM csb_u u WHERE u.k = t.id) FROM csb_t t ORDER BY id;
+SELECT id, (SELECT t.n * 2), (SELECT sum(u.w) * t.n FROM csb_u u), (SELECT avg(w) FROM csb_u u WHERE u.k <= t.id) FROM csb_t t ORDER BY id;
+SELECT id, (SELECT t.s || u.s FROM csb_u u WHERE u.k = t.id ORDER BY u.s LIMIT 1) FROM csb_t t ORDER BY id;
+SELECT id, ARRAY(SELECT w FROM csb_u u WHERE u.k = t.id ORDER BY w), ARRAY(SELECT t.d) FROM csb_t t ORDER BY id;
+SELECT id, (SELECT count(*) FILTER (WHERE w > 10) FROM csb_u u WHERE u.k = t.id), (SELECT array_agg(w ORDER BY w DESC) FROM csb_u u WHERE u.k = t.id) FROM csb_t t ORDER BY id;
+SELECT id, (SELECT 1/(t.id - 2) FROM csb_u u LIMIT 1) FROM csb_t t WHERE id <> 2 ORDER BY id;
+SELECT id, (SELECT max(w) FROM csb_u u WHERE u.k = t.id) IS NULL FROM csb_t t GROUP BY id ORDER BY id;
+SELECT pg_typeof((SELECT t.d)), pg_typeof((SELECT max(w) FROM csb_u u WHERE k = t.id)) FROM csb_t t LIMIT 1;

@@ -633,6 +633,7 @@ pub mod sqlstate {
     pub const EXCLUSION_VIOLATION: &str = "23P01";
     pub const DUPLICATE_PREPARED_STATEMENT: &str = "42P05";
     pub const FOREIGN_KEY_VIOLATION: &str = "23503";
+    pub const RESTRICT_VIOLATION: &str = "23001";
     pub const INVALID_FOREIGN_KEY: &str = "42830";
     pub const INVALID_PRECEDING_OR_FOLLOWING_SIZE: &str = "22013";
     pub const INVALID_RECURSION: &str = "42P19";
@@ -2265,6 +2266,14 @@ pub trait CatalogAccess {
         0
     }
     fn signal_backend(&self, _backend_pid: i32, _terminate: bool) -> Result<bool, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "backend signaling is unavailable"
+        ))
+    }
+    /// `pg_log_backend_memory_contexts`: logs the memory contexts of a
+    /// server process and reports whether `backend_pid` named one.
+    fn log_backend_memory_contexts(&self, _backend_pid: i32) -> Result<bool, SqlError> {
         Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "backend signaling is unavailable"
@@ -4524,7 +4533,7 @@ fn eval_binary_expression<'a>(
             expression.right,
             row,
             hooks.catalog,
-        )?)
+        ))
     } else {
         None
     };
@@ -4538,6 +4547,18 @@ fn eval_binary_expression<'a>(
         hooks,
         arena,
     )?;
+    // PostgreSQL's strict comparison functions are not called with a NULL
+    // input, so an indeterminate collation is reported only for two values.
+    let comparison_collation = match comparison_collation {
+        Some(Err(error))
+            if error.sqlstate == sqlstate::INDETERMINATE_COLLATION
+                && (left.is_null() || right.is_null()) =>
+        {
+            Some(crate::sql::ast::Collation::None)
+        }
+        Some(resolved) => Some(resolved?),
+        None => None,
+    };
     if expression.left.is_row_constructor()
         && expression.right.is_row_constructor()
         && comparison_collation.is_some()
@@ -6684,8 +6705,28 @@ fn eval_full_inner<'a>(
             // A row `IS NULL` is true only when *every* field is null, and
             // `IS NOT NULL` only when every field is non-null — so a mixed row
             // is false for both (PostgreSQL's row null-test, not a plain
-            // negation). A whole-row reference is a named composite.
-            if let Datum::Record(fields) | Datum::Composite { fields, .. } = v {
+            // negation).
+            let fields = match v {
+                Datum::Record(fields) | Datum::Composite { fields, .. } => Some(fields),
+                Datum::CompositeText {
+                    slot,
+                    physical_fields,
+                    text,
+                } => {
+                    let catalog = hooks.catalog.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "named composite catalog access is unavailable"
+                        )
+                    })?;
+                    match catalog.materialize_composite(slot, physical_fields, text, arena)? {
+                        Datum::Composite { fields, .. } => Some(fields),
+                        _ => unreachable!("catalog materializes named composites"),
+                    }
+                }
+                _ => None,
+            };
+            if let Some(fields) = fields {
                 let result = if negated {
                     fields.iter().all(|f| !f.value.is_null())
                 } else {

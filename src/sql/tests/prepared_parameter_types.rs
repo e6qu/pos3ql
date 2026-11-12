@@ -435,3 +435,26 @@ fn unspecified_parameter_fields_report_unknown() {
         .unwrap();
     assert_eq!(inferred, [crate::sql::types::oid::TEXT]);
 }
+
+/// An untyped parameter takes its type from the built-in overload PostgreSQL
+/// selects, or from the column it is compared with.
+#[test]
+fn untyped_parameters_take_call_and_comparison_types() {
+    let config = test_config("prepared-parameter-uses");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "PREPARE typed_from_call AS SELECT abs($1), sqrt($2), upper($3), length($4); \
+             EXECUTE typed_from_call(-1, 4, 'ab', 'abc'); \
+             CREATE TABLE labelled (label text); \
+             INSERT INTO labelled VALUES ('1'), ('3'); \
+             PREPARE after_label AS SELECT label FROM labelled WHERE label > $1; \
+             EXECUTE after_label(2)",
+            true
+        )),
+        ["1|2|AB|3", "3"]
+    );
+}

@@ -938,7 +938,7 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
                 if scope.reset
                     && let Some(variable) = workspace.locals[..parent_values.len()]
                         .iter()
-                        .rposition(|local| local.name == open.variable)
+                        .rposition(|local| open.variable.names(local))
                 {
                     parent_values[variable] = Datum::Null;
                 }
@@ -1676,8 +1676,8 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                                 condition,
                                 definition,
                                 invocation,
-                                records.old.row(),
-                                records.new.row(),
+                                records.old.value(),
+                                records.new.value(),
                                 scope,
                                 scope_values,
                                 found,
@@ -1752,7 +1752,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                         };
                         let child_scope = PlpgsqlScope::frame(frames.state.active + 1);
                         if !state.opened {
-                            let statement = TriggerStatement::CursorOpen(open);
+                            let statement = TriggerStatement::CursorOpen(*open);
                             let invocation = bind_exception_variables(
                                 invocation,
                                 frames.diagnostic(),
@@ -1760,10 +1760,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                                 context.arena,
                             )?;
                             let (scope, scope_values, exception) = frames.scope(locals, values);
-                            let variable = trigger_local_index(
-                                scope,
-                                PlpgsqlVariableName::plain(open.variable),
-                            )?;
+                            let variable = trigger_local_index(scope, open.variable)?;
                             let reset = scope_values[variable].is_null();
                             execute_trigger_step(
                                 context,
@@ -1806,7 +1803,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                             transition_relations,
                             scope,
                             scope_values,
-                            TriggerStatement::CursorMotion(fetch),
+                            TriggerStatement::CursorMotion(*fetch),
                             child_scope,
                             status,
                             exception,

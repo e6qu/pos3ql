@@ -587,6 +587,9 @@ impl Engine {
         conn_id: i32,
         lock_timeout_expired: bool,
     ) -> Result<StreamStep, WireFull> {
+        // A stream resumes at its read position and never restarts, so the
+        // downloads before this wait are progress, not repeated work.
+        self.statement_progressed();
         let Some(mut state) = stream.state.filter(|state| !state.suspended) else {
             return self.fail_result_stream(
                 Some(stream),
@@ -901,6 +904,7 @@ impl Engine {
                     }
                     row_attempted = false;
                     state.emitted += u64::from(emitted);
+                    self.statement_progressed();
                 }
                 Ok(None) => {
                     if let Err(error) = sequence_scope.finish(guc.seq_session()) {
@@ -1070,7 +1074,7 @@ impl Engine {
                         txid,
                         work,
                         Some(sequences),
-                        invocations,
+                        Some(invocations),
                         frame,
                     )
                 },
@@ -1098,7 +1102,7 @@ impl Engine {
                             txid,
                             work,
                             Some(sequences),
-                            invocations,
+                            Some(invocations),
                             frame,
                         )
                     },

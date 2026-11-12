@@ -339,8 +339,8 @@ impl ExternalSorter {
                 runs[count] = Some(run);
                 count += 1;
             }
-            for slot in 0..self.level_counts[level] {
-                runs[count] = self.levels[level][slot];
+            for run in &self.levels[level][..self.level_counts[level]] {
+                runs[count] = *run;
                 count += 1;
             }
             self.level_counts[level] = 0;

@@ -452,7 +452,10 @@ pub(super) fn rule_definition<'a>(
             };
             let deparsed = match table.as_deref() {
                 Some(definition) => {
-                    let joined = [("new", definition), ("old", definition)];
+                    let joined = [
+                        super::deparse::Joined::new("new", definition),
+                        super::deparse::Joined::new("old", definition),
+                    ];
                     super::deparse::deparse(
                         &super::deparse::Context {
                             storage,

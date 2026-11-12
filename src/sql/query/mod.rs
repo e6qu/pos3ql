@@ -24,7 +24,9 @@ use super::eval::{
 use super::exec::{MAX_PROJ, describe_items};
 use super::types::{ColDesc, ColType, Datum};
 
+mod backward_scan;
 pub(super) mod input_progress;
+pub(crate) use backward_scan::{select_scans_backward, set_query_scans_backward};
 mod invocation_results;
 mod suspended_invocations;
 pub(crate) use invocation_results::OwnedRoutineResult;
@@ -82,7 +84,7 @@ pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 
 mod cte;
 pub(crate) use cte::captured_type_oid;
-pub(crate) use cte::{CteReader, dml_cte_runs_after};
+pub(crate) use cte::{CteReader, dml_cte_runs_after, select_relations, set_query_relations};
 mod dependencies;
 mod procedural_names;
 pub(crate) use procedural_names::{
@@ -102,11 +104,11 @@ mod pullup;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
 pub(crate) use cte::{
-    RuleReturningRelation, RuleTransitionType, attach_rule_source, dml_parameter_scope_query,
-    expand_set_tree, expand_stored_query, expand_stored_query_exec, expand_stored_rule_action_exec,
-    expand_stored_rule_expression_exec, expand_stored_statement_exec, restrict_rule_original,
-    rule_original_transition, rule_returning_entries, rule_returning_items, rule_transition_source,
-    split_rule_insert_defaults,
+    RuleInsertTarget, RuleReturningRelation, RuleTransitionType, attach_rule_source,
+    describe_stored_set_query, dml_parameter_scope_query, expand_set_tree, expand_stored_query,
+    expand_stored_query_exec, expand_stored_rule_action_exec, expand_stored_rule_expression_exec,
+    expand_stored_statement_exec, restrict_rule_original, rule_original_transition,
+    rule_returning_entries, rule_returning_items, rule_transition_source,
 };
 pub use cte::{
     describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under, expand_dml_ctes,
@@ -2410,6 +2412,62 @@ impl<'a> RoutineResultContract<'a> {
     }
 }
 
+/// PostgreSQL's `check_sql_fn_retval` at `CREATE FUNCTION` for a scalar
+/// result: the final query returns exactly one column, of a type with an
+/// assignment cast to the declared one (an untyped literal resolves to text).
+pub(crate) fn check_routine_scalar_result<'a>(
+    program: &RoutineFunctionProgram<'a>,
+    declared_oid: i32,
+    declared: &str,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let mut types = [0; crate::sql::exec::MAX_PROJ];
+    let count = match program.result {
+        RoutineFunctionResult::Query(RoutineQuery::Select(select)) => {
+            let mut count = 0;
+            visit_projection_types(select, storage, txid, arena, None, &mut |source, _| {
+                if let Some(slot) = types.get_mut(count) {
+                    *slot = source;
+                }
+                count += 1;
+                Ok(())
+            })?;
+            count
+        }
+        RoutineFunctionResult::Query(RoutineQuery::Set(query)) => {
+            let mut columns =
+                [crate::sql::types::ColDesc::new("", 0, 0); crate::sql::exec::MAX_PROJ];
+            setops::describe_set_body(
+                storage,
+                query.body,
+                txid,
+                &mut columns,
+                arena,
+                Some(&mut types),
+                crate::sql::exec::DescriptionTarget::Sql,
+                None,
+            )?
+        }
+        _ => return Ok(()),
+    };
+    if count != 1 {
+        return Err(routine_result_width_mismatch(declared, true, count, 1));
+    }
+    let source = if types[0] == super::types::oid::UNKNOWN {
+        ColType::Text.oid()
+    } else {
+        types[0]
+    };
+    if super::catalog::can_coerce_assignment(storage, txid, source, declared_oid) {
+        return Ok(());
+    }
+    let actual = super::catalog::format_type_name(storage, txid, source)?;
+    let detail = crate::stack_format!(300, "Actual return type is {}.", actual.as_str());
+    Err(routine_result_mismatch(declared, detail.as_str()))
+}
+
 /// PostgreSQL's `check_sql_stmt_retval` failure for a declared result.
 pub(crate) fn routine_result_mismatch(declared: &str, detail: &str) -> SqlError {
     crate::sql::eval::stash_diagnostic(Some(crate::util::StackStr::from_str(detail)), None);
@@ -2775,6 +2833,31 @@ pub(crate) fn execute_bound_routine_query<'a>(
         Some((path, dependencies.view())),
         emit,
     )
+}
+
+/// The creator's search path that binds a SQL-standard body; string bodies
+/// resolve names when they run.
+pub(crate) fn stored_routine_path(
+    storage: &Storage,
+    routine: &crate::storage::RoutineDef,
+    txid: u32,
+) -> Option<crate::storage::PathContext> {
+    (routine.body_kind != crate::storage::RoutineBodyKind::String).then(|| {
+        let user = super::eval::funcs::system::session_user_owned();
+        storage.compute_path(routine.creation_path.as_str(), user.as_str(), txid)
+    })
+}
+
+/// Binds a stored expression's routine and type names to the identities they
+/// captured at CREATE, spelled under their current names.
+pub(crate) fn bind_stored_expression<'a>(
+    expression: &'a Expr<'a>,
+    storage: &Storage,
+    txid: u32,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    cte::expand_stored_expression(expression, storage, txid, dependencies, arena)
 }
 
 pub(crate) fn bind_routine_parameter_default<'a>(
@@ -4168,6 +4251,15 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 validate_stored_type_inputs(parser, self.storage, self.txid, dependencies.view())
             },
         )?;
+        super::exec::check_polymorphic_sql_result(
+            self.storage,
+            self.txid,
+            routine,
+            arguments,
+            routine.body.as_str(),
+            &function_program,
+            self.routine_workspace,
+        )?;
         super::exec::check_called_sql_routine_result(
             self.storage,
             self.txid,
@@ -4185,6 +4277,8 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 routine,
                 self.routine_workspace,
             )?,
+            stored_routine_path(self.storage, routine, self.txid)
+                .map(|path| (path, dependencies.view())),
             self.routine_workspace,
         )?;
         let program_access = routine_program_access(&function_program);
@@ -4574,6 +4668,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn signal_backend(&self, backend_pid: i32, terminate: bool) -> Result<bool, SqlError> {
         self.storage
             .request_backend_signal(backend_pid, terminate, self.txid)
+    }
+
+    fn log_backend_memory_contexts(&self, backend_pid: i32) -> Result<bool, SqlError> {
+        self.storage.log_backend_memory_contexts(backend_pid)
     }
 
     fn listening_channel_count(&self) -> usize {
@@ -8411,6 +8509,169 @@ pub(crate) fn analyse_routine_statement<'a>(
     ))
 }
 
+/// PostgreSQL's parse analysis of a stored query (`PREPARE`): the operators,
+/// functions and condition types of the query, its join conditions, its set
+/// operation branches, derived tables and subqueries resolve before it ever
+/// runs. `select` has its views and `WITH` queries expanded. `LATERAL`
+/// derived tables and `FROM`-less subqueries are analysed when they run.
+pub(crate) fn analyse_select<'a>(
+    select: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<(), SqlError> {
+    if let Some(body) = select.set_body {
+        return analyse_set_tree(body, storage, txid, arena, outer);
+    }
+    let Some(from) = select.from.as_ref() else {
+        return Ok(());
+    };
+    for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
+        if let Some(subquery) = table.subquery
+            && !table.lateral
+        {
+            analyse_select(subquery, storage, txid, arena, outer)?;
+        }
+    }
+    let scope = QueryScope::resolve_schema(storage, from, txid, arena, outer)?;
+    check_select_types(select, &scope, storage, txid, arena, outer)?;
+    check_key_types(select, &scope, arena, storage, txid)?;
+    let schema = ScopeSchema(&scope);
+    let row = Chained {
+        inner: &schema,
+        outer,
+    };
+    let catalog = CatalogScopeCols {
+        scope: &scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    };
+    for join in from.joins {
+        if let Some(condition) = join.on {
+            if outer.is_none() {
+                super::exec::infer_type_res(condition, &catalog)?;
+            }
+            analyse_sublinks(condition, storage, txid, arena, &row)?;
+        }
+    }
+    let items = select.items.iter().filter_map(|item| match item {
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+            Some(*expression)
+        }
+        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => None,
+    });
+    for expression in items
+        .chain(select.where_clause)
+        .chain(select.group_by.iter().copied())
+        .chain(select.having)
+        .chain(select.order_by.iter().map(|key| key.expression))
+    {
+        analyse_sublinks(expression, storage, txid, arena, &row)?;
+    }
+    Ok(())
+}
+
+/// [`analyse_select`] for the condition of a stored `UPDATE` or `DELETE`,
+/// over its target and `FROM`/`USING` tables.
+pub(crate) fn analyse_dml_condition<'a>(
+    statement: &'a Stmt<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let (target, alias, extra, condition) = match statement {
+        Stmt::Update(update) => (update.table, update.alias, update.from, update.where_clause),
+        Stmt::Delete(delete) => (
+            delete.table,
+            delete.alias,
+            delete.using,
+            delete.where_clause,
+        ),
+        _ => return Ok(()),
+    };
+    let Some(condition) = condition else {
+        return Ok(());
+    };
+    let scope =
+        dependencies::dml_dependency_scope(storage, target, alias, extra, txid, arena, None)?;
+    let columns = CatalogScopeCols {
+        scope: &scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    };
+    super::exec::infer_type_res(condition, &columns)?;
+    check_condition_type("WHERE", condition, &columns, storage, txid, arena)?;
+    check_literal_operands(condition, &scope, arena)?;
+    let schema = ScopeSchema(&scope);
+    let row = Chained {
+        inner: &schema,
+        outer: None,
+    };
+    analyse_sublinks(condition, storage, txid, arena, &row)
+}
+
+fn analyse_sublinks<'a>(
+    expression: &'a Expr<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    row: &dyn ColumnLookup<'a>,
+) -> Result<(), SqlError> {
+    match expression {
+        Expr::Subquery(select)
+        | Expr::Exists(select)
+        | Expr::ArraySubquery(select)
+        | Expr::RowSubquery { select, .. } => {
+            analyse_select(select, storage, txid, arena, Some(row))
+        }
+        Expr::InSubquery {
+            operand, select, ..
+        }
+        | Expr::QuantifiedSubquery {
+            operand, select, ..
+        } => {
+            analyse_sublinks(operand, storage, txid, arena, row)?;
+            analyse_select(select, storage, txid, arena, Some(row))
+        }
+        _ => walk_children(expression, &mut |child| {
+            analyse_sublinks(child, storage, txid, arena, row)
+        }),
+    }
+}
+
+/// [`analyse_select`] for every branch of a set-operation query.
+pub(crate) fn analyse_set_query<'a>(
+    query: &'a crate::sql::ast::SetQuery<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    analyse_set_tree(query.body, storage, txid, arena, None)
+}
+
+fn analyse_set_tree<'a>(
+    tree: &'a crate::sql::ast::SetTree<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<(), SqlError> {
+    match tree {
+        crate::sql::ast::SetTree::Select(select) => {
+            analyse_select(select, storage, txid, arena, outer)
+        }
+        crate::sql::ast::SetTree::Op { left, right, .. } => {
+            analyse_set_tree(left, storage, txid, arena, outer)?;
+            analyse_set_tree(right, storage, txid, arena, outer)
+        }
+    }
+}
+
 /// [`analyse_routine_statement`] for every statement of a parsed body.
 pub(crate) fn analyse_routine_program<'a>(
     program: &RoutineFunctionProgram<'a>,
@@ -9504,7 +9765,7 @@ pub(crate) fn describe_query_under<'a>(
         super::type_inputs::validate_restored(parser, storage, txid)
     })?;
     let select = expand_ctes_under(select, storage, txid, path, arena)?;
-    describe_select(
+    let count = describe_select(
         select,
         storage,
         txid,
@@ -9512,7 +9773,9 @@ pub(crate) fn describe_query_under<'a>(
         out,
         crate::sql::exec::DescriptionTarget::Sql,
         None,
-    )
+    )?;
+    analyse_select(select, storage, txid, arena, None)?;
+    Ok(count)
 }
 
 #[expect(
@@ -11601,8 +11864,6 @@ fn over_one_row<'a>(
         .map_err(|_| arena_full())?)
 }
 
-/// A WHERE condition must be boolean (or a literal that reads as one); its
-/// type is checked before any row is read.
 /// PostgreSQL's analysis requires a boolean `WHERE` or `HAVING` condition.
 fn check_condition_type<'a>(
     clause: &str,
@@ -11633,9 +11894,35 @@ fn check_condition_type<'a>(
         ));
     }
     if let Expr::Str(text) = w {
-        super::eval::parse_bool(text)?;
+        super::eval::parse_bool(text)
+            .map_err(|error| crate::sql::error_position::at_subject(error, text))?;
     }
     Ok(())
+}
+
+/// Parse analysis of a FROM-less `SELECT` without running it: its `WHERE`
+/// type and its constant inputs, as `PREPARE` checks them.
+pub(crate) fn analyse_fromless_select<'a>(
+    statement: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    if statement.from.is_some() || statement.set_body.is_some() {
+        return Ok(());
+    }
+    let columns = super::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    if let Some(condition) = statement.where_clause {
+        check_condition_type("WHERE", condition, &columns, storage, txid, arena)?;
+    }
+    check_select_constants(statement, arena, storage, txid)
 }
 
 /// Admit the virtual input row once before scalar projection or set expansion.
@@ -14595,6 +14882,7 @@ fn describe_scope_record_star<'q>(
         txid,
         arena,
     };
+    super::exec::reject_scalar_expansion(base, &resolver, storage, txid)?;
     match base {
         Expr::Call {
             kind: super::ast::CallKind::SqlSyntax,

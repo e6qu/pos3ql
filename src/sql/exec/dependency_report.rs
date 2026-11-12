@@ -69,11 +69,62 @@ fn creation_order(object: ObjectAddress) -> u64 {
     crate::storage::OidBand::creation_order(object.object)
 }
 
+/// When `object` was created, with a rank breaking ties. A TOAST table's and
+/// its index's OIDs follow identities drawn at other times, but PostgreSQL
+/// creates them after the table's columns and constraints and before its
+/// key indexes, so they order just before the oldest key constraint or index.
+fn creation_key(storage: &Storage, txid: u32, object: ObjectAddress) -> (u64, u8) {
+    let toast_rank = if crate::storage::OidBand::ToastRelation.contains(object.object) {
+        Some(0)
+    } else if crate::storage::OidBand::of(object.object)
+        == crate::storage::OidBand::of(crate::sql::catalog::FIRST_TOAST_INDEX_OID)
+    {
+        Some(1)
+    } else {
+        None
+    };
+    if let Some(rank) = toast_rank {
+        let owner = (0..storage.table_count()).find(|&slot| {
+            storage.table_slot_visible_to(slot, txid) && {
+                let table = storage.table_def(slot, txid);
+                table.has_toast
+                    && if rank == 0 {
+                        crate::sql::catalog::toast_relation_oid(storage, slot) == object.object
+                    } else {
+                        crate::sql::catalog::toast_index_oid(storage, slot, txid) == object.object
+                    }
+            }
+        });
+        if let Some(slot) = owner {
+            let table = storage.table_def(slot, txid);
+            let keys = (0..table.columns().len())
+                .filter_map(|column| table.column_constraint_identity(column))
+                .map(|identity| creation_order(ObjectAddress::new(0, identity.oid(), 0)))
+                .chain(
+                    table
+                        .implicit_index_identities()
+                        .flatten()
+                        .map(|identity| creation_order(ObjectAddress::new(0, identity.oid(), 0))),
+                )
+                .min();
+            if let Some(boundary) = keys {
+                return (boundary, rank);
+            }
+        }
+    }
+    (creation_order(object), 2)
+}
+
 /// PostgreSQL's `object_address_comparator`: newest first, then catalog, then
 /// sub-object number.
-fn visit_order(left: &ObjectAddress, right: &ObjectAddress) -> core::cmp::Ordering {
-    creation_order(*right)
-        .cmp(&creation_order(*left))
+fn visit_order(
+    storage: &Storage,
+    txid: u32,
+    left: &ObjectAddress,
+    right: &ObjectAddress,
+) -> core::cmp::Ordering {
+    creation_key(storage, txid, *right)
+        .cmp(&creation_key(storage, txid, *left))
         .then(left.class.cmp(&right.class))
         .then((left.sub as u32).cmp(&(right.sub as u32)))
 }
@@ -338,8 +389,9 @@ impl Walker<'_> {
                 .ok_or_else(table_full)? = (edge.dependent, subflags);
             self.pending_count += 1;
         }
-        self.pending[first..self.pending_count]
-            .sort_unstable_by(|left, right| visit_order(&left.0, &right.0));
+        self.pending[first..self.pending_count].sort_unstable_by(|left, right| {
+            visit_order(self.storage, self.txid, &left.0, &right.0)
+        });
         *self.stack.get_mut(self.depth).ok_or_else(table_full)? = Frame {
             object,
             flags,
@@ -613,8 +665,17 @@ pub(crate) fn report_drop(
         return Ok(None);
     }
     let mark = arena.mark();
-    let reported = walk(storage, txid, originals, arena)
-        .and_then(|walked| report(storage, txid, &walked, originals, cascade, arena));
+    let reported = walk(storage, txid, originals, arena).and_then(|walked| {
+        let reported = report(storage, txid, &walked, originals, cascade, arena)?;
+        crate::sql::event_trigger::record_drop_order(
+            walked
+                .targets
+                .iter()
+                .rev()
+                .map(|target| (target.object.class, target.object.object, target.object.sub)),
+        );
+        Ok(reported)
+    });
     // SAFETY: the report is a value; nothing borrows the walk's memory.
     unsafe { arena.rewind_to(mark) };
     reported.map(Some)

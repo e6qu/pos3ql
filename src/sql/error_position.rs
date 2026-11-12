@@ -29,12 +29,27 @@ pub(crate) struct SourceCopy {
 /// address locates a constant that keeps no source text.
 const NODE: usize = usize::MAX;
 
+/// The length a [`SourceCopy`] of a simple `CASE`'s `WHEN` value records:
+/// the value's address locates its `WHEN` keyword, where PostgreSQL reports
+/// the comparison with the `CASE` operand.
+const CASE_WHEN: usize = usize::MAX - 1;
+
 impl SourceCopy {
     /// Records that the sublink querying `select` was written at byte `at`.
     pub(crate) fn query(select: &crate::sql::ast::Select<'_>, at: usize) -> Self {
         Self {
             address: core::ptr::from_ref(select) as usize,
             len: NODE,
+            at,
+        }
+    }
+
+    /// Records that the `WHEN` comparing `value` with a simple `CASE`'s
+    /// operand was written at byte `at`.
+    pub(crate) fn case_when(value: &crate::sql::ast::Expr<'_>, at: usize) -> Self {
+        Self {
+            address: core::ptr::from_ref(value) as usize,
+            len: CASE_WHEN,
             at,
         }
     }
@@ -58,6 +73,8 @@ struct Source {
     /// Where the text the statement was parsed from starts in `text`, which
     /// parsed source offsets are relative to.
     offset_base: usize,
+    /// Where the text `copies` were recorded from starts in `text`.
+    copies_base: usize,
     /// Whether `text` is a query a routine runs rather than the client's.
     internal: bool,
 }
@@ -68,6 +85,7 @@ const NO_SOURCE: Source = Source {
     copies: core::ptr::null(),
     copies_len: 0,
     offset_base: 0,
+    copies_base: 0,
     internal: false,
 };
 
@@ -141,6 +159,8 @@ fn note(error: SqlError, note: AnalysisNote) -> SqlError {
 
 const FUNCTION_HINT: &str = "No function matches the given name and argument types. You might need to add explicit type casts.";
 const BINARY_OPERATOR_HINT: &str = "No operator matches the given name and argument types. You might need to add explicit type casts.";
+const AMBIGUOUS_OPERATOR_HINT: &str =
+    "Could not choose a best candidate operator. You might need to add explicit type casts.";
 const UNARY_OPERATOR_HINT: &str = "No operator matches the given name and argument type. You might need to add an explicit type cast.";
 
 std::thread_local! {
@@ -150,6 +170,31 @@ std::thread_local! {
     /// position; utility commands look names up without one.
     static ANALYZED: Cell<bool> = const { Cell::new(false) };
     static PENDING: Cell<Option<Pending>> = const { Cell::new(None) };
+    /// The client's whole query string, PostgreSQL's `debug_query_string`:
+    /// the outermost statement source while it runs.
+    static CLIENT_QUERY: Cell<(*const u8, usize)> = const { Cell::new((core::ptr::null(), 0)) };
+}
+
+struct ClientQueryScope(Option<(*const u8, usize)>);
+
+impl Drop for ClientQueryScope {
+    fn drop(&mut self) {
+        if let Some(prior) = self.0 {
+            CLIENT_QUERY.with(|client| client.set(prior));
+        }
+    }
+}
+
+/// Runs `run` with the client's whole query string, if a client statement is
+/// running.
+pub(crate) fn with_client_query<R>(run: impl FnOnce(Option<&str>) -> R) -> R {
+    let (text, len) = CLIENT_QUERY.with(Cell::get);
+    if text.is_null() {
+        return run(None);
+    }
+    // with_statement_source keeps the client's text alive while it is installed.
+    let bytes = unsafe { core::slice::from_raw_parts(text, len) };
+    run(core::str::from_utf8(bytes).ok())
 }
 
 struct SourceScope(Source, bool);
@@ -175,6 +220,13 @@ pub(crate) fn with_statement_source<R>(
 ) -> R {
     PENDING.with(|pending| pending.set(None));
     crate::sql::error_context::reset();
+    let _client = ClientQueryScope(CLIENT_QUERY.with(|client| {
+        client
+            .get()
+            .0
+            .is_null()
+            .then(|| client.replace((text.as_ptr(), text.len())))
+    }));
     let _scope = SourceScope(
         SOURCE.with(|source| {
             source.replace(Source {
@@ -183,6 +235,7 @@ pub(crate) fn with_statement_source<R>(
                 copies: copies.as_ptr(),
                 copies_len: copies.len(),
                 offset_base,
+                copies_base: 0,
                 internal: false,
             })
         }),
@@ -215,16 +268,18 @@ fn within_copy(
     const MAX_DELIMITER: usize = 64;
     let text = unsafe { core::slice::from_raw_parts(source.text, source.len) };
     copies.iter().find_map(|copy| {
-        if copy.len == NODE || address < copy.address || address + len > copy.address + copy.len {
+        if copy.len >= CASE_WHEN
+            || address < copy.address
+            || address + len > copy.address + copy.len
+        {
             return None;
         }
         // The copy lives in the statement arena for the statement's duration.
         let copied = unsafe { core::slice::from_raw_parts(copy.address as *const u8, copy.len) };
+        let at = copy.at + source.copies_base;
         (0..=MAX_DELIMITER)
-            .find(|delimiter| {
-                text.get(copy.at + delimiter..copy.at + delimiter + copy.len) == Some(copied)
-            })
-            .map(|delimiter| (copy.at + delimiter + (address - copy.address), source))
+            .find(|delimiter| text.get(at + delimiter..at + delimiter + copy.len) == Some(copied))
+            .map(|delimiter| (at + delimiter + (address - copy.address), source))
     })
 }
 
@@ -241,7 +296,7 @@ fn locate(subject: &str) -> Option<(usize, Source)> {
         .iter()
         .find(|copy| copy.address == address && copy.len == subject.len())
     {
-        return Some((copy.at, source));
+        return Some((copy.at + source.copies_base, source));
     }
     let start = source.text as usize;
     if address < start || address + subject.len() > start + source.len {
@@ -285,7 +340,7 @@ fn expression_start(expression: &crate::sql::ast::Expr<'_>) -> Option<(usize, So
             copies
                 .iter()
                 .find(|copy| copy.len == NODE && copy.address == address)
-                .map(|copy| (copy.at, source))
+                .map(|copy| (copy.at + source.copies_base, source))
         }
         Expr::Str(text) | Expr::NumericLit(text) | Expr::BitLit(text) => locate(text),
         Expr::Column { qualifier, name }
@@ -361,7 +416,7 @@ pub(crate) fn at_node(error: SqlError, expression: &crate::sql::ast::Expr<'_>) -
                 copies
                     .iter()
                     .find(|copy| copy.len == NODE && copy.address == address)
-                    .map(|copy| character_position(source, copy.at))
+                    .map(|copy| character_position(source, copy.at + source.copies_base))
             };
             at(node).or_else(|| query.and_then(at))
         })
@@ -386,6 +441,37 @@ pub(crate) fn operator_at_node(
     }
     let error = at_node(error, expression);
     record(&error, None, Some(BINARY_OPERATOR_HINT));
+    error
+}
+
+/// Positions a missing comparison operator between a simple `CASE`'s
+/// operand and its `WHEN` `value` at the `WHEN` keyword, with PostgreSQL's
+/// hint; other errors pass through.
+pub(crate) fn operator_at_case_when(
+    error: SqlError,
+    value: &crate::sql::ast::Expr<'_>,
+) -> SqlError {
+    if error.sqlstate != crate::sql::eval::sqlstate::UNDEFINED_FUNCTION
+        || !error
+            .message
+            .as_str()
+            .starts_with("operator does not exist: ")
+    {
+        return error;
+    }
+    let address = core::ptr::from_ref(value) as usize;
+    let source = SOURCE.with(Cell::get);
+    let position = (!source.copies.is_null())
+        .then(|| {
+            // with_statement_source keeps the copy map alive with its text.
+            let copies = unsafe { core::slice::from_raw_parts(source.copies, source.copies_len) };
+            copies
+                .iter()
+                .find(|copy| copy.len == CASE_WHEN && copy.address == address)
+                .map(|copy| character_position(source, copy.at + source.copies_base))
+        })
+        .flatten();
+    record(&error, position, Some(BINARY_OPERATOR_HINT));
     error
 }
 
@@ -561,6 +647,13 @@ pub(crate) fn expression_error(
         } if state == sqlstate::UNDEFINED_FUNCTION && message.starts_with("operator ") => {
             annotated(error, source_position.get(), BINARY_OPERATOR_HINT)
         }
+        Expr::Binary {
+            source_position, ..
+        } if state == sqlstate::AMBIGUOUS_FUNCTION
+            && message.starts_with("operator is not unique: ") =>
+        {
+            annotated(error, source_position.get(), AMBIGUOUS_OPERATOR_HINT)
+        }
         Expr::Unary {
             source_position, ..
         } if state == sqlstate::UNDEFINED_FUNCTION && message.starts_with("operator ") => {
@@ -645,6 +738,7 @@ pub(crate) fn with_internal_source<R>(text: &str, run: impl FnOnce() -> R) -> R 
                 copies: (&[] as &[SourceCopy]).as_ptr(),
                 copies_len: 0,
                 offset_base: 0,
+                copies_base: 0,
                 internal: true,
             })
         }),
@@ -682,12 +776,27 @@ pub(crate) fn with_copied_source<R>(written: &str, copy: &str, run: impl FnOnce(
 /// inside a utility statement (a `CREATE FUNCTION ... BEGIN ATOMIC` body):
 /// their parsed offsets count from the slice's start.
 pub(crate) fn with_analysis_in<R>(text: &str, run: impl FnOnce() -> R) -> R {
+    with_analysis_of_parsed(text, None, run)
+}
+
+/// [`with_analysis_in`] for a statement parsed on its own from `text`, whose
+/// parser recorded `copies` relative to `text`.
+pub(crate) fn with_analysis_of_parsed<R>(
+    text: &str,
+    copies: Option<&[SourceCopy]>,
+    run: impl FnOnce() -> R,
+) -> R {
     let current = SOURCE.with(Cell::get);
     let start = current.text as usize;
     let address = text.as_ptr() as usize;
     let mut source = current;
     if !current.text.is_null() && address >= start && address + text.len() <= start + current.len {
         source.offset_base = address - start;
+        if let Some(copies) = copies {
+            source.copies = copies.as_ptr();
+            source.copies_len = copies.len();
+            source.copies_base = address - start;
+        }
     }
     let _scope = SourceScope(
         SOURCE.with(|installed| installed.replace(source)),

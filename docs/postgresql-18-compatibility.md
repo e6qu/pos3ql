@@ -133,6 +133,20 @@ Identity, inheritance, and partitions:
 - Ordinary `INHERITS` does not inherit identity generation. Partitions use the
   parent's sequence, but `pg_get_serial_sequence` returns NULL for a child.
   Detaching a partition clears its inherited identity; rolling back restores it.
+- A partition created with `PARTITION OF` or attached with `ATTACH PARTITION`
+  receives a copy of each index of its partitioned parent, as in PostgreSQL:
+  an equivalent valid index it already has is attached, otherwise a new one is
+  built (a unique copy fails with `23505` `could not create unique index` over
+  duplicate rows), and a partitioned partition passes the copy on to its own
+  partitions. So after `CREATE UNIQUE INDEX ON orders (id)`, a partition added
+  later rejects a duplicate `id`. Detaching a partition keeps its copies as
+  independent indexes. A foreign partition takes no copies and is refused when
+  the parent has a unique index. One difference remains: an equivalent
+  `UNIQUE` or `PRIMARY KEY` constraint of the new partition is not attached to
+  a parent's plain unique index, so pos3ql builds a separate copy where
+  PostgreSQL reuses the constraint's index. Startup refuses (`22000`) a saved
+  catalog in which a valid partitioned index lacks its copy on a partition, a
+  state earlier pos3ql releases could commit.
 
 Syntax and errors:
 
@@ -352,7 +366,35 @@ Row types:
   parameters (`PREPARE q(orders) AS SELECT $1.note`) behave as in PostgreSQL. A routine
   or column using the row type blocks `DROP TABLE orders`; `CASCADE` drops the
   routine or column. Comparing two composite values uses PostgreSQL's record
-  ordering, so `ROW(1, NULL)::orders = ROW(1, NULL)::orders` is true.
+  ordering, so `ROW(1, NULL)::orders = ROW(1, NULL)::orders` is true, and a
+  row `IS NULL`/`IS NOT NULL` test reads every field: an `orders` row with
+  one NULL column is neither.
+- `CHECK` constraints, index keys and index predicates may use the whole row
+  (`CHECK (orders IS NOT NULL)`, `CREATE INDEX ON orders (total_of(orders.*))`)
+  with PostgreSQL's constraint names, `conkey`, `pg_depend` rows and printed
+  definitions; `(orders).total` and `orders.total` mean the column itself.
+  Copying such a constraint or index with `LIKE`, `INHERITS` or `PARTITION OF`
+  fails with PostgreSQL's `0A000` `cannot convert whole-row table reference`,
+  and an extended statistics expression cannot use it. Renaming the table or
+  a column rewrites the stored keys and predicates, as PostgreSQL's printed
+  definitions show. An index key that is the row itself
+  (`CREATE INDEX ON orders ((orders))`) fails with `0A000`.
+- Renaming or moving a function or type, or renaming an enum value, fails
+  with `0A000` while a column default or generated expression, `CHECK` or
+  exclusion predicate, index key or predicate, statistics expression, trigger
+  `WHEN` condition or domain constraint names it, because those are stored
+  as SQL text; for example, after
+  `CREATE TABLE t (a int CHECK (f(a) > 0))`, `ALTER FUNCTION f(int) RENAME TO g`
+  is refused. Views, rules, policies and SQL-standard routine bodies follow
+  the rename, and so do enum literals that a domain constraint or an enum
+  column's default binds. After `ALTER FUNCTION s.f(int) RENAME TO g`, a
+  function `RETURN s.f(1)` still calls it and prints as `RETURN s.g(1)`.
+- Index keys and predicates must be immutable (`42P17` `functions in index
+  expression must be marked IMMUTABLE`), judged as PostgreSQL does after
+  inlining simple SQL functions: `CREATE INDEX ON orders ((placed_at::date))`
+  is refused for a `timestamptz` column because that cast depends on the
+  `TimeZone` setting, and so is a `STABLE` PL/pgSQL function, while a
+  `VOLATILE` SQL function whose body is `SELECT $1` is accepted.
 - A view's row type has the view's column types, modifiers and collations as
   they were when the view was created or replaced: `CREATE VIEW totals AS
   SELECT sum(amount) AS total FROM orders` keeps `total numeric` even if a later
@@ -375,7 +417,10 @@ Functions and expressions:
   defaults and `RETURN` bodies as PostgreSQL does: `DEFAULT 'x'` on a `text`
   column is shown as `'x'::text`, and `CHECK (v <> '')` on a `varchar` column as
   `CHECK (((v)::text <> ''::text))`. `pg_get_viewdef` uses PostgreSQL's
-  indented layout for views over plain tables joined with `ON`. Pretty output
+  indented layout for views over plain tables joined with `ON`, printing the
+  current names of renamed tables, functions, types and enum values
+  (`WHERE (x = 'z'::status)` after `ALTER TYPE status RENAME VALUE 'a' TO
+  'z'`). Pretty output
   (`pg_get_constraintdef(oid, true)`, as psql's `\d` uses) drops redundant
   parentheses as PostgreSQL does. Expressions outside the deparser's typed
   coverage and other views keep their stored spelling
@@ -409,8 +454,9 @@ Functions and expressions:
   supported in SQL functions`). `pg_get_function_sqlbody`
   returns a `RETURN` or `BEGIN ATOMIC` body (`RETURN (x * 2)`; `BEGIN ATOMIC`
   then one statement per line) and NULL for a quoted body; a `SELECT` of
-  expressions without `FROM` is printed in PostgreSQL's analyzed form
-  (`SELECT (x + 1);`), other statements as written.
+  expressions without `FROM` is printed in PostgreSQL's analyzed form with
+  each column's name (`SELECT (x + 1);`, `SELECT abs(x) AS abs;`), other
+  statements as written.
 - PL/pgSQL `CALL` assigns output parameters to the variables written as
   their arguments: `CALL doubled(x, y)` updates `x` and `y`, and a constant in
   an output position fails with `42601` (`procedure parameter "b" is an output
@@ -658,9 +704,13 @@ Domains and checked inputs:
   `double precision` in `pg_prepared_statements`, so `EXECUTE q(2.5)` returns
   2. A parameter that is never used (`SELECT $2::int` leaves `$1` unused) or
   only passed where any type is accepted (`pg_typeof($1)`) fails with `42P18`;
-  an otherwise untyped one is `text`. User-defined types are recorded exactly:
-  `PREPARE q(positive)` and `PREPARE q AS SELECT $1::mood` list `positive`
-  and `mood`. `EXECUTE` converts each argument with PostgreSQL's assignment
+  an otherwise untyped one is `text`. An untyped operand of a built-in
+  operator takes the type PostgreSQL's operator selection picks
+  (`jsonb -> $1` reads `text`); when it cannot pick one (`current_date + $1`)
+  `PREPARE` fails with `operator is not unique` (`42725`). User-defined types
+  are recorded exactly: `PREPARE q(positive)` and `PREPARE q AS SELECT
+  $1::mood` list `positive` and `mood`, and `EXECUTE` checks a domain's
+  constraints. `EXECUTE` converts each argument with PostgreSQL's assignment
   rules, so `EXECUTE q(2.7)` passes 3 to an integer domain and
   `EXECUTE q('happy'::text)` fails with `42804` (`parameter $1 of type text
   cannot be coerced to the expected type mood`). A protocol Parse fixes its
@@ -818,6 +868,7 @@ Exhaustion returns `54000` naming the pool, before any partial effect.
 | `table_metadata_bytes`, `table_metadata_leases` | Schema images and routine input values (starter 64 MiB, 8,192) |
 | `statistics_bytes`, `statistics_leases` | Column statistics (starter 1 MiB, 1,024) |
 | `index_statistics_slots` | Index counters (starter 4,096) |
+| `deferred_trigger_bytes`, `trigger_event_spill_bytes` (required; `0` disables spilling) | Queued `AFTER` trigger and foreign key events: per-connection memory pages, then a local file shared by all connections |
 | `definition_image_slots` | Schema pins held by executing statements |
 | `execution_control_bytes`, `execution_control_leases` | PL/pgSQL source images, locals, loop frames, saved outputs, caught errors, and the step records of a running multi-step write |
 | `write_step_levels` (optional, default 4, at most 64) | Levels of multi-step statements (rule actions on tables with rules, rules on `WITH` targets) nested in one another's steps whose progress a write keeps; a routine call after rows changed one level deeper fails with `54000` naming the setting |
@@ -832,6 +883,7 @@ Exhaustion returns `54000` naming the pool, before any partial effect.
 | `commit_queue_slots` | Commits waiting for durability |
 | `memtable_bytes` (≤ `u32::MAX`) | Two heap buffers are reserved; reclamation returns `54000` while both are retained |
 | `object_store_get_slots`, `object_store_put_slots`, `object_store_block_put_slots`, `wal_upload_buffer_bytes` | Concurrent object-store requests; see [object storage](object-storage.md) |
+| `statement_restart_waits` (optional, default 64) | Blocks one statement's restarts may download, per read owner, before a restart without progress reads the rest synchronously; see [execution model](architecture.md#execution-model) |
 | `checkpoint_manifest_bytes` and backup/merge/cleanup rosters | Maintenance work per step |
 
 Fixed per-query-workspace limits: 1,024 snapshot and file-owner slots, 64 scan
@@ -880,6 +932,11 @@ rows fit; raising `cursor_bytes` does not help there.
   row-locking cursor.
 - `WITH HOLD`: the unread suffix (plus history when scrolling) must fit; a
   scrollable cursor whose rows are evaluated again saves its whole result.
+- A trigger fired inside a writing statement (`INSERT`, `UPDATE`, `DELETE`,
+  `MERGE`, `COPY`, `TRUNCATE`, deferred constraints) can read a cursor whose
+  query runs whole at its first read. One that evaluates its rows as they are
+  fetched, or whose data-modifying `WITH` queries have not run yet, raises
+  `0A000` there.
 - A PL/pgSQL `OPEN` query with data-modifying `WITH` queries runs once, at
   the cursor's first `FETCH` or `MOVE` as in PostgreSQL, and its whole result
   must fit; a cursor closed unread never writes. A full store raises `54000`
@@ -909,7 +966,12 @@ PostgreSQL physical standby cannot replay pos3ql's journal.
   Cost estimates and `EXPLAIN` text differ from PostgreSQL.
 - Logical copies are separate durable databases updated asynchronously; there
   are no shared-storage replicas or multiple writers.
-- Monitoring fields for absent subsystems report empty or zero values.
+- Monitoring fields for absent subsystems report empty or zero values. A
+  session has no memory contexts because every pool is reserved at startup:
+  `pg_backend_memory_contexts` is empty, and
+  `pg_log_backend_memory_contexts(pid)` returns true for a session's PID after
+  logging `logging memory contexts of PID n` and an empty grand total, or warns
+  `PID n is not a PostgreSQL server process` and returns false.
 - XPath and some definition breadths are smaller subsets, as listed above.
 - Compatibility with earlier pos3ql versions is not required; unsupported
   stored formats fail explicitly.

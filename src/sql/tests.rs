@@ -10,6 +10,7 @@ use crate::mem::mutex::Mutex;
 mod aggregate_levels;
 mod array_element_comparisons;
 mod assignment_and_name_diagnostics;
+mod bound_definition_renames;
 mod builtin_aggregate_resolution;
 mod builtin_argument_binding;
 mod builtin_routine_changes;
@@ -28,10 +29,12 @@ mod dependency_rows;
 mod drop_dependency_reports;
 mod error_report_fields;
 mod evaluation_timing;
+mod foreign_key_lookups;
 mod foreign_parent_admission;
 mod function_progress;
 mod geometric_casts;
 mod geometry_assignments;
+mod index_expression_mutability;
 mod index_parent_ownership;
 mod indirect_execute_privileges;
 mod information_schema_domains;
@@ -43,6 +46,7 @@ pub(super) mod object_reads;
 mod oid_alias_comparisons;
 mod owner_role_inheritance;
 mod partition_ancestry;
+mod partition_index_propagation;
 mod plpgsql_data_modifying_with;
 mod plpgsql_row_variables;
 mod polymorphic_resolution;
@@ -59,6 +63,7 @@ mod query_scope_chain;
 mod record_comparisons;
 mod relation_row_types;
 mod result_streams;
+mod rewritten_expression_recovery;
 mod routine_calls;
 mod routine_identity_diagnostics;
 mod routine_selection;
@@ -561,11 +566,11 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
                     &mut editor.transaction,
                     &editor.guc,
                     crate::sql::txn::CommitTarget::Ordinary,
-                    Some(CursorCommitContext {
+                    CursorCommitContext {
                         cursors: &mut editor.cursors,
-                        plans: &mut editor.pool,
+                        plans: Some(&mut editor.pool),
                         arena: &editor.arena,
-                    }),
+                    },
                     &editor.arena,
                     &mut Responder::new(&mut editor.send),
                 )
@@ -8087,13 +8092,7 @@ fn postgresql_18_refcursor_type_catalog_and_native_plpgsql_cursors() {
          BEGIN; SELECT returned_cursor_probe(); \
          SELECT name, statement, is_holdable, is_binary, is_scrollable \
            FROM pg_cursors WHERE name = 'returned'; \
-         FETCH NEXT FROM returned; CLOSE returned; COMMIT; \
-         BEGIN; \
-         DECLARE visible SCROLL CURSOR FOR SELECT 1; \
-         SELECT name, statement, is_holdable, is_binary, is_scrollable, creation_time IS NOT NULL \
-           FROM pg_cursors; \
-         SELECT count(*) FROM pg_cursor(); \
-         CLOSE visible; COMMIT",
+         FETCH NEXT FROM returned; CLOSE returned; COMMIT",
     );
     assert_eq!(
         data_rows(&output),
@@ -8109,11 +8108,21 @@ fn postgresql_18_refcursor_type_catalog_and_native_plpgsql_cursors() {
             "returned",
             "returned|SELECT 11::integer AS value|f|f|f",
             "11",
-            "visible|DECLARE visible SCROLL CURSOR FOR SELECT 1|f|f|t|t",
-            "1",
         ],
         "{}",
         String::from_utf8_lossy(&output),
+    );
+    // A declared cursor shows the client's whole query string.
+    const DECLARED: &str = "BEGIN; DECLARE visible SCROLL CURSOR FOR SELECT 1; \
+         SELECT name, statement, is_holdable, is_binary, is_scrollable, creation_time IS NOT NULL \
+           FROM pg_cursors; \
+         SELECT count(*) FROM pg_cursor(); CLOSE visible; COMMIT";
+    let declared = run_with(&mut engine, &mut budget, DECLARED);
+    assert_eq!(
+        data_rows(&declared),
+        [format!("visible|{DECLARED}|f|f|t|t"), "1".to_string()],
+        "{}",
+        String::from_utf8_lossy(&declared),
     );
     assert_eq!(copy_data_rows(&output), ["saved\t{left,right}"]);
     for query in [
@@ -18338,7 +18347,14 @@ fn copy_line(
     engine.copy_row_line(
         setup,
         line,
-        super::CopyRowContext::new(txn, guc, arena, &mut responder, inserted),
+        super::CopyRowContext::new(
+            txn,
+            guc,
+            &mut super::cursor::CursorPool::for_tests(),
+            arena,
+            &mut responder,
+            inserted,
+        ),
     )
 }
 
@@ -18361,7 +18377,14 @@ fn copy_binary_row(
     engine.copy_row_binary(
         setup,
         row,
-        super::CopyRowContext::new(txn, guc, arena, &mut responder, inserted),
+        super::CopyRowContext::new(
+            txn,
+            guc,
+            &mut super::cursor::CursorPool::for_tests(),
+            arena,
+            &mut responder,
+            inserted,
+        ),
     )
 }
 
@@ -18374,11 +18397,16 @@ fn finish_copy(
     inserted: &mut crate::sql::exec::CopyTransitionRows,
 ) -> Result<(), SqlError> {
     let mut send = crate::mem::FixedBuf::new(budget, "copy finish response", 1 << 16).unwrap();
+    let arena = Arena::new(budget, "copy finish arena", 1 << 12).unwrap();
     let result = engine.copy_finish(
         setup,
         txn,
         guc,
-        None,
+        CursorCommitContext {
+            cursors: &mut super::cursor::CursorPool::for_tests(),
+            plans: None,
+            arena: &arena,
+        },
         &mut Responder::new(&mut send),
         inserted,
         CopyFinishMode::ImplicitTransaction,
@@ -19154,17 +19182,20 @@ fn configured_transaction_capacity_covers_deferred_exhaustion_and_reuse() {
         (
             "deferred-metadata",
             2,
-            4096,
+            crate::sql::trigger_events::TRIGGER_EVENT_PAGE_BYTES,
             "INSERT INTO bounded_deferred VALUES(1, 'x'), (2, 'x'), (3, 'x')",
         ),
         (
+            // One in-memory page and no spill file: an event larger than the
+            // page cannot be queued.
             "deferred-row-images",
             8,
-            128,
-            "INSERT INTO bounded_deferred VALUES(1, repeat('x', 256))",
+            crate::sql::trigger_events::TRIGGER_EVENT_PAGE_BYTES,
+            "INSERT INTO bounded_deferred VALUES(1, repeat('x', 70000))",
         ),
     ] {
         let mut config = test_config(label);
+        config.trigger_event_spill_bytes = 0;
         config.max_deferred_constraints_per_transaction = metadata;
         config.deferred_trigger_bytes = row_bytes;
         let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
@@ -19178,6 +19209,56 @@ fn configured_transaction_capacity_covers_deferred_exhaustion_and_reuse() {
             String::from_utf8_lossy(&exhausted)
         );
         assert_eq!(data_rows(&session.success(&mut engine, "ROLLBACK TO before_exhaustion; SELECT count(*) FROM bounded_deferred; INSERT INTO bounded_deferred VALUES(1, 'x'); COMMIT; SELECT count(*) FROM bounded_deferred_audit; BEGIN; INSERT INTO bounded_deferred VALUES(2, 'x'); COMMIT; SELECT count(*) FROM bounded_deferred_audit", true)), ["0", "1", "2"]);
+    }
+}
+
+/// Queued foreign key checks past one in-memory page move to the shared
+/// spill file; without it the queue fails with a named `54000`, and a
+/// rollback leaves the transaction usable.
+#[test]
+fn foreign_key_events_spill_past_memory_and_fail_named_without_spill() {
+    for spill in [true, false] {
+        let mut config = test_config(if spill {
+            "trigger-events-spill"
+        } else {
+            "trigger-events-memory"
+        });
+        config.deferred_trigger_bytes = crate::sql::trigger_events::TRIGGER_EVENT_PAGE_BYTES;
+        config.trigger_event_spill_bytes = if spill { 1 << 24 } else { 0 };
+        config.txn_rows = 4096;
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        if let Some(file) = engine.trigger_event_spill() {
+            session.transaction.attach_trigger_event_spill(file);
+        }
+        session.success(
+            &mut engine,
+            "CREATE TABLE spill_parent(id int PRIMARY KEY); \
+             CREATE TABLE spill_child(id int, parent int REFERENCES spill_parent); \
+             INSERT INTO spill_parent SELECT generate_series(1, 1500)",
+            false,
+        );
+        let output = session.execute(
+            &mut engine,
+            "INSERT INTO spill_child SELECT g, g FROM generate_series(1, 1500) g",
+            true,
+        );
+        if spill {
+            assert!(error_sqlstates(&output).is_empty());
+            let output = session.execute(
+                &mut engine,
+                "INSERT INTO spill_child SELECT g, g + 1 FROM generate_series(1490, 1500) g",
+                true,
+            );
+            assert_eq!(error_sqlstates(&output), ["23503"]);
+        } else {
+            assert_eq!(error_sqlstates(&output), ["54000"]);
+        }
+        assert_eq!(
+            data_rows(&session.success(&mut engine, "SELECT count(*) FROM spill_child", true)),
+            [if spill { "1500" } else { "0" }]
+        );
     }
 }
 
@@ -60979,6 +61060,18 @@ fn enums_order_and_enforce() {
     );
     // DROP RESTRICT fails while a column depends on the enum.
     assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "DROP TYPE mood")).contains("2BP01"));
+    // A column default's cast names the type and its labels as text, so
+    // label and type renames are refused until that table is gone.
+    for refused in [
+        "ALTER TYPE mood RENAME VALUE 'sad' TO 'blue'",
+        "ALTER TYPE mood RENAME TO feeling",
+    ] {
+        assert!(
+            String::from_utf8_lossy(&run_with(&mut e, &mut b, refused)).contains("0A000"),
+            "{refused}"
+        );
+    }
+    run_with(&mut e, &mut b, "DROP TABLE enum_defaults");
     // Renames rewrite inline scalar/array labels while preserving sort order,
     // then move the type identity (including its generated array type).
     run_with(
@@ -70891,7 +70984,7 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
             "SELECT indexdef FROM pg_indexes WHERE tablename = 'copied_cover'",
         )),
         [
-            "CREATE UNIQUE INDEX copied_cover_key_idx ON public.copied_cover USING btree (key) INCLUDE (payload, note)"
+            "CREATE UNIQUE INDEX copied_cover_key_payload_note_idx ON public.copied_cover USING btree (key) INCLUDE (payload, note)"
         ]
     );
     run_with(
@@ -80241,8 +80334,8 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
         )),
         [
             "lifecycle_default_idx|i|f|NULL",
-            "lifecycle_high_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
-            "lifecycle_low_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_high_id_value_payload_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_low_id_value_payload_idx|i|t|{fillfactor=80,deduplicate_items=off}",
             "lifecycle_value_idx|I|f|{fillfactor=80,deduplicate_items=off}",
             "2",
         ]
@@ -80386,8 +80479,8 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
             &mut replayed,
             &mut replay_budget,
             "SELECT relname, relkind, relispartition, reloptions FROM pg_class \
-             WHERE relname IN ('lifecycle_value_idx', 'lifecycle_low_id_idx', \
-                               'lifecycle_high_id_idx', 'lifecycle_expression_idx') \
+             WHERE relname IN ('lifecycle_value_idx', 'lifecycle_low_id_value_payload_idx', \
+                               'lifecycle_high_id_value_payload_idx', 'lifecycle_expression_idx') \
              ORDER BY relname; \
              SELECT attstattarget FROM pg_attribute \
              WHERE attrelid = 'lifecycle_expression_idx'::regclass AND attnum = 1; \
@@ -80400,8 +80493,8 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
         )),
         [
             "lifecycle_expression_idx|i|f|{fillfactor=70,deduplicate_items=on}",
-            "lifecycle_high_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
-            "lifecycle_low_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_high_id_value_payload_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_low_id_value_payload_idx|i|t|{fillfactor=80,deduplicate_items=off}",
             "lifecycle_value_idx|I|f|{fillfactor=80,deduplicate_items=off}",
             "77",
             "lifecycle_space_renamed|{random_page_cost=2,seq_page_cost=1.5,effective_io_concurrency=8}",
@@ -80430,7 +80523,7 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
             &mut replayed,
             &mut replay_budget,
             "SELECT count(*) FROM pg_indexes WHERE indexname IN \
-             ('lifecycle_value_idx', 'lifecycle_low_id_idx', 'lifecycle_high_id_idx')",
+             ('lifecycle_value_idx', 'lifecycle_low_id_value_payload_idx', 'lifecycle_high_id_value_payload_idx')",
         )),
         ["0"]
     );
@@ -96888,6 +96981,7 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                     &setup,
                     &mut reader.transaction,
                     &reader.guc,
+                    &mut reader.cursors,
                     &arena,
                     &mut Responder::new(&mut send),
                 )
@@ -96901,6 +96995,7 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                 let context = CopyRowContext::new(
                     &mut reader.transaction,
                     &reader.guc,
+                    &mut reader.cursors,
                     &arena,
                     &mut responder,
                     &mut transition,
@@ -96943,11 +97038,11 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                         &setup,
                         &mut reader.transaction,
                         &reader.guc,
-                        Some(CursorCommitContext {
+                        CursorCommitContext {
                             cursors: &mut reader.cursors,
-                            plans: &mut reader.pool,
+                            plans: Some(&mut reader.pool),
                             arena: &reader.arena,
-                        }),
+                        },
                         &mut Responder::new(&mut send),
                         &transition,
                         CopyFinishMode::ImplicitTransaction,

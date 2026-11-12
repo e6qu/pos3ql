@@ -416,7 +416,8 @@ impl<'a> SortState<'a> {
     /// values; NULLs are not distinct from each other.
     fn same_distinct(&self, storage: &Storage, txid: u32, index: usize) -> Result<bool, SqlError> {
         let (previous, row) = (self.entry(index - 1), self.entry(index));
-        for column in self.keys.len() - self.unique..self.keys.len() {
+        let first = self.keys.len() - self.unique;
+        for (column, key) in self.keys.iter().enumerate().skip(first) {
             let left = crate::sql::exec::ProjectedValue::column(previous, column);
             let right = crate::sql::exec::ProjectedValue::column(row, column);
             let equal = match (left.is_null(), right.is_null()) {
@@ -424,7 +425,7 @@ impl<'a> SortState<'a> {
                 (false, false) => super::materialize::compare_materialized_key(
                     storage,
                     txid,
-                    self.keys[column].collation,
+                    key.collation,
                     left,
                     right,
                 )?

@@ -90,20 +90,26 @@ fn catalog_scan(
 
 /// 42P10 for a column alias list longer than its table's columns. The
 /// query an `INSERT` with subscripted targets reads instead reports
-/// PostgreSQL's `INSERT has more target columns than expressions`.
-pub(crate) fn derived_alias_mismatch(table: &str, available: usize, specified: usize) -> SqlError {
+/// PostgreSQL's `INSERT has more target columns than expressions` at the
+/// first target without an expression, where the parser recorded each
+/// target's output name.
+pub(crate) fn derived_alias_mismatch(table: &str, available: usize, aliases: &[&str]) -> SqlError {
     if table == crate::sql::ast::INSERT_SUBSCRIPT_SOURCE {
-        return sql_err!(
+        let error = sql_err!(
             sqlstate::SYNTAX_ERROR,
             "INSERT has more target columns than expressions"
         );
+        return match aliases.get(available) {
+            Some(target) => crate::sql::error_position::at_subject(error, target),
+            None => error,
+        };
     }
     sql_err!(
         sqlstate::INVALID_COLUMN_REFERENCE,
         "table \"{}\" has {} columns available but {} columns specified",
         table,
         available,
-        specified
+        aliases.len()
     )
 }
 
@@ -1954,7 +1960,7 @@ impl<'d> QueryScope<'d> {
         if let Some(aliases) = tref.col_alias
             && aliases.len() > ncols
         {
-            return Err(derived_alias_mismatch(exposed, ncols, aliases.len()));
+            return Err(derived_alias_mismatch(exposed, ncols, aliases));
         }
         let mut names = [""; MAX_COLUMNS];
         for (index, name) in names.iter_mut().enumerate().take(ncols) {
@@ -2443,7 +2449,7 @@ impl<'d> QueryScope<'d> {
                 return Err(derived_alias_mismatch(
                     exposed,
                     definition.n_columns,
-                    aliases.len(),
+                    aliases,
                 ));
             }
             let columns = arena
@@ -2799,7 +2805,7 @@ impl<'d> QueryScope<'d> {
                 return Err(derived_alias_mismatch(
                     exposed,
                     stored_def.n_columns,
-                    aliases.len(),
+                    aliases,
                 ));
             }
             let columns = arena

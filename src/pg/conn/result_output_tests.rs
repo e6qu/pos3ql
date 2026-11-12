@@ -170,15 +170,21 @@ fn drain_after(
     ready_count: usize,
     mut received: Vec<u8>,
 ) -> Vec<u8> {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // A stall, not total duration, fails the drain: a long result on a busy
+    // host keeps delivering bytes and must not trip a wall-clock budget.
+    let mut deadline = Instant::now() + Duration::from_secs(20);
     loop {
+        let before = received.len();
         read_available(client, &mut received);
+        if received.len() > before {
+            deadline = Instant::now() + Duration::from_secs(20);
+        }
         if messages(&received).iter().filter(|m| m.0 == b'Z').count() >= ready_count {
             return received;
         }
         assert!(
             Instant::now() < deadline,
-            "response did not drain: received {} bytes, last kinds {:?}, parked {:?}, send {}, overflow {}, recv {}",
+            "response stalled: received {} bytes, last kinds {:?}, parked {:?}, send {}, overflow {}, recv {}",
             received.len(),
             messages(&received)
                 .iter()

@@ -1585,6 +1585,26 @@ pub(crate) fn validate_dml_assignment_casts(
                     insert_values(insert.columns, row, &values_columns)?;
                 }
                 if let Some(select) = insert.select {
+                    // A rule action's trailing VALUES row number is not assigned.
+                    let assigned;
+                    let select = if insert.values_defaults.is_empty() {
+                        select
+                    } else {
+                        assigned = Select {
+                            items: &select.items[..select.items.len().saturating_sub(1)],
+                            ..*select
+                        };
+                        &assigned
+                    };
+                    check_insert_counts(
+                        select,
+                        insert.columns,
+                        target.n_columns,
+                        storage,
+                        txid,
+                        arena,
+                        transition.as_ref().map(|columns| columns.row),
+                    )?;
                     super::subquery::check_select_literals(select, None, storage, txid, arena)?;
                     validate_insert_projection(
                         select,
@@ -1826,6 +1846,63 @@ pub(crate) fn require_dml_builtin_execute<'a, 'o: 'a>(
     // The check returns no arena-backed values.
     unsafe { arena.rewind_to(mark) };
     result
+}
+
+/// PostgreSQL compares the numbers of target columns and query outputs of an
+/// `INSERT ... SELECT` before converting any value, positioning the error at
+/// the first target or expression without a partner. Targets with subscripts
+/// or fields are counted as written.
+fn check_insert_counts(
+    select: &Select<'_>,
+    names: &[&str],
+    table_columns: usize,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
+) -> Result<(), SqlError> {
+    let (source, targets) = match select.from {
+        Some(FromClause {
+            base:
+                TableRef {
+                    alias: Some(crate::sql::ast::INSERT_SUBSCRIPT_SOURCE),
+                    subquery: Some(written),
+                    col_alias: Some(written_targets),
+                    ..
+                },
+            ..
+        }) => (written, written_targets.len()),
+        _ if names.is_empty() => (select, table_columns),
+        _ => (select, names.len()),
+    };
+    let mut width = 0usize;
+    visit_projection_types(source, storage, txid, arena, outer, &mut |_, _| {
+        width += 1;
+        Ok(())
+    })?;
+    if width > targets {
+        let error = sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "INSERT has more expressions than target columns"
+        );
+        return Err(
+            match crate::sql::exec::select_output_expression(source, targets) {
+                Some(expression) => crate::sql::error_position::at_expression(error, expression),
+                None => error,
+            },
+        );
+    }
+    if width < targets && !names.is_empty() {
+        let error = sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "INSERT has more target columns than expressions"
+        );
+        return Err(match names.get(width).filter(|_| names.len() == targets) {
+            Some(column) => crate::sql::error_position::at_reference(error, column),
+            None => error,
+        });
+    }
+    Ok(())
 }
 
 fn validate_insert_projection(
@@ -3924,6 +4001,21 @@ fn record_routine_call(
     }
     let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
     for (slot, argument) in argument_oids.iter_mut().zip(args.iter().copied()) {
+        // Without the FROM scope a whole-row reference has no row type yet;
+        // the caller retries with the scope instead of selecting `record`.
+        if let Expr::WholeRow(table) = argument
+            && resolver.scope.is_none()
+            && !ColTypeResolver::is_whole_row(resolver, table)
+        {
+            if unresolved.is_none() {
+                *unresolved = Some(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "missing FROM-clause entry for table \"{}\"",
+                    table
+                ));
+            }
+            return Ok(());
+        }
         match crate::sql::exec::infer_routine_argument_oid(argument, resolver) {
             Ok(oid) => *slot = oid,
             Err(error)

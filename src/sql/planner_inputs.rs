@@ -1254,6 +1254,22 @@ impl Engine {
                 txid: txn.txid,
                 arena,
             };
+            let mut argument_oids = [0; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            if candidate.arguments.len() <= argument_oids.len() {
+                for (target, argument) in argument_oids.iter_mut().zip(candidate.arguments) {
+                    *target = argument.type_oid;
+                }
+                super::exec::check_inlined_polymorphic_result(
+                    &self.storage,
+                    txn.txid,
+                    &routine,
+                    &argument_oids[..candidate.arguments.len()],
+                    body,
+                    &statements[0],
+                    inline::simple_expression(statements).is_some(),
+                    arena,
+                )?;
+            }
             let accepted = inline::accepted(
                 &routine,
                 statements,

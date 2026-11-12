@@ -6,30 +6,95 @@ use crate::mem::lease_pool::SharedSlice;
 use crate::storage::{PinnedRelationDefinition, RelationDefinition, TableDefinitionImages};
 
 /// A trigger function's `OLD` or `NEW` record. PostgreSQL declares both as
-/// record variables with the triggering relation's row structure: one the
-/// firing does not set (`NEW` for a `DELETE`, both in a statement trigger) is
-/// NULL until a field or whole row is assigned, and every assignment is
-/// local to the invocation except what a BEFORE trigger returns.
+/// record variables that start with the triggering relation's row structure:
+/// one the firing does not set (`NEW` for a `DELETE`, both in a statement
+/// trigger) is NULL until a field or whole row is assigned, and every
+/// assignment is local to the invocation except what a BEFORE trigger
+/// returns. Assigning a row of another structure gives the record that
+/// structure; assigning NULL leaves it with none.
 pub(super) struct TriggerRecord<'r, 'a> {
     values: &'r mut [Datum<'a>],
-    assigned: bool,
+    state: RecordState<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum RecordState<'a> {
+    /// No row, with the relation's structure.
+    Empty,
+    /// `values` holds a row of the relation's structure.
+    Row,
+    /// A row of another structure: a record or composite value.
+    Foreign(Datum<'a>),
+    /// Assigned NULL: no row and no structure.
+    Unassigned,
+}
+
+/// What a trigger record holds, as expressions read it.
+#[derive(Clone, Copy)]
+pub(crate) enum TriggerRecordValue<'s, 'v> {
+    /// NULL with the relation's structure.
+    Empty,
+    Row(&'s [Datum<'v>]),
+    /// A record or composite value of another structure.
+    Foreign(Datum<'v>),
+    /// NULL with no structure.
+    Unassigned,
+}
+
+impl<'s, 'v> TriggerRecordValue<'s, 'v> {
+    /// A record of the relation's structure holding `row`, if any.
+    pub(crate) fn of_row(row: Option<&'s [Datum<'v>]>) -> Self {
+        row.map_or(Self::Empty, Self::Row)
+    }
+
+    /// The relation-shaped row, or `None` for a record without one.
+    pub(crate) fn row(self) -> Option<&'s [Datum<'v>]> {
+        match self {
+            Self::Row(row) => Some(row),
+            _ => None,
+        }
+    }
 }
 
 impl<'r, 'a> TriggerRecord<'r, 'a> {
     pub(super) fn new(values: &'r mut [Datum<'a>], assigned: bool) -> Self {
-        Self { values, assigned }
+        Self {
+            values,
+            state: if assigned {
+                RecordState::Row
+            } else {
+                RecordState::Empty
+            },
+        }
     }
 
-    /// The record's row, or `None` while it is NULL.
+    /// The record's row of the relation's structure, or `None` while it holds
+    /// none.
     pub(super) fn row(&self) -> Option<&[Datum<'a>]> {
-        self.assigned.then_some(&*self.values)
+        matches!(self.state, RecordState::Row).then_some(&*self.values)
+    }
+
+    pub(super) fn value(&self) -> TriggerRecordValue<'_, 'a> {
+        match self.state {
+            RecordState::Empty => TriggerRecordValue::Empty,
+            RecordState::Row => TriggerRecordValue::Row(self.values),
+            RecordState::Foreign(value) => TriggerRecordValue::Foreign(value),
+            RecordState::Unassigned => TriggerRecordValue::Unassigned,
+        }
+    }
+
+    /// Whether the record has the relation's structure, so its fields are
+    /// the relation's columns.
+    pub(super) fn has_relation_structure(&self) -> bool {
+        matches!(self.state, RecordState::Empty | RecordState::Row)
     }
 
     /// Assigning a field of a NULL record makes its other fields NULL.
     pub(super) fn set_field(&mut self, column: usize, value: Datum<'a>) {
-        if !self.assigned {
+        debug_assert!(self.has_relation_structure());
+        if !matches!(self.state, RecordState::Row) {
             self.values.fill(Datum::Null);
-            self.assigned = true;
+            self.state = RecordState::Row;
         }
         self.values[column] = value;
     }
@@ -38,9 +103,50 @@ impl<'r, 'a> TriggerRecord<'r, 'a> {
         match row {
             Some(row) => {
                 self.values.copy_from_slice(row);
-                self.assigned = true;
+                self.state = RecordState::Row;
             }
-            None => self.assigned = false,
+            None => self.state = RecordState::Empty,
+        }
+    }
+
+    /// Takes the structure and value of a row of another structure.
+    pub(super) fn set_foreign(&mut self, value: Datum<'a>) {
+        debug_assert!(matches!(value, Datum::Record(_) | Datum::Composite { .. }));
+        self.state = RecordState::Foreign(value);
+    }
+
+    pub(super) fn set_unassigned(&mut self) {
+        self.state = RecordState::Unassigned;
+    }
+
+    const SAVED_EMPTY: i16 = 0;
+    const SAVED_ROW: i16 = 1;
+    const SAVED_FOREIGN: i16 = 2;
+    const SAVED_UNASSIGNED: i16 = 3;
+
+    /// Restores a record from what [`Self::saved_state`] captured.
+    fn restore_state(&mut self, state: Datum<'a>, foreign: Datum<'a>) -> Result<(), SqlError> {
+        self.state = match state {
+            Datum::Int2(Self::SAVED_EMPTY) => RecordState::Empty,
+            Datum::Int2(Self::SAVED_ROW) => RecordState::Row,
+            Datum::Int2(Self::SAVED_FOREIGN)
+                if matches!(foreign, Datum::Record(_) | Datum::Composite { .. }) =>
+            {
+                RecordState::Foreign(foreign)
+            }
+            Datum::Int2(Self::SAVED_UNASSIGNED) => RecordState::Unassigned,
+            _ => return Err(invalid("saved trigger firing record state changed type")),
+        };
+        Ok(())
+    }
+
+    /// The record's state code and any value of another structure.
+    fn saved_state(&self) -> (Datum<'a>, Datum<'a>) {
+        match self.state {
+            RecordState::Empty => (Datum::Int2(Self::SAVED_EMPTY), Datum::Null),
+            RecordState::Row => (Datum::Int2(Self::SAVED_ROW), Datum::Null),
+            RecordState::Foreign(value) => (Datum::Int2(Self::SAVED_FOREIGN), value),
+            RecordState::Unassigned => (Datum::Int2(Self::SAVED_UNASSIGNED), Datum::Null),
         }
     }
 
@@ -98,8 +204,8 @@ impl<'r, 'a> TriggerRows<'r, 'a> {
     ) -> TriggerTransition<'d, 's, 'a> {
         TriggerTransition {
             definition,
-            old: self.old.row(),
-            new: self.new.row(),
+            old: self.old.value(),
+            new: self.new.value(),
         }
     }
 
@@ -221,25 +327,39 @@ impl<'values, 'schema, 'rows> TriggerFiring<'values, 'schema, 'rows> {
         )?;
         let binding = &mut self.binding;
         match result {
-            Some(TriggerFlow::Return(_)) if !binding.rows.before => Ok(true),
+            // A statement trigger's result is ignored.
+            Some(TriggerFlow::Return(_)) if binding.level != TriggerLevel::Row => Ok(true),
             Some(TriggerFlow::Return(result)) => {
-                let returned = match result {
-                    TriggerReturnValue::Null | TriggerReturnValue::Void => None,
-                    TriggerReturnValue::Old => binding.rows.old.row(),
-                    TriggerReturnValue::New => binding.rows.new.row(),
-                    TriggerReturnValue::Value(value) => {
-                        control_flow::at_trigger_exit(context, binding.invocation, || {
-                            trigger_record_row(
-                                binding.definition,
-                                value,
-                                TriggerRowSource::Return,
-                                context.storage(),
-                                context.txn.txid,
-                                context.arena,
-                            )
-                        })?
-                    }
+                // Every row trigger's result must have the relation's
+                // structure, though only a BEFORE trigger's is used.
+                let foreign = |value| {
+                    control_flow::at_trigger_exit(context, binding.invocation, || {
+                        trigger_record_row(
+                            binding.definition,
+                            value,
+                            TriggerRowSource::Return,
+                            context.storage(),
+                            context.txn.txid,
+                            context.arena,
+                        )
+                    })
                 };
+                let record = match result {
+                    TriggerReturnValue::Null | TriggerReturnValue::Void => {
+                        TriggerRecordValue::Empty
+                    }
+                    TriggerReturnValue::Old => binding.rows.old.value(),
+                    TriggerReturnValue::New => binding.rows.new.value(),
+                    TriggerReturnValue::Value(value) => TriggerRecordValue::Foreign(value),
+                };
+                let returned = match record {
+                    TriggerRecordValue::Row(row) => Some(row),
+                    TriggerRecordValue::Foreign(value) => foreign(value)?,
+                    TriggerRecordValue::Empty | TriggerRecordValue::Unassigned => None,
+                };
+                if !binding.rows.before {
+                    return Ok(true);
+                }
                 let Some(returned) = returned else {
                     return Ok(false);
                 };
@@ -352,14 +472,17 @@ struct SavedAlias {
     rows: transition_rows::SavedTransitionRows,
 }
 
-/// Eight invocation values, then whether `OLD` and `NEW` are assigned.
-const HEADER_VALUES: usize = 10;
+/// Eight invocation values, then the states of `OLD` and `NEW` and their
+/// values of another structure.
+const HEADER_VALUES: usize = 12;
 
 fn capture_values(
     saved: &mut local_values::SavedValues,
     binding: &FiringBinding<'_, '_, '_>,
 ) -> Result<(), SqlError> {
     let input = binding.invocation;
+    let (old_state, old_foreign) = binding.rows.old.saved_state();
+    let (new_state, new_foreign) = binding.rows.new.saved_state();
     let header = [
         Datum::Text(input.name),
         Datum::Text(input.routine_schema),
@@ -369,8 +492,10 @@ fn capture_values(
         Datum::Text(input.event),
         Datum::Text(input.tag),
         input.argv,
-        Datum::Bool(binding.rows.old.assigned),
-        Datum::Bool(binding.rows.new.assigned),
+        old_state,
+        new_state,
+        old_foreign,
+        new_foreign,
     ];
     let old = &*binding.rows.old.values;
     let new = &*binding.rows.new.values;
@@ -567,18 +692,17 @@ impl SavedMetadata {
             materialized_relations,
             ..self.header
         };
-        let assigned = |index| match header_values[index] {
-            Datum::Bool(value) => Ok(value),
-            _ => Err(invalid("saved trigger firing record state changed type")),
-        };
-        let (old_assigned, new_assigned) = (assigned(8)?, assigned(9)?);
         let (old, new) = rows.split_at_mut(self.width);
+        let mut old = TriggerRecord::new(old, false);
+        old.restore_state(header_values[8], header_values[10])?;
+        let mut new = TriggerRecord::new(new, false);
+        new.restore_state(header_values[9], header_values[11])?;
         Ok(FiringBinding {
             invocation,
             definition,
             rows: TriggerRows {
-                old: TriggerRecord::new(old, old_assigned),
-                new: TriggerRecord::new(new, new_assigned),
+                old,
+                new,
                 before: self.before,
             },
             caller_new: self.caller_new,
@@ -681,7 +805,8 @@ impl SuspendedTriggerFiring {
         }
         let width = self.saved.metadata.width;
         let values = self.saved.values.decode(arena)?;
-        if !matches!(values[9], Datum::Bool(true)) {
+        // Only a relation-shaped `NEW` is a row the caller uses.
+        if !matches!(values[9], Datum::Int2(TriggerRecord::SAVED_ROW)) {
             return Ok(None);
         }
         let start = HEADER_VALUES + width;

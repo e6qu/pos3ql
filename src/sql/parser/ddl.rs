@@ -2876,6 +2876,29 @@ impl<'a> Parser<'a> {
                     index_expression_source(expression, self.text[start..self.peek_at].trim());
                 self.expect_op(")")?;
                 StatisticsKey::Expression(StatisticsExpression { expression, source })
+            } else if matches!(self.peeked, Tok::Ident(_) | Tok::QuotedIdent(_)) && {
+                // PostgreSQL's `stats_param` also takes a bare function call.
+                let mut lexer = self.lexer.clone();
+                matches!(
+                    lexer
+                        .next_token()
+                        .map_err(|error| ParseError::lexical(error, self.text))?,
+                    Tok::Op("(") | Tok::Op(".")
+                )
+            } {
+                let start = self.peek_at;
+                let expression = self.prefix()?;
+                if !matches!(
+                    expression,
+                    Expr::Call {
+                        kind: crate::sql::ast::CallKind::Routine,
+                        ..
+                    }
+                ) {
+                    return Err(self.syntax_error_here());
+                }
+                let source = self.text[start..self.peek_at].trim();
+                StatisticsKey::Expression(StatisticsExpression { expression, source })
             } else {
                 StatisticsKey::Column(self.col_ident("column name")?)
             };
@@ -4317,8 +4340,14 @@ impl<'a> Parser<'a> {
                 return Err(self.syntax_error_here());
             }
         }
-        let language =
-            language.ok_or_else(|| self.invalid_function_definition("no language specified"))?;
+        // PostgreSQL's CreateFunction: a SQL-standard body implies LANGUAGE SQL.
+        let language = match (language, body) {
+            (Some(language), _) => language,
+            (None, Some(body)) if !matches!(body, crate::sql::ast::RoutineBody::String(_)) => {
+                crate::sql::ast::RoutineLanguage::Sql
+            }
+            (None, _) => return Err(self.invalid_function_definition("no language specified")),
+        };
         if body.is_some_and(|body| {
             !matches!(body, crate::sql::ast::RoutineBody::String(_))
                 && language != crate::sql::ast::RoutineLanguage::Sql
@@ -8994,7 +9023,8 @@ impl<'a> Parser<'a> {
     /// The attribute elements PostgreSQL allows after a column constraint
     /// (`DEFERRABLE`, `INITIALLY ...`, `[NOT] ENFORCED`), applied to the
     /// constraint before them as its parse analysis does, with the same
-    /// errors at the offending attribute.
+    /// errors at the offending attribute. The grammar accepts any sequence,
+    /// so these errors wait until the whole statement has parsed.
     fn column_constraint_attributes(
         &mut self,
         target: ColumnAttributeTarget,
@@ -9022,10 +9052,10 @@ impl<'a> Parser<'a> {
             };
             if self.eat_ident("deferrable")? {
                 if !defers {
-                    return Err(misplaced("DEFERRABLE"));
+                    self.analysis_error(misplaced("DEFERRABLE"))?;
                 }
                 if saw_deferrability {
-                    return Err(multiple_deferrability(at));
+                    self.analysis_error(multiple_deferrability(at))?;
                 }
                 saw_deferrability = true;
                 deferrable = true;
@@ -9035,23 +9065,23 @@ impl<'a> Parser<'a> {
                 self.expect_ident("not")?;
                 if self.eat_ident("deferrable")? {
                     if !defers {
-                        return Err(misplaced("NOT DEFERRABLE"));
+                        self.analysis_error(misplaced("NOT DEFERRABLE"))?;
                     }
                     if saw_deferrability {
-                        return Err(multiple_deferrability(at));
+                        self.analysis_error(multiple_deferrability(at))?;
                     }
                     saw_deferrability = true;
                     deferrable = false;
                     if saw_initially && initially_deferred {
-                        return Err(deferred_not_deferrable(at));
+                        self.analysis_error(deferred_not_deferrable(at))?;
                     }
                 } else {
                     self.expect_ident("enforced")?;
                     if !enforces {
-                        return Err(misplaced("NOT ENFORCED"));
+                        self.analysis_error(misplaced("NOT ENFORCED"))?;
                     }
                     if saw_enforced {
-                        return Err(multiple_enforcement(at));
+                        self.analysis_error(multiple_enforcement(at))?;
                     }
                     saw_enforced = true;
                     enforced = false;
@@ -9064,17 +9094,17 @@ impl<'a> Parser<'a> {
                     false
                 };
                 if !defers {
-                    return Err(misplaced(if deferred {
+                    self.analysis_error(misplaced(if deferred {
                         "INITIALLY DEFERRED"
                     } else {
                         "INITIALLY IMMEDIATE"
-                    }));
+                    }))?;
                 }
                 if saw_initially {
-                    return Err(positioned_syntax_error(
+                    self.analysis_error(positioned_syntax_error(
                         at,
                         "multiple INITIALLY IMMEDIATE/DEFERRED clauses not allowed",
-                    ));
+                    ))?;
                 }
                 saw_initially = true;
                 initially_deferred = deferred;
@@ -9083,15 +9113,15 @@ impl<'a> Parser<'a> {
                     if !saw_deferrability {
                         deferrable = true;
                     } else if !deferrable {
-                        return Err(deferred_not_deferrable(at));
+                        self.analysis_error(deferred_not_deferrable(at))?;
                     }
                 }
             } else if self.eat_ident("enforced")? {
                 if !enforces {
-                    return Err(misplaced("ENFORCED"));
+                    self.analysis_error(misplaced("ENFORCED"))?;
                 }
                 if saw_enforced {
-                    return Err(multiple_enforcement(at));
+                    self.analysis_error(multiple_enforcement(at))?;
                 }
                 saw_enforced = true;
                 enforced = true;

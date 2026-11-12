@@ -249,6 +249,7 @@ max_extended_statistics = 512
 max_views = 64
 max_materialized_views = 64
 max_routines = 64
+max_cursors = 24
 max_casts = 64
 max_operators = 64
 max_operator_families = 64
@@ -1536,10 +1537,25 @@ reset_user_extensions() { # host port
       -c "DROP EXTENSION \"$extension\" CASCADE" >/dev/null 2>&1
   done
 }
+reset_user_routines() { # host port
+  psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
+    -F $'\t' \
+    -c "SELECT p.oid::regprocedure, p.prokind FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')" |
+  while IFS=$'\t' read -r routine kind; do
+    [[ -z "$routine" ]] && continue
+    case "$kind" in
+    a) drop='DROP AGGREGATE' ;;
+    p) drop='DROP PROCEDURE' ;;
+    *) drop='DROP FUNCTION' ;;
+    esac
+    psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -q \
+      -c "$drop $routine CASCADE" >/dev/null 2>&1
+  done
+}
 reset_user_relations() { # host port
   psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
     -F $'\t' \
-    -c "SELECT n.nspname, c.relname, c.relkind FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p', 'm')" |
+    -c "SELECT n.nspname, c.relname, c.relkind FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p', 'm', 'v', 'S')" |
   while IFS=$'\t' read -r schema relation relkind; do
     [[ -z "$relation" ]] && continue
     schema=${schema//\"/\"\"}
@@ -1547,6 +1563,8 @@ reset_user_relations() { # host port
     case "$relkind" in
     m) drop='DROP MATERIALIZED VIEW' ;;
     r | p) drop='DROP TABLE' ;;
+    v) drop='DROP VIEW' ;;
+    S) drop='DROP SEQUENCE' ;;
     *)
       printf 'FAIL: unexpected reset relation kind %q\n' "$relkind"
       return 1
@@ -1561,6 +1579,8 @@ reset_corpus_pair() {
   reset_user_extensions 127.0.0.1 "$P3_PORT"
   reset_user_relations "$PGHOST" "$PGPORT"
   reset_user_relations 127.0.0.1 "$P3_PORT"
+  reset_user_routines "$PGHOST" "$PGPORT"
+  reset_user_routines 127.0.0.1 "$P3_PORT"
 }
 
 if [[ "$RUN_CORPUS" == 1 ]]; then

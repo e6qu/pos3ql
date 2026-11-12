@@ -10,10 +10,17 @@ pub(crate) fn infer<'a>(
     txid: u32,
     arena: &'a Arena,
     oids: &mut [i32],
-) {
+) -> Ambiguity {
     infer_declared(storage, statement, txid, oids, None, arena);
-    infer_resolved(storage, statement, txid, arena, oids);
+    infer_resolved(storage, statement, txid, arena, oids)
 }
+
+/// The first parameter that is the untyped operand of a built-in operator
+/// PostgreSQL cannot choose (`date + $1`). It stays `unknown` so analysis
+/// reports `operator is not unique` at the operator.
+#[derive(Clone, Copy, Default)]
+#[must_use]
+pub(crate) struct Ambiguity(Option<u32>);
 
 pub(crate) fn infer_declared(
     storage: &Storage,
@@ -27,6 +34,7 @@ pub(crate) fn infer_declared(
         storage,
         captured_types,
         arena,
+        ambiguous: core::cell::Cell::new(None),
     }
     .infer_stmt_params(statement, txid, oids);
 }
@@ -37,19 +45,22 @@ pub(crate) fn infer_resolved<'a>(
     txid: u32,
     arena: &'a Arena,
     oids: &mut [i32],
-) {
-    ParameterInference {
+) -> Ambiguity {
+    let inference = ParameterInference {
         storage,
         captured_types: None,
         arena,
-    }
-    .infer_resolved_stmt_params(statement, txid, arena, oids);
+        ambiguous: core::cell::Cell::new(None),
+    };
+    inference.infer_resolved_stmt_params(statement, txid, arena, oids);
+    Ambiguity(inference.ambiguous.get())
 }
 
 struct ParameterInference<'a> {
     storage: &'a Storage,
     captured_types: Option<CapturedTypeResolver<'a>>,
     arena: &'a Arena,
+    ambiguous: core::cell::Cell<Option<u32>>,
 }
 
 impl ParameterInference<'_> {
@@ -192,6 +203,18 @@ impl ParameterInference<'_> {
                 None => self.infer_resolved_select_params(cte.query, outer, txid, arena, oids),
             }
         }
+        // Derived tables (and LATERAL bodies) are analyzed before the query
+        // that reads them, item by item, as PostgreSQL's transformFromClause
+        // does, so their parameters take the types their own operators need.
+        if let Some(from) = select.from {
+            for table in
+                core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table))
+            {
+                if let Some(subquery) = table.subquery {
+                    self.infer_resolved_select_params(subquery, outer, txid, arena, oids);
+                }
+            }
+        }
 
         let scope = match select.from.as_ref() {
             Some(from) => {
@@ -233,6 +256,21 @@ impl ParameterInference<'_> {
             (inferred != types::oid::UNKNOWN).then_some(inferred)
         };
 
+        // A bare parameter as a condition is coerced to boolean.
+        for condition in select.where_clause.into_iter().chain(select.having).chain(
+            select
+                .from
+                .iter()
+                .flat_map(|from| from.joins.iter().filter_map(|join| join.on)),
+        ) {
+            if let Expr::Param(index) = condition
+                && *index >= 1
+                && (*index as usize) <= oids.len()
+                && oids[*index as usize - 1] == types::oid::UNKNOWN
+            {
+                oids[*index as usize - 1] = types::oid::BOOL;
+            }
+        }
         let mut visit = |expression| {
             self.infer_expression_params(expression, nested, txid, arena, oids, &infer)
         };
@@ -358,12 +396,66 @@ impl ParameterInference<'_> {
                 expression,
                 type_oid,
             } => assign(expression, *type_oid, oids),
-            Expr::Binary { left, right, .. } => {
-                if let Some(type_oid) = infer(right) {
-                    assign(left, type_oid, oids);
+            Expr::Binary {
+                operator,
+                left,
+                right,
+                ..
+            } => {
+                let (left_oid, right_oid) = (infer(left), infer(right));
+                // One untyped side takes the type the selected operator
+                // declares (`$1 + now()` reads an interval), as PostgreSQL's
+                // operator resolution chooses it.
+                let selected = match (operator.operator_name(), left_oid, right_oid) {
+                    (Some(name), Some(_), None) | (Some(name), None, Some(_)) => {
+                        let actual = [
+                            left_oid.unwrap_or(types::oid::UNKNOWN),
+                            right_oid.unwrap_or(types::oid::UNKNOWN),
+                        ];
+                        self.storage
+                            .operator_call_parameter_oids(None, name, actual, txid)
+                            .or_else(|| {
+                                match self.storage.builtin_operator_input_oids(
+                                    name,
+                                    Some(actual[0]),
+                                    Some(actual[1]),
+                                    txid,
+                                ) {
+                                    Some((Some(left), Some(right))) => Some([left, right]),
+                                    _ => None,
+                                }
+                            })
+                    }
+                    _ => None,
+                };
+                // An ambiguous built-in choice leaves the parameter untyped,
+                // so analysis reports PostgreSQL's `operator is not unique`.
+                let ambiguous = selected.is_none()
+                    && operator.operator_name().is_some_and(|name| {
+                        crate::sql::catalog::builtin_operator_choice(
+                            name,
+                            Some(left_oid.unwrap_or(types::oid::UNKNOWN)),
+                            Some(right_oid.unwrap_or(types::oid::UNKNOWN)),
+                        ) == crate::sql::catalog::BuiltinOperatorChoice::NotUnique
+                    });
+                if ambiguous
+                    && self.ambiguous.get().is_none()
+                    && let Some(Expr::Param(index)) = [left, right]
+                        .into_iter()
+                        .find(|operand| matches!(operand, Expr::Param(_)))
+                {
+                    self.ambiguous.set(Some(*index));
                 }
-                if let Some(type_oid) = infer(left) {
-                    assign(right, type_oid, oids);
+                if let Some([left_expected, right_expected]) = selected {
+                    assign(left, left_expected, oids);
+                    assign(right, right_expected, oids);
+                } else if !ambiguous {
+                    if let Some(type_oid) = right_oid {
+                        assign(left, type_oid, oids);
+                    }
+                    if let Some(type_oid) = left_oid {
+                        assign(right, type_oid, oids);
+                    }
                 }
             }
             Expr::InList { operand, list, .. } => {
@@ -712,6 +804,7 @@ pub(crate) fn finish_unresolved(
     text: &str,
     arena: &Arena,
     oids: &mut [i32],
+    ambiguity: Ambiguity,
 ) -> Result<(), SqlError> {
     let undetermined = |index: usize| {
         sql_err!(
@@ -725,6 +818,9 @@ pub(crate) fn finish_unresolved(
             return Err(undetermined(index));
         }
         if *oid == types::oid::UNKNOWN {
+            if ambiguity.0 == Some(index as u32 + 1) {
+                continue;
+            }
             if !references_parameter(text, arena, index + 1) {
                 return Err(undetermined(index));
             }

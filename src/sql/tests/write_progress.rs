@@ -586,9 +586,9 @@ fn write_rows_keep_progress_across_routine_calls() {
     }
 }
 
-/// Orders whose rows check foreign keys against three cold tables, with
-/// BEFORE and AFTER row triggers that write and call a sequence, and
-/// transition tables.
+/// Orders whose rows read three cold tables in a BEFORE row trigger (their
+/// foreign key checks run at the statement's end), with BEFORE and AFTER row
+/// triggers that write and call a sequence, and transition tables.
 const ORDER_SETUP: &str = "CREATE TABLE hot_log(stage text); CREATE SEQUENCE numbers; \
      CREATE TABLE audit(stage text, n bigint); \
      CREATE TABLE cold_more(id integer PRIMARY KEY); \
@@ -599,6 +599,9 @@ const ORDER_SETUP: &str = "CREATE TABLE hot_log(stage text); CREATE SEQUENCE num
      item integer REFERENCES cold_items, more integer REFERENCES cold_more, \
      extra integer REFERENCES cold_extra, note text); \
      CREATE FUNCTION audit_order() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+     PERFORM 1 FROM cold_items WHERE id = NEW.item; \
+     PERFORM 1 FROM cold_more WHERE id = NEW.more; \
+     PERFORM 1 FROM cold_extra WHERE id = NEW.extra; \
      INSERT INTO audit VALUES (TG_OP || '-' || NEW.note, nextval('numbers')); \
      NEW.note := NEW.note || '+'; RETURN NEW; END$$; \
      CREATE TRIGGER audit_order BEFORE INSERT OR UPDATE ON orders \
@@ -618,8 +621,8 @@ const ORDER_SETUP: &str = "CREATE TABLE hot_log(stage text); CREATE SEQUENCE num
      REFERENCING NEW TABLE AS changed \
      FOR EACH STATEMENT EXECUTE FUNCTION changed_orders()";
 
-/// Storage waits inside a write's rows, several rows in: a foreign key check
-/// of a later row reads the cold parent table. The write keeps its earlier
+/// Storage waits inside a write's rows, several rows in: the BEFORE trigger
+/// of a later row reads a cold parent table. The write keeps its earlier
 /// rows, lets another client run, and continues at the waiting row: sequence
 /// defaults, BEFORE ROW trigger bodies with their own writes and sequence
 /// calls, AFTER ROW triggers, transition tables of AFTER STATEMENT triggers
@@ -772,7 +775,23 @@ fn write_steps_resume_after_storage_waits() {
                  INSERT INTO log VALUES ('deleting-' || OLD.id || '-' || seen, NULL); \
                  END IF; RETURN OLD; END$$; \
                  CREATE TRIGGER links_delete BEFORE DELETE ON links \
-                 FOR EACH ROW EXECUTE FUNCTION check_delete()",
+                 FOR EACH ROW EXECUTE FUNCTION check_delete(); \
+                 CREATE FUNCTION read_more() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+                 PERFORM 1 FROM cold_more WHERE id = NEW.more; RETURN NEW; END$$; \
+                 CREATE TRIGGER links_read BEFORE INSERT ON links \
+                 FOR EACH ROW EXECUTE FUNCTION read_more(); \
+                 CREATE FUNCTION read_extra() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+                 PERFORM 1 FROM cold_extra WHERE id = NEW.more; RETURN NEW; END$$; \
+                 CREATE TRIGGER log_read BEFORE INSERT ON log \
+                 FOR EACH ROW EXECUTE FUNCTION read_extra(); \
+                 CREATE FUNCTION read_gone() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+                 PERFORM 1 FROM cold_gone WHERE id = NEW.more; RETURN NEW; END$$; \
+                 CREATE TRIGGER gone_read BEFORE INSERT ON gone_log \
+                 FOR EACH ROW EXECUTE FUNCTION read_gone(); \
+                 CREATE FUNCTION read_pairs() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+                 PERFORM 1 FROM cold_pairs WHERE id = NEW.more; RETURN NEW; END$$; \
+                 CREATE TRIGGER pairs_read BEFORE INSERT OR UPDATE ON pairs \
+                 FOR EACH ROW EXECUTE FUNCTION read_pairs()",
             );
             cold.rows("INSERT INTO pairs VALUES (1, NULL, 'p1'), (2, NULL, 'p2')");
             for &(sql, returned) in statements {
@@ -878,6 +897,69 @@ fn procedural_write_rows_resume_after_storage_waits() {
             assert_eq!(
                 cold.rows("SELECT count(*), sum(n), sum(more), sum(extra) FROM orders"),
                 ["10|156|6|17"],
+                "{context}"
+            );
+            assert_eq!(
+                cold.rows("SELECT count(*) FROM hot_log"),
+                ["3"],
+                "{context}"
+            );
+            cold.finish();
+        }
+    }
+}
+
+/// Foreign key checks queued by writes in a procedure, a `DO` body and a
+/// dynamic `EXECUTE` are the only cold reads: each check waits for a delayed
+/// GET while another client runs, and the write finishes with PostgreSQL
+/// 18.6's rows; both transaction modes and both protocols.
+#[test]
+fn nested_foreign_key_checks_yield_after_storage_waits() {
+    let statements = [
+        "CALL fill()",
+        "DO $$BEGIN INSERT INTO plain_do VALUES (11, 11), (12, 12); END$$",
+        "DO $$BEGIN EXECUTE 'INSERT INTO plain_ex VALUES (21, 21), (22, 22)'; END$$",
+    ];
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for extended in [false, true] {
+            let mut cold = cold_table(
+                &format!("nested-fk-waits-{extended}"),
+                mode,
+                "CREATE TABLE hot_log(stage text); \
+                 CREATE TABLE cold_more(id integer PRIMARY KEY); \
+                 INSERT INTO cold_more SELECT generate_series(1, 40); \
+                 CREATE TABLE cold_gone(id integer PRIMARY KEY); \
+                 INSERT INTO cold_gone SELECT generate_series(1, 40); \
+                 CREATE TABLE cold_pairs(id integer PRIMARY KEY); \
+                 INSERT INTO cold_pairs SELECT generate_series(1, 40); \
+                 CREATE TABLE plain(id int, more int REFERENCES cold_more); \
+                 CREATE TABLE plain_do(id int, more int REFERENCES cold_gone); \
+                 CREATE TABLE plain_ex(id int, more int REFERENCES cold_pairs); \
+                 CREATE PROCEDURE fill() LANGUAGE plpgsql AS $$BEGIN \
+                 INSERT INTO plain SELECT g, g FROM generate_series(1, 3) g; END$$",
+            );
+            for sql in statements {
+                let context = format!("{mode:?} extended={extended}: {sql}");
+                let waits = cold.run(sql, extended, other_client_progresses);
+                assert!(waits > 0, "{context}: a foreign key check must wait");
+                let output = cold.writer.send.readable().to_vec();
+                assert!(
+                    error_sqlstates(&output).is_empty(),
+                    "{context}: {}",
+                    String::from_utf8_lossy(&output)
+                );
+            }
+            let context = format!("{mode:?} extended={extended}");
+            assert_eq!(
+                cold.rows(
+                    "SELECT string_agg(id || ':' || more, ',' ORDER BY id) FROM plain; \
+                     SELECT string_agg(id || ':' || more, ',' ORDER BY id) FROM plain_do; \
+                     SELECT string_agg(id || ':' || more, ',' ORDER BY id) FROM plain_ex"
+                ),
+                ["1:1,2:2,3:3", "11:11,12:12", "21:21,22:22"],
                 "{context}"
             );
             assert_eq!(
@@ -1020,6 +1102,114 @@ fn after_row_reads_yield_after_storage_waits() {
                 cold.rows("SELECT count(*) FROM hot_log"),
                 ["3"],
                 "{context}"
+            );
+            cold.finish();
+        }
+    }
+}
+
+/// With no block or disk cache, every restartable statement shape finishes:
+/// an attempt after a wait that would download a block the statement already
+/// downloaded reads the rest of the statement synchronously, so restarts
+/// cannot repeat without progress. Results match PostgreSQL 18.6; both
+/// transaction modes and both protocols.
+#[test]
+fn restartable_statements_finish_without_block_caches() {
+    let statements: &[(&str, &[&str])] = &[
+        (
+            "SELECT 'i', id FROM cold_items WHERE id <= 2 UNION ALL \
+             SELECT 'm', id FROM cold_more WHERE id <= 2 UNION ALL \
+             SELECT 'e', id FROM cold_extra WHERE id <= 2",
+            &["e|1", "e|2", "i|1", "i|2", "m|1", "m|2"],
+        ),
+        (
+            "SELECT i.id, m.id + e.id FROM cold_items i \
+             JOIN cold_more m ON m.id = i.id JOIN cold_extra e ON e.id = m.id \
+             WHERE i.id <= 2",
+            &["1|2", "2|4"],
+        ),
+        (
+            "SELECT id, (SELECT count(*) FROM cold_more), \
+             (SELECT max(id) FROM cold_extra WHERE id < i.id + 5) \
+             FROM cold_items i WHERE id IN (SELECT id FROM cold_more WHERE id <= 2)",
+            &["1|40|5", "2|40|6"],
+        ),
+        (
+            "INSERT INTO seen_log SELECT 'u' || id FROM (SELECT id FROM cold_items \
+             UNION ALL SELECT id FROM cold_more UNION ALL SELECT id FROM cold_extra) u \
+             WHERE id = 1 RETURNING stage",
+            &["u1", "u1", "u1"],
+        ),
+        (
+            "UPDATE cold_items SET code = 'x' || m.id FROM cold_more m, cold_extra e \
+             WHERE cold_items.id = m.id AND m.id = e.id AND cold_items.id <= 2 \
+             RETURNING cold_items.id, code",
+            &["1|x1", "2|x2"],
+        ),
+        (
+            "DELETE FROM cold_more WHERE id IN (SELECT id FROM cold_extra WHERE id > 38) \
+             RETURNING id",
+            &["39", "40"],
+        ),
+        // A rule action's selection is a later step: it yields too.
+        ("INSERT INTO ruled VALUES (3) RETURNING id", &["3"]),
+    ];
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        for extended in [false, true] {
+            let mut cold = cold_table(
+                &format!("uncached-{extended}"),
+                mode,
+                "CREATE TABLE hot_log(stage text); CREATE TABLE seen_log(stage text); \
+                 CREATE TABLE cold_more(id integer PRIMARY KEY); \
+                 INSERT INTO cold_more SELECT generate_series(1, 40); \
+                 CREATE TABLE cold_extra(id integer PRIMARY KEY); \
+                 INSERT INTO cold_extra SELECT generate_series(1, 40); \
+                 CREATE TABLE ruled(id integer); \
+                 CREATE RULE ruled_log AS ON INSERT TO ruled DO ALSO \
+                 INSERT INTO seen_log SELECT 'r' || i.id || m.id || e.id FROM cold_items i \
+                 JOIN cold_more m USING (id) JOIN cold_extra e USING (id) WHERE id = NEW.id",
+            );
+            for &(sql, returned) in statements {
+                let context = format!("{mode:?} extended={extended}: {sql}");
+                let before = cold.server.requests.load(Ordering::Acquire);
+                let waits = cold.run(sql, extended, other_client_progresses);
+                let gets = cold.server.requests.load(Ordering::Acquire) - before;
+                assert!(waits > 0, "{context}: the statement must wait");
+                let output = cold.writer.send.readable().to_vec();
+                assert!(
+                    error_sqlstates(&output).is_empty(),
+                    "{context}: {}",
+                    String::from_utf8_lossy(&output)
+                );
+                let mut rows = data_rows(&output);
+                rows.sort();
+                assert_eq!(rows, returned, "{context}");
+                // Reading synchronously from the start downloads each block
+                // the plan reads; each wait adds at most its own GET and one
+                // repeat before the statement reads synchronously.
+                cold.writer.success(&mut cold.engine, "BEGIN", true);
+                cold.engine
+                    .ckpt
+                    .as_mut()
+                    .unwrap()
+                    .disable_async_block_reads();
+                let before = cold.server.requests.load(Ordering::Acquire);
+                cold.writer.success(&mut cold.engine, sql, true);
+                let synchronous_gets = cold.server.requests.load(Ordering::Acquire) - before;
+                cold.writer.success(&mut cold.engine, "ROLLBACK", true);
+                cold.engine.enable_async_block_reads();
+                assert!(
+                    gets <= synchronous_gets + 2 * waits,
+                    "{context}: {gets} GETs over {waits} waits, {synchronous_gets} synchronously"
+                );
+            }
+            assert_eq!(
+                cold.rows("SELECT string_agg(stage, ',' ORDER BY stage) FROM seen_log"),
+                ["r333,u1,u1,u1"],
+                "{mode:?} extended={extended}"
             );
             cold.finish();
         }

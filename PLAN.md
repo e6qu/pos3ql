@@ -383,10 +383,9 @@ fails with `0A000` for a simple `LATERAL` subquery that reads tables (PostgreSQL
 keeps the rows it first joined); an `UPDATE ... FROM` or `DELETE ... USING`
 recheck runs its join again instead of keeping the joined rows; a foreign key
 check that waited for a parent row another transaction moved to a different
-partition reports `23503` where PostgreSQL fails with `40001`. A `FROM` item
-of `UPDATE`, `DELETE` or `MERGE` that refers to the target is accepted where
-PostgreSQL fails with `42P10` or `42P01` (`invalid reference to FROM-clause
-entry`), and `RETURNING` cannot read `FROM`/`USING` items. The
+partition reports `23503` where PostgreSQL fails with `40001`. `RETURNING`
+of `UPDATE ... FROM` and `DELETE ... USING` cannot read the `FROM`/`USING`
+items (`42P01`). The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

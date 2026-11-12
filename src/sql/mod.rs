@@ -19947,6 +19947,11 @@ impl Engine {
                 | Stmt::Delete(_)
                 | Stmt::Merge(_)
         ) {
+            if let Err(error) =
+                exec::reject_dml_target_references(&self.storage, txn.txid, statement)
+            {
+                return Ok(Err(error));
+            }
             let planned = planner_inputs::with_parameters(Some(params), || {
                 self.prepare_planner_inputs(
                     statement, None, arena, txn, sqlprep, cursors, guc, responder,

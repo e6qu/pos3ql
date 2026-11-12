@@ -66832,6 +66832,23 @@ pub(crate) fn merge<'a>(
 ) -> Outcome {
     let coercion_txid = txn.txid;
     use crate::sql::ast::MergeActionRef as MergeAction;
+    let source_from = crate::sql::ast::FromClause {
+        base: statement.source,
+        joins: &[],
+    };
+    if let Err(error) = reject_target_references_of(
+        storage,
+        txn.txid,
+        &crate::sql::ast::QualName {
+            schema: statement.target.schema,
+            name: statement.target.name,
+        },
+        Some(&source_from),
+        statement.target_alias.unwrap_or(statement.target.name),
+        true,
+    ) {
+        return sql_fail(error);
+    }
     if let Err(error) = super::query::validate_dml_assignment_casts(
         &Stmt::Merge(*statement),
         storage,
@@ -72807,6 +72824,16 @@ pub(crate) fn update<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     mut progress: Option<&mut RowProgress>,
 ) -> Outcome {
+    if let Err(error) = reject_target_references_of(
+        storage,
+        txn.txid,
+        &statement.table,
+        statement.from,
+        statement.alias.unwrap_or(statement.table.name),
+        false,
+    ) {
+        return sql_fail(error);
+    }
     let coercion_txid = txn.txid;
     if let Err(error) = super::query::validate_dml_assignment_casts(
         &Stmt::Update(*statement),
@@ -74149,6 +74176,16 @@ pub(crate) fn delete<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     mut progress: Option<&mut RowProgress>,
 ) -> Outcome {
+    if let Err(error) = reject_target_references_of(
+        storage,
+        txn.txid,
+        &statement.table,
+        statement.using,
+        statement.alias.unwrap_or(statement.table.name),
+        false,
+    ) {
+        return sql_fail(error);
+    }
     let coercion_txid = txn.txid;
     let outer_lookup = outer;
     let capturing = capture.is_some();
@@ -85919,4 +85956,323 @@ mod tests {
             assert_eq!(error.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
         }
     }
+}
+
+/// Where a data-modifying statement's `FROM`, `USING` or `MERGE` source item
+/// referred to its target, which PostgreSQL does not let those items see.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TargetReference {
+    /// A function source or `LATERAL` subquery of `UPDATE`/`DELETE`
+    /// (`check_lateral_ref_ok`: `42P10` with a hint).
+    Lateral,
+    /// Any other item (`errorMissingRTE`: `42P01` with a detail).
+    Hidden,
+}
+
+/// Rejects a `FROM`/`USING`/`MERGE` source item that names the target, as
+/// PostgreSQL's parse analysis does before reading any row:
+/// `UPDATE orders o SET total = 0 FROM generate_series(1, o.n) g` fails with
+/// `42P10`. `exposed` is the target's alias or table name; `merge` marks a
+/// `MERGE` source, whose items are never lateral to the target.
+/// [`reject_target_references`] for a data-modifying statement, before its
+/// planner inputs are analysed.
+pub(crate) fn reject_dml_target_references(
+    storage: &Storage,
+    txid: u32,
+    statement: &Stmt<'_>,
+) -> Result<(), SqlError> {
+    match statement {
+        Stmt::Update(update) => reject_target_references_of(
+            storage,
+            txid,
+            &update.table,
+            update.from,
+            update.alias.unwrap_or(update.table.name),
+            false,
+        ),
+        Stmt::Delete(delete) => reject_target_references_of(
+            storage,
+            txid,
+            &delete.table,
+            delete.using,
+            delete.alias.unwrap_or(delete.table.name),
+            false,
+        ),
+        Stmt::Merge(merge) => reject_target_references_of(
+            storage,
+            txid,
+            &crate::sql::ast::QualName {
+                schema: merge.target.schema,
+                name: merge.target.name,
+            },
+            Some(&crate::sql::ast::FromClause {
+                base: merge.source,
+                joins: &[],
+            }),
+            merge.target_alias.unwrap_or(merge.target.name),
+            true,
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn reject_target_references_of(
+    storage: &Storage,
+    txid: u32,
+    target: &crate::sql::ast::QualName<'_>,
+    from: Option<&crate::sql::ast::FromClause<'_>>,
+    exposed: &str,
+    merge: bool,
+) -> Result<(), SqlError> {
+    let Some(from) = from else {
+        return Ok(());
+    };
+    let def = storage.table_def(resolve_dml_table(storage, target, txid)?, txid);
+    let mut names = [""; MAX_COLUMNS];
+    for (name, column) in names.iter_mut().zip(def.columns()) {
+        *name = column.name.as_str();
+    }
+    reject_target_references(storage, txid, from, exposed, &names[..def.n_columns], merge)
+}
+
+/// Whether `table` may have a column `name`. Only an ordinary relation's
+/// columns are known here; any other item may.
+fn item_may_answer(
+    storage: &Storage,
+    txid: u32,
+    table: &crate::sql::ast::TableRef<'_>,
+    name: &str,
+) -> bool {
+    if table.subquery.is_some() || table.is_function_source() || table.cte.is_some() {
+        return true;
+    }
+    let relation = crate::sql::ast::QualName {
+        schema: table.schema,
+        name: table.table,
+    };
+    match resolve_dml_table(storage, &relation, txid) {
+        Ok(index) => storage.table_def(index, txid).column_index(name).is_some(),
+        Err(_) => true,
+    }
+}
+
+fn from_may_answer(
+    storage: &Storage,
+    txid: u32,
+    from: &crate::sql::ast::FromClause<'_>,
+    name: &str,
+) -> bool {
+    core::iter::once(&from.base)
+        .chain(from.joins.iter().map(|join| &join.table))
+        .any(|table| item_may_answer(storage, txid, table, name))
+}
+
+fn reject_target_references(
+    storage: &Storage,
+    txid: u32,
+    from: &crate::sql::ast::FromClause<'_>,
+    exposed: &str,
+    target_columns: &[&str],
+    merge: bool,
+) -> Result<(), SqlError> {
+    for (index, table) in core::iter::once(&from.base)
+        .chain(from.joins.iter().map(|join| &join.table))
+        .enumerate()
+    {
+        let lateral = !merge && (table.lateral || table.is_function_source());
+        let kind = if lateral {
+            TargetReference::Lateral
+        } else {
+            TargetReference::Hidden
+        };
+        let mut found = false;
+        if let Some(arguments) = table.func_args {
+            for argument in arguments {
+                found |= expression_names_target(argument, exposed, &mut |name| {
+                    // An unqualified argument column the items to its left
+                    // cannot answer is the target's.
+                    !merge
+                        && target_columns.contains(&name)
+                        && !left_may_answer(storage, txid, from, index, name)
+                });
+            }
+        }
+        if let Some(rows_from) = table.rows_from {
+            for function in rows_from {
+                for argument in function.func_args.unwrap_or(&[]) {
+                    found |= expression_names_target(argument, exposed, &mut |_| false);
+                }
+            }
+        }
+        if let Some(select) = table.subquery {
+            found |= select_names_target(select, exposed, &mut |inner: &Select<'_>, name| {
+                // A LATERAL body's unqualified column that neither its own
+                // FROM nor the items to its left answer is the target's.
+                lateral
+                    && target_columns.contains(&name)
+                    && !inner
+                        .from
+                        .is_some_and(|inner_from| from_may_answer(storage, txid, &inner_from, name))
+                    && !left_may_answer(storage, txid, from, index, name)
+            });
+        }
+        if index > 0
+            && let Some(condition) = from.joins[index - 1].on
+            && expression_names_target(condition, exposed, &mut |_| false)
+        {
+            return Err(target_reference_error(exposed, TargetReference::Hidden));
+        }
+        if found {
+            return Err(target_reference_error(exposed, kind));
+        }
+    }
+    Ok(())
+}
+
+/// Whether an item left of `index` in `from` may have a column `name`.
+fn left_may_answer(
+    storage: &Storage,
+    txid: u32,
+    from: &crate::sql::ast::FromClause<'_>,
+    index: usize,
+    name: &str,
+) -> bool {
+    core::iter::once(&from.base)
+        .chain(from.joins.iter().map(|join| &join.table))
+        .take(index)
+        .any(|table| item_may_answer(storage, txid, table, name))
+}
+
+fn target_reference_error(exposed: &str, kind: TargetReference) -> SqlError {
+    let explanation = crate::stack_format!(
+        crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+        "There is an entry for table \"{}\", but it cannot be referenced from this part of the query.",
+        exposed
+    );
+    let (state, detail, hint) = match kind {
+        TargetReference::Lateral => (sqlstate::INVALID_COLUMN_REFERENCE, None, Some(explanation)),
+        TargetReference::Hidden => (sqlstate::UNDEFINED_TABLE, Some(explanation), None),
+    };
+    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
+        detail,
+        hint,
+        objects: crate::sql::eval::ErrorObjects::default(),
+    });
+    sql_err!(
+        state,
+        "invalid reference to FROM-clause entry for table \"{}\"",
+        exposed
+    )
+}
+
+/// Whether `select` refers to `exposed` through a qualifier its own `FROM`
+/// does not answer.
+fn select_names_target(
+    select: &Select<'_>,
+    exposed: &str,
+    unqualified: &mut dyn FnMut(&Select<'_>, &str) -> bool,
+) -> bool {
+    let shadows = |table: &crate::sql::ast::TableRef<'_>| {
+        table
+            .alias
+            .unwrap_or(table.table)
+            .eq_ignore_ascii_case(exposed)
+    };
+    if select.from.is_some_and(|from| {
+        shadows(&from.base) || from.joins.iter().any(|join| shadows(&join.table))
+    }) {
+        return false;
+    }
+    let mut names = |expression: &Expr<'_>| {
+        expression_names_target(expression, exposed, &mut |name| unqualified(select, name))
+    };
+    let from_names = select.from.is_some_and(|from| {
+        core::iter::once(&from.base)
+            .chain(from.joins.iter().map(|join| &join.table))
+            .any(|table| {
+                table
+                    .subquery
+                    .is_some_and(|query| select_names_target(query, exposed, &mut |_, _| false))
+                    || table
+                        .func_args
+                        .is_some_and(|arguments| arguments.iter().any(|argument| names(argument)))
+            })
+            || from
+                .joins
+                .iter()
+                .any(|join| join.on.is_some_and(&mut names))
+    });
+    from_names
+        || select.items.iter().any(|item| match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                names(expression)
+            }
+            SelectItem::Wildcard => false,
+            SelectItem::TableWildcard(qualifier) => qualifier.eq_ignore_ascii_case(exposed),
+        })
+        || select.where_clause.is_some_and(&mut names)
+        || select.having.is_some_and(&mut names)
+        || select.group_by.iter().any(|expression| names(expression))
+        || select
+            .distinct_on
+            .iter()
+            .any(|expression| names(expression))
+        || select.order_by.iter().any(|order| names(order.expression))
+        || select.limit.is_some_and(&mut names)
+        || select.offset.is_some_and(&mut names)
+        || select
+            .set_body
+            .is_some_and(|tree| set_tree_names_target(tree, exposed))
+}
+
+fn set_tree_names_target(tree: &crate::sql::ast::SetTree<'_>, exposed: &str) -> bool {
+    match tree {
+        crate::sql::ast::SetTree::Select(select) => {
+            select_names_target(select, exposed, &mut |_, _| false)
+        }
+        crate::sql::ast::SetTree::Op { left, right, .. } => {
+            set_tree_names_target(left, exposed) || set_tree_names_target(right, exposed)
+        }
+    }
+}
+
+/// Whether `expression` refers to `exposed`: a column it qualifies, or an
+/// unqualified column `unqualified` assigns to the target.
+fn expression_names_target(
+    expression: &Expr<'_>,
+    exposed: &str,
+    unqualified: &mut dyn FnMut(&str) -> bool,
+) -> bool {
+    match expression {
+        Expr::Column {
+            qualifier: Some(qualifier),
+            ..
+        } => return qualifier.eq_ignore_ascii_case(exposed),
+        Expr::Column {
+            qualifier: None,
+            name,
+        } => return unqualified(name),
+        Expr::Subquery(select)
+        | Expr::Exists(select)
+        | Expr::ArraySubquery(select)
+        | Expr::RowSubquery { select, .. } => {
+            return select_names_target(select, exposed, &mut |_, _| false);
+        }
+        Expr::InSubquery {
+            operand, select, ..
+        }
+        | Expr::QuantifiedSubquery {
+            operand, select, ..
+        } => {
+            return expression_names_target(operand, exposed, unqualified)
+                || select_names_target(select, exposed, &mut |_, _| false);
+        }
+        _ => {}
+    }
+    let mut found = false;
+    let _ = super::query::walk_children(expression, &mut |child| {
+        found |= expression_names_target(child, exposed, unqualified);
+        Ok(())
+    });
+    found
 }

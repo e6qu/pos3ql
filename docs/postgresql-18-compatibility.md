@@ -54,6 +54,18 @@ Schemas and catalogs:
   binary input with `0A000`, as PostgreSQL does. Copying non-null statistics
   values, including `pg_statistic[]`, into user tables fails with `0A000`.
 
+Data-modifying statements:
+
+- A `FROM`, `USING` or `MERGE` source item cannot refer to the statement's
+  target, as in PostgreSQL. `UPDATE orders o SET n = 0 FROM generate_series(1,
+  o.n) g` and `FROM LATERAL (SELECT o.n)` fail with `42P10`; a plain subquery,
+  a join condition or a `MERGE` source fails with `42P01` (`invalid reference
+  to FROM-clause entry for table "o"`). An unqualified target column in a plain
+  subquery reports `42703` without PostgreSQL's detail line.
+- Correlated subqueries in `WHERE` and `WHEN` conditions run for every
+  candidate row: `DELETE FROM orders WHERE EXISTS (SELECT 1 FROM refunds r
+  WHERE r.order_id = orders.id)`.
+
 Identity, inheritance, and partitions:
 
 - `CREATE TABLE ... (LIKE ... INCLUDING IDENTITY)` creates independently owned

@@ -33965,6 +33965,7 @@ pub fn alter_trigger(
         Ok(())
     } else {
         let lsn = storage.bump_lsn();
+        let when = storage.trigger_when_to(slot, txn.txid);
         wal.stage_reserved(
             txn.txid,
             lsn,
@@ -33976,6 +33977,7 @@ pub fn alter_trigger(
                 table: relation.as_str(),
                 new_name: new_name.as_str(),
                 enabled: enabled.code(),
+                when: when.as_ref().map(|when| when.as_str()),
             },
         )
     };
@@ -53778,6 +53780,7 @@ fn rewrite_table_owned_column_references(
     definition: &mut TableDefBuilder,
     column: usize,
     to: SqlName,
+    catalog: (&Storage, u32),
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let from = definition.columns[column].name;
@@ -53798,6 +53801,7 @@ fn rewrite_table_owned_column_references(
                         &current,
                         &target_shape,
                         rename,
+                        catalog,
                         arena,
                     )?,
                 }
@@ -53808,6 +53812,7 @@ fn rewrite_table_owned_column_references(
                     &current,
                     &target_shape,
                     rename,
+                    catalog,
                     arena,
                 )?)
             }
@@ -53817,6 +53822,7 @@ fn rewrite_table_owned_column_references(
                     &current,
                     &target_shape,
                     rename,
+                    catalog,
                     arena,
                 )?)
             }
@@ -53828,6 +53834,7 @@ fn rewrite_table_owned_column_references(
             &current,
             &target_shape,
             rename,
+            catalog,
             arena,
         )?;
     }
@@ -53838,6 +53845,7 @@ fn rewrite_table_owned_column_references(
                 &current,
                 &target_shape,
                 rename,
+                catalog,
                 arena,
             )?);
         }
@@ -53877,13 +53885,27 @@ fn rewrite_table_policy_column_references<Definition0: crate::storage::Definitio
             definition.using = definition
                 .using
                 .map(|source| {
-                    rewrite_table_column_reference(source.as_str(), &shape, &renamed, rename, arena)
+                    rewrite_table_column_reference(
+                        source.as_str(),
+                        &shape,
+                        &renamed,
+                        rename,
+                        (&*storage, txn.txid),
+                        arena,
+                    )
                 })
                 .transpose()?;
             definition.with_check = definition
                 .with_check
                 .map(|source| {
-                    rewrite_table_column_reference(source.as_str(), &shape, &renamed, rename, arena)
+                    rewrite_table_column_reference(
+                        source.as_str(),
+                        &shape,
+                        &renamed,
+                        rename,
+                        (&*storage, txn.txid),
+                        arena,
+                    )
                 })
                 .transpose()?;
             shape = renamed;
@@ -53967,6 +53989,126 @@ fn rewrite_table_policy_column_references<Definition0: crate::storage::Definitio
     Ok(())
 }
 
+/// Trigger conditions and rule texts name the table's columns through `NEW`
+/// and `OLD`; a column rename rewrites and journals each affected one.
+fn rewrite_table_row_reference_columns<Definition0: crate::storage::DefinitionBacking>(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table: usize,
+    original: &crate::storage::TableDefinition<Definition0>,
+    renames: &[(SqlName, SqlName)],
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    if renames.is_empty() {
+        return Ok(());
+    }
+    let temporary = original.persistence == crate::storage::RelationPersistence::Temporary;
+    for slot in 0..storage.trigger_capacity() {
+        let trigger = storage.trigger_to(slot, txn.txid);
+        if trigger.database != storage.current_database_oid()
+            || !trigger.visible_to(txn.txid)
+            || trigger.target != crate::storage::TriggerTarget::Table(table as u16)
+        {
+            continue;
+        }
+        let Some(mut when) = trigger.definition_to(txn.txid).when else {
+            continue;
+        };
+        let mut changed = false;
+        for &(from, to) in renames {
+            changed |=
+                crate::storage::rename_row_reference_columns(&mut when, from, to, arena)?.changed;
+        }
+        if !changed {
+            continue;
+        }
+        let crate::storage::TriggerAlter::Changed { prior } =
+            storage.alter_trigger_when(slot, Some(when), txn.txid)?
+        else {
+            continue;
+        };
+        if !temporary {
+            let name = trigger.name_to(txn.txid);
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage_reserved(
+                txn.txid,
+                lsn,
+                &WalOp::AlterTrigger {
+                    identity: storage.trigger_position(slot),
+                    name: name.as_str(),
+                    target: crate::wal::TriggerTargetKind::Table,
+                    table_schema: original.schema.as_str(),
+                    table: original.name.as_str(),
+                    new_name: name.as_str(),
+                    enabled: trigger.enabled_to(txn.txid).code(),
+                    when: Some(when.as_str()),
+                },
+            ) {
+                storage.rollback_trigger_alter(slot, prior);
+                return Err(error);
+            }
+        }
+        if let Err(error) = txn.record_ddl(
+            storage,
+            super::txn::DdlUndo::TriggerAltered {
+                slot: slot as u32,
+                prior,
+            },
+        ) {
+            storage.rollback_trigger_alter(slot, prior);
+            return Err(error);
+        }
+    }
+    for slot in 0..storage.rule_count() {
+        let Some(rule) = storage.rule_slot_visible_to(slot, txn.txid) else {
+            continue;
+        };
+        if rule.definition_for(txn.txid).target != crate::storage::RuleTarget::Table(table as u16) {
+            continue;
+        }
+        for &(from, to) in renames {
+            let Some(column) = original.column_index(from.as_str()) else {
+                continue;
+            };
+            let mut probe = rule.definition_for(txn.txid);
+            let outcome = probe.rename_target_column(from, to, arena)?;
+            if !outcome.changed
+                && !(outcome.unqualified
+                    && storage
+                        .rule_dependencies(slot, txn.txid)
+                        .entries()
+                        .iter()
+                        .any(|dependency| {
+                            dependency.class == crate::storage::DependencyClass::Table
+                                && usize::from(dependency.slot) == table
+                                && dependency.uses_column(column)
+                        }))
+            {
+                continue;
+            }
+            let (prior, definition) = storage.alter_rule(
+                storage.prepare_rule_edit(slot, txn.txid)?,
+                crate::storage::RuleMetadataChange::TargetColumn {
+                    old: from,
+                    new: to,
+                    arena,
+                },
+                txn.txid,
+            )?;
+            if let Err(error) = stage_rule(storage, wal, txn, slot, definition) {
+                storage.rollback_rule_alter(prior);
+                return Err(error);
+            }
+            if let Err(error) = txn.record_ddl(storage, super::txn::DdlUndo::RuleAltered(prior)) {
+                storage.rollback_rule_alter(prior);
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn rewrite_table_statistics_column_references<Definition0: crate::storage::DefinitionBacking>(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -54009,6 +54151,7 @@ fn rewrite_table_statistics_column_references<Definition0: crate::storage::Defin
                             &shape,
                             &renamed,
                             rename,
+                            (&*storage, txn.txid),
                             arena,
                         )?;
                         changed |= rewritten != *source;
@@ -54165,6 +54308,7 @@ fn rewrite_table_publication_column_references<Definition0: crate::storage::Defi
                     &shape,
                     &renamed,
                     CompositeFieldRename { from, to },
+                    (&*storage, txn.txid),
                     arena,
                 )?;
                 changed |= rewritten != *filter;
@@ -54305,15 +54449,26 @@ fn rewrite_table_column_reference<
     current: &crate::storage::TableDefinition<Definition0>,
     renamed: &crate::storage::TableDefinition<Definition1>,
     rename: CompositeFieldRename,
+    (storage, txid): (&Storage, u32),
     arena: &Arena,
 ) -> Result<crate::util::StackStr<N>, SqlError> {
     use crate::sql::lexer::{Lexer, Tok};
     use core::fmt::Write;
 
+    // Types resolve against the catalog: a user routine's result type is
+    // not known to the table's column list alone.
+    let types = |definition| CatalogCols {
+        definition: Some(definition),
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
     let expression = crate::sql::parser::parse_expr(text, arena)?;
     infer_type_res(
         expression,
-        &DefCols(crate::storage::RelationDefinition::from_definition(current)),
+        &types(crate::storage::RelationDefinition::from_definition(current)),
     )?;
 
     let mut output = crate::util::StackStr::<N>::new();
@@ -54379,7 +54534,7 @@ fn rewrite_table_column_reference<
     let expression = crate::sql::parser::parse_expr(output.as_str(), arena)?;
     infer_type_res(
         expression,
-        &DefCols(crate::storage::RelationDefinition::from_definition(renamed)),
+        &types(crate::storage::RelationDefinition::from_definition(renamed)),
     )?;
     Ok(output)
 }
@@ -74470,6 +74625,7 @@ fn alter_table_trigger_enabled(
             Ok(())
         } else {
             let lsn = storage.bump_lsn();
+            let when = storage.trigger_when_to(slot, txn.txid);
             wal.stage_reserved(
                 txn.txid,
                 lsn,
@@ -74481,6 +74637,7 @@ fn alter_table_trigger_enabled(
                     table: relation,
                     new_name: trigger.name_to(txn.txid).as_str(),
                     enabled: mode.code(),
+                    when: when.as_ref().map(|when| when.as_str()),
                 },
             )
         };
@@ -77258,9 +77415,13 @@ fn alter_table_relation(
                 }
                 column_renames[n_column_renames] = (new_def.columns[i].name, to);
                 n_column_renames += 1;
-                if let Err(error) =
-                    rewrite_table_owned_column_references(&mut new_def, i, to, arena)
-                {
+                if let Err(error) = rewrite_table_owned_column_references(
+                    &mut new_def,
+                    i,
+                    to,
+                    (&*storage, txn.txid),
+                    arena,
+                ) {
                     return sql_fail(error);
                 }
             }
@@ -79158,6 +79319,17 @@ fn alter_table_relation(
         return sql_fail(error);
     }
     if let Err(error) = rewrite_table_statistics_column_references(
+        storage,
+        wal,
+        txn,
+        table_index,
+        &def,
+        &column_renames[..n_column_renames],
+        arena,
+    ) {
+        return sql_fail(error);
+    }
+    if let Err(error) = rewrite_table_row_reference_columns(
         storage,
         wal,
         txn,

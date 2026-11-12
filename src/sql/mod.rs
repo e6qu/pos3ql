@@ -26747,6 +26747,7 @@ fn apply_wal_op(
             table,
             new_name,
             enabled,
+            when,
         } => {
             let target = match (
                 target,
@@ -26784,6 +26785,12 @@ fn apply_wal_op(
                     slot,
                     crate::storage::SqlName::parse(new_name)?,
                     enabled,
+                    0,
+                )?;
+                storage.alter_trigger_when(
+                    slot,
+                    when.map(crate::storage::trigger_when_stackstr)
+                        .transpose()?,
                     0,
                 )?;
                 storage.commit_trigger_alter(slot, 0);
@@ -28707,7 +28714,8 @@ fn apply_wal_op(
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
-                        "WAL ownership target \"{}\" does not exist",
+                        "WAL ownership target \"{}\".\"{}\" does not exist",
+                        schema,
                         name
                     )
                 })?;

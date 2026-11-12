@@ -149,6 +149,71 @@ pub(crate) fn rename(
             )?;
         }
     }
+    for slot in 0..storage.trigger_capacity() {
+        let trigger = storage.trigger(slot);
+        if trigger.database != storage.current_database_oid() || !trigger.visible_to(txn.txid) {
+            continue;
+        }
+        let Some(mut when) = trigger.definition_to(txn.txid).when else {
+            continue;
+        };
+        if !rename_schema_qualified_sql(
+            &mut when,
+            &mut [],
+            old,
+            name,
+            crate::sql::parser::StoredSqlKind::Expression,
+            arena,
+        )? {
+            continue;
+        }
+        if let crate::storage::TriggerAlter::Changed { prior } =
+            storage.alter_trigger_when(slot, Some(when), txn.txid)?
+        {
+            txn.record_catalog_change(
+                storage,
+                DdlUndo::TriggerAltered {
+                    slot: slot as u32,
+                    prior,
+                },
+            )?;
+        }
+    }
+    for slot in 0..storage.extended_statistics_count() {
+        let statistics = storage.extended_statistics(slot);
+        if statistics.database != storage.current_database_oid() || !statistics.visible_to(txn.txid)
+        {
+            continue;
+        }
+        let mut keys = [crate::storage::ExtendedStatisticsKey::Column(SqlName::EMPTY);
+            crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
+        let current = statistics.keys_for(txn.txid);
+        keys[..current.len()].copy_from_slice(current);
+        let mut changed = false;
+        for key in &mut keys[..current.len()] {
+            if let crate::storage::ExtendedStatisticsKey::Expression(source) = key {
+                changed |= rename_schema_qualified_sql(
+                    source,
+                    &mut [],
+                    old,
+                    name,
+                    crate::sql::parser::StoredSqlKind::Expression,
+                    arena,
+                )?;
+            }
+        }
+        if !changed {
+            continue;
+        }
+        let prior = storage.alter_extended_statistics_keys(slot, keys, txn.txid)?;
+        txn.record_catalog_change(
+            storage,
+            DdlUndo::StatisticsKeysAltered {
+                slot: slot as u32,
+                prior,
+            },
+        )?;
+    }
     for slot in 0..storage.sequence_count() {
         let sequence = storage.sequence_for(slot, txn.txid);
         if sequence.database != storage.current_database_oid() || !sequence.visible_to(txn.txid) {

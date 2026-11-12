@@ -48,6 +48,7 @@ mod pseudo_type_identities;
 mod query_execution;
 mod relation_row_types;
 mod result_streams;
+mod rewritten_expression_recovery;
 mod routine_calls;
 mod routine_identity_diagnostics;
 mod routine_selection;

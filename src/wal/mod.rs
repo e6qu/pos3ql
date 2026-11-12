@@ -120,6 +120,9 @@ wal_record_kinds! {
     KIND_CATALOG_RESERVATION = 157;
     KIND_SET_PARTITION_TRIGGER = 158;
     KIND_SET_BUILTIN_ROUTINE = 159;
+/// Trigger alterations carry the trigger's `WHEN` condition, which a column or
+/// schema rename rewrites. Kind 57, without the condition, is rejected.
+    KIND_ALTER_TRIGGER_V2 = 160;
 // Publication records carry the typed ordinary-descendant selection added
 // after the original record layout. New kinds make older bytes fail recovery
 // loudly instead of being reinterpreted as a different catalog contract.
@@ -1754,6 +1757,8 @@ pub(crate) enum WalOp<'a> {
         table: &'a str,
         new_name: &'a str,
         enabled: u8,
+        /// The complete condition after the change.
+        when: Option<&'a str>,
     },
     SetPolicy {
         identity: crate::storage::CatalogPosition,
@@ -3260,7 +3265,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::AlterReplicationSlot { .. } => KIND_ALTER_REPLICATION_SLOT,
         WalOp::CreateTrigger { .. } => KIND_CREATE_TRIGGER_V2,
         WalOp::DropTrigger { .. } => KIND_DROP_TRIGGER,
-        WalOp::AlterTrigger { .. } => KIND_ALTER_TRIGGER,
+        WalOp::AlterTrigger { .. } => KIND_ALTER_TRIGGER_V2,
         WalOp::SetPolicy { .. } => KIND_SET_POLICY_V2,
         WalOp::DropPolicy { .. } => KIND_DROP_POLICY,
         WalOp::Commit { .. } => KIND_COMMIT,
@@ -3825,6 +3830,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             table_schema,
             table,
             new_name,
+            when,
             ..
         } => {
             crate::storage::CatalogPosition::ENCODED_BYTES
@@ -3838,6 +3844,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + new_name.len()
                 + 1
+                + 2
+                + when.map_or(0, str::len)
         }
         WalOp::SetPolicy {
             schema,
@@ -7050,7 +7058,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             table,
             new_name,
             enabled,
+            when,
         } => {
+            let when_len = when.map_or(0usize, |value| value.len() + 1);
             buffer.append(&identity.encode())
                 && name_bytes(buffer, name)
                 && buffer.append(&[target.code()])
@@ -7058,6 +7068,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, table)
                 && name_bytes(buffer, new_name)
                 && buffer.append(&[*enabled])
+                && u16::try_from(when_len)
+                    .ok()
+                    .is_some_and(|length| buffer.append(&length.to_le_bytes()))
+                && when.is_none_or(|value| buffer.append(value.as_bytes()))
         }
         WalOp::SetPolicy {
             identity,
@@ -9560,7 +9574,8 @@ fn decode_op_inner<'a>(
                 table,
             })
         }),
-        KIND_ALTER_TRIGGER => decode_large_op(|| {
+        KIND_ALTER_TRIGGER => None,
+        KIND_ALTER_TRIGGER_V2 => decode_large_op(|| {
             let identity = take_catalog_position(payload, &mut at)?;
             crate::storage::CatalogIdentity::parse(identity.created_at())?;
             let name = take_name(&mut at)?;
@@ -9572,6 +9587,16 @@ fn decode_op_inner<'a>(
             let enabled = *payload.get(at)?;
             crate::storage::TriggerEnabled::from_code(enabled)?;
             at += 1;
+            let when_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+            at += 2;
+            let when = if when_len == 0 {
+                None
+            } else {
+                let length = when_len - 1;
+                let value = core::str::from_utf8(payload.get(at..at + length)?).ok()?;
+                at += length;
+                Some(value)
+            };
             (at == payload.len()).then_some(WalOp::AlterTrigger {
                 identity,
                 name,
@@ -9580,6 +9605,7 @@ fn decode_op_inner<'a>(
                 table,
                 new_name,
                 enabled,
+                when,
             })
         }),
         KIND_SET_POLICY | KIND_SET_POLICY_V2 => decode_large_op(|| {
@@ -14009,6 +14035,36 @@ mod tests {
     }
 
     #[test]
+    fn trigger_alteration_carries_its_condition_and_rejects_the_retired_kind() {
+        let mut budget = Budget::new(1024);
+        let mut payload = FixedBuf::new(&mut budget, "trigger-alteration", 512).unwrap();
+        for when in [Some("(new.renamed > 0)"), None] {
+            payload.clear();
+            let operation = WalOp::AlterTrigger {
+                identity: crate::storage::CatalogPosition::new(3, 41).unwrap(),
+                name: "audit",
+                target: TriggerTargetKind::Table,
+                table_schema: "public",
+                table: "orders",
+                new_name: "audit",
+                enabled: b'O',
+                when,
+            };
+            assert!(append_payload(&mut payload, &operation));
+            assert_eq!(payload.len(), encoded_payload_len(&operation));
+            let encoded = payload.readable();
+            assert!(matches!(
+                decode_op(KIND_ALTER_TRIGGER_V2, encoded),
+                Some(WalOp::AlterTrigger { when: decoded, .. }) if decoded == when
+            ));
+            assert!(decode_op(KIND_ALTER_TRIGGER, encoded).is_none());
+            for truncated in 0..encoded.len() {
+                assert!(decode_op(KIND_ALTER_TRIGGER_V2, &encoded[..truncated]).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn logical_message_payload_round_trips_binary_content_strictly() {
         let mut budget = Budget::new(1024);
         let mut payload = FixedBuf::new(&mut budget, "logical-message", 256).unwrap();
@@ -16749,6 +16805,7 @@ mod tests {
                     table: "orders",
                     new_name: "audit_row_disabled",
                     enabled: b'D',
+                    when: Some("NEW.total > OLD.total"),
                 },
             )
             .unwrap();

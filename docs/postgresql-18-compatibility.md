@@ -204,7 +204,12 @@ Syntax and errors:
   those enabled `REPLICA` or `ALWAYS`; `origin` (the default) and `local`
   fire those enabled `ORIGIN` or `ALWAYS`. Foreign key checks and actions are
   `ORIGIN` triggers, so `SET session_replication_role = replica` loads rows
-  without them, for example an order line before its order. A view's
+  without them, for example an order line before its order. A superuser's
+  `ALTER TABLE orders DISABLE TRIGGER ALL` (as `pg_dump --disable-triggers`
+  emits) also stops the foreign keys' `RI_ConstraintTrigger_*` checks on a
+  referencing table or actions on a referenced one; other roles get `42501`
+  (`permission denied: "RI_ConstraintTrigger_c_..." is a system trigger`),
+  and `USER` leaves them alone. A view's
   `INSTEAD OF` trigger that does not fire leaves the row unwritten without an
   error.
 - A trigger's `NEW` and `OLD` have the table's row type in every firing. One

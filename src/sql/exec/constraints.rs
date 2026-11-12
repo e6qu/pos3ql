@@ -2638,11 +2638,18 @@ fn check_or_defer_fk_child(
     arena: &Arena,
 ) -> Result<(), SqlError> {
     // A written row's checks are RI triggers; validating existing rows is not.
-    if row.validation_read().is_none() && !foreign_key_triggers_fire()? {
-        return Ok(());
-    }
+    let role = match row.validation_read() {
+        Some(_) => None,
+        None => Some(crate::sql::guc::active_session_replication_role()?),
+    };
+    let check_trigger = if row.excluded().is_some() {
+        crate::storage::ForeignKeyTrigger::CheckUpdate
+    } else {
+        crate::storage::ForeignKeyTrigger::CheckInsert
+    };
     for fk in def.fkeys() {
         if !fk.validation.enforced()
+            || role.is_some_and(|role| !fk.trigger_enabled(check_trigger).fires_in(role))
             || fk
                 .columns()
                 .iter()
@@ -2714,15 +2721,6 @@ fn check_or_defer_fk_child(
         }
     }
     Ok(())
-}
-
-/// Whether foreign key checks and actions fire for rows written now. Their
-/// RI triggers fire on ORIGIN, as PostgreSQL creates them, so
-/// `session_replication_role = replica` (a subscription's apply worker, or a
-/// superuser loading data) skips them; validating existing rows does not.
-fn foreign_key_triggers_fire() -> Result<bool, SqlError> {
-    Ok(crate::storage::TriggerEnabled::Origin
-        .fires_in(crate::sql::guc::active_session_replication_role()?))
 }
 
 /// How a referencing row's check reads its parent row.
@@ -2912,7 +2910,7 @@ fn missing_parent_key(
 
 /// The name of a foreign key's RI trigger, which orders its queued check
 /// among the row's AFTER triggers.
-fn foreign_key_trigger_name(
+pub(super) fn foreign_key_trigger_name(
     foreign_key: &crate::storage::ForeignKey,
     trigger: crate::storage::ForeignKeyTrigger,
 ) -> Result<SqlName, SqlError> {
@@ -3840,9 +3838,9 @@ pub(crate) fn apply_fk_parent_actions(
     new_parent: Option<&[Datum]>,
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    if !foreign_key_triggers_fire()? {
-        return Ok(());
-    }
+    // Each action is an RI trigger with its own firing mode: ORIGIN as
+    // created, so `session_replication_role = replica` skips it.
+    let role = crate::sql::guc::active_session_replication_role()?;
     let parent_index = storage
         .find_visible(parent_schema, parent_name, txn.txid)
         .ok_or_else(|| {
@@ -3863,6 +3861,14 @@ pub(crate) fn apply_fk_parent_actions(
                 continue;
             }
             if !references_parent(storage, &fk, parent_schema, parent_name, txn.txid) {
+                continue;
+            }
+            let action_trigger = if new_parent.is_none() {
+                crate::storage::ForeignKeyTrigger::ActionDelete
+            } else {
+                crate::storage::ForeignKeyTrigger::ActionUpdate
+            };
+            if !fk.trigger_enabled(action_trigger).fires_in(role) {
                 continue;
             }
             let declared_parent = storage

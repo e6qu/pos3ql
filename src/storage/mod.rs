@@ -1968,6 +1968,11 @@ pub struct ForeignKey {
     pub on_update: FkAction,
     pub timing: ConstraintTiming,
     pub validation: ConstraintValidation,
+    /// The firing modes of the foreign key's four RI triggers, indexed by
+    /// [`ForeignKeyTrigger::ordinal`] (PostgreSQL's `tgenabled`): `ALTER
+    /// TABLE ... ENABLE/DISABLE TRIGGER` on the referencing or referenced
+    /// table changes them.
+    pub(crate) trigger_enabled: [TriggerEnabled; 4],
 }
 
 impl ForeignKey {
@@ -1986,7 +1991,12 @@ impl ForeignKey {
         on_update: FkAction::NoAction,
         timing: ConstraintTiming::NotDeferrable,
         validation: ConstraintValidation::EnforcedValidated,
+        trigger_enabled: [TriggerEnabled::Origin; 4],
     };
+
+    pub(crate) const fn trigger_enabled(&self, trigger: ForeignKeyTrigger) -> TriggerEnabled {
+        self.trigger_enabled[trigger.ordinal()]
+    }
 
     pub fn columns(&self) -> &[u16] {
         &self.columns[..self.n_cols]

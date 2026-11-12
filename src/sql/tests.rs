@@ -100836,3 +100836,84 @@ fn captured_type_references_recover_journal_definitions_committed_after_a_rename
 mod engine_triggers;
 mod relation_input_granularity;
 mod row_progress;
+
+#[test]
+fn foreign_key_trigger_modes_survive_journal_and_checkpoint_recovery() {
+    let mut config = test_config("foreign-key-trigger-modes");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("foreign-key-trigger-modes-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let modes = "SELECT c.relname, t.tgenabled FROM pg_trigger t \
+                   JOIN pg_class c ON c.oid = t.tgrelid \
+                  WHERE t.tgname LIKE 'RI_%' ORDER BY c.relname, t.tgenabled";
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE fk_mode_parent (id integer PRIMARY KEY); \
+         CREATE TABLE fk_mode_child (id integer, parent integer REFERENCES fk_mode_parent); \
+         CREATE ROLE fk_mode_owner; \
+         ALTER TABLE fk_mode_child OWNER TO fk_mode_owner; \
+         SET ROLE fk_mode_owner; \
+         ALTER TABLE fk_mode_child DISABLE TRIGGER USER;",
+    );
+    let text = String::from_utf8_lossy(&created);
+    assert!(!text.contains("ERROR"), "{text}");
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE fk_mode_owner; ALTER TABLE fk_mode_child DISABLE TRIGGER ALL",
+    );
+    let text = String::from_utf8_lossy(&rejected);
+    assert!(text.contains("C42501\0"), "{text}");
+    assert!(text.contains("is a system trigger"), "{text}");
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "RESET ROLE; \
+         ALTER TABLE fk_mode_child DISABLE TRIGGER ALL; \
+         DO $$DECLARE t name; BEGIN \
+           FOR t IN SELECT tgname FROM pg_trigger \
+                     WHERE tgrelid = 'fk_mode_parent'::regclass AND tgname LIKE 'RI_%' LOOP \
+             EXECUTE format('ALTER TABLE fk_mode_parent ENABLE ALWAYS TRIGGER %I', t); \
+           END LOOP; END$$; \
+         INSERT INTO fk_mode_child VALUES (1, 9);",
+    );
+    let text = String::from_utf8_lossy(&created);
+    assert!(!text.contains("ERROR"), "{text}");
+    let expected = [
+        "fk_mode_child|D",
+        "fk_mode_child|D",
+        "fk_mode_parent|A",
+        "fk_mode_parent|A",
+    ];
+    let journaled = run_with(&mut engine, &mut budget, modes);
+    assert_eq!(data_rows(&journaled), expected);
+    drop(engine);
+
+    let mut replay_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut replayed, &mut replay_budget, modes)),
+        expected
+    );
+    assert!(replayed.checkpoint().unwrap());
+    drop(replayed);
+
+    let mut restarted_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let recovered = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        &format!("{modes}; SELECT count(*) FROM fk_mode_child"),
+    );
+    let mut rows = expected.to_vec();
+    rows.push("1");
+    assert_eq!(data_rows(&recovered), rows);
+    drop(restarted);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}

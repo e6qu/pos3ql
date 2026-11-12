@@ -27331,7 +27331,14 @@ fn pg_trigger<'a>(
                 })
                 .map_or(0, |index| index.oid);
             let constraint_oid = foreign_key.oid();
+            // A partition's cloned constraint checks rows on the partition;
+            // the referenced table's actions belong to the parent constraint.
+            let cloned =
+                inherited_foreign_key_parent_oid(storage, txid, child_slot, foreign_key) != 0;
             for trigger in crate::storage::ForeignKeyTrigger::ALL {
+                if cloned && trigger.ordinal() < 2 {
+                    continue;
+                }
                 if count == rows.len() {
                     return Err(catalog_capacity_exceeded("pg_trigger"));
                 }
@@ -27367,7 +27374,12 @@ fn pg_trigger<'a>(
                         text(name.as_str(), arena)?,
                         Datum::Int4(function),
                         Datum::Int2(trigger_type),
-                        Datum::Bpchar("O"),
+                        Datum::Bpchar(match foreign_key.trigger_enabled(trigger) {
+                            crate::storage::TriggerEnabled::Origin => "O",
+                            crate::storage::TriggerEnabled::Replica => "R",
+                            crate::storage::TriggerEnabled::Always => "A",
+                            crate::storage::TriggerEnabled::Disabled => "D",
+                        }),
                         Datum::Bool(true),
                         Datum::Int4(constrained_relation),
                         Datum::Int4(parent_index),

@@ -76863,10 +76863,14 @@ fn alter_table_trigger_enabled(
             return sql_fail(error);
         }
     }
+    match alter_foreign_key_trigger_modes(storage, wal, txn, table, trigger_target, mode, recurse) {
+        Ok(found) => matched |= found,
+        Err(error) => return sql_fail(error),
+    }
     if !matched && let crate::sql::ast::TriggerEnableTarget::Name(name) = trigger_target {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
-            "trigger \"{}\" for relation \"{}\" does not exist",
+            "trigger \"{}\" for table \"{}\" does not exist",
             name,
             relation
         ));
@@ -76875,6 +76879,125 @@ fn alter_table_trigger_enabled(
         responder.command_complete(tag)?;
     }
     sql_ok()
+}
+
+/// Sets the firing mode of the foreign key RI triggers on `table` that
+/// `target` selects: `ALL` or one `RI_ConstraintTrigger_*` name, never
+/// `USER`. A referencing table owns its check triggers and a referenced table
+/// its action triggers; both live in the referencing table's definition.
+/// Only superusers may change these system triggers. Returns whether any
+/// trigger matched.
+fn alter_foreign_key_trigger_modes(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table: usize,
+    target: crate::sql::ast::TriggerEnableTarget<'_>,
+    mode: crate::storage::TriggerEnabled,
+    recurse: bool,
+) -> Result<bool, SqlError> {
+    use crate::storage::ForeignKeyTrigger;
+    // Without ONLY, a partitioned table's change reaches its partitions'
+    // cloned check triggers too, as PostgreSQL recurses.
+    let txid = txn.txid;
+    let owned = |owner: Option<usize>, storage: &Storage| {
+        owner.is_some_and(|owner| {
+            owner == table || (recurse && storage.partition_descends_from(owner, table, txid))
+        })
+    };
+    if matches!(target, crate::sql::ast::TriggerEnableTarget::User) {
+        return Ok(false);
+    }
+    let selected = |name: &str| match target {
+        crate::sql::ast::TriggerEnableTarget::Name(wanted) => name == wanted,
+        _ => true,
+    };
+    // PostgreSQL visits a table's triggers in name order and rejects the
+    // first system trigger a non-superuser selects.
+    let mut first: Option<SqlName> = None;
+    for child in 0..storage.table_count() {
+        if !storage.table(child).visible_to(txn.txid) {
+            continue;
+        }
+        let definition = storage.table_def(child, txn.txid);
+        for foreign_key in definition.fkeys() {
+            let parent = storage.find_visible(
+                foreign_key.parent_schema.as_str(),
+                foreign_key.parent.as_str(),
+                txn.txid,
+            );
+            for trigger in ForeignKeyTrigger::ALL {
+                let owner = match trigger {
+                    ForeignKeyTrigger::ActionDelete | ForeignKeyTrigger::ActionUpdate => parent,
+                    ForeignKeyTrigger::CheckInsert | ForeignKeyTrigger::CheckUpdate => Some(child),
+                };
+                let name = constraints::foreign_key_trigger_name(foreign_key, trigger)?;
+                if owner == Some(table)
+                    && selected(name.as_str())
+                    && first.is_none_or(|first| name.as_str() < first.as_str())
+                {
+                    first = Some(name);
+                }
+            }
+        }
+    }
+    let Some(first) = first else {
+        return Ok(false);
+    };
+    if storage
+        .current_role_slot(txn.txid)
+        .is_some_and(|role| !storage.role(role).attributes_to(txn.txid).superuser)
+    {
+        return Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied: \"{}\" is a system trigger",
+            first.as_str()
+        ));
+    }
+    for child in 0..storage.table_count() {
+        if !storage.table(child).visible_to(txn.txid) {
+            continue;
+        }
+        let (edit_target, definition) = storage.select_table_definition(child, txn.txid);
+        let mut next = TableDefBuilder::from_definition(&definition);
+        let mut changed = false;
+        for foreign_key in &mut next.fkeys[..next.n_fkeys] {
+            let parent = storage.find_visible(
+                foreign_key.parent_schema.as_str(),
+                foreign_key.parent.as_str(),
+                txn.txid,
+            );
+            for trigger in ForeignKeyTrigger::ALL {
+                let owner = match trigger {
+                    ForeignKeyTrigger::ActionDelete | ForeignKeyTrigger::ActionUpdate => parent,
+                    ForeignKeyTrigger::CheckInsert | ForeignKeyTrigger::CheckUpdate => Some(child),
+                };
+                let name = constraints::foreign_key_trigger_name(foreign_key, trigger)?;
+                if (owned(owner, storage)
+                    && (owner == Some(table)
+                        || matches!(target, crate::sql::ast::TriggerEnableTarget::All)))
+                    && selected(name.as_str())
+                    && foreign_key.trigger_enabled[trigger.ordinal()] != mode
+                {
+                    foreign_key.trigger_enabled[trigger.ordinal()] = mode;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            continue;
+        }
+        if child != table {
+            storage.lock_table(
+                txn.txid,
+                child,
+                crate::sql::ast::TableLockMode::ShareRowExclusive,
+                false,
+            )?;
+        }
+        stage_table_definition(storage, wal, txn, edit_target, definition, next)?;
+    }
+    Ok(true)
 }
 
 #[derive(Clone, Copy)]

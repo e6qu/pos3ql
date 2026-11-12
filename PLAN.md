@@ -386,11 +386,6 @@ A trigger's returned row is checked by column type identity only: a
 also compares type modifiers. A field selected from a function's row result
 (`(coalesce(NEW, OLD)).label`) has its storage type, not a domain column's
 declared type. `ROW(...)::t` for a table's row type fails with `42846`.
-Foreign key internal triggers (`RI_ConstraintTrigger_*` in `pg_trigger`)
-always stay `ORIGIN`: `ALTER TABLE ... DISABLE TRIGGER ALL`, `ENABLE ALWAYS
-TRIGGER ALL` and naming one of them leave foreign key checks and actions as
-they were, where PostgreSQL disables them (as `pg_dump --disable-triggers`
-relies on) or fires them under `session_replication_role = replica`.
 A `RETURNING` list routed through a rule's `RETURNING` list reads the rule's
 relation only: `UPDATE v ... FROM o RETURNING o.label`, `*` beside `FROM` or
 `USING` sources, and subqueries in that list fail with `0A000` where

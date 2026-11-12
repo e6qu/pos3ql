@@ -25,7 +25,7 @@ schema changes follow a different procedure; see
 
 | Object | Identity | Read | Write | Notes |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v39` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
+| Checkpoint manifest | `pos3ql-manifest-v40` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
 | Journal record | Version `27` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | Identity is SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; the LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
@@ -112,13 +112,15 @@ Other payload rules:
   another partition. Other bits are rejected. Recovery and restored prepared
   transactions keep the move flag, so a statement that waited for the row
   fails with PostgreSQL's `40001` instead of skipping it.
-- **Table definition payload** is version 18: version byte, ten-byte catalog
-  position, name, then the definition. Other versions are rejected. Each
-  foreign key ends with a one-byte count and the two-byte column positions
-  its `ON DELETE SET NULL (...)` or `SET DEFAULT (...)` list changes
-  (PostgreSQL's `confdelsetcols`; zero means every key column). The
-  manifest's `fkey` line carries the same count and positions after the
-  validation code.
+- **Table definition payload** is version 19: version byte, ten-byte catalog
+  position, name, then the definition. Other versions are rejected. After its
+  validation code, each foreign key stores four one-byte `tgenabled` codes
+  (`O`, `R`, `A`, `D`) for its delete-action, update-action, insert-check and
+  update-check RI triggers, then a one-byte count and the two-byte column
+  positions its `ON DELETE SET NULL (...)` or `SET DEFAULT (...)` list
+  changes (PostgreSQL's `confdelsetcols`; zero means every key column). The
+  manifest's `fkey` line carries the same four codes, count and positions
+  after the validation code.
 - **Domain payload** uses marker 251; earlier layouts are rejected. A mandatory
   checked-default input section follows the constraint identities (an empty
   section is explicit).
@@ -335,7 +337,7 @@ detached partition CHECKs, and domain CHECK and NOT NULL constraints each have a
 creation identity. Renames preserve it; replacing a backing index changes
 `conindid` but not the constraint identifier, comments or dependencies.
 
-Table payload v18 and domain marker 251 append one four-byte little-endian
+Table payload v19 and domain marker 251 append one four-byte little-endian
 identity per constraint. Table order: CHECKs, foreign keys, live NOT NULL
 attributes by stable attribute number, detached partition CHECK, named primary
 and unique keys, exclusions, inline keys by attribute number. Domain order:
@@ -346,9 +348,9 @@ the saved counter, or shared by distinct tables or domains in one database.
 | Rule | Format |
 |---|---|
 | Per-kind capacity | 64 table constraints per kind, 64 domain checks; journal counts are bytes; the 65th returns `54000` |
-| Unique-key mode | Tag `0` NULLs distinct, `1` primary key, `2` `NULLS NOT DISTINCT`; other tags rejected. v18 stores tag, key-column count and timing as three bytes before positions |
+| Unique-key mode | Tag `0` NULLs distinct, `1` primary key, `2` `NULLS NOT DISTINCT`; other tags rejected. v19 stores tag, key-column count and timing as three bytes before positions |
 | Constraint-created indexes | Own stamp; stored beside stable attribute numbers within the 512-byte column metadata bound |
-| Inline key names | Chosen once at admission (63-byte limit, no split UTF-8, collision suffix); v18 stores two-byte attribute number plus bounded name per key |
+| Inline key names | Chosen once at admission (63-byte limit, no split UTF-8, collision suffix); v19 stores two-byte attribute number plus bounded name per key |
 | NOT NULL names | Stored for columns and domains; renaming `orders` keeps `orders_id_not_null` |
 | Deferred uniqueness | Stored; every current index-option section is required |
 

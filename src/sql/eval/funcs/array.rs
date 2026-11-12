@@ -524,9 +524,12 @@ pub(crate) fn dispatch<'a>(
                 };
                 // The result element type promotes to hold both the array's elements
                 // and the new one (PostgreSQL's polymorphic anyarray/anyelement).
+                // An untyped literal takes the array's element type, as
+                // PostgreSQL resolves `anyelement` from `anyarray`.
+                let untyped = matches!(args[elem_index], Expr::Str(_)) && raw.is_some();
                 let element = match ArrElem::from_datum(&elem) {
-                    Some(e) => unify_arr_elem(source, e)?,
-                    None => source,
+                    Some(e) if !untyped => unify_arr_elem(source, e)?,
+                    _ => source,
                 };
                 let source_count = raw.map_or(0, array::len);
                 let items = array::alloc_items(arena, source_count + 1)?;
@@ -541,8 +544,14 @@ pub(crate) fn dispatch<'a>(
                 let coerced = if elem.is_null() {
                     Datum::Null
                 } else {
+                    let cast = cast_to(elem, element.to_coltype(), arena);
                     durable_element(
-                        cast_to(elem, element.to_coltype(), arena)?,
+                        match (cast, args[elem_index]) {
+                            (Err(error), Expr::Str(literal)) if untyped => {
+                                return Err(crate::sql::error_position::at_subject(error, literal));
+                            }
+                            (cast, _) => cast?,
+                        },
                         element,
                         hooks.catalog,
                         arena,

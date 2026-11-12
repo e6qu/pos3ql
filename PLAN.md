@@ -99,6 +99,10 @@ is owned.
   cursor returns saved values where PostgreSQL evaluates a volatile output
   list again, and a row-locking cursor over a join, or ordered by an
   expression that is not a source column, locks its rows at `DECLARE`.
+  Such a cursor declared without `SCROLL` or `NO SCROLL` shows
+  `is_scrollable` false in `pg_cursors` yet accepts backward fetches, where
+  PostgreSQL decides from its plan (a sort scans backward, an aggregate
+  rejects it with `55000`).
   PL/pgSQL bound cursor declarations (`c CURSOR FOR ...` in `DECLARE`) are
   rejected with `0A000`; a `refcursor` opened with `OPEN ... FOR` works. Saving a held cursor at
   commit yields during storage waits. Cursors keep declared record and domain
@@ -266,14 +270,13 @@ behavior; being listed in the catalog is not support. Keep the SQLAlchemy,
 Alembic, psycopg2 and other client comparisons passing, and turn every
 unsupported case into an explicit error. Known gaps: `ALTER`, `COMMENT ON`
 and `GRANT` on a built-in function (`ALTER FUNCTION lower(text) STABLE`) fail
-with `0A000` where PostgreSQL changes the catalog entry; `array_replace` takes
-the replacement's runtime type, so `array_replace('{a}'::refcursor[], 'a',
-'b')` fails with `42804` where PostgreSQL returns `{b}`; `information_schema`
+with `0A000` where PostgreSQL changes the catalog entry; `information_schema`
 domains such as `cardinal_number` do not exist. `CREATE FUNCTION` checks a
 SQL function's final query against a scalar result only; a composite or record
-result is checked when called. A polymorphic SQL function's runtime result
-mismatch names the declared type (`anyelement`) where PostgreSQL names the
-resolved one. Expressions are shown as stored, not deparsed: `pg_get_expr`,
+result is checked when called. A polymorphic SQL function whose body
+returns another type than the resolved one (`anyelement` called with an
+integer, body returning `text`) fails converting the value where PostgreSQL
+reports `return type mismatch` while inlining it. Expressions are shown as stored, not deparsed: `pg_get_expr`,
 `pg_get_function_arguments` and `pg_get_functiondef` print a default `'x'` for a
 `text` parameter where PostgreSQL prints `'x'::text`, `pg_get_viewdef` returns
 the view's query text, and a `BEGIN ATOMIC` body is printed as written rather

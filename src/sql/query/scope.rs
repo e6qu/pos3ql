@@ -1825,9 +1825,15 @@ impl<'d> QueryScope<'d> {
             out[n_out] = ResolvedColumn::Table(0, c);
             n_out += 1;
         }
+        // The current join tree's output starts here; a comma-separated item
+        // starts a new tree, which a later USING/NATURAL join merges with.
+        let mut tree_start = 0usize;
         for (join_index, join) in joins.iter().enumerate() {
             let right_t = join_index + 1;
             let right_def = self.defs.get(right_t).expect("resolved");
+            if join.list_item {
+                tree_start = n_out;
+            }
             if !(join.natural || join.using.is_some()) {
                 for c in 0..right_def.n_columns {
                     out[n_out] = ResolvedColumn::Table(right_t, c);
@@ -1842,7 +1848,7 @@ impl<'d> QueryScope<'d> {
                 clause.columns
             } else {
                 let mut n_using = 0usize;
-                for entry in &out[..n_out] {
+                for entry in &out[tree_start..n_out] {
                     let name = self.output_name(*entry);
                     if right_def.column_index(name).is_some()
                         && !natural_using[..n_using].contains(&name)
@@ -1859,7 +1865,7 @@ impl<'d> QueryScope<'d> {
                 // The name must be unique in the left tree and present on
                 // the right (empirically pinned against PostgreSQL 18.4).
                 let mut left_entry = None;
-                for (k, entry) in out[..n_out].iter().enumerate() {
+                for (k, entry) in out[..n_out].iter().enumerate().skip(tree_start) {
                     if self.output_name(*entry) == name {
                         if left_entry.is_some() {
                             return Err(sql_err!(
@@ -1971,8 +1977,8 @@ impl<'d> QueryScope<'d> {
                     n_columns: n_new,
                 });
             }
-            out.copy_within(0..n_out, n_new);
-            for (k, slot) in out[..n_new].iter_mut().enumerate() {
+            out.copy_within(tree_start..n_out, tree_start + n_new);
+            for (k, slot) in out[tree_start..tree_start + n_new].iter_mut().enumerate() {
                 *slot = ResolvedColumn::Merged(first_new_merge + k);
             }
             n_out += n_new;
@@ -2208,11 +2214,37 @@ impl<'d> QueryScope<'d> {
                 "missing FROM-clause entry for table \"{}\"",
                 table
             ),
-            None => sql_err!(
-                sqlstate::UNDEFINED_TABLE,
-                "missing FROM-clause entry for table \"{}\"",
-                name
-            ),
+            // A table named by its relation name while an alias hides it.
+            None => match (0..self.n).find(|&index| {
+                self.derived[index].is_none()
+                    && self.names[index] != name
+                    && self
+                        .defs
+                        .get(index)
+                        .is_some_and(|definition| definition.name.as_str() == name)
+            }) {
+                Some(aliased) => {
+                    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
+                        detail: None,
+                        hint: Some(crate::stack_format!(
+                            crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+                            "Perhaps you meant to reference the table alias \"{}\".",
+                            self.names[aliased]
+                        )),
+                        objects: crate::sql::eval::ErrorObjects::default(),
+                    });
+                    sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "invalid reference to FROM-clause entry for table \"{}\"",
+                        name
+                    )
+                }
+                None => sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "missing FROM-clause entry for table \"{}\"",
+                    name
+                ),
+            },
         })
     }
 

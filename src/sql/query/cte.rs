@@ -900,6 +900,7 @@ fn prepend_rule_source<'a>(
                     on: None,
                     using: None,
                     natural: false,
+                    list_item: true,
                 }
             } else {
                 existing.joins[index - 1]
@@ -980,6 +981,7 @@ fn append_rule_input_from<'a>(
                     on: None,
                     using: None,
                     natural: false,
+                    list_item: true,
                 }
             } else {
                 existing.joins[index - 1]
@@ -5889,6 +5891,7 @@ fn subst_from<'a>(
                 on: opt_subst(j.on, context, arena)?,
                 using: j.using,
                 natural: j.natural,
+                list_item: j.list_item,
             })
             .map_err(|_| arena_full())?;
     }

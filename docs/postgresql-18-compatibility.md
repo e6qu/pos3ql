@@ -59,6 +59,13 @@ Schemas and catalogs:
   LATERAL (SELECT v) s`, `v` is `t.v`. On the right of a `RIGHT` or `FULL`
   join such an item reads none of them; naming one fails with `42P10` and
   PostgreSQL's detail, and a body that names none runs once.
+- A comma starts a new join tree: in `FROM x, a JOIN b USING (id)` the
+  `USING` and `NATURAL` columns come from `a` and `b` only, and lead their
+  tree's columns after `x`'s. A `RIGHT` or `FULL` join after a comma (`FROM x,
+  a RIGHT JOIN b ON ...`) fails with `0A000`: joins run left to right over
+  the whole list, which PostgreSQL's `x` crossed with `a RIGHT JOIN b` does
+  not match. A join condition may still name items before the comma, which
+  PostgreSQL rejects with `42P01`.
 
 Data-modifying statements:
 

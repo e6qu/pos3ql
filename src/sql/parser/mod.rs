@@ -4410,6 +4410,7 @@ impl<'a> Parser<'a> {
         let mut joins = ArenaList::new(self.arena);
         loop {
             let natural = self.eat_ident("natural")?;
+            let mut list_item = false;
             let kind = if natural {
                 if self.eat_ident("inner")? {
                     self.expect_ident("join")?;
@@ -4431,6 +4432,7 @@ impl<'a> Parser<'a> {
                     JoinKind::Inner
                 }
             } else if self.eat_op(",")? {
+                list_item = true;
                 JoinKind::Cross
             } else if self.eat_ident("cross")? {
                 self.expect_ident("join")?;
@@ -4493,6 +4495,7 @@ impl<'a> Parser<'a> {
                     on,
                     using,
                     natural,
+                    list_item,
                 },
             )?;
         }

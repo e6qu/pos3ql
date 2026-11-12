@@ -7714,6 +7714,19 @@ fn scan_source_mode<'a>(
     // item depends on the tables to its left, so any lateral entry also pins the
     // order to FROM order (reordering could bind a dependency after it).
     let any_lateral = scope.lateral[..scope.n].iter().any(|&l| l);
+    // Joins run left-deep over the whole FROM list, which matches
+    // PostgreSQL's `a, b RIGHT JOIN c` (`a` crossed with `b RIGHT JOIN c`)
+    // only for inner and left joins.
+    for (index, join) in from.joins.iter().enumerate() {
+        if matches!(join.kind, JoinKind::Right | JoinKind::Full)
+            && from.joins[..index].iter().any(|prior| prior.list_item)
+        {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a RIGHT or FULL JOIN after a comma-separated FROM item is not supported"
+            ));
+        }
+    }
     let all_cross = from.joins.iter().all(|j| matches!(j.kind, JoinKind::Cross));
     let order = arena
         .alloc_slice_with(scope.n, |index| index)

@@ -1487,6 +1487,12 @@ fn a_lateral_body_reads_only_the_items_to_its_left() {
                     .to_string(),
             ),
             (
+                "SELECT count(*) FROM lw, lt a RIGHT JOIN lu s ON true",
+                "ERROR 0A000 a RIGHT or FULL JOIN after a comma-separated FROM item is not \
+                 supported"
+                    .to_string(),
+            ),
+            (
                 "DELETE FROM lt USING lw WHERE false RETURNING *",
                 "ERROR 0A000 RETURNING * is not supported with UPDATE ... FROM or DELETE ... \
                  USING"

@@ -397,7 +397,10 @@ of `UPDATE ... FROM` and `DELETE ... USING` cannot read the `FROM`/`USING`
 items (`42P01`; `RETURNING *` fails with `0A000`). A parameter used inside a
 `FROM` subquery of `PREPARE` (`PREPARE p AS SELECT * FROM (SELECT 1 + $1) s`)
 is typed `text` before the subquery is described, so the statement fails
-with `42883`. The
+with `42883`. Joins run left to right over the whole FROM list, so a `RIGHT`
+or `FULL` join after a comma-separated item fails with `0A000`, and a join
+condition naming an item before the comma is accepted where PostgreSQL
+fails with `42P01`; both need nested join trees. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

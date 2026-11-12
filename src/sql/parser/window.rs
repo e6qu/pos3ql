@@ -171,23 +171,33 @@ impl<'a> Parser<'a> {
 
     /// The inside of a window specification, `(` already consumed: an optional
     /// existing window name to copy, then PARTITION BY / ORDER BY / frame.
+    /// The grammar admits only a window clause or `)` after a copied
+    /// window's name; anything else is a syntax error there, before the name
+    /// is looked up.
+    fn copied_window_continues(&self) -> Result<(), ParseError> {
+        match self.peeked {
+            Tok::Ident("partition" | "order" | "rows" | "range" | "groups") => Ok(()),
+            Tok::Op(")") => Ok(()),
+            _ => Err(self.syntax_error_here()),
+        }
+    }
+
     pub(super) fn window_spec_body(&mut self) -> Result<WindowSpec<'a>, ParseError> {
         // A leading identifier that is not one of the clause keywords names an
         // existing window to copy, as in `OVER (w ORDER BY x)`.
         let copied = match self.peeked {
-            // `exclude` is not a window name either: it only follows a frame,
-            // so a leading one is the syntax error PostgreSQL reports.
+            // `exclude` is an unreserved keyword, so `OVER (EXCLUDE CURRENT
+            // ROW)` names a window and fails at `CURRENT`, as in PostgreSQL.
             Tok::Ident(name)
-                if !matches!(
-                    name,
-                    "partition" | "order" | "rows" | "range" | "groups" | "exclude"
-                ) =>
+                if !matches!(name, "partition" | "order" | "rows" | "range" | "groups") =>
             {
                 self.advance()?;
+                self.copied_window_continues()?;
                 Some((name, *self.named_window(name)?))
             }
             Tok::QuotedIdent(name) => {
                 self.advance()?;
+                self.copied_window_continues()?;
                 Some((name, *self.named_window(name)?))
             }
             _ => None,

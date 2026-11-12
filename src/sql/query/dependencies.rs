@@ -2183,6 +2183,7 @@ pub(super) fn dml_dependency_scope<'a>(
                             on: None,
                             using: None,
                             natural: false,
+                            list_item: true,
                         }
                     } else {
                         extra.joins[index - 1]

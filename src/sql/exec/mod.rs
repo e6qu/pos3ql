@@ -66736,6 +66736,7 @@ pub fn describe_merge_returning<'a>(
             on: None,
             using: None,
             natural: false,
+            list_item: true,
         }])
         .map_err(|_| super::query::arena_full_pub())?;
     let from = arena
@@ -66833,6 +66834,7 @@ pub fn describe_merge_returning<'a>(
                         on: None,
                         using: None,
                         natural: false,
+                        list_item: true,
                     },
                     Join {
                         table: old_target,
@@ -66840,6 +66842,7 @@ pub fn describe_merge_returning<'a>(
                         on: None,
                         using: None,
                         natural: false,
+                        list_item: true,
                     },
                     Join {
                         table: new_target,
@@ -66847,6 +66850,7 @@ pub fn describe_merge_returning<'a>(
                         on: None,
                         using: None,
                         natural: false,
+                        list_item: true,
                     },
                 ])
                 .map_err(|_| super::query::arena_full_pub())?;

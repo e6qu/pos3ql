@@ -3571,6 +3571,9 @@ pub struct Join<'a> {
     /// NATURAL join: the using-column list is every common column name,
     /// resolved at plan time.
     pub natural: bool,
+    /// A comma-separated FROM list item (`FROM a, b`): it starts a new join
+    /// tree, so a later join's left side begins here, not at the FROM base.
+    pub list_item: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -9342,6 +9342,18 @@ pub fn json_each_pairs<'a>(
 ) -> Result<&'a [(&'a str, Datum<'a>)], SqlError> {
     match super::json::kind_of(text) {
         super::json::Kind::Object => {}
+        // jsonb names the function for an array or a scalar alike.
+        _ if jsonb => {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "cannot call {} on a non-object",
+                if as_text {
+                    "jsonb_each_text"
+                } else {
+                    "jsonb_each"
+                }
+            ));
+        }
         super::json::Kind::Array => {
             return Err(sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,

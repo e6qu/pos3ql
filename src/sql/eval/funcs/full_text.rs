@@ -271,6 +271,35 @@ fn rank_normalization(value: Datum<'_>) -> Result<Option<i32>, SqlError> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// PostgreSQL's NOTICE for a text-search query function whose result is
+/// empty: either its input held no operand at all, or every operand was a
+/// stop word or produced no lexeme. The plain and phrase parsers treat any
+/// nonempty input as one operand.
+fn empty_query_notice(name: &str, source: &str) -> Result<(), SqlError> {
+    let no_operand = if matches!(name, "plainto_tsquery" | "phraseto_tsquery") {
+        source.is_empty()
+    } else {
+        source
+            .bytes()
+            .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
+    };
+    if no_operand {
+        crate::sql::eval::raise_eval_message(
+            crate::sql::eval::EvalMessageLevel::Notice,
+            sqlstate::SUCCESSFUL_COMPLETION,
+            format_args!("text-search query doesn't contain lexemes: \"{source}\""),
+        )
+    } else {
+        crate::sql::eval::raise_eval_message(
+            crate::sql::eval::EvalMessageLevel::Notice,
+            sqlstate::SUCCESSFUL_COMPLETION,
+            format_args!(
+                "text-search query contains only stop words or doesn't contain lexemes, ignored"
+            ),
+        )
+    }
+}
+
 pub(crate) fn dispatch<'a>(
     name: &str,
     args: &[&Expr<'a>],
@@ -465,6 +494,9 @@ pub(crate) fn dispatch<'a>(
                         },
                     )?
                 };
+                if query.is_empty() {
+                    empty_query_notice(name, source)?;
+                }
                 Ok(Datum::TsQuery(full_text::restore_query(query)))
             }
             "strip" => {

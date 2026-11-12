@@ -125,18 +125,20 @@ fn invalid(message: &'static str) -> SqlError {
     sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "{}", message)
 }
 
-/// PostgreSQL clamps an over-precise temporal modifier with a WARNING, which
-/// an expression cannot send to the client; the call is rejected rather than
-/// clamped silently.
-fn clamped_precision(type_name: &str, suffix: &str, precision: i32) -> SqlError {
-    sql_err!(
-        sqlstate::FEATURE_NOT_SUPPORTED,
-        "{}({}){} precision would be reduced to 6 with a warning, which this call cannot report",
-        type_name,
-        precision,
-        suffix
-    )
+/// PostgreSQL clamps an over-precise temporal modifier to 6 with a WARNING.
+fn clamped_precision(type_name: &str, suffix: &str, precision: i32) -> Result<i32, SqlError> {
+    crate::sql::eval::raise_eval_message(
+        crate::sql::eval::EvalMessageLevel::Warning,
+        sqlstate::INVALID_PARAMETER_VALUE,
+        format_args!(
+            "{}({}){} precision reduced to maximum allowed, {}",
+            type_name, precision, suffix, MAX_TEMPORAL_PRECISION
+        ),
+    )?;
+    Ok(MAX_TEMPORAL_PRECISION)
 }
+
+const MAX_TEMPORAL_PRECISION: i32 = 6;
 
 /// The `atttypmod` that `typmods` (of `count` entries) encodes for `kind`.
 fn encode(kind: TypmodKind, typmods: &[i32], count: usize) -> Result<i32, SqlError> {
@@ -227,8 +229,8 @@ fn encode(kind: TypmodKind, typmods: &[i32], count: usize) -> Result<i32, SqlErr
                     suffix
                 ));
             }
-            if *precision > 6 {
-                return Err(clamped_precision(type_name, suffix, *precision));
+            if *precision > MAX_TEMPORAL_PRECISION {
+                return clamped_precision(type_name, suffix, *precision);
             }
             Ok(*precision)
         }
@@ -254,9 +256,11 @@ fn encode(kind: TypmodKind, typmods: &[i32], count: usize) -> Result<i32, SqlErr
                             precision
                         ));
                     }
-                    if *precision > 6 {
-                        return Err(clamped_precision("INTERVAL", "", *precision));
-                    }
+                    let precision = if *precision > MAX_TEMPORAL_PRECISION {
+                        clamped_precision("INTERVAL", "", *precision)?
+                    } else {
+                        *precision
+                    };
                     Ok((range << 16) | precision)
                 }
                 _ => Err(invalid("invalid INTERVAL type modifier")),
@@ -295,12 +299,25 @@ mod tests {
                 .as_str(),
             "22023"
         );
+        crate::sql::eval::clear_eval_messages();
+        assert_eq!(encoded(TypmodKind::Temporal("TIME", ""), &[7]), 6);
+        assert_eq!(encoded(TypmodKind::Interval, &[32767, 9]), 2_147_418_118);
+        let first = crate::sql::eval::peek_eval_message().unwrap();
+        assert_eq!(first.level, crate::sql::eval::EvalMessageLevel::Warning);
+        assert_eq!(first.sqlstate.as_str(), "22023");
         assert_eq!(
-            encode(TypmodKind::Temporal("TIME", ""), &[7], 1)
-                .unwrap_err()
-                .sqlstate
-                .as_str(),
-            "0A000"
+            first.message.as_str(),
+            "TIME(7) precision reduced to maximum allowed, 6"
         );
+        crate::sql::eval::pop_eval_message();
+        assert_eq!(
+            crate::sql::eval::peek_eval_message()
+                .unwrap()
+                .message
+                .as_str(),
+            "INTERVAL(9) precision reduced to maximum allowed, 6"
+        );
+        crate::sql::eval::clear_eval_messages();
+        assert!(crate::sql::eval::peek_eval_message().is_none());
     }
 }

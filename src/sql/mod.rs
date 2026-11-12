@@ -15699,7 +15699,7 @@ impl Engine {
             self.work.reset();
             self.storage.set_read_snapshot(source_snapshot);
             invocations.begin_attempt();
-            let output_mark = responder.mark();
+            let output_mark = responder.attempt_mark();
             let outcome = self.execute_select_once(
                 statement,
                 arena,
@@ -15715,7 +15715,7 @@ impl Engine {
             if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
                 return Ok(Err(error));
             }
-            if let Err(error) = responder.truncate_to(output_mark) {
+            if let Err(error) = responder.restart_attempt(output_mark) {
                 // Rows already sent cannot be withdrawn for another attempt.
                 return Ok(Err(error));
             }
@@ -15807,7 +15807,7 @@ impl Engine {
                 self.work.reset();
                 self.storage.set_read_snapshot(source_snapshot);
                 invocations.begin_attempt();
-                let output_mark = responder.mark();
+                let output_mark = responder.attempt_mark();
                 let outcome = {
                     let sequence =
                         sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
@@ -15822,7 +15822,7 @@ impl Engine {
                 if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
                     return Ok(Err(error));
                 }
-                if let Err(error) = responder.truncate_to(output_mark) {
+                if let Err(error) = responder.restart_attempt(output_mark) {
                     // Rows already sent cannot be withdrawn for another attempt.
                     return Ok(Err(error));
                 }
@@ -16103,7 +16103,7 @@ impl Engine {
             self.work.reset();
             invocations.begin_attempt();
             let attempt_arena_mark = arena.mark();
-            let output_mark = responder.mark();
+            let output_mark = responder.attempt_mark();
             let statement_mark =
                 txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
             let boundary = completion_handoff.then_some(txn::WriteCompletionBoundary {
@@ -16166,7 +16166,7 @@ impl Engine {
             }
             self.rollback_waiting_statement(txn, statement_mark);
             self.dml_scratch.clear();
-            if let Err(error) = responder.truncate_to(output_mark) {
+            if let Err(error) = responder.restart_attempt(output_mark) {
                 // Rows already sent cannot be withdrawn for another attempt.
                 return Ok(Err(error));
             }
@@ -19101,6 +19101,9 @@ impl Engine {
         // install this session's effective search path in the worker-local
         // execution context used by every name resolution below.
         let _ = eval::take_diagnostic();
+        if reset_workspace {
+            eval::clear_eval_messages();
+        }
         exec::reset_record_shapes();
         for (_, composite) in self.storage.composites_with_slots_visible_to(txn.txid) {
             if let Err(error) = exec::register_named_composite_shape(

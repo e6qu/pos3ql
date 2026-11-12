@@ -314,6 +314,7 @@ impl Engine {
     ) -> Result<(), SqlError> {
         self.refresh_prepared_transaction_catalog()?;
         let _ = eval::take_diagnostic();
+        eval::clear_eval_messages();
         exec::reset_record_shapes();
         for (_, composite) in self.storage.composites_with_slots_visible_to(txn.txid) {
             exec::register_named_composite_shape(

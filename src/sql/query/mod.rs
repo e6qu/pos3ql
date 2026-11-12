@@ -4096,8 +4096,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 .iter()
                 .all(|column| column.type_oid == super::types::oid::TSQUERY);
         let query = RoutineQuery::Select(query);
-        let source = arena.alloc_str(source).map_err(|_| arena_full())?;
-        let mut rewritten = super::full_text::canonical_query(source, arena)?;
+        let mut rewriter = super::full_text::QueryRewriter::new(source, arena)?;
         execute_routine_query(
             &query,
             self.storage,
@@ -4118,13 +4117,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                         "ts_rewrite query must return two tsquery columns"
                     ));
                 };
-                rewritten = super::full_text::rewrite_query(
-                    rewritten,
-                    target.as_str(),
-                    replacement.as_str(),
-                    arena,
-                )?;
-                Ok(())
+                rewriter.apply(target.as_str(), replacement.as_str())
             },
         )?;
         if !valid {
@@ -4133,7 +4126,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 "ts_rewrite query must return two tsquery columns"
             ));
         }
-        Ok(rewritten)
+        rewriter.finish()
     }
 
     fn text_search_configuration_name(&self, oid: i32) -> Option<crate::util::StackStr<128>> {
@@ -9524,6 +9517,15 @@ fn check_select_types<'a>(
 /// Surfaces plan-time constant errors (e.g. `1/0`) across every expression
 /// of a SELECT, matching PostgreSQL's constant folding.
 pub fn check_select_constants<'a>(
+    statement: &Select<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<(), SqlError> {
+    super::eval::probe_constants(|| check_select_constants_in(statement, arena, storage, txid))
+}
+
+fn check_select_constants_in<'a>(
     statement: &Select<'a>,
     arena: &'a Arena,
     storage: &Storage,

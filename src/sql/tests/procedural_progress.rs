@@ -2282,3 +2282,46 @@ fn procedural_bound_cursor_declarations_are_rejected_as_unsupported() {
         ["6"]
     );
 }
+
+#[test]
+fn builtin_notices_and_warnings_reach_the_client_once_and_in_order() {
+    let config = test_config("builtin-evaluation-messages");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let output = session.success(
+        &mut engine,
+        "select timestamptypmodin('{7}'), timetypmodin('{9}'), intervaltypmodin('{32767,8}');
+         set client_min_messages = error;
+         select timestamptypmodin('{8}');
+         reset client_min_messages;
+         select to_tsquery('english', 'the'), plainto_tsquery('english', '');
+         select pg_cancel_backend(999999);
+         select to_tsvector('simple', repeat('x', 2048) || ' y');
+         select ts_rewrite('a & b'::tsquery, 'a'::tsquery, 'c'::tsquery);",
+        true,
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["6|6|2147418118", "6", "|", "f", "'y':1", "'b' & 'c'"]
+    );
+    let wire = String::from_utf8_lossy(&output);
+    let expected = [
+        "SWARNING\0VWARNING\0C22023\0MTIMESTAMP(7) precision reduced to maximum allowed, 6\0\0",
+        "SWARNING\0VWARNING\0C22023\0MTIME(9) precision reduced to maximum allowed, 6\0\0",
+        "SWARNING\0VWARNING\0C22023\0MINTERVAL(8) precision reduced to maximum allowed, 6\0\0",
+        "SNOTICE\0VNOTICE\0C00000\0Mtext-search query contains only stop words or doesn't contain lexemes, ignored\0\0",
+        "SNOTICE\0VNOTICE\0C00000\0Mtext-search query doesn't contain lexemes: \"\"\0\0",
+        "SWARNING\0VWARNING\0C01000\0MPID 999999 is not a PostgreSQL backend process\0\0",
+        "SNOTICE\0VNOTICE\0C54000\0Mword is too long to be indexed\0DWords longer than 2047 characters are ignored.\0\0",
+    ];
+    let mut from = 0;
+    for message in expected {
+        assert_eq!(wire.matches(message).count(), 1, "{message:?} in {wire:?}");
+        let at = wire[from..]
+            .find(message)
+            .unwrap_or_else(|| panic!("{message:?} out of order in {wire:?}"));
+        from += at + message.len();
+    }
+    assert!(!wire.contains("TIMESTAMP(8)"), "{wire:?}");
+}

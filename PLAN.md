@@ -268,10 +268,7 @@ behavior; being listed in the catalog is not support. Keep the SQLAlchemy,
 Alembic, psycopg2 and other client comparisons passing, and turn every
 unsupported case into an explicit error. Known gaps: renaming or moving a
 built-in function fails with `0A000` where PostgreSQL changes the catalog
-entry (every built-in name lookup must consult a renamed or moved row);
-a type-modifier input function whose precision PostgreSQL clamps to 6 with a
-`WARNING` (`timetypmodin('{7}')`) fails with `0A000`, because a function
-call has no channel for a warning; a quantified regular-expression match
+entry (every built-in name lookup must consult a renamed or moved row); a quantified regular-expression match
 (`x ~ ANY (array['^a'])`) fails with `42883`; `pg_type` lists all 473
 `pg_catalog` types but of `information_schema`'s 148 only its domains and their
 arrays (the row types of its views, whose OIDs initdb assigns after importing

@@ -268,6 +268,152 @@ macro_rules! sql_err {
     };
 }
 
+/// NOTICE and WARNING messages a builtin raised while evaluating. Evaluation
+/// has no client connection, so they wait here and the session's responder
+/// sends them, in order, before its next protocol message. A statement that
+/// raises more than this many before sending anything fails with SQLSTATE
+/// 54000 instead of dropping one.
+pub const MAX_PENDING_EVAL_MESSAGES: usize = 64;
+pub const MAX_EVAL_MESSAGE_BYTES: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvalMessageLevel {
+    Notice,
+    Warning,
+}
+
+#[derive(Clone, Copy)]
+pub struct EvalMessage {
+    pub level: EvalMessageLevel,
+    pub sqlstate: SqlState,
+    pub message: StackStr<MAX_EVAL_MESSAGE_BYTES>,
+    pub detail: Option<&'static str>,
+}
+
+struct PendingEvalMessages {
+    messages: [Option<EvalMessage>; MAX_PENDING_EVAL_MESSAGES],
+    head: usize,
+    len: usize,
+}
+
+std::thread_local! {
+    static PENDING_EVAL_MESSAGES: core::cell::RefCell<PendingEvalMessages> =
+        const {
+            core::cell::RefCell::new(PendingEvalMessages {
+                messages: [None; MAX_PENDING_EVAL_MESSAGES],
+                head: 0,
+                len: 0,
+            })
+        };
+}
+
+/// Queues a client message raised by builtin evaluation.
+pub fn raise_eval_message(
+    level: EvalMessageLevel,
+    sqlstate: &'static str,
+    message: core::fmt::Arguments<'_>,
+) -> Result<(), SqlError> {
+    queue_eval_message(level, sqlstate, message, None)
+}
+
+/// [`raise_eval_message`] with a fixed DETAIL line.
+pub fn raise_eval_message_with_detail(
+    level: EvalMessageLevel,
+    sqlstate: &'static str,
+    message: core::fmt::Arguments<'_>,
+    detail: &'static str,
+) -> Result<(), SqlError> {
+    queue_eval_message(level, sqlstate, message, Some(detail))
+}
+
+fn queue_eval_message(
+    level: EvalMessageLevel,
+    sqlstate: &'static str,
+    message: core::fmt::Arguments<'_>,
+    detail: Option<&'static str>,
+) -> Result<(), SqlError> {
+    let mut text = StackStr::<MAX_EVAL_MESSAGE_BYTES>::new();
+    if core::fmt::Write::write_fmt(&mut text, message).is_err() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "message exceeds {} bytes",
+            MAX_EVAL_MESSAGE_BYTES
+        ));
+    }
+    PENDING_EVAL_MESSAGES.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        if pending.len == MAX_PENDING_EVAL_MESSAGES {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "more than {} notices and warnings raised before the next output message",
+                MAX_PENDING_EVAL_MESSAGES
+            ));
+        }
+        let at = (pending.head + pending.len) % MAX_PENDING_EVAL_MESSAGES;
+        pending.messages[at] = Some(EvalMessage {
+            level,
+            sqlstate: SqlState::from(sqlstate),
+            message: text,
+            detail,
+        });
+        pending.len += 1;
+        Ok(())
+    })
+}
+
+/// The oldest queued evaluation message, left queued until
+/// [`pop_eval_message`] confirms it was sent.
+pub fn peek_eval_message() -> Option<EvalMessage> {
+    PENDING_EVAL_MESSAGES.with(|pending| {
+        let pending = pending.borrow();
+        if pending.len == 0 {
+            None
+        } else {
+            pending.messages[pending.head]
+        }
+    })
+}
+
+pub fn pop_eval_message() {
+    PENDING_EVAL_MESSAGES.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        if pending.len > 0 {
+            let head = pending.head;
+            pending.messages[head] = None;
+            pending.head = (head + 1) % MAX_PENDING_EVAL_MESSAGES;
+            pending.len -= 1;
+        }
+    });
+}
+
+/// The number of queued evaluation messages, for [`truncate_eval_messages`].
+pub fn eval_message_mark() -> usize {
+    PENDING_EVAL_MESSAGES.with(|pending| pending.borrow().len)
+}
+
+/// Drops the messages queued after `mark`, from an evaluation whose result
+/// is discarded and recomputed.
+pub fn truncate_eval_messages(mark: usize) {
+    PENDING_EVAL_MESSAGES.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        while pending.len > mark {
+            pending.len -= 1;
+            let at = (pending.head + pending.len) % MAX_PENDING_EVAL_MESSAGES;
+            pending.messages[at] = None;
+        }
+    });
+}
+
+/// Discards messages another session's evaluation left on this worker.
+pub fn clear_eval_messages() {
+    PENDING_EVAL_MESSAGES.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        pending.messages = [None; MAX_PENDING_EVAL_MESSAGES];
+        pending.head = 0;
+        pending.len = 0;
+    });
+}
+
 pub mod sqlstate {
     pub const SYNTAX_ERROR: &str = "42601";
     pub const INVALID_NAME: &str = "42602";
@@ -2877,7 +3023,26 @@ pub fn check_constant_errors<'a>(
     arena: &'a Arena,
     catalog: Option<&dyn CatalogAccess>,
 ) -> Result<(), SqlError> {
-    fold_check(expression, arena, catalog).map(|_| ())
+    probe_constants(|| fold_check(expression, arena, catalog).map(|_| ()))
+}
+
+std::thread_local! {
+    static CONSTANT_PROBE_DEPTH: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Runs a planning-time probe that evaluates constant expressions only to
+/// report their errors. A probe that succeeds is evaluated again at run time,
+/// which raises its notices then; a failing one is the statement's error, and
+/// PostgreSQL has sent the notices its folding raised before it.
+pub fn probe_constants(probe: impl FnOnce() -> Result<(), SqlError>) -> Result<(), SqlError> {
+    let messages = eval_message_mark();
+    let depth = CONSTANT_PROBE_DEPTH.with(|depth| depth.replace(depth.get() + 1));
+    let result = probe();
+    CONSTANT_PROBE_DEPTH.with(|probe_depth| probe_depth.set(depth));
+    if depth == 0 && result.is_ok() {
+        truncate_eval_messages(messages);
+    }
+    result
 }
 
 fn catalog_evaluation(
@@ -3100,6 +3265,7 @@ fn fold_check<'a>(
         } else {
             eval(expression, arena, NO_PARAMS, &NoColumns)
         };
+
         return Ok(match result {
             Ok(Datum::Bool(b)) => Some(b),
             Ok(_) => None,

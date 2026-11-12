@@ -257,9 +257,9 @@ Functions and expressions:
   declared type before reading a row, so a `cstring` side fails with `42883`
   even over an empty result. The type-modifier input functions
   (`numerictypmodin('{10,2}')` is `655366`) encode and validate modifiers as
-  PostgreSQL does. Limits: renaming or moving a built-in fails with `0A000`;
-  a temporal precision above 6, which PostgreSQL clamps with a `WARNING`
-  (`timetypmodin('{7}')`), fails with `0A000`.
+  PostgreSQL does; a temporal precision above 6 (`timetypmodin('{7}')`) is
+  clamped to 6 with PostgreSQL's `WARNING`. Limits: renaming or moving a
+  built-in fails with `0A000`.
   Dropping a built-in fails with `2BP01`, as in PostgreSQL.
 - PostgreSQL 18.6's predefined roles exist from the start, with their
   OIDs, and initdb's memberships of `pg_monitor` in `pg_read_all_settings`,
@@ -512,6 +512,7 @@ why none of these numbers is a throughput rate.
 | Timeout settings | 2,147,483,647 ms | `22023`; enabling a disabled-only timeout is `0A000` |
 | Simultaneously tracked function calls (`track_functions`) per SQL worker | 1,024 | `54000` |
 | Missing-function error text | 192 bytes | `54000` |
+| Built-in function NOTICE/WARNING messages raised before the next output message; one message's text | 64; 256 bytes | `54000` |
 | Transaction identities and command counters | 32-bit, checked | `54000` before reuse |
 | JSON nesting / jsonpath depth | 1,000 / 128 | see [SQL/JSON](sql-json.md) |
 | XML nesting, XPath work, constructor output | see [SQL/XML](sql-xml.md) | program-limit error |

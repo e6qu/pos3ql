@@ -312,6 +312,13 @@ pub struct Responder<'b> {
     dependency_report: Option<DependencyReport>,
 }
 
+/// See [`Responder::attempt_mark`].
+#[derive(Clone, Copy)]
+pub(crate) struct AttemptMark {
+    output: OutputMark,
+    eval_messages: usize,
+}
+
 /// One `DROP`'s dependency report while its executors run. The `CASCADE`
 /// notice waits until the executors hold their locks, so a statement that
 /// waits and restarts never sends it twice.
@@ -907,6 +914,23 @@ impl<'b> Responder<'b> {
     /// Discards unsent output after `mark` so a statement attempt can run
     /// again. Output that already reached the client cannot be retracted, so
     /// such an attempt fails with `0A000` instead of repeating rows.
+    /// The start of one evaluation attempt that a pending routine call may
+    /// restart, covering builtin notices not yet sent as well as output.
+    pub(crate) fn attempt_mark(&self) -> AttemptMark {
+        AttemptMark {
+            output: self.mark(),
+            eval_messages: crate::sql::eval::eval_message_mark(),
+        }
+    }
+
+    /// Discards an attempt's unsent output and notices; the next attempt
+    /// evaluates and raises them again.
+    pub(crate) fn restart_attempt(&mut self, mark: AttemptMark) -> Result<(), SqlError> {
+        self.truncate_to(mark.output)?;
+        crate::sql::eval::truncate_eval_messages(mark.eval_messages);
+        Ok(())
+    }
+
     pub(crate) fn truncate_to(&mut self, mark: OutputMark) -> Result<(), SqlError> {
         let Some(excess) = self.excess_since(mark) else {
             return Err(crate::sql_err!(
@@ -964,6 +988,53 @@ impl<'b> Responder<'b> {
     /// Appends one complete message after all queued output. `build` may
     /// run more than once, so it must be deterministic.
     fn emit(
+        &mut self,
+        class: OutputClass,
+        build: impl Fn(&mut FixedBuf) -> Result<(), WireFull>,
+    ) -> Result<(), WireFull> {
+        self.send_eval_messages()?;
+        self.emit_now(class, build)
+    }
+
+    /// Sends the notices and warnings builtin evaluation queued, ahead of the
+    /// message that follows them. Cursor capture leaves them for the client
+    /// responder.
+    fn send_eval_messages(&mut self) -> Result<(), WireFull> {
+        if !matches!(self.cursor_rows, CursorRowOutput::Wire) {
+            return Ok(());
+        }
+        while let Some(pending) = crate::sql::eval::peek_eval_message() {
+            let (level, severity) = match pending.level {
+                crate::sql::eval::EvalMessageLevel::Notice => {
+                    (crate::sql::guc::MessageLevel::Notice, "NOTICE")
+                }
+                crate::sql::eval::EvalMessageLevel::Warning => {
+                    (crate::sql::guc::MessageLevel::Warning, "WARNING")
+                }
+            };
+            if self.render_context().min_message_level.allows(level) {
+                let sqlstate = pending.sqlstate;
+                let message = pending.message;
+                let diagnostic = pending.detail.map(|detail| crate::sql::eval::Diagnostic {
+                    detail: Some(crate::util::StackStr::from_str(detail)),
+                    hint: None,
+                });
+                self.emit_now(OutputClass::Control, |buffer| {
+                    Self::build_notice_response(
+                        buffer,
+                        severity,
+                        sqlstate.as_str(),
+                        message.as_str(),
+                        diagnostic.as_ref(),
+                    )
+                })?;
+            }
+            crate::sql::eval::pop_eval_message();
+        }
+        Ok(())
+    }
+
+    fn emit_now(
         &mut self,
         class: OutputClass,
         build: impl Fn(&mut FixedBuf) -> Result<(), WireFull>,
@@ -2294,6 +2365,18 @@ impl<'b> Responder<'b> {
         diagnostic: Option<&crate::sql::eval::Diagnostic>,
     ) -> Result<(), WireFull> {
         self.control(|buffer| {
+            Self::build_notice_response(buffer, severity, sqlstate, message, diagnostic)
+        })
+    }
+
+    fn build_notice_response(
+        buffer: &mut FixedBuf,
+        severity: &str,
+        sqlstate: &str,
+        message: &str,
+        diagnostic: Option<&crate::sql::eval::Diagnostic>,
+    ) -> Result<(), WireFull> {
+        {
             let mut m = MsgOut::begin(buffer, wire::MSG_NOTICE_RESPONSE);
             m.u8(b'S');
             m.cstr(severity);
@@ -2315,7 +2398,7 @@ impl<'b> Responder<'b> {
             }
             m.u8(0);
             m.finish()
-        })
+        }
     }
 
     /// ErrorResponse with the fields every client expects: severity (twice,

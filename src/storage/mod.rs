@@ -19283,6 +19283,11 @@ impl Storage {
             .find(|activity| activity.pid == pid)
             .copied()
         else {
+            crate::sql::eval::raise_eval_message(
+                crate::sql::eval::EvalMessageLevel::Warning,
+                sqlstate::WARNING,
+                format_args!("PID {pid} is not a PostgreSQL backend process"),
+            )?;
             return Ok(false);
         };
         let current_role = self
@@ -52358,6 +52363,13 @@ impl Storage {
                 "transaction ID {} is in the future",
                 transaction_id
             ));
+        }
+        // PostgreSQL's bootstrap (1) and frozen (2) identities are permanently
+        // committed; the invalid identity 0 has no status.
+        match transaction_id {
+            0 => return Ok(None),
+            1 | 2 => return Ok(Some("committed")),
+            _ => {}
         }
         if identities.active.iter().any(|identity| {
             identity.assigned && u64::from(identity.transaction_id) == transaction_id

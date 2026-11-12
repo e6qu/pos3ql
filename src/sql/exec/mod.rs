@@ -26718,11 +26718,13 @@ where
                 {
                     return Ok(Datum::Null);
                 }
+                // An unassigned `record`, a declared one or a parameter, has
+                // no field list yet.
                 Datum::Null
                     if matches!(
                         self.locals[index].record_shape,
                         Some(PlpgsqlRecordShape::Dynamic)
-                    ) =>
+                    ) || self.locals[index].ctype == ColType::Record =>
                 {
                     return Err(crate::sql::error_position::with_detail(
                         sql_err!(

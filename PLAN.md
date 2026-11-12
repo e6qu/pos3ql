@@ -458,7 +458,9 @@ lacks (`ON INSERT ... WHERE OLD.n > 0`) is reported without its cursor
 position, and a missing field of a PL/pgSQL record variable read in a `DO`
 body (`RAISE NOTICE '%', r.nope`) carries a position where PostgreSQL names
 the expression in `CONTEXT`. Selecting a field of a named composite cast to
-`record` (`(ROW(1, 2)::t::record).id`) fails as an unknown field.
+`record` (`(ROW(1, 2)::t::record).id`) fails as an unknown field. Reading a
+field of a NULL `record` parameter names the expression in `CONTEXT`, which
+PostgreSQL omits because it raises the error while evaluating, not planning.
 COPY to or from a server file or program,
 `COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
 RETURNING` a non-JSON, non-string type are rejected with `0A000`.

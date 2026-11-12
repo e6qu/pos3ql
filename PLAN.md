@@ -125,7 +125,14 @@ is owned.
   across its attempts. Deferrable foreign key checks in `IMMEDIATE` mode run
   after all of the statement's `AFTER ROW` triggers, where PostgreSQL runs
   them among each row's triggers in name order, so a failing check can
-  follow notices and writes PostgreSQL never reaches.
+  follow notices and writes PostgreSQL never reaches. A non-deferrable
+  foreign key is checked as each row is written, where PostgreSQL checks it
+  in that same AFTER order at the statement's end: `INSERT INTO tree VALUES
+  (2, 1), (1, NULL)` on a self-referencing table, or a row whose parent an
+  `AFTER` trigger inserts, fails with `23503` where PostgreSQL succeeds.
+  Queuing every check as an AFTER event needs an event queue that spills,
+  because the fixed deferred-constraint capacity would otherwise limit how
+  many rows one statement may write.
   `INSTEAD OF` view rows, DDL, COPY, replication apply and deferred
   triggers read synchronously. A routine call inside the rows
   keeps the changed rows (row progress), also for views and rules written

@@ -574,6 +574,10 @@ fn advance<'a>(
             }
             release(below, pull.state_arena);
         },
+        // A row a wait interrupted before it was released is evaluated
+        // again rather than skipped.
+        PlanNode::Sort(sort) if sort.has_current() => Ok(true),
+        PlanNode::Group(group) if group.has_current() => Ok(true),
         PlanNode::Sort(sort) => {
             while !sort.filled() {
                 if !advance(below, state, keep_finished, pull)? {

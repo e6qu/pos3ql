@@ -1539,7 +1539,7 @@ reset_user_extensions() { # host port
 reset_user_relations() { # host port
   psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
     -F $'\t' \
-    -c "SELECT n.nspname, c.relname, c.relkind FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p', 'm')" |
+    -c "SELECT n.nspname, c.relname, c.relkind FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p', 'm', 'v', 'S')" |
   while IFS=$'\t' read -r schema relation relkind; do
     [[ -z "$relation" ]] && continue
     schema=${schema//\"/\"\"}
@@ -1547,6 +1547,8 @@ reset_user_relations() { # host port
     case "$relkind" in
     m) drop='DROP MATERIALIZED VIEW' ;;
     r | p) drop='DROP TABLE' ;;
+    v) drop='DROP VIEW' ;;
+    S) drop='DROP SEQUENCE' ;;
     *)
       printf 'FAIL: unexpected reset relation kind %q\n' "$relkind"
       return 1

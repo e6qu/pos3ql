@@ -407,7 +407,10 @@ is typed `text` before the subquery is described, so the statement fails
 with `42883`. Joins run left to right over the whole FROM list, so a `RIGHT`
 or `FULL` join after a comma-separated item fails with `0A000`, and a join
 condition naming an item before the comma is accepted where PostgreSQL
-fails with `42P01`; both need nested join trees. The
+fails with `42P01`; both need nested join trees. A subquery's `t.*` naming an
+enclosing query's item (`FROM t, LATERAL (SELECT t.*) s`, `SELECT (SELECT
+t.*) FROM t`) fails with `42601` or `42P01`; PostgreSQL expands the outer
+row's columns. The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current
 surface.
 

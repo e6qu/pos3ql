@@ -296,7 +296,14 @@ constraint cannot be named by `CLUSTER ON`, `CLUSTER ... USING` or `REPLICA
 IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 `reloptions` lists its options in a fixed order (`security_invoker`,
 `security_barrier`, `check_option`) where PostgreSQL keeps the order they were
-set, and omits an explicit `security_invoker=false`. A rewrite rule whose `INSERT` action writes `DEFAULT`
+set, and omits an explicit `security_invoker=false`. A row compared with a subquery
+whose matching column is an untyped literal (`(1, 'a') = (SELECT 1, 2)`) fails
+with `42883` (`operator does not exist: text = integer`) where PostgreSQL
+converts the literal and reports its invalid input. Foreign tables accept
+`UNIQUE`, `PRIMARY KEY` and `FOREIGN KEY` constraints written in `CREATE
+FOREIGN TABLE` or `ALTER TABLE ... ADD`, and reject identity columns, where
+PostgreSQL rejects the constraints (`unique constraints are not supported on
+foreign tables`) and accepts identity columns. A rewrite rule whose `INSERT` action writes `DEFAULT`
 (`DO ALSO INSERT INTO log VALUES (NEW.a, DEFAULT)`) fails with `42601`
 (`DEFAULT is not allowed in this context`) when it fires: the action runs as an
 `INSERT ... SELECT` over the rule's source rows, which has no column-default

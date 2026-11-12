@@ -1205,7 +1205,7 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
     // checks
     n += 1;
     for check in def.checks() {
-        n += 1 + check.name.as_str().len() + 3 + check.expression.as_str().len();
+        n += 1 + check.name.as_str().len() + 4 + check.expression.as_str().len();
     }
     // foreign keys
     n += 1;
@@ -1345,7 +1345,7 @@ fn append_table_payload<B: DefinitionBacking>(
     for check in def.checks() {
         ok &= name_bytes(buffer, check.name.as_str());
         let e = check.expression.as_str();
-        ok &= buffer.append(&[check.validation.code()]);
+        ok &= buffer.append(&[check.validation.code(), u8::from(check.no_inherit)]);
         ok &= buffer.append(&(e.len() as u16).to_le_bytes());
         ok &= buffer.append(e.as_bytes());
     }
@@ -8456,7 +8456,12 @@ fn decode_op_inner<'a>(
                 let constraint_name = take_name(&mut at)?;
                 let validation =
                     crate::storage::ConstraintValidation::from_code(*payload.get(at)?)?;
-                at += 1;
+                let no_inherit = match *payload.get(at + 1)? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                };
+                at += 2;
                 let elen =
                     u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
                 at += 2;
@@ -8466,6 +8471,7 @@ fn decode_op_inner<'a>(
                 let mut check = CheckConstraint::EMPTY;
                 check.name = SqlName::parse(constraint_name).ok()?;
                 check.validation = validation;
+                check.no_inherit = no_inherit;
                 core::fmt::Write::write_str(&mut check.expression, text).ok()?;
                 if check.expression.is_truncated() {
                     return None;
@@ -10575,6 +10581,8 @@ fn decode_op_inner<'a>(
                     name: SqlName::parse(cname).ok()?,
                     expression: bounded_wal_text(expr)?,
                     validation,
+                    // Domain constraints are never inherited.
+                    no_inherit: false,
                 };
             }
             for check in checks.iter_mut().take(n_checks) {

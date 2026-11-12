@@ -5938,7 +5938,7 @@ impl Checkpointer {
                     def.uniques[i] = uk;
                     def.n_uniques += 1;
                 }
-                Some("chk") => {
+                Some("chk2") => {
                     let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("chk outside table"));
                     };
@@ -5946,6 +5946,11 @@ impl Checkpointer {
                         return Err(CheckpointSetupError::Corrupt("too many chk lines"));
                     }
                     let validation: u8 = parse_field(words.next(), "chk validation")?;
+                    let no_inherit = match parse_field::<u8>(words.next(), "chk inheritance")? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(CheckpointSetupError::Corrupt("bad chk inheritance")),
+                    };
                     let hex_name = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("chk name missing"))?;
@@ -5956,6 +5961,7 @@ impl Checkpointer {
                     check.validation = crate::storage::ConstraintValidation::from_code(validation)
                         .ok_or(CheckpointSetupError::Corrupt("bad chk validation"))?;
                     check.name = sql_name(&decode_hex_name(hex_name)?)?;
+                    check.no_inherit = no_inherit;
                     let expression = decode_hex_name(hexpr)?;
                     use core::fmt::Write;
                     let _ = write!(check.expression, "{expression}");
@@ -8111,6 +8117,8 @@ impl Checkpointer {
                             name: sql_name(&cname)?,
                             expression: crate::util::StackStr::from_str(&cexpr),
                             validation,
+                            // Domain constraints are never inherited.
+                            no_inherit: false,
                         };
                     }
                     let base_domain = match (base_domain.is_empty(), base_domain_schema.is_empty())
@@ -11010,7 +11018,7 @@ impl Checkpointer {
                     ),
                 )?;
             }
-            // `chk <validation> <hex-name> <hex-predicate>`
+            // `chk2 <validation> <no-inherit> <hex-name> <hex-predicate>`
             for check in definition.checks() {
                 use core::fmt::Write;
                 let mut hex_name = StackStr::<130>::new();
@@ -11024,8 +11032,9 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "chk {} {} {}",
+                        "chk2 {} {} {} {}",
                         check.validation.code(),
+                        u8::from(check.no_inherit),
                         hex_name.as_str(),
                         hexpr.as_str()
                     ),

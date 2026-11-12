@@ -17,6 +17,7 @@ mod canonical_sequences;
 mod cast_and_operator_class_descriptions;
 mod catalog_identity_lookup;
 mod catalog_join_work;
+mod check_no_inherit;
 mod client_catalog;
 mod composite_parameter_fields;
 mod constraint_index_identity;

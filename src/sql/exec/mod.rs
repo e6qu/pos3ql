@@ -3929,7 +3929,7 @@ fn inherit_table_checks<Definition0: crate::storage::DefinitionBacking>(
     require_existing: bool,
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    for inherited in parent.checks() {
+    for inherited in parent.checks().iter().filter(|check| !check.no_inherit) {
         if let Some(existing) = child
             .checks()
             .iter()
@@ -48384,6 +48384,8 @@ fn build_domain_spec(
         checks[n] = crate::storage::CheckConstraint {
             identity: None,
             name,
+            // Domain constraints are never inherited.
+            no_inherit: false,
             expression: super::enum_values::checks::bind::<{ crate::storage::CHECK_SQL_MAX }>(
                 domain_text::<{ crate::storage::CHECK_SQL_MAX }>(c.expression)?.as_str(),
                 base,
@@ -49643,6 +49645,8 @@ pub fn alter_domain(
             spec.checks[spec.n_checks] = crate::storage::CheckConstraint {
                 identity: None,
                 name: cname,
+                // Domain constraints are never inherited.
+                no_inherit: false,
                 expression,
                 validation: match check.validation {
                     crate::sql::ast::ConstraintValidation::EnforcedValidated => {
@@ -74611,13 +74615,15 @@ fn ordinary_inheritance_propagates_action<Definition0: crate::storage::Definitio
             alteration: crate::sql::ast::ConstraintAlteration::NotNullInheritance { .. },
             ..
         } => true,
-        AlterAction::AddConstraint(crate::sql::ast::TableConstraint::Check { .. }) => true,
+        AlterAction::AddConstraint(crate::sql::ast::TableConstraint::Check {
+            no_inherit, ..
+        }) => !no_inherit,
         AlterAction::DropConstraint { name, .. }
         | AlterAction::RenameConstraint { from: name, .. }
         | AlterAction::ValidateConstraint(name) => definition
             .checks()
             .iter()
-            .any(|check| check.name.as_str() == *name),
+            .any(|check| !check.no_inherit && check.name.as_str() == *name),
         _ => false,
     }
 }
@@ -74657,7 +74663,10 @@ fn ordinary_inheritance_only_error<Definition0: crate::storage::DefinitionBackin
                     column
                 ));
             }
-            AlterAction::AddConstraint(crate::sql::ast::TableConstraint::Check { .. }) => {
+            AlterAction::AddConstraint(crate::sql::ast::TableConstraint::Check {
+                no_inherit: false,
+                ..
+            }) => {
                 return Some(sql_err!(
                     sqlstate::INVALID_TABLE_DEFINITION,
                     "constraint must be added to child tables too"
@@ -74678,7 +74687,7 @@ fn ordinary_inheritance_only_error<Definition0: crate::storage::DefinitionBackin
                 if definition
                     .checks()
                     .iter()
-                    .any(|check| check.name.as_str() == *name) =>
+                    .any(|check| !check.no_inherit && check.name.as_str() == *name) =>
             {
                 return Some(sql_err!(
                     sqlstate::INVALID_TABLE_DEFINITION,

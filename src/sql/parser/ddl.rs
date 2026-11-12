@@ -8662,13 +8662,27 @@ impl<'a> Parser<'a> {
         let text = self.text[start..self.peek_at].trim_end();
         let text = self.arena_str(text)?;
         self.expect_op(")")?;
+        // PostgreSQL accepts NO INHERIT before or after the other attributes.
+        let mut no_inherit = self.check_no_inherit(false)?;
         let (_, validation) = self.constraint_attributes(false, true, allow_not_valid)?;
+        no_inherit = self.check_no_inherit(no_inherit)?;
         Ok(TableConstraint::Check {
             name,
             expression,
             text,
             validation,
+            no_inherit,
         })
+    }
+
+    /// A repeated `NO INHERIT` is left unconsumed, so it fails as a syntax
+    /// error at `NO` as in PostgreSQL.
+    fn check_no_inherit(&mut self, seen: bool) -> Result<bool, ParseError> {
+        if seen || !self.eat_ident("no")? {
+            return Ok(seen);
+        }
+        self.expect_ident("inherit")?;
+        Ok(true)
     }
 
     /// The part of a FOREIGN KEY after `REFERENCES`: parent table, optional

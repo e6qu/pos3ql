@@ -327,8 +327,7 @@ PRIMARY KEY (c, a))` numbers `t_b_key`, `t_c_key`, `t_a_b_key`, `t_pkey`),
 where PostgreSQL numbers the primary key first and the rest in declaration
 order, so catalog queries ordered by OID list them differently; the
 declaration order of a single-column table `UNIQUE` is not retained.
-`CHECK ... NO
-INHERIT` fails with `42601`; an exclusion constraint over a B-tree index fails
+An exclusion constraint over a B-tree index fails
 with `42601`, and `box` has no default GiST operator class. `ALTER TABLE ...
 CLUSTER ON` and `REPLICA IDENTITY USING INDEX` reject an index that backs a
 `PRIMARY KEY` or `UNIQUE` constraint (`42704`), since those indexes have no

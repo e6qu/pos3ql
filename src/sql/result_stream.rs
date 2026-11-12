@@ -21,6 +21,10 @@ const STREAM_PLAN_HEADROOM: usize = 32 * 1024;
 pub(crate) enum StreamChoice {
     /// A `SELECT` reopens as a stream if its output first overflows.
     Promote,
+    /// A `UNION ALL` opens its stream before it runs: the general
+    /// executor's attempt would materialize every query before its first
+    /// row could overflow.
+    Open,
     /// A FETCH streams its cursor's rows from the start: they are evaluated
     /// as the client reads them and never saved in `cursor_bytes`.
     Fetch(FetchStream),
@@ -125,9 +129,36 @@ impl Engine {
             return Err(SpoolReason::Capacity);
         }
         let mark = self.work.mark();
+        let mut appended = false;
         let (source, source_len) = match statement {
             Stmt::Select(select) => (
-                query::RetainedSelect::stream_source(&self.storage, txid, select, &self.work),
+                query::stream_query(select, &self.storage, txid, &self.work).and_then(|stream| {
+                    appended = select.set_body.is_some();
+                    stream.map_or(Ok(None), |select| {
+                        query::RetainedSelect::stream_source(
+                            &self.storage,
+                            txid,
+                            select,
+                            &self.work,
+                        )
+                    })
+                }),
+                source_len,
+            ),
+            Stmt::SetQuery(set) => (
+                query::set_query_select(set, &self.work)
+                    .and_then(|select| query::stream_query(select, &self.storage, txid, &self.work))
+                    .and_then(|select| {
+                        appended = true;
+                        select.map_or(Ok(None), |select| {
+                            query::RetainedSelect::stream_source(
+                                &self.storage,
+                                txid,
+                                select,
+                                &self.work,
+                            )
+                        })
+                    }),
                 source_len,
             ),
             // COPY TO STDOUT streams the query it reads.
@@ -136,6 +167,12 @@ impl Engine {
                     .copy_query_text(copy, txid, &self.work)
                     .and_then(|text| {
                         let select = crate::sql::parser::parse_query(text, &self.work)?;
+                        appended = select.set_body.is_some();
+                        let Some(select) =
+                            query::stream_query(select, &self.storage, txid, &self.work)?
+                        else {
+                            return Ok((None, text.len()));
+                        };
                         query::RetainedSelect::stream_source(
                             &self.storage,
                             txid,
@@ -179,7 +216,11 @@ impl Engine {
             .and_then(|bytes| bytes.checked_add(STREAM_PLAN_HEADROOM));
         match estimate {
             Some(bytes) if bytes <= ResultStream::query_bytes(self.result_stream_bytes) => {
-                Ok(StreamChoice::Promote)
+                Ok(if appended {
+                    StreamChoice::Open
+                } else {
+                    StreamChoice::Promote
+                })
             }
             _ => Err(SpoolReason::Capacity),
         }
@@ -207,7 +248,15 @@ impl Engine {
         }
         match self.result_stream_choice(statement, typed_inputs, txid, source_len, cursors) {
             Ok(StreamChoice::Promote) => {
-                responder.arm_promotion();
+                if !responder.request_page_stream() {
+                    responder.arm_promotion();
+                }
+                None
+            }
+            Ok(StreamChoice::Open) => {
+                if !responder.request_page_stream() && !responder.request_stream() {
+                    responder.arm_promotion();
+                }
                 None
             }
             Ok(StreamChoice::Fetch(fetch)) => responder.request_stream().then_some(fetch),

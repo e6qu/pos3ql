@@ -87,6 +87,18 @@ pub(super) struct WriteCompletionBoundary {
     pub(super) mark: StatementMark,
     pub(super) command: u32,
     pub(super) depth: u16,
+    /// The owner keeps its frame across a wait. A function called from a
+    /// statement that restarts on a wait still takes its writes' AFTER work,
+    /// so those triggers run on the engine, but nothing in it is retained.
+    pub(super) retained: bool,
+}
+
+impl TxnState {
+    /// A frame that keeps its execution across a wait owns this command.
+    pub(super) fn retains_write_frame(&self) -> bool {
+        self.write_completion_boundary
+            .is_some_and(|boundary| boundary.retained)
+    }
 }
 
 pub(crate) fn establish_savepoint(
@@ -432,6 +444,9 @@ pub struct TxnState {
     /// The top-level `CALL` or `DO` body waiting at a saved statement. It
     /// outlives transactions the body commits; ending the statement releases it.
     pub(super) pending_procedure: Option<super::exec::SuspendedProcedure>,
+    /// The top-level write waiting inside its rows; its next run continues
+    /// at the unfinished row. Ending or canceling the statement releases it.
+    retained_write: Option<super::exec::RetainedWrite>,
     /// Saved procedure bodies currently running, and whether a wait inside
     /// one reached a position no saved frame can own, so the whole statement
     /// must instead roll back and run again.
@@ -860,15 +875,20 @@ pub(crate) struct DeferredTriggerEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeferredTriggerKind {
+    /// `trigger_depth` and `command` name the statement whose end fires an
+    /// immediate event: a statement waiting between attempts of its rows
+    /// keeps its events from another statement at the same depth.
     Constraint {
         identity: ConstraintIdentity,
         effective_table: u16,
         trigger_depth: u16,
+        command: u32,
     },
     AfterRow {
         trigger_slot: u16,
         effective_table: u16,
         trigger_depth: u16,
+        command: u32,
     },
 }
 
@@ -1150,6 +1170,7 @@ impl TxnState {
             write_completion_boundary: None,
             pending_write_completion: None,
             pending_procedure: None,
+            retained_write: None,
             running_procedures: 0,
             procedure_restart: false,
             cache_capacity_wait: None,
@@ -1702,8 +1723,16 @@ impl TxnState {
 
     pub(crate) fn release_suspended_statement(&mut self) {
         self.suspended_statement = None;
+        self.retained_write = None;
         self.cache_capacity_wait = None;
         self.checkpoint_request = None;
+    }
+
+    /// Runs as `command` again, an earlier command of the running statement
+    /// that a resumed write step continues.
+    pub(crate) fn resume_command(&mut self, command: u32) {
+        debug_assert!(command <= self.command_counter);
+        self.command_id = command;
     }
 
     pub fn begin_command(&mut self) -> Result<(), SqlError> {
@@ -1752,12 +1781,53 @@ impl TxnState {
         })
     }
 
+    /// Joins the nested command already running instead of starting one:
+    /// the `WITH` queries of a PL/pgSQL statement and its write share one
+    /// command and snapshot, so neither sees the other's changes.
+    pub(crate) fn share_trigger_sql<'txn>(
+        &'txn mut self,
+        storage: &Storage,
+    ) -> TriggerSqlScope<'txn> {
+        let parent_command = self.command_id;
+        let parent_depth = self.trigger_depth;
+        TriggerSqlScope {
+            transaction: self,
+            parent_command,
+            parent_depth,
+            _snapshot: storage.same_statement_snapshot(),
+        }
+    }
+
     pub(crate) fn trigger_depth(&self) -> u16 {
         self.trigger_depth
     }
 
+    #[cfg(test)]
     pub(crate) fn has_pending_write_completion(&self) -> bool {
         self.pending_write_completion.is_some()
+    }
+
+    /// Whether the waiting statement keeps work and output it already did:
+    /// its next run continues instead of starting again.
+    pub(crate) fn retains_statement_progress(&self) -> bool {
+        self.pending_write_completion.is_some() || self.retained_write.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_retained_write(&self) -> bool {
+        self.retained_write.is_some()
+    }
+
+    pub(super) fn retain_write(&mut self, write: super::exec::RetainedWrite) {
+        self.retained_write = Some(write);
+    }
+
+    pub(super) fn take_retained_write(&mut self) -> Option<super::exec::RetainedWrite> {
+        self.retained_write.take()
+    }
+
+    pub(crate) fn release_retained_write(&mut self) {
+        self.retained_write = None;
     }
 
     pub(crate) fn enter_extension_script(&mut self) {
@@ -2472,6 +2542,7 @@ impl TxnState {
                 identity,
                 effective_table,
                 trigger_depth: self.trigger_depth,
+                command: self.command_id,
             },
             event,
             updated_columns,
@@ -2494,6 +2565,7 @@ impl TxnState {
                 trigger_slot,
                 effective_table,
                 trigger_depth: self.trigger_depth,
+                command: self.command_id,
             },
             event,
             updated_columns,
@@ -3289,6 +3361,7 @@ impl TxnState {
     pub fn clear(&mut self) {
         self.pending_write_completion = None;
         self.pending_procedure = None;
+        self.retained_write = None;
         self.procedure_restart = false;
         self.write_completion_boundary = None;
         self.concurrent_index = None;

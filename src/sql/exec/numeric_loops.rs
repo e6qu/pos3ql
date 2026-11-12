@@ -54,7 +54,7 @@ impl<'a> NumericLoopFrames<'a> {
                 let counts = layout
                     .alloc_slice_with(depth, |_| 0usize)
                     .map_err(|_| frame_full())?;
-                frame_layout(block, locals, None, locals.len(), 0, counts);
+                frame_layout(block, locals.len(), 0, counts);
                 let mut slots = pool.lease(depth).map_err(control_flow::execution_full)?;
                 for (depth, count) in counts.iter().copied().enumerate() {
                     let mut locals = pool.lease(count).map_err(control_flow::execution_full)?;
@@ -128,39 +128,14 @@ impl NumericLoopFrames<'static> {
     }
 }
 
-struct CounterName<'scope> {
-    name: SqlName,
-    parent: Option<&'scope CounterName<'scope>>,
-}
-
-impl CounterName<'_> {
-    fn contains(&self, name: SqlName) -> bool {
-        self.name == name || self.parent.is_some_and(|parent| parent.contains(name))
-    }
-}
-
-fn frame_layout(
-    block: TriggerBlock<'_>,
-    locals: &[TriggerLocalDecl],
-    counters: Option<&CounterName<'_>>,
-    count: usize,
-    depth: usize,
-    counts: &mut [usize],
-) {
-    visit_nested_blocks(block, |block, edge| {
-        if let BlockEdge::Numeric(name) = edge {
-            let existing = locals.iter().any(|local| local.name == name)
-                || counters.is_some_and(|parent| parent.contains(name));
-            // Only a fresh name adds a slot; shadowed counters reuse one.
-            let count = count + usize::from(!existing);
-            counts[depth] = counts[depth].max(count);
-            let counter = CounterName {
-                name,
-                parent: counters,
-            };
-            frame_layout(block, locals, Some(&counter), count, depth + 1, counts);
-        } else {
-            frame_layout(block, locals, counters, count, depth, counts);
+fn frame_layout(block: TriggerBlock<'_>, count: usize, depth: usize, counts: &mut [usize]) {
+    visit_nested_blocks(block, |block, edge| match edge.declared() {
+        // Every counter or declaration is a new slot after the enclosing
+        // variables, so `label.name` still reaches a shadowed one.
+        0 => frame_layout(block, count, depth, counts),
+        declared => {
+            counts[depth] = counts[depth].max(count + declared);
+            frame_layout(block, count + declared, depth + 1, counts);
         }
     });
 }
@@ -175,32 +150,59 @@ fn frame_full() -> SqlError {
 fn numeric_depth(block: TriggerBlock<'_>) -> usize {
     let mut depth = 0;
     visit_nested_blocks(block, |block, edge| {
-        depth =
-            depth.max(numeric_depth(block) + usize::from(matches!(edge, BlockEdge::Numeric(_))));
+        depth = depth.max(numeric_depth(block) + usize::from(edge.declared() != 0));
     });
     depth
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum BlockEdge {
+pub(super) enum BlockEdge<'a> {
     Ordinary,
-    Numeric(SqlName),
+    Numeric,
+    /// A nested block that declares variables.
+    Scope(&'a [ParsedTriggerLocalDecl<'a>]),
+    /// A cursor `FOR` loop, which declares its record and keeps its portal's
+    /// name in a hidden slot.
+    Cursor,
     Handler,
+}
+
+impl BlockEdge<'_> {
+    /// How many variables entering the block declares.
+    fn declared(self) -> usize {
+        match self {
+            Self::Numeric => 1,
+            Self::Cursor => 2,
+            Self::Scope(declarations) => declarations.len(),
+            Self::Ordinary | Self::Handler => 0,
+        }
+    }
 }
 
 // Layout passes share this exhaustive set of lexical block edges.
 pub(super) fn visit_nested_blocks<'a>(
     block: TriggerBlock<'a>,
-    mut visit: impl FnMut(TriggerBlock<'a>, BlockEdge),
+    mut visit: impl FnMut(TriggerBlock<'a>, BlockEdge<'a>),
 ) {
     for statement in block.statements {
         match statement {
             TriggerStatement::For(program) => visit(
                 program.block,
-                if matches!(program.source, TriggerForSource::Numeric { .. }) {
-                    BlockEdge::Numeric(program.target)
-                } else {
+                match program.source {
+                    TriggerForSource::Numeric { .. } => BlockEdge::Numeric,
+                    TriggerForSource::Cursor { .. } => BlockEdge::Cursor,
+                    TriggerForSource::Query(_)
+                    | TriggerForSource::Dml(_)
+                    | TriggerForSource::DynamicQuery(_)
+                    | TriggerForSource::Array { .. } => BlockEdge::Ordinary,
+                },
+            ),
+            TriggerStatement::Block(program) => visit(
+                program.block,
+                if program.declarations.is_empty() {
                     BlockEdge::Ordinary
+                } else {
+                    BlockEdge::Scope(program.declarations)
                 },
             ),
             TriggerStatement::If(program) => {

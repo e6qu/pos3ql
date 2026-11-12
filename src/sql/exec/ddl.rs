@@ -112,25 +112,6 @@ fn empty_meta() -> ColumnMeta {
     }
 }
 
-/// A stored column of a relation's row type. Values of a view's row type are
-/// described from its query rather than a stored layout, so such columns are
-/// rejected explicitly.
-fn column_row_type(
-    storage: &Storage,
-    relation: crate::storage::RowTypeRelation,
-    array: bool,
-    txid: u32,
-) -> Result<crate::storage::RoutineResult, SqlError> {
-    if let crate::storage::RowTypeRelation::View(slot) = relation {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "columns of the row type of view \"{}\" are not supported",
-            storage.view(slot).name_for(txid).as_str()
-        ));
-    }
-    storage.relation_row_type_result(relation, array, txid)
-}
-
 /// Resolves one column definition, evaluating its DEFAULT (which must be a
 /// constant) and coercing it to the column type.
 pub(super) fn build_column(
@@ -139,12 +120,12 @@ pub(super) fn build_column(
     txid: u32,
     arena: &Arena,
 ) -> Result<ColumnMeta, SqlError> {
-    if matches!(c.type_name, "record" | "record[]") {
+    if let Some(pseudo) = crate::sql::types::pseudo_type_column_name(c.type_name) {
         return Err(sql_err!(
             sqlstate::INVALID_TABLE_DEFINITION,
             "column \"{}\" has pseudo-type {}",
             c.name,
-            c.type_name
+            pseudo
         ));
     }
     // A base type resolves statically; an unknown name falls back to the
@@ -225,7 +206,7 @@ pub(super) fn build_column(
                     )
                 } else if let Some(relation) = storage.resolve_relation_row_type(element_name, txid)
                 {
-                    let result = column_row_type(storage, relation, true, txid)?;
+                    let result = storage.relation_row_type_result(relation, true, txid)?;
                     (result.ctype, -1, result.user_type, None)
                 } else {
                     return Err(crate::sql::error_position::at_subject(
@@ -273,7 +254,8 @@ pub(super) fn build_column(
                             }
                             None => match storage.resolve_relation_row_type(c.type_name, txid) {
                                 Some(relation) => {
-                                    let result = column_row_type(storage, relation, false, txid)?;
+                                    let result =
+                                        storage.relation_row_type_result(relation, false, txid)?;
                                     (result.ctype, -1, result.user_type, None)
                                 }
                                 None => {

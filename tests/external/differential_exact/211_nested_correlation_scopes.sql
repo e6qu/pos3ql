@@ -1,0 +1,25 @@
+-- Subqueries and derived tables read every enclosing query, at any depth.
+create table a194(x int); create table b194(y int); create table c194(z int);
+insert into a194 values (1), (2), (3); insert into b194 values (1), (2); insert into c194 values (1), (3);
+select (select (select a194.x * 10 + b194.y from c194 limit 1) from b194 order by y limit 1) from a194 order by 1;
+select x, (select count(*) from b194 where exists (select 1 from c194 where c194.z = b194.y and a194.x = 1)) from a194 order by 1;
+select x, (select (select b194.y + a194.x from c194 limit 1) from b194 group by b194.y order by 1 limit 1) from a194 order by 1;
+select x, (select max((select b194.y + a194.x from c194 limit 1)) from b194) from a194 order by 1;
+select x, (select distinct (select b194.y + a194.x from c194 limit 1) from b194 order by 1 limit 1) from a194 order by 1;
+select x, array(select (select a194.x * 10 + b194.y) from b194 order by 1) from a194 order by 1;
+select x in (select (select b194.y + a194.x - 1 from c194 limit 1) from b194) from a194 order by 1;
+select x, (select y from b194 where y = a194.x union select z from c194 where z = a194.x order by 1 limit 1) from a194 order by 1;
+select x, (select y from b194 where y = a194.x group by y having count(*) > 0 and a194.x > 1) from a194 order by 1;
+select x, (select s.v from (select a194.x + 1 as v) s) from a194 order by 1;
+select x, (select min(t.s) from (select y + a194.x as s from b194) t) from a194 order by 1;
+select x, (select t.v from (select s.v from (select a194.x * 10 as v) s) t) from a194 order by 1;
+select x, (select count(*) from b194, lateral (select y + a194.x as w) l where w > 2) from a194 order by 1;
+select x, (select count(*) from b194 join (select z from c194 where z > a194.x) s on s.z > b194.y) from a194 order by 1;
+select x, (select s.w from (select y as w from b194 where y = a194.x union all select z from c194 where z = a194.x) s order by 1 limit 1) from a194 order by 1;
+select x, (with q as (select a194.x as v) select v from q) from a194 order by 1;
+select * from a194, lateral (select * from (select a194.x + 5 as w) q) t order by 1;
+select * from a194 join (b194 join lateral (select a194.x + b194.y as z) s on true) on true order by 1, 2;
+select * from a194 where exists (select 1 from (select 10 / a194.x) s) order by 1;
+select * from a194 where exists (select 1 from (select 10 / a194.x as v) s where v > 4) order by 1;
+select * from a194 where x in (select v from (select a194.x as v) s) order by 1;
+drop table a194, b194, c194;

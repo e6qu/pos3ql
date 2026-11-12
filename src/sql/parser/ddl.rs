@@ -1641,6 +1641,28 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// [`Self::unmodified_type_name`] plus PostgreSQL's `TypeNameToString`
+    /// of the written name (`pg_catalog.int4` for `int`).
+    fn unmodified_type_name_written(&mut self) -> Result<(&'a str, &'a str), ParseError> {
+        let (name, modifier, written) = self.type_name_written()?;
+        if modifier != -1 {
+            return Err(self.err_here("type modifiers are not allowed in this definition"));
+        }
+        let text = stack_format!(
+            264,
+            "{}{}{}{}",
+            written.schema.unwrap_or(""),
+            if written.schema.is_some() { "." } else { "" },
+            written.name,
+            if written.array { "[]" } else { "" }
+        );
+        let written = self
+            .arena
+            .alloc_str(text.as_str())
+            .map_err(|_| self.err_here("type name too long"))?;
+        Ok((name, written))
+    }
+
     pub(super) fn unmodified_type_name(&mut self) -> Result<&'a str, ParseError> {
         let (name, modifier) = self.type_name_mod()?;
         if modifier != -1 {
@@ -3785,6 +3807,7 @@ impl<'a> Parser<'a> {
                 self.expect_op(",")?;
             }
         }
+        let mut missing_result = false;
         let kind = if function {
             let has_returns = self.eat_ident("returns")?;
             if has_returns && self.eat_ident("trigger")? {
@@ -3858,12 +3881,12 @@ impl<'a> Parser<'a> {
                     declared_result_type,
                     set_returning,
                 }
+            } else if !has_returns {
+                // PostgreSQL reports this after the options parse, so a
+                // syntax error there wins.
+                missing_result = true;
+                RoutineCreateKind::Procedure
             } else {
-                if !has_returns {
-                    return Err(
-                        self.invalid_function_definition("function result type must be specified")
-                    );
-                }
                 RoutineCreateKind::Function {
                     set_returning: self.eat_ident("setof")?,
                     result_type: self.type_name()?,
@@ -3956,6 +3979,10 @@ impl<'a> Parser<'a> {
                     }
                     if self.peeked == Tok::Eof {
                         return Err(self.syntax_error_here());
+                    }
+                    // PostgreSQL's statement list allows empty statements.
+                    if self.eat_op(";")? {
+                        continue;
                     }
                     let _ = self.statement()?;
                     self.expect_op(";")?;
@@ -4184,6 +4211,9 @@ impl<'a> Parser<'a> {
         {
             return Err(self.syntax_error_here());
         }
+        if missing_result {
+            return Err(self.invalid_function_definition("function result type must be specified"));
+        }
         if attributes.rows.is_some()
             && !matches!(
                 kind,
@@ -4208,19 +4238,6 @@ impl<'a> Parser<'a> {
                 near: None,
                 detail: None,
             });
-        }
-        // PostgreSQL's SQL-function validator rejects these pseudo-types.
-        if language == crate::sql::ast::RoutineLanguage::Sql
-            && let Some(result) = match kind {
-                RoutineCreateKind::Trigger => Some("trigger"),
-                RoutineCreateKind::EventTrigger => Some("event_trigger"),
-                _ => None,
-            }
-        {
-            return Err(self.invalid_function_definition_owned(stack_format!(
-                super::PARSE_MESSAGE_BYTES,
-                "SQL functions cannot return type {result}"
-            )));
         }
         if language == crate::sql::ast::RoutineLanguage::PlPgSql
             && !matches!(
@@ -7230,9 +7247,9 @@ impl<'a> Parser<'a> {
                 false
             };
             self.expect_op("(")?;
-            let source_type = self.unmodified_type_name()?;
+            let (source_type, source_written) = self.unmodified_type_name_written()?;
             self.expect_ident("as")?;
-            let target_type = self.unmodified_type_name()?;
+            let (target_type, target_written) = self.unmodified_type_name_written()?;
             self.expect_op(")")?;
             let cascade = if self.eat_ident("cascade")? {
                 true
@@ -7243,6 +7260,8 @@ impl<'a> Parser<'a> {
             return Ok(Stmt::DropCast(crate::sql::ast::DropCast {
                 source_type,
                 target_type,
+                source_written,
+                target_written,
                 if_exists,
                 cascade,
             }));
@@ -8026,21 +8045,99 @@ impl<'a> Parser<'a> {
             if n == names.len() {
                 return Err(self.limit("relations", names.len()));
             }
-            let first = self.any_ident(what)?;
-            names[n] = if self.eat_op(".")? {
-                QualName {
-                    schema: Some(first),
-                    name: self.any_ident(what)?,
-                }
-            } else {
-                QualName::bare(first)
-            };
+            names[n] = self.drop_target_name(what)?;
             n += 1;
             if !self.eat_op(",")? {
                 break;
             }
         }
         Ok((self.arena_slice(&names[..n])?, if_exists))
+    }
+
+    /// One dotted name of a DROP list. PostgreSQL resolves the list when the
+    /// command runs, so a database other than the session's, or too many
+    /// parts, is an analysis error without a cursor position.
+    fn drop_target_name(&mut self, what: &str) -> Result<QualName<'a>, ParseError> {
+        let at = self.peek_at;
+        let mut parts = [""; 4];
+        let mut n = 0usize;
+        loop {
+            let part = self.any_ident(what)?;
+            if n < parts.len() {
+                parts[n] = part;
+            }
+            n += 1;
+            if !self.eat_op(".")? {
+                break;
+            }
+        }
+        let written = || {
+            let mut written = crate::stack_format!(super::PARSE_MESSAGE_BYTES, "{}", parts[0]);
+            for part in &parts[1..n.min(parts.len())] {
+                let _ = core::fmt::Write::write_fmt(&mut written, format_args!(".{part}"));
+            }
+            written
+        };
+        let failure = |sqlstate: &'static str, message| ParseError {
+            at,
+            message,
+            sqlstate,
+            cursor: None,
+            hint: None,
+            near: None,
+            detail: None,
+        };
+        match n {
+            1 => Ok(QualName::bare(parts[0])),
+            2 => Ok(QualName {
+                schema: Some(parts[0]),
+                name: parts[1],
+            }),
+            3 => {
+                if !crate::sql::eval::funcs::system::is_current_database(parts[0]) {
+                    self.analysis_error(failure(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        crate::stack_format!(
+                            super::PARSE_MESSAGE_BYTES,
+                            "cross-database references are not implemented: \"{}\"",
+                            written()
+                        ),
+                    ))?;
+                }
+                Ok(QualName {
+                    schema: Some(parts[1]),
+                    name: parts[2],
+                })
+            }
+            _ => {
+                let kind = if matches!(
+                    what,
+                    "table name"
+                        | "view name"
+                        | "materialized view name"
+                        | "index name"
+                        | "sequence name"
+                        | "foreign table name"
+                ) {
+                    "relation"
+                } else {
+                    "qualified"
+                };
+                self.analysis_error(failure(
+                    sqlstate::SYNTAX_ERROR,
+                    crate::stack_format!(
+                        super::PARSE_MESSAGE_BYTES,
+                        "improper {} name (too many dotted names): {}",
+                        kind,
+                        written()
+                    ),
+                ))?;
+                Ok(QualName {
+                    schema: Some(parts[n.min(parts.len()) - 2]),
+                    name: parts[n.min(parts.len()) - 1],
+                })
+            }
+        }
     }
 
     fn drop_bare_targets(
@@ -8632,6 +8729,16 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         let mut columns = ArenaList::new(self.arena);
         loop {
+            // PostgreSQL accepts `(expression)` and function-call keys too;
+            // pos3ql partitions only by columns and refuses the rest loudly.
+            let at = self.peek_at;
+            if self.peeked == Tok::Op("(") || self.peek_is_function_call()? {
+                self.expression(0)?;
+                let mut error =
+                    ParseError::new(at, "partition keys that are expressions are not supported");
+                error.sqlstate = crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED;
+                return Err(error);
+            }
             let column = self.col_ident("partition key column")?;
             self.push(&mut columns, column)?;
             if !self.eat_op(",")? {

@@ -20,7 +20,9 @@ pub(crate) fn deadline() -> Instant {
 /// Reads an HTTP request head (and any bytes after it) into `buffer` for a
 /// background fake server. Returns `None` when `stop` is set first, so the
 /// server can exit when a client connects but its test finishes without
-/// sending; otherwise returns the bytes read and the head length.
+/// sending, and when the client closes the connection before sending (a
+/// statement that restarts abandons its read); otherwise returns the bytes
+/// read and the head length.
 pub(crate) fn read_request_head(
     stream: &mut TcpStream,
     buffer: &mut [u8],
@@ -44,6 +46,7 @@ pub(crate) fn read_request_head(
             "fixture request headers are too large"
         );
         match stream.read(&mut buffer[received..]) {
+            Ok(0) if received == 0 => return None,
             Ok(0) => panic!("request ended before its headers"),
             Ok(count) => received += count,
             Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {

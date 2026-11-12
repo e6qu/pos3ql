@@ -170,14 +170,7 @@ pub(crate) fn capture_procedural_statement_type_inputs<'a>(
             visit,
             planner: PlannerPass::TypeInputs,
         };
-        match statement {
-            Stmt::Select(select) => walker.select(select, Some(&outer), None),
-            Stmt::SetQuery(query) => walker.set_query(query, Some(&outer)),
-            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
-                walker.dml(statement, Some(&outer))
-            }
-            _ => walker.statement(statement),
-        }
+        walker.statement(statement, Some(&outer))
     })
 }
 
@@ -310,6 +303,44 @@ fn discover_defaults(
         }
         return Ok(());
     }
+    // A view's column defaults, written as ALTER VIEW's own action or as
+    // ALTER TABLE subcommands on a view.
+    let view_defaults = match statement {
+        Stmt::AlterView {
+            name,
+            action: ast::AlterViewAction::SetDefault { column, expression },
+            ..
+        } => {
+            return discover_view_default(
+                parser, name, column, expression, storage, txid, arena, visit,
+            );
+        }
+        Stmt::AlterView {
+            name,
+            action: ast::AlterViewAction::TableActions(actions),
+            ..
+        } => Some((name, *actions)),
+        Stmt::AlterTable(alter) => Some((&alter.table, alter.actions)),
+        _ => None,
+    };
+    if let Some((name, actions)) = view_defaults {
+        if matches!(
+            storage.resolve_relation(name.schema, name.name, txid),
+            Some(crate::storage::ResolvedRelation::View(_))
+        ) {
+            for action in actions {
+                if let ast::AlterAction::SetDefault {
+                    column, value_text, ..
+                } = action
+                {
+                    discover_view_default(
+                        parser, name, column, value_text, storage, txid, arena, visit,
+                    )?;
+                }
+            }
+        }
+        return Ok(());
+    }
     let (source, target, type_mod) = match statement {
         Stmt::CreateDomain(domain) => {
             let Some(source) = domain.default_text else {
@@ -367,8 +398,7 @@ fn discover_defaults(
                     crate::sql::types::ColDesc::new("", 0, 0)
                 })
                 .map_err(|_| super::arena_full())?;
-            let count =
-                crate::sql::catalog::describe_view(storage, txid, &view, arena, descriptions)?;
+            let count = crate::sql::catalog::describe_view(&view, txid, arena, descriptions)?;
             let description = descriptions
                 .get(index)
                 .filter(|_| index < count)
@@ -394,6 +424,62 @@ fn discover_defaults(
     };
     discover_default_source(
         parser, source, target, type_mod, storage, txid, arena, visit,
+    )
+}
+
+/// A view column default's checked inputs, typed by the view's output column.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "default discovery keeps its original source, view column, catalog and admission callback explicit"
+)]
+fn discover_view_default(
+    parser: &crate::sql::parser::Parser<'_>,
+    name: &ast::QualName<'_>,
+    column: &str,
+    expression: &str,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    visit: &mut Visit<'_>,
+) -> Result<(), SqlError> {
+    let Some(crate::storage::ResolvedRelation::View(slot)) =
+        storage.resolve_relation(name.schema, name.name, txid)
+    else {
+        return Ok(());
+    };
+    let view = storage.view(slot);
+    let Some(index) = view
+        .columns_for(txid)
+        .names()
+        .iter()
+        .position(|name| name.as_str() == column)
+    else {
+        return Ok(());
+    };
+    let descriptions = arena
+        .alloc_slice_with(view.columns_for(txid).len(), |_| {
+            crate::sql::types::ColDesc::new("", 0, 0)
+        })
+        .map_err(|_| super::arena_full())?;
+    let count = crate::sql::catalog::describe_view(&view, txid, arena, descriptions)?;
+    let description = descriptions
+        .get(index)
+        .filter(|_| index < count)
+        .ok_or_else(|| {
+            sql_err!(
+                super::sqlstate::INTERNAL_ERROR,
+                "view default output type is missing"
+            )
+        })?;
+    discover_default_source(
+        parser,
+        expression,
+        description.type_oid,
+        description.type_mod,
+        storage,
+        txid,
+        arena,
+        visit,
     )
 }
 
@@ -483,7 +569,7 @@ fn discover(
         visit,
         planner: PlannerPass::TypeInputs,
     };
-    walker.statement(statement)
+    walker.statement(statement, None)
 }
 
 /// Planning visits selected expression calls with schema metadata only. The
@@ -619,14 +705,48 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
     where
         'storage: 'a,
     {
-        match statement {
-            Stmt::Select(select) => self.select(select, Some(outer), None),
-            Stmt::SetQuery(query) => self.set_query(query, Some(outer)),
-            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
-                self.dml(statement, Some(outer))
-            }
-            _ => self.statement(statement),
+        self.statement(statement, Some(outer))
+    }
+
+    /// A `CALL`'s arguments, typed by `columns` and read from `row`.
+    fn call_statement<'a>(
+        &mut self,
+        statement: &'a Stmt<'a>,
+        columns: &dyn ColTypeResolver,
+        row: &dyn ColumnLookup<'a>,
+    ) -> Result<(), SqlError>
+    where
+        'storage: 'a,
+    {
+        let Stmt::Call {
+            name,
+            arguments,
+            argument_names,
+            variadic,
+            ..
+        } = statement
+        else {
+            return Ok(());
+        };
+        let name = match name.schema {
+            Some(schema) => self
+                .arena
+                .alloc_str_display(format_args!("{schema}.{}", name.name))
+                .map_err(|_| super::arena_full())?,
+            None => name.name,
+        };
+        for argument in *arguments {
+            self.expression(argument, columns, row)?;
         }
+        self.call(
+            name,
+            None,
+            arguments,
+            argument_names,
+            *variadic,
+            true,
+            columns,
+        )
     }
 
     fn input(&mut self, expression: &Expr<'_>, target: i32, type_mod: i32) -> Result<(), SqlError> {
@@ -1000,17 +1120,24 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         Ok(())
     }
 
+    /// Visits a FROM item. Its function arguments read `row`; a derived
+    /// table reads `lateral` when marked `LATERAL`, otherwise `hidden`.
     fn table_ref<'a>(
         &mut self,
         table: &ast::TableRef<'a>,
         columns: &dyn ColTypeResolver,
         row: &dyn ColumnLookup<'a>,
+        lateral: &dyn ColumnLookup<'a>,
+        hidden: &dyn ColumnLookup<'a>,
     ) -> Result<(), SqlError>
     where
         'storage: 'a,
     {
+        // A plain derived table reads only the levels around its query; a
+        // LATERAL one also reads the tables beside it.
         if let Some(query) = table.subquery {
-            self.select(query, Some(row), None)?;
+            let outer = if table.lateral { lateral } else { hidden };
+            self.select(query, Some(outer), None)?;
         }
         if let Some(arguments) = table.func_args {
             for expression in arguments {
@@ -1057,7 +1184,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         }
         if let Some(group) = table.rows_from {
             for table in group {
-                self.table_ref(table, columns, row)?;
+                self.table_ref(table, columns, row, lateral, hidden)?;
             }
         }
         Ok(())
@@ -1102,7 +1229,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                 let mark = arena.mark();
                 let result: Result<(), SqlError> = (|| {
                     let output = super::srf::describe_derived_definition(
-                        storage, select, "", None, txid, arena, None,
+                        storage, select, "", None, txid, arena, outer,
                     )?;
                     // Set outputs can repeat names such as ?column?. Bind by
                     // ordinal so one output never acquires a sibling's type.
@@ -1172,9 +1299,35 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             catalog: Some(&catalog),
         };
         if let Some(from) = select.from {
-            self.table_ref(&from.base, &columns, &row)?;
-            for join in from.joins {
-                self.table_ref(&join.table, &columns, &row)?;
+            let scope = scope.as_ref().expect("a FROM clause resolves a scope");
+            let reach =
+                |preceding, lateral: bool, reads_left: bool| super::scope::DerivedTableOuter {
+                    siblings: scope,
+                    preceding,
+                    visible_from: if lateral && reads_left {
+                        scope.lateral_from
+                    } else {
+                        preceding
+                    },
+                    lateral,
+                    enclosing: outer,
+                };
+            self.table_ref(
+                &from.base,
+                &columns,
+                &row,
+                &reach(0, true, true),
+                &reach(0, false, true),
+            )?;
+            for (index, join) in from.joins.iter().enumerate() {
+                let reads_left = !join.kind.is_right_or_full();
+                self.table_ref(
+                    &join.table,
+                    &columns,
+                    &row,
+                    &reach(index + 1, true, reads_left),
+                    &reach(index + 1, false, reads_left),
+                )?;
                 if let Some(expression) = join.on {
                     self.expression(expression, &columns, &row)?;
                 }
@@ -1222,7 +1375,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             if targets.is_some() {
                 let width = match item {
                     SelectItem::Expr { .. } => 1,
-                    SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+                    SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
                         let scope = scope.as_ref().ok_or_else(|| {
                             sql_err!(
                                 super::sqlstate::UNDEFINED_TABLE,
@@ -1243,14 +1396,19 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                                     }
                                     _ => scope.star_entry(index),
                                 };
-                                let expression = Expr::Column {
-                                    qualifier: match entry {
-                                        super::ResolvedColumn::Table(table, _) => {
-                                            Some(scope.names[table])
+                                let expression = match entry {
+                                    super::ResolvedColumn::Table(table, column) => {
+                                        let (qualifier, name) =
+                                            scope.column_reference_name(table, column);
+                                        Expr::Column {
+                                            qualifier: Some(qualifier),
+                                            name,
                                         }
-                                        super::ResolvedColumn::Merged(_) => None,
+                                    }
+                                    super::ResolvedColumn::Merged(_) => Expr::Column {
+                                        qualifier: None,
+                                        name: scope.output_name(entry),
                                     },
-                                    name: scope.output_name(entry),
                                 };
                                 if let Some((target, type_mod, Some(site))) =
                                     targets.and_then(|targets| targets.get(output_index + index))
@@ -1347,7 +1505,9 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                         self.select(select, outer, None)
                     }
                     super::cte::ScopedCte::Select(_) => Ok(()),
-                    super::cte::ScopedCte::DataModification(statement) => self.statement(statement),
+                    super::cte::ScopedCte::DataModification(statement) => {
+                        self.statement(statement, outer)
+                    }
                 },
             )?;
             let tree = super::cte::expand_set_tree(
@@ -1377,13 +1537,19 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         }
     }
 
-    fn statement<'a>(&mut self, statement: &'a Stmt<'a>) -> Result<(), SqlError>
+    /// Visits `statement`, whose queries see `outer` (a PL/pgSQL routine's
+    /// variables) beyond their own FROM items.
+    fn statement<'a>(
+        &mut self,
+        statement: &'a Stmt<'a>,
+        outer: Option<&dyn ColumnLookup<'a>>,
+    ) -> Result<(), SqlError>
     where
         'storage: 'a,
     {
         match statement {
-            Stmt::Select(select) => self.select(select, None, None),
-            Stmt::SetQuery(query) => self.set_query(query, None),
+            Stmt::Select(select) => self.select(select, outer, None),
+            Stmt::SetQuery(query) => self.set_query(query, outer),
             Stmt::With { ctes, statement } => {
                 let storage = self.storage;
                 let txid = self.txid;
@@ -1398,11 +1564,11 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                     arena,
                     &mut |source| match source {
                         super::cte::ScopedCte::Select(select) if !planner => {
-                            self.select(select, None, None)
+                            self.select(select, outer, None)
                         }
                         super::cte::ScopedCte::Select(_) => Ok(()),
                         super::cte::ScopedCte::DataModification(statement) => {
-                            self.statement(statement)
+                            self.statement(statement, outer)
                         }
                     },
                 )?;
@@ -1415,16 +1581,19 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                     None,
                     self.arena,
                 )?;
-                self.statement(statement)
+                self.statement(statement, outer)
             }
-            Stmt::Explain { statement, .. } => self.statement(statement),
-            Stmt::Call {
-                name,
-                arguments,
-                argument_names,
-                variadic,
-                ..
-            } => {
+            Stmt::Explain { statement, .. } => self.statement(statement, outer),
+            Stmt::Call { .. } => {
+                // A procedural CALL's arguments read the block's variables.
+                if let Some(outer) = outer {
+                    let catalog = super::storage_catalog(self.storage, self.arena, self.txid);
+                    let columns = RuntimeColumnTypes {
+                        row: outer,
+                        catalog: Some(&catalog),
+                    };
+                    return self.call_statement(statement, &columns, outer);
+                }
                 let catalog = crate::sql::exec::CatalogCols {
                     definition: None,
                     alias: None,
@@ -1433,28 +1602,10 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                     txid: self.txid,
                     arena: self.arena,
                 };
-                let name = match name.schema {
-                    Some(schema) => self
-                        .arena
-                        .alloc_str_display(format_args!("{schema}.{}", name.name))
-                        .map_err(|_| super::arena_full())?,
-                    None => name.name,
-                };
-                for argument in *arguments {
-                    self.expression(argument, &catalog, &crate::sql::eval::NoColumns)?;
-                }
-                self.call(
-                    name,
-                    None,
-                    arguments,
-                    argument_names,
-                    *variadic,
-                    true,
-                    &catalog,
-                )
+                self.call_statement(statement, &catalog, &crate::sql::eval::NoColumns)
             }
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
-                self.dml(statement, None)
+                self.dml(statement, outer)
             }
             _ => Ok(()),
         }
@@ -1499,6 +1650,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             extra,
             self.txid,
             self.arena,
+            outer.map(|outer| outer as &dyn ColumnLookup<'_>),
         )?;
         let schema = super::materialize::ScopeSchema(&scope);
         let row = super::Chained {
@@ -1511,9 +1663,33 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             catalog: Some(&catalog),
         };
         if let Some(from) = extra {
-            self.table_ref(&from.base, &columns, &row)?;
-            for join in from.joins {
-                self.table_ref(&join.table, &columns, &row)?;
+            // The assignment target is entry 0, out of every FROM item's reach.
+            let reach = |preceding, lateral: bool| super::scope::DerivedTableOuter {
+                siblings: &scope,
+                preceding,
+                visible_from: if lateral {
+                    scope.lateral_from
+                } else {
+                    preceding
+                },
+                lateral,
+                enclosing: outer,
+            };
+            self.table_ref(
+                &from.base,
+                &columns,
+                &row,
+                &reach(1, true),
+                &reach(1, false),
+            )?;
+            for (index, join) in from.joins.iter().enumerate() {
+                self.table_ref(
+                    &join.table,
+                    &columns,
+                    &row,
+                    &reach(index + 2, true),
+                    &reach(index + 2, false),
+                )?;
                 if let Some(expression) = join.on {
                     self.expression(expression, &columns, &row)?;
                 }
@@ -1572,6 +1748,24 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         }
         if let Stmt::Merge(merge) = statement {
             self.expression(merge.on, &columns, &row)?;
+        }
+        let check_sources = |assignments: &[(&str, &Expr<'_>)]| {
+            assignments.iter().try_for_each(|(_, expression)| {
+                super::dependencies::check_multiple_assignment_source(
+                    expression, &scope, storage, txid, arena,
+                )
+            })
+        };
+        match statement {
+            Stmt::Update(update) => check_sources(update.assignments)?,
+            Stmt::Merge(merge) => {
+                for when in merge.whens {
+                    if let ast::MergeActionRef::Update(assignments) = when.action() {
+                        check_sources(assignments)?;
+                    }
+                }
+            }
+            _ => {}
         }
         super::dependencies::visit_resolved_dml_assignment_inputs(
             statement,
@@ -1650,8 +1844,16 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             catalog: Some(&catalog),
         };
         for item in returning.items {
-            if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
-                self.expression(expression, &columns, &row)?;
+            match item {
+                SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                    self.expression(expression, &columns, &row)?;
+                }
+                SelectItem::TableWildcard(qualifier) => {
+                    scope
+                        .qualified_star_columns(qualifier)
+                        .map_err(|error| crate::sql::error_position::at_item(error, item))?;
+                }
+                SelectItem::Wildcard(_) => {}
             }
         }
         Ok(())

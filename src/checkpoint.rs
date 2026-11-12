@@ -311,7 +311,9 @@ fn parse_manifest_metadata(text: &str) -> Result<ManifestMetadata, &'static str>
                     .next()
                     .and_then(|word| word.parse().ok())
                     .ok_or("invalid role identity allocator")?;
-                if !(crate::storage::RoleOid::USER_FLOOR..=i32::MAX as u64).contains(&sequence) {
+                if !(crate::storage::RoleOid::USER_FLOOR..=crate::storage::RoleOid::LAST_USER)
+                    .contains(&sequence)
+                {
                     return Err("invalid role identity allocator");
                 }
                 role_sequence = Some(sequence);
@@ -1289,6 +1291,18 @@ impl AtomicBlockReadScope {
                 .expect("block store lock poisoned")
                 .base_mut()
                 .enter_atomic_reads();
+        }
+    }
+
+    /// Lets this owner's reads yield again; an enclosing atomic owner still
+    /// keeps them synchronous.
+    pub(crate) fn deactivate(&self) {
+        if self.active.replace(false) {
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .base_mut()
+                .leave_atomic_reads();
         }
     }
 }
@@ -4153,6 +4167,7 @@ impl Checkpointer {
             .map_err(|_| CheckpointSetupError::Corrupt("invalid role identity allocator"))?;
         storage.restore_next_large_object_oid(metadata.next_large_object_oid);
         storage.clear_schemas_for_restore();
+        storage.clear_initdb_role_memberships();
         let lines = text.lines().skip(1);
         let mut database_identities = Vec::with_capacity(storage.database_count());
         let mut system_setting_names = Vec::with_capacity(crate::storage::MAX_SYSTEM_SETTINGS);
@@ -5197,7 +5212,8 @@ impl Checkpointer {
                 }
                 Some("rmem") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let identity = parse_catalog_position(&mut words, metadata.catalog_sequence)?;
+                    let identity =
+                        parse_membership_position(&mut words, metadata.catalog_sequence)?;
                     let role_oid =
                         |word, name| -> Result<crate::storage::RoleOid, CheckpointSetupError> {
                             crate::storage::RoleOid::parse(parse_field(word, name)?).ok_or(
@@ -5828,11 +5844,28 @@ impl Checkpointer {
                         cost_bits: Some(parse_field(words.next(), "brtn cost")?),
                         rows_bits: Some(parse_field(words.next(), "brtn rows")?),
                     };
+                    // The settings use the journal image's encoding.
+                    let configs = decode_manifest_hex_bytes(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("brtn settings missing"))?,
+                    )?;
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("invalid brtn record"));
                     }
-                    let image = crate::storage::BuiltinRoutineAttributes::new(routine, attributes)
-                        .map_err(|_| CheckpointSetupError::Corrupt("invalid brtn image"))?;
+                    let mut encoded = Vec::with_capacity(21 + configs.len());
+                    encoded.extend_from_slice(&[
+                        u8::from(attributes.strict),
+                        attributes.volatility.code(),
+                        attributes.parallel.code(),
+                        u8::from(attributes.security_definer),
+                        u8::from(attributes.leakproof),
+                    ]);
+                    encoded.extend_from_slice(&attributes.cost_bits.unwrap_or(0).to_le_bytes());
+                    encoded.extend_from_slice(&attributes.rows_bits.unwrap_or(0).to_le_bytes());
+                    encoded.extend_from_slice(&configs);
+                    let image = crate::wal::decode_builtin_routine_image(routine, &encoded)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid brtn image"))?;
                     storage
                         .replay_builtin_routine_attributes(
                             storage.current_database_oid(),
@@ -10214,7 +10247,10 @@ impl Checkpointer {
 
         // Roles are durable catalog authority. Parsed verifier material crosses
         // this object-backed manifest; plaintext passwords never do.
-        for (slot, role) in storage.live_roles() {
+        for (slot, role) in storage
+            .live_roles()
+            .filter(|(slot, _)| crate::storage::PredefinedRole::from_slot(*slot).is_none())
+        {
             use core::fmt::Write;
             let attributes = role.attributes;
             let mut name = StackStr::<130>::new();
@@ -13540,10 +13576,25 @@ impl Checkpointer {
                 &mut database_context,
                 entry.database,
             )?;
+            struct ConfigsHex<'a>(&'a [crate::storage::RoutineConfig]);
+            impl core::fmt::Display for ConfigsHex<'_> {
+                fn fmt(&self, out: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    write!(out, "{:02x}", self.0.len())?;
+                    for config in self.0 {
+                        for text in [config.name.as_str(), config.value.as_str()] {
+                            write!(out, "{:02x}", text.len())?;
+                            for byte in text.as_bytes() {
+                                write!(out, "{byte:02x}")?;
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+            }
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "brtn {} {} {} {} {} {} {} {}",
+                    "brtn {} {} {} {} {} {} {} {} {}",
                     routine.get(),
                     u8::from(attributes.strict),
                     attributes.volatility.code(),
@@ -13552,6 +13603,7 @@ impl Checkpointer {
                     u8::from(attributes.leakproof),
                     image.cost().to_bits(),
                     image.rows().to_bits(),
+                    ConfigsHex(image.configs()),
                 ),
             )?;
         }
@@ -19030,6 +19082,8 @@ fn load_view(
     }
     let mut names = [crate::storage::SqlName::EMPTY; crate::storage::MAX_COLUMNS];
     let mut defaults = [ColumnDefault::NONE; crate::storage::MAX_COLUMNS];
+    let mut identities = [None; crate::storage::MAX_COLUMNS];
+    let mut types = [crate::storage::ViewColumnType::PLACEHOLDER; crate::storage::MAX_COLUMNS];
     if count == 0 {
         if !encoded_entries.is_empty() {
             return Err(CheckpointSetupError::Corrupt("invalid empty view columns"));
@@ -19040,7 +19094,7 @@ fn load_view(
             let entry = entries
                 .next()
                 .ok_or(CheckpointSetupError::Corrupt("view column missing"))?;
-            let mut fields = entry.splitn(4, '/');
+            let mut fields = entry.split('/');
             names[index] =
                 sql_name(&decode_hex_name(fields.next().ok_or(
                     CheckpointSetupError::Corrupt("view column name missing"),
@@ -19052,6 +19106,29 @@ fn load_view(
             let expression = fields.next().ok_or(CheckpointSetupError::Corrupt(
                 "view column default expression missing",
             ))?;
+            let stamp = parse_field::<u64>(fields.next(), "view column default identity")?;
+            types[index] = crate::storage::ViewColumnType::new(
+                parse_field(fields.next(), "view column type")?,
+                parse_field(fields.next(), "view column type length")?,
+                parse_field(fields.next(), "view column type modifier")?,
+                crate::sql::ast::Collation::from_code(parse_field(
+                    fields.next(),
+                    "view column collation",
+                )?)
+                .ok_or(CheckpointSetupError::Corrupt(
+                    "invalid view column collation",
+                ))?,
+            )
+            .ok_or(CheckpointSetupError::Corrupt("invalid view column type"))?;
+            if fields.next().is_some() {
+                return Err(CheckpointSetupError::Corrupt("trailing view column fields"));
+            }
+            identities[index] = match stamp {
+                0 => None,
+                stamp => Some(crate::storage::ConstraintIdentity::parse(stamp).ok_or(
+                    CheckpointSetupError::Corrupt("invalid view column default identity"),
+                )?),
+            };
             let expression = if expression == "0" {
                 None
             } else {
@@ -19079,7 +19156,7 @@ fn load_view(
             return Err(CheckpointSetupError::Corrupt("trailing view columns"));
         }
     }
-    let mut columns = crate::storage::ViewColumns::from_sql_names(&names[..count])
+    let mut columns = crate::storage::ViewColumns::from_sql_names(&names[..count], &types[..count])
         .map(|columns| columns.with_aliases(aliases))
         .map_err(|error| {
             CheckpointSetupError::ObjectStore(format!(
@@ -19094,7 +19171,19 @@ fn load_view(
                 error.message.as_str()
             ))
         })?;
+        if matches!(default, ColumnDefault::None) != identities[index].is_none() {
+            return Err(CheckpointSetupError::Corrupt(
+                "view column default identity does not match its default",
+            ));
+        }
+        if let Some(identity) = identities[index] {
+            columns = columns.with_default_identity(index, identity).ok_or(
+                CheckpointSetupError::Corrupt("view column default identity has no default"),
+            )?;
+        }
     }
+    crate::storage::validate_constraint_identities(columns.default_identities())
+        .map_err(|_| CheckpointSetupError::Corrupt("duplicate view column default identity"))?;
     let bytes = decode_manifest_hex_bytes(words.next().ok_or(CheckpointSetupError::Corrupt(
         "view default type inputs missing",
     ))?)?;
@@ -19160,6 +19249,26 @@ fn parse_catalog_position(
     }
     crate::storage::CatalogPosition::new(slot, created_at)
         .map_err(|_| CheckpointSetupError::Corrupt("invalid catalog source identity"))
+}
+
+/// A membership position: a catalog source position, or an initdb
+/// membership's reserved identity at its own position.
+fn parse_membership_position(
+    words: &mut core::str::Split<'_, char>,
+    catalog_sequence: u64,
+) -> Result<crate::storage::CatalogPosition, CheckpointSetupError> {
+    let slot: usize = parse_field(words.next(), "catalog source slot")?;
+    let created_at: u64 = parse_field(words.next(), "catalog source creation")?;
+    if crate::storage::initdb_membership(created_at).is_none() && created_at > catalog_sequence {
+        return Err(CheckpointSetupError::Corrupt(
+            "catalog source exceeds saved identity allocator",
+        ));
+    }
+    let position = crate::storage::CatalogPosition::new(slot, created_at)
+        .map_err(|_| CheckpointSetupError::Corrupt("invalid catalog source identity"))?;
+    crate::storage::Storage::require_membership_identity(position)
+        .map_err(|_| CheckpointSetupError::Corrupt("invalid role membership identity"))?;
+    Ok(position)
 }
 
 #[inline(never)]
@@ -19427,6 +19536,24 @@ impl core::fmt::Display for ManifestViewColumns {
                     return Err(core::fmt::Error);
                 }
             }
+            // The `pg_attrdef` stamp; zero for a column without a default.
+            let identity = match default {
+                ColumnDefault::None => 0,
+                _ => self
+                    .0
+                    .default_identity(index)
+                    .ok_or(core::fmt::Error)?
+                    .created_at(),
+            };
+            let column_type = self.0.types()[index];
+            write!(
+                output,
+                "/{identity}/{}/{}/{}/{}",
+                column_type.oid(),
+                column_type.typlen(),
+                column_type.type_mod(),
+                column_type.collation().code()
+            )?;
         }
         Ok(())
     }
@@ -19470,7 +19597,11 @@ impl core::fmt::Display for ManifestDependencies<'_> {
             for byte in dependency.referenced_name.as_str().as_bytes() {
                 write!(output, "{byte:02x}")?;
             }
-            write!(output, " {}", dependency.referenced_columns)?;
+            write!(
+                output,
+                " {} {}",
+                dependency.referenced_columns, dependency.written_columns
+            )?;
         }
         write!(
             output,
@@ -19562,6 +19693,7 @@ fn parse_stored_query_dependencies<'a>(
             CheckpointSetupError::Corrupt("stored-query referenced name missing"),
         )?)?;
         let referenced_columns = parse_field(words.next(), "stored-query referenced columns")?;
+        let written_columns = parse_field(words.next(), "stored-query written columns")?;
         dependencies
             .serialized_push(SerializedStoredQueryDependency {
                 class,
@@ -19571,6 +19703,7 @@ fn parse_stored_query_dependencies<'a>(
                 referenced_schema: sql_name(&referenced_schema)?,
                 referenced_name: sql_name(&referenced_name)?,
                 referenced_columns,
+                written_columns,
             })
             .map_err(|_| CheckpointSetupError::Corrupt("too many stored-query dependencies"))?;
     }
@@ -20359,7 +20492,7 @@ mod stored_dependency_tests {
                     let Some((_, head)) =
                         crate::test_wait::read_request_head(&mut socket, &mut bytes, &server_stop)
                     else {
-                        break;
+                        continue;
                     };
                     let headers = core::str::from_utf8(&bytes[..head]).unwrap();
                     assert!(headers.starts_with("GET "));
@@ -22479,7 +22612,7 @@ mod stored_dependency_tests {
                     (10, "nsp 7 0 6669727374\nnsp 7 0 7365636f6e64\n"),
                     (10, "nsp 7 0 6669727374\nnsp 8 0 6669727374\n"),
                     (10, "nsp 7 0 6669727374\nnsp 11 0 7365636f6e64\n"),
-                    (1_920_000, "nsp 7 0 6669727374\nnsp 1920000 0 7365636f6e64\n"),
+                    (10_000_000, "nsp 7 0 6669727374\nnsp 10000000 0 7365636f6e64\n"),
                     (10, "nsp 7 0 6669727374\nnsp 8 2 7365636f6e64\n"),
                     (10, "nsp 7 0 6669727374\nnsp 8 0 7365636f6e64 trailing\n"),
                     (10, "nsp 7 0 6669727374\nnsp 8 0 \n"),
@@ -22925,6 +23058,7 @@ mod stored_dependency_tests {
                 referenced_schema: SqlName::parse("").unwrap(),
                 referenced_name: SqlName::parse("original_name").unwrap(),
                 referenced_columns: crate::storage::ColumnSet::from_low_word(0b101),
+                written_columns: crate::storage::ColumnSet::EMPTY,
             })
             .unwrap();
         dependencies
@@ -22938,6 +23072,7 @@ mod stored_dependency_tests {
                 referenced_schema: SqlName::parse("").unwrap(),
                 referenced_name: SqlName::parse("original_function").unwrap(),
                 referenced_columns: crate::storage::ColumnSet::EMPTY,
+                written_columns: crate::storage::ColumnSet::EMPTY,
             })
             .unwrap();
         let encoded = format!("{}", ManifestDependencies(dependencies.view()));
@@ -22967,6 +23102,7 @@ mod stored_dependency_tests {
                     referenced_schema: SqlName::parse("").unwrap(),
                     referenced_name: SqlName::parse("original_type").unwrap(),
                     referenced_columns: crate::storage::ColumnSet::EMPTY,
+                    written_columns: crate::storage::ColumnSet::EMPTY,
                 })
                 .unwrap();
             let encoded = format!("{}", ManifestDependencies(dependencies.view()));
@@ -23000,14 +23136,16 @@ mod stored_dependency_tests {
                 "v:31"
             };
             let valid = format!(
-                "i2 1 {} {valid_key} 7075626c6963 6974656d73  6974656d73 {} -",
+                "i2 1 {} {valid_key} 7075626c6963 6974656d73  6974656d73 {} {} -",
                 class as u8,
+                crate::storage::ColumnSet::EMPTY,
                 crate::storage::ColumnSet::EMPTY
             );
             assert!(parse_stored_query_dependencies(&mut valid.split(' ')).is_ok());
             let input = format!(
-                "i2 1 {} {key} 7075626c6963 6974656d73  6974656d73 {} -",
+                "i2 1 {} {key} 7075626c6963 6974656d73  6974656d73 {} {} -",
                 class as u8,
+                crate::storage::ColumnSet::EMPTY,
                 crate::storage::ColumnSet::EMPTY
             );
             assert!(

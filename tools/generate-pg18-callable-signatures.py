@@ -6,8 +6,12 @@ usage: generate-pg18-callable-signatures.py --dsn DSN RS_FILE [OID...]
 Extends the recorded extraction SQL's OID list with OID..., reruns the
 extraction against a PostgreSQL 18.6 reference server, refreshes both recorded
 SHA-256 digests (SQL text plus newline; `psql -At` output), inserts the
-requested entries in (name, oid) order and rebuilds CALLABLE_OIDS. With no
-OIDs it only re-verifies the recorded digests and index.
+requested entries in (name, oid) order and rebuilds CALLABLE_OIDS. It also
+rewrites CALLABLE_TYPE_NAMES, PostgreSQL's format_type name of every type a
+pg_proc row uses, and CALLABLE_INITIAL_ACLS, the initdb proacl of every
+routine that has one (read from template1, which no session changes), each
+with its own SQL and result digests. With no OIDs it only re-verifies the
+recorded digests and index.
 """
 import argparse, hashlib, json, re, subprocess, sys
 parser = argparse.ArgumentParser()
@@ -89,4 +93,33 @@ index = sorted((oid, at) for at, oid in enumerate(order))
 o_start = s.index('pub(super) const CALLABLE_OIDS: &[(i32, usize)] = &[\n') + len('pub(super) const CALLABLE_OIDS: &[(i32, usize)] = &[\n')
 o_end = s.index('];', o_start)
 s = s[:o_start] + ''.join('    (%d, %d),\n' % pair for pair in index) + s[o_end:]
+# Every type a pg_proc row names, as format_type_be prints it.
+TYPE_SQL = ("SELECT jsonb_agg(jsonb_build_array(t.oid::integer, format_type(t.oid, NULL)) ORDER BY t.oid) "
+            "FROM pg_type t WHERE t.oid IN (SELECT unnest(p.proargtypes::oid[] || "
+            "coalesce(p.proallargtypes, '{}') || p.prorettype) FROM pg_proc p)")
+type_out = subprocess.run(['psql', '-X', '-At', options.dsn, '-c', TYPE_SQL], capture_output=True, text=True, check=True).stdout
+type_rows = json.loads(type_out)
+block = ('/* Exact type-name extraction SQL:\n' + TYPE_SQL + '\n*/\n'
+         '// Type-name SQL SHA256: ' + hashlib.sha256((TYPE_SQL + '\n').encode()).hexdigest() + '\n'
+         '// Type-name result JSON SHA256: ' + hashlib.sha256(type_out.encode()).hexdigest() + '\n'
+         '/// `format_type` names of the types `pg_proc` rows use, sorted by OID.\n'
+         'pub(super) const CALLABLE_TYPE_NAMES: &[(i32, &str)] = &[\n'
+         + ''.join('    (%d, %s),\n' % (oid, rs(name)) for oid, name in type_rows) + '];\n')
+# initdb's proacl, which pg_init_privs records, from the unmodified template.
+ACL_SQL = ("SELECT jsonb_agg(jsonb_build_array(p.oid::integer, p.proacl::text[]) ORDER BY p.oid) "
+           "FROM pg_proc p WHERE p.proacl IS NOT NULL")
+template = options.dsn + ' dbname=template1'
+acl_out = subprocess.run(['psql', '-X', '-At', template, '-c', ACL_SQL], capture_output=True, text=True, check=True).stdout
+block += ('/* Exact initial-ACL extraction SQL (database template1):\n' + ACL_SQL + '\n*/\n'
+          '// Initial-ACL SQL SHA256: ' + hashlib.sha256((ACL_SQL + '\n').encode()).hexdigest() + '\n'
+          '// Initial-ACL result JSON SHA256: ' + hashlib.sha256(acl_out.encode()).hexdigest() + '\n'
+          '/// The `proacl` initdb gives a routine, sorted by OID; every other routine\n'
+          '/// keeps the default ACL (owner and `PUBLIC` may execute).\n'
+          'pub(super) const CALLABLE_INITIAL_ACLS: &[(i32, &[&str])] = &[\n'
+          + ''.join('    (%d, %s),\n' % (oid, arr([rs(item) for item in items])) for oid, items in json.loads(acl_out)) + '];\n')
+marker = '/* Exact type-name extraction SQL:\n'
+if marker in s:
+    s = s[:s.index(marker)] + block
+else:
+    s = s.rstrip('\n') + '\n\n' + block
 open(path, 'w').write(s)

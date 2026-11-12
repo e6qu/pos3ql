@@ -30,6 +30,11 @@ enum ItemPlace {
 
 pub(super) struct SortState<'a> {
     keys: &'a [SortKey<'a>],
+    /// `DISTINCT ON`: the last `unique` keys are its expressions, and only
+    /// the first sorted row of each run of equal values is returned.
+    unique: usize,
+    /// The reader's bound output items, and where each one's values are.
+    outputs: &'a [SelectItem<'a>],
     items: &'a [ItemPlace],
     /// Saved values before the input columns: keys, then saved items.
     saved_values: usize,
@@ -54,9 +59,15 @@ fn sort_full(error: LeaseError) -> SqlError {
 /// Output values one item produces; a qualified `table.*` is not admitted.
 fn item_width(item: &SelectItem<'_>, scope: &QueryScope<'_>) -> usize {
     match item {
-        SelectItem::Wildcard => scope.star_columns(),
+        SelectItem::Wildcard(_) => scope.star_columns(),
         _ => 1,
     }
+}
+
+/// Whether the statement's output is sorted: by its `ORDER BY`, or by its
+/// `DISTINCT ON` expressions to keep each first row.
+pub(super) fn sorts(statement: &Select<'_>) -> bool {
+    !statement.order_by.is_empty() || !statement.distinct_on.is_empty()
 }
 
 /// Decides whether a retained reader can sort this statement itself, before
@@ -71,7 +82,7 @@ pub(super) fn sort_admitted(
     catalog: &dyn crate::sql::eval::CatalogAccess,
 ) -> Result<bool, SqlError> {
     let storage = columns.storage;
-    if statement.order_by.is_empty()
+    if !sorts(statement)
         || storage.spill_attached()
         || statement.with_ties
         || !statement.locking.is_empty()
@@ -98,9 +109,13 @@ pub(super) fn sort_admitted(
                 && !volatile(expression)?,
         )
     };
-    for order in statement.order_by {
-        let expression =
-            crate::sql::exec::resolve_order_expr_pub(order.expression, statement.items)?;
+    let keys = statement
+        .order_by
+        .iter()
+        .map(|order| order.expression)
+        .chain(statement.distinct_on.iter().copied());
+    for key in keys {
+        let expression = crate::sql::exec::resolve_order_expr_pub(key, statement.items)?;
         let expression = if let Expr::Int(position) = expression {
             if statement
                 .items
@@ -133,10 +148,12 @@ pub(super) fn sort_admitted(
     for item in statement.items {
         let expression = match item {
             SelectItem::Expr { expression, .. } => expression,
-            SelectItem::Wildcard => continue,
+            SelectItem::Wildcard(_) => continue,
             SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => return Ok(false),
         };
-        if volatile(expression)? {
+        // The general executor postpones volatile output past a sort only
+        // without DISTINCT ON.
+        if volatile(expression)? && statement.distinct_on.is_empty() {
             continue;
         }
         if !before_sort(expression)?
@@ -180,42 +197,63 @@ impl<'a> SortState<'a> {
             )
             .map(|properties| properties.volatile)
         };
+        let n_order = statement.order_by.len();
         let keys = arena
-            .alloc_slice_with(statement.order_by.len(), |_| SortKey {
+            .alloc_slice_with(n_order + statement.distinct_on.len(), |_| SortKey {
                 expression: &Expr::Null,
                 descending: false,
                 nulls_first: false,
                 collation: Collation::None,
             })
             .map_err(|_| arena_full())?;
-        for (key, order) in keys.iter_mut().zip(statement.order_by) {
-            let mut expression =
-                crate::sql::exec::resolve_order_expr_pub(order.expression, statement.items)?;
-            if let Expr::Int(position) = expression {
-                let item = usize::try_from(*position)
-                    .ok()
-                    .and_then(|position| position.checked_sub(1))
-                    .and_then(|index| statement.items.get(index));
-                match item {
-                    Some(SelectItem::Expr {
-                        expression: item, ..
-                    }) => expression = item,
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::INVALID_COLUMN_REFERENCE,
-                            "ORDER BY position {} is not in select list",
-                            position
-                        ));
-                    }
-                }
-            }
+        // DISTINCT ON expressions follow ORDER BY ascending, as the general
+        // executor sorts them.
+        let orders = statement
+            .order_by
+            .iter()
+            .map(|order| {
+                (
+                    order.expression,
+                    order.descending,
+                    order.nulls_first,
+                    "ORDER BY",
+                )
+            })
+            .chain(
+                statement
+                    .distinct_on
+                    .iter()
+                    .map(|expression| (*expression, false, false, "DISTINCT ON")),
+            );
+        let mut targets = [&Expr::Null; MAX_PROJ];
+        if keys.len() > targets.len() {
+            return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "too many columns"));
+        }
+        for ((key, target), (original, descending, nulls_first, clause)) in
+            keys.iter_mut().zip(&mut targets).zip(orders)
+        {
+            let expression = crate::sql::query::resolve_position_target(
+                original,
+                statement.items,
+                Some(scope),
+                arena,
+                storage,
+                txid,
+                clause,
+            )?;
+            *target = expression;
             *key = SortKey {
                 expression: bind_expression(expression, arena, Some(columns), None)?,
-                descending: order.descending,
-                nulls_first: order.nulls_first,
+                descending,
+                nulls_first,
                 collation: scope.expression_collation(storage, arena, expression)?,
             };
         }
+        super::materialize::check_distinct_on_order(
+            &targets[..n_order],
+            &targets[n_order..keys.len()],
+            statement.distinct_on,
+        )?;
         let places = arena
             .alloc_slice_with(items.len(), |_| ItemPlace::Postponed)
             .map_err(|_| arena_full())?;
@@ -238,6 +276,8 @@ impl<'a> SortState<'a> {
         let pool = storage.plan_build();
         Ok(Self {
             keys,
+            unique: statement.distinct_on.len(),
+            outputs: items,
             items: places,
             saved_values,
             keeps_inputs,
@@ -251,10 +291,6 @@ impl<'a> SortState<'a> {
 
     pub(super) fn filled(&self) -> bool {
         self.filled
-    }
-
-    pub(super) fn keeps_inputs(&self) -> bool {
-        self.keeps_inputs
     }
 
     /// Values item `index` saves before the sort.
@@ -321,12 +357,12 @@ impl<'a> SortState<'a> {
     pub(super) fn finish_fill(&mut self, storage: &Storage, txid: u32) -> Result<(), SqlError> {
         let keys = self.keys;
         let bytes = self.bytes.as_slice();
-        heap_sort(self.entries.as_mut_slice(), |left, right| {
+        crate::util::try_sort_unstable_by(self.entries.as_mut_slice(), |left, right| {
             let left_row = &bytes[left.0 as usize..(left.0 + left.1) as usize];
             let right_row = &bytes[right.0 as usize..(right.0 + right.1) as usize];
             for (column, key) in keys.iter().enumerate() {
-                let left_value = crate::sql::exec::decode_projected_pub(left_row, column);
-                let right_value = crate::sql::exec::decode_projected_pub(right_row, column);
+                let left_value = crate::sql::exec::ProjectedValue::column(left_row, column);
+                let right_value = crate::sql::exec::ProjectedValue::column(right_row, column);
                 let ordering = match (left_value.is_null(), right_value.is_null()) {
                     (true, true) => core::cmp::Ordering::Equal,
                     (true, false) if key.nulls_first => core::cmp::Ordering::Less,
@@ -338,8 +374,8 @@ impl<'a> SortState<'a> {
                             storage,
                             txid,
                             key.collation,
-                            &left_value,
-                            &right_value,
+                            left_value,
+                            right_value,
                         )?;
                         if key.descending {
                             compared.reverse()
@@ -349,26 +385,142 @@ impl<'a> SortState<'a> {
                     }
                 };
                 if !ordering.is_eq() {
-                    return Ok(ordering.is_lt());
+                    return Ok(ordering);
                 }
             }
-            Ok(left.0 < right.0)
+            Ok(left.0.cmp(&right.0))
         })?;
         self.filled = true;
         self.next = 0;
         Ok(())
     }
 
-    /// Makes the next sorted row current; `false` at the end.
-    pub(super) fn advance(&mut self) -> bool {
-        if self.next < self.entries.len() {
-            self.current = Some(self.next);
+    /// Makes the next sorted row current; `false` at the end. Under
+    /// `DISTINCT ON`, a row whose expressions equal its predecessor's is
+    /// skipped.
+    pub(super) fn advance(&mut self, storage: &Storage, txid: u32) -> Result<bool, SqlError> {
+        while self.next < self.entries.len() {
+            let index = self.next;
             self.next += 1;
-            true
-        } else {
-            self.current = None;
-            false
+            if index > 0 && self.unique > 0 && self.same_distinct(storage, txid, index)? {
+                continue;
+            }
+            self.current = Some(index);
+            return Ok(true);
         }
+        self.current = None;
+        Ok(false)
+    }
+
+    /// Whether sorted row `index` repeats its predecessor's `DISTINCT ON`
+    /// values; NULLs are not distinct from each other.
+    fn same_distinct(&self, storage: &Storage, txid: u32, index: usize) -> Result<bool, SqlError> {
+        let (previous, row) = (self.entry(index - 1), self.entry(index));
+        for column in self.keys.len() - self.unique..self.keys.len() {
+            let left = crate::sql::exec::ProjectedValue::column(previous, column);
+            let right = crate::sql::exec::ProjectedValue::column(row, column);
+            let equal = match (left.is_null(), right.is_null()) {
+                (true, true) => true,
+                (false, false) => super::materialize::compare_materialized_key(
+                    storage,
+                    txid,
+                    self.keys[column].collation,
+                    left,
+                    right,
+                )?
+                .is_eq(),
+                _ => false,
+            };
+            if !equal {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Encodes one filtered input row: its sort keys, saved output values
+    /// and, for postponed items, its input columns.
+    pub(super) fn encode_input<'work>(
+        &self,
+        scope: &QueryScope<'_>,
+        storage: &'work Storage,
+        txid: u32,
+        row: &scan::JoinRow<'_, 'work, '_>,
+        work: &'work Arena,
+        params: &[Datum<'_>],
+    ) -> Result<&'work [u8], SqlError> {
+        let catalog = StorageCatalog {
+            storage,
+            routine_workspace: work,
+            txid,
+            invocations: None,
+            statement_arena: None,
+        };
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            ..crate::sql::eval::NO_HOOKS
+        };
+        let mut values = crate::mem::arena::ArenaList::new(work);
+        for key in self.key_expressions() {
+            let value = eval_full(key, work, params, row, &hooks)?;
+            values.push(value).map_err(|_| arena_full())?;
+        }
+        for index in 0..self.outputs.len() {
+            if self.postponed(index) {
+                continue;
+            }
+            let mut projected = [Datum::Null; MAX_PROJ];
+            let width = project_row(
+                &self.outputs[index..index + 1],
+                scope,
+                row,
+                work,
+                params,
+                &hooks,
+                &mut projected,
+                None,
+            )?;
+            if width != self.saved_width(index) {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "retained sort item width changed"
+                ));
+            }
+            for value in &projected[..width] {
+                values.push(*value).map_err(|_| arena_full())?;
+            }
+        }
+        if self.keeps_inputs {
+            for table in 0..scope.n {
+                let width = scope.defs.get(table).expect("resolved").n_columns;
+                match row
+                    .table_values(table)
+                    .filter(|_| row.table_present(table) == Some(true))
+                {
+                    Some(columns) if !columns.is_empty() || width == 0 => {
+                        values.push(Datum::Bool(true)).map_err(|_| arena_full())?;
+                        for column in 0..width {
+                            values
+                                .push(columns.get(column).copied().unwrap_or(Datum::Null))
+                                .map_err(|_| arena_full())?;
+                        }
+                    }
+                    _ => {
+                        values.push(Datum::Bool(false)).map_err(|_| arena_full())?;
+                        for _ in 0..width {
+                            values.push(Datum::Null).map_err(|_| arena_full())?;
+                        }
+                    }
+                }
+            }
+        }
+        let values = values.as_slice();
+        let length = crate::sql::exec::projected_row_len(values)?;
+        let bytes = work
+            .alloc_slice_with(length, |_| 0u8)
+            .map_err(|_| arena_full())?;
+        crate::sql::exec::encode_projected_into(values, bytes)?;
+        Ok(&*bytes)
     }
 
     pub(super) fn finish_row(&mut self) {

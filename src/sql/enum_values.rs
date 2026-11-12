@@ -322,6 +322,7 @@ pub(crate) fn bind_query<const N: usize>(
                             slot: slot as u16,
                             identity: crate::storage::StoredDependencyIdentity::Type(reference),
                             referenced_columns: crate::storage::ColumnSet::EMPTY,
+                            written_columns: crate::storage::ColumnSet::EMPTY,
                             schema: definition.schema,
                             name: definition.name,
                             referenced_schema: definition.schema,

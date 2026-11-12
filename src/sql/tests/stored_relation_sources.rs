@@ -20,6 +20,7 @@ fn captured_view_lifetimes_reject_same_name_slot_reuse() {
             .capture_stored_query_relation(crate::storage::ResolvedRelation::View(slot), 0)
             .unwrap(),
         referenced_columns: crate::storage::ColumnSet::EMPTY,
+        written_columns: crate::storage::ColumnSet::EMPTY,
         schema: crate::storage::SqlName::parse("public").unwrap(),
         name: crate::storage::SqlName::parse("same_view").unwrap(),
         referenced_schema: crate::storage::SqlName::EMPTY,

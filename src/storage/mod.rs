@@ -20,11 +20,16 @@ pub(crate) use runtime_input_validity::{
 mod catalog_identities;
 mod catalog_keys;
 mod catalog_sources;
+mod predefined_roles;
 pub(crate) use catalog_identities::{CatalogCreation, CatalogIdentity};
+pub(crate) use predefined_roles::{
+    INITDB_MEMBERSHIP_BASE, INITDB_MEMBERSHIPS, PREDEFINED_ROLE_COUNT, PredefinedRole,
+    initdb_membership, membership_identity_valid,
+};
 mod builtin_routines;
 pub(crate) use builtin_routines::{
     BuiltinRoutineAttributes, BuiltinRoutineEntry, BuiltinRoutineOid,
-    MAX_BUILTIN_ROUTINE_CATALOG_SLOTS, PendingBuiltinRoutine,
+    MAX_BUILTIN_ROUTINE_CATALOG_SLOTS, MAX_BUILTIN_ROUTINE_CONFIGS, PendingBuiltinRoutine,
 };
 mod default_acls;
 mod partition_triggers;
@@ -54,7 +59,7 @@ mod routine_lifecycles;
 mod schema_names;
 pub(crate) use matview_lifecycles::MatviewDdlUndo;
 pub(crate) use matview_lifecycles::MatviewQueryUndo;
-pub(crate) use schema_names::{FIRST_TEMP_NAMESPACE_OID, SchemaIdentity, SchemaNameUndo};
+pub(crate) use schema_names::{SchemaIdentity, SchemaNameUndo};
 mod routine_resolution;
 pub(crate) use crate::sql::eval::RoutineCallSelection;
 pub(crate) use routine_resolution::builtin_compatible_element_oid;
@@ -78,7 +83,7 @@ mod restored_key_names;
 #[cfg(test)]
 pub(crate) use constraint_identities::MAX_CONSTRAINT_CREATION;
 pub(crate) use constraint_identities::{
-    ConstraintIdentity, ForeignKeyTrigger, validate_constraint_identities,
+    AttributeIdentities, ConstraintIdentity, ForeignKeyTrigger, validate_constraint_identities,
     validate_constraint_lifetimes,
 };
 pub(crate) use key_name_admission::{GeneratedNameClass, RelationNameSources};
@@ -110,6 +115,8 @@ pub(crate) use type_edits::{
     TypeDdlDecision, TypeDdlUndo, TypeEditTarget,
 };
 mod domain_validation;
+mod oid_bands;
+pub(crate) use oid_bands::{FIRST_NORMAL_OBJECT_ID, OidBand};
 mod relation_identities;
 pub(crate) use relation_identities::{MAX_RELATION_GENERATION, RelationIdentity};
 mod relation_row_types;
@@ -2053,7 +2060,7 @@ pub struct TableDefinition<B: DefinitionBacking> {
     pub n_columns: usize,
     pub(crate) not_null_names: B::Slice<Option<SqlName>, MAX_COLUMNS>,
     pub(crate) not_null_name_edits: ColumnSet,
-    pub(crate) not_null_identities: B::Slice<Option<ConstraintIdentity>, MAX_RELATION_COLUMNS>,
+    pub(crate) attribute_identities: B::Slice<AttributeIdentities, MAX_RELATION_COLUMNS>,
     pub(crate) attributes: column_attributes::ColumnAttributes<B>,
     pub(crate) inline_index_identities: B::Slice<Option<RelationIdentity>, MAX_RELATION_COLUMNS>,
     pub(crate) inline_constraint_identities:
@@ -2485,7 +2492,7 @@ impl<B: DefinitionBacking> TableDefinition<B> {
             partition: self.partition,
             columns: &self.columns.as_ref()[..self.n_columns],
             not_null_names: &self.not_null_names.as_ref()[..self.n_columns],
-            not_null_identities: &self.not_null_identities.as_ref()
+            attribute_identities: &self.attribute_identities.as_ref()
                 [..usize::from(self.attributes.count)],
             inline_index_identities: &self.inline_index_identities.as_ref()
                 [..usize::from(self.attributes.count)],
@@ -2685,8 +2692,8 @@ impl TableDefBuilder {
             .copy_from_slice(&source.columns.as_ref()[..source.n_columns]);
         result.not_null_names[..source.n_columns]
             .copy_from_slice(&source.not_null_names.as_ref()[..source.n_columns]);
-        result.not_null_identities[..attribute_count]
-            .copy_from_slice(&source.not_null_identities.as_ref()[..attribute_count]);
+        result.attribute_identities[..attribute_count]
+            .copy_from_slice(&source.attribute_identities.as_ref()[..attribute_count]);
         result.inline_index_identities[..attribute_count]
             .copy_from_slice(&source.inline_index_identities.as_ref()[..attribute_count]);
         result.inline_constraint_identities[..attribute_count]
@@ -2758,8 +2765,8 @@ impl TableDefBuilder {
             not_null_names: pool
                 .copy_slice(&self.not_null_names[..self.n_columns])
                 .map_err(exhausted)?,
-            not_null_identities: pool
-                .copy_slice(&self.not_null_identities[..attribute_count])
+            attribute_identities: pool
+                .copy_slice(&self.attribute_identities[..attribute_count])
                 .map_err(exhausted)?,
             inline_index_identities: pool
                 .copy_slice(&self.inline_index_identities[..attribute_count])
@@ -2808,7 +2815,7 @@ impl TableDefBuilder {
             n_columns: 0,
             not_null_names: [None; MAX_COLUMNS],
             not_null_name_edits: ColumnSet::EMPTY,
-            not_null_identities: [None; MAX_RELATION_COLUMNS],
+            attribute_identities: [AttributeIdentities::NONE; MAX_RELATION_COLUMNS],
             attributes: column_attributes::ColumnAttributes::<InlineDefinition>::EMPTY,
             inline_index_identities: [None; MAX_RELATION_COLUMNS],
             inline_constraint_identities: [None; MAX_RELATION_COLUMNS],
@@ -2851,7 +2858,7 @@ impl TableDef {
             n_columns: 0,
             not_null_names: crate::mem::lease_pool::SharedSlice::EMPTY,
             not_null_name_edits: ColumnSet::EMPTY,
-            not_null_identities: crate::mem::lease_pool::SharedSlice::EMPTY,
+            attribute_identities: crate::mem::lease_pool::SharedSlice::EMPTY,
             attributes: column_attributes::ColumnAttributes::<StoredDefinition>::EMPTY,
             inline_index_identities: crate::mem::lease_pool::SharedSlice::EMPTY,
             inline_constraint_identities: crate::mem::lease_pool::SharedSlice::EMPTY,
@@ -2893,7 +2900,7 @@ impl TableDefView<'_> {
             n_columns: 0,
             not_null_names: &[],
             not_null_name_edits: ColumnSet::EMPTY,
-            not_null_identities: &[],
+            attribute_identities: &[],
             attributes: column_attributes::ColumnAttributes::<BorrowedDefinition<'_>>::EMPTY,
             inline_index_identities: &[],
             inline_constraint_identities: &[],
@@ -3736,12 +3743,12 @@ fn text_search_lifetime_oid(
     created_at: u64,
 ) -> Result<i32, SqlError> {
     let base = match kind {
-        crate::sql::ast::TextSearchObjectKind::Parser => 640_000_000,
-        crate::sql::ast::TextSearchObjectKind::Template => 660_000_000,
-        crate::sql::ast::TextSearchObjectKind::Dictionary => 680_000_000,
-        crate::sql::ast::TextSearchObjectKind::Configuration => 700_000_000,
+        crate::sql::ast::TextSearchObjectKind::Parser => OidBand::TextSearchParser,
+        crate::sql::ast::TextSearchObjectKind::Template => OidBand::TextSearchTemplate,
+        crate::sql::ast::TextSearchObjectKind::Dictionary => OidBand::TextSearchDictionary,
+        crate::sql::ast::TextSearchObjectKind::Configuration => OidBand::TextSearchConfiguration,
     };
-    Ok(base + CatalogIdentity::require(created_at)?.get() as i32)
+    Ok(base.oid(CatalogIdentity::require(created_at)?.created_at()))
 }
 
 pub(crate) const TEXT_SEARCH_TOKEN_TYPES: usize = 23;
@@ -4036,10 +4043,11 @@ impl ConversionDef {
     }
 
     pub(crate) fn oid(self) -> i32 {
-        620_000_000
-            + CatalogIdentity::parse(self.created_at)
+        OidBand::Conversion.oid(
+            CatalogIdentity::parse(self.created_at)
                 .expect("admitted conversion has a checked lifetime")
-                .get() as i32
+                .created_at(),
+        )
     }
 }
 
@@ -4159,10 +4167,11 @@ impl EventTriggerDef {
     }
 
     pub(crate) fn oid(self) -> i32 {
-        820_000_000
-            + CatalogIdentity::parse(self.created_at)
+        OidBand::EventTrigger.oid(
+            CatalogIdentity::parse(self.created_at)
                 .expect("admitted event trigger has a checked lifetime")
-                .get() as i32
+                .created_at(),
+        )
     }
 }
 pub(crate) const EXTENDED_STATISTICS_EXPRESSION_MAX: usize = CHECK_SQL_MAX;
@@ -5030,6 +5039,10 @@ pub struct StoredQueryDependency {
     /// retain zero; this avoids treating an unknown column set as every
     /// column when reconstructing catalog dependencies.
     pub referenced_columns: ColumnSet,
+    /// Target columns of a stored `INSERT` or `UPDATE` (`INSERT INTO t (e)`
+    /// writes `t.e`). They are `pg_depend` column rows like the read columns,
+    /// but grant no read access and need no read privilege.
+    pub written_columns: ColumnSet,
     pub schema: SqlName,
     pub name: SqlName,
     pub referenced_schema: SqlName,
@@ -5041,6 +5054,7 @@ pub(crate) struct SerializedStoredQueryDependency {
     pub class: DependencyClass,
     pub identity: StoredDependencyIdentity,
     pub referenced_columns: ColumnSet,
+    pub written_columns: ColumnSet,
     pub schema: SqlName,
     pub name: SqlName,
     pub referenced_schema: SqlName,
@@ -5048,11 +5062,22 @@ pub(crate) struct SerializedStoredQueryDependency {
 }
 
 impl StoredQueryDependency {
+    /// Whether the query reads or writes column position `column`.
+    pub(crate) fn uses_column(&self, column: usize) -> bool {
+        self.referenced_columns.contains(column) || self.written_columns.contains(column)
+    }
+
+    /// Whether the dependency names columns rather than the whole object.
+    pub(crate) fn names_columns(&self) -> bool {
+        !self.referenced_columns.is_empty() || !self.written_columns.is_empty()
+    }
+
     pub(crate) const EMPTY: Self = Self {
         class: DependencyClass::Table,
         slot: 0,
         identity: StoredDependencyIdentity::Name,
         referenced_columns: ColumnSet::EMPTY,
+        written_columns: ColumnSet::EMPTY,
         schema: SqlName::EMPTY,
         name: SqlName::EMPTY,
         referenced_schema: SqlName::EMPTY,
@@ -5448,6 +5473,36 @@ impl StoredQueryDependencies {
         Ok(())
     }
 
+    /// Records a target column of a stored `INSERT` or `UPDATE` on a relation
+    /// the query already depends on.
+    pub fn mark_written_column(
+        &mut self,
+        class: DependencyClass,
+        slot: usize,
+        column: usize,
+    ) -> Result<(), SqlError> {
+        if column >= MAX_COLUMNS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "stored query writes a column beyond the static attribute bound"
+            ));
+        }
+        let len = usize::from(self.len);
+        let dependency = self
+            .entry_storage_mut()
+            .iter_mut()
+            .take(len)
+            .find(|entry| entry.class == class && entry.slot as usize == slot)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "written column has no owning relation dependency"
+                )
+            })?;
+        dependency.written_columns.insert(column);
+        Ok(())
+    }
+
     pub(crate) fn serialized_push(
         &mut self,
         dependency: SerializedStoredQueryDependency,
@@ -5471,6 +5526,7 @@ impl StoredQueryDependencies {
             slot: u16::MAX,
             identity: dependency.identity,
             referenced_columns: dependency.referenced_columns,
+            written_columns: dependency.written_columns,
             schema: dependency.schema,
             name: dependency.name,
             referenced_schema: dependency.referenced_schema,
@@ -5828,6 +5884,18 @@ impl RuleDefinition {
         let start = usize::from(span.start);
         &self.source.as_str()[start..start + usize::from(span.len)]
     }
+
+    /// The rule's condition and action texts.
+    pub(crate) fn fragments(&self) -> impl Iterator<Item = &str> {
+        self.condition
+            .into_iter()
+            .chain(
+                self.actions[..usize::from(self.action_count)]
+                    .iter()
+                    .copied(),
+            )
+            .map(|span| self.text(span))
+    }
 }
 
 #[derive(Clone)]
@@ -5884,10 +5952,11 @@ impl RuleDef {
     }
 
     pub(crate) fn oid(self) -> i32 {
-        880_000_000
-            + CatalogIdentity::parse(self.created_at)
+        OidBand::RewriteRule.oid(
+            CatalogIdentity::parse(self.created_at)
                 .expect("admitted rewrite rule has a checked identity")
-                .get() as i32
+                .created_at(),
+        )
     }
 }
 
@@ -5975,12 +6044,114 @@ pub(crate) struct ViewDefinition {
     pub options: ViewOptions,
 }
 
-/// The output relation of a view.  A stored SELECT describes types at the
-/// query boundary, while these names are catalog identity and therefore must
-/// never be recovered by reparsing aliases from the source text.
+/// A view column's type as PostgreSQL's `pg_attribute` row records it when
+/// the view is created. Later uses read this record instead of analyzing the
+/// view's query again, so a column keeps the type it was created with.
+/// User-defined types are identified by their OID, which is a band base plus
+/// the type's durable creation stamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewColumnType {
+    oid: i32,
+    type_mod: i32,
+    collation: Collation,
+    typlen: i16,
+}
+
+impl ViewColumnType {
+    /// Fills array slots past a view's last column; never a column's type.
+    pub(crate) const PLACEHOLDER: Self = Self {
+        oid: 0,
+        type_mod: -1,
+        collation: Collation::None,
+        typlen: 0,
+    };
+    pub(crate) const ENCODED_BYTES: usize = 14;
+    #[cfg(test)]
+    pub(crate) const INT4: Self = Self {
+        oid: 23,
+        type_mod: -1,
+        collation: Collation::None,
+        typlen: 4,
+    };
+
+    pub(crate) fn new(oid: i32, typlen: i16, type_mod: i32, collation: Collation) -> Option<Self> {
+        (oid > 0 && type_mod >= -1 && typlen != 0).then_some(Self {
+            oid,
+            type_mod,
+            collation,
+            typlen,
+        })
+    }
+
+    pub(crate) fn from_description(column: &crate::sql::types::ColDesc<'_>) -> Self {
+        Self::new(
+            column.type_oid,
+            column.typlen,
+            column.type_mod,
+            column.collation,
+        )
+        .expect("a described view column has a concrete type")
+    }
+
+    pub(crate) const fn oid(self) -> i32 {
+        self.oid
+    }
+
+    pub(crate) const fn type_mod(self) -> i32 {
+        self.type_mod
+    }
+
+    pub(crate) const fn typlen(self) -> i16 {
+        self.typlen
+    }
+
+    pub(crate) const fn collation(self) -> Collation {
+        self.collation
+    }
+
+    /// The column as a query sees it: a reference to a view column has the
+    /// column's collation with implicit derivation, as a table column does.
+    pub(crate) fn description(self, name: &str) -> crate::sql::types::ColDesc<'_> {
+        crate::sql::types::ColDesc {
+            name,
+            type_oid: self.oid,
+            typlen: self.typlen,
+            type_mod: self.type_mod,
+            collation: self.collation,
+            collation_derivation: if matches!(self.collation, Collation::None) {
+                crate::sql::types::CollationDerivation::None
+            } else {
+                crate::sql::types::CollationDerivation::Implicit
+            },
+        }
+    }
+
+    pub(crate) fn to_le_bytes(self) -> [u8; Self::ENCODED_BYTES] {
+        let mut bytes = [0; Self::ENCODED_BYTES];
+        bytes[..4].copy_from_slice(&self.oid.to_le_bytes());
+        bytes[4..6].copy_from_slice(&self.typlen.to_le_bytes());
+        bytes[6..10].copy_from_slice(&self.type_mod.to_le_bytes());
+        bytes[10..].copy_from_slice(&self.collation.code().to_le_bytes());
+        bytes
+    }
+
+    pub(crate) fn from_le_bytes(bytes: [u8; Self::ENCODED_BYTES]) -> Option<Self> {
+        Self::new(
+            i32::from_le_bytes(bytes[..4].try_into().ok()?),
+            i16::from_le_bytes(bytes[4..6].try_into().ok()?),
+            i32::from_le_bytes(bytes[6..10].try_into().ok()?),
+            Collation::from_code(u32::from_le_bytes(bytes[10..].try_into().ok()?))?,
+        )
+    }
+}
+
+/// The output relation of a view: names are catalog identity and therefore
+/// must never be recovered by reparsing aliases from the source text, and
+/// types are fixed when the view is created or replaced.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewColumns {
     names: [SqlName; MAX_COLUMNS],
+    types: [ViewColumnType; MAX_COLUMNS],
     defaults: [ViewColumnDefault; MAX_VIEW_DEFAULTS],
     count: u16,
     aliases: bool,
@@ -5989,12 +6160,31 @@ pub struct ViewColumns {
 impl ViewColumns {
     pub const EMPTY: Self = Self {
         names: [SqlName::EMPTY; MAX_COLUMNS],
+        types: [ViewColumnType::PLACEHOLDER; MAX_COLUMNS],
         defaults: [ViewColumnDefault::EMPTY; MAX_VIEW_DEFAULTS],
         count: 0,
         aliases: false,
     };
 
-    pub fn from_names(names: &[&str]) -> Result<Self, SqlError> {
+    /// Records each column's type; every column must have exactly one.
+    fn with_types(mut self, types: &[ViewColumnType]) -> Result<Self, SqlError> {
+        if types.len() != self.count as usize {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view has {} columns but {} column types",
+                self.count,
+                types.len()
+            ));
+        }
+        self.types[..types.len()].copy_from_slice(types);
+        Ok(self)
+    }
+
+    pub(crate) fn types(&self) -> &[ViewColumnType] {
+        &self.types[..self.count as usize]
+    }
+
+    pub fn from_names(names: &[&str], types: &[ViewColumnType]) -> Result<Self, SqlError> {
         if names.len() > MAX_RELATION_COLUMNS {
             return Err(sql_err!(
                 sqlstate::TOO_MANY_COLUMNS,
@@ -6016,10 +6206,10 @@ impl ViewColumns {
         }
         output.count = names.len() as u16;
         output.aliases = true;
-        Ok(output)
+        output.with_types(types)
     }
 
-    pub fn from_sql_names(names: &[SqlName]) -> Result<Self, SqlError> {
+    pub fn from_sql_names(names: &[SqlName], types: &[ViewColumnType]) -> Result<Self, SqlError> {
         if names.len() > MAX_RELATION_COLUMNS {
             return Err(sql_err!(
                 sqlstate::TOO_MANY_COLUMNS,
@@ -6040,11 +6230,11 @@ impl ViewColumns {
         }
         output.count = names.len() as u16;
         output.aliases = true;
-        Ok(output)
+        output.with_types(types)
     }
 
-    pub fn from_derived_names(names: &[&str]) -> Result<Self, SqlError> {
-        let mut output = Self::from_names(names)?;
+    pub fn from_derived_names(names: &[&str], types: &[ViewColumnType]) -> Result<Self, SqlError> {
+        let mut output = Self::from_names(names, types)?;
         output.aliases = false;
         Ok(output)
     }
@@ -6116,7 +6306,9 @@ impl ViewColumns {
             if matches!(default, ColumnDefault::None) {
                 *entry = ViewColumnDefault::EMPTY;
             } else {
+                // A replacement is a new `pg_attrdef` row with its own OID.
                 entry.default = default;
+                entry.identity = None;
             }
             return Ok(self);
         }
@@ -6137,8 +6329,49 @@ impl ViewColumns {
         *entry = ViewColumnDefault {
             column: index as u16,
             default,
+            identity: None,
         };
         Ok(self)
+    }
+
+    /// The stamp of the column's default, once admission reserved it.
+    pub(crate) fn default_identity(&self, index: usize) -> Option<ConstraintIdentity> {
+        self.defaults
+            .iter()
+            .find(|entry| entry.column == index as u16 && entry.column != u16::MAX)
+            .and_then(|entry| entry.identity)
+    }
+
+    /// Restores the durable stamp of an existing default.
+    pub(crate) fn with_default_identity(
+        mut self,
+        index: usize,
+        identity: ConstraintIdentity,
+    ) -> Option<Self> {
+        let entry = self
+            .defaults
+            .iter_mut()
+            .find(|entry| entry.column == index as u16 && entry.column != u16::MAX)?;
+        entry.identity = Some(identity);
+        Some(self)
+    }
+
+    pub(crate) fn default_identities(
+        &self,
+    ) -> impl Iterator<Item = Option<ConstraintIdentity>> + Clone + '_ {
+        self.defaults
+            .iter()
+            .filter(|entry| entry.column != u16::MAX)
+            .map(|entry| entry.identity)
+    }
+
+    pub(crate) fn default_identities_mut(
+        &mut self,
+    ) -> impl Iterator<Item = &mut Option<ConstraintIdentity>> {
+        self.defaults
+            .iter_mut()
+            .filter(|entry| entry.column != u16::MAX)
+            .map(|entry| &mut entry.identity)
     }
 
     pub fn with_name(mut self, index: usize, name: SqlName) -> Result<Self, SqlError> {
@@ -6174,12 +6407,14 @@ impl ViewColumns {
 struct ViewColumnDefault {
     column: u16,
     default: ColumnDefault,
+    identity: Option<ConstraintIdentity>,
 }
 
 impl ViewColumnDefault {
     const EMPTY: Self = Self {
         column: u16::MAX,
         default: ColumnDefault::NONE,
+        identity: None,
     };
 }
 
@@ -7309,6 +7544,17 @@ impl MatviewDef {
         self.ddl_state.visible_to(txid)
     }
 
+    /// The OID of the view's `_RETURN` rule in `pg_rewrite`. Rules and
+    /// materialized views draw creation stamps from one sequence, so the
+    /// view's own stamp names its rule within the rewrite-rule band.
+    pub(crate) fn rule_oid(&self) -> i32 {
+        OidBand::RewriteRule.oid(
+            CatalogIdentity::parse(self.created_at)
+                .expect("admitted materialized view has a checked identity")
+                .created_at(),
+        )
+    }
+
     pub(crate) fn populated_for(&self, transaction: u32) -> bool {
         self.pending_population
             .filter(|pending| pending.transaction == transaction)
@@ -7334,10 +7580,8 @@ pub(crate) const MAX_TABLE_CATALOG_SLOTS: usize = 10_000;
 pub(crate) const MAX_VIEW_CATALOG_SLOTS: usize = 10_000;
 
 pub(crate) const FIRST_IMPLICIT_INDEX_OID: i32 = relation_identities::FIRST_RELATION_OID;
-pub(crate) const FIRST_EXPLICIT_INDEX_OID: i32 = 300_000_000;
-pub(crate) const FIRST_TOAST_INDEX_OID: i32 = 340_000_000;
-pub(crate) const FIRST_PARTITION_TRIGGER_OID: i32 = 1_000_000_000;
-pub(crate) const TRIGGER_CONSTRAINT_OID_OFFSET: i32 = 500_000;
+pub(crate) const FIRST_EXPLICIT_INDEX_OID: i32 = OidBand::Relation.base();
+pub(crate) const FIRST_TOAST_INDEX_OID: i32 = OidBand::ToastIndex.base();
 pub(crate) const MAX_INDEX_OID_GENERATION: u64 = relation_identities::MAX_RELATION_GENERATION;
 pub(crate) const MAX_TRIGGER_OID_GENERATION: u64 = MAX_CATALOG_CREATION;
 
@@ -7363,30 +7607,38 @@ pub(crate) const ROUTINE_SQL_MAX: usize = VIEW_SQL_MAX;
 pub(crate) const ROUTINE_DEFAULT_MAX: usize = DEFAULT_EXPR_MAX;
 pub(crate) const AGGREGATE_INIT_MAX: usize = 256;
 /// User-defined routine OIDs occupy a stable, disjoint catalog range.
-pub(crate) const ROUTINE_OID_BASE: i32 = 100_000;
+pub(crate) const ROUTINE_OID_BASE: i32 = OidBand::Routine.base();
 
 /// Declarations and inherited images use startup pools. Public identifiers
 /// belong to checked creation stamps, independently of reusable storage slots.
-pub(crate) const TRIGGER_OID_BASE: i32 = 140_000;
-pub(crate) const POLICY_OID_BASE: i32 = 180_000;
 pub(crate) const POLICY_EXPRESSION_MAX: usize = CHECK_SQL_MAX;
 
 pub(crate) fn trigger_oid(trigger: &TriggerDef) -> i32 {
-    TRIGGER_OID_BASE
-        .checked_add(i32::try_from(trigger.created_at).expect("trigger OID range exhausted"))
-        .expect("trigger OID range exhausted")
+    OidBand::Trigger.oid(trigger.created_at)
+}
+
+/// The `pg_constraint` OID of a constraint trigger, in the band paired with
+/// its trigger's band.
+pub(crate) fn trigger_constraint_oid(trigger_oid: i32) -> i32 {
+    let (band, ordinal) = [
+        (OidBand::Trigger, OidBand::TriggerConstraint),
+        (
+            OidBand::PartitionTrigger,
+            OidBand::PartitionTriggerConstraint,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(trigger, constraint)| Some((constraint, trigger.ordinal(trigger_oid)?)))
+    .expect("constraint trigger OID is in a trigger band");
+    band.oid(ordinal)
 }
 
 pub(crate) fn policy_oid(policy: &PolicyDef) -> i32 {
-    POLICY_OID_BASE
-        .checked_add(i32::try_from(policy.created_at).expect("policy OID range exhausted"))
-        .expect("policy OID range exhausted")
+    OidBand::Policy.oid(policy.created_at)
 }
 
 pub(crate) fn routine_oid(routine: &RoutineDef) -> i32 {
-    ROUTINE_OID_BASE
-        .checked_add(i32::try_from(routine.created_at).expect("routine OID range exhausted"))
-        .expect("routine OID range exhausted")
+    OidBand::Routine.oid(routine.created_at)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7868,11 +8120,11 @@ impl RoutineResult {
     }
 }
 
-pub(crate) const CAST_OID_BASE: i32 = 720_000_000;
-pub(crate) const OPERATOR_OID_BASE: i32 = 740_000_000;
-pub(crate) const OPERATOR_FAMILY_OID_BASE: i32 = 760_000_000;
-pub(crate) const OPERATOR_CLASS_OID_BASE: i32 = 780_000_000;
-pub(crate) const ACCESS_METHOD_OID_BASE: i32 = 800_000_000;
+pub(crate) const CAST_OID_BASE: i32 = OidBand::Cast.base();
+pub(crate) const OPERATOR_OID_BASE: i32 = OidBand::Operator.base();
+pub(crate) const OPERATOR_FAMILY_OID_BASE: i32 = OidBand::OperatorFamily.base();
+pub(crate) const OPERATOR_CLASS_OID_BASE: i32 = OidBand::OperatorClass.base();
+pub(crate) const ACCESS_METHOD_OID_BASE: i32 = OidBand::AccessMethod.base();
 /// Operators and support functions each follow the parser's bounded DDL list.
 pub(crate) const MAX_OPERATOR_FAMILY_MEMBERS: usize = MAX_DEFINITION_ITEMS;
 pub(crate) const MAX_ACCESS_METHODS: usize = 32;
@@ -9201,24 +9453,29 @@ pub(crate) struct AggregateRoutine {
 }
 
 impl AggregateRoutine {
+    /// Every support function the aggregate calls: transition, final,
+    /// combine, serialization and moving-aggregate functions.
+    pub(crate) fn support_function_oids(self) -> [Option<i32>; 8] {
+        [
+            Some(self.transition_oid),
+            self.final_function.map(|function| function.function_oid),
+            self.partial.map(|partial| partial.combine_oid),
+            self.partial
+                .and_then(|partial| partial.serde)
+                .map(|serde| serde.serialize_oid),
+            self.partial
+                .and_then(|partial| partial.serde)
+                .map(|serde| serde.deserialize_oid),
+            self.moving.map(|moving| moving.transition_oid),
+            self.moving.map(|moving| moving.inverse_oid),
+            self.moving
+                .and_then(|moving| moving.final_function)
+                .map(|function| function.function_oid),
+        ]
+    }
+
     pub(crate) fn uses_function_oid(self, oid: i32) -> bool {
-        self.transition_oid == oid
-            || self
-                .final_function
-                .is_some_and(|function| function.function_oid == oid)
-            || self.partial.is_some_and(|partial| {
-                partial.combine_oid == oid
-                    || partial.serde.is_some_and(|serde| {
-                        serde.serialize_oid == oid || serde.deserialize_oid == oid
-                    })
-            })
-            || self.moving.is_some_and(|moving| {
-                moving.transition_oid == oid
-                    || moving.inverse_oid == oid
-                    || moving
-                        .final_function
-                        .is_some_and(|function| function.function_oid == oid)
-            })
+        self.support_function_oids().contains(&Some(oid))
     }
 
     pub(crate) fn encode_wire(self) -> StackStr<ROUTINE_SQL_MAX> {
@@ -11707,7 +11964,7 @@ pub(crate) fn index_expression_stackstr(
     Ok(value)
 }
 
-pub(crate) const USER_DATABASE_OID_BASE: i32 = 16_383;
+pub(crate) const USER_DATABASE_OID_BASE: i32 = OidBand::UserDatabase.base();
 pub(crate) const TABLESPACE_LOCATION_MAX: usize = 256;
 
 /// Stable database identity. Catalog slots are reusable, so session, ACL,
@@ -11724,7 +11981,7 @@ impl DatabaseOid {
         if oid == Self::TEMPLATE1.0
             || oid == Self::TEMPLATE0.0
             || oid == Self::POSTGRES.0
-            || oid > USER_DATABASE_OID_BASE
+            || oid >= oid_bands::FIRST_NORMAL_OBJECT_ID
         {
             Some(Self(oid))
         } else {
@@ -11736,8 +11993,25 @@ impl DatabaseOid {
         self.0
     }
 
+    /// The automatic allocator after `oid` is assigned; a client-chosen OID
+    /// outside the band leaves it unchanged.
+    fn after_assigning(self, oid: Self) -> Self {
+        if OidBand::UserDatabase.contains(oid.0) {
+            self.max(oid)
+        } else {
+            self
+        }
+    }
+
+    /// The next automatically assigned OID. `CREATE DATABASE ... OID` may
+    /// name any OID from 16,384, as in PostgreSQL; automatic ones stay in
+    /// their band.
     fn next_after(self) -> Option<Self> {
-        self.0.checked_add(1).and_then(Self::parse)
+        self.0
+            .max(OidBand::UserDatabase.base())
+            .checked_add(1)
+            .filter(|oid| OidBand::UserDatabase.contains(*oid))
+            .and_then(Self::parse)
     }
 }
 
@@ -13581,7 +13855,7 @@ pub(crate) struct DefaultAclIdentity {
 
 impl DefaultAclIdentity {
     pub(crate) fn oid(self) -> i32 {
-        840_000_000 + self.creation.get() as i32
+        OidBand::DefaultAcl.oid(self.creation.created_at())
     }
 }
 
@@ -13794,8 +14068,12 @@ impl Iterator for DefaultAclIter<'_> {
 /// therefore follows the same transaction/WAL/manifest lifecycle as schemas;
 /// it never lives in a process-global authentication side table.
 /// Role slots use `u16::MAX` for PUBLIC, leaving indices 0..65534 available.
-pub(crate) const MAX_ROLE_CATALOG_SLOTS: usize = u16::MAX as usize;
-pub(crate) const MAX_ROLE_MEMBERSHIP_CATALOG_SLOTS: usize = u16::MAX as usize;
+/// Largest `max_roles`: with the predefined roles, every slot stays below the
+/// PUBLIC sentinel.
+pub(crate) const MAX_ROLE_CATALOG_SLOTS: usize = u16::MAX as usize - PREDEFINED_ROLE_COUNT;
+/// Largest `max_role_memberships`; the initdb memberships take extra slots.
+pub(crate) const MAX_ROLE_MEMBERSHIP_CATALOG_SLOTS: usize =
+    u16::MAX as usize - INITDB_MEMBERSHIPS.len();
 pub(crate) const MAX_ROLE_SETTING_CATALOG_SLOTS: usize = u16::MAX as usize;
 pub(crate) const MAX_SYSTEM_SETTINGS: usize = 32;
 pub(crate) const ROLE_SETTING_VALUE_MAX: usize = 256;
@@ -13960,22 +14238,31 @@ pub struct RoleMembership {
 }
 
 impl RoleMembership {
-    pub(crate) fn creation_to(self, txid: u32) -> CatalogIdentity {
+    /// The creation identity: a catalog stamp, or an initdb membership's
+    /// reserved identity (see [`membership_identity_valid`]).
+    pub(crate) fn creation_to(self, txid: u32) -> u64 {
         let created_at = self
             .pending
             .filter(|pending| pending.txid == txid)
             .map_or(self.created_at, |pending| pending.created_at);
-        CatalogIdentity::parse(created_at)
-            .expect("admitted role membership has a checked creation identity")
+        assert!(
+            membership_identity_valid(created_at),
+            "admitted role membership has a checked creation identity"
+        );
+        created_at
     }
 
     pub(crate) fn position(self, slot: usize, txid: u32) -> CatalogPosition {
-        CatalogPosition::new(slot, self.creation_to(txid).created_at())
+        CatalogPosition::new(slot, self.creation_to(txid))
             .expect("admitted role membership has a checked catalog position")
     }
 
     pub(crate) fn oid(self, txid: u32) -> i32 {
-        860_000_000 + self.creation_to(txid).get() as i32
+        let created_at = self.creation_to(txid);
+        match initdb_membership(created_at) {
+            Some((_, initdb)) => initdb.oid,
+            None => OidBand::RoleMembership.oid(created_at),
+        }
     }
 
     pub fn visible_to(&self, txid: u32) -> bool {
@@ -15287,6 +15574,9 @@ struct SnapshotState {
 pub(crate) struct TemporaryNamespaceIdentity {
     database: DatabaseOid,
     connection: i32,
+    /// The smallest number no other live namespace holds, like PostgreSQL's
+    /// backend number; it selects the OID.
+    number: u32,
 }
 
 impl TemporaryNamespaceIdentity {
@@ -15295,9 +15585,7 @@ impl TemporaryNamespaceIdentity {
     }
 
     pub(crate) fn oid(self) -> i32 {
-        self.connection
-            .checked_add(FIRST_TEMP_NAMESPACE_OID)
-            .expect("temporary namespace identity was checked at creation")
+        OidBand::TemporaryNamespace.oid(u64::from(self.number))
     }
 
     pub(crate) fn name(self) -> SqlName {
@@ -15887,6 +16175,9 @@ pub struct Storage {
     row_versions: RowVersionPools,
     pub(crate) row_work: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     pub(crate) execution_control: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    /// Step records a write leases from `execution_control` for its
+    /// multi-step progress (`write_step_levels`).
+    pub(crate) write_step_levels: usize,
     metadata_pool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     statistics_pool: std::sync::Arc<crate::mem::lease_pool::LeasePool>,
     /// Client result output queued behind slow readers.
@@ -15995,11 +16286,16 @@ pub struct Storage {
     /// The lock retains one allocation frontier through nested evaluation;
     /// every use rewinds to its entry mark.
     index_arena: Mutex<Arena>,
+    /// Decoded fields of stored named composites while one comparison orders
+    /// them; each comparison rewinds to its entry mark.
+    comparison_arena: Mutex<Arena>,
     /// The process-independent locale state selected at engine startup.
     collation: Option<CollationRuntime>,
 }
 
 const INDEX_ARENA_BYTES: usize = 2 * crate::store::MAX_PAYLOAD;
+/// Two decoded composite values of one stored row's size, with their fields.
+const COMPARISON_ARENA_BYTES: usize = 4 * crate::store::MAX_PAYLOAD;
 
 struct CollationScratch {
     left: FixedBuf,
@@ -19005,16 +19301,56 @@ impl Storage {
         let target_role = self.session_role_slot(target.role.source(), txid);
         let target_superuser =
             target_role.is_some_and(|role| self.role(role).attributes_to(txid).superuser);
-        if target.pid != self.current_connection_id()
-            && !current_superuser
-            && (target_superuser
-                || !target_role
-                    .is_some_and(|role| self.role_is_member_of(current_role, role, txid)))
-        {
-            return Err(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "must be a member of the role whose process is being signaled or a superuser"
-            ));
+        // PostgreSQL 18.6 pg_signal_backend: only a superuser signals a
+        // superuser's backend; otherwise the caller needs the privileges of
+        // the backend's role or of pg_signal_backend.
+        if !current_superuser {
+            let denied = if terminate {
+                sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied to terminate process"
+                )
+            } else {
+                sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied to cancel query"
+                )
+            };
+            if target_superuser || target_role.is_none() {
+                return Err(crate::sql::eval::with_detail(
+                    denied,
+                    if terminate {
+                        format_args!(
+                            "Only roles with the SUPERUSER attribute may terminate processes of roles with the SUPERUSER attribute."
+                        )
+                    } else {
+                        format_args!(
+                            "Only roles with the SUPERUSER attribute may cancel queries of roles with the SUPERUSER attribute."
+                        )
+                    },
+                ));
+            }
+            if !target_role
+                .is_some_and(|role| self.role_has_privileges_of(current_role, role, txid))
+                && !self.role_has_privileges_of(
+                    current_role,
+                    PredefinedRole::SignalBackend.slot(),
+                    txid,
+                )
+            {
+                return Err(crate::sql::eval::with_detail(
+                    denied,
+                    if terminate {
+                        format_args!(
+                            "Only roles with privileges of the role whose process is being terminated or with privileges of the \"pg_signal_backend\" role may terminate this process."
+                        )
+                    } else {
+                        format_args!(
+                            "Only roles with privileges of the role whose query is being canceled or with privileges of the \"pg_signal_backend\" role may cancel this query."
+                        )
+                    },
+                ));
+            }
         }
         let signal = if terminate {
             BackendSignal::Terminate(pid)
@@ -19153,20 +19489,8 @@ impl Storage {
         &self,
         transaction: u32,
     ) -> Result<Option<TemporaryNamespaceIdentity>, SqlError> {
-        let identity = TemporaryNamespaceIdentity {
-            database: current_database(),
-            connection: self.current_connection_id(),
-        };
-        if identity
-            .connection
-            .checked_add(FIRST_TEMP_NAMESPACE_OID)
-            .is_none_or(|oid| oid <= 0)
-        {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "temporary namespace identity exhausted"
-            ));
-        }
+        let database = current_database();
+        let connection = self.current_connection_id();
         let creation = core::num::NonZeroU32::new(transaction).ok_or_else(|| {
             sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -19177,11 +19501,9 @@ impl Storage {
             .temporary_transactions
             .lock()
             .expect("temporary transaction lock poisoned");
-        if let Some(namespace) = state
-            .namespaces
-            .iter()
-            .find(|namespace| namespace.identity == identity)
-        {
+        if let Some(namespace) = state.namespaces.iter().find(|namespace| {
+            namespace.identity.database == database && namespace.identity.connection == connection
+        }) {
             if !namespace.visible_to(transaction) {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -19190,6 +19512,26 @@ impl Storage {
             }
             return Ok(None);
         }
+        // The registry is bounded, so a free number exists at or below its length.
+        let number = (1..=state.namespaces.len() as u32 + 1)
+            .find(|number| {
+                state
+                    .namespaces
+                    .iter()
+                    .all(|namespace| namespace.identity.number != *number)
+            })
+            .filter(|number| *number <= OidBand::TemporaryNamespace.capacity())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "temporary namespace identity exhausted"
+                )
+            })?;
+        let identity = TemporaryNamespaceIdentity {
+            database,
+            connection,
+            number,
+        };
         state
             .namespaces
             .push(TemporaryNamespace {
@@ -20733,6 +21075,7 @@ impl Storage {
             slot: slot as u16,
             identity: dependency.identity,
             referenced_columns: dependency.referenced_columns,
+            written_columns: dependency.written_columns,
             schema,
             name,
             referenced_schema: dependency.referenced_schema,
@@ -20986,6 +21329,7 @@ impl Storage {
     pub fn extra_budget_bytes(config: &Config) -> usize {
         [
             INDEX_ARENA_BYTES,
+            COMPARISON_ARENA_BYTES,
             CatalogHistory::budget_bytes(
                 config.catalog_history_bytes,
                 catalog_transaction_capacity(config),
@@ -21147,16 +21491,21 @@ impl Storage {
                 .max_extension_scripts
                 .saturating_mul(size_of::<ExtensionScript>()),
             config.extension_script_bytes,
-            config.max_roles.saturating_mul(size_of::<RoleDef>()),
             config
-                .max_role_memberships
+                .role_catalog_slots()
+                .saturating_mul(size_of::<RoleDef>()),
+            config
+                .role_membership_catalog_slots()
                 .saturating_mul(size_of::<RoleMembership>()),
             config
                 .max_role_settings
                 .saturating_mul(size_of::<RoleSetting>()),
             config.query_workspace_slots.saturating_mul(
-                size_of::<Mutex<FixedVec<bool>>>()
-                    .saturating_add(config.max_roles.saturating_mul(size_of::<bool>())),
+                size_of::<Mutex<FixedVec<bool>>>().saturating_add(
+                    config
+                        .role_catalog_slots()
+                        .saturating_mul(size_of::<bool>()),
+                ),
             ),
             MAX_SYSTEM_SETTINGS.saturating_mul(size_of::<SystemSetting>()),
             2usize
@@ -21837,44 +22186,63 @@ impl Storage {
                 .push(CommentEntry::empty())
                 .expect("sized to max_comments");
         }
-        let mut roles = FixedVec::new(budget, "roles", config.max_roles)?;
-        for slot in 0..config.max_roles {
+        let role_slots = config.role_catalog_slots();
+        let mut roles = FixedVec::new(budget, "roles", role_slots)?;
+        for slot in 0..role_slots {
+            let predefined = PredefinedRole::from_slot(slot);
             roles
-                .push(RoleDef {
-                    lifetime: if slot == 0 {
-                        Some(RoleOid::BOOTSTRAP)
-                    } else {
-                        None
-                    },
-                    name: if slot == 0 {
-                        SqlName::parse("postgres").expect("bootstrap role name fits")
-                    } else {
-                        SqlName::EMPTY
-                    },
-                    attributes: if slot == 0 {
-                        RoleAttributes::BOOTSTRAP
-                    } else {
-                        RoleAttributes::ORDINARY
-                    },
-                    live: slot == 0,
-                    pending: None,
+                .push(if slot == 0 {
+                    RoleDef {
+                        lifetime: Some(RoleOid::BOOTSTRAP),
+                        name: SqlName::parse("postgres").expect("bootstrap role name fits"),
+                        attributes: RoleAttributes::BOOTSTRAP,
+                        live: true,
+                        pending: None,
+                    }
+                } else if let Some(predefined) = predefined {
+                    RoleDef {
+                        lifetime: Some(predefined.role_oid()),
+                        name: SqlName::parse(predefined.name()).expect("predefined role name fits"),
+                        attributes: RoleAttributes::ORDINARY,
+                        live: true,
+                        pending: None,
+                    }
+                } else {
+                    RoleDef {
+                        lifetime: None,
+                        name: SqlName::EMPTY,
+                        attributes: RoleAttributes::ORDINARY,
+                        live: false,
+                        pending: None,
+                    }
                 })
-                .expect("sized to max_roles");
+                .expect("sized to the role catalog");
         }
-        let mut role_memberships =
-            FixedVec::new(budget, "role_memberships", config.max_role_memberships)?;
-        for _ in 0..config.max_role_memberships {
+        let membership_slots = config.role_membership_catalog_slots();
+        let mut role_memberships = FixedVec::new(budget, "role_memberships", membership_slots)?;
+        for slot in 0..membership_slots {
             role_memberships
-                .push(RoleMembership {
-                    created_at: 0,
-                    role: 0,
-                    member: 0,
-                    grantor: 0,
-                    options: RoleMembershipOptions::DEFAULT,
-                    live: false,
-                    pending: None,
+                .push(match INITDB_MEMBERSHIPS.get(slot) {
+                    Some(initdb) => RoleMembership {
+                        created_at: INITDB_MEMBERSHIP_BASE + slot as u64,
+                        role: initdb.role.slot() as u16,
+                        member: initdb.member.slot() as u16,
+                        grantor: BOOTSTRAP_ROLE,
+                        options: RoleMembershipOptions::DEFAULT,
+                        live: true,
+                        pending: None,
+                    },
+                    None => RoleMembership {
+                        created_at: 0,
+                        role: 0,
+                        member: 0,
+                        grantor: 0,
+                        options: RoleMembershipOptions::DEFAULT,
+                        live: false,
+                        pending: None,
+                    },
                 })
-                .expect("sized to max_role_memberships");
+                .expect("sized to the role membership catalog");
         }
         let mut role_settings = FixedVec::new(budget, "role_settings", config.max_role_settings)?;
         for _ in 0..config.max_role_settings {
@@ -21888,9 +22256,10 @@ impl Storage {
             config.query_workspace_slots,
         )?;
         for _ in 0..config.query_workspace_slots {
-            let mut scratch = FixedVec::new(budget, "role_graph_scratch", config.max_roles)?;
-            for _ in 0..config.max_roles {
-                scratch.push(false).expect("sized to max_roles");
+            let mut scratch =
+                FixedVec::new(budget, "role_graph_scratch", config.role_catalog_slots())?;
+            for _ in 0..config.role_catalog_slots() {
+                scratch.push(false).expect("sized to the role catalog");
             }
             role_graph_scratch
                 .push(Mutex::new(scratch))
@@ -22044,6 +22413,8 @@ impl Storage {
         let value_indexes =
             ValueIndexPool::new(budget, config.max_value_indexes, config.value_index_rows)?;
         let index_arena = Arena::new(budget, "index expression evaluation", INDEX_ARENA_BYTES)?;
+        let comparison_arena =
+            Arena::new(budget, "named composite comparison", COMPARISON_ARENA_BYTES)?;
         let transaction_capacity =
             config.max_connections as usize + config.max_prepared_transactions;
         budget.draw(snapshot_owner_bytes(), "snapshot and lock owners")?;
@@ -22148,6 +22519,7 @@ impl Storage {
             row_versions,
             row_work,
             execution_control,
+            write_step_levels: config.write_step_levels,
             metadata_pool,
             statistics_pool,
             result_spool,
@@ -22348,6 +22720,7 @@ impl Storage {
             spill: None,
             value_indexes,
             index_arena: Mutex::new(index_arena),
+            comparison_arena: Mutex::new(comparison_arena),
             collation: None,
         };
         crate::sql::reset_execution_query_workspace();
@@ -22664,6 +23037,24 @@ impl Storage {
         })?;
         self.observe_role_oid(entry.owner);
         Ok(())
+    }
+
+    /// Runs one comparison of stored named composites with the reserved
+    /// decoding scratch, released when the comparison returns.
+    pub(crate) fn with_comparison_scratch<R>(
+        &self,
+        compare: impl for<'s> FnOnce(&'s Arena) -> R,
+    ) -> R {
+        let arena = self
+            .comparison_arena
+            .lock()
+            .expect("composite comparison arena lock poisoned");
+        let mark = arena.mark();
+        let result = compare(&arena);
+        // SAFETY: `R` cannot borrow the arena, so nothing allocated above the
+        // entry mark outlives the comparison.
+        unsafe { arena.rewind_to(mark) };
+        result
     }
 
     /// Installs the configured database-default collation before recovery or
@@ -23480,7 +23871,7 @@ impl Storage {
                     catalog.definitions.len()
                 )
             })?;
-        catalog.allocated_oid = catalog.allocated_oid.max(oid);
+        catalog.allocated_oid = catalog.allocated_oid.after_assigning(oid);
         statistics.databases[slot] = DatabaseCumulativeStatistics::empty(oid);
         catalog.definitions[slot] = DatabaseDef {
             oid,
@@ -23527,7 +23918,7 @@ impl Storage {
                     catalog.definitions.len()
                 )
             })?;
-        catalog.allocated_oid = catalog.allocated_oid.max(oid);
+        catalog.allocated_oid = catalog.allocated_oid.after_assigning(oid);
         statistics.databases[slot] = DatabaseCumulativeStatistics::empty(oid);
         catalog.definitions[slot] = DatabaseDef {
             oid,
@@ -26754,6 +27145,18 @@ impl Storage {
         }
     }
 
+    /// The database of an object visible to `txid` outside the current
+    /// database, if it is one.
+    pub(crate) fn access_object_in_other_database(
+        &self,
+        object: AccessObject,
+        txid: u32,
+    ) -> Option<DatabaseOid> {
+        let database = self.access_object_database(object)?;
+        (database != current_database() && self.access_object_visible_in_any_database(object, txid))
+            .then_some(database)
+    }
+
     fn access_object_in_current_database(&self, object: AccessObject) -> bool {
         self.access_object_database(object)
             .is_none_or(|database| database == current_database())
@@ -29275,6 +29678,19 @@ impl Storage {
             return;
         }
         out[member] = true;
+        // The current database's owner is implicitly a member of
+        // pg_database_owner, which cannot have explicit members.
+        let database_owner = self
+            .database_slot_by_oid(current_database(), txid)
+            .map(|slot| {
+                self.object_owner(
+                    AccessObject {
+                        class: AccessClass::Database,
+                        slot: slot as u16,
+                    },
+                    txid,
+                )
+            });
         let catalog = self
             .role_catalog
             .lock()
@@ -29294,6 +29710,13 @@ impl Storage {
                     out[role] = true;
                     changed = true;
                 }
+            }
+            if let Some(owner) = database_owner
+                && out.get(owner).copied().unwrap_or(false)
+                && !out[PredefinedRole::DatabaseOwner.slot()]
+            {
+                out[PredefinedRole::DatabaseOwner.slot()] = true;
+                changed = true;
             }
             if !changed {
                 break;
@@ -29333,6 +29756,33 @@ impl Storage {
             };
         }
         default_public_object_privileges(object.class)
+    }
+
+    /// Privileges initdb grants predefined role `role` on `object` before any
+    /// `GRANT` or `REVOKE` (`EXECUTE` on `pg_ls_waldir()` for `pg_monitor`).
+    pub(crate) fn object_default_role_privileges(
+        &self,
+        object: AccessObject,
+        role: usize,
+    ) -> PrivilegeSet {
+        if object.class != AccessClass::BuiltinRoutine {
+            return PrivilegeSet::NONE;
+        }
+        let Some(predefined) = PredefinedRole::from_slot(role) else {
+            return PrivilegeSet::NONE;
+        };
+        let granted = self
+            .builtin_routine_entry(usize::from(object.slot))
+            .routine
+            .is_some_and(|routine| {
+                crate::sql::catalog::builtin_routine_initial_grantees(routine.get())
+                    .any(|grantee| grantee == predefined)
+            });
+        if granted {
+            PrivilegeSet::EXECUTE
+        } else {
+            PrivilegeSet::NONE
+        }
     }
 
     pub(crate) fn role_has_privileges_of(&self, member: usize, target: usize, txid: u32) -> bool {
@@ -29384,9 +29834,50 @@ impl Storage {
                 if slot == usize::from(owner) && !owner_defined {
                     effective = effective.union(all_object_privileges(object.class));
                 }
+                if !acl_defined {
+                    effective = effective.union(self.object_default_role_privileges(object, slot));
+                }
             }
         }
+        effective = effective.union(Self::predefined_role_privileges(object.class, &roles));
         effective.contains(privilege)
+    }
+
+    /// Privileges PostgreSQL 18.6 adds for predefined roles whatever an
+    /// object's ACL says (`pg_class_aclmask`, `pg_namespace_aclmask`):
+    /// `pg_read_all_data` reads every relation and uses every schema,
+    /// `pg_write_all_data` writes every relation and uses every schema, and
+    /// `pg_maintain` maintains every relation. `held` is the set of roles
+    /// whose privileges the checked role has.
+    fn predefined_role_privileges(class: AccessClass, held: &[bool]) -> PrivilegeSet {
+        let holds = |role: PredefinedRole| held.get(role.slot()).copied().unwrap_or(false);
+        let mut granted = PrivilegeSet::NONE;
+        match class {
+            AccessClass::Table
+            | AccessClass::View
+            | AccessClass::MaterializedView
+            | AccessClass::Sequence => {
+                if holds(PredefinedRole::ReadAllData) {
+                    granted = granted.union(PrivilegeSet::SELECT);
+                }
+                if holds(PredefinedRole::WriteAllData) {
+                    granted = granted
+                        .union(PrivilegeSet::INSERT)
+                        .union(PrivilegeSet::UPDATE)
+                        .union(PrivilegeSet::DELETE);
+                }
+                if holds(PredefinedRole::Maintain) {
+                    granted = granted.union(PrivilegeSet::MAINTAIN);
+                }
+            }
+            AccessClass::Schema
+                if holds(PredefinedRole::ReadAllData) || holds(PredefinedRole::WriteAllData) =>
+            {
+                granted = granted.union(PrivilegeSet::USAGE);
+            }
+            _ => {}
+        }
+        granted
     }
 
     pub(crate) fn require_schema_create(&self, schema: &str, txid: u32) -> Result<(), SqlError> {
@@ -29781,7 +30272,7 @@ impl Storage {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many roles (limit {})",
-                catalog.roles.len()
+                catalog.roles.len() - PREDEFINED_ROLE_COUNT
             ));
         };
         let prior = catalog.roles[slot].pending;
@@ -29982,6 +30473,14 @@ impl Storage {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
                 "stored role has an invalid bootstrap slot"
+            ));
+        }
+        if PredefinedRole::from_slot(slot).is_some()
+            || PredefinedRole::from_oid(oid.get()).is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored role replaces a predefined role"
             ));
         }
         if catalog.roles.iter().any(|role| {
@@ -30212,7 +30711,7 @@ impl Storage {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many role memberships (limit {})",
-                        catalog.memberships.len()
+                        catalog.memberships.len() - INITDB_MEMBERSHIPS.len()
                     )
                 })?,
         };
@@ -30231,7 +30730,7 @@ impl Storage {
             self.catalog_sequence
                 .next_bounded(MAX_CATALOG_CREATION, "role membership")?
         } else {
-            catalog.memberships[slot].creation_to(txid).created_at()
+            catalog.memberships[slot].creation_to(txid)
         };
         if existing.is_none() {
             catalog.memberships[slot].role = role as u16;
@@ -30290,7 +30789,7 @@ impl Storage {
         grantor_oid: RoleOid,
         options: RoleMembershipOptions,
     ) -> Result<usize, SqlError> {
-        CatalogIdentity::require(identity.created_at())?;
+        Self::require_membership_identity(identity)?;
         let mut catalog = self
             .role_catalog
             .lock()
@@ -30378,8 +30877,41 @@ impl Storage {
             live: true,
             pending: None,
         };
-        self.catalog_sequence.observe(identity.created_at());
+        if initdb_membership(identity.created_at()).is_none() {
+            self.catalog_sequence.observe(identity.created_at());
+        }
         Ok(slot)
+    }
+
+    /// A stored membership identity is a catalog stamp, or an initdb
+    /// membership's reserved identity at that membership's own position.
+    pub(crate) fn require_membership_identity(identity: CatalogPosition) -> Result<(), SqlError> {
+        match initdb_membership(identity.created_at()) {
+            Some((slot, _)) if slot == identity.slot() => Ok(()),
+            Some(_) => Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "stored initdb role membership is at another position"
+            )),
+            None => CatalogIdentity::require(identity.created_at()).map(|_| ()),
+        }
+    }
+
+    /// A checkpoint lists every live membership, so restoring one replaces
+    /// the initdb memberships a fresh catalog starts with.
+    pub(crate) fn clear_initdb_role_memberships(&self) {
+        let mut catalog = self
+            .role_catalog
+            .lock()
+            .expect("role catalog lock poisoned");
+        for slot in 0..INITDB_MEMBERSHIPS.len() {
+            let membership = &mut catalog.memberships[slot];
+            if membership.pending.is_none() && initdb_membership(membership.created_at).is_some() {
+                membership.live = false;
+                membership.role = 0;
+                membership.member = 0;
+                membership.grantor = 0;
+            }
+        }
     }
 
     pub(crate) fn role_settings(&self) -> impl Iterator<Item = (usize, RoleSetting)> + '_ {
@@ -30672,7 +31204,7 @@ impl Storage {
     }
 
     pub(crate) fn remove_role_membership(&self, identity: CatalogPosition) -> Result<(), SqlError> {
-        CatalogIdentity::require(identity.created_at())?;
+        Self::require_membership_identity(identity)?;
         let mut catalog = self
             .role_catalog
             .lock()
@@ -31661,16 +32193,9 @@ impl Storage {
             ));
         };
         let version = match allocation {
-            schema_names::SchemaAllocation::New => {
-                let version = self.catalog_sequence.next()?;
-                SchemaIdentity::parse(version).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "schema object identifier range is exhausted"
-                    )
-                })?;
-                version
-            }
+            schema_names::SchemaAllocation::New => self
+                .catalog_sequence
+                .next_bounded(MAX_CATALOG_CREATION, "schema")?,
             schema_names::SchemaAllocation::Restore { identity, .. } => {
                 if schemas.iter().any(|schema| {
                     schema.database == current_database() && schema.identity() == Some(identity)
@@ -32838,13 +33363,24 @@ impl Storage {
         let extension_name = catalog.definitions[extension].name;
         drop(catalog);
         let (_, name) = self.access_object_name_to(object, txid);
-        Err(sql_err!(
+        // PostgreSQL's dependency walk names the member and its extension
+        // as `getObjectDescription` does, without quotes.
+        let error = sql_err!(
             sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-            "cannot drop {} \"{}\" because extension \"{}\" requires it",
+            "cannot drop {} {} because extension {} requires it",
             kind,
             name.as_str(),
             extension_name.as_str()
-        ))
+        );
+        crate::sql::eval::stash_diagnostic(
+            None,
+            Some(crate::stack_format!(
+                128,
+                "You can drop extension {} instead.",
+                extension_name.as_str()
+            )),
+        );
+        Err(error)
     }
 
     pub(crate) fn change_extension_dependency(
@@ -40771,6 +41307,29 @@ impl Storage {
         self.view_rule_catalog().views[slot].clone()
     }
 
+    /// A view's name and column count as `txid` sees them, without copying
+    /// its column set.
+    pub(crate) fn view_column_shape(&self, slot: usize, txid: u32) -> (SqlName, usize) {
+        let catalog = self.view_rule_catalog();
+        let view = &catalog.views[slot];
+        (view.name_for(txid), view.columns_for(txid).len())
+    }
+
+    /// One view column's name and recorded type as `txid` sees them.
+    pub(crate) fn view_column(
+        &self,
+        slot: usize,
+        txid: u32,
+        position: usize,
+    ) -> Option<(SqlName, ViewColumnType)> {
+        let catalog = self.view_rule_catalog();
+        let columns = catalog.views[slot].columns_for(txid);
+        Some((
+            *columns.names().get(position)?,
+            *columns.types().get(position)?,
+        ))
+    }
+
     pub(crate) fn view_relation_name(&self, oid: i32, txid: u32) -> Option<(SqlName, SqlName)> {
         let catalog = self.view_rule_catalog();
         catalog.views.iter().find_map(|view| {
@@ -43082,6 +43641,12 @@ impl Storage {
                 })
                 .then_some(slot)
             })
+    }
+
+    /// The materialized view whose `_RETURN` rule has `oid`.
+    pub(crate) fn matview_slot_by_rule_oid(&self, oid: i32, txid: u32) -> Option<usize> {
+        self.matviews_visible_to(txid)
+            .find_map(|(slot, matview)| (matview.rule_oid() == oid).then_some(slot))
     }
 
     pub(crate) fn matview_table(&self, slot: usize) -> usize {
@@ -45706,7 +46271,7 @@ impl Storage {
         &self,
         schema: SqlName,
         name: SqlName,
-        definition: ViewDefinition,
+        mut definition: ViewDefinition,
         or_replace: bool,
         txid: u32,
     ) -> Result<ViewPublication, SqlError> {
@@ -45789,6 +46354,7 @@ impl Storage {
         let created_at = self
             .catalog_sequence
             .next_bounded(MAX_RELATION_GENERATION, "relation")?;
+        self.reserve_view_default_identities(&mut definition.columns, None)?;
         // Reserve and populate the return rule before changing either view.
         // Capacity and identity errors preserve an existing replacement target.
         let rule = self.create_new_rule_in(
@@ -46950,6 +47516,20 @@ impl Storage {
             Some(actual) => actual,
             None => return false,
         };
+        // Every composite type, including a relation's row type, coerces to
+        // `record` (and its arrays to `record[]`) without a pg_cast row.
+        match (actual.ctype, expected_oid) {
+            (ColType::Composite(_) | ColType::Record, oid::RECORD) => return true,
+            (ColType::Array(element), oid::RECORD_ARRAY)
+                if matches!(
+                    element.to_coltype(),
+                    ColType::Composite(_) | ColType::Record
+                ) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
         let expected = match self.routine_result_for_oid(expected_oid, txid) {
             Some(expected) => expected,
             None => return false,
@@ -47100,6 +47680,26 @@ impl Storage {
             }
         }
         Ok(found)
+    }
+
+    /// Whether a visible user routine of any schema with this name is volatile.
+    pub(crate) fn has_volatile_routine_named(&self, name: &str, txid: u32) -> bool {
+        self.routine_entries().any(|(slot, routine)| {
+            routine.database == current_database()
+                && routine.visible_to(txid)
+                && routine.name_for(txid).as_str() == name
+                && self.routine_for(slot, txid).attributes.volatility == RoutineVolatility::Volatile
+        })
+    }
+
+    /// Whether a visible routine with this name returns a set.
+    pub(crate) fn has_set_returning_routine_named(&self, name: &str, txid: u32) -> bool {
+        self.routine_entries().any(|(slot, routine)| {
+            routine.database == current_database()
+                && routine.visible_to(txid)
+                && routine.name_for(txid).as_str() == name
+                && self.routine_for(slot, txid).kind.is_set_returning()
+        })
     }
 
     /// Visible routines with this schema and name, in catalog order.
@@ -47953,10 +48553,12 @@ impl Storage {
             .iter()
             .any(|trigger| same_identity(trigger) && trigger.visible_to(txid))
         {
+            drop(catalog);
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
-                "trigger \"{}\" for relation already exists",
-                spec.name.as_str()
+                "trigger \"{}\" for relation \"{}\" already exists",
+                spec.name.as_str(),
+                self.trigger_target_name(spec.target, txid).as_str()
             ));
         }
         let Some(slot) = catalog
@@ -48073,10 +48675,13 @@ impl Storage {
                     && candidate.name_to(txid) == name
             })
         {
+            let target = trigger.target;
+            drop(catalog);
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
-                "trigger \"{}\" for relation already exists",
-                name.as_str()
+                "trigger \"{}\" for relation \"{}\" already exists",
+                name.as_str(),
+                self.trigger_target_name(target, txid).as_str()
             ));
         }
         let trigger = &mut catalog.definitions[slot];
@@ -48411,7 +49016,12 @@ impl Storage {
         let capacity = self.trigger_capacity();
         for slot in 0..capacity {
             let trigger = self.trigger(slot);
-            if trigger.ddl_state != CatalogDdlState::Absent && trigger.target == target {
+            // A trigger the transaction dropped commits through its own drop
+            // record, which may come after the view's.
+            if trigger.ddl_state != CatalogDdlState::Absent
+                && trigger.ddl_state.pending_drop_txid().is_none()
+                && trigger.target == target
+            {
                 self.clear_trigger_slot(slot);
                 self.clear_trigger_dependents(slot, trigger);
             }
@@ -51537,6 +52147,14 @@ impl Storage {
         }
     }
 
+    /// Keeps the running statement's visibility and restores it on drop.
+    pub(crate) fn same_statement_snapshot(&self) -> ReadSnapshotScope {
+        ReadSnapshotScope {
+            previous: execution_visibility(),
+            thread: core::marker::PhantomData,
+        }
+    }
+
     pub(crate) fn dml_expression_snapshot(&self, command: u32) -> ReadSnapshotScope {
         let previous = execution_visibility();
         replace_execution_visibility(VisibilityContext {
@@ -51843,6 +52461,15 @@ impl Storage {
                     "aborted"
                 }
             }))
+    }
+
+    /// Whether `txid` reads one snapshot for its whole life (repeatable read
+    /// or serializable), which registers it here at its first statement.
+    pub(crate) fn keeps_transaction_snapshot(&self, txid: u32) -> bool {
+        self.snapshot_state()
+            .active
+            .iter()
+            .any(|(owner, _)| *owner == txid)
     }
 
     pub fn register_snapshot(&self, txid: u32, snapshot: u64) -> Result<(), SqlError> {
@@ -54786,6 +55413,8 @@ impl Storage {
         txid: u32,
     ) -> Result<RulePublication, SqlError> {
         validate_stored_search_path(&definition.creation_path)?;
+        // Named before the rule catalog lock, which the view's names share.
+        let (_, target_name) = self.rule_target_names(definition.target, txid);
         let target = self.query_rule_target(definition.target, txid)?;
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
@@ -54803,8 +55432,9 @@ impl Storage {
             if !or_replace {
                 return Err(sql_err!(
                     sqlstate::DUPLICATE_OBJECT,
-                    "rule \"{}\" for relation already exists",
-                    definition.name.as_str()
+                    "rule \"{}\" for relation \"{}\" already exists",
+                    definition.name.as_str(),
+                    target_name.as_str()
                 ));
             }
             let prior = catalog.rules[slot].pending;
@@ -55140,6 +55770,14 @@ impl Storage {
                 let view = self.view(usize::from(slot));
                 view.names_for(txid)
             }
+        }
+    }
+
+    /// The relation name PostgreSQL's duplicate-trigger errors print.
+    pub(crate) fn trigger_target_name(&self, target: TriggerTarget, txid: u32) -> SqlName {
+        match target {
+            TriggerTarget::Table(slot) => self.table_def(usize::from(slot), txid).name,
+            TriggerTarget::View(slot) => self.view(usize::from(slot)).names_for(txid).1,
         }
     }
 
@@ -55970,7 +56608,8 @@ impl Storage {
         }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_FUNCTION,
-                "operator already exists with the same argument types"
+                "operator {} already exists",
+                definition.name.as_str()
             ));
         }
         if let Some(owner) = catalog.operators.iter().find_map(|candidate| {
@@ -56051,7 +56690,8 @@ impl Storage {
         {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_FUNCTION,
-                "operator already exists with the same argument types"
+                "operator {} already exists",
+                definition.name.as_str()
             ));
         }
         let slot = identity.slot();
@@ -56120,7 +56760,8 @@ impl Storage {
         {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_FUNCTION,
-                "operator already exists with the same argument types"
+                "operator {} already exists",
+                definition.name.as_str()
             ));
         }
         if let Some(owner) = catalog

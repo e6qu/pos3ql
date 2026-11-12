@@ -279,10 +279,25 @@ pub fn build_shaped<'a>(
     if items.len() != shape.element_count() {
         return Err(invalid_shape());
     }
+    // A named composite enters an array in its durable text form, which only
+    // the catalog can produce; the element's caller must normalize it first.
+    if items
+        .iter()
+        .any(|item| matches!(item, Datum::Composite { .. }))
+    {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "named composite array element was not normalized by the catalog"
+        ));
+    }
     let header = PREFIX + shape.dimension_count() * 6;
     let mut total = header;
+    // A record array's elements use the projected encoding, which keeps each
+    // record's structure; its NULL elements share that encoding.
+    let records = items.iter().any(|item| matches!(item, Datum::Record(_)));
+    let projected = |item: &Datum| matches!(item, Datum::Record(_)) || records && item.is_null();
     for item in items {
-        let length = if matches!(item, Datum::Record(_)) {
+        let length = if projected(item) {
             2 + crate::sql::exec::projected_value_len(item)?
         } else {
             rowenc::encoded_len(core::slice::from_ref(item))
@@ -302,7 +317,7 @@ pub fn build_shaped<'a>(
         at += 6;
     }
     for item in items {
-        let record = matches!(item, Datum::Record(_));
+        let record = projected(item);
         let length = if record {
             2 + crate::sql::exec::projected_value_len(item)?
         } else {
@@ -434,10 +449,9 @@ pub fn get<'a>(raw: &'a [u8], element: ArrElem, index: usize) -> Option<Datum<'a
         at += 4;
         if current == index {
             if element == ArrElem::Record {
-                return Some(crate::sql::exec::decode_projected_pub(
-                    raw.get(at..at + length)?,
-                    0,
-                ));
+                return Some(
+                    record_element(raw.get(at..at + length)?).map_or(Datum::Null, |v| v.datum()),
+                );
             }
             let mut out = [Datum::Null; 1];
             rowenc::decode(raw.get(at..at + length)?, &schema, &mut out).ok()?;
@@ -456,6 +470,35 @@ pub fn get<'a>(raw: &'a [u8], element: ArrElem, index: usize) -> Option<Datum<'a
 pub struct Elements<'a> {
     payloads: ElementPayloads<'a>,
     element: ArrElem,
+}
+
+/// One record array element's encoded value, `None` for NULL. Elements use
+/// the projected encoding; an array built from NULLs alone holds row-codec
+/// NULLs, the only payload whose single tag position reads 1 (a record's tag
+/// never does).
+pub(crate) fn record_element(payload: &[u8]) -> Option<crate::sql::exec::ProjectedValue<'_>> {
+    let value = crate::sql::exec::ProjectedValue::column(payload, 0);
+    (payload.get(2) != Some(&1) && !value.is_null()).then_some(value)
+}
+
+/// Walks an array's elements like [`elements`], but rebuilds record
+/// elements with their fields (arena-allocated) instead of their rendered
+/// text, for consumers that compare or access fields.
+pub(crate) fn structured_elements<'a>(
+    raw: &'a [u8],
+    element: ArrElem,
+    arena: &'a Arena,
+) -> impl Iterator<Item = Result<Datum<'a>, SqlError>> + 'a {
+    let records = element == ArrElem::Record;
+    element_payloads(raw)
+        .zip(elements(raw, element))
+        .map(move |(payload, value)| {
+            if records && record_element(payload).is_some() {
+                crate::sql::exec::decode_projected_col_record(payload, 0, arena)
+            } else {
+                Ok(value)
+            }
+        })
 }
 
 pub fn elements(raw: &[u8], element: ArrElem) -> Elements<'_> {
@@ -510,7 +553,7 @@ impl<'a> Iterator for Elements<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let payload = self.payloads.next()?;
         if self.element == ArrElem::Record {
-            return Some(crate::sql::exec::decode_projected_pub(payload, 0));
+            return Some(record_element(payload).map_or(Datum::Null, |v| v.datum()));
         }
         let schema = [self.element.to_coltype()];
         let mut out = [Datum::Null; 1];

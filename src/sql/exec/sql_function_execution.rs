@@ -37,6 +37,18 @@ struct SqlSource {
     /// is a single plain `SELECT` of one expression into its caller, which
     /// then reports no context line for it.
     inlinable: bool,
+    /// PostgreSQL's planner runs an IMMUTABLE function called with constant
+    /// arguments instead of inlining it.
+    planned_with_constants: bool,
+}
+
+impl SqlSource {
+    fn inlining(
+        &self,
+        program: &query::RoutineFunctionProgram<'_>,
+    ) -> crate::sql::error_context::SqlFunctionInlining {
+        choose_inlining(self.planned_with_constants, self.inlinable, program)
+    }
 }
 
 struct ParsedSource<'a> {
@@ -295,6 +307,53 @@ impl SqlResult {
 /// Whether PostgreSQL's `inline_function` would replace a call of this body
 /// by its expression: one `SELECT` of one expression with no other clause,
 /// subquery or set-returning call.
+/// Whether PostgreSQL's planner may inline a call of `routine`, by its
+/// declaration alone.
+fn inlinable_declaration(routine: &crate::storage::RoutineDef) -> bool {
+    !routine.attributes.security_definer
+        && !routine.attributes.strict
+        && routine.config_count == 0
+        && !routine.kind.is_set_returning()
+        && routine.kind.function_result() != Some(ColType::Record)
+}
+
+/// How PostgreSQL's planner treats a call of a SQL-language function, which
+/// decides its error context: an IMMUTABLE function called with constant
+/// arguments runs at plan time, a body of one plain expression is inlined,
+/// and any other body runs as its own statements. A folded body's errors are
+/// raised in planning, so a call that runs is never `during inlining`.
+pub(crate) fn sql_function_inlining(
+    routine: &crate::storage::RoutineDef,
+    program: &query::RoutineFunctionProgram<'_>,
+    constant_arguments: bool,
+) -> crate::sql::error_context::SqlFunctionInlining {
+    choose_inlining(
+        planned_with_constants(routine, constant_arguments),
+        inlinable_declaration(routine),
+        program,
+    )
+}
+
+fn planned_with_constants(routine: &crate::storage::RoutineDef, constant_arguments: bool) -> bool {
+    constant_arguments
+        && routine.attributes.volatility == crate::storage::RoutineVolatility::Immutable
+}
+
+fn choose_inlining(
+    planned_with_constants: bool,
+    inlinable: bool,
+    program: &query::RoutineFunctionProgram<'_>,
+) -> crate::sql::error_context::SqlFunctionInlining {
+    use crate::sql::error_context::SqlFunctionInlining;
+    // A body that fails while folded with constants fails in planning; one
+    // that runs here was inlined and its errors carry no frame.
+    if planned_with_constants || !inlinable || !inlined_by_postgresql(program) {
+        SqlFunctionInlining::Executed
+    } else {
+        SqlFunctionInlining::Inlined
+    }
+}
+
 fn inlined_by_postgresql(program: &query::RoutineFunctionProgram<'_>) -> bool {
     let query::RoutineFunctionResult::Query(query::RoutineQuery::Select(select)) = program.result
     else {
@@ -472,21 +531,22 @@ impl SqlExecution {
         arguments: &'a [Datum<'a>],
         context: &mut TriggerExecContext<'_, 'a, '_>,
     ) -> Result<FunctionOutput<'a>, SqlError> {
+        // The body's writes hand it their AFTER work, so those triggers run
+        // on the engine whether or not this call is kept across a wait.
         let prior = context.txn.write_completion_boundary;
-        if self.policy == query::RoutineExecution::Retained {
-            context.txn.write_completion_boundary =
-                Some(super::super::txn::WriteCompletionBoundary {
-                    mark: self.boundary,
-                    command: context.txn.command_id(),
-                    depth: context.txn.trigger_depth(),
-                });
-        }
+        context.txn.write_completion_boundary = Some(super::super::txn::WriteCompletionBoundary {
+            mark: self.boundary,
+            command: context.txn.command_id(),
+            depth: context.txn.trigger_depth(),
+            retained: self.policy == query::RoutineExecution::Retained,
+        });
         let name = self.source.name;
+        let inlining = self.source.inlining(&parsed.program);
         let frame = crate::sql::error_context::SqlFunctionFrame {
             name: name.as_str(),
             body: parsed.text,
             statement: core::cell::Cell::new(0),
-            inlined: self.source.inlinable && inlined_by_postgresql(&parsed.program),
+            inlining,
         };
         let result = crate::sql::error_context::within(&frame, || {
             crate::sql::error_position::with_internal_source(parsed.text, || {
@@ -633,6 +693,29 @@ impl SqlExecution {
         context: &mut TriggerExecContext<'_, 'a, '_>,
         capture: bool,
     ) -> Result<(), SqlError> {
+        // Data-modifying WITH queries run before the query that reads them,
+        // under the statement's snapshot, as in a top-level query. A query
+        // resuming after a wait continues from its saved state; its WITH
+        // writes already ran and must not run again.
+        if let query::RoutineQuery::Select(select) = query
+            && select.with.iter().any(|cte| cte.dml.is_some())
+            && self.pending_query.is_none()
+        {
+            let params = core::mem::replace(&mut context.params, arguments);
+            let bound = super::bind_plpgsql_dml_ctes(context, select, &super::NoColumns);
+            context.params = params;
+            let (bound, written) = bound?;
+            self.query(
+                &query::RoutineQuery::Select(bound),
+                arguments,
+                context,
+                capture,
+            )?;
+            let params = core::mem::replace(&mut context.params, arguments);
+            let finished = super::finish_plpgsql_dml_ctes(context, select, written);
+            context.params = params;
+            return finished;
+        }
         let arena = context.arena;
         let txid = context.txn.txid;
         let PlpgsqlExecHost::Routine {
@@ -771,6 +854,7 @@ impl SqlExecution {
             .unwrap_or_else(|| query::RoutineInvocationState::new(owner, self.policy));
         calls.require_arena(owner)?;
         let replay = sequence::begin_replay_cursor()?;
+        let mut progress = super::RowProgress::new(context.storage())?;
         let result = loop {
             sequence::rewind_replay_cursor(replay)?;
             calls.begin_attempt();
@@ -802,7 +886,8 @@ impl SqlExecution {
                     break Err(error);
                 }
             }
-            if capture {
+            // Rows a resumed write keeps also keep their returned values.
+            if capture && !progress.resuming() {
                 self.result.clear();
             }
             let shape = query::RoutineResultShape::from_contract(
@@ -816,18 +901,15 @@ impl SqlExecution {
                 let PlpgsqlExecHost::Routine { engine, .. } = &context.host else {
                     return Err(changed());
                 };
-                context.txn.statement_mark(
+                let (wal, lock) = (
                     engine.wal.stage_mark(context.txn.txid),
                     engine.storage.lock_mark(),
-                )
+                );
+                progress.begin_attempt(wal, lock);
+                context.txn.statement_mark(wal, lock)
             };
-            let before = context.txn.transaction_effect_mark();
-            let descriptors = context.txn.statement_large_object_descriptors(arena)?;
-            let advisory = context.storage().advisory_statement_mark();
-            let settings = match &context.host {
-                PlpgsqlExecHost::Routine { guc, .. } => guc.statement_settings(),
-                _ => return Err(changed()),
-            };
+            let effects = super::write_attempts::WriteAttemptEffects::capture(context)?
+                .ok_or_else(changed)?;
             let outcome = query::with_routine_invocation_scope(
                 Some(query::RoutineInvocationContext::new(&calls, owner)),
                 || {
@@ -862,6 +944,7 @@ impl SqlExecution {
                             None,
                             Some(&mut capture_rows),
                             &mut self.pending_write,
+                            Some(&mut progress),
                         )
                     } else {
                         let output_mark = context.responder.mark();
@@ -900,17 +983,7 @@ impl SqlExecution {
                     }
                 },
             );
-            let changed_effects = context.txn.transaction_effect_mark() != before
-                || !context
-                    .txn
-                    .matches_statement_large_object_descriptors(descriptors)
-                || context.storage().advisory_statement_mark() != advisory
-                || match &context.host {
-                    PlpgsqlExecHost::Routine { guc, .. } => {
-                        !guc.matches_statement_settings(&settings)
-                    }
-                    _ => true,
-                };
+            let changed_effects = effects.changed(context);
             match outcome {
                 Ok(_) => break Ok(()),
                 Err(error) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION => {
@@ -922,11 +995,15 @@ impl SqlExecution {
                         }
                         break result;
                     }
-                    if changed_effects {
-                        break Err(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "SQL row expression requires retained write progress"
-                        ));
+                    let unfinished = match progress.unfinished_row(context.txn) {
+                        Ok(unfinished) => unfinished,
+                        Err(error) => break Err(error),
+                    };
+                    if unfinished.is_none()
+                        && changed_effects
+                        && !calls.pending_firing_started_at(effects.transaction)
+                    {
+                        break Err(progress.progress_required());
                     }
                     let PlpgsqlExecHost::Routine {
                         engine,
@@ -938,7 +1015,11 @@ impl SqlExecution {
                     else {
                         return Err(changed());
                     };
-                    engine.rollback_waiting_statement(context.txn, mark);
+                    // Kept rows stay changed; only the unfinished row is undone.
+                    engine.rollback_waiting_statement(
+                        context.txn,
+                        unfinished.map_or(mark, |row| row.mark),
+                    );
                     let pending = calls.take_pending().ok_or_else(|| {
                         sql_err!(
                             sqlstate::INTERNAL_ERROR,
@@ -962,11 +1043,11 @@ impl SqlExecution {
                         break Err(error);
                     }
                 }
-                Err(error) if changed_effects && control_flow::is_execution_wait(&error) => {
-                    break Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "SQL row expression requires retained write progress"
-                    ));
+                Err(error)
+                    if (changed_effects || progress.changed_rows())
+                        && control_flow::is_execution_wait(&error) =>
+                {
+                    break Err(super::write_attempts::retained_progress_required());
                 }
                 Err(error) => break Err(error),
             }
@@ -1000,6 +1081,7 @@ pub(in crate::sql) fn execute_sql_function<'a>(
     environment: &CallEnvironment,
     policy: query::RoutineExecution,
     suspended: &mut Option<SuspendedFunction>,
+    constant_arguments: bool,
 ) -> Result<FunctionOutput<'a>, SqlError> {
     let controls = &engine.storage.execution_control;
     let rows = &engine.storage.row_work;
@@ -1123,11 +1205,8 @@ pub(in crate::sql) fn execute_sql_function<'a>(
                 owner: body_inputs.owner,
                 input_source: body_inputs.source,
                 stored,
-                inlinable: !routine.attributes.security_definer
-                    && !routine.attributes.strict
-                    && routine.config_count == 0
-                    && !routine.kind.is_set_returning()
-                    && routine.kind.function_result() != Some(ColType::Record),
+                inlinable: inlinable_declaration(routine),
+                planned_with_constants: planned_with_constants(routine, constant_arguments),
             },
             arguments,
             result,

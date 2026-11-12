@@ -176,7 +176,7 @@ impl ParameterInference<'_> {
         };
         let resolver = scope.as_ref().map(|scope| query::CatalogScopeCols {
             scope,
-            outer_scope: None,
+            outer: None,
             storage: self.storage,
             txid,
             arena: self.arena,
@@ -197,7 +197,7 @@ impl ParameterInference<'_> {
             match item {
                 ast::SelectItem::Expr { expression, .. }
                 | ast::SelectItem::RecordStar(expression) => visit(expression),
-                ast::SelectItem::Wildcard | ast::SelectItem::TableWildcard(_) => {}
+                ast::SelectItem::Wildcard(_) | ast::SelectItem::TableWildcard(_) => {}
             }
         }
         if let Some(from) = select.from {
@@ -228,14 +228,21 @@ impl ParameterInference<'_> {
         oids: &mut [i32],
         infer: &impl Fn(&Expr<'a>) -> Option<i32>,
     ) {
+        // `"any"` marks a parameter first reached, still untyped, by a
+        // position imposing no type. PostgreSQL then rejects it even when a
+        // later use would type it (`pg_typeof($1), $1 + 1`).
         let assign = |expression: &Expr, type_oid: i32, oids: &mut [i32]| {
             if let Expr::Param(index) = expression
                 && *index >= 1
                 && (*index as usize) <= oids.len()
             {
-                // Another position's concrete type wins over a pseudo-type.
+                // The first use decides: a parameter that first reaches a
+                // pseudo-type position stays undetermined, as PostgreSQL's
+                // left-to-right analysis leaves it.
                 let slot = &mut oids[*index as usize - 1];
-                if !accepts_any_type(type_oid) || *slot == types::oid::UNKNOWN {
+                if !accepts_any_type(*slot)
+                    && (!accepts_any_type(type_oid) || *slot == types::oid::UNKNOWN)
+                {
                     *slot = type_oid;
                 }
             }
@@ -324,6 +331,7 @@ impl ParameterInference<'_> {
                     assign(operand, type_oid, oids);
                 }
             }
+            Expr::IsNull { operand, .. } => assign(operand, types::oid::ANY, oids),
             Expr::Like {
                 operand, pattern, ..
             }

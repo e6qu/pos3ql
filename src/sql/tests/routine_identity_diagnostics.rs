@@ -55,7 +55,10 @@ pub(super) type Expected = (char, &'static str, &'static str);
 
 /// Expected PostgreSQL 18.6 diagnostics, captured from a reference server.
 pub(super) fn check(cases: &[(&str, &[Expected])]) {
-    let config = test_config("routine-identity-diagnostics");
+    // Tests run this concurrently; each engine needs its own data directory.
+    static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let run = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let config = test_config(&format!("routine-identity-diagnostics-{run}"));
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
@@ -488,13 +491,8 @@ fn built_in_routine_targets_follow_postgresql() {
                 "built-in function lower(text) cannot be changed",
             )],
         ),
-        (
-            "ALTER FUNCTION lower(text) CALLED ON NULL INPUT",
-            &[(
-                'E',
-                "0A000",
-                "STRICT, SECURITY and SET of built-in function lower(text) cannot be changed",
-            )],
-        ),
+        ("ALTER FUNCTION lower(text) CALLED ON NULL INPUT", NONE),
+        ("ALTER FUNCTION lower(text) SET search_path = public", NONE),
+        ("ALTER FUNCTION lower(text) RESET ALL", NONE),
     ]);
 }

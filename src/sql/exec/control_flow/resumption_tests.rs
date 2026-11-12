@@ -89,7 +89,12 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
             .unwrap();
             let invocation = crate::sql::type_input_plans::with_owner(
                 crate::sql::type_input_plans::Owner::Backend,
-                || TriggerInvocation::anonymous(crate::sql::guc::VariableConflict::Error),
+                || {
+                    TriggerInvocation::anonymous(crate::sql::guc::PlpgsqlSettings {
+                        variable_conflict: crate::sql::guc::VariableConflict::Error,
+                        print_strict_params: false,
+                    })
+                },
             )
             .unwrap()
             .with_input_sites(program.input_sites);
@@ -190,11 +195,16 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                 assert_eq!(command.trigger_depth(), 1);
                 assert_eq!(command.command_id(), nested_command);
                 assert_eq!(storage.read_snapshot(), crate::storage::SNAPSHOT_ALL);
-                let (program, code) = saved.source().parse(&resumed).unwrap();
+                let (program, code) = saved.source().parse(&resumed, None).unwrap();
                 let mut execution = saved.restore(&resumed, &code).ok().unwrap();
                 let invocation = crate::sql::type_input_plans::with_owner(
                     crate::sql::type_input_plans::Owner::Backend,
-                    || TriggerInvocation::anonymous(crate::sql::guc::VariableConflict::Error),
+                    || {
+                        TriggerInvocation::anonymous(crate::sql::guc::PlpgsqlSettings {
+                            variable_conflict: crate::sql::guc::VariableConflict::Error,
+                            print_strict_params: false,
+                        })
+                    },
                 )
                 .unwrap()
                 .with_input_sites(program.input_sites);

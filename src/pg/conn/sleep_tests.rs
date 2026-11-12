@@ -47,7 +47,7 @@ fn connection(fixture: &mut Fixture, id: i32) -> (Conn, TcpStream) {
     let mut conn = Conn::new(&fixture.config, &mut fixture.budget).unwrap();
     conn.open(server, id).unwrap();
     conn.auth_database = fixture.engine.database_login("postgres");
-    conn.phase = Phase::Ready;
+    conn.enter_ready_for_tests(&fixture.engine);
     (conn, client)
 }
 
@@ -283,4 +283,46 @@ fn statement_timeout_and_cancellation_end_a_sleep() {
         "SELECT 1",
     );
     assert_eq!(rows(&received(&mut sleeper, &mut sleeper_client)), ["1"]);
+}
+
+/// A parked statement resumes in its own database even after the worker
+/// served a session connected to another database meanwhile.
+#[test]
+fn parked_statement_resumes_in_its_own_database() {
+    let mut fixture = fixture("database");
+    let (mut admin, mut admin_client) = connection(&mut fixture, 1);
+    send(
+        &mut admin,
+        &mut fixture.engine,
+        &mut admin_client,
+        "CREATE DATABASE sleep_elsewhere",
+    );
+    assert!(sqlstates(&received(&mut admin, &mut admin_client)).is_empty());
+    let (mut sleeper, mut sleeper_client) = connection(&mut fixture, 2);
+    sleeper.auth_database = fixture.engine.database_login("sleep_elsewhere");
+    send(
+        &mut sleeper,
+        &mut fixture.engine,
+        &mut sleeper_client,
+        "SELECT pg_sleep(0.1), current_database()",
+    );
+    assert_eq!(
+        sleeper.parked_wait(),
+        Some(crate::sql::StatementWait::Timer)
+    );
+    send(
+        &mut admin,
+        &mut fixture.engine,
+        &mut admin_client,
+        "SELECT current_database()",
+    );
+    assert_eq!(rows(&received(&mut admin, &mut admin_client)), ["postgres"]);
+    while sleeper.parked_wait().is_some() {
+        std::thread::sleep(sleeper.parked_wait_remaining().unwrap());
+        retry(&mut sleeper, &mut fixture.engine);
+    }
+    assert_eq!(
+        rows(&received(&mut sleeper, &mut sleeper_client)),
+        ["|sleep_elsewhere"]
+    );
 }

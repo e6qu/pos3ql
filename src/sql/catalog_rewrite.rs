@@ -86,6 +86,43 @@ fn rule_row<'a>(
     )
 }
 
+/// A materialized view's `_RETURN` rule: unconditional, `INSTEAD`, with the
+/// view's query as its one action. Like PostgreSQL, it cannot be disabled or
+/// dropped on its own.
+fn matview_rule_row<'a>(
+    storage: &Storage,
+    matview: crate::storage::MatviewDef,
+    bodies: bool,
+    arena: &'a Arena,
+) -> Result<&'a [Datum<'a>], SqlError> {
+    let body = if bodies {
+        let values = arena
+            .alloc_slice_with(2, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        values[1] = super::text(matview.sql.as_str(), arena)?;
+        Datum::Array {
+            element: crate::sql::types::ArrElem::Text,
+            raw: crate::sql::array::build(values, arena)?,
+        }
+    } else {
+        Datum::Null
+    };
+    super::row(
+        &[
+            Datum::Oid(matview.rule_oid() as u32),
+            super::text("_RETURN", arena)?,
+            Datum::Oid(super::user_table_oid(storage, usize::from(matview.backing_table)) as u32),
+            Datum::Char(crate::storage::RewriteEvent::Select.catalog_code()),
+            Datum::Char(b'O'),
+            Datum::Bool(true),
+            Datum::Oid(2618),
+            Datum::Null,
+            body,
+        ][..if bodies { 9 } else { PUBLIC_COLUMNS }],
+        arena,
+    )
+}
+
 pub(super) fn current<'a>(
     storage: &Storage,
     transaction: u32,
@@ -96,9 +133,19 @@ pub(super) fn current<'a>(
     let hidden = if bodies { PRIVATE_COLUMNS } else { &[] };
     let (definition, hidden_columns) =
         super::materialize_with_hidden(super::schema::require("pg_rewrite", false), hidden, arena)?;
-    let output = super::catalog_rows(arena, storage.rules_visible_to(transaction).count())?;
+    let rules = storage.rules_visible_to(transaction).count();
+    let output = super::catalog_rows(
+        arena,
+        rules + storage.matviews_visible_to(transaction).count(),
+    )?;
     for (target, (_, rule)) in output.iter_mut().zip(storage.rules_visible_to(transaction)) {
         *target = rule_row(storage, rule, transaction, bodies, arena)?;
+    }
+    for (target, (_, matview)) in output[rules..]
+        .iter_mut()
+        .zip(storage.matviews_visible_to(transaction))
+    {
+        *target = matview_rule_row(storage, matview, bodies, arena)?;
     }
     Ok(SynthTable {
         def: definition,
@@ -143,6 +190,9 @@ fn selected_rule<'a>(
     arena: &'a Arena,
 ) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
     let current_row = |at| {
+        if let Some(slot) = storage.matview_slot_by_rule_oid(oid, at) {
+            return matview_rule_row(storage, storage.matview_for(slot, at), true, arena).map(Some);
+        }
         storage
             .rule_slot_by_oid(oid, at)
             .map(|slot| rule_row(storage, storage.rule(slot), at, true, arena))
@@ -321,6 +371,40 @@ pub(super) fn rule_definition<'a>(
             ));
         }
     };
+    // A view's `_RETURN` action is its query, printed as `pg_get_viewdef`
+    // prints it (with its leading space, hence PostgreSQL's `INSTEAD  SELECT`).
+    if name == "_RETURN" && event == "SELECT" {
+        let mut target = StackStr::<264>::new();
+        if !unqualified {
+            super::write_identifier(&mut target, schema.as_str());
+            let _ = target.write_char('.');
+        }
+        super::write_identifier(&mut target, relation.as_str());
+        let query = super::view_def_text_pretty(
+            storage,
+            transaction,
+            relation_oid,
+            super::deparse::ViewLayout {
+                pretty,
+                wrap_column: 0,
+            },
+            arena,
+        )?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "cache lookup failed for relation {}",
+                relation_oid
+            )
+        })?;
+        return arena
+            .alloc_str_display(format_args!(
+                "CREATE RULE \"_RETURN\" AS\n    ON SELECT TO {} DO INSTEAD {query}",
+                target.as_str()
+            ))
+            .map(Some)
+            .map_err(|_| arena_full());
+    }
     let Datum::Array { raw, element } = values[RULE_BODY] else {
         return Err(sql_err!(
             sqlstate::INTERNAL_ERROR,

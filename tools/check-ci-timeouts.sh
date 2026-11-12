@@ -27,7 +27,7 @@ fi
 # Instrumented library tests include a cold release build and must retain
 # enough explicit workers to fit beneath the fixed 15-minute ceiling.
 coverage_matrix=.github/workflows/coverage.yml
-for coverage_partition in 0-of-4 1-of-4 2-of-4 3-of-4; do
+for coverage_partition in 0-of-6 1-of-6 2-of-6 3-of-6 4-of-6 5-of-6; do
     if ! grep -Fq -- "lib:$coverage_partition" "$coverage_matrix"; then
         printf 'CI timeout guard: missing coverage library partition %s\n' "$coverage_partition" >&2
         failed=1
@@ -45,7 +45,9 @@ for spill_entry in \
     '- { name: d, corpus_shard: "3-of-6", auxiliary: none }' \
     '- { name: e, corpus_shard: "4-of-6", auxiliary: none }' \
     '- { name: f, corpus_shard: "5-of-6", auxiliary: none }' \
-    '- { name: exact, corpus_shard: "none", auxiliary: exact }' \
+    '- { name: exact-a, corpus_shard: "none", auxiliary: exact, exact_shard: "0", exact_shards: "3" }' \
+    '- { name: exact-b, corpus_shard: "none", auxiliary: exact, exact_shard: "1", exact_shards: "3" }' \
+    '- { name: exact-c, corpus_shard: "none", auxiliary: exact, exact_shard: "2", exact_shards: "3" }' \
     '- { name: copy, corpus_shard: "none", auxiliary: copy }' \
     '- { name: types, corpus_shard: "none", auxiliary: types }' \
     '- { name: grouping, corpus_shard: "none", auxiliary: grouping }' \
@@ -101,7 +103,9 @@ for reference_entry in \
     '- { name: corpus-d, corpus_shard: "3-of-6", auxiliary: none }' \
     '- { name: corpus-e, corpus_shard: "4-of-6", auxiliary: none }' \
     '- { name: corpus-f, corpus_shard: "5-of-6", auxiliary: none }' \
-    '- { name: auxiliary-exact, corpus_shard: "none", auxiliary: exact }' \
+    '- { name: auxiliary-exact-a, corpus_shard: "none", auxiliary: exact, exact_shard: "0", exact_shards: "3" }' \
+    '- { name: auxiliary-exact-b, corpus_shard: "none", auxiliary: exact, exact_shard: "1", exact_shards: "3" }' \
+    '- { name: auxiliary-exact-c, corpus_shard: "none", auxiliary: exact, exact_shard: "2", exact_shards: "3" }' \
     '- { name: auxiliary-copy, corpus_shard: "none", auxiliary: copy }' \
     '- { name: auxiliary-types, corpus_shard: "none", auxiliary: types }' \
     '- { name: auxiliary-grouping, corpus_shard: "none", auxiliary: grouping, grouping_timeout: "300" }' \
@@ -123,6 +127,11 @@ for reference_entry in \
     fi
 done
 
+if (( $(grep -Fc -- "POS3QL_EXACT_SHARDS: \${{ matrix.exact_shards || '1' }}" "$reference_matrix") != 2 )); then
+    printf '%s\n' 'CI timeout guard: instrumented exact-error corpora must pass their file slices' >&2
+    failed=1
+fi
+
 if ! grep -Fq -- 'POS3QL_POSTGRES_REGRESS_SHARDS: "4"' "$reference_matrix"; then
     printf '%s\n' 'CI timeout guard: instrumented PostgreSQL regression inputs must retain four file slices' >&2
     failed=1
@@ -131,7 +140,8 @@ fi
 # PostgreSQL-width unit fixtures no longer fit behind build and lint in one
 # worker. Keep the complete library suite split across explicit partitions.
 ci_workflow=.github/workflows/ci.yml
-for test_partition in 0-of-8 1-of-8 2-of-8 3-of-8 4-of-8 5-of-8 6-of-8 7-of-8; do
+for test_partition in 0-of-12 1-of-12 2-of-12 3-of-12 4-of-12 5-of-12 \
+    6-of-12 7-of-12 8-of-12 9-of-12 10-of-12 11-of-12; do
     if ! grep -Fq -- "$test_partition" "$ci_workflow"; then
         printf 'CI timeout guard: missing library test partition %s\n' "$test_partition" >&2
         failed=1

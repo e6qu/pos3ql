@@ -88,6 +88,7 @@ write_credentials "$POS3QL_CREDENTIALS_FILE" "$S3_TEST_ACCESS_KEY" "$S3_TEST_SEC
 # a complete run of what it selects.
 #   proto      psql golden files, protocol versions, raw wire probes,
 #              the psycopg driver suite and the \copy round trip
+#   streams    stalled result clients in object-store mode
 #   dur        durability cycles on the main server: kill -9 recovery,
 #              durable WAL rebuild, commit-durable-on-bucket, cold start
 #   overlay    row-map pressure: 5000 rows through a 1024-entry map, plus
@@ -437,19 +438,6 @@ else
   tail -120 "$WORK/server-wire.log"
 fi
 
-step "stalled result clients do not stall other sessions (object-store mode)"
-restart_main_server result-streams
-ensure_psycopg_venv || exit 1
-if "$VENV/bin/python" "$EXT/result_streams.py" --host 127.0.0.1 --p3 "$PG_PORT" \
-    --storage-mode object-store \
-    > "$WORK/result_streams.out" 2>&1; then
-  ok "stalled result clients"
-else
-  bad "stalled result clients"
-  cat "$WORK/result_streams.out"
-  tail -120 "$WORK/server-result-streams.log"
-fi
-
 step "driver test (psycopg 3, extended protocol with binary parameters)"
 restart_main_server psycopg
 ensure_psycopg_venv || exit 1
@@ -482,9 +470,26 @@ out=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A \
 
 fi # proto
 
+if want streams; then
+
+step "stalled result clients do not stall other sessions (object-store mode)"
+restart_main_server result-streams
+ensure_psycopg_venv || exit 1
+if "$VENV/bin/python" "$EXT/result_streams.py" --host 127.0.0.1 --p3 "$PG_PORT" \
+    --storage-mode object-store \
+    > "$WORK/result_streams.out" 2>&1; then
+  ok "stalled result clients"
+else
+  bad "stalled result clients"
+  cat "$WORK/result_streams.out"
+  tail -120 "$WORK/server-result-streams.log"
+fi
+
+fi # streams
+
 if want dur; then
 
-if want proto; then
+if want proto || want streams; then
   step "isolate durability fixtures"
   stop_pos3ql "$SERVER_PID"
   rm -rf "$WORK/data"

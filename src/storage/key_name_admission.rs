@@ -37,6 +37,13 @@ fn constraint_named<B: DefinitionBacking>(definition: &TableDefinition<B>, name:
             .is_some_and(|key| key.name == name)
 }
 
+impl<B: DefinitionBacking> TableDefinition<B> {
+    /// Whether any constraint of this table, of any kind, has `name`.
+    pub(crate) fn has_constraint_named(&self, name: &str) -> bool {
+        SqlName::parse(name).is_ok_and(|name| constraint_named(self, name))
+    }
+}
+
 fn implicit_relation_named<B: DefinitionBacking>(
     definition: &TableDefinition<B>,
     name: SqlName,

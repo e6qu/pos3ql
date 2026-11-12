@@ -501,6 +501,7 @@ pub(crate) fn check_domain_constraints(
 /// 23505 for the key `columns` of `values`, with PostgreSQL's detail and
 /// the constraint's table.
 fn unique_violation(
+    duplicate: DuplicateKey,
     name: SqlName,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     columns: &[u16],
@@ -510,16 +511,28 @@ fn unique_violation(
         .iter()
         .map(|column| def.columns()[*column as usize].name.as_str());
     let keys = columns.iter().map(|column| values[*column as usize]);
-    described_unique_violation(name, def, &mut { names }, &mut { keys })
+    duplicate_key_error(duplicate, name, def, &mut { names }, &mut { keys })
 }
 
-fn described_unique_violation<'v>(
+/// Whether a duplicate key meets a written row or an index being built.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DuplicateKey {
+    Write,
+    IndexBuild,
+}
+
+fn duplicate_key_error<'v>(
+    duplicate: DuplicateKey,
     name: SqlName,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     names: &mut dyn Iterator<Item = &str>,
     keys: &mut dyn Iterator<Item = Datum<'v>>,
 ) -> SqlError {
-    let detail = match key_detail(names, keys, format_args!(" already exists.")) {
+    let suffix = match duplicate {
+        DuplicateKey::Write => format_args!(" already exists."),
+        DuplicateKey::IndexBuild => format_args!(" is duplicated."),
+    };
+    let detail = match key_detail(names, keys, suffix) {
         Ok(detail) => detail,
         Err(error) => return error,
     };
@@ -531,11 +544,18 @@ fn described_unique_violation<'v>(
             name.as_str(),
         ),
     );
-    sql_err!(
-        sqlstate::UNIQUE_VIOLATION,
-        "duplicate key value violates unique constraint \"{}\"",
-        name.as_str()
-    )
+    match duplicate {
+        DuplicateKey::Write => sql_err!(
+            sqlstate::UNIQUE_VIOLATION,
+            "duplicate key value violates unique constraint \"{}\"",
+            name.as_str()
+        ),
+        DuplicateKey::IndexBuild => sql_err!(
+            sqlstate::UNIQUE_VIOLATION,
+            "could not create unique index \"{}\"",
+            name.as_str()
+        ),
+    }
 }
 
 /// Whether the row `rowid`'s committed key equals `values` under this index's
@@ -848,6 +868,7 @@ fn enforce_expression_index_uniqueness<'a>(
     nulls_not_distinct: bool,
     name: SqlName,
     predicate: Option<&'a Expr<'a>>,
+    duplicate: DuplicateKey,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     let decoder =
@@ -866,7 +887,7 @@ fn enforce_expression_index_uniqueness<'a>(
             expression_texts[position].unwrap_or(def.columns()[*column as usize].name.as_str())
         });
         let values = keys[..columns.len()].iter().copied();
-        described_unique_violation(name, def, &mut { names }, &mut { values })
+        duplicate_key_error(duplicate, name, def, &mut { names }, &mut { values })
     };
     let matches = |other: &[Datum]| -> Result<bool, SqlError> {
         if let Some(predicate) = predicate
@@ -956,6 +977,7 @@ fn enforce_key_uniqueness(
     columns: &[u16],
     nulls_not_distinct: bool,
     name: SqlName,
+    duplicate: DuplicateKey,
     source: UniqueKeySource,
 ) -> Result<(), SqlError> {
     if !nulls_not_distinct && columns.iter().any(|&c| values[c as usize].is_null()) {
@@ -973,6 +995,7 @@ fn enforce_key_uniqueness(
             txid,
             def,
             name,
+            duplicate,
         )?;
         return pending_scan_uniqueness(
             storage,
@@ -985,6 +1008,7 @@ fn enforce_key_uniqueness(
             txid,
             def,
             name,
+            duplicate,
         );
     }
     if storage.has_pending_table_def(table_index, txid) {
@@ -1000,6 +1024,7 @@ fn enforce_key_uniqueness(
                 txid,
                 def,
                 name,
+                duplicate,
             )?;
         }
         return pending_scan_uniqueness(
@@ -1013,6 +1038,7 @@ fn enforce_key_uniqueness(
             txid,
             def,
             name,
+            duplicate,
         );
     }
 
@@ -1073,7 +1099,9 @@ fn enforce_key_uniqueness(
                     ),
                 };
                 match matched {
-                    Ok(true) => result = Err(unique_violation(name, def, columns, values)),
+                    Ok(true) => {
+                        result = Err(unique_violation(duplicate, name, def, columns, values))
+                    }
                     Ok(false) => {}
                     Err(e) => result = Err(e),
                 }
@@ -1094,6 +1122,7 @@ fn enforce_key_uniqueness(
             txid,
             def,
             name,
+            duplicate,
         )?;
     }
     pending_scan_uniqueness(
@@ -1107,6 +1136,7 @@ fn enforce_key_uniqueness(
         txid,
         def,
         name,
+        duplicate,
     )
 }
 
@@ -1130,6 +1160,7 @@ fn committed_scan_uniqueness(
     txid: u32,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     name: SqlName,
+    duplicate: DuplicateKey,
 ) -> Result<(), SqlError> {
     let decoder =
         crate::storage::RelationRowDecoder::new(def, &storage.table_def(table_index, txid))?;
@@ -1157,7 +1188,7 @@ fn committed_scan_uniqueness(
                 )
             })?;
             if matched {
-                return Err(unique_violation(name, def, columns, values));
+                return Err(unique_violation(duplicate, name, def, columns, values));
             }
             Ok(ControlFlow::Continue(()))
         })?;
@@ -1181,6 +1212,7 @@ fn pending_scan_uniqueness(
     txid: u32,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     name: SqlName,
+    duplicate: DuplicateKey,
 ) -> Result<(), SqlError> {
     let decoder =
         crate::storage::RelationRowDecoder::new(def, &storage.table_def(table_index, txid))?;
@@ -1213,7 +1245,7 @@ fn pending_scan_uniqueness(
                     "statement is waiting for a concurrent unique-key writer"
                 ));
             }
-            return Err(unique_violation(name, def, columns, values));
+            return Err(unique_violation(duplicate, name, def, columns, values));
         }
         Ok(ControlFlow::Continue(()))
     })?;
@@ -1237,6 +1269,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
     columns: &[u16],
     nulls_not_distinct: bool,
     name: SqlName,
+    duplicate: DuplicateKey,
     predicate: &Expr,
     arena: &Arena,
 ) -> Result<(), SqlError> {
@@ -1280,7 +1313,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
                 matches(&other)
             })?;
             if matched {
-                return Err(unique_violation(name, def, columns, values));
+                return Err(unique_violation(duplicate, name, def, columns, values));
             }
             Ok(ControlFlow::Continue(()))
         })?;
@@ -1307,7 +1340,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
                 "statement is waiting for a concurrent unique-key writer"
             ));
         }
-        Err(unique_violation(name, def, columns, values))
+        Err(unique_violation(duplicate, name, def, columns, values))
     })?;
     Ok(())
 }
@@ -1348,7 +1381,8 @@ pub(crate) fn index_predicate_matches(
 
 /// Unique/PK enforcement for the single-column column flags: each `unique`
 /// column's value must not equal that column in any other visible row.
-pub fn check_unique(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_unique(
     storage: &Storage,
     table_index: usize,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
@@ -1356,6 +1390,7 @@ pub fn check_unique(
     values: &[Datum],
     self_rowid: Option<u64>,
     txid: u32,
+    duplicate: DuplicateKey,
 ) -> Result<(), SqlError> {
     for (i, column) in def.columns().iter().enumerate() {
         if !column.unique {
@@ -1378,6 +1413,7 @@ pub fn check_unique(
             &[i as u16],
             false,
             name,
+            duplicate,
             UniqueKeySource::Cache,
         )?;
     }
@@ -1386,7 +1422,7 @@ pub fn check_unique(
 
 /// Enforces both column-level UNIQUE/PRIMARY KEY and every UNIQUE index.
 #[allow(clippy::too_many_arguments)]
-pub fn check_all_unique(
+pub(crate) fn check_all_unique(
     storage: &Storage,
     table_index: usize,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
@@ -1395,8 +1431,18 @@ pub fn check_all_unique(
     self_rowid: Option<u64>,
     txid: u32,
     arena: &Arena,
+    duplicate: DuplicateKey,
 ) -> Result<(), SqlError> {
-    check_unique(storage, table_index, def, schema, values, self_rowid, txid)?;
+    check_unique(
+        storage,
+        table_index,
+        def,
+        schema,
+        values,
+        self_rowid,
+        txid,
+        duplicate,
+    )?;
     check_unique_indexes(
         storage,
         table_index,
@@ -1666,6 +1712,7 @@ pub(crate) fn check_reindex_constraints(
             &[column as u16],
             false,
             name,
+            DuplicateKey::IndexBuild,
             UniqueKeySource::Rows,
         )?;
     }
@@ -1687,6 +1734,7 @@ pub(crate) fn check_reindex_constraints(
             key.columns(),
             key.kind.nulls_not_distinct(),
             key.name,
+            DuplicateKey::IndexBuild,
             UniqueKeySource::Rows,
         )?;
     }
@@ -1821,6 +1869,10 @@ pub fn check_unique_indexes(
                 index.nulls_not_distinct,
                 name,
                 predicate,
+                match check {
+                    UniqueIndexCheck::Cache => DuplicateKey::Write,
+                    UniqueIndexCheck::Rebuild { .. } => DuplicateKey::IndexBuild,
+                },
                 arena,
             )?;
             continue;
@@ -1838,6 +1890,10 @@ pub fn check_unique_indexes(
                 icols,
                 index.nulls_not_distinct,
                 name,
+                match check {
+                    UniqueIndexCheck::Cache => DuplicateKey::Write,
+                    UniqueIndexCheck::Rebuild { .. } => DuplicateKey::IndexBuild,
+                },
                 expression,
                 arena,
             )?;
@@ -1853,6 +1909,10 @@ pub fn check_unique_indexes(
                 icols,
                 index.nulls_not_distinct,
                 name,
+                match check {
+                    UniqueIndexCheck::Cache => DuplicateKey::Write,
+                    UniqueIndexCheck::Rebuild { .. } => DuplicateKey::IndexBuild,
+                },
                 UniqueKeySource::Cache,
             )?;
         }
@@ -2063,9 +2123,61 @@ impl ConstraintRow {
     }
 }
 
-/// Enforces constraints using the exact identity that the caller will store.
+/// Enforces constraints using the exact identity that the caller will store,
+/// in PostgreSQL's order: the row's own CHECK and domain constraints before
+/// its index keys and foreign keys.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn enforce_row_constraints(
+    storage: &Storage,
+    table_index: usize,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    schema: &[ColType],
+    values: &[Datum],
+    row: ConstraintRow,
+    txid: u32,
+    txn: Option<&mut TxnState>,
+    checks: &ParsedChecks,
+    arena: &Arena,
+    params: &[Datum],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<(), SqlError> {
+    enforce_row_checks(storage, def, values, txid, checks, arena, params, sequences)?;
+    enforce_row_keys(
+        storage,
+        table_index,
+        def,
+        schema,
+        values,
+        row,
+        txid,
+        txn,
+        checks,
+        arena,
+    )
+}
+
+/// The row's CHECK, partition bound and domain constraints, which
+/// PostgreSQL's `ExecConstraints` tests before the row is stored.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn enforce_row_checks(
+    storage: &Storage,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    values: &[Datum],
+    txid: u32,
+    checks: &ParsedChecks,
+    arena: &Arena,
+    params: &[Datum],
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<(), SqlError> {
+    check_detached_partition_bound(def, values)?;
+    check_row_checks(storage, def, checks, values, txid, arena, params, sequences)?;
+    check_domain_constraints(storage, def, values, txid, arena, params, sequences)
+}
+
+/// The row's unique, exclusion and foreign key constraints, which PostgreSQL
+/// tests while and after it stores the row.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn enforce_row_keys(
     storage: &Storage,
     table_index: usize,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
@@ -2076,11 +2188,15 @@ pub(crate) fn enforce_row_constraints(
     mut txn: Option<&mut TxnState>,
     checks: &ParsedChecks,
     arena: &Arena,
-    params: &[Datum],
-    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
-    let self_rowid = row.excluded();
     check_index_tuple_sizes(storage, def, values, txid, arena)?;
+    let self_rowid = row.excluded();
+    // Existing rows meeting a new key are its index being built.
+    let duplicate = if matches!(row, ConstraintRow::Existing { .. }) {
+        DuplicateKey::IndexBuild
+    } else {
+        DuplicateKey::Write
+    };
     let constraint_table = storage
         .find_visible(def.schema.as_str(), def.name.as_str(), txid)
         .unwrap_or(table_index);
@@ -2097,7 +2213,7 @@ pub(crate) fn enforce_row_constraints(
                 continue;
             }
             check_all_unique(
-                storage, candidate, def, schema, values, self_rowid, txid, arena,
+                storage, candidate, def, schema, values, self_rowid, txid, arena, duplicate,
             )?;
             check_or_defer_unique_keys(
                 storage,
@@ -2134,6 +2250,7 @@ pub(crate) fn enforce_row_constraints(
             self_rowid,
             txid,
             arena,
+            duplicate,
         )?;
         check_or_defer_unique_keys(
             storage,
@@ -2160,10 +2277,16 @@ pub(crate) fn enforce_row_constraints(
             arena,
         )?;
     }
-    check_detached_partition_bound(def, values)?;
-    check_row_checks(storage, def, checks, values, txid, arena, params, sequences)?;
-    check_domain_constraints(storage, def, values, txid, arena, params, sequences)?;
-    check_or_defer_fk_child(storage, constraint_table, def, values, row, txid, txn)?;
+    check_or_defer_fk_child(
+        storage,
+        constraint_table,
+        def,
+        values,
+        row,
+        txid,
+        txn,
+        arena,
+    )?;
     Ok(())
 }
 
@@ -2291,7 +2414,15 @@ fn check_fk_child(
                 .iter()
                 .any(|&column| values[column as usize].is_null())
         {
-            check_fk_child_one_at(storage, def, fk, values, txid, Some(read))?;
+            check_fk_child_one_at(
+                storage,
+                def,
+                fk,
+                values,
+                txid,
+                ParentRead::Validation(read),
+                None,
+            )?;
         }
     }
     Ok(())
@@ -2330,6 +2461,12 @@ fn check_or_defer_unique_keys(
             key.columns(),
             key.kind.nulls_not_distinct(),
             key.name,
+            // Existing rows meeting a new key are its index being built.
+            if matches!(row, ConstraintRow::Existing { .. }) {
+                DuplicateKey::IndexBuild
+            } else {
+                DuplicateKey::Write
+            },
             UniqueKeySource::Cache,
         )?;
     }
@@ -2504,6 +2641,7 @@ fn enforce_exclusion_constraint(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_or_defer_fk_child(
     storage: &Storage,
     constraint_table: usize,
@@ -2512,6 +2650,7 @@ fn check_or_defer_fk_child(
     row: ConstraintRow,
     txid: u32,
     mut txn: Option<&mut TxnState>,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     for fk in def.fkeys() {
         if !fk.validation.enforced()
@@ -2530,46 +2669,63 @@ fn check_or_defer_fk_child(
             transaction.defer_constraint(identity, rowid)?;
             continue;
         }
-        check_fk_child_one_at(storage, def, fk, values, txid, row.validation_read())?;
+        let read = match row.validation_read() {
+            Some(read) => ParentRead::Validation(read),
+            None => ParentRead::Write(
+                txn.as_deref()
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "a written row's foreign key check has no transaction"
+                        )
+                    })?
+                    .isolation,
+            ),
+        };
+        check_fk_child_one_at(storage, def, fk, values, txid, read, Some(arena))?;
     }
     Ok(())
 }
 
-fn check_fk_child_one(
-    storage: &Storage,
-    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
-    fk: &crate::storage::ForeignKey,
-    values: &[Datum],
-    txid: u32,
-) -> Result<(), SqlError> {
-    check_fk_child_one_at(storage, def, fk, values, txid, None)
+/// How a referencing row's check reads its parent row.
+#[derive(Clone, Copy)]
+enum ParentRead {
+    /// Validation while a relation lock keeps writers out: the latest
+    /// committed rows, without row locks.
+    Validation(ValidationRead),
+    /// A written row. Like PostgreSQL's referential check query, it locks the
+    /// parent `FOR KEY SHARE`, so a concurrent delete or key change and the
+    /// referencing transaction wait for each other. Read committed reads the
+    /// latest committed parent; repeatable read and serializable read their
+    /// snapshot and fail with `40001` when the parent was deleted or its key
+    /// changed after it.
+    Write(crate::sql::ast::TransactionIsolation),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_fk_child_one_at(
     storage: &Storage,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     fk: &crate::storage::ForeignKey,
     values: &[Datum],
     txid: u32,
-    read: Option<ValidationRead>,
+    read: ParentRead,
+    arena: Option<&Arena>,
 ) -> Result<(), SqlError> {
     let Some(parent_index) =
         storage.find_visible(fk.parent_schema.as_str(), fk.parent.as_str(), txid)
     else {
         return Err(missing_parent_key(def, fk, values));
     };
-    let parent = storage.table_def(parent_index, txid).clone();
-    let mut schema = [ColType::Bool; MAX_COLUMNS];
-    parent.schema(&mut schema);
     if parent_has_key(
         storage,
         parent_index,
-        &schema[..parent.n_columns],
         fk.parent_cols(),
         fk.columns(),
         values,
         txid,
         read,
+        arena,
     )? {
         Ok(())
     } else {
@@ -2620,6 +2776,7 @@ pub(crate) fn validate_constraint_obligation(
     constraint: crate::sql::txn::ConstraintIdentity,
     rowid: u64,
     txid: u32,
+    isolation: crate::sql::ast::TransactionIsolation,
     arena: &Arena,
 ) -> Result<Option<crate::storage::ConstraintTiming>, SqlError> {
     let crate::sql::txn::ConstraintIdentity::Table { table, name, .. } = constraint else {
@@ -2691,6 +2848,7 @@ pub(crate) fn validate_constraint_obligation(
                     key.columns(),
                     key.kind.nulls_not_distinct(),
                     key.name,
+                    DuplicateKey::Write,
                     UniqueKeySource::Cache,
                 )?;
             } else if let Some(foreign_key) = foreign_key {
@@ -2700,7 +2858,15 @@ pub(crate) fn validate_constraint_obligation(
                         .iter()
                         .any(|&column| values[column as usize].is_null())
                 {
-                    check_fk_child_one(storage, &definition, &foreign_key, values, txid)?;
+                    check_fk_child_one_at(
+                        storage,
+                        &definition,
+                        &foreign_key,
+                        values,
+                        txid,
+                        ParentRead::Write(isolation),
+                        Some(arena),
+                    )?;
                 }
             } else if let Some(exclusion) = exclusion {
                 enforce_exclusion_constraint(
@@ -2782,7 +2948,8 @@ pub(crate) fn validate_foreign_key_constraint(
                         foreign_key,
                         values,
                         txid,
-                        Some(read),
+                        ParentRead::Validation(read),
+                        None,
                     )
                 },
             )
@@ -2875,7 +3042,14 @@ pub(crate) fn validate_deferred_constraints(
             index += 1;
             continue;
         }
-        validate_constraint_obligation(storage, current, obligation.rowid, txn.txid, arena)?;
+        validate_constraint_obligation(
+            storage,
+            current,
+            obligation.rowid,
+            txn.txid,
+            txn.isolation,
+            arena,
+        )?;
         txn.complete_deferred_constraint(index)?;
         index += 1;
     }
@@ -3068,32 +3242,68 @@ pub(crate) fn resolve_constraint_name(
     ))
 }
 
-/// Whether any row of the parent (visible to `txid`) has, in `parent_cols`, the
-/// same tuple the child row carries in `child_cols`.
+/// Whether a parent row has, in `parent_cols`, the tuple the child row
+/// carries in `child_cols`. A write locks that parent row (see [`ParentRead`]).
 #[allow(clippy::too_many_arguments)]
 fn parent_has_key(
     storage: &Storage,
     parent_index: usize,
-    _parent_schema: &[ColType],
     parent_cols: &[u16],
     child_cols: &[u16],
     child_values: &[Datum],
     txid: u32,
-    read: Option<ValidationRead>,
+    read: ParentRead,
+    arena: Option<&Arena>,
 ) -> Result<bool, SqlError> {
+    use super::row_conflicts::{LockedVersion, concurrent_change, uses_transaction_snapshot};
     let parent_definition = storage.table_def(parent_index, txid).clone();
-    let mut found = false;
+    // Read committed follows the latest committed parent, as PostgreSQL's
+    // check query takes a new snapshot; the other levels keep theirs.
+    let latest = match read {
+        ParentRead::Validation(read) => Some(read),
+        ParentRead::Write(isolation) if !uses_transaction_snapshot(isolation) => {
+            Some(storage.validation_read())
+        }
+        ParentRead::Write(_) => None,
+    };
+    let key_matches = |physical: &crate::storage::TableDefinition<_>,
+                       mapped: &[u16],
+                       bytes: &[u8]|
+     -> Result<bool, SqlError> {
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        physical.schema(&mut schema);
+        let mut prow = [Datum::Null; MAX_COLUMNS];
+        rowenc::decode(bytes, &schema[..physical.n_columns], &mut prow)?;
+        for ((&parent_column, &physical_column), &child_column) in
+            parent_cols.iter().zip(mapped).zip(child_cols)
+        {
+            let parent = &prow[physical_column as usize];
+            let child = &child_values[child_column as usize];
+            if parent.is_null()
+                || !compare_datums_collated(
+                    storage,
+                    txid,
+                    parent_definition.columns()[parent_column as usize].collation,
+                    child,
+                    parent,
+                )?
+                .is_eq()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    let mut found = None;
     constraint_row_tables(storage, parent_index, txid, |row_table| {
-        if found {
+        if found.is_some() {
             return Ok(());
         }
         let physical = storage.table_def(row_table, txid).clone();
         let mapped = super::remap_columns(&physical, &parent_definition, parent_cols)?;
-        let mut schema = [ColType::Bool; MAX_COLUMNS];
-        physical.schema(&mut schema);
         let mut visit = |rowid: u64, state: crate::storage::RowRead<'_>| {
             use core::ops::ControlFlow;
-            let home = match read {
+            let home = match latest {
                 Some(read) => read.visible_row_home(storage, row_table, rowid, state, txid)?,
                 None => storage.visible_row_home_at(
                     row_table,
@@ -3107,42 +3317,70 @@ fn parent_has_key(
             let Some(home) = home else {
                 return Ok(ControlFlow::Continue(()));
             };
-            let all_eq = storage.with_row_bytes(row_table, rowid, home, |bytes| {
-                let mut prow = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, &schema[..physical.n_columns], &mut prow)?;
-                for ((&parent_column, &physical_column), &child_column) in
-                    parent_cols.iter().zip(&mapped).zip(child_cols)
-                {
-                    let parent = &prow[physical_column as usize];
-                    let child = &child_values[child_column as usize];
-                    if parent.is_null()
-                        || !compare_datums_collated(
-                            storage,
-                            txid,
-                            parent_definition.columns()[parent_column as usize].collation,
-                            child,
-                            parent,
-                        )?
-                        .is_eq()
-                    {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            })?;
-            if all_eq {
-                found = true;
+            let seen = home.snapshot();
+            if storage.with_row_bytes(row_table, rowid, home, |bytes| {
+                key_matches(&physical, &mapped, bytes)
+            })? {
+                found = Some((row_table, rowid, seen));
                 return Ok(ControlFlow::Break(()));
             }
             Ok(ControlFlow::Continue(()))
         };
-        match read {
+        match latest {
             Some(read) => read.for_each_row_state(storage, row_table, &mut visit)?,
             None => storage.for_each_row_state(row_table, &mut visit)?,
         }
         Ok(())
     })?;
-    Ok(found)
+    let Some((row_table, rowid, seen)) = found else {
+        return Ok(false);
+    };
+    let ParentRead::Write(isolation) = read else {
+        return Ok(true);
+    };
+    let arena = arena.ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a written row's foreign key check has no statement arena"
+        )
+    })?;
+    let locked = super::row_conflicts::lock_selected_row(
+        storage,
+        txid,
+        row_table,
+        rowid,
+        seen,
+        crate::sql::ast::LockStrength::KeyShare,
+        crate::sql::ast::LockWait::Wait,
+    )?
+    .ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a foreign key check skipped its locked parent row"
+        )
+    })?;
+    let physical = storage.table_def(row_table, txid).clone();
+    match locked {
+        LockedVersion::Selected => Ok(true),
+        LockedVersion::Deleted if uses_transaction_snapshot(isolation) => {
+            Err(concurrent_change(false))
+        }
+        LockedVersion::Deleted => Ok(false),
+        LockedVersion::Updated(home) if uses_transaction_snapshot(isolation) => {
+            // A key share lock survives a committed change that kept every
+            // unique key column, as PostgreSQL's tuple lock does.
+            if super::row_conflicts::key_unchanged(storage, txid, row_table, rowid, seen, home)? {
+                Ok(true)
+            } else {
+                Err(concurrent_change(false))
+            }
+        }
+        LockedVersion::Updated(home) => {
+            let mapped = super::remap_columns(&physical, &parent_definition, parent_cols)?;
+            let latest = storage.row_bytes(row_table, rowid, home, arena)?;
+            key_matches(&physical, &mapped, latest)
+        }
+    }
 }
 
 /// Referential-action cascades can chase foreign keys through many tables
@@ -3272,54 +3510,128 @@ pub(crate) fn apply_fk_parent_actions(
             };
             // Retain matching bytes while their original owner is held. A second
             // metadata walk could otherwise select a different version.
-            let mut matches = crate::mem::arena::ArenaList::new(arena);
-            let mut has_match = false;
             let existence_only = deferred_identity.is_some()
                 || matches!(
                     action,
                     crate::storage::FkAction::NoAction | crate::storage::FkAction::Restrict
                 );
-            storage.for_each_row_state(child_index, &mut |rowid, state| {
-                use core::ops::ControlFlow;
-                let Some(home) = storage.visible_row_home_at(
-                    child_index,
-                    rowid,
-                    state,
-                    txn.txid,
-                    crate::storage::SNAPSHOT_ALL,
-                    storage.commit_snapshot(),
-                )?
-                else {
-                    return Ok(ControlFlow::Continue(()));
-                };
-                storage.with_row_bytes(child_index, rowid, home, |bytes| {
-                    let mut crow = [Datum::Null; MAX_COLUMNS];
-                    rowenc::decode(bytes, cschema, &mut crow)?;
-                    if !refers(&crow[..cdef.n_columns])? {
-                        return Ok(ControlFlow::Continue(()));
+            let rewrite_strength =
+                if new_parent.is_none() && action == crate::storage::FkAction::Cascade {
+                    crate::sql::ast::LockStrength::Update
+                } else {
+                    let mut changed = crate::storage::ColumnSet::EMPTY;
+                    for &column in fk.columns() {
+                        changed.insert(column as usize);
                     }
-                    has_match = true;
-                    if let Some(identity) = deferred_identity {
-                        txn.defer_constraint(identity, rowid)?;
-                    } else if existence_only {
-                        return Ok(ControlFlow::Break(()));
-                    } else {
-                        let copy = arena.alloc_slice_copy(bytes).map_err(|_| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "foreign key cascade exceeds the statement arena"
-                            )
-                        })?;
-                        matches.push((rowid, &*copy)).map_err(|_| {
+                    super::update_lock_strength(storage, &cdef, changed, txn.txid)
+                };
+            // As PostgreSQL's referential queries, the scan reads the latest
+            // committed rows and locks each one it relies on or rewrites; a row
+            // that changed before its lock was granted sends the scan back.
+            let (matches, has_match) = loop {
+                let latest = storage.validation_read();
+                let mut matches = crate::mem::arena::ArenaList::new(arena);
+                let mut has_match = false;
+                latest.for_each_row_state(storage, child_index, &mut |rowid, state| {
+                    use core::ops::ControlFlow;
+                    let Some(home) =
+                        latest.visible_row_home(storage, child_index, rowid, state, txn.txid)?
+                    else {
+                        return Ok(ControlFlow::Continue(()));
+                    };
+                    let seen = home.snapshot();
+                    storage.with_row_bytes(child_index, rowid, home, |bytes| {
+                        let mut crow = [Datum::Null; MAX_COLUMNS];
+                        rowenc::decode(bytes, cschema, &mut crow)?;
+                        if !refers(&crow[..cdef.n_columns])? {
+                            return Ok(ControlFlow::Continue(()));
+                        }
+                        has_match = true;
+                        if let Some(identity) = deferred_identity {
+                            txn.defer_constraint(identity, rowid)?;
+                            return Ok(ControlFlow::Continue(()));
+                        }
+                        let copy = if existence_only {
+                            &[][..]
+                        } else {
+                            &*arena.alloc_slice_copy(bytes).map_err(|_| {
+                                sql_err!(
+                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                    "foreign key cascade exceeds the statement arena"
+                                )
+                            })?
+                        };
+                        matches.push((rowid, seen, copy)).map_err(|_| {
                             sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                                 "foreign key cascade row records exceed the statement arena"
                             )
                         })?;
+                        Ok(if existence_only {
+                            ControlFlow::Break(())
+                        } else {
+                            ControlFlow::Continue(())
+                        })
+                    })
+                })?;
+                if deferred_identity.is_some() {
+                    break (matches, has_match);
+                }
+                let strength = if existence_only {
+                    crate::sql::ast::LockStrength::KeyShare
+                } else {
+                    rewrite_strength
+                };
+                let mut changed = false;
+                for &(rowid, seen, _) in matches.as_slice() {
+                    match super::row_conflicts::lock_selected_row(
+                        storage,
+                        txn.txid,
+                        child_index,
+                        rowid,
+                        seen,
+                        strength,
+                        crate::sql::ast::LockWait::Wait,
+                    )? {
+                        Some(super::row_conflicts::LockedVersion::Selected) => {}
+                        Some(_) => changed = true,
+                        None => {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "a foreign key action skipped a locked row"
+                            ));
+                        }
                     }
-                    Ok(ControlFlow::Continue(()))
-                })
-            })?;
+                }
+                if changed {
+                    continue;
+                }
+                // Repeatable read and serializable rewrite only rows their
+                // snapshot sees in the same version (PostgreSQL's crosscheck
+                // snapshot).
+                if !existence_only && super::row_conflicts::uses_transaction_snapshot(txn.isolation)
+                {
+                    for &(rowid, seen, _) in matches.as_slice() {
+                        let snapshot_version = match storage.row_state(child_index, rowid)? {
+                            Some(state) => storage
+                                .visible_row_home_at(
+                                    child_index,
+                                    rowid,
+                                    state,
+                                    txn.txid,
+                                    crate::storage::SNAPSHOT_ALL,
+                                    storage.commit_snapshot(),
+                                )?
+                                .map(|home| home.snapshot().row_version()),
+                            None => None,
+                        };
+                        if snapshot_version != Some(seen.row_version()) {
+                            return Err(super::row_conflicts::concurrent_change(false));
+                        }
+                    }
+                }
+                break (matches, has_match);
+            };
             if !has_match || deferred_identity.is_some() {
                 continue;
             }
@@ -3355,8 +3667,9 @@ pub(crate) fn apply_fk_parent_actions(
                 );
                 return Err(sql_err!(
                     code,
-                    "update or delete on table \"{}\" violates {setting}foreign key constraint \"{}\" on table \"{}\"",
+                    "update or delete on table \"{}\" violates {}foreign key constraint \"{}\" on table \"{}\"",
                     parent_name,
+                    setting,
                     fk.name.as_str(),
                     cdef.name.as_str()
                 ));
@@ -3365,7 +3678,7 @@ pub(crate) fn apply_fk_parent_actions(
             let child_schema = cdef.schema.as_str();
             let child_name = cdef.name.as_str();
             let defaults = parse_defaults(&cdef, arena, storage, txn.txid)?;
-            for &(rowid, old_bytes) in matches.as_slice() {
+            for &(rowid, _, old_bytes) in matches.as_slice() {
                 let mut crow = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(old_bytes, cschema, &mut crow)?;
                 let crow = &crow[..cdef.n_columns];

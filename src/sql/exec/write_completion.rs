@@ -29,6 +29,7 @@ pub(super) enum CompletionReply {
 
 /// The next event belongs to this statement's trigger depth. Its completion
 /// marker is installed by the firing, before recursive trigger SQL can run.
+#[derive(Clone, Copy)]
 pub(super) struct QueuedFiring {
     pub(super) index: usize,
     pub(super) trigger_slot: u16,
@@ -38,12 +39,18 @@ pub(super) struct QueuedFiring {
 
 pub(super) struct AfterRowCursor {
     depth: u16,
+    command: u32,
     next: usize,
 }
 
 impl AfterRowCursor {
-    pub(super) fn new(depth: u16) -> Self {
-        Self { depth, next: 0 }
+    /// The events of the statement at `depth` running as `command`.
+    pub(super) fn new(depth: u16, command: u32) -> Self {
+        Self {
+            depth,
+            command,
+            next: 0,
+        }
     }
 
     pub(super) fn next(
@@ -62,12 +69,16 @@ impl AfterRowCursor {
                     trigger_slot,
                     effective_table,
                     trigger_depth,
-                } if trigger_depth == self.depth => Some((trigger_slot, effective_table)),
+                    command,
+                } if trigger_depth == self.depth && command == self.command => {
+                    Some((trigger_slot, effective_table))
+                }
                 crate::sql::txn::DeferredTriggerKind::Constraint {
                     identity,
                     effective_table,
                     trigger_depth,
-                } if trigger_depth == self.depth => {
+                    command,
+                } if trigger_depth == self.depth && command == self.command => {
                     let Some(timing) = constraints::constraint_timing(
                         context.storage(),
                         identity,
@@ -119,8 +130,8 @@ impl StatementTriggerCursor {
         event: u8,
         before: bool,
         columns: ColumnSet,
-    ) -> Option<crate::storage::TriggerDef> {
-        while let Some(trigger) = context
+    ) -> Option<(u16, crate::storage::TriggerDef)> {
+        while let Some((slot, trigger)) = context
             .storage()
             .triggers_for_target(target, context.txn.txid)
             .filter(|(_, trigger)| {
@@ -132,7 +143,6 @@ impl StatementTriggerCursor {
                     .as_str()
                     .cmp(right.name_to(context.txn.txid).as_str())
             })
-            .map(|(_, trigger)| trigger)
         {
             self.last_name = Some(trigger.name_to(context.txn.txid));
             if !(if context.txn.replication_apply {
@@ -153,7 +163,7 @@ impl StatementTriggerCursor {
             {
                 continue;
             }
-            return Some(trigger);
+            return Some((slot as u16, trigger));
         }
         None
     }
@@ -173,6 +183,7 @@ enum AfterPhase {
     clippy::large_enum_variant,
     reason = "selected trigger definitions stay inline without heap allocation"
 )]
+#[derive(Clone, Copy)]
 enum AfterFiring {
     Row(QueuedFiring),
     Statement {
@@ -240,6 +251,9 @@ pub(super) enum NestedWriteOutput {
     Rows {
         values: local_values::SavedValues,
         rows: u64,
+        /// A dynamic statement's `USING` values, which a `STRICT` failure
+        /// lists after the write resumes.
+        arguments: local_values::SavedValues,
     },
     NoResult,
 }
@@ -261,6 +275,7 @@ impl PendingNestedWrite {
         &mut self,
         values: Option<&[Datum<'_>]>,
         rows: u64,
+        arguments: &[Datum<'_>],
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<(), SqlError> {
         if self.output.is_some() {
@@ -273,9 +288,12 @@ impl PendingNestedWrite {
             Some(values) => {
                 let mut saved = local_values::SavedValues::new(pool)?;
                 saved.replace(values)?;
+                let mut saved_arguments = local_values::SavedValues::new(pool)?;
+                saved_arguments.replace(arguments)?;
                 NestedWriteOutput::Rows {
                     values: saved,
                     rows,
+                    arguments: saved_arguments,
                 }
             }
             None => NestedWriteOutput::NoResult,
@@ -306,6 +324,7 @@ impl PendingNestedWrite {
             mark: self.completion.boundary(),
             command: command.command_id(),
             depth: command.trigger_depth(),
+            retained: prior.is_some_and(|boundary| boundary.retained),
         });
         let result = self.completion.poll(&mut TriggerExecContext {
             host: context.host.reborrow(),
@@ -373,7 +392,8 @@ impl SuspendedWriteCompletion {
             .map_err(control_flow::execution_full)?;
         let selected = SavedAfterFiring::capture(selected, &context.storage().execution_control)?;
         let definitions = context.storage().table_definition_images();
-        let mut row_cursor = AfterRowCursor::new(context.txn.trigger_depth());
+        let mut row_cursor =
+            AfterRowCursor::new(context.txn.trigger_depth(), context.txn.command_id());
         while let Some(firing) = row_cursor.next(context)? {
             definitions.definition(
                 context.storage(),
@@ -480,6 +500,16 @@ impl WriteCompletionState {
                     self.firing = Some(firing);
                     return sql_fail(wait);
                 }
+                // A wait before the firing could keep its own progress runs
+                // the same event again on resume; the cursor has moved past it.
+                Err(error) if control_flow::is_execution_wait(&error) => {
+                    match SavedAfterFiring::capture(selected, &context.storage().execution_control)
+                    {
+                        Ok(saved) => self.selected = Some(saved),
+                        Err(capture) => return sql_fail(capture),
+                    }
+                    return sql_fail(error);
+                }
                 Err(error) => return sql_fail(error),
             }
         }
@@ -506,6 +536,7 @@ pub(in crate::sql) fn resume(
         mark: completion.boundary(),
         command: txn.command_id(),
         depth: txn.trigger_depth(),
+        retained: true,
     });
     let result = completion.poll(&mut TriggerExecContext {
         host: PlpgsqlExecHost::Routine {
@@ -625,11 +656,11 @@ fn run_selected_firing<'run>(
 }
 
 impl CompletionCursor {
-    fn new(completion: WriteCompletion, reply: CompletionReply, depth: u16) -> Self {
+    fn new(completion: WriteCompletion, reply: CompletionReply, depth: u16, command: u32) -> Self {
         Self {
             completion,
             reply,
-            phase: AfterPhase::Rows(AfterRowCursor::new(depth)),
+            phase: AfterPhase::Rows(AfterRowCursor::new(depth, command)),
         }
     }
 
@@ -658,8 +689,9 @@ impl CompletionCursor {
                         continue;
                     }
                     if let Some((operation, columns)) = events[*event]
-                        && let Some(selected) =
-                            trigger.next(context, target, operation, false, columns)
+                        && let Some(selected) = trigger
+                            .next(context, target, operation, false, columns)
+                            .map(|(_, trigger)| trigger)
                     {
                         return Ok(Some(AfterFiring::Statement {
                             trigger: selected,
@@ -738,7 +770,7 @@ impl WriteCompletion {
         reply: CompletionReply,
     ) -> Outcome {
         let depth = context.txn.trigger_depth();
-        let mut cursor = CompletionCursor::new(self, reply, depth);
+        let mut cursor = CompletionCursor::new(self, reply, depth, context.txn.command_id());
         if let Some(boundary) = context.txn.write_completion_boundary
             && boundary.command == context.txn.command_id()
             && boundary.depth == depth
@@ -788,6 +820,7 @@ impl WriteCompletion {
                 ),
                 AfterFiring::Statement { trigger, event } => execute_statement_trigger(
                     &mut context,
+                    None,
                     &trigger,
                     target,
                     crate::storage::RelationDefinition::from_definition(definition),
@@ -819,6 +852,7 @@ mod ownership_tests {
                     conflict_update: None,
                 },
                 CompletionReply::Command,
+                0,
                 0,
             );
             let mut responder = Responder::new(&mut buffer);

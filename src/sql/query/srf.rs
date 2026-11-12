@@ -8,7 +8,7 @@
 //! scan machinery can resolve against, which is what is synthesized here.
 
 use crate::mem::arena::{Arena, ArenaList, ArenaString};
-use crate::sql::ast::{Expr, Select, SelectItem, TableRef};
+use crate::sql::ast::{Expr, Select, SelectItem, SetTree, TableRef};
 use crate::sql::eval::{ColumnLookup, EvalHooks, ProjectSetValue, SqlError, eval_full, sqlstate};
 use crate::sql::exec::MAX_PROJ;
 
@@ -776,7 +776,7 @@ pub(super) fn srf_in_item<'a>(item: &'a SelectItem<'a>) -> Option<&'a Expr<'a>> 
     match item {
         SelectItem::Expr { expression, .. } => srf_in_expr(expression),
         SelectItem::RecordStar(base) => srf_in_expr(base),
-        SelectItem::Wildcard | SelectItem::TableWildcard(_) => None,
+        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => None,
     }
 }
 
@@ -812,7 +812,7 @@ pub(super) fn has_project_set(items: &[SelectItem<'_>], storage: &Storage, txid:
         SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
             expression_has_project_set(expression, storage, txid)
         }
-        SelectItem::Wildcard | SelectItem::TableWildcard(_) => false,
+        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => false,
     })
 }
 
@@ -1092,6 +1092,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                         authorization_role: None,
                         bound_table: None,
                         view_access: None,
+                        join_members: None,
                     })
                     .map_err(|_| arena_full())?;
                 let routine = capture_table_func_routine(
@@ -1539,7 +1540,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
     for item in items {
         let expression = match item {
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => expression,
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => continue,
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => continue,
         };
         visit(
             expression,
@@ -2249,8 +2250,8 @@ pub(super) fn preserve_projection_type_identities(
         match entry {
             super::ResolvedColumn::Table(table, column) => resolver
                 .column_meta(
-                    Some(scope.names[table]),
-                    scope.defs.column_name(table, column),
+                    Some(scope.column_reference_name(table, column).0),
+                    scope.column_reference_name(table, column).1,
                 )
                 .map(|metadata| metadata.type_oid)
                 .ok_or_else(shape_error),
@@ -2260,7 +2261,7 @@ pub(super) fn preserve_projection_type_identities(
     let mut output = 0usize;
     for item in items {
         match item {
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 let scope = scope.ok_or_else(shape_error)?;
                 for index in 0..scope.star_columns() {
                     *type_oids.get_mut(output).ok_or_else(shape_error)? =
@@ -2309,8 +2310,85 @@ pub(super) fn preserve_projection_type_identities(
     Ok(())
 }
 
+/// A record column of a set operation has the field shape of its leftmost
+/// query's expression, as PostgreSQL resolves `(u.tail).f1` through the
+/// first query's target list.
+fn register_set_record_shapes<'a>(
+    storage: &Storage,
+    tree: &SetTree<'_>,
+    txid: u32,
+    arena: &'a Arena,
+    descriptors: &mut [ColDesc<'a>],
+) -> Result<(), SqlError> {
+    let mut leaf = tree;
+    while let SetTree::Op { left, .. } = leaf {
+        leaf = left;
+    }
+    let SetTree::Select(leaf) = leaf else {
+        unreachable!("set tree leaf");
+    };
+    if leaf.set_body.is_some()
+        || !descriptors
+            .iter()
+            .any(|column| column.type_oid == crate::sql::types::oid::RECORD)
+    {
+        return Ok(());
+    }
+    let scope = leaf
+        .from
+        .as_ref()
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, None))
+        .transpose()?;
+    let scoped = scope.as_ref().map(|scope| super::CatalogScopeCols {
+        scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    });
+    let fromless = crate::sql::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    let columns: &dyn crate::sql::exec::ColTypeResolver = match scoped.as_ref() {
+        Some(columns) => columns,
+        None => &fromless,
+    };
+    let mut slot = 0usize;
+    for item in leaf.items {
+        match item {
+            SelectItem::Wildcard(_) => slot += scope.as_ref().map_or(0, QueryScope::star_columns),
+            SelectItem::TableWildcard(name) => {
+                if let Some(scope) = scope.as_ref() {
+                    slot += scope.qualified_star_columns(name)?;
+                }
+            }
+            SelectItem::RecordStar(base) => {
+                slot += record_star_width(base, scope.as_ref(), storage, txid, arena)?;
+            }
+            SelectItem::Expr { expression, .. } => {
+                if let Some(column) = descriptors.get_mut(slot)
+                    && column.type_oid == crate::sql::types::oid::RECORD
+                    && let Some(handle) =
+                        crate::sql::exec::register_shape_for(expression, columns, arena)?
+                {
+                    column.type_mod = handle;
+                }
+                slot += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Describes a derived table without retaining a maximum-width arena image.
-/// FROM-less LATERAL projections use the preceding tables' column types.
+/// `outer` resolves the names the derived table may read from outside
+/// itself: the enclosing queries, and for a `LATERAL` item first the FROM
+/// items before it.
 pub(crate) fn describe_derived_definition<'a>(
     storage: &Storage,
     sub: &Select<'_>,
@@ -2318,7 +2396,7 @@ pub(crate) fn describe_derived_definition<'a>(
     col_alias: Option<&[&str]>,
     txid: u32,
     arena: &'a Arena,
-    outer: Option<&QueryScope<'_>>,
+    outer: Option<&dyn ColumnLookup<'_>>,
 ) -> Result<RelationDefinition<'a>, SqlError> {
     let sub = if sub.with.is_empty() {
         sub
@@ -2327,27 +2405,35 @@ pub(crate) fn describe_derived_definition<'a>(
         // columns, including during procedural input/dependency analysis.
         super::expand_ctes(sub, storage, txid, arena)?
     };
-    let outer_schema = outer.map(super::ScopeSchema);
-    let outer_columns = outer_schema
-        .as_ref()
-        .map(|schema| schema as &dyn ColumnLookup<'_>);
+    let outer_columns = outer;
     let mut descriptors = [ColDesc::new("", 0, 0); MAX_PROJ];
     let mut type_oids = [0_i32; MAX_PROJ];
-    let mut output_collations = [crate::sql::ast::Collation::None; MAX_PROJ];
     let n_cols = match sub.set_body {
-        Some(tree) => describe_set_body(
-            storage,
-            tree,
-            txid,
-            &mut descriptors,
-            arena,
-            Some(&mut type_oids),
-            crate::sql::exec::DescriptionTarget::Sql,
-            None,
-        )?,
+        Some(tree) => {
+            let outer_types = outer.map(super::scope::OuterColumnTypes);
+            let n = describe_set_body(
+                storage,
+                tree,
+                txid,
+                &mut descriptors,
+                arena,
+                Some(&mut type_oids),
+                crate::sql::exec::DescriptionTarget::Sql,
+                outer_types
+                    .as_ref()
+                    .map(|types| types as &dyn ColumnLookup<'_>),
+            )?;
+            register_set_record_shapes(storage, tree, txid, arena, &mut descriptors[..n])?;
+            n
+        }
         None => match &sub.from {
-            Some(f) => {
-                let ss = QueryScope::resolve_schema(storage, f, txid, arena, outer_columns)?;
+            // A FROM-less body may still read the enclosing queries
+            // (`LATERAL (SELECT t.a * 2)` sees the enclosing `t`).
+            from if from.is_some() || outer.is_some() => {
+                let ss = match from {
+                    Some(f) => QueryScope::resolve_schema(storage, f, txid, arena, outer_columns)?,
+                    None => QueryScope::singleton(storage, txid, arena)?,
+                };
                 let n = describe_scope_items(
                     sub.items,
                     &ss,
@@ -2365,7 +2451,7 @@ pub(crate) fn describe_derived_definition<'a>(
                 let mut slot = 0usize;
                 for item in sub.items {
                     match item {
-                        SelectItem::Wildcard => slot += ss.star_columns(),
+                        SelectItem::Wildcard(_) => slot += ss.star_columns(),
                         SelectItem::TableWildcard(q) => {
                             slot += ss.qualified_star_columns(q)?;
                         }
@@ -2382,7 +2468,7 @@ pub(crate) fn describe_derived_definition<'a>(
                                     expression,
                                     &super::CatalogScopeCols {
                                         scope: &ss,
-                                        outer_scope: outer,
+                                        outer,
                                         storage,
                                         txid,
                                         arena,
@@ -2421,31 +2507,19 @@ pub(crate) fn describe_derived_definition<'a>(
                         }
                     }
                 }
-                let mut slot = 0usize;
+                // Collation conflicts in the projection fail here; the
+                // descriptors already carry each column's collation.
                 for item in sub.items {
                     match item {
-                        SelectItem::Wildcard => {
-                            for position in 0..ss.star_columns() {
-                                output_collations[slot] =
-                                    ss.output_collation(ss.star_entry(position));
-                                slot += 1;
-                            }
-                        }
                         SelectItem::TableWildcard(name) => {
                             for index in 0..ss.qualified_star_columns(name)? {
-                                output_collations[slot] =
-                                    ss.output_collation(ss.qualified_star_entry(name, index)?);
-                                slot += 1;
+                                ss.qualified_star_entry(name, index)?;
                             }
                         }
-                        SelectItem::RecordStar(base) => {
-                            slot += record_star_width(base, Some(&ss), storage, txid, arena)?;
-                        }
                         SelectItem::Expr { expression, .. } => {
-                            output_collations[slot] =
-                                ss.expression_collation(storage, arena, expression)?;
-                            slot += 1;
+                            ss.expression_collation(storage, arena, expression)?;
                         }
+                        SelectItem::Wildcard(_) | SelectItem::RecordStar(_) => {}
                     }
                 }
                 preserve_projection_type_identities(
@@ -2453,7 +2527,7 @@ pub(crate) fn describe_derived_definition<'a>(
                     Some(&ss),
                     &super::CatalogScopeCols {
                         scope: &ss,
-                        outer_scope: outer,
+                        outer,
                         storage,
                         txid,
                         arena,
@@ -2463,36 +2537,7 @@ pub(crate) fn describe_derived_definition<'a>(
                 )?;
                 n
             }
-            // A FROM-less lateral body types its projection against the outer
-            // scope (`SELECT t.a * 2` sees the enclosing `t`).
-            None if outer.is_some() => {
-                let outer = outer.expect("checked");
-                let n = describe_scope_items(
-                    sub.items,
-                    outer,
-                    None,
-                    storage,
-                    txid,
-                    arena,
-                    &mut descriptors,
-                    crate::sql::exec::DescriptionTarget::Sql,
-                )?;
-                preserve_projection_type_identities(
-                    sub.items,
-                    Some(outer),
-                    &super::CatalogScopeCols {
-                        scope: outer,
-                        outer_scope: None,
-                        storage,
-                        txid,
-                        arena,
-                    },
-                    &descriptors[..n],
-                    &mut type_oids[..n],
-                )?;
-                n
-            }
-            None => {
+            _ => {
                 let n = super::describe_catalog_items(
                     sub.items,
                     None,
@@ -2543,12 +2588,27 @@ pub(crate) fn describe_derived_definition<'a>(
             }
         },
     };
-    for (output, description) in output_collations[..n_cols]
-        .iter_mut()
-        .zip(&descriptors[..n_cols])
-    {
-        *output = description.collation;
-    }
+    finish_derived_definition(
+        storage,
+        exposed,
+        col_alias,
+        txid,
+        arena,
+        &mut descriptors[..n_cols],
+        &type_oids[..n_cols],
+    )
+}
+
+fn finish_derived_definition<'a, 'd>(
+    storage: &Storage,
+    exposed: &str,
+    col_alias: Option<&[&'d str]>,
+    txid: u32,
+    arena: &'a Arena,
+    descriptors: &mut [ColDesc<'d>],
+    type_oids: &[i32],
+) -> Result<RelationDefinition<'a>, SqlError> {
+    let n_cols = descriptors.len();
     if n_cols > MAX_COLUMNS {
         return Err(sql_err!(
             sqlstate::TOO_MANY_COLUMNS,
@@ -2605,7 +2665,7 @@ pub(crate) fn describe_derived_definition<'a>(
             ctype,
             type_mod: descriptors[i].type_mod,
             collation: if ctype.is_collatable() {
-                match output_collations[i] {
+                match descriptors[i].collation {
                     crate::sql::ast::Collation::None => crate::sql::ast::Collation::Default,
                     collation => collation,
                 }
@@ -2900,7 +2960,7 @@ fn populate_record_append_columns<'a, C: ColumnLookup<'a>>(
         let described = arena
             .alloc_slice_with(width, |_| crate::sql::types::ColDesc::new("", 0, 0))
             .map_err(|_| arena_full())?;
-        let count = crate::sql::catalog::describe_view(storage, txid, &view, arena, described)?;
+        let count = crate::sql::catalog::describe_view(&view, txid, arena, described)?;
         for column in &described[..count] {
             let (ctype, user_type) =
                 crate::sql::exec::catalog_column_type(storage, txid, column.type_oid).ok_or_else(

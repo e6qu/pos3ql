@@ -378,6 +378,12 @@ enum EventObjectRef {
     TableRowType(u16),
     TableArrayType(u16),
     ToastRelation(u16),
+    /// `chunk_id`, `chunk_seq` or `chunk_data` (attributes 1–3) of a table's
+    /// TOAST relation.
+    ToastColumn {
+        table: u16,
+        attnum: u16,
+    },
     ToastIndex(u16),
     TableConstraint {
         table: u16,
@@ -387,6 +393,13 @@ enum EventObjectRef {
     ViewRowType(u16),
     ViewArrayType(u16),
     ViewRule(u16),
+    MatviewRule(u16),
+    /// A row trigger's clone on a partition of its table.
+    PartitionTrigger {
+        trigger: u16,
+        table: u16,
+        oid: i32,
+    },
     DomainArray(u16),
     DomainConstraint {
         domain: u16,
@@ -550,6 +563,61 @@ impl EventObjectRef {
                 rule.address_name_count = 3;
                 rule
             }
+            Self::MatviewRule(slot) => {
+                let matview = storage.matview(usize::from(slot));
+                let relation = storage.table_def(usize::from(matview.backing_table), txid);
+                let mut identity = EventIdentity::new();
+                write!(
+                    identity,
+                    "\"_RETURN\" on {}",
+                    qualified(relation.schema.as_str(), relation.name.as_str())?.as_str()
+                )
+                .map_err(|_| graph_full())?;
+                let mut rule = base_object(
+                    catalog::PG_REWRITE_OID,
+                    matview.rule_oid(),
+                    "rule",
+                    None,
+                    None,
+                    identity,
+                    false,
+                );
+                rule.address_names[0] = StackStr::from_str(relation.schema.as_str());
+                rule.address_names[1] = StackStr::from_str(relation.name.as_str());
+                rule.address_names[2] = StackStr::from_str("_RETURN");
+                rule.address_name_count = 3;
+                rule
+            }
+            Self::PartitionTrigger {
+                trigger,
+                table,
+                oid,
+            } => {
+                let name = storage.trigger(usize::from(trigger)).name_to(txid);
+                let table = storage.table_def(usize::from(table), txid);
+                let mut identity = EventIdentity::new();
+                write!(
+                    identity,
+                    "{} on {}",
+                    identifier(name.as_str()).as_str(),
+                    qualified(table.schema.as_str(), table.name.as_str())?.as_str()
+                )
+                .map_err(|_| graph_full())?;
+                let mut object = base_object(
+                    catalog::PG_TRIGGER_OID,
+                    oid,
+                    "trigger",
+                    Some(table.schema.as_str()),
+                    Some(name.as_str()),
+                    identity,
+                    false,
+                );
+                object.address_names[0] = StackStr::from_str(table.schema.as_str());
+                object.address_names[1] = StackStr::from_str(table.name.as_str());
+                object.address_names[2] = StackStr::from_str(name.as_str());
+                object.address_name_count = 3;
+                object
+            }
             Self::DomainArray(slot) => {
                 let slot = usize::from(slot);
                 let domain = storage.domain_for(slot, txid);
@@ -645,12 +713,34 @@ impl EventObjectRef {
                     true,
                 )
             }
+            Self::ToastColumn { table, attnum } => {
+                let mut object = Self::ToastRelation(table).materialize(storage, txid)?;
+                let relation_name = object.object_name.ok_or_else(graph_full)?;
+                let name = TOAST_COLUMNS[usize::from(attnum) - 1];
+                let mut identity = qualified("pg_toast", relation_name.as_str())?;
+                write!(identity, ".{name}").map_err(|_| graph_full())?;
+                object.sub_id = i32::from(attnum);
+                object.object_type = StackStr::from_str("toast table column");
+                object.object_name = None;
+                object.identity = identity;
+                object.address_names = [StackStr::new(); MAX_ADDRESS_PARTS];
+                object.address_names[0] = StackStr::from_str("pg_toast");
+                object.address_names[1] = StackStr::from_str(relation_name.as_str());
+                object.address_names[2] = StackStr::from_str(name);
+                object.address_name_count = 3;
+                object
+            }
             Self::RelationColumn {
                 relation,
                 attnum,
                 name,
             } => {
                 let mut object = primary_object(storage, txid, relation)?;
+                if let ObjectRef::Composite(slot) = relation {
+                    // A composite type's columns belong to its relation.
+                    object.class_id = catalog::PG_CLASS_OID;
+                    object.object_id = catalog::named_composite_relation_oid(storage, slot);
+                }
                 let relation_name = object.object_name.ok_or_else(graph_full)?;
                 let schema = object.schema_name.ok_or_else(graph_full)?;
                 let mut identity = qualified(schema.as_str(), relation_name.as_str())?;
@@ -660,6 +750,7 @@ impl EventObjectRef {
                 object.object_type = StackStr::from_str(match relation {
                     ObjectRef::View(_) => "view column",
                     ObjectRef::MaterializedView(_) => "materialized view column",
+                    ObjectRef::Composite(_) => "composite type column",
                     _ => "table column",
                 });
                 object.object_name = None;
@@ -902,8 +993,9 @@ fn mutation(storage: &Storage, undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
     })
 }
 
+/// PostgreSQL's `quote_identifier`, which also quotes reserved words.
 fn identifier(value: &str) -> StackStr<132> {
-    crate::sql::types::acl_identifier(value)
+    crate::sql::eval::quote_identifier(value)
 }
 
 fn qualified(schema: &str, name: &str) -> Result<EventIdentity, SqlError> {
@@ -1534,7 +1626,32 @@ fn builtin_routine_type_name(
         }
         scalar => (scalar.name(), scalar.catalog_name()),
     };
-    let name = if display.trim_end_matches("[]") == catalog_name {
+    qualified_type_display(display, catalog_name)
+}
+
+/// `format_type_be_qualified` of a built-in type OID: `pg_catalog.text`,
+/// `pg_catalog."any"`, `integer`, `pg_catalog.cstring[]`.
+fn builtin_type_identity_name(type_oid: i32) -> Result<EventAddressPart, SqlError> {
+    let display = catalog::intrinsic_type_name(type_oid).ok_or_else(graph_full)?;
+    let rows = catalog::builtin_type_rows();
+    let row = |oid: i32| {
+        rows.binary_search_by_key(&oid, |row| row.oid)
+            .ok()
+            .map(|index| &rows[index])
+    };
+    let mut base = row(type_oid).ok_or_else(graph_full)?;
+    if display.ends_with("[]") {
+        base = row(base.element).ok_or_else(graph_full)?;
+    }
+    qualified_type_display(display, base.name)
+}
+
+/// Types PostgreSQL spells with SQL syntax (`integer`, `character varying`)
+/// stay unqualified; every other type name is schema-qualified. `json` is
+/// printed bare, as the SQL/JSON standard names it.
+fn qualified_type_display(display: &str, catalog_name: &str) -> Result<EventAddressPart, SqlError> {
+    let quoted = crate::sql::eval::quote_identifier(catalog_name);
+    let name = if display.trim_end_matches("[]") == quoted.as_str() && catalog_name != "json" {
         crate::stack_format!(512, "pg_catalog.{display}")
     } else {
         StackStr::from_str(display)
@@ -1618,10 +1735,88 @@ fn access_method_object(
     schema: &str,
     name: &str,
 ) -> Result<EventObject, SqlError> {
+    access_method_object_using(class_id, oid, object_type, schema, name, "btree")
+}
+
+/// A built-in operator class or family, which lives in `pg_catalog`.
+fn builtin_access_method_object(
+    class_id: i32,
+    oid: i32,
+    method: i32,
+    name: &str,
+) -> Result<EventObject, SqlError> {
+    let method = catalog::access_method_name(method).ok_or_else(graph_full)?;
+    let object_type = if class_id == catalog::PG_OPCLASS_OID {
+        "operator class"
+    } else {
+        "operator family"
+    };
+    access_method_object_using(class_id, oid, object_type, "pg_catalog", name, method)
+}
+
+/// PostgreSQL's identity of a built-in cast: both types as
+/// `format_type_be_qualified` prints them.
+fn builtin_cast_object(oid: i32, source: i32, target: i32) -> Result<EventObject, SqlError> {
+    let qualified_type = |type_oid: i32| -> Result<EventAddressPart, SqlError> {
+        let name = catalog::intrinsic_type_name(type_oid).ok_or_else(graph_full)?;
+        // format_type prints these SQL-standard spellings without a schema.
+        const SQL_NAMES: &[&str] = &[
+            "bit",
+            "boolean",
+            "character",
+            "real",
+            "double precision",
+            "smallint",
+            "integer",
+            "bigint",
+            "numeric",
+            "interval",
+            "time without time zone",
+            "time with time zone",
+            "timestamp without time zone",
+            "timestamp with time zone",
+            "bit varying",
+            "character varying",
+            "json",
+        ];
+        let name = if SQL_NAMES.contains(&name) {
+            StackStr::from_str(name)
+        } else {
+            crate::stack_format!(512, "pg_catalog.{name}")
+        };
+        (!name.is_truncated())
+            .then_some(name)
+            .ok_or_else(graph_full)
+    };
+    let source = qualified_type(source)?;
+    let target = qualified_type(target)?;
+    let mut identity = EventIdentity::new();
+    write!(identity, "({} AS {})", source.as_str(), target.as_str()).map_err(|_| graph_full())?;
+    let mut object = base_object(
+        catalog::PG_CAST_OID,
+        oid,
+        "cast",
+        None,
+        None,
+        identity,
+        false,
+    );
+    object.address_names[0] = source;
+    object.address_names[1] = target;
+    object.address_name_count = 2;
+    Ok(object)
+}
+
+fn access_method_object_using(
+    class_id: i32,
+    oid: i32,
+    object_type: &str,
+    schema: &str,
+    name: &str,
+    method: &str,
+) -> Result<EventObject, SqlError> {
     let mut identity = qualified(schema, name)?;
-    identity
-        .write_str(" USING btree")
-        .map_err(|_| graph_full())?;
+    write!(identity, " USING {method}").map_err(|_| graph_full())?;
     let mut object = base_object(
         class_id,
         oid,
@@ -1631,7 +1826,7 @@ fn access_method_object(
         identity,
         false,
     );
-    object.address_args[0] = StackStr::from_str("btree");
+    object.address_args[0] = StackStr::from_str(method);
     object.address_arg_count = 1;
     Ok(object)
 }
@@ -1647,7 +1842,11 @@ fn primary_object(
             base_object(
                 catalog::PG_CLASS_OID,
                 catalog::user_table_oid(storage, slot),
-                "table",
+                if table.kind == crate::storage::TableKind::Foreign {
+                    "foreign table"
+                } else {
+                    "table"
+                },
                 Some(table.schema.as_str()),
                 Some(table.name.as_str()),
                 qualified(table.schema.as_str(), table.name.as_str())?,
@@ -2475,6 +2674,9 @@ fn relation_object_ref(storage: &Storage, txid: u32, object_id: i32) -> Option<E
     None
 }
 
+/// A TOAST relation's attributes, by attribute number.
+const TOAST_COLUMNS: [&str; 3] = ["chunk_id", "chunk_seq", "chunk_data"];
+
 fn relation_column_ref(
     storage: &Storage,
     txid: u32,
@@ -2482,6 +2684,12 @@ fn relation_column_ref(
     attnum: i32,
 ) -> Option<EventObjectRef> {
     let index = usize::try_from(attnum.checked_sub(1)?).ok()?;
+    if let EventObjectRef::ToastRelation(table) = relation {
+        return (index < TOAST_COLUMNS.len()).then_some(EventObjectRef::ToastColumn {
+            table,
+            attnum: u16::try_from(attnum).ok()?,
+        });
+    }
     let (reference, name) = match relation {
         EventObjectRef::Primary(reference @ ObjectRef::Table(slot)) => {
             let table = storage.table_def(slot, txid);
@@ -2497,6 +2705,13 @@ fn relation_column_ref(
             reference,
             *storage.view(slot).columns_for(txid).names().get(index)?,
         ),
+        EventObjectRef::CompositeRelation(slot) => {
+            let composite = storage.composite_for(usize::from(slot), txid);
+            let field = composite
+                .active_fields_for(txid)
+                .find(|field| i32::from(field.attribute_number) == attnum)?;
+            (ObjectRef::Composite(usize::from(slot)), field.name)
+        }
         _ => return None,
     };
     Some(EventObjectRef::RelationColumn {
@@ -2507,26 +2722,37 @@ fn relation_column_ref(
 }
 
 fn type_object_ref(storage: &Storage, txid: u32, object_id: i32) -> Option<EventObjectRef> {
-    if let Some((kind, _, array)) = crate::storage::NamedTypeKind::from_oid(object_id) {
-        let result = storage.routine_result_for_oid(object_id, txid)?;
-        let reference = crate::storage::TypeReference::from_bound_name(result.user_type?).ok()?;
-        let slot = reference.catalog_slot();
-        return Some(match (kind, array) {
-            (crate::storage::NamedTypeKind::Domain, false) => {
-                EventObjectRef::Primary(ObjectRef::Domain(usize::from(slot)))
-            }
-            (crate::storage::NamedTypeKind::Enum, false) => {
-                EventObjectRef::Primary(ObjectRef::Enum(usize::from(slot)))
-            }
-            (crate::storage::NamedTypeKind::Composite, false) => {
-                EventObjectRef::Primary(ObjectRef::Composite(usize::from(slot)))
-            }
-            (crate::storage::NamedTypeKind::Domain, true) => EventObjectRef::DomainArray(slot),
-            (crate::storage::NamedTypeKind::Enum, true) => EventObjectRef::EnumArray(slot),
-            (crate::storage::NamedTypeKind::Composite, true) => {
-                EventObjectRef::CompositeArray(slot)
-            }
-        });
+    // A named type is found by its creation stamp. Relation row types share
+    // the composite OID band; they match no named composite and resolve below.
+    if let Some((kind, creation, array)) = crate::storage::NamedTypeKind::from_oid(object_id) {
+        use crate::storage::NamedTypeKind;
+        let found = match kind {
+            NamedTypeKind::Domain => (0..storage.domain_count()).find(|slot| {
+                storage.domain_slot_visible_to(*slot, txid)
+                    && storage.domain_for(*slot, txid).creation() == creation
+            }),
+            NamedTypeKind::Enum => (0..storage.enum_count()).find(|slot| {
+                storage.enum_slot_visible_to(*slot, txid)
+                    && storage.enum_for(*slot, txid).creation() == creation
+            }),
+            NamedTypeKind::Composite => storage
+                .composites_with_slots_visible_to(txid)
+                .find(|(_, composite)| composite.creation() == creation)
+                .map(|(slot, _)| slot),
+        };
+        if let Some(slot) = found {
+            let array_slot = u16::try_from(slot).ok()?;
+            return Some(match (kind, array) {
+                (NamedTypeKind::Domain, false) => EventObjectRef::Primary(ObjectRef::Domain(slot)),
+                (NamedTypeKind::Enum, false) => EventObjectRef::Primary(ObjectRef::Enum(slot)),
+                (NamedTypeKind::Composite, false) => {
+                    EventObjectRef::Primary(ObjectRef::Composite(slot))
+                }
+                (NamedTypeKind::Domain, true) => EventObjectRef::DomainArray(array_slot),
+                (NamedTypeKind::Enum, true) => EventObjectRef::EnumArray(array_slot),
+                (NamedTypeKind::Composite, true) => EventObjectRef::CompositeArray(array_slot),
+            });
+        }
     }
     if let Some(slot) = catalog::table_slot_by_row_type_oid(storage, txid, object_id, false) {
         return Some(EventObjectRef::TableRowType(slot as u16));
@@ -2553,11 +2779,16 @@ fn type_object_ref(storage: &Storage, txid: u32, object_id: i32) -> Option<Event
 }
 
 fn builtin_routine_object(object_id: i32) -> Result<Option<EventObject>, SqlError> {
-    let Some((name, arguments, object_type)) = catalog::intrinsic_routine_event_identity(object_id)
-    else {
+    let Some(routine) = catalog::builtin_callable_by_oid(object_id) else {
         return Ok(None);
     };
-    let mut identity = qualified("pg_catalog", name)?;
+    let name = routine.name;
+    let object_type = match routine.kind {
+        b'a' => "aggregate",
+        b'p' => "procedure",
+        _ => "function",
+    };
+    let mut identity = qualified(routine.schema, name)?;
     identity.write_char('(').map_err(|_| graph_full())?;
     let mut object = base_object(
         catalog::PG_PROC_OID,
@@ -2568,16 +2799,14 @@ fn builtin_routine_object(object_id: i32) -> Result<Option<EventObject>, SqlErro
         StackStr::new(),
         false,
     );
-    object.address_names[0] = StackStr::from_str("pg_catalog");
+    object.address_names[0] = StackStr::from_str(routine.schema);
     object.address_names[1] = StackStr::from_str(name);
     object.address_name_count = 2;
-    for (index, raw) in arguments.split_ascii_whitespace().enumerate() {
+    for (index, oid) in routine.arguments.iter().copied().enumerate() {
         if index != 0 {
             identity.write_char(',').map_err(|_| graph_full())?;
         }
-        let oid = raw.parse::<i32>().map_err(|_| graph_full())?;
-        let name = catalog::intrinsic_type_name(oid).ok_or_else(graph_full)?;
-        let qualified_name = crate::stack_format!(512, "pg_catalog.{name}");
+        let qualified_name = builtin_type_identity_name(oid)?;
         identity
             .write_str(qualified_name.as_str())
             .map_err(|_| graph_full())?;
@@ -2592,6 +2821,50 @@ fn builtin_routine_object(object_id: i32) -> Result<Option<EventObject>, SqlErro
 /// Resolve a PostgreSQL catalog address through the same typed object graph
 /// used by event triggers. DDL callbacks and SQL introspection therefore
 /// cannot disagree after a rename or while observing transaction-local DDL.
+/// PostgreSQL's `default acl` object: identity `for role r in schema s on
+/// sequences`, address names `{r,s}` and the object-type letter as argument.
+fn default_acl_object(storage: &Storage, txid: u32, object_id: i32) -> Option<EventObject> {
+    use crate::storage::DefaultPrivilegeClass;
+    let identity = storage.default_acl_identity_by_oid(object_id, txid)?;
+    let owner = storage.role_name_by_oid(identity.owner, txid)?;
+    let schema = match identity.schema {
+        Some(schema) => Some(catalog::schema_name_by_oid(storage, txid, schema.oid())?),
+        None => None,
+    };
+    let (objects, letter) = match identity.class {
+        DefaultPrivilegeClass::Table => ("relations", "r"),
+        DefaultPrivilegeClass::Sequence => ("sequences", "S"),
+        DefaultPrivilegeClass::Function => ("functions", "f"),
+        DefaultPrivilegeClass::Type => ("types", "T"),
+        DefaultPrivilegeClass::Schema => ("schemas", "n"),
+    };
+    let mut text = EventIdentity::new();
+    write!(text, "for role {}", identifier(owner.as_str()).as_str()).ok()?;
+    if let Some(schema) = schema {
+        write!(text, " in schema {}", identifier(schema.as_str()).as_str()).ok()?;
+    }
+    write!(text, " on {objects}").ok()?;
+    if text.is_truncated() {
+        return None;
+    }
+    let mut object = EventObject {
+        class_id: 826,
+        object_id,
+        object_type: StackStr::from_str("default acl"),
+        identity: text,
+        ..EventObject::EMPTY
+    };
+    object.address_names[0] = StackStr::from_str(owner.as_str());
+    object.address_name_count = 1;
+    if let Some(schema) = schema {
+        object.address_names[1] = StackStr::from_str(schema.as_str());
+        object.address_name_count = 2;
+    }
+    object.address_args[0] = StackStr::from_str(letter);
+    object.address_arg_count = 1;
+    Some(object)
+}
+
 fn existing_catalog_object(
     storage: &Storage,
     txid: u32,
@@ -2599,6 +2872,11 @@ fn existing_catalog_object(
     object_id: i32,
     sub_id: i32,
 ) -> Result<EventObject, SqlError> {
+    if class_id == 826 {
+        return default_acl_object(storage, txid, object_id)
+            .filter(|_| sub_id == 0)
+            .ok_or_else(|| catalog_lookup_failed(class_id, object_id));
+    }
     let reference = match class_id {
         catalog::PG_CLASS_OID => {
             let relation = relation_object_ref(storage, txid, object_id)
@@ -2681,20 +2959,28 @@ fn existing_catalog_object(
                 .operator_slot_by_oid(object_id, txid)
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
-        catalog::PG_OPFAMILY_OID => EventObjectRef::Primary(ObjectRef::OperatorFamily(
-            storage
-                .operator_family_slot_by_oid(object_id, txid)
-                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
-        )),
-        catalog::PG_OPCLASS_OID => EventObjectRef::Primary(ObjectRef::OperatorClass(
-            storage
-                .operator_class_slot_by_oid(
-                    crate::storage::OperatorClassOid::parse(object_id)
-                        .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
-                    txid,
-                )
-                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
-        )),
+        catalog::PG_OPFAMILY_OID => {
+            if let Some(slot) = storage.operator_family_slot_by_oid(object_id, txid) {
+                EventObjectRef::Primary(ObjectRef::OperatorFamily(slot))
+            } else {
+                let (method, name) = catalog::builtin_operator_family(object_id)
+                    .filter(|_| sub_id == 0)
+                    .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?;
+                return builtin_access_method_object(class_id, object_id, method, name);
+            }
+        }
+        catalog::PG_OPCLASS_OID => {
+            if let Some(slot) = crate::storage::OperatorClassOid::parse(object_id)
+                .and_then(|oid| storage.operator_class_slot_by_oid(oid, txid))
+            {
+                EventObjectRef::Primary(ObjectRef::OperatorClass(slot))
+            } else {
+                let (method, name) = catalog::builtin_operator_class(object_id)
+                    .filter(|_| sub_id == 0)
+                    .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?;
+                return builtin_access_method_object(class_id, object_id, method, name);
+            }
+        }
         catalog::PG_COLLATION_OID => EventObjectRef::Primary(ObjectRef::Collation(
             storage
                 .collations_visible_to(txid)
@@ -2749,26 +3035,42 @@ fn existing_catalog_object(
                 })
                 .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
         )),
-        catalog::PG_TRIGGER_OID => EventObjectRef::Primary(ObjectRef::Trigger(
-            storage
+        catalog::PG_TRIGGER_OID => {
+            match storage
                 .triggers_with_slots_visible_to(txid)
                 .find_map(|(slot, trigger)| {
                     (crate::storage::trigger_oid(&trigger) == object_id).then_some(slot)
-                })
-                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
-        )),
-        catalog::PG_REWRITE_OID => EventObjectRef::Primary(ObjectRef::Rule(
-            storage
-                .rules_visible_to(txid)
-                .find_map(|(slot, rule)| (rule.oid() == object_id).then_some(slot))
-                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
-        )),
-        catalog::PG_CAST_OID => EventObjectRef::Primary(ObjectRef::Cast(
-            storage
+                }) {
+                Some(slot) => EventObjectRef::Primary(ObjectRef::Trigger(slot)),
+                None => partition_trigger_object(storage, txid, object_id)?
+                    .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+            }
+        }
+        catalog::PG_REWRITE_OID => {
+            if let Some(slot) = storage.matview_slot_by_rule_oid(object_id, txid) {
+                EventObjectRef::MatviewRule(u16::try_from(slot).map_err(|_| graph_full())?)
+            } else {
+                EventObjectRef::Primary(ObjectRef::Rule(
+                    storage
+                        .rules_visible_to(txid)
+                        .find_map(|(slot, rule)| (rule.oid() == object_id).then_some(slot))
+                        .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+                ))
+            }
+        }
+        catalog::PG_CAST_OID => {
+            if let Some(slot) = storage
                 .casts_visible_to(txid)
                 .find_map(|(slot, cast)| (cast.oid() == object_id).then_some(slot))
-                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
-        )),
+            {
+                EventObjectRef::Primary(ObjectRef::Cast(slot))
+            } else {
+                let (source, target) = catalog::cast_type_oids(storage, txid, object_id)
+                    .filter(|_| sub_id == 0)
+                    .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?;
+                return builtin_cast_object(object_id, source, target);
+            }
+        }
         catalog::PG_POLICY_OID => EventObjectRef::Primary(ObjectRef::Policy(
             storage
                 .policies_with_slots_visible_to(txid)
@@ -2860,6 +3162,24 @@ pub(crate) fn catalog_object(
     match existing_catalog_object(storage, txid, class_id, object_id, sub_id) {
         Ok(object) => Ok(object),
         Err(error) if error.sqlstate == sqlstate::UNDEFINED_OBJECT => {
+            // A missing attribute of an existing relation is still typed by
+            // its relation's kind (`table column`), as in PostgreSQL.
+            if class_id == catalog::PG_CLASS_OID
+                && sub_id != 0
+                && let Some(relation) = relation_object_ref(storage, txid, object_id)
+            {
+                let relation = relation.materialize(storage, txid)?;
+                let mut object_type = StackStr::new();
+                write!(object_type, "{} column", relation.object_type.as_str())
+                    .map_err(|_| graph_full())?;
+                return Ok(EventObject {
+                    class_id,
+                    object_id,
+                    sub_id,
+                    object_type,
+                    ..EventObject::EMPTY
+                });
+            }
             let object_type = match class_id {
                 catalog::PG_CLASS_OID => "relation",
                 catalog::PG_PROC_OID => "routine",
@@ -3751,10 +4071,14 @@ fn push_table_indexes(
     Ok(())
 }
 
+/// A table's dependents, or a materialized view's (`matview` names it, and
+/// its `_RETURN` rule follows its row types; `parent_is_normal` is the
+/// rule's `normal` flag).
 fn push_table_drop_dependents(
     storage: &Storage,
     txid: u32,
     slot: usize,
+    matview: Option<(usize, bool)>,
     indexes: &[(usize, crate::storage::RelationIdentity)],
     output: &mut ArenaList<'_, DroppedObject>,
     count: &mut usize,
@@ -3792,6 +4116,15 @@ fn push_table_drop_dependents(
         false,
         false,
     )?;
+    if let Some((matview, parent_is_normal)) = matview {
+        push_drop(
+            output,
+            count,
+            EventObjectRef::MatviewRule(u16::try_from(matview).map_err(|_| graph_full())?),
+            false,
+            parent_is_normal,
+        )?;
+    }
 
     for check in table.checks() {
         push_drop(
@@ -4069,12 +4402,13 @@ fn push_drop_dependents(
 ) -> Result<(), SqlError> {
     match reference {
         ObjectRef::Table(slot) => {
-            push_table_drop_dependents(storage, txid, slot, before.indexes, output, count)
+            push_table_drop_dependents(storage, txid, slot, None, before.indexes, output, count)
         }
         ObjectRef::MaterializedView(slot) => push_table_drop_dependents(
             storage,
             txid,
             storage.matview_table(slot),
+            Some((slot, parent_is_normal)),
             before.indexes,
             output,
             count,
@@ -4175,6 +4509,23 @@ pub(crate) fn collect<'a>(
             let Some((reference, Mutation::Drop)) = mutation(storage, entry) else {
                 continue;
             };
+            // A dropped materialized view reports itself, not its backing table.
+            if let ObjectRef::Table(table) = reference
+                && undo
+                    .iter()
+                    .cloned()
+                    .zip(undo_origins)
+                    .any(|(other, &other_origin)| {
+                        other_origin == origin
+                            && matches!(
+                                mutation(storage, other),
+                                Some((ObjectRef::MaterializedView(matview), Mutation::Drop))
+                                    if usize::from(storage.matview(matview).backing_table) == table
+                            )
+                    })
+            {
+                continue;
+            }
             let original = before.original_drops.contains(&reference);
             if original != original_pass {
                 continue;
@@ -4313,4 +4664,40 @@ pub(crate) fn collect<'a>(
         commands: commands.as_slice(),
         drops: drops.as_slice(),
     })
+}
+
+/// The partition clone of a row trigger whose OID is `oid`, if any.
+fn partition_trigger_object(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Result<Option<EventObjectRef>, SqlError> {
+    for (slot, trigger) in storage.triggers_with_slots_visible_to(txid) {
+        let crate::storage::TriggerTarget::Table(parent) = trigger.target else {
+            continue;
+        };
+        if !matches!(trigger.level, crate::sql::ast::TriggerLevel::Row) {
+            continue;
+        }
+        for child in 0..storage.table_count() {
+            if !storage.table_slot_visible_to(child, txid)
+                || !storage.partition_descends_from(child, usize::from(parent), txid)
+            {
+                continue;
+            }
+            let clone = storage.partition_trigger_oid_to(
+                trigger.position(slot),
+                storage.table_position(child),
+                txid,
+            )?;
+            if clone == oid {
+                return Ok(Some(EventObjectRef::PartitionTrigger {
+                    trigger: u16::try_from(slot).map_err(|_| graph_full())?,
+                    table: u16::try_from(child).map_err(|_| graph_full())?,
+                    oid,
+                }));
+            }
+        }
+    }
+    Ok(None)
 }

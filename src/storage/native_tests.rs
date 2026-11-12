@@ -1385,7 +1385,7 @@ fn catalog_creation_role_oid_exhaustion_preserves_the_catalog() {
     let mut budget = test_budget(&config);
     let storage = Storage::new(&config, &mut budget, 0).unwrap();
     storage
-        .restore_role_identity_sequence(i32::MAX as u64)
+        .restore_role_identity_sequence(RoleOid::LAST_USER)
         .unwrap();
     let sequence = storage.catalog_identity_sequence();
     crate::mem::guard::forbid_alloc(|| {
@@ -1400,7 +1400,7 @@ fn catalog_creation_role_oid_exhaustion_preserves_the_catalog() {
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
             assert_eq!(error.message.as_str(), "role identity space exhausted");
             assert!(storage.find_role_visible("exhausted_actor", 7).is_none());
-            assert_eq!(storage.role_identity_sequence(), i32::MAX as u64);
+            assert_eq!(storage.role_identity_sequence(), RoleOid::LAST_USER);
             assert_eq!(storage.catalog_identity_sequence(), sequence);
             assert_eq!(storage.role_oid(0), 10);
         }
@@ -1436,7 +1436,7 @@ fn catalog_creation_role_identity_survives_rename_but_rejects_slot_reuse() {
             name,
             RoleAttributes::ORDINARY,
             storage.catalog_sources.next_role().unwrap(),
-            1,
+            1 + PREDEFINED_ROLE_COUNT,
         )
         .unwrap();
     let actor = SessionIdentity::bound(storage.capture_role_slot(slot, 0).unwrap());
@@ -2214,9 +2214,19 @@ fn database_reservation_rejects_pending_and_recovery_collisions() {
         assert_eq!(storage.databases_visible_to(12).count(), 4);
         storage.retire_database(first, true);
         storage.retire_database(second, true);
-        let maximum = storage
+        // A client-chosen OID outside the automatic band leaves the allocator alone.
+        let chosen = storage
             .reserve_database(
                 Some(DatabaseOid(i32::MAX)),
+                test_database_definition("chosen_oid"),
+                0,
+                13,
+            )
+            .unwrap();
+        storage.retire_database(chosen, true);
+        let maximum = storage
+            .reserve_database(
+                Some(DatabaseOid(crate::storage::OidBand::UserDatabase.last())),
                 test_database_definition("maximum_oid"),
                 0,
                 13,
@@ -2844,6 +2854,7 @@ fn test_table_dependency(storage: &Storage, table: usize) -> StoredQueryDependen
         slot: table as u16,
         identity,
         referenced_columns: ColumnSet::EMPTY,
+        written_columns: ColumnSet::EMPTY,
         schema: definition.schema,
         name: definition.name,
         referenced_schema: SqlName::EMPTY,
@@ -4044,8 +4055,11 @@ fn catalog_object_pools_follow_their_independent_startup_capacities() {
         .role_catalog
         .lock()
         .expect("role catalog lock poisoned");
-    assert_eq!(role_catalog.roles.len(), 19);
-    assert_eq!(role_catalog.memberships.len(), 20);
+    assert_eq!(role_catalog.roles.len(), 19 + PREDEFINED_ROLE_COUNT);
+    assert_eq!(
+        role_catalog.memberships.len(),
+        20 + INITDB_MEMBERSHIPS.len()
+    );
     assert_eq!(role_catalog.settings.len(), 21);
     drop(role_catalog);
     assert_eq!(storage.role_graph_scratch.len(), 2);
@@ -4054,7 +4068,7 @@ fn catalog_object_pools_follow_their_independent_startup_capacities() {
             .lock()
             .expect("role graph scratch lock poisoned")
             .len()
-            == 19
+            == 19 + PREDEFINED_ROLE_COUNT
     }));
     storage.role_graph_scratch[0]
         .lock()
@@ -5710,13 +5724,25 @@ fn role_catalog_is_synchronized_and_startup_bounded() {
         .role_catalog
         .lock()
         .expect("role catalog lock poisoned");
-    assert_eq!(catalog.roles.capacity(), 1 + WORKERS);
-    assert_eq!(catalog.memberships.capacity(), WORKERS);
+    assert_eq!(
+        catalog.roles.capacity(),
+        1 + PREDEFINED_ROLE_COUNT + WORKERS
+    );
+    assert_eq!(
+        catalog.memberships.capacity(),
+        INITDB_MEMBERSHIPS.len() + WORKERS
+    );
     assert_eq!(catalog.settings.capacity(), WORKERS);
     drop(catalog);
 
-    assert_eq!(storage.live_roles().count(), 1 + WORKERS);
-    assert_eq!(storage.live_role_memberships().count(), WORKERS);
+    assert_eq!(
+        storage.live_roles().count(),
+        1 + PREDEFINED_ROLE_COUNT + WORKERS
+    );
+    assert_eq!(
+        storage.live_role_memberships().count(),
+        INITDB_MEMBERSHIPS.len() + WORKERS
+    );
     assert_eq!(
         storage
             .role_settings()
@@ -5766,7 +5792,10 @@ fn role_catalog_is_synchronized_and_startup_bounded() {
 
     storage.remove_role(names[0]);
     assert!(storage.find_role(names[0]).is_none());
-    assert_eq!(storage.live_role_memberships().count(), WORKERS - 1);
+    assert_eq!(
+        storage.live_role_memberships().count(),
+        INITDB_MEMBERSHIPS.len() + WORKERS - 1
+    );
     assert_eq!(
         storage
             .role_settings()
@@ -6040,6 +6069,7 @@ fn routine_candidate_lookup_preserves_visibility_identity_and_guard_release() {
             catalog[slot].schema = SqlName::parse("public").unwrap();
             catalog[slot].name = SqlName::parse("probe").unwrap();
             catalog[slot].ddl_state = CatalogDdlState::Present;
+            catalog[slot].created_at = slot as u64;
         }
         catalog[1].pending_identity = Some(PendingRoutineIdentity {
             txid: 7,
@@ -7764,8 +7794,8 @@ fn catalog_graph_scratch_is_synchronized_and_startup_bounded() {
     let roles = storage.role_graph_scratch[0]
         .lock()
         .expect("role graph scratch lock poisoned");
-    assert_eq!(roles.capacity(), config.max_roles);
-    assert!(roles.iter().all(|visited| *visited));
+    assert_eq!(roles.capacity(), config.role_catalog_slots());
+    assert!(roles[..4].iter().all(|visited| *visited));
     drop(roles);
     let domains = storage
         .domain_graph_scratch
@@ -8945,6 +8975,8 @@ fn foreign_catalog_is_synchronized_and_startup_bounded() {
     assert_eq!(storage.foreign_tables(0).count(), WORKERS);
     assert_eq!(storage.checkpoint_foreign_wrappers().count(), WORKERS);
     assert_eq!(storage.checkpoint_foreign_servers().count(), WORKERS);
+    // The bootstrap superuser also grants initdb's pg_monitor memberships.
+    storage.clear_initdb_role_memberships();
     assert_eq!(
         storage
             .role_object_dependency(usize::from(BOOTSTRAP_ROLE), 0)
@@ -9168,6 +9200,7 @@ fn stored_query_dependency_catalog_is_synchronized_and_startup_bounded() {
                             RelationReference::from_storage(worker as u64 + 1).unwrap(),
                         ),
                         referenced_columns: ColumnSet::EMPTY,
+                        written_columns: ColumnSet::EMPTY,
                         schema: marker,
                         name: marker,
                         referenced_schema: marker,
@@ -9180,6 +9213,7 @@ fn stored_query_dependency_catalog_is_synchronized_and_startup_bounded() {
                         slot: worker as u16,
                         identity: StoredDependencyIdentity::Name,
                         referenced_columns: ColumnSet::EMPTY,
+                        written_columns: ColumnSet::EMPTY,
                         schema: marker,
                         name: marker,
                         referenced_schema: marker,

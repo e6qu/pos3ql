@@ -254,6 +254,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             input_collation: crate::sql::ast::Collation::None,
             input_sites: program.input_sites,
             variable_conflict: crate::sql::guc::VariableConflict::Error,
+            print_strict_params: false,
             fresh_snapshots: true,
             materialized_relations: Some(relations),
             nargs: 1,
@@ -414,7 +415,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
                 let FiringState::Paused(frame) = &saved.state else {
                     panic!("paused firing")
                 };
-                let (parsed, _code) = frame.source().parse(scratch).unwrap();
+                let (parsed, _code) = frame.source().parse(scratch, None).unwrap();
                 let values = saved.saved.values.decode(scratch).unwrap();
                 let binding = saved
                     .saved

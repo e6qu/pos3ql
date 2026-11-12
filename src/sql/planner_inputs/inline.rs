@@ -1014,7 +1014,7 @@ fn count_parameters(
     if let Expr::Param(index)
     | Expr::RoutineParam {
         index,
-        source: ast::ParameterSource::SqlRoutine,
+        source: ast::ParameterSource::SqlRoutine | ast::ParameterSource::SqlRoutineField,
         ..
     } = expression
     {

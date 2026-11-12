@@ -139,6 +139,7 @@ fn pending_routine_contract_reports_fixed_capacity_exhaustion() {
     let mut budget = Budget::new(1);
     let arena = Arena::new(&mut budget, "routine contract", 1).unwrap();
     let mut routine = Box::new(RoutineDef::EMPTY);
+    routine.created_at = 1;
     routine.argument_count = 1;
     crate::mem::guard::forbid_alloc(|| {
         let error = match OwnedRoutineCallContract::capture(&routine, &arena) {
@@ -181,6 +182,7 @@ fn pending_calls_own_nested_arguments_and_types_after_scratch_release_and_arena_
                     }])
                     .unwrap();
                 PendingRoutineInvocation {
+                    constant_arguments: false,
                     target: PendingRoutineTarget::Stored(
                         original
                             .retain(OwnedRoutineCallContract::capture(&routine, &original).unwrap())
@@ -263,6 +265,7 @@ fn pending_call_argument_exhaustion_and_borrow_failures_preserve_the_owner() {
         ));
         drop(borrowed);
         let pending = PendingRoutineInvocation {
+            constant_arguments: false,
             target: PendingRoutineTarget::Intrinsic(42),
             arguments: source.freeze_retained_slice(mutable).unwrap(),
             argument_count: 1,

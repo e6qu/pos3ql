@@ -44,6 +44,56 @@ earlier status after another transaction changes it. In locking mode, a
 conflicting writer waits for the reader's relation lock, while work on
 unrelated tables continues.
 
+**Foreign keys and concurrent writers.** Inserting or updating a row that
+references another table locks the referenced (parent) row `FOR KEY SHARE`, as
+PostgreSQL does. A delete or key change of that parent waits for the inserting
+transaction, and an insert waits for a transaction that is deleting the parent
+or changing its key; after the wait each side checks the outcome again. For
+example, if one session deletes customer 7 while another inserts an order for
+customer 7, the order insert waits; when the delete commits the insert fails
+with `23503`, and when it rolls back the insert succeeds. Under `REPEATABLE
+READ` and `SERIALIZABLE`, an insert whose parent was deleted or had its key
+changed after the transaction's snapshot fails with `40001`. Changing other
+parent columns does not conflict, nor does an assignment that keeps the key
+value, such as `UPDATE customers SET id = id`. `ON DELETE`/`ON UPDATE` actions lock the
+referencing rows they check or rewrite. Each locked row takes one entry of the
+row-lock registry, (`max_connections` + `max_prepared_transactions`) ×
+`txn_rows` entries in total; a full registry fails the statement with `54000`.
+
+**Writes that meet a concurrently changed row.** `UPDATE`, `DELETE`,
+`MERGE` and `SELECT ... FOR UPDATE` (or `FOR SHARE`, `FOR KEY SHARE`, `FOR NO
+KEY UPDATE`) lock each row they select. When another transaction changed that
+row after the statement's snapshot, `READ COMMITTED` continues with the row's
+latest committed version, as PostgreSQL does: `UPDATE accounts SET balance =
+balance + 10` that waited for another session's `+ 1` stores the sum of both,
+a row that no longer meets the `WHERE` condition is skipped, and a deleted row
+is neither updated nor deleted again. `REPEATABLE READ` and `SERIALIZABLE`
+fail such a statement with `40001` (`could not serialize access due to
+concurrent update`, or `concurrent delete` for an `UPDATE`, `DELETE` or
+`MERGE` of a deleted row); `FOR KEY SHARE` still succeeds when the change kept
+every unique key column.
+
+Under `READ COMMITTED`, `SELECT ... FOR UPDATE` returns the locked row's latest
+version: the join conditions, `WHERE` and output list run again over it, while
+the other tables in the join keep the rows first read. For example, a job
+queue's `SELECT id FROM jobs WHERE state = 'new' ORDER BY id LIMIT 1 FOR
+UPDATE` that waited for another worker skips the job that worker claimed and
+returns the next one. The result keeps its original order. `MERGE` chooses the
+action again for the target row's latest version: a `WHEN MATCHED` pair whose
+`ON` condition still holds checks its `WHEN` conditions from the first one; a
+pair whose `ON` condition no longer holds runs the `WHEN NOT MATCHED BY SOURCE`
+actions on the target row and the `WHEN NOT MATCHED` action for the source
+row; a deleted target row leaves only the `WHEN NOT MATCHED` action, as in
+PostgreSQL 15 and later. An `IN (subquery)` condition that does not refer to
+the outer query is rechecked against the subquery row it first matched, as
+PostgreSQL's semi-join does: the row stays only if the tested value did not
+change. Three differences remain: PostgreSQL rechecks a correlated `EXISTS
+(subquery)` against the subquery row it first matched, where pos3ql runs the
+subquery again; a row another transaction moved to a
+different partition is skipped where PostgreSQL fails with `40001`; and a
+query with a `LATERAL` source fails such a recheck with `0A000` where
+PostgreSQL runs the `LATERAL` source again.
+
 A commit becomes visible all at once, and only after it is durable: new
 statements never see half of an order-and-invoice update. If commit waits for
 storage, completed work is not repeated; a default that issued an order number
@@ -146,8 +196,8 @@ reads it gradually. Meanwhile other applications keep inserting orders. If the
 tool falls behind by more than `result_spool_bytes`, it receives the rows
 already queued followed by `54000` naming that setting, and its session stays
 usable. A large `SELECT` from one ordinary table or one builtin series such
-as `generate_series`, without sorting, grouping or joins, resumes row by row
-instead: it waits for the client and for cold storage without holding the
+as `generate_series`, also joined, sorted (local mode) or grouped with
+`GROUP BY` and aggregates, resumes row by row instead: it waits for the client and for cold storage without holding the
 worker, and rows already delivered are never repeated. A paged portal (an
 extended `Execute` with a row limit) over such a query evaluates rows only as
 each `Execute` asks for them, as PostgreSQL does, so
@@ -558,13 +608,20 @@ output names.
 A materialized view created `WITH NO DATA` fails ordinary reads with `55000`,
 including `LIMIT 0`. REFRESH requires MAINTAIN, runs as the owner and holds an
 exclusive lock until the transaction ends. Rollback restores both rows and
-populated status.
+populated status. Like a view, a materialized view owns a `_RETURN` rule in
+`pg_rewrite` whose `pg_depend` rows name each column it reads, so
+`ALTER TABLE orders ALTER COLUMN total TYPE numeric` fails with `0A000` while
+a materialized view reads `orders.total`. Rule commands on a materialized view
+fail as in PostgreSQL (`0A000` for `CREATE RULE`, `2BP01` for dropping
+`_RETURN`); only `COMMENT ON RULE "_RETURN"` is accepted.
 
 Rewrite rules take the target table's exclusive lock, so a rule that redirects
 an insert conflicts with ordinary reads of that table. `_RETURN` cannot be
-renamed. `pg_get_ruledef` supports both formatting modes for unconditional
-`DO NOTHING` rules; other rules return their saved SQL, and pretty formatting
-of a condition or action returns `0A000`. A missing rule returns NULL.
+renamed or dropped apart from its view. `pg_get_ruledef` supports both
+formatting modes for unconditional `DO NOTHING` rules and for `_RETURN` rules,
+whose action is printed as `pg_get_viewdef` prints the view; other rules
+return their saved SQL, and pretty formatting of a condition or action returns
+`0A000`. A missing rule returns NULL.
 
 ## Catalog listings and current lookups
 
@@ -587,8 +644,14 @@ columns have that script's domains (`sql_identifier`, `cardinal_number`,
 types with their CHECK constraints.
 
 Every table, materialized view and view has a row type named like the relation,
-usable in casts, columns and routine signatures; the relation owns it, so
-dropping the relation reaches the routines and columns that use it.
+usable in casts, columns, attributes of `CREATE TYPE ... AS`, PL/pgSQL
+variables and routine signatures; the relation owns it, so dropping the
+relation reaches the routines, columns, composite attributes and domains that
+use it. **Example:** after `CREATE TYPE wrap AS (o orders, n int)`,
+`DROP TABLE orders CASCADE` drops attribute `o` and keeps `wrap`, and
+`ALTER TABLE orders ALTER COLUMN total TYPE float8` fails with `0A000` while a
+table column stores `wrap` values. In PL/pgSQL, `r.total := 5` assigns one
+field of a row variable.
 
 Column defaults, CHECK constraints and routine defaults are printed in
 PostgreSQL's analyzed form for the expression shapes listed in

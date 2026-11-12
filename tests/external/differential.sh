@@ -113,6 +113,14 @@ if ! [[ "$POSTGRES_REGRESS_SHARD" =~ ^[0-9]+$ \
     "$POSTGRES_REGRESS_SHARD" "$POSTGRES_REGRESS_SHARDS"
   exit 1
 fi
+EXACT_SHARD=${POS3QL_EXACT_SHARD:-0}
+EXACT_SHARDS=${POS3QL_EXACT_SHARDS:-1}
+if ! [[ "$EXACT_SHARD" =~ ^[0-9]+$ && "$EXACT_SHARDS" =~ ^[1-9][0-9]*$ ]] \
+    || (( EXACT_SHARD >= EXACT_SHARDS )); then
+  printf 'FAIL: POS3QL_EXACT_SHARD must be in [0, POS3QL_EXACT_SHARDS) (got %q/%q)\n' \
+    "$EXACT_SHARD" "$EXACT_SHARDS"
+  exit 1
+fi
 want_auxiliary() { [[ "$DIFF_AUXILIARY" == all || "$DIFF_AUXILIARY" == "$1" ]]; }
 
 corpus_file_count=0
@@ -399,7 +407,10 @@ if want_auxiliary exact; then
 
 printf '%s\n' '' '=== exact-error corpora (message wording must match) ==='
 restart_pos3ql_clean
+exact_ordinal=0
 for f in $EXT/differential_exact/*.sql; do
+  exact_ordinal=$((exact_ordinal + 1))
+  (( (exact_ordinal - 1) % EXACT_SHARDS == EXACT_SHARD )) || continue
   name=$(basename "$f" .sql)
   run_corpus "$PG_PORT" "$name.pg" "$f" verbose || exit 1
   run_corpus "$P3_PORT" "$name.p3" "$f" verbose || exit 1

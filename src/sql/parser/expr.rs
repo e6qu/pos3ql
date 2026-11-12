@@ -225,7 +225,10 @@ impl<'a> Parser<'a> {
                         operand: None,
                         whens,
                         otherwise: Some(else_v),
-                        synthetic: true,
+                        origin: crate::sql::ast::CaseOrigin::BooleanTest {
+                            value: is_true,
+                            negated,
+                        },
                     })?;
                     continue;
                 }
@@ -263,6 +266,21 @@ impl<'a> Parser<'a> {
                     self.expect_op("]")?;
                     let index = lower.expect("non-slice subscript has an index");
                     left = self.arena_expr(Expr::Subscript { base: left, index })?;
+                }
+                // PostgreSQL's indirection continues with field selections:
+                // `items[1].price`, `items[1].*`.
+                while self.peeked == Tok::Op(".") {
+                    self.advance()?;
+                    if self.peeked == Tok::Op("*") {
+                        self.advance()?;
+                        left = self.arena_expr(Expr::Field {
+                            base: left,
+                            field: "*",
+                        })?;
+                        break;
+                    }
+                    let field = self.any_ident("field name")?;
+                    left = self.arena_expr(Expr::Field { base: left, field })?;
                 }
                 subscriptable = true;
                 continue;
@@ -356,6 +374,8 @@ impl<'a> Parser<'a> {
                         return Ok(left);
                     }
                 }
+                // A sublink is located at its keyword, NOT included.
+                let keyword_at = self.peek_at;
                 let negated = if self.peeked == Tok::Ident("not") {
                     self.advance()?;
                     // Infix NOT must introduce one of these forms.
@@ -382,11 +402,14 @@ impl<'a> Parser<'a> {
                             .arena
                             .alloc(select)
                             .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
-                        left = self.arena_expr(Expr::InSubquery {
-                            operand: left,
-                            select: boxed,
-                            negated,
-                        })?;
+                        left = self.arena_expr_at(
+                            Expr::InSubquery {
+                                operand: left,
+                                select: boxed,
+                                negated,
+                            },
+                            keyword_at,
+                        )?;
                         continue;
                     }
                     let mut list = ArenaList::new(self.arena);
@@ -568,6 +591,7 @@ impl<'a> Parser<'a> {
             if operator.precedence() < min_prec {
                 return Ok(left);
             }
+            let operator_at = self.peek_at;
             self.advance()?;
             // Quantified comparison: `operand operator ANY/ALL (array)` or
             // `... (subquery)`.
@@ -589,24 +613,33 @@ impl<'a> Parser<'a> {
                     // quantify over the subquery's collected result column
                     // (same truth table as the array forms, per PostgreSQL).
                     left = if operator == BinaryOp::Eq && !all {
-                        self.arena_expr(Expr::InSubquery {
-                            operand: left,
-                            select: boxed,
-                            negated: false,
-                        })?
+                        self.arena_expr_at(
+                            Expr::InSubquery {
+                                operand: left,
+                                select: boxed,
+                                negated: false,
+                            },
+                            operator_at,
+                        )?
                     } else if operator == BinaryOp::NotEq && all {
-                        self.arena_expr(Expr::InSubquery {
-                            operand: left,
-                            select: boxed,
-                            negated: true,
-                        })?
+                        self.arena_expr_at(
+                            Expr::InSubquery {
+                                operand: left,
+                                select: boxed,
+                                negated: true,
+                            },
+                            operator_at,
+                        )?
                     } else {
-                        self.arena_expr(Expr::QuantifiedSubquery {
-                            operand: left,
-                            operator,
-                            select: boxed,
-                            all,
-                        })?
+                        self.arena_expr_at(
+                            Expr::QuantifiedSubquery {
+                                operand: left,
+                                operator,
+                                select: boxed,
+                                all,
+                            },
+                            operator_at,
+                        )?
                     };
                     continue;
                 }
@@ -702,7 +735,18 @@ impl<'a> Parser<'a> {
             Tok::Param(n) => {
                 self.advance()?;
                 self.max_param = self.max_param.max(n);
-                self.arena_expr(Expr::Param(n))
+                // PostgreSQL's `PARAM opt_indirection`: `$1.field`, `$1.*`.
+                let mut base = self.arena_expr(Expr::Param(n))?;
+                while self.peeked == Tok::Op(".") {
+                    self.advance()?;
+                    if self.peeked == Tok::Op("*") {
+                        self.advance()?;
+                        return self.arena_expr(Expr::Field { base, field: "*" });
+                    }
+                    let field = self.any_ident("field name")?;
+                    base = self.arena_expr(Expr::Field { base, field })?;
+                }
+                Ok(base)
             }
             Tok::Op("(") => {
                 let source_position_at = self.peek_at;
@@ -715,7 +759,7 @@ impl<'a> Parser<'a> {
                         .alloc(select)
                         .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
                     self.parenthesized_primary = Some(source_position_at);
-                    return self.arena_expr(Expr::Subquery(boxed));
+                    return self.arena_expr_at(Expr::Subquery(boxed), source_position_at);
                 }
                 let inner = self.expression(0)?;
                 // A parenthesized comma list is either an OVERLAPS period pair
@@ -776,6 +820,25 @@ impl<'a> Parser<'a> {
                         return self.arena_expr(Expr::Field { base, field: "*" });
                     }
                     let field = self.any_ident("field name")?;
+                    // A field of a bound procedural record variable is
+                    // bound like `variable.field`, with the field's type.
+                    if let Expr::RoutineParam {
+                        qualifier: None,
+                        name,
+                        source: crate::sql::ast::ParameterSource::PlpgsqlCursor(_),
+                        ..
+                    } = base
+                        && let Some((index, source)) = self.qualified_routine_parameter(name, field)
+                    {
+                        self.max_param = self.max_param.max(index);
+                        base = self.arena_expr(Expr::RoutineParam {
+                            qualifier: Some(name),
+                            name: field,
+                            index,
+                            source,
+                        })?;
+                        continue;
+                    }
                     base = self.arena_expr(Expr::Field { base, field })?;
                 }
                 // An implicit row `(1, 2)` is not a parenthesized expression.
@@ -909,6 +972,7 @@ impl<'a> Parser<'a> {
                 })
             }
             Tok::Ident("exists") => {
+                let exists_at = self.peek_at;
                 self.advance()?;
                 self.expect_op("(")?;
                 let select = self.query_select()?;
@@ -917,7 +981,7 @@ impl<'a> Parser<'a> {
                     .arena
                     .alloc(select)
                     .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
-                self.arena_expr(Expr::Exists(boxed))
+                self.arena_expr_at(Expr::Exists(boxed), exists_at)
             }
             Tok::Ident("default") => {
                 self.advance()?;
@@ -953,7 +1017,7 @@ impl<'a> Parser<'a> {
                     operand,
                     whens: whens.as_slice(),
                     otherwise,
-                    synthetic: false,
+                    origin: crate::sql::ast::CaseOrigin::Written,
                 })
             }
             Tok::Ident("true") => {
@@ -1004,6 +1068,7 @@ impl<'a> Parser<'a> {
                 }
                 // `ARRAY(SELECT ...)` array-from-subquery constructor.
                 if name.eq_ignore_ascii_case("array") && self.peeked == Tok::Op("(") {
+                    let array_at = self.previous_token.map_or(self.peek_at, |token| token.1);
                     self.advance()?;
                     let select = self.query_select()?;
                     self.expect_op(")")?;
@@ -1011,7 +1076,7 @@ impl<'a> Parser<'a> {
                         .arena
                         .alloc(select)
                         .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
-                    return self.arena_expr(Expr::ArraySubquery(boxed));
+                    return self.arena_expr_at(Expr::ArraySubquery(boxed), array_at);
                 }
                 if name.eq_ignore_ascii_case("json") && self.peeked == Tok::Op("(") {
                     return self.sql_json_constructor();
@@ -1181,6 +1246,22 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         let third = self.any_ident("column name")?;
+                        if self.peeked == Tok::Op(".") {
+                            return self.catalog_qualified_column(name_at, name, column, third);
+                        }
+                        // `routine.parameter.field` names a field of a
+                        // composite parameter unless a relation answers.
+                        if self.routine_name == Some(name)
+                            && let Some((index, source)) = self.routine_parameter_field(column)
+                        {
+                            self.max_param = self.max_param.max(index);
+                            return self.arena_expr(Expr::RoutineParam {
+                                qualifier: Some(self.composed_qualifier(name, column)?),
+                                name: third,
+                                index,
+                                source,
+                            });
+                        }
                         return self.arena_expr(Expr::SchemaColumn {
                             schema: name,
                             table: column,
@@ -1290,6 +1371,22 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         let third = self.any_ident("column name")?;
+                        if self.peeked == Tok::Op(".") {
+                            return self.catalog_qualified_column(name_at, name, column, third);
+                        }
+                        // `routine.parameter.field` names a field of a
+                        // composite parameter unless a relation answers.
+                        if self.routine_name == Some(name)
+                            && let Some((index, source)) = self.routine_parameter_field(column)
+                        {
+                            self.max_param = self.max_param.max(index);
+                            return self.arena_expr(Expr::RoutineParam {
+                                qualifier: Some(self.composed_qualifier(name, column)?),
+                                name: third,
+                                index,
+                                source,
+                            });
+                        }
                         return self.arena_expr(Expr::SchemaColumn {
                             schema: name,
                             table: column,
@@ -2129,7 +2226,7 @@ impl<'a> Parser<'a> {
 
     /// Builds a simple function call `name(args)` (no star/distinct/over).
     pub(super) fn plain_call(
-        &mut self,
+        &self,
         name: &'a str,
         args: &[&'a Expr<'a>],
     ) -> Result<&'a Expr<'a>, ParseError> {
@@ -3309,6 +3406,20 @@ impl<'a> Parser<'a> {
         negated: bool,
     ) -> Result<&'a Expr<'a>, ParseError> {
         let source_position = SourcePosition::new(Some(self.peek_at));
+        if left.is_row_constructor() && right.is_row_constructor() {
+            // Row constructors are never NULL themselves; their fields are
+            // compared pairwise, so NULL fields make neither side unknown.
+            let same = self.plain_call(crate::sql::parser::ROWS_NOT_DISTINCT, &[left, right])?;
+            return if negated {
+                Ok(same)
+            } else {
+                self.arena_expr(Expr::Unary {
+                    source_position,
+                    operator: UnaryOp::Not,
+                    operand: same,
+                })
+            };
+        }
         let l_null = self.arena_expr(Expr::IsNull {
             operand: left,
             negated: false,
@@ -3329,17 +3440,23 @@ impl<'a> Parser<'a> {
             left: l_null,
             right: r_null,
         })?;
-        let cmp_op = if negated {
-            BinaryOp::Eq
-        } else {
-            BinaryOp::NotEq
-        };
-        let cmp = self.arena_expr(Expr::Binary {
+        // PostgreSQL's DistinctExpr calls the `=` operator's function and
+        // negates its result; it never looks up `<>`.
+        let equal = self.arena_expr(Expr::Binary {
             source_position,
-            operator: cmp_op,
+            operator: BinaryOp::Eq,
             left,
             right,
         })?;
+        let cmp = if negated {
+            equal
+        } else {
+            self.arena_expr(Expr::Unary {
+                source_position,
+                operator: UnaryOp::Not,
+                operand: equal,
+            })?
+        };
         let both_val = self.arena_expr(Expr::Bool(negated))?;
         let either_val = self.arena_expr(Expr::Bool(!negated))?;
         let whens = self.arena_slice(&[(both, both_val), (either, either_val)])?;
@@ -3347,7 +3464,7 @@ impl<'a> Parser<'a> {
             operand: None,
             whens,
             otherwise: Some(cmp),
-            synthetic: true,
+            origin: crate::sql::ast::CaseOrigin::DistinctFrom { negated },
         })
     }
 

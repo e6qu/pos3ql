@@ -30,6 +30,15 @@ pub(crate) struct SourceCopy {
 const NODE: usize = usize::MAX;
 
 impl SourceCopy {
+    /// Records that the sublink querying `select` was written at byte `at`.
+    pub(crate) fn query(select: &crate::sql::ast::Select<'_>, at: usize) -> Self {
+        Self {
+            address: core::ptr::from_ref(select) as usize,
+            len: NODE,
+            at,
+        }
+    }
+
     /// Records that the constant `expression` was written at byte `at`.
     pub(crate) fn node(expression: &crate::sql::ast::Expr<'_>, at: usize) -> Self {
         Self {
@@ -69,6 +78,7 @@ struct Pending {
     /// One-based character position, as the `P` field counts.
     position: Option<usize>,
     hint: Option<&'static str>,
+    note: Option<AnalysisNote>,
 }
 
 /// What PostgreSQL adds to an analysis error: its cursor and hint.
@@ -76,6 +86,57 @@ struct Pending {
 pub(crate) struct Annotation {
     pub(crate) position: Option<usize>,
     pub(crate) hint: Option<&'static str>,
+    pub(crate) note: Option<AnalysisNote>,
+}
+
+/// A computed DETAIL or HINT of a name-resolution error, kept beside the
+/// error it explains: it reaches the client only with that error (same
+/// SQLSTATE and message), so a probe that discards its error cannot attach
+/// text to an unrelated later one.
+#[derive(Clone, Copy)]
+pub(crate) enum AnalysisNote {
+    Detail(crate::util::StackStr<NOTE_BYTES>),
+    Hint(crate::util::StackStr<NOTE_BYTES>),
+}
+
+/// Two quoted identifiers of `NAMEDATALEN - 1` bytes plus the wording.
+const NOTE_BYTES: usize = 2 * crate::sql::lexer::MAX_IDENTIFIER_BYTES + 128;
+
+/// Attaches a computed DETAIL to `error`.
+pub(crate) fn with_detail(error: SqlError, detail: core::fmt::Arguments<'_>) -> SqlError {
+    note(error, AnalysisNote::Detail(note_text(detail)))
+}
+
+/// Attaches a computed HINT to `error`.
+pub(crate) fn with_computed_hint(error: SqlError, hint: core::fmt::Arguments<'_>) -> SqlError {
+    note(error, AnalysisNote::Hint(note_text(hint)))
+}
+
+fn note_text(text: core::fmt::Arguments<'_>) -> crate::util::StackStr<NOTE_BYTES> {
+    use core::fmt::Write as _;
+    let mut out = crate::util::StackStr::new();
+    let _ = out.write_fmt(text);
+    out
+}
+
+fn note(error: SqlError, note: AnalysisNote) -> SqlError {
+    if error.sqlstate.internal_control().is_some() {
+        return error;
+    }
+    let message_hash = message_hash(&error.message);
+    PENDING.with(|pending| {
+        let known = pending
+            .get()
+            .filter(|known| known.sqlstate == error.sqlstate && known.message_hash == message_hash);
+        pending.set(Some(Pending {
+            sqlstate: error.sqlstate,
+            message_hash,
+            position: known.and_then(|known| known.position),
+            hint: known.and_then(|known| known.hint),
+            note: Some(note),
+        }))
+    });
+    error
 }
 
 const FUNCTION_HINT: &str = "No function matches the given name and argument types. You might need to add explicit type casts.";
@@ -142,6 +203,31 @@ pub(crate) fn at_reference(error: SqlError, subject: &str) -> SqlError {
 
 /// The byte offset of `subject` in the installed statement text: a token the
 /// parser copied, or a slice of the text itself.
+/// A slice inside a token the lexer copied verbatim, such as a word of a
+/// dollar-quoted function body: the copy's text appears in the statement
+/// just after the token's opening delimiter.
+fn within_copy(
+    copies: &[SourceCopy],
+    source: Source,
+    address: usize,
+    len: usize,
+) -> Option<(usize, Source)> {
+    const MAX_DELIMITER: usize = 64;
+    let text = unsafe { core::slice::from_raw_parts(source.text, source.len) };
+    copies.iter().find_map(|copy| {
+        if copy.len == NODE || address < copy.address || address + len > copy.address + copy.len {
+            return None;
+        }
+        // The copy lives in the statement arena for the statement's duration.
+        let copied = unsafe { core::slice::from_raw_parts(copy.address as *const u8, copy.len) };
+        (0..=MAX_DELIMITER)
+            .find(|delimiter| {
+                text.get(copy.at + delimiter..copy.at + delimiter + copy.len) == Some(copied)
+            })
+            .map(|delimiter| (copy.at + delimiter + (address - copy.address), source))
+    })
+}
+
 fn locate(subject: &str) -> Option<(usize, Source)> {
     let source = SOURCE.with(Cell::get);
     if source.text.is_null() {
@@ -159,7 +245,7 @@ fn locate(subject: &str) -> Option<(usize, Source)> {
     }
     let start = source.text as usize;
     if address < start || address + subject.len() > start + source.len {
-        return None;
+        return within_copy(copies, source, address, subject.len());
     }
     let at = address - start;
     // A quoted token parsed without a copy map (a routine's query) is a
@@ -187,7 +273,12 @@ fn expression_start(expression: &crate::sql::ast::Expr<'_>) -> Option<(usize, So
             .map(|at| (at, source))
     };
     match expression {
-        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Null | Expr::Param(_) => {
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Param(_)
+        | Expr::Subquery(_) => {
             let address = core::ptr::from_ref(expression) as usize;
             // with_statement_source keeps the copy map alive with its text.
             let copies = unsafe { core::slice::from_raw_parts(source.copies, source.copies_len) };
@@ -197,7 +288,10 @@ fn expression_start(expression: &crate::sql::ast::Expr<'_>) -> Option<(usize, So
                 .map(|copy| (copy.at, source))
         }
         Expr::Str(text) | Expr::NumericLit(text) | Expr::BitLit(text) => locate(text),
-        Expr::Column { qualifier, name } => locate(qualifier.unwrap_or(name)),
+        Expr::Column { qualifier, name }
+        | Expr::RoutineParam {
+            qualifier, name, ..
+        } => locate(qualifier.unwrap_or(name)),
         Expr::Binary { left, .. } => expression_start(left),
         Expr::Cast {
             operand,
@@ -217,6 +311,15 @@ fn expression_start(expression: &crate::sql::ast::Expr<'_>) -> Option<(usize, So
         | Expr::Call {
             source_position, ..
         } => parsed(*source_position),
+        Expr::RecordFieldIndex {
+            base: Expr::RowSubquery { select, .. },
+            index,
+        } => match select.items.get(usize::from(*index)) {
+            Some(crate::sql::ast::SelectItem::Expr { expression, .. }) => {
+                expression_start(expression)
+            }
+            _ => None,
+        },
         Expr::IsNull { operand, .. }
         | Expr::Collate { operand, .. }
         | Expr::InList { operand, .. }
@@ -230,6 +333,89 @@ pub(crate) fn at_expression(error: SqlError, expression: &crate::sql::ast::Expr<
     let position = expression_start(expression).map(|(at, source)| character_position(source, at));
     record(&error, position, None);
     error
+}
+
+/// [`at_expression`] with PostgreSQL's hint.
+pub(crate) fn at_expression_with_hint(
+    error: SqlError,
+    expression: &crate::sql::ast::Expr<'_>,
+    hint: &'static str,
+) -> SqlError {
+    let position = expression_start(expression).map(|(at, source)| character_position(source, at));
+    record(&error, position, Some(hint));
+    error
+}
+
+/// Marks `error` as being about the node `expression` at the position the
+/// parser recorded for it: a subquery at its parenthesis, an `IN` or
+/// quantified sublink at its keyword or operator.
+pub(crate) fn at_node(error: SqlError, expression: &crate::sql::ast::Expr<'_>) -> SqlError {
+    let node = core::ptr::from_ref(expression) as usize;
+    let query = sublink_query(expression).map(|select| core::ptr::from_ref(select) as usize);
+    let source = SOURCE.with(Cell::get);
+    let position = (!source.copies.is_null())
+        .then(|| {
+            // with_statement_source keeps the copy map alive with its text.
+            let copies = unsafe { core::slice::from_raw_parts(source.copies, source.copies_len) };
+            let at = |address: usize| {
+                copies
+                    .iter()
+                    .find(|copy| copy.len == NODE && copy.address == address)
+                    .map(|copy| character_position(source, copy.at))
+            };
+            at(node).or_else(|| query.and_then(at))
+        })
+        .flatten();
+    record(&error, position, None);
+    error
+}
+
+/// [`at_node`] for a missing comparison operator of an `IN` or quantified
+/// sublink, with PostgreSQL's hint; other errors pass through.
+pub(crate) fn operator_at_node(
+    error: SqlError,
+    expression: &crate::sql::ast::Expr<'_>,
+) -> SqlError {
+    if error.sqlstate != crate::sql::eval::sqlstate::UNDEFINED_FUNCTION
+        || !error
+            .message
+            .as_str()
+            .starts_with("operator does not exist: ")
+    {
+        return error;
+    }
+    let error = at_node(error, expression);
+    record(&error, None, Some(BINARY_OPERATOR_HINT));
+    error
+}
+
+/// Marks `error` as being about a select-list item: `t.*` at its
+/// qualifier, a bare `*` where the parser read it.
+pub(crate) fn at_item(error: SqlError, item: &crate::sql::ast::SelectItem<'_>) -> SqlError {
+    use crate::sql::ast::SelectItem;
+    match item {
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+            at_expression(error, expression)
+        }
+        SelectItem::TableWildcard(qualifier) => at_reference(error, qualifier),
+        SelectItem::Wildcard(at) => at_parsed_offset(error, at.get()),
+    }
+}
+
+/// The query of a sublink expression.
+pub(crate) fn sublink_query<'e, 'a>(
+    expression: &'e crate::sql::ast::Expr<'a>,
+) -> Option<&'e crate::sql::ast::Select<'a>> {
+    use crate::sql::ast::Expr;
+    match expression {
+        Expr::Subquery(select)
+        | Expr::ArraySubquery(select)
+        | Expr::Exists(select)
+        | Expr::RowSubquery { select, .. }
+        | Expr::InSubquery { select, .. }
+        | Expr::QuantifiedSubquery { select, .. } => Some(select),
+        _ => None,
+    }
 }
 
 /// One-based character position of byte offset `at` in the source text.
@@ -383,6 +569,7 @@ fn record(error: &SqlError, position: Option<usize>, hint: Option<&'static str>)
             message_hash,
             position: known.and_then(|known| known.position).or(position),
             hint: known.and_then(|known| known.hint).or(hint),
+            note: known.and_then(|known| known.note),
         }))
     });
 }
@@ -449,12 +636,44 @@ pub(crate) fn with_internal_source<R>(text: &str, run: impl FnOnce() -> R) -> R 
     run()
 }
 
-/// Runs `run` positioning relation and column lookups in the installed
-/// statement text, for a query written inside a utility statement such as
-/// the body of `CREATE FUNCTION ... BEGIN ATOMIC`.
-pub(crate) fn with_analysis<R>(run: impl FnOnce() -> R) -> R {
+/// Runs `run` positioning subjects inside `copy`, a verbatim copy of
+/// `written`, where `written` appears in the installed statement text.
+pub(crate) fn with_copied_source<R>(written: &str, copy: &str, run: impl FnOnce() -> R) -> R {
+    let Some((at, current)) = locate(written) else {
+        return run();
+    };
+    let copies = [SourceCopy {
+        address: copy.as_ptr() as usize,
+        len: copy.len(),
+        at,
+    }];
     let _scope = SourceScope(
-        SOURCE.with(Cell::get),
+        SOURCE.with(|installed| {
+            installed.replace(Source {
+                copies: copies.as_ptr(),
+                copies_len: copies.len(),
+                ..current
+            })
+        }),
+        ANALYZED.with(Cell::get),
+    );
+    run()
+}
+
+/// Runs `run` positioning relation and column lookups in the installed
+/// statement text, for queries parsed from `text`, a slice of it written
+/// inside a utility statement (a `CREATE FUNCTION ... BEGIN ATOMIC` body):
+/// their parsed offsets count from the slice's start.
+pub(crate) fn with_analysis_in<R>(text: &str, run: impl FnOnce() -> R) -> R {
+    let current = SOURCE.with(Cell::get);
+    let start = current.text as usize;
+    let address = text.as_ptr() as usize;
+    let mut source = current;
+    if !current.text.is_null() && address >= start && address + text.len() <= start + current.len {
+        source.offset_base = address - start;
+    }
+    let _scope = SourceScope(
+        SOURCE.with(|installed| installed.replace(source)),
         ANALYZED.with(|flag| flag.replace(true)),
     );
     run()
@@ -483,6 +702,7 @@ pub(crate) fn take_annotation(sqlstate: &str, message: &dyn core::fmt::Display) 
         Annotation {
             position: pending.position,
             hint: pending.hint,
+            note: pending.note,
         }
     } else {
         Annotation::default()
@@ -494,6 +714,11 @@ pub(crate) fn take_annotation(sqlstate: &str, message: &dyn core::fmt::Display) 
 /// column and a missing or invalid FROM-clause entry.
 pub(crate) fn column_reference(error: SqlError, qualifier: Option<&str>, name: &str) -> SqlError {
     use crate::sql::eval::sqlstate;
+    // PL/pgSQL reports a record variable's missing field without a position.
+    let message = error.message.as_str();
+    if message.starts_with("record \"") && message.contains("\" has no field \"") {
+        return error;
+    }
     if matches!(
         error.sqlstate.as_str(),
         sqlstate::UNDEFINED_COLUMN

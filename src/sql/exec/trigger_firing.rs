@@ -342,6 +342,7 @@ impl SavedBinding {
             input_collation: input.input_collation,
             input_sites: &[],
             variable_conflict: input.variable_conflict,
+            print_strict_params: input.print_strict_params,
             fresh_snapshots: input.fresh_snapshots,
             materialized_relations: None,
             nargs: input.nargs,
@@ -588,7 +589,7 @@ fn resume<'run>(
                 Ok(active) => active,
                 Err(error) => return Err(ResumeError::Unattached(frame, error)),
             };
-            let (parsed, code) = match frame.source().parse(context.arena) {
+            let (parsed, code) = match frame.source().parse(context.arena, None) {
                 Ok(parsed) => parsed,
                 Err(error) => return Err(ResumeError::Unattached(frame, error)),
             };

@@ -9,7 +9,7 @@
 use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::Responder;
 use crate::sql::ast::{Collation, Expr, OrderBy, Select, SelectItem, SetOp, SetQuery, SetTree};
-use crate::sql::eval::{ColumnLookup, SequenceAccess, SqlError, compare_datums_collated, sqlstate};
+use crate::sql::eval::{ColumnLookup, SequenceAccess, SqlError, sqlstate};
 use crate::sql::exec::{self, MAX_PROJ};
 use crate::sql::external::ExternalRun;
 use crate::sql::types::{ColDesc, ColType, CollationDerivation, Datum};
@@ -36,12 +36,14 @@ struct ExternalSetContext<'scope, 'a> {
 /// type; the operators combine those multisets; then the trailing ORDER BY /
 /// LIMIT / OFFSET apply to the whole result. Grouped/DISTINCT/aggregate leaves
 /// are rejected loudly (they flow through `select_into_rows`).
+#[allow(clippy::too_many_arguments)]
 pub fn set_query<'a>(
     storage: &'a Storage,
     txid: u32,
     q: &'a SetQuery<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    dml_mats: &[(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)],
     sequences: Option<&dyn SequenceAccess>,
     responder: &mut Responder,
 ) -> Outcome {
@@ -64,7 +66,9 @@ pub fn set_query<'a>(
         ));
     }
     // WITH CTEs and view references expand across the whole tree first.
-    let body = match expand_set_tree_exec(q.with, q.body, storage, txid, arena, params, sequences) {
+    let body = match expand_set_tree_exec(
+        q.with, q.body, storage, txid, arena, params, dml_mats, sequences,
+    ) {
         Ok(b) => b,
         Err(e) => return sql_fail(e),
     };
@@ -83,6 +87,10 @@ pub fn set_query<'a>(
         Ok(n) => n,
         Err(e) => return sql_fail(e),
     };
+    if let Err(error) = require_set_equality_execute(storage, txid, arena, body, &columns[..n_cols])
+    {
+        return sql_fail(error);
+    }
     let mut target = [ColType::Bool; MAX_PROJ];
     for (c, col) in columns[..n_cols].iter().enumerate() {
         let Some((ctype, _)) = exec::catalog_column_type(storage, txid, col.type_oid) else {
@@ -215,7 +223,14 @@ pub(crate) fn set_query_into_rows<'a>(
         ));
     }
     let body = expand_set_tree_exec(
-        query.with, query.body, storage, txid, arena, params, sequences,
+        query.with,
+        query.body,
+        storage,
+        txid,
+        arena,
+        params,
+        &[],
+        sequences,
     )?;
     if storage.spill_attached() {
         return external_set_body_into(
@@ -244,6 +259,7 @@ pub(crate) fn set_query_into_rows<'a>(
         crate::sql::exec::DescriptionTarget::Sql,
         None,
     )?;
+    require_set_equality_execute(storage, txid, arena, body, &columns[..column_count])?;
     let mut target = [ColType::Bool; MAX_PROJ];
     for (column, desc) in columns[..column_count].iter().enumerate() {
         target[column] = exec::catalog_column_type(storage, txid, desc.type_oid)
@@ -306,12 +322,40 @@ pub(crate) fn set_query_into_rows<'a>(
     Ok(())
 }
 
-fn byte_order(left: &[u8], right: &[u8]) -> Result<core::cmp::Ordering, SqlError> {
-    Ok(left.cmp(right))
+/// Whether the reader's current row equals `row` under SQL equality.
+fn same_set_row(
+    storage: &Storage,
+    txid: u32,
+    current: Option<&[u8]>,
+    row: &[u8],
+) -> Result<bool, SqlError> {
+    Ok(match current {
+        Some(current) => exec::compare_projected_rows(storage, txid, current, row)?.is_eq(),
+        None => false,
+    })
 }
 
-fn insertion_order(_left: &[u8], _right: &[u8]) -> Result<core::cmp::Ordering, SqlError> {
-    Ok(core::cmp::Ordering::Equal)
+/// Advances past the reader's staged current row and its duplicates and
+/// returns how many there were. The staged row counts without comparing it to
+/// itself: like PostgreSQL's sorted grouping, only distinct input rows are
+/// compared, so a record field without an ordering is reached only when an
+/// earlier field ties between two rows.
+fn skip_set_duplicates(
+    storage: &Storage,
+    txid: u32,
+    reader: &mut crate::sql::external::ExternalRunReader,
+    staged: usize,
+) -> Result<u64, SqlError> {
+    let mut count = 0u64;
+    loop {
+        count += 1;
+        storage
+            .with_block_store(|blocks| reader.advance(blocks))
+            .expect("spill-attached block store")?;
+        if !same_set_row(storage, txid, reader.row(), reader.output(staged))? {
+            return Ok(count);
+        }
+    }
 }
 
 fn resolve_set_order(
@@ -381,6 +425,29 @@ fn reject_missing_ordering(type_oid: i32) -> Result<(), SqlError> {
     Ok(())
 }
 
+/// Duplicate-removing set operations call each output type's `=` function,
+/// which PostgreSQL's executor checks for EXECUTE.
+fn require_set_equality_execute(
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    tree: &SetTree<'_>,
+    columns: &[ColDesc<'_>],
+) -> Result<(), SqlError> {
+    use crate::sql::eval::CatalogAccess;
+    let catalog = super::storage_catalog(storage, arena, txid);
+    if !catalog.builtin_routine_privileges_present() || !set_tree_requires_equality(tree) {
+        return Ok(());
+    }
+    for column in columns {
+        let oid = catalog
+            .domain_base_type(column.type_oid)
+            .map_or(column.type_oid, ColType::oid);
+        crate::sql::eval::require_builtin_operator_types_execute(&catalog, "=", Some(oid), oid)?;
+    }
+    Ok(())
+}
+
 fn set_tree_requires_equality(tree: &SetTree<'_>) -> bool {
     match tree {
         SetTree::Select(_) => false,
@@ -407,29 +474,14 @@ fn compare_set_order(
     keys: &[(usize, bool, bool)],
 ) -> Result<core::cmp::Ordering, SqlError> {
     for &(index, descending, nulls_first) in keys {
-        let left_value = exec::decode_projected_pub(left, index);
-        let right_value = exec::decode_projected_pub(right, index);
-        let ordering = match (left_value.is_null(), right_value.is_null()) {
-            (true, true) => core::cmp::Ordering::Equal,
-            (true, false) if nulls_first => core::cmp::Ordering::Less,
-            (true, false) => core::cmp::Ordering::Greater,
-            (false, true) if nulls_first => core::cmp::Ordering::Greater,
-            (false, true) => core::cmp::Ordering::Less,
-            (false, false) => {
-                let ordering = compare_datums_collated(
-                    storage,
-                    txid,
-                    columns[index].collation,
-                    &left_value,
-                    &right_value,
-                )?;
-                if descending {
-                    ordering.reverse()
-                } else {
-                    ordering
-                }
-            }
-        };
+        let ordering = super::materialize::compare_ordered_key(
+            storage,
+            txid,
+            columns[index].collation,
+            (descending, nulls_first),
+            exec::ProjectedValue::column(left, index),
+            exec::ProjectedValue::column(right, index),
+        )?;
         if !ordering.is_eq() {
             return Ok(ordering);
         }
@@ -466,10 +518,12 @@ fn external_set_leaf<'a>(
 ) -> Result<Option<ExternalRun>, SqlError> {
     let mut sorter = context.storage.external_sorter()?;
     sorter.reset();
-    let mut compare = if sorted {
-        byte_order as fn(&[u8], &[u8]) -> Result<_, _>
-    } else {
-        insertion_order as fn(&[u8], &[u8]) -> Result<_, _>
+    let mut compare = |left: &[u8], right: &[u8]| {
+        if sorted {
+            exec::compare_projected_rows(context.storage, context.txid, left, right)
+        } else {
+            Ok(core::cmp::Ordering::Equal)
+        }
     };
     select_into_rows_recycling(
         context.storage,
@@ -534,10 +588,13 @@ fn external_set_tree<'a>(
 
     let mut sorter = context.storage.external_sorter()?;
     sorter.reset();
-    let mut output_compare = if sorted || merge_inputs {
-        byte_order as fn(&[u8], &[u8]) -> Result<_, _>
-    } else {
-        insertion_order as fn(&[u8], &[u8]) -> Result<_, _>
+    let output_sorted = sorted || merge_inputs;
+    let mut output_compare = |left: &[u8], right: &[u8]| {
+        if output_sorted {
+            exec::compare_projected_rows(context.storage, context.txid, left, right)
+        } else {
+            Ok(core::cmp::Ordering::Equal)
+        }
     };
     if *operator == SetOp::Union && *all {
         let mut reader = context.storage.external_run_reader()?;
@@ -574,16 +631,17 @@ fn external_set_tree<'a>(
         }
         while left_reader.row().is_some() {
             let left_length = left_reader.stage_current().expect("current left row");
-            let mut left_count = 0u64;
-            while left_reader.row() == Some(left_reader.output(left_length)) {
-                left_count += 1;
-                context
-                    .storage
-                    .with_block_store(|blocks| left_reader.advance(blocks))
-                    .expect("spill-attached block store")?;
-            }
+            let left_count =
+                skip_set_duplicates(context.storage, context.txid, &mut left_reader, left_length)?;
             let left_row = left_reader.output(left_length);
-            while right_reader.row().is_some_and(|row| row < left_row) {
+            while right_reader
+                .row()
+                .map(|row| {
+                    exec::compare_projected_rows(context.storage, context.txid, row, left_row)
+                })
+                .transpose()?
+                .is_some_and(|order| order.is_lt())
+            {
                 let right_length = right_reader.stage_current().expect("current right row");
                 if *operator == SetOp::Union {
                     context
@@ -597,15 +655,15 @@ fn external_set_tree<'a>(
                         })
                         .expect("spill-attached block store")?;
                 }
-                while right_reader.row() == Some(right_reader.output(right_length)) {
-                    context
-                        .storage
-                        .with_block_store(|blocks| right_reader.advance(blocks))
-                        .expect("spill-attached block store")?;
-                }
+                skip_set_duplicates(
+                    context.storage,
+                    context.txid,
+                    &mut right_reader,
+                    right_length,
+                )?;
             }
             let mut right_count = 0u64;
-            while right_reader.row() == Some(left_row) {
+            while same_set_row(context.storage, context.txid, right_reader.row(), left_row)? {
                 right_count += 1;
                 context
                     .storage
@@ -642,12 +700,12 @@ fn external_set_tree<'a>(
                         )
                     })
                     .expect("spill-attached block store")?;
-                while right_reader.row() == Some(right_reader.output(right_length)) {
-                    context
-                        .storage
-                        .with_block_store(|blocks| right_reader.advance(blocks))
-                        .expect("spill-attached block store")?;
-                }
+                skip_set_duplicates(
+                    context.storage,
+                    context.txid,
+                    &mut right_reader,
+                    right_length,
+                )?;
             }
         }
     } else if *operator == SetOp::Union && !*all {
@@ -669,12 +727,7 @@ fn external_set_tree<'a>(
                         )
                     })
                     .expect("spill-attached block store")?;
-                while reader.row() == Some(reader.output(right_length)) {
-                    context
-                        .storage
-                        .with_block_store(|blocks| reader.advance(blocks))
-                        .expect("spill-attached block store")?;
-                }
+                skip_set_duplicates(context.storage, context.txid, &mut reader, right_length)?;
             }
         }
     }
@@ -725,6 +778,7 @@ pub(crate) fn external_set_body_into<'a>(
         crate::sql::exec::DescriptionTarget::Sql,
         outer,
     )?;
+    require_set_equality_execute(storage, txid, arena, tree, &columns[..column_count])?;
     let mut target = [ColType::Bool; MAX_PROJ];
     for column in 0..column_count {
         target[column] = exec::catalog_column_type(storage, txid, columns[column].type_oid)
@@ -990,7 +1044,7 @@ fn external_set_query<'a>(
 }
 
 /// Walks a set tree collecting its SELECT leaves left-to-right.
-fn collect_set_leaves<'a>(
+pub(super) fn collect_set_leaves<'a>(
     tree: &'a SetTree<'a>,
     out: &mut ArenaList<'a, &'a Select<'a>>,
 ) -> Result<(), SqlError> {
@@ -1030,6 +1084,13 @@ fn leaf_col_unknown<'a>(
                     if matches!(expression, Expr::Cast { .. }) {
                         return false;
                     }
+                    // An untyped literal stays unknown whatever the FROM.
+                    if matches!(
+                        exec::infer_type_pub(expression, None).map(|t| t.0),
+                        Ok(crate::sql::types::oid::UNKNOWN)
+                    ) {
+                        return true;
+                    }
                     let scratch_mark = arena.mark();
                     let raw = match &s.from {
                         None => exec::infer_type_pub(expression, None).map(|t| t.0),
@@ -1045,7 +1106,7 @@ fn leaf_col_unknown<'a>(
                 }
                 idx += 1;
             }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => {
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => {
                 return false;
             }
         }
@@ -1054,15 +1115,18 @@ fn leaf_col_unknown<'a>(
 }
 
 /// Column descriptions of a set-operation leaf (FROM-less or table-backed).
-fn describe_leaf<'a>(
+fn describe_leaf<'a, 'o>(
     storage: &'a Storage,
     s: &'a Select<'a>,
     txid: u32,
     columns: &mut [ColDesc<'a>],
     arena: &'a Arena,
     type_oids: &mut [i32],
-    outer: Option<&dyn ColumnLookup<'a>>,
-) -> Result<usize, SqlError> {
+    outer: Option<&dyn ColumnLookup<'o>>,
+) -> Result<usize, SqlError>
+where
+    'a: 'o,
+{
     let mark = arena.mark();
     let result = (|| {
         let count = describe_leaf_inner(storage, s, txid, columns, arena, type_oids, outer)?;
@@ -1083,15 +1147,18 @@ fn describe_leaf<'a>(
     Ok(count)
 }
 
-fn describe_leaf_inner<'a>(
+fn describe_leaf_inner<'a, 'o>(
     storage: &'a Storage,
     s: &'a Select<'a>,
     txid: u32,
     columns: &mut [ColDesc<'a>],
     arena: &'a Arena,
     type_oids: &mut [i32],
-    outer: Option<&dyn ColumnLookup<'a>>,
-) -> Result<usize, SqlError> {
+    outer: Option<&dyn ColumnLookup<'o>>,
+) -> Result<usize, SqlError>
+where
+    'a: 'o,
+{
     if let Some(tree) = s.set_body {
         return describe_set_body(
             storage,
@@ -1163,7 +1230,7 @@ fn describe_leaf_inner<'a>(
                 Some(&scope),
                 &super::CatalogScopeCols {
                     scope: &scope,
-                    outer_scope: None,
+                    outer: None,
                     storage,
                     txid,
                     arena,
@@ -1358,7 +1425,7 @@ fn register_record_shapes_inner(
     let mut slot = 0usize;
     for item in statement.items {
         match item {
-            SelectItem::Wildcard => slot += scope.map_or(0, QueryScope::star_columns),
+            SelectItem::Wildcard(_) => slot += scope.map_or(0, QueryScope::star_columns),
             SelectItem::TableWildcard(name) => {
                 slot += scope
                     .and_then(|scope| scope.qualified_star_columns(name).ok())
@@ -1430,6 +1497,23 @@ pub(crate) fn unify_set_type(a: ColType, b: ColType) -> Option<ColType> {
     if numeric(a) && numeric(b) {
         return Some(exec::unify_numeric_tower(a, b));
     }
+    // The string category: PostgreSQL's select_common_type keeps the
+    // running type unless it is not the preferred `text` and only it casts
+    // implicitly to the next one, so `varchar UNION text` stays varchar.
+    let string = |t| {
+        matches!(
+            t,
+            ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name
+        )
+    };
+    if string(a) && string(b) {
+        let implicit = |from, to| from != ColType::Name || to == ColType::Text;
+        return Some(if a != ColType::Text && implicit(a, b) && !implicit(b, a) {
+            b
+        } else {
+            a
+        });
+    }
     None
 }
 
@@ -1481,7 +1565,7 @@ fn eval_set_tree<'a>(
     clippy::too_many_arguments,
     reason = "set output uses the same outer scope as execution"
 )]
-pub(crate) fn describe_set_body<'a>(
+pub(crate) fn describe_set_body<'a, 'o>(
     storage: &'a Storage,
     tree: &'a SetTree<'a>,
     txid: u32,
@@ -1489,8 +1573,11 @@ pub(crate) fn describe_set_body<'a>(
     arena: &'a Arena,
     type_oids: Option<&mut [i32]>,
     description_target: crate::sql::exec::DescriptionTarget,
-    outer: Option<&dyn ColumnLookup<'a>>,
-) -> Result<usize, SqlError> {
+    outer: Option<&dyn ColumnLookup<'o>>,
+) -> Result<usize, SqlError>
+where
+    'a: 'o,
+{
     let mut leaves = ArenaList::new(arena);
     collect_set_leaves(tree, &mut leaves)?;
     let leaves = leaves.as_slice();
@@ -1505,6 +1592,9 @@ pub(crate) fn describe_set_body<'a>(
     // type of the other branches, as PostgreSQL resolves an unknown literal).
     let mut target: [Option<ColType>; MAX_PROJ] = [None; MAX_PROJ];
     let mut identical_types: [Option<i32>; MAX_PROJ] = [None; MAX_PROJ];
+    // PostgreSQL keeps a column's type modifier only when every input has
+    // the same type and modifier (select_common_typmod).
+    let mut identical_mods: [bool; MAX_PROJ] = [true; MAX_PROJ];
     for (c, col) in columns[..n_cols].iter().enumerate() {
         let unknown = leaf_col_unknown(storage, leaf0, c, txid, arena);
         identical_types[c] = Some(if unknown {
@@ -1554,6 +1644,9 @@ pub(crate) fn describe_set_body<'a>(
             };
             if identical_types[c] != Some(input_oid) {
                 identical_types[c] = None;
+            }
+            if lc[c].type_mod != columns[c].type_mod {
+                identical_mods[c] = false;
             }
             if unknown {
                 continue; // an untyped NULL column adopts the running type
@@ -1606,6 +1699,11 @@ pub(crate) fn describe_set_body<'a>(
             .filter(|oid| *oid != crate::sql::types::oid::UNKNOWN)
             .unwrap_or_else(|| target[c].oid());
         col.typlen = target[c].typlen();
+        // An anonymous record keeps the leftmost input's shape, which
+        // PostgreSQL's field selection reads through a set operation.
+        if (identical_types[c].is_none() || !identical_mods[c]) && target[c] != ColType::Record {
+            col.type_mod = -1;
+        }
     }
     // Set operations retain a domain only when every input has that declared type.
     if let Some(type_oids) = type_oids {
@@ -1698,6 +1796,7 @@ pub(super) fn materialize_set_body_tied<'a>(
         crate::sql::exec::DescriptionTarget::Sql,
         outer,
     )?;
+    require_set_equality_execute(storage, txid, arena, tree, &columns[..n])?;
     let mut tgt = [ColType::Bool; MAX_PROJ];
     for c in 0..n {
         tgt[c] = exec::catalog_column_type(storage, txid, columns[c].type_oid)
@@ -1794,32 +1893,13 @@ fn combine_sets<'a>(
     // UNION ALL preserves order (left rows then right, as scanned); only the
     // distinct set operations sort to merge/dedup.
     if !(operator == SetOp::Union && all) {
-        let mut error = None;
-        crate::mem::arena::stable_sort_via(arena, l, |left, right| {
-            match compare_set_rows(storage, txid, collations, left, right) {
-                Ok(ordering) => ordering,
-                Err(value) => {
-                    error = Some(value);
-                    core::cmp::Ordering::Equal
-                }
-            }
-        })
-        .map_err(|_| arena_full())?;
-        if let Some(error) = error {
-            return Err(error);
-        }
-        crate::mem::arena::stable_sort_via(arena, r, |left, right| {
-            match compare_set_rows(storage, txid, collations, left, right) {
-                Ok(ordering) => ordering,
-                Err(value) => {
-                    error = Some(value);
-                    core::cmp::Ordering::Equal
-                }
-            }
-        })
-        .map_err(|_| arena_full())?;
-        if let Some(error) = error {
-            return Err(error);
+        for rows in [&mut *l, &mut *r] {
+            crate::mem::arena::try_stable_sort_via(
+                arena,
+                rows,
+                |left, right| compare_set_rows(storage, txid, collations, left, right),
+                |_| arena_full(),
+            )?;
         }
     }
     let empty: &[u8] = &[];
@@ -1910,16 +1990,13 @@ fn compare_set_rows(
     right: &[u8],
 ) -> Result<core::cmp::Ordering, SqlError> {
     for (index, &collation) in collations.iter().enumerate() {
-        let left_value = exec::decode_projected_pub(left, index);
-        let right_value = exec::decode_projected_pub(right, index);
-        let ordering = match (left_value.is_null(), right_value.is_null()) {
-            (true, true) => core::cmp::Ordering::Equal,
-            (true, false) => core::cmp::Ordering::Less,
-            (false, true) => core::cmp::Ordering::Greater,
-            (false, false) => {
-                compare_datums_collated(storage, txid, collation, &left_value, &right_value)?
-            }
-        };
+        let ordering = super::materialize::compare_materialized_key(
+            storage,
+            txid,
+            collation,
+            exec::ProjectedValue::column(left, index),
+            exec::ProjectedValue::column(right, index),
+        )?;
         if !ordering.is_eq() {
             return Ok(ordering);
         }
@@ -1958,16 +2035,15 @@ pub(crate) fn set_rows_tie(
             },
             _ => return Ok(false),
         };
-        let va = exec::decode_projected_pub(a, index);
-        let vb = exec::decode_projected_pub(b, index);
-        let equal = match (va.is_null(), vb.is_null()) {
-            (true, true) => true,
-            (false, false) => {
-                compare_datums_collated(storage, txid, columns[index].collation, &va, &vb)?.is_eq()
-            }
-            _ => false,
-        };
-        if !equal {
+        if !super::materialize::compare_materialized_key(
+            storage,
+            txid,
+            columns[index].collation,
+            exec::ProjectedValue::column(a, index),
+            exec::ProjectedValue::column(b, index),
+        )?
+        .is_eq()
+        {
             return Ok(false);
         }
     }
@@ -2027,56 +2103,10 @@ pub(crate) fn sort_set_rows(
         nk += 1;
     }
     let keys = &keys[..nk];
-    let mut err: Option<SqlError> = None;
-    crate::mem::arena::stable_sort_via(arena, rows, |a, b| {
-        if err.is_some() {
-            return core::cmp::Ordering::Equal;
-        }
-        for &(index, descending, nulls_first) in keys {
-            let va = exec::decode_projected_pub(a, index);
-            let vb = exec::decode_projected_pub(b, index);
-            let ord = match (va.is_null(), vb.is_null()) {
-                (true, true) => core::cmp::Ordering::Equal,
-                (true, false) => {
-                    if nulls_first {
-                        core::cmp::Ordering::Less
-                    } else {
-                        core::cmp::Ordering::Greater
-                    }
-                }
-                (false, true) => {
-                    if nulls_first {
-                        core::cmp::Ordering::Greater
-                    } else {
-                        core::cmp::Ordering::Less
-                    }
-                }
-                (false, false) => {
-                    match compare_datums_collated(storage, txid, columns[index].collation, &va, &vb)
-                    {
-                        Ok(o) => {
-                            if descending {
-                                o.reverse()
-                            } else {
-                                o
-                            }
-                        }
-                        Err(e) => {
-                            err = Some(e);
-                            core::cmp::Ordering::Equal
-                        }
-                    }
-                }
-            };
-            if ord != core::cmp::Ordering::Equal {
-                return ord;
-            }
-        }
-        core::cmp::Ordering::Equal
-    })
-    .map_err(|_| arena_full())?;
-    match err {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
+    crate::mem::arena::try_stable_sort_via(
+        arena,
+        rows,
+        |a, b| compare_set_order(storage, txid, columns, a, b, keys),
+        |_| arena_full(),
+    )
 }

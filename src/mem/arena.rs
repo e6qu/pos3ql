@@ -907,16 +907,34 @@ pub fn stable_sort_via<T>(
     items: &mut [T],
     mut cmp: impl FnMut(&T, &T) -> core::cmp::Ordering,
 ) -> Result<(), ArenaFull> {
+    try_stable_sort_via(arena, items, |a, b| Ok(cmp(a, b)), |full| full)
+}
+
+/// [`stable_sort_via`] with a fallible comparison: the first comparison
+/// error stops the sort and is returned, leaving `items` in their original
+/// order; `arena_full` reports exhaustion of the staging space.
+pub fn try_stable_sort_via<T, E>(
+    arena: &Arena,
+    items: &mut [T],
+    mut cmp: impl FnMut(&T, &T) -> Result<core::cmp::Ordering, E>,
+    arena_full: impl FnOnce(ArenaFull) -> E,
+) -> Result<(), E> {
     let n = items.len();
     if n < 2 {
         return Ok(());
     }
-    let perm = arena.alloc_slice_with(n, |i| i as u32)?;
-    perm.sort_unstable_by(|&a, &b| {
-        cmp(&items[a as usize], &items[b as usize]).then_with(|| a.cmp(&b))
-    });
+    let (perm, visited) = match arena.alloc_slice_with(n, |i| i as u32).and_then(|perm| {
+        arena
+            .alloc_slice_with(n, |_| false)
+            .map(|visited| (perm, visited))
+    }) {
+        Ok(staged) => staged,
+        Err(full) => return Err(arena_full(full)),
+    };
+    crate::util::try_sort_unstable_by(perm, |&a, &b| {
+        Ok(cmp(&items[a as usize], &items[b as usize])?.then_with(|| a.cmp(&b)))
+    })?;
     // Apply the permutation by cycles: each element moves at most once.
-    let visited = arena.alloc_slice_with(n, |_| false)?;
     for start in 0..n {
         if visited[start] || perm[start] as usize == start {
             visited[start] = true;

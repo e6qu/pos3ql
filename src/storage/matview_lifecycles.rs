@@ -384,7 +384,9 @@ impl Storage {
             target.catalog.source,
             transaction,
             |comment| {
-                matches!(comment.class, CommentClass::Relation | CommentClass::Type)
+                // The view's `_RETURN` rule is named by its backing relation.
+                let rule = super::RuleTarget::Table(view.backing_table).comment_subid();
+                (matches!(comment.class, CommentClass::Relation | CommentClass::Type)
                     && comment.matches_to(
                         Some(current_database()),
                         comment.class,
@@ -392,7 +394,17 @@ impl Storage {
                         name.as_str(),
                         comment.subid,
                         transaction,
-                    )
+                    ))
+                    || (comment.class == CommentClass::Rule
+                        && comment.subid == rule
+                        && comment.matches_to(
+                            Some(current_database()),
+                            CommentClass::Rule,
+                            "",
+                            "_RETURN",
+                            rule,
+                            transaction,
+                        ))
             },
         )?;
         owners.catalog[slot].ddl_state = view.ddl_state.drop_by(transaction);

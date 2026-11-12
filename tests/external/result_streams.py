@@ -5,7 +5,7 @@ Client A sends a large simple Query, then the same result through an unpaged
 extended Execute (Parse/Bind/Execute(0)/Sync) and through a paged portal
 (Execute with a row limit, repeated, then Execute(0)), and stops reading with
 a small receive buffer. The results are a generated series, a scan
-of one table, joins and sorts (pos3ql resumes them row by row, and evaluates
+of one table, joins, sorts, groupings, DISTINCT and UNION ALL (pos3ql resumes them row by row, and evaluates
 a paged portal's rows as each Execute asks for them). --storage-mode names
 the server's mode: object-store mode sorts in external runs, so its sorted
 result spools and is not paged.
@@ -69,8 +69,49 @@ QUERIES = (
         TABLE_ROWS,
         ("simple", "extended"),
     ),
-    # COPY TO STDOUT of one table resumes row by row too.
+    # Groupings resume row by row after reading their input, in both
+    # storage modes; rows must arrive as 1..n, so the key orders them.
+    (
+        "SELECT id, max(payload) FROM result_stream_rows GROUP BY id ORDER BY id",
+        TABLE_ROWS,
+        ALL_PROTOCOLS,
+    ),
+    # Fixed-size aggregate states fold per group as the input is read.
+    (
+        "SELECT id, repeat('x', 199 + count(*)::int), sum(id) FROM result_stream_rows "
+        "GROUP BY id ORDER BY id",
+        TABLE_ROWS,
+        ALL_PROTOCOLS,
+    ),
+    # Plain DISTINCT groups by its output list the same way.
+    (
+        "SELECT DISTINCT id, payload FROM result_stream_rows ORDER BY id",
+        TABLE_ROWS,
+        ALL_PROTOCOLS,
+    ),
+    # DISTINCT ON keeps each first row of a local-mode sort.
+    (
+        "SELECT DISTINCT ON (-id) id, payload FROM result_stream_rows ORDER BY -id DESC",
+        TABLE_ROWS,
+        LOCAL_PAGED,
+    ),
+    # UNION ALL appends its queries' streams, in both storage modes.
+    (
+        "SELECT id, payload FROM result_stream_rows UNION ALL "
+        f"SELECT g, repeat('x', 200) FROM generate_series({TABLE_ROWS + 1}, {ROWS}) g",
+        ROWS,
+        ALL_PROTOCOLS,
+    ),
+    # COPY TO STDOUT of one table resumes row by row too, as does one of a
+    # UNION ALL.
     (COPY_TABLE, TABLE_ROWS, ("simple",)),
+    (
+        "COPY (SELECT id, payload FROM result_stream_rows UNION ALL "
+        f"SELECT g, repeat('x', 200) FROM generate_series({TABLE_ROWS + 1}, {ROWS}) g) "
+        "TO STDOUT",
+        ROWS,
+        ("simple",),
+    ),
 )
 OTHER_QUERIES = 100
 STALL_SECONDS = 2.0
@@ -291,7 +332,7 @@ def probe(host, port, user, database, mode):
         sock.close()
         results[(query, protocol)] = transcript
         print(f"{protocol} {query!r}: {transcript} (other session {elapsed:.2f}s)", flush=True)
-        if query == COPY_TABLE:
+        if query.startswith("COPY "):
             expected = [
                 ("H", None),
                 ("d", rows),

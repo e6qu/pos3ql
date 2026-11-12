@@ -6,7 +6,7 @@ use crate::sql::types::ColType;
 use crate::util::StackStr;
 
 mod expression_copy;
-pub(crate) use expression_copy::duplicate_expression;
+pub(crate) use expression_copy::{duplicate_expression, rewrite_expression, rewrite_expressions};
 
 /// A normalized PostgreSQL configuration parameter identity.  Configuration
 /// parameters are not SQL objects: they may be dotted and their spelling is
@@ -166,6 +166,9 @@ pub enum AlterViewAction<'a> {
     SetSchema(&'a str),
     SetOptions(&'a [ViewOption]),
     ResetOptions(&'a [ViewOptionName]),
+    /// `ALTER TABLE` subcommands; execution rejects those PostgreSQL does
+    /// not perform on a view.
+    TableActions(&'a [AlterAction<'a>]),
 }
 
 /// `ALTER MATERIALIZED VIEW` deliberately exposes only operations whose
@@ -253,7 +256,7 @@ impl CatalogCollation {
         matches!(self.algorithm, CollationAlgorithm::UnicodeCaseMapping)
     }
     pub(crate) const fn oid(self) -> i32 {
-        580_000_000 + self.created_at() as i32
+        crate::storage::OidBand::Collation.oid(self.created_at())
     }
 }
 
@@ -1390,6 +1393,8 @@ impl Stmt<'_> {
         matches!(
             self,
             Stmt::Select(_)
+                | Stmt::SetQuery(_)
+                | Stmt::With { .. }
                 | Stmt::Insert(_)
                 | Stmt::Update(_)
                 | Stmt::Delete(_)
@@ -2671,6 +2676,9 @@ pub struct CreateCast<'a> {
 pub struct DropCast<'a> {
     pub source_type: &'a str,
     pub target_type: &'a str,
+    /// PostgreSQL's `TypeNameToString` spellings, for the skip notice.
+    pub source_written: &'a str,
+    pub target_written: &'a str,
     pub if_exists: bool,
     pub cascade: bool,
 }
@@ -3175,6 +3183,10 @@ pub struct Select<'a> {
     /// `DISTINCT ON (exprs)`: keep the first row per distinct value of these
     /// expressions (in ORDER BY order). Empty = plain DISTINCT or none.
     pub distinct_on: &'a [&'a Expr<'a>],
+    /// The `WINDOW` clause's definitions in written order. PostgreSQL numbers
+    /// their sort keys before those of inline `OVER (...)` specifications,
+    /// which decides the order its window evaluation leaves rows in.
+    pub windows: &'a [&'a WindowSpec<'a>],
     pub from: Option<FromClause<'a>>,
     pub where_clause: Option<&'a Expr<'a>>,
     pub group_by: &'a [&'a Expr<'a>],
@@ -3201,6 +3213,29 @@ pub struct Select<'a> {
     /// `FOR UPDATE`/`FOR SHARE`/… row-locking clauses, in written order. Empty
     /// when the query carries none.
     pub locking: &'a [LockClause<'a>],
+}
+
+impl Select<'_> {
+    /// A query level with no items or clauses, for building one field by field.
+    pub const EMPTY: Self = Self {
+        items: &[],
+        distinct: false,
+        distinct_on: &[],
+        windows: &[],
+        from: None,
+        where_clause: None,
+        group_by: &[],
+        grouping_set_quantifier: GroupingSetQuantifier::All,
+        grouping_sets: &[],
+        having: None,
+        order_by: &[],
+        limit: None,
+        offset: None,
+        with_ties: false,
+        with: &[],
+        set_body: None,
+        locking: &[],
+    };
 }
 
 /// A variable-width bitmap over a query's flat `GROUP BY` expression list.
@@ -3265,7 +3300,7 @@ pub enum LockWait {
 }
 
 /// PostgreSQL's table-level lock modes, weakest to strongest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TableLockMode {
     AccessShare,
     RowShare,
@@ -3386,6 +3421,33 @@ pub(crate) enum MaterializedCteSource<'a> {
     External(Option<crate::sql::external::ExternalRun>),
     RecursiveInline(&'a core::sync::atomic::AtomicUsize),
     RecursiveExternal(&'a core::sync::atomic::AtomicUsize),
+    /// A data-modifying `WITH` query that runs when its rows are first read.
+    Write(WriteQuerySource<'a>),
+    /// An ordinary `WITH` query evaluated once, when a scan first reads it,
+    /// as PostgreSQL's CTE scan runs it: a query that is never read never
+    /// runs, and its calls happen after the main query's earlier ones.
+    Deferred(DeferredCteQuery<'a>),
+}
+
+/// The query of a [`MaterializedCteSource::Deferred`] source and its rows
+/// once read. The rows live in the statement arena's persistent tail, which
+/// per-row rewinds cannot reclaim.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeferredCteQuery<'a> {
+    pub tree: &'a SetTree<'a>,
+    /// Zero until read, then the address of the persistent
+    /// [`MaterializedCteInlineSource`] naming the rows.
+    pub rows: &'a core::sync::atomic::AtomicUsize,
+}
+
+/// A data-modifying `WITH` query bound into one statement attempt. The
+/// statement that owns `with` and its parameters outlives every attempt and
+/// every pending run of the query, so the run can borrow them again.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WriteQuerySource<'a> {
+    pub with: &'a [Cte<'a>],
+    pub index: usize,
+    pub params: (usize, usize),
 }
 
 #[derive(Clone, Copy)]
@@ -3405,6 +3467,49 @@ impl PartialEq for MaterializedCteSource<'_> {
             (Self::RecursiveExternal(left), Self::RecursiveExternal(right)) => {
                 core::ptr::eq(left, right)
             }
+            (Self::Write(left), Self::Write(right)) => {
+                core::ptr::eq(left.with, right.with) && left.index == right.index
+            }
+            (Self::Deferred(left), Self::Deferred(right)) => core::ptr::eq(left.rows, right.rows),
+            _ => false,
+        }
+    }
+}
+
+impl Expr<'_> {
+    /// A `ROW(...)` or `(a, b, ...)` constructor. PostgreSQL compares two of
+    /// these field by field with SQL-standard NULL semantics, while every
+    /// other composite comparison uses the record operators.
+    pub(crate) fn is_row_constructor(&self) -> bool {
+        matches!(
+            self,
+            Expr::Call {
+                kind: CallKind::SqlSyntax,
+                name,
+                ..
+            } if name.eq_ignore_ascii_case("row")
+        )
+    }
+
+    /// Whether PostgreSQL's planner folds this expression to a constant, as
+    /// it does a literal, a parameter of a custom plan, and operators and
+    /// casts over them.
+    pub(crate) fn folds_to_constant(&self) -> bool {
+        match self {
+            Expr::Null
+            | Expr::Bool(_)
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::NumericLit(_)
+            | Expr::Str(_)
+            | Expr::Param(_)
+            | Expr::BoundLiteral { .. } => true,
+            Expr::Unary { operand, .. }
+            | Expr::Cast { operand, .. }
+            | Expr::Collate { operand, .. } => operand.folds_to_constant(),
+            Expr::Binary { left, right, .. } => {
+                left.folds_to_constant() && right.folds_to_constant()
+            }
             _ => false,
         }
     }
@@ -3414,19 +3519,30 @@ impl<'a> MaterializedCte<'a> {
     pub(crate) fn rows(&self) -> &'a [&'a [u8]] {
         match self.source {
             MaterializedCteSource::Inline(rows) => rows,
-            MaterializedCteSource::RecursiveInline(source) => {
-                let source = source.load(core::sync::atomic::Ordering::Relaxed);
-                if source == 0 {
-                    return &[];
-                }
-                // The selector names one immutable arena-owned descriptor, so
-                // an update cannot expose a pointer/length from different rows.
-                let source = unsafe { &*(source as *const MaterializedCteInlineSource) };
-                unsafe {
-                    core::slice::from_raw_parts(source.address as *const &'a [u8], source.length)
-                }
+            MaterializedCteSource::RecursiveInline(source) => inline_rows(source),
+            // Only a read runs the query; see `read_rows`.
+            MaterializedCteSource::Write(_)
+            | MaterializedCteSource::Deferred(_)
+            | MaterializedCteSource::External(_)
+            | MaterializedCteSource::RecursiveExternal(_) => &[],
+        }
+    }
+
+    /// The rows a scan reads. A data-modifying `WITH` query runs here, when its
+    /// rows are first read, as PostgreSQL's CTE scan runs it.
+    pub(crate) fn read_rows(
+        &self,
+        arena: &'a crate::mem::arena::Arena,
+        query: Option<crate::sql::query::DeferredCteRead<'_, 'a>>,
+    ) -> Result<&'a [&'a [u8]], crate::sql::SqlError> {
+        match self.source {
+            MaterializedCteSource::Write(source) => {
+                crate::sql::query::read_write_query(&source, arena)
             }
-            MaterializedCteSource::External(_) | MaterializedCteSource::RecursiveExternal(_) => &[],
+            MaterializedCteSource::Deferred(deferred) => {
+                crate::sql::query::read_deferred_cte(deferred, arena, query)
+            }
+            _ => Ok(self.rows()),
         }
     }
 
@@ -3442,9 +3558,23 @@ impl<'a> MaterializedCte<'a> {
                     Some(unsafe { *(address as *const crate::sql::external::ExternalRun) })
                 }
             }
-            MaterializedCteSource::Inline(_) | MaterializedCteSource::RecursiveInline(_) => None,
+            MaterializedCteSource::Inline(_)
+            | MaterializedCteSource::RecursiveInline(_)
+            | MaterializedCteSource::Write(_)
+            | MaterializedCteSource::Deferred(_) => None,
         }
     }
+}
+
+fn inline_rows<'a>(source: &core::sync::atomic::AtomicUsize) -> &'a [&'a [u8]] {
+    let source = source.load(core::sync::atomic::Ordering::Relaxed);
+    if source == 0 {
+        return &[];
+    }
+    // The selector names one immutable arena-owned descriptor, so an update
+    // cannot expose a pointer/length from different rows.
+    let source = unsafe { &*(source as *const MaterializedCteInlineSource) };
+    unsafe { core::slice::from_raw_parts(source.address as *const &'a [u8], source.length) }
 }
 
 /// A base table plus a chain of joins (nested-loop order).
@@ -3549,6 +3679,24 @@ pub struct TableRef<'a> {
     /// Source view retained across expansion so projected column privileges
     /// remain enforceable after its body becomes a derived table.
     pub view_access: Option<u16>,
+    /// A parenthesized join, `(a JOIN b ON ...)`, runs as the derived table
+    /// in `subquery`. Unaliased, its member tables (and `USING` aliases)
+    /// stay addressable by these names outside it: the subquery's output is
+    /// the join's own columns, then each member's columns (`m.*`), then one
+    /// `num_nulls(m)` per table member marking whether that member was
+    /// null-extended. An alias hides the members, which then only name
+    /// what an error reports as out of reach, and the output is the join's
+    /// own columns.
+    pub join_members: Option<&'a [JoinMember<'a>]>,
+}
+
+/// A name a parenthesized join exposes to its enclosing FROM clause.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JoinMember<'a> {
+    pub name: &'a str,
+    /// A `USING (...) AS alias` name qualifies merged columns only; it has
+    /// no row presence of its own.
+    pub using_alias: bool,
 }
 
 impl TableRef<'_> {
@@ -3588,12 +3736,29 @@ pub enum JoinKind {
     Right,
     Full,
     Cross,
+    /// A comma in the FROM list: a cross join that also starts a new FROM
+    /// item, so later USING, NATURAL and ON clauses cannot see the tables
+    /// before it.
+    Comma,
+}
+
+impl JoinKind {
+    /// Whether the join pairs every left row with every right row.
+    pub const fn is_cross(self) -> bool {
+        matches!(self, Self::Cross | Self::Comma)
+    }
+
+    /// Whether the join keeps unmatched rows of its right side, so a
+    /// `LATERAL` right side cannot read its left side.
+    pub const fn is_right_or_full(self) -> bool {
+        matches!(self, Self::Right | Self::Full)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SelectItem<'a> {
-    /// `*`
-    Wildcard,
+    /// `*`, with the position of the star where the statement was parsed.
+    Wildcard(SourcePosition),
     /// `t.*`: every column of the named FROM item (its own copies, even for
     /// USING/NATURAL-merged columns).
     TableWildcard(&'a str),
@@ -5651,7 +5816,35 @@ pub enum AlterStatisticsAction<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParameterSource {
     SqlRoutine,
-    PlpgsqlCursor,
+    /// `p.f` in a SQL-language routine, where `p` names a composite
+    /// parameter: a column `f` of a FROM item `p` wins, and otherwise the
+    /// reference is field `f` (the node's `name`) of parameter `index`, as
+    /// PostgreSQL's `sql_fn_post_column_ref` resolves it.
+    SqlRoutineField,
+    /// A PL/pgSQL variable captured by a cursor query, with the body's
+    /// `plpgsql.variable_conflict` rule for a column of the same name.
+    PlpgsqlCursor(crate::sql::guc::VariableConflict),
+}
+
+/// What a parameter reference means when a column has the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParameterCollision {
+    Column,
+    Parameter,
+    Ambiguous,
+}
+
+impl ParameterSource {
+    pub(crate) const fn collision(self) -> ParameterCollision {
+        use crate::sql::guc::VariableConflict;
+        match self {
+            Self::SqlRoutine
+            | Self::SqlRoutineField
+            | Self::PlpgsqlCursor(VariableConflict::UseColumn) => ParameterCollision::Column,
+            Self::PlpgsqlCursor(VariableConflict::UseVariable) => ParameterCollision::Parameter,
+            Self::PlpgsqlCursor(VariableConflict::Error) => ParameterCollision::Ambiguous,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5808,11 +6001,10 @@ pub enum Expr<'a> {
         operand: Option<&'a Expr<'a>>,
         whens: &'a [(&'a Expr<'a>, &'a Expr<'a>)],
         otherwise: Option<&'a Expr<'a>>,
-        /// True when this `CASE` is the desugaring of a syntactic construct that
-        /// is not itself a `CASE` — `IS TRUE`, `IS DISTINCT FROM`. PostgreSQL
-        /// labels those output columns `?column?`, not `case`, so the flag lets
-        /// naming tell them from a `CASE` the query actually wrote.
-        synthetic: bool,
+        /// The syntax this node represents. PostgreSQL labels `IS TRUE` and
+        /// `IS DISTINCT FROM` output columns `?column?`, not `case`, and
+        /// deparses them in their own spelling.
+        origin: CaseOrigin,
     },
     /// The DEFAULT keyword inside INSERT VALUES.
     DefaultMarker,
@@ -5897,6 +6089,21 @@ pub enum Expr<'a> {
         array: &'a Expr<'a>,
         all: bool,
     },
+}
+
+/// The SQL construct an [`Expr::Case`] node was parsed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseOrigin {
+    /// A `CASE` expression the query wrote.
+    Written,
+    /// `x IS [NOT] TRUE` (`value`) or `x IS [NOT] FALSE`: one `WHEN` whose
+    /// condition is `x`, or `NOT x` for `FALSE`.
+    BooleanTest { value: bool, negated: bool },
+    /// `x IS [NOT] DISTINCT FROM y`: `WHEN x IS NULL AND y IS NULL`, then
+    /// `WHEN x IS NULL OR y IS NULL`, else the `=` comparison of `x` and `y`
+    /// (negated for `IS DISTINCT FROM`), as PostgreSQL's `DistinctExpr` calls
+    /// the equality operator's function.
+    DistinctFrom { negated: bool },
 }
 
 pub(crate) fn is_volatile_function(name: &str) -> bool {
@@ -6020,7 +6227,66 @@ fn is_nonimmutable_function(name: &str) -> bool {
             .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
-impl Expr<'_> {
+impl<'a> Expr<'a> {
+    /// The operands of `x IS [NOT] DISTINCT FROM y` and whether it is negated
+    /// (`IS NOT DISTINCT FROM`).
+    pub(crate) fn distinct_from_operands(&self) -> Option<(&'a Expr<'a>, &'a Expr<'a>, bool)> {
+        let Expr::Case {
+            origin: CaseOrigin::DistinctFrom { negated },
+            otherwise: Some(otherwise),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let otherwise: &'a Expr<'a> = otherwise;
+        let equality: &'a Expr<'a> = match otherwise {
+            Expr::Unary {
+                operator: UnaryOp::Not,
+                operand,
+                ..
+            } if !negated => operand,
+            _ if *negated => otherwise,
+            _ => return None,
+        };
+        match equality {
+            Expr::Binary {
+                operator: BinaryOp::Eq,
+                left,
+                right,
+                ..
+            } => Some((left, right, *negated)),
+            _ => None,
+        }
+    }
+
+    /// The operand of `x IS [NOT] TRUE/FALSE`, the tested value and whether
+    /// the test is negated.
+    pub(crate) fn boolean_test_operand(&self) -> Option<(&'a Expr<'a>, bool, bool)> {
+        let Expr::Case {
+            origin: CaseOrigin::BooleanTest { value, negated },
+            whens: [(condition, _)],
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let condition: &'a Expr<'a> = condition;
+        let operand = if *value {
+            condition
+        } else {
+            match condition {
+                Expr::Unary {
+                    operator: UnaryOp::Not,
+                    operand,
+                    ..
+                } => operand,
+                _ => return None,
+            }
+        };
+        Some((operand, *value, *negated))
+    }
+
     pub(crate) const fn source_position(&self) -> SourcePosition {
         match self {
             Self::Call {

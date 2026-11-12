@@ -5,9 +5,6 @@ use super::{CatalogDdlDecision, DatabaseOid, SchemaDef, SqlName, Storage, curren
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
-const FIRST_SCHEMA_OID: u64 = 80_000;
-pub(crate) const FIRST_TEMP_NAMESPACE_OID: i32 = 2_000_000;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SchemaIdentity {
     created_at: u64,
@@ -15,8 +12,7 @@ pub(crate) struct SchemaIdentity {
 
 impl SchemaIdentity {
     pub(crate) fn parse(created_at: u64) -> Option<Self> {
-        (created_at < FIRST_TEMP_NAMESPACE_OID as u64 - FIRST_SCHEMA_OID)
-            .then_some(Self { created_at })
+        (created_at <= super::MAX_CATALOG_CREATION).then_some(Self { created_at })
     }
 
     pub(crate) fn created_at(self) -> u64 {
@@ -27,7 +23,7 @@ impl SchemaIdentity {
         if self.is_initial_public() {
             2200
         } else {
-            (FIRST_SCHEMA_OID + self.created_at) as i32
+            super::OidBand::Schema.oid(self.created_at)
         }
     }
 
@@ -709,11 +705,14 @@ mod tests {
         let rejected = SqlName::parse("exhausted_schema").unwrap();
         let slot = storage.create_schema(name).unwrap();
         let identity = storage.schema_def(slot).identity().unwrap();
-        storage.replace_catalog_sequence_for_test(1_919_999);
+        storage.replace_catalog_sequence_for_test(9_999_999);
         crate::mem::guard::forbid_alloc(|| {
             assert_eq!(SchemaIdentity::parse(0).unwrap().oid(), 2200);
-            assert_eq!(SchemaIdentity::parse(1_919_999).unwrap().oid(), 1_999_999);
-            assert!(SchemaIdentity::parse(1_920_000).is_none());
+            assert_eq!(
+                SchemaIdentity::parse(9_999_999).unwrap().oid(),
+                crate::storage::OidBand::Schema.last()
+            );
+            assert!(SchemaIdentity::parse(10_000_000).is_none());
             assert!(SchemaIdentity::parse(u64::MAX).is_none());
             assert_eq!(
                 storage.create_schema(rejected).unwrap_err().sqlstate,

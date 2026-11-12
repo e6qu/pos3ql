@@ -545,6 +545,8 @@ impl Storage {
             )
         })?;
         if (slot == 0) != (oid == RoleOid::BOOTSTRAP)
+            || PredefinedRole::from_slot(slot).is_some()
+            || PredefinedRole::from_oid(oid.get()).is_some()
             || ((selected.live || selected.pending.is_some()) && selected.lifetime != Some(oid))
             || selected
                 .pending
@@ -586,7 +588,7 @@ impl Storage {
         options: RoleMembershipOptions,
         transaction: u32,
     ) -> Result<(usize, Option<PendingRoleMembership>), SqlError> {
-        CatalogIdentity::require(identity.created_at())?;
+        Self::require_membership_identity(identity)?;
         let resolve = |oid: RoleOid| {
             self.role_slot_by_oid(oid.get(), transaction)
                 .ok_or_else(|| {
@@ -612,7 +614,7 @@ impl Storage {
             .pending
             .is_some_and(|pending| pending.txid != transaction)
             || ((selected.live || selected.pending.is_some())
-                && (selected.creation_to(transaction).created_at() > identity.created_at()
+                && (selected.creation_to(transaction) > identity.created_at()
                     || usize::from(selected.role) != role
                     || usize::from(selected.member) != member
                     || usize::from(selected.grantor) != grantor))
@@ -623,8 +625,7 @@ impl Storage {
                 .any(|(other, candidate)| {
                     other != slot
                         && (candidate.live || candidate.pending.is_some())
-                        && (candidate.creation_to(transaction).created_at()
-                            == identity.created_at()
+                        && (candidate.creation_to(transaction) == identity.created_at()
                             || (usize::from(candidate.role) == role
                                 && usize::from(candidate.member) == member
                                 && usize::from(candidate.grantor) == grantor))
@@ -650,7 +651,9 @@ impl Storage {
                 options,
             }),
         };
-        self.catalog_sequence.observe(identity.created_at());
+        if initdb_membership(identity.created_at()).is_none() {
+            self.catalog_sequence.observe(identity.created_at());
+        }
         Ok((slot, prior))
     }
 

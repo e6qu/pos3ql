@@ -180,6 +180,7 @@ pub(super) fn sql_constructor(name: &str) -> Option<SqlConstructor> {
         | "__json_serialize_bytea"
         | "__jsonb_subscript_set"
         | "__array_subscript_set"
+        | "__assign_path"
         | "__json_exists_true"
         | "__json_exists_unknown"
         | "__json_exists_error"

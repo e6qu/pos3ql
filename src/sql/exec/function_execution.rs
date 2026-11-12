@@ -88,6 +88,7 @@ impl ReturnBinding {
         execution: &execution_frame::ExecutionFrame<'_, 'a>,
         flow: Option<TriggerFlow<'a>>,
         result_type: ColType,
+        (storage, txid): (&crate::storage::Storage, u32),
         arena: &'a Arena,
     ) -> Result<FunctionOutput<'a>, SqlError> {
         let output = match (self, flow) {
@@ -146,7 +147,13 @@ impl ReturnBinding {
         }?;
         match output {
             FunctionOutput::Scalar(value) => Ok(FunctionOutput::Scalar(cast_to(
-                detach_routine_datum(value, arena)?,
+                super::plpgsql_conversion_input(
+                    detach_routine_datum(value, arena)?,
+                    storage.routine_type_oid(result_type, None, txid),
+                    storage,
+                    txid,
+                    arena,
+                )?,
                 result_type,
                 arena,
             )?)),
@@ -219,6 +226,7 @@ struct FunctionBinding {
     input_owner: super::super::type_input_plans::Owner,
     input_collation: crate::sql::ast::Collation,
     variable_conflict: super::super::guc::VariableConflict,
+    print_strict_params: bool,
     fresh_snapshots: bool,
     parameters: SharedSlice<RoutineArgumentDef>,
     inputs: local_values::SavedValues,
@@ -353,6 +361,7 @@ impl FunctionBinding {
             input_collation: self.input_collation,
             input_sites,
             variable_conflict: self.variable_conflict,
+            print_strict_params: self.print_strict_params,
             fresh_snapshots: self.fresh_snapshots,
             materialized_relations: None,
             nargs: i32::try_from(self.parameters.len()).expect("bounded routine argument count"),
@@ -468,6 +477,7 @@ impl SuspendedFunctionState {
             .map(|sources| sources.enter())
             .transpose()?;
         let environment = self.binding.environment.enter(context.txn)?;
+        let invocation = self.binding.invocation(&[], arena)?;
         let pending = self.conversion.as_mut().ok_or_else(changed)?;
         let value = pending.value.read(0, arena)?;
         admission.commit();
@@ -476,16 +486,8 @@ impl SuspendedFunctionState {
             FunctionOutput::Scalar(value),
             self.binding.result_type,
             Some(&mut pending.check),
-        );
-        let result = match result {
-            Err(error) if !control_flow::is_execution_wait(&error) => {
-                Err(match self.binding.invocation(&[], arena) {
-                    Ok(invocation) => control_flow::routine_exit_error(context, invocation, error),
-                    Err(invocation_error) => invocation_error,
-                })
-            }
-            result => result,
-        };
+        )
+        .map_err(|error| control_flow::routine_exit_error(context, invocation, error));
         admission.preserve_caller_inputs()?;
         Ok(self.finish_conversion(result, &environment, context))
     }
@@ -542,7 +544,7 @@ impl SuspendedFunctionState {
             Ok(environment) => environment,
             Err(error) => return Err((frame, error)),
         };
-        let (parsed, code) = match frame.source().parse(arena) {
+        let (parsed, code) = match frame.source().parse(arena, None) {
             Ok(parsed) => parsed,
             Err(error) => return Err((frame, error)),
         };
@@ -577,7 +579,9 @@ impl SuspendedFunctionState {
             invocation,
             context,
             seeded,
-            Some(self.binding.boundary),
+            self.binding.boundary,
+            // Only a retained call is saved across a wait.
+            true,
         );
         if let Err(error) = admission.preserve_caller_inputs() {
             return Ok(Err(error));
@@ -589,6 +593,7 @@ impl SuspendedFunctionState {
                         &execution,
                         flow,
                         self.binding.result_type.ctype,
+                        (context.storage(), context.txn.txid),
                         arena,
                     )
                 }) {
@@ -647,16 +652,18 @@ fn run_body<'a>(
     invocation: TriggerInvocation<'a>,
     context: &mut TriggerExecContext<'_, 'a, '_>,
     seeded: &[Datum<'a>],
-    boundary: Option<super::super::txn::StatementMark>,
+    boundary: super::super::txn::StatementMark,
+    retained: bool,
 ) -> Result<Option<TriggerFlow<'a>>, SqlError> {
+    // The body's writes hand it their AFTER work, so those triggers run on
+    // the engine whether or not this frame is kept across a wait.
     let prior = context.txn.write_completion_boundary;
-    if let Some(mark) = boundary {
-        context.txn.write_completion_boundary = Some(super::super::txn::WriteCompletionBoundary {
-            mark,
-            command: context.txn.command_id(),
-            depth: context.txn.trigger_depth(),
-        });
-    }
+    context.txn.write_completion_boundary = Some(super::super::txn::WriteCompletionBoundary {
+        mark: boundary,
+        command: context.txn.command_id(),
+        depth: context.txn.trigger_depth(),
+        retained,
+    });
     let definition = crate::storage::RelationDefinition::EMPTY;
     let result = (|| {
         execution.initialize(
@@ -726,7 +733,7 @@ pub(crate) fn execute<'a>(
     environment: &CallEnvironment,
     policy: super::super::query::RoutineExecution,
     suspended: &mut Option<SuspendedFunction>,
-    compiled_conflict: super::super::guc::VariableConflict,
+    compiled_conflict: super::super::guc::PlpgsqlSettings,
 ) -> Result<FunctionOutput<'a>, SqlError> {
     let inputs = arena
         .alloc_slice_copy(inputs)
@@ -783,6 +790,7 @@ pub(crate) fn execute<'a>(
             continue;
         }
         declarations[count] = TriggerLocalDecl {
+            label: Some(routine.name),
             scope: PlpgsqlScope::Invocation,
             name: argument.name,
             ctype: argument.ctype,
@@ -805,6 +813,7 @@ pub(crate) fn execute<'a>(
             return;
         }
         declarations[count] = TriggerLocalDecl {
+            label: Some(routine.name),
             scope: PlpgsqlScope::Invocation,
             name: output.name,
             ctype: output.ctype,
@@ -867,7 +876,7 @@ pub(crate) fn execute<'a>(
         routine,
         kind,
         collation,
-        program.variable_conflict(compiled_conflict),
+        program.settings(compiled_conflict),
         arena,
     )?
     .with_input_sites(program.input_sites);
@@ -923,22 +932,27 @@ pub(crate) fn execute<'a>(
         params: inputs,
         responder,
     };
-    let retained_boundary =
-        (policy == super::super::query::RoutineExecution::Retained).then_some(boundary);
     let result = run_body(
         &mut execution,
         &code,
         invocation,
         &mut context,
         &seeded[..seeded_count],
-        retained_boundary,
+        boundary,
+        policy == super::super::query::RoutineExecution::Retained,
     );
     drop(seeded);
     match result {
         Ok(flow) => {
             let result = declared_result(routine)?;
             let output = control_flow::at_routine_exit(&context, invocation, || {
-                returns.finish(&execution, flow, result.ctype, arena)
+                returns.finish(
+                    &execution,
+                    flow,
+                    result.ctype,
+                    (context.storage(), context.txn.txid),
+                    arena,
+                )
             })?;
             if policy == super::super::query::RoutineExecution::StatementReplay {
                 return convert_result(&mut context, output, result, None).map_err(|error| {
@@ -1039,6 +1053,7 @@ fn suspend_call(
                 input_owner: invocation.input_owner,
                 input_collation: collation,
                 variable_conflict: invocation.variable_conflict,
+                print_strict_params: invocation.print_strict_params,
                 fresh_snapshots: invocation.fresh_snapshots,
                 parameters,
                 inputs: saved_inputs,

@@ -43,6 +43,13 @@ pub(crate) trait Frame {
         None
     }
 
+    /// For a PL/pgSQL invocation: the statement it runs when a `STRICT`
+    /// failure there reports its parameters, else `Some(None)`. Other frames
+    /// answer `None`.
+    fn strict_parameters(&self) -> Option<Option<&str>> {
+        None
+    }
+
     /// Names the dynamic query this frame runs; false if it runs none.
     fn begin_dynamic(&self, _text: *const str) -> bool {
         false
@@ -102,7 +109,7 @@ pub(crate) fn begin_dynamic_query(text: &str) {
 pub(crate) enum QueryMode {
     /// `SQL statement "..."`.
     Statement,
-    /// `SQL expression "..."`.
+    /// `PL/pgSQL expression "..."`.
     Expression,
     /// `PL/pgSQL assignment "..."`.
     Assignment,
@@ -149,7 +156,7 @@ impl Frame for QueryFrame<'_> {
         }
         let what = match self.mode {
             QueryMode::Statement => "SQL statement",
-            QueryMode::Expression => "SQL expression",
+            QueryMode::Expression => "PL/pgSQL expression",
             QueryMode::Assignment => "PL/pgSQL assignment",
         };
         write!(out, "{what} \"{}\"", self.text)
@@ -163,28 +170,56 @@ pub(crate) struct SqlFunctionFrame<'a> {
     pub(crate) body: &'a str,
     /// One-based index of the running statement; zero before the first.
     pub(crate) statement: Cell<usize>,
-    /// PostgreSQL inlines this body into its caller's query: the call has no
-    /// frame of its own.
-    pub(crate) inlined: bool,
+    pub(crate) inlining: SqlFunctionInlining,
+}
+
+/// How PostgreSQL's planner treats a SQL-language function call.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqlFunctionInlining {
+    /// The body runs as its own statements.
+    Executed,
+    /// The body is inlined into its caller's query: the call has no frame.
+    Inlined,
+    /// The body is inlined with constant arguments and folded while it is
+    /// inlined: `SQL function "f" during inlining`.
+    Folded,
 }
 
 impl Frame for SqlFunctionFrame<'_> {
     fn query(&self) -> Option<&str> {
-        (!self.inlined).then_some(self.body)
+        (self.inlining != SqlFunctionInlining::Inlined).then_some(self.body)
     }
 
     fn write_line(&self, out: &mut dyn Write, _positioned: bool) -> fmt::Result {
-        if self.inlined {
-            return Ok(());
-        }
-        match self.statement.get() {
-            0 => write!(out, "SQL function \"{}\" during startup", self.name),
-            statement => write!(
+        match (self.inlining, self.statement.get()) {
+            (SqlFunctionInlining::Inlined, _) => Ok(()),
+            (SqlFunctionInlining::Folded, _) => {
+                write!(out, "SQL function \"{}\" during inlining", self.name)
+            }
+            (SqlFunctionInlining::Executed, 0) => {
+                write!(out, "SQL function \"{}\" during startup", self.name)
+            }
+            (SqlFunctionInlining::Executed, statement) => write!(
                 out,
                 "SQL function \"{}\" statement {}",
                 self.name, statement
             ),
         }
+    }
+}
+
+/// A SQL-language function body validated at `CREATE FUNCTION`: an error
+/// that cannot point into the statement names the function.
+pub(crate) struct SqlFunctionValidationFrame<'a> {
+    pub(crate) name: &'a str,
+}
+
+impl Frame for SqlFunctionValidationFrame<'_> {
+    fn write_line(&self, out: &mut dyn Write, positioned: bool) -> fmt::Result {
+        if positioned {
+            return Ok(());
+        }
+        write!(out, "SQL function \"{}\"", self.name)
     }
 }
 
@@ -482,6 +517,21 @@ pub(crate) fn innermost_assignment<'s>() -> Option<&'s str> {
     frame
         .assignment()
         .map(|text| unsafe { &*(text as *const str) })
+}
+
+/// The statement whose `STRICT` failure reports its parameters: the
+/// innermost PL/pgSQL invocation's, when `#print_strict_params` is on.
+pub(crate) fn strict_parameters_statement<'s>() -> Option<&'s str> {
+    let mut node = HEAD.with(Cell::get);
+    while !node.is_null() {
+        // Active frames outlive the statement asking for them.
+        let frame = unsafe { &*(*node).frame };
+        if let Some(statement) = frame.strict_parameters() {
+            return statement.map(|text| unsafe { &*(text as *const str) });
+        }
+        node = unsafe { (*node).previous };
+    }
+    None
 }
 
 /// Whether any frame is active, so a notice has a context.

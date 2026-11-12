@@ -365,6 +365,73 @@ impl<'a> ColumnLookup<'a> for NoColumns {
     }
 }
 
+/// The latest version of a locked source row, in the source's column order.
+/// `None` when the row is gone, which a held lock rules out except for the
+/// locking transaction's own deletion.
+pub(super) fn latest_locked_source<'a>(
+    storage: &Storage,
+    txid: u32,
+    scope: &QueryScope<'a>,
+    table: usize,
+    slot: usize,
+    rowid: u64,
+    arena: &'a Arena,
+) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
+    let Some(state) = storage.row_state(slot, rowid)? else {
+        return Ok(None);
+    };
+    let Some(home) = storage.uniqueness_row_home(slot, rowid, state, txid)? else {
+        return Ok(None);
+    };
+    let bytes = storage.row_bytes(slot, rowid, home, arena)?;
+    let definitions = storage.table_definition_images();
+    let physical = definitions.definition(storage, slot, txid)?;
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    physical.schema(&mut schema);
+    let mut physical_values = [Datum::Null; MAX_COLUMNS];
+    rowenc::decode(bytes, &schema[..physical.n_columns], &mut physical_values)?;
+    let logical = scope
+        .defs
+        .stored(table)
+        .expect("locked source is a stored relation");
+    let values = arena
+        .alloc_slice_with(logical.n_columns, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    crate::storage::RelationColumnMap::new(logical, physical, arena)?
+        .project(&physical_values[..physical.n_columns], values);
+    refresh_catalog_object_names(storage, txid, values, arena)?;
+    Ok(Some(values))
+}
+
+/// The SELECT row-security policy a stored source's scan applies.
+pub(super) fn source_select_security<'a>(
+    storage: &Storage,
+    scope: &QueryScope<'a>,
+    table: usize,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<RowSecurityPlan<'a>>, SqlError> {
+    if scope.derived[table].is_some() {
+        return Ok(None);
+    }
+    let current_role = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        )
+    })?;
+    let role = scope.authorization_roles[table].map_or(current_role, usize::from);
+    plan_row_security(
+        storage,
+        scope.slots[table],
+        role,
+        PolicyCommandKind::Select,
+        RowSecurityExpression::Using,
+        txid,
+        arena,
+    )
+}
+
 fn refresh_catalog_object_names<'a>(
     storage: &Storage,
     txid: u32,
@@ -1012,7 +1079,7 @@ fn pax_column_demand_bounded(
             }
             // A wildcard belongs to the nested select's own output. It cannot
             // name an enclosing physical column.
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => true,
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => true,
         }) && select
             .distinct_on
             .iter()
@@ -1050,8 +1117,7 @@ fn pax_column_demand_bounded(
                 Err(error)
                     if error.sqlstate == sqlstate::UNDEFINED_COLUMN
                         && qualifier.is_none()
-                        && (scope.table_index(name).is_ok()
-                            || scope.using_alias(name).is_some()) =>
+                        && (scope.source(name).is_ok() || scope.using_alias(name).is_some()) =>
                 {
                     // A bare local relation name reads its complete row, just
                     // like WholeRow; it is not an unresolved outer column.
@@ -2527,10 +2593,12 @@ pub(crate) fn parameterized_index_access_plan<'a>(
             .is_some_and(|(tables, _)| tables & target_bit == 0 && tables & !bound_tables == 0)
     };
     if (outer_available
-        || from
-            .joins
-            .iter()
-            .all(|join| matches!(join.kind, JoinKind::Inner | JoinKind::Cross)))
+        || from.joins.iter().all(|join| {
+            matches!(
+                join.kind,
+                JoinKind::Inner | JoinKind::Cross | JoinKind::Comma
+            )
+        }))
         && let Some(predicate) = where_clause
     {
         collect_index_constraints(
@@ -3935,7 +4003,6 @@ fn indexed_candidates_for_plan<'a>(
             candidates[live] = candidate;
             live += 1;
         }
-        let mut comparison_error = None;
         if let Some((knn, origin)) = knn_origin {
             for candidate in &mut candidates[..live] {
                 let key = &encoded[candidate.key_at..candidate.key_at + candidate.key_len];
@@ -3976,26 +4043,16 @@ fn indexed_candidates_for_plan<'a>(
                 }
             });
         } else {
-            candidates[..live].sort_unstable_by(|left, right| {
-                if comparison_error.is_some() {
-                    return core::cmp::Ordering::Equal;
-                }
+            crate::util::try_sort_unstable_by(&mut candidates[..live], |left, right| {
                 let left_key = &encoded[left.key_at..left.key_at + left.key_len];
                 let right_key = &encoded[right.key_at..right.key_at + right.key_len];
-                match compare_ordered_index_keys(
-                    storage, txid, &plan, &ordered, left_key, right_key,
-                ) {
-                    Ok(core::cmp::Ordering::Equal) => left.rowid.cmp(&right.rowid),
-                    Ok(ordering) => ordering,
-                    Err(error) => {
-                        comparison_error = Some(error);
-                        core::cmp::Ordering::Equal
-                    }
-                }
-            });
-        }
-        if let Some(error) = comparison_error {
-            return Err(error);
+                Ok(
+                    compare_ordered_index_keys(
+                        storage, txid, &plan, &ordered, left_key, right_key,
+                    )?
+                    .then_with(|| left.rowid.cmp(&right.rowid)),
+                )
+            })?;
         }
         for (output, candidate) in rowids.iter_mut().zip(candidates[..live].iter()) {
             *output = candidate.rowid;
@@ -4175,9 +4232,31 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
             }
             JoinRowValues::Flat { values, offsets } => {
                 let start = *offsets.get(table)?;
-                let width = self.scope.defs.get(table).expect("resolved").n_columns;
+                let width = self.scope.stored_width(table);
                 Some(&values[start..start + width])
             }
+        }
+    }
+}
+
+impl<'v> JoinRow<'_, 'v, '_> {
+    /// The value of one join-tree output column: a merged USING column is its
+    /// first non-null contributor.
+    pub(crate) fn output_value(&self, entry: ResolvedColumn) -> Datum<'v> {
+        let one = |(table, column): (usize, usize)| {
+            self.table_values(table)
+                .and_then(|values| values.get(column))
+                .copied()
+                .unwrap_or(Datum::Null)
+        };
+        match entry {
+            ResolvedColumn::Table(table, column) => one((table, column)),
+            ResolvedColumn::Merged(merged) => self.scope.merged[merged]
+                .parts
+                .iter()
+                .map(|&part| one(part))
+                .find(|value| !value.is_null())
+                .unwrap_or(Datum::Null),
         }
     }
 }
@@ -4234,7 +4313,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     }
 
     fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'v>, SqlError> {
-        let table = self.scope.table_index(qualifier)?;
+        let table = self.scope.source(qualifier)?.table;
         let visible = self.scope.defs.get(table).expect("resolved").n_columns;
         self.table_values(table)
             .and_then(|values| values.get(visible + index))
@@ -4305,14 +4384,25 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         if self.scope.using_alias(table).is_some() {
             return Ok(true);
         }
-        let t = self.scope.table_index(table)?;
-        match self.table_present(t) {
-            Some(present) => Ok(present),
-            None => Err(sql_err!(
-                sqlstate::INVALID_COLUMN_REFERENCE,
-                "whole-row reference to \"{}\" before its table is joined",
-                table
-            )),
+        let source = self.scope.source(table)?;
+        let present = match self.table_present(source.table) {
+            Some(present) => present,
+            None => {
+                return Err(sql_err!(
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                    "whole-row reference to \"{}\" before its table is joined",
+                    table
+                ));
+            }
+        };
+        match source.presence.filter(|_| present) {
+            Some(column) => super::scope::member_present(
+                self.table_values(source.table)
+                    .and_then(|values| values.get(column))
+                    .copied()
+                    .unwrap_or(Datum::Null),
+            ),
+            None => Ok(present),
         }
     }
 
@@ -4339,32 +4429,31 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
                 .map(|fields| Some(&*fields))
                 .map_err(|_| arena_full());
         }
-        let t = self.scope.table_index(table)?;
-        let def = self.scope.defs.get(t).expect("resolved");
+        let source = self.scope.source(table)?;
         if !self.whole_row_present(table)? {
             return Ok(None);
         }
         let vals = self
-            .table_values(t)
+            .table_values(source.table)
             .expect("present source has bound values");
         // Copy field names into the arena so the record does not borrow the
         // catalog (its lifetime is unrelated to the row's `'v`).
-        let cols = def.columns();
+        let cols = self.scope.source_columns(source);
         let mut fields = [crate::sql::types::RecordField {
             name: "",
             type_oid: 0,
             value: Datum::Null,
         }; MAX_COLUMNS];
-        for (i, field) in fields.iter_mut().enumerate().take(def.n_columns) {
+        for (i, field) in fields.iter_mut().enumerate().take(source.n_columns) {
             let name = arena
                 .alloc_str(cols[i].name.as_str())
                 .map_err(|_| arena_full())?;
             field.name = name;
             field.type_oid = cols[i].ctype.oid();
-            field.value = vals.get(i).copied().unwrap_or(Datum::Null);
+            field.value = vals.get(source.first + i).copied().unwrap_or(Datum::Null);
         }
         let out = arena
-            .alloc_slice_copy(&fields[..def.n_columns])
+            .alloc_slice_copy(&fields[..source.n_columns])
             .map_err(|_| arena_full())?;
         Ok(Some(&*out))
     }
@@ -4377,16 +4466,13 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         if let Some(fields) = self.whole_row_fields(table, arena)? {
             return Ok(fields);
         }
-        let table = self.scope.table_index(table)?;
-        let definition = self.scope.defs.get(table).expect("resolved");
-        let columns = definition.columns();
+        let source = self.scope.source(table)?;
+        let columns = self.scope.source_columns(source);
         let fields = arena
-            .alloc_slice_with(definition.n_columns, |index| {
-                crate::sql::types::RecordField {
-                    name: "",
-                    type_oid: columns[index].ctype.oid(),
-                    value: Datum::Null,
-                }
+            .alloc_slice_with(source.n_columns, |index| crate::sql::types::RecordField {
+                name: "",
+                type_oid: columns[index].ctype.oid(),
+                value: Datum::Null,
             })
             .map_err(|_| arena_full())?;
         for (field, column) in fields.iter_mut().zip(columns) {
@@ -4414,6 +4500,31 @@ impl Chained<'_, '_> {
 }
 
 impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
+    fn check_unassigned_row_field(
+        &self,
+        qualifier: &str,
+        name: &str,
+        catalog: Option<&dyn super::super::eval::CatalogAccess>,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        // The scope that answered the lookup checks its row variable.
+        match self.inner.lookup(Some(qualifier), name) {
+            Ok(_)
+                if crate::sql::eval::column_precedes_variable(
+                    self.outer,
+                    Some(qualifier),
+                    name,
+                )? =>
+            {
+                self.inner
+                    .check_unassigned_row_field(qualifier, name, catalog, arena)
+            }
+            _ => self.outer.map_or(Ok(()), |outer| {
+                outer.check_unassigned_row_field(qualifier, name, catalog, arena)
+            }),
+        }
+    }
+
     fn procedural_variable(
         &self,
         qualifier: Option<&str>,
@@ -5005,6 +5116,7 @@ fn consume_external_lateral_run<'a>(
     run: crate::sql::external::ExternalRun,
     arena: &'a Arena,
     recycle_rows: bool,
+    retain_match: Option<&core::cell::Cell<bool>>,
     visit: &mut impl FnMut(usize, &'a [u8]) -> Result<bool, SqlError>,
 ) -> Result<bool, SqlError> {
     let mut reader = storage.external_run_reader()?;
@@ -5018,9 +5130,12 @@ fn consume_external_lateral_run<'a>(
         let owned = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
         let keep_scanning = visit(index, owned)?;
         index += 1;
-        if let Some(mark) = mark {
+        if let Some(mark) = mark
+            && !retain_match.is_some_and(core::cell::Cell::get)
+        {
             // SAFETY: the candidate and every evaluator result derived from it
-            // were consumed synchronously by `visit`.
+            // were consumed synchronously by `visit`. A retained match (a
+            // joined DML source row) keeps its copy for the statement.
             unsafe { arena.rewind_to(mark) };
         }
         if !keep_scanning {
@@ -5373,7 +5488,25 @@ fn join_key_types_compatible(a: ColType, b: ColType) -> bool {
     fn is_integer(t: ColType) -> bool {
         matches!(t, ColType::Int2 | ColType::Int4 | ColType::Int8)
     }
-    a == b || (is_integer(a) && is_integer(b))
+    // `oid` and the reg* aliases are binary coercible and hash their OID.
+    fn is_oid(t: ColType) -> bool {
+        matches!(
+            t,
+            ColType::Oid
+                | ColType::Regtype
+                | ColType::Regproc
+                | ColType::Regprocedure
+                | ColType::Regoper
+                | ColType::Regoperator
+                | ColType::Regclass
+                | ColType::Regnamespace
+                | ColType::Regrole
+                | ColType::Regconfig
+                | ColType::Regdictionary
+                | ColType::Regcollation
+        )
+    }
+    a == b || (is_integer(a) && is_integer(b)) || (is_oid(a) && is_oid(b))
 }
 
 /// Extracts every equi-join key for a two-table hash join: each
@@ -5383,13 +5516,33 @@ fn join_key_types_compatible(a: ColType, b: ColType) -> bool {
 /// generate candidates — the full ON and WHERE still run at the leaf, so a
 /// missed extraction never changes a result, only the access path.
 #[allow(clippy::type_complexity)]
+/// The scope column a join key names, written `column`, `table.column` or
+/// `schema.table.column`; `None` for any other expression.
+fn key_column(scope: &QueryScope<'_>, expression: &Expr<'_>) -> Option<ResolvedColumn> {
+    match *expression {
+        Expr::Column { qualifier, name } => scope.find_column(qualifier, name).ok(),
+        Expr::SchemaColumn {
+            schema,
+            table,
+            name,
+        } => {
+            let qualifier = crate::stack_format!(130, "{}.{}", schema, table);
+            scope.find_column(Some(qualifier.as_str()), name).ok()
+        }
+        _ => None,
+    }
+}
+
+/// Up to eight (probe column, build column) join key pairs and their count.
+type JoinKeyPairs = ([(usize, usize); 8], usize);
+
 fn hash_join_keys<'a>(
     scope: &QueryScope<'a>,
     on: Option<&'a Expr<'a>>,
     where_clause: Option<&'a Expr<'a>>,
     probe_t: usize,
     build_t: usize,
-) -> Result<Option<([(usize, usize); 8], usize)>, SqlError> {
+) -> Result<Option<JoinKeyPairs>, SqlError> {
     let mut conjuncts: [&Expr; MAX_CONJUNCTS] = [&Expr::Null; MAX_CONJUNCTS];
     let mut nc = 0usize;
     for source in [on, where_clause].into_iter().flatten() {
@@ -5419,22 +5572,8 @@ fn hash_join_keys<'a>(
         else {
             continue;
         };
-        let Expr::Column {
-            qualifier: lq,
-            name: ln,
-        } = **left
-        else {
-            continue;
-        };
-        let Expr::Column {
-            qualifier: rq,
-            name: rn,
-        } = **right
-        else {
-            continue;
-        };
-        let (Ok(ResolvedColumn::Table(lt, lc)), Ok(ResolvedColumn::Table(rt, rc))) =
-            (scope.find_column(lq, ln), scope.find_column(rq, rn))
+        let (Some(ResolvedColumn::Table(lt, lc)), Some(ResolvedColumn::Table(rt, rc))) =
+            (key_column(scope, left), key_column(scope, right))
         else {
             continue;
         };
@@ -5472,6 +5611,134 @@ fn hash_join_keys<'a>(
     } else {
         Ok(Some((pairs, npairs)))
     }
+}
+
+/// A hash index over a materialized source (a derived table or catalog
+/// relation) joined below the first level, keyed by one column its join
+/// condition compares with an earlier source's column. Each outer row then
+/// visits only the rows whose key hashes alike instead of every row.
+#[derive(Clone, Copy)]
+pub(crate) struct DerivedProbe<'a> {
+    probe_qualifier: &'a str,
+    probe_name: &'a str,
+    collation: Collation,
+    /// Bucket heads, then each row's next row in its bucket, both
+    /// `u32::MAX`-terminated, and each row's key hash.
+    buckets: &'a [u32],
+    next: &'a [u32],
+    hashes: &'a [u64],
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static DERIVED_CANDIDATES: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_derived_candidate() {
+    DERIVED_CANDIDATES.with(|count| count.set(count.get() + 1));
+}
+
+/// Rows of materialized sources this thread's joins have visited below their
+/// first level, for tests that bound a join's work deterministically.
+#[cfg(test)]
+pub(crate) fn derived_candidates_visited() -> u64 {
+    DERIVED_CANDIDATES.with(core::cell::Cell::get)
+}
+
+/// Smaller sources scan faster than they hash.
+const DERIVED_PROBE_MIN_ROWS: usize = 32;
+
+#[allow(clippy::too_many_arguments)]
+fn derived_probe<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    where_clause: Option<&'a Expr<'a>>,
+    order: &[usize],
+    depth: usize,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<DerivedProbe<'a>>, SqlError> {
+    let table = order[depth];
+    let join = &from.joins[depth - 1];
+    let (Some(rows), None) = (scope.derived[table], scope.external_runs[table]) else {
+        return Ok(None);
+    };
+    if rows.len() < DERIVED_PROBE_MIN_ROWS
+        || rows.len() >= u32::MAX as usize
+        || scope.lateral[table]
+        || !matches!(
+            join.kind,
+            JoinKind::Inner | JoinKind::Cross | JoinKind::Comma | JoinKind::Left
+        )
+    {
+        return Ok(None);
+    }
+    let on = join.on.or(scope.join_on[depth - 1]);
+    // An inner join's WHERE equality filters its rows as surely as its ON
+    // condition; an outer join's WHERE runs after null extension.
+    let filter = (join.kind != JoinKind::Left)
+        .then_some(where_clause)
+        .flatten();
+    let Some(((probe_table, (probe_column, build_column)), collation)) = order[..depth]
+        .iter()
+        .find_map(|&earlier| {
+            hash_join_keys(scope, on, filter, earlier, table)
+                .ok()
+                .flatten()
+                .map(|(keys, _)| (earlier, keys[0]))
+        })
+        .map(|(earlier, key)| {
+            let collation = scope.defs.get(table).expect("resolved").columns[key.1].collation;
+            ((earlier, key), collation)
+        })
+    else {
+        return Ok(None);
+    };
+    let (probe_qualifier, probe_name) = scope.column_reference_name(probe_table, probe_column);
+    let full = |_| arena_full();
+    let bucket_count = rows.len().next_power_of_two();
+    let buckets = arena
+        .alloc_slice_with(bucket_count, |_| u32::MAX)
+        .map_err(full)?;
+    let next = arena
+        .alloc_slice_with(rows.len(), |_| u32::MAX)
+        .map_err(full)?;
+    let hashes = arena.alloc_slice_with(rows.len(), |_| 0u64).map_err(full)?;
+    // Inserting in reverse leaves each bucket in row order.
+    for (index, bytes) in rows.iter().enumerate().rev() {
+        let mark = arena.mark();
+        let value = crate::sql::exec::decode_projected_col_record(bytes, build_column, arena)?;
+        let hash = if value.is_null() {
+            None
+        } else {
+            Some(hash_key_collated_catalog(
+                storage,
+                txid,
+                &[value],
+                &[0],
+                &[collation],
+            )?)
+        };
+        // SAFETY: the decoded key is not kept; only its hash is.
+        unsafe { arena.rewind_to(mark) };
+        let Some(hash) = hash else { continue };
+        let bucket = (hash as usize) & (bucket_count - 1);
+        hashes[index] = hash;
+        next[index] = buckets[bucket];
+        buckets[bucket] = index as u32;
+    }
+    let probe_qualifier = arena.alloc_str(probe_qualifier).map_err(full)?;
+    let probe_name = arena.alloc_str(probe_name).map_err(full)?;
+    Ok(Some(DerivedProbe {
+        probe_qualifier,
+        probe_name,
+        collation,
+        buckets,
+        next,
+        hashes,
+    }))
 }
 
 /// A selected two-table hash implementation. Planning is shared with EXPLAIN
@@ -5545,7 +5812,7 @@ pub(crate) fn select_hash_join_plan<'a>(
     let join = &from.joins[0];
     if !matches!(
         join.kind,
-        JoinKind::Inner | JoinKind::Cross | JoinKind::Left
+        JoinKind::Inner | JoinKind::Cross | JoinKind::Comma | JoinKind::Left
     ) {
         return Ok(None);
     }
@@ -5558,8 +5825,10 @@ pub(crate) fn select_hash_join_plan<'a>(
     // source is derived. Otherwise probe the first source in its own row order.
     let (probe_table, build_table) = if scope.derived[first_table].is_some()
         && scope.derived[second_table].is_none()
-        && matches!(join.kind, JoinKind::Inner | JoinKind::Cross)
-    {
+        && matches!(
+            join.kind,
+            JoinKind::Inner | JoinKind::Cross | JoinKind::Comma
+        ) {
         (second_table, first_table)
     } else {
         (first_table, second_table)
@@ -6121,9 +6390,10 @@ fn scan_source_mode<'a>(
         Ok(())
     }
 
-    /// Executes a previously selected two-table hash plan. Its fixed capacity
-    /// is a plan invariant: stale statistics that exceed it raise 54000 rather
-    /// than changing the execution strategy after query execution begins.
+    /// Executes a previously selected two-table hash plan. Its capacity is
+    /// the planner's estimate; a build side larger than that estimate (rows
+    /// spilled to object storage are estimated, not counted) grows the table
+    /// in the statement arena instead of changing the execution strategy.
     #[allow(clippy::too_many_arguments)]
     fn execute_hash_join_plan<'a>(
         storage: &'a Storage,
@@ -6154,14 +6424,14 @@ fn scan_source_mode<'a>(
         let build_external_run = scope.external_runs[build_t];
         let build_count = plan.build_capacity;
         let completed = (|| -> Result<bool, SqlError> {
-            let buckets_len = (build_count * 2).next_power_of_two().max(16);
-            let entries = arena
+            let mut buckets_len = (build_count * 2).next_power_of_two().max(16);
+            let mut entries = arena
                 .alloc_slice_with(build_count, |_| EMPTY_HASH_ENTRY)
                 .map_err(|_| arena_full())?;
-            let next = arena
+            let mut next = arena
                 .alloc_slice_with(build_count, |_| 0u32)
                 .map_err(|_| arena_full())?;
-            let buckets = arena
+            let mut buckets = arena
                 .alloc_slice_with(buckets_len, |_| u32::MAX)
                 .map_err(|_| arena_full())?;
             let mut build_schema = [ColType::Bool; MAX_COLUMNS];
@@ -6175,6 +6445,33 @@ fn scan_source_mode<'a>(
             let hash_cols: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
             let mut key_vals = [Datum::Null; 8];
             let mut n = 0usize;
+            // Doubles the entries and rehashes them into twice as many
+            // buckets. Chains keep their order: later rows first.
+            macro_rules! grow_build {
+                () => {{
+                    if n == entries.len() {
+                        let grown = entries.len().checked_mul(2).ok_or_else(arena_full)?;
+                        let old_entries = &*entries;
+                        entries = arena
+                            .alloc_slice_with(grown, |index| {
+                                old_entries.get(index).copied().unwrap_or(EMPTY_HASH_ENTRY)
+                            })
+                            .map_err(|_| arena_full())?;
+                        next = arena
+                            .alloc_slice_with(grown, |_| 0u32)
+                            .map_err(|_| arena_full())?;
+                        buckets_len = (grown * 2).next_power_of_two().max(16);
+                        buckets = arena
+                            .alloc_slice_with(buckets_len, |_| u32::MAX)
+                            .map_err(|_| arena_full())?;
+                        for index in 0..n {
+                            let bucket = (entries[index].hash as usize) & (buckets_len - 1);
+                            next[index] = buckets[bucket];
+                            buckets[bucket] = index as u32;
+                        }
+                    }
+                }};
+            }
             macro_rules! insert_build {
                 ($rowid:expr, $row:expr, $values:expr) => {{
                     let values = $values;
@@ -6187,9 +6484,7 @@ fn scan_source_mode<'a>(
                         }
                     }
                     if !any_null {
-                        if n == entries.len() {
-                            return Err(arena_full());
-                        }
+                        grow_build!();
                         let hash = hash_key_collated_catalog(
                             storage,
                             txid,
@@ -6253,15 +6548,25 @@ fn scan_source_mode<'a>(
                 scan.for_each_spilled_row_batch(arena, false, Some(demand), &mut |rows| {
                     for spilled in rows {
                         storage.record_relation_tuple_read(txid, build_slot, None)?;
-                        let crate::storage::SpilledRowRepresentation::Values(values) =
-                            spilled.representation
-                        else {
-                            return Err(sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "PAX scan did not return selected values"
-                            ));
-                        };
-                        insert_build!(Some(spilled.rowid), BoundRow::Values(values), values);
+                        // Rows not yet in column blocks arrive encoded.
+                        match spilled.representation {
+                            crate::storage::SpilledRowRepresentation::Values(values) => {
+                                insert_build!(
+                                    Some(spilled.rowid),
+                                    BoundRow::Values(values),
+                                    values
+                                );
+                            }
+                            crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
+                                let mut decoded = [Datum::Null; MAX_COLUMNS];
+                                rowenc::decode(bytes, build_schema, &mut decoded)?;
+                                insert_build!(
+                                    Some(spilled.rowid),
+                                    BoundRow::Encoded(bytes),
+                                    &decoded[..build_schema.len()]
+                                );
+                            }
+                        }
                     }
                     Ok(ControlFlow::Continue(()))
                 })?;
@@ -6293,9 +6598,7 @@ fn scan_source_mode<'a>(
                     if any_null {
                         return Ok(ControlFlow::Continue(()));
                     }
-                    if n == entries.len() {
-                        return Err(arena_full());
-                    }
+                    grow_build!();
                     let hash = hash_key_collated_catalog(
                         storage,
                         txid,
@@ -6347,13 +6650,16 @@ fn scan_source_mode<'a>(
                     for spilled in rows {
                         check_timeout()?;
                         storage.record_relation_tuple_read(txid, probe_slot, None)?;
-                        let crate::storage::SpilledRowRepresentation::Values(values) =
-                            spilled.representation
-                        else {
-                            return Err(sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "PAX scan did not return selected values"
-                            ));
+                        // Rows not yet in column blocks arrive encoded.
+                        let values = match spilled.representation {
+                            crate::storage::SpilledRowRepresentation::Values(values) => values,
+                            crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
+                                let mut decoded = [Datum::Null; MAX_COLUMNS];
+                                rowenc::decode(bytes, probe_schema, &mut decoded)?;
+                                &*arena
+                                    .alloc_slice_copy(&decoded[..probe_schema.len()])
+                                    .map_err(|_| arena_full())?
+                            }
                         };
                         let mut any_null = false;
                         for i in 0..nkeys {
@@ -6871,6 +7177,7 @@ fn scan_source_mode<'a>(
         // (identity unless a cross join was cost-reordered).
         order: &[usize],
         parameterized: &[Option<IndexAccessPlan<'a>>],
+        derived_probes: &[Option<DerivedProbe<'a>>],
         indexed: Option<&IndexedCandidates<'a>>,
         decode_buffers: &mut RowDecodeBuffers<'a>,
         recycle_rows: bool,
@@ -6958,6 +7265,7 @@ fn scan_source_mode<'a>(
                         sample_plans,
                         order,
                         parameterized,
+                        derived_probes,
                         indexed,
                         decode_buffers,
                         recycle_rows,
@@ -7072,7 +7380,7 @@ fn scan_source_mode<'a>(
                 storage,
                 txid,
                 tref,
-                scope.defs.get(t).expect("resolved").n_columns,
+                scope.stored_width(t),
                 arena,
                 params,
                 &chained,
@@ -7085,6 +7393,7 @@ fn scan_source_mode<'a>(
                             run,
                             arena,
                             recycle_rows,
+                            retain_match,
                             &mut |index, bytes| {
                                 visit_candidate!(index, BoundRow::Encoded(bytes), None)
                             },
@@ -7132,9 +7441,55 @@ fn scan_source_mode<'a>(
                     .with_block_store(|blocks| reader.advance(blocks))
                     .expect("external run has a block store")?;
             }
+        } else if let (Some(rows), Some(probe)) =
+            (scope.derived[order[depth]], derived_probes[depth])
+        {
+            // Only the rows whose join key hashes like the outer row's key can
+            // satisfy the join condition, which still decides each candidate.
+            // The key is hashed in recycled memory; only the hash leaves it.
+            let hash = recycled(arena, recycle_rows, None, || {
+                let outer_row = assemble(
+                    storage,
+                    txid,
+                    scope,
+                    bound,
+                    bound_rowids,
+                    order,
+                    depth,
+                    decode_buffers,
+                    arena,
+                )?;
+                let key = outer_row.lookup(Some(probe.probe_qualifier), probe.probe_name)?;
+                if key.is_null() {
+                    return Ok::<_, SqlError>(None);
+                }
+                hash_key_collated_catalog(storage, txid, &[key], &[0], &[probe.collation]).map(Some)
+            })?;
+            if let Some(hash) = hash {
+                let mut entry = probe.buckets[(hash as usize) & (probe.buckets.len() - 1)];
+                while entry != u32::MAX {
+                    let index = entry as usize;
+                    entry = probe.next[index];
+                    if probe.hashes[index] != hash {
+                        continue;
+                    }
+                    check_timeout()?;
+                    #[cfg(test)]
+                    count_derived_candidate();
+                    let bytes = rows[index];
+                    let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
+                        visit_candidate!(index, BoundRow::Encoded(bytes), None)
+                    })?;
+                    if !keep_scanning {
+                        return Ok(false);
+                    }
+                }
+            }
         } else if let Some(rows) = scope.derived[order[depth]] {
             for (index, bytes) in rows.iter().enumerate() {
                 check_timeout()?;
+                #[cfg(test)]
+                count_derived_candidate();
                 let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                     visit_candidate!(index, BoundRow::Encoded(bytes), None)
                 })?;
@@ -7509,6 +7864,7 @@ fn scan_source_mode<'a>(
                 sample_plans,
                 order,
                 parameterized,
+                derived_probes,
                 indexed,
                 decode_buffers,
                 recycle_rows,
@@ -7594,12 +7950,22 @@ fn scan_source_mode<'a>(
     // toward the filtered result size. Results are identical — a partial row
     // that fails such a conjunct cannot satisfy the full WHERE (the conjunct's
     // value does not depend on the still-unbound tables), and the leaf still
-    // evaluates the whole WHERE. Restricted to inner/cross joins so a
-    // WHERE clause over an outer join's nullable side is never pruned early.
-    let all_inner = from
+    // evaluates the whole WHERE. Only tables bound before the first outer
+    // join take part, so a WHERE clause over an outer join's nullable side
+    // is never pruned early; a RIGHT or FULL join makes its left side
+    // nullable too, so it disables pushdown.
+    let pushdown_depth = if from
         .joins
         .iter()
-        .all(|j| matches!(j.kind, JoinKind::Inner | JoinKind::Cross));
+        .any(|j| matches!(j.kind, JoinKind::Right | JoinKind::Full))
+    {
+        0
+    } else {
+        from.joins
+            .iter()
+            .position(|j| j.kind == JoinKind::Left)
+            .map_or(scope.n, |join| join + 1)
+    };
     // Cost-based execution order: only cross joins (no ON clause, no nullable
     // side) may be reordered freely — an explicit JOIN ... ON's condition is tied
     // to its position. Everything else keeps FROM order (identity). A LATERAL
@@ -7608,6 +7974,22 @@ fn scan_source_mode<'a>(
     let any_lateral = scope.lateral[..scope.n].iter().any(|&l| l);
     // A LATERAL item references the tables to its left, so it cannot be the
     // right side of a RIGHT/FULL join (PostgreSQL rejects this too).
+    // Joins run as one left-deep chain. That equals PostgreSQL's tree for a
+    // RIGHT or FULL join only within the first comma-separated FROM item;
+    // the parser runs any later such item as a parenthesized join.
+    if let Some(after_comma) = from
+        .joins
+        .iter()
+        .position(|join| join.kind == JoinKind::Comma)
+        && from.joins[after_comma..]
+            .iter()
+            .any(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full))
+    {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "RIGHT or FULL join after a comma was not grouped"
+        ));
+    }
     for j in from.joins {
         if j.table.lateral && matches!(j.kind, JoinKind::Right | JoinKind::Full) {
             return Err(sql_err!(
@@ -7616,7 +7998,14 @@ fn scan_source_mode<'a>(
             ));
         }
     }
-    let all_cross = from.joins.iter().all(|j| matches!(j.kind, JoinKind::Cross));
+    for (index, join) in from.joins.iter().enumerate() {
+        if join.kind == JoinKind::Full
+            && let Some(on) = join.on
+        {
+            super::plan::check_full_join_condition(on, scope, index + 1)?;
+        }
+    }
+    let all_cross = from.joins.iter().all(|j| j.kind.is_cross());
     let order = arena
         .alloc_slice_with(scope.n, |index| index)
         .map_err(|_| arena_full())?;
@@ -7635,7 +8024,7 @@ fn scan_source_mode<'a>(
     let pushdown_counts = arena
         .alloc_slice_with(scope.n, |_| 0usize)
         .map_err(|_| arena_full())?;
-    if all_inner
+    if pushdown_depth >= 1
         && scope.n >= 2
         && let Some(w) = where_clause
     {
@@ -7658,7 +8047,7 @@ fn scan_source_mode<'a>(
                     .map(|t| inv_order[t])
                     .max()
                     .unwrap_or(0);
-                if d < scope.n && pushdown_counts[d] < MAX_CONJUNCTS {
+                if d < pushdown_depth && pushdown_counts[d] < MAX_CONJUNCTS {
                     pushdown_buffers[d][pushdown_counts[d]] = c;
                     pushdown_counts[d] += 1;
                 }
@@ -7701,6 +8090,24 @@ fn scan_source_mode<'a>(
     let parameterized = arena
         .alloc_slice_with(scope.n, |depth| parameterized_plans[depth])
         .map_err(|_| arena_full())?;
+    let derived_probes = arena
+        .alloc_slice_with(scope.n, |_| None)
+        .map_err(|_| arena_full())?;
+    for depth in 1..scope.n {
+        if security_plans[order[depth]].is_none() && sample_plans[order[depth]].is_none() {
+            derived_probes[depth] = derived_probe(
+                storage,
+                scope,
+                from,
+                planning_where_clause,
+                order,
+                depth,
+                txid,
+                arena,
+            )?;
+        }
+    }
+    let derived_probes = &*derived_probes;
     let bound = arena
         .alloc_slice_with(scope.n, |_| None)
         .map_err(|_| arena_full())?;
@@ -7793,6 +8200,7 @@ fn scan_source_mode<'a>(
             sample_plans,
             order,
             parameterized,
+            derived_probes,
             indexed,
             decode_buffers,
             recycle_rows,
@@ -7910,6 +8318,7 @@ fn scan_source_mode<'a>(
                     sample_plans,
                     order,
                     parameterized,
+                    derived_probes,
                     indexed,
                     decode_buffers,
                     recycle_rows,

@@ -164,3 +164,122 @@ pub(super) fn functions<'a>(
         "pg_type domain input/output dependency cycle"
     ))
 }
+
+/// The `pg_type` columns PostgreSQL derives for a type outside pg_catalog:
+/// storage traits and binary I/O, subscripting and statistics support.
+/// typecmds.c gives enums and composites their generic routines, domains
+/// their base type's traits with `domain_recv`, and arrays the array
+/// routines with `double` alignment only over `double`-aligned elements.
+#[derive(Clone, Copy)]
+pub(super) struct DerivedTraits {
+    pub(super) by_value: bool,
+    pub(super) align: u8,
+    pub(super) subscript: TypeIoRoutine,
+    pub(super) receive: TypeIoRoutine,
+    pub(super) send: TypeIoRoutine,
+    pub(super) analyze: TypeIoRoutine,
+    pub(super) dimensions: i32,
+}
+
+const NO_ROUTINE: TypeIoRoutine = TypeIoRoutine { oid: 0, name: "-" };
+
+const fn routine(oid: i32, name: &'static str) -> TypeIoRoutine {
+    TypeIoRoutine { oid, name }
+}
+
+pub(super) fn derived(
+    row: &[Datum<'_>],
+    rows: &[&[Datum<'_>]],
+    fields: [usize; 4],
+) -> Result<DerivedTraits, SqlError> {
+    derived_at(row, rows, fields, rows.len() + 1)
+}
+
+fn derived_at(
+    row: &[Datum<'_>],
+    rows: &[&[Datum<'_>]],
+    fields: [usize; 4],
+    depth: usize,
+) -> Result<DerivedTraits, SqlError> {
+    let [oid, kind, element, base] = fields;
+    let Some(depth) = depth.checked_sub(1) else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "pg_type trait dependency cycle"
+        ));
+    };
+    let identity = type_oid(row[oid])?;
+    let lookup = |identity: i32| -> Result<DerivedTraits, SqlError> {
+        if let Ok(position) =
+            super::type_rows::BUILTIN_TYPE_ROWS.binary_search_by_key(&identity, |ty| ty.oid)
+        {
+            let ty = super::type_rows::BUILTIN_TYPE_ROWS[position];
+            return Ok(DerivedTraits {
+                by_value: ty.by_value,
+                align: ty.align,
+                subscript: routine(ty.subscript, ty.routine_names[0]),
+                receive: routine(ty.receive, ty.routine_names[3]),
+                send: routine(ty.send, ty.routine_names[4]),
+                analyze: routine(ty.analyze, ty.routine_names[7]),
+                dimensions: 0,
+            });
+        }
+        for candidate in rows {
+            if type_oid(candidate[oid])? == identity {
+                return derived_at(candidate, rows, fields, depth);
+            }
+        }
+        Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "pg_type references a missing type {}",
+            identity
+        ))
+    };
+    match row[kind] {
+        Datum::Text("d") | Datum::Char(b'd') => {
+            let base_identity = type_oid(row[base])?;
+            let base = lookup(base_identity)?;
+            Ok(DerivedTraits {
+                subscript: NO_ROUTINE,
+                receive: routine(2598, "domain_recv"),
+                dimensions: i32::from(base.subscript.oid == 6179),
+                ..base
+            })
+        }
+        Datum::Text("e") | Datum::Char(b'e') => Ok(DerivedTraits {
+            by_value: true,
+            align: b'i',
+            subscript: NO_ROUTINE,
+            receive: routine(3532, "enum_recv"),
+            send: routine(3533, "enum_send"),
+            analyze: NO_ROUTINE,
+            dimensions: 0,
+        }),
+        Datum::Text("c") | Datum::Char(b'c') => Ok(DerivedTraits {
+            by_value: false,
+            align: b'd',
+            subscript: NO_ROUTINE,
+            receive: routine(2402, "record_recv"),
+            send: routine(2403, "record_send"),
+            analyze: NO_ROUTINE,
+            dimensions: 0,
+        }),
+        Datum::Text("b") | Datum::Char(b'b') if type_oid(row[element])? != 0 => {
+            let element = lookup(type_oid(row[element])?)?;
+            Ok(DerivedTraits {
+                by_value: false,
+                align: if element.align == b'd' { b'd' } else { b'i' },
+                subscript: routine(6179, "array_subscript_handler"),
+                receive: routine(2400, "array_recv"),
+                send: routine(2401, "array_send"),
+                analyze: routine(3816, "array_typanalyze"),
+                dimensions: 0,
+            })
+        }
+        _ => Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "pg_type has no derived traits for type {}",
+            identity
+        )),
+    }
+}

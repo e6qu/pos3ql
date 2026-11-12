@@ -980,10 +980,10 @@ def test_paged_portal_capacity_is_a_named_error_not_a_disconnect():
     simple_query(s, "BEGIN")
     parse = frontend_message(
         b"P",
-        # Grouping is not a retained shape, so this paged portal buffers its
-        # whole result in portal_result_bytes.
+        # A set operation is not a retained shape, so this paged portal
+        # buffers its whole result in portal_result_bytes.
         b"bounded_statement\x00SELECT repeat('x', 1024) || g FROM generate_series(1,100) g "
-        b"GROUP BY g\x00\x00\x00",
+        b"UNION ALL SELECT 'end'\x00\x00\x00",
     )
     bind = frontend_message(
         b"B", b"bounded_portal\x00bounded_statement\x00" + struct.pack("!hhh", 0, 0, 0)
@@ -2866,8 +2866,18 @@ def test_database_force_terminates_live_backends_with_fatal():
     victim = connect()
     victim.sendall(startup_payload(0, parameters=(("database", "wire_force_database"),)))
     drain_startup(victim)
+    # Like PostgreSQL, an ordinary DROP waits five seconds for the backend to
+    # leave before it reports the database in use.
+    admin.settimeout(15)
+    started = time.monotonic()
     blocked = simple_query(admin, "DROP DATABASE wire_force_database")
-    check("raw wire: ordinary DROP sees the live backend", has_sqlstate(blocked, "55006"), blocked)
+    waited = time.monotonic() - started
+    admin.settimeout(5)
+    check(
+        "raw wire: ordinary DROP waits for, then reports, the live backend",
+        has_sqlstate(blocked, "55006") and waited >= 4.5,
+        (waited, blocked),
+    )
     dropped = simple_query(admin, "DROP DATABASE wire_force_database WITH (FORCE)")
     check(
         "raw wire: DROP DATABASE FORCE completes",
@@ -6201,7 +6211,7 @@ def test_generated_expression_lifecycle_over_raw_wire():
         and has_sqlstate(add_identity, "55000")
         and rewritten_rows == [["2", "20"], ["4", "40"]]
         and dropped_rows == [["2", "99", ""], ["4", "40", ""], ["7", "8", ""]]
-        and any(kind == b"N" and b"not a stored generated column, skipping" in payload for kind, payload in drop_expression),
+        and any(kind == b"N" and b"is not a generated column, skipping" in payload for kind, payload in drop_expression),
         results,
     )
     s.close()

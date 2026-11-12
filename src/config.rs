@@ -110,6 +110,11 @@ pub struct Config {
     /// The shared registry is reserved at startup from this PostgreSQL-shaped
     /// limit; exhaustion is reported instead of allocating while serving.
     pub max_locks_per_transaction: usize,
+    /// Levels of multi-step statements nested in one another's steps (a rule
+    /// action on a table with rules) whose progress a write keeps; a running
+    /// multi-step write leases one step record per level from
+    /// `execution_control_bytes`.
+    pub write_step_levels: usize,
     /// Bound-parameter format, length, and value bytes per portal.
     pub portal_bytes: usize,
     /// Buffered result bytes per portal (Execute max_rows paging).
@@ -139,9 +144,11 @@ pub struct Config {
     pub max_enum_labels_per_type: usize,
     /// Fixed number of named composite type catalog slots across all databases.
     pub max_composites: usize,
-    /// Fixed number of cluster-wide role catalog slots, including `postgres`.
+    /// Fixed number of cluster-wide role catalog slots, including `postgres`
+    /// but not PostgreSQL's 16 predefined roles, which are always present.
     pub max_roles: usize,
-    /// Fixed number of cluster-wide role-membership catalog slots.
+    /// Fixed number of cluster-wide role-membership catalog slots, not
+    /// counting the three memberships initdb grants to `pg_monitor`.
     pub max_role_memberships: usize,
     /// Fixed number of per-role and per-database setting catalog slots.
     pub max_role_settings: usize,
@@ -426,6 +433,18 @@ impl Drop for TestDataDirCleanup {
 }
 
 impl Config {
+    /// Role catalog slots: `max_roles` (including `postgres`) plus
+    /// PostgreSQL's predefined roles, which are always present.
+    pub fn role_catalog_slots(&self) -> usize {
+        self.max_roles + crate::storage::PREDEFINED_ROLE_COUNT
+    }
+
+    /// Role membership slots: `max_role_memberships` plus the memberships
+    /// initdb grants among predefined roles.
+    pub fn role_membership_catalog_slots(&self) -> usize {
+        self.max_role_memberships + crate::storage::INITDB_MEMBERSHIPS.len()
+    }
+
     /// Explicit development fixture; the server requires a configuration file.
     pub fn default_dev() -> Self {
         Self {
@@ -463,6 +482,7 @@ impl Config {
             max_analyze_per_transaction: 64,
             max_prepared_transactions: 0,
             max_locks_per_transaction: 64,
+            write_step_levels: 4,
             memtable_bytes: 64 * MIB,
             wal_bytes: 256 * MIB,
             wal_buffer_bytes: MIB,
@@ -865,6 +885,10 @@ impl Config {
                 }
                 "max_locks_per_transaction" => {
                     config.max_locks_per_transaction =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "write_step_levels" => {
+                    config.write_step_levels =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "memtable_bytes" => {
@@ -1705,6 +1729,15 @@ impl Config {
                 "max_locks_per_transaction must be greater than zero".to_string(),
             ));
         }
+        if !(1..=Self::MAX_WRITE_STEP_LEVELS).contains(&config.write_step_levels) {
+            return Err(ConfigError::at(
+                0,
+                format!(
+                    "write_step_levels must be 1..{}",
+                    Self::MAX_WRITE_STEP_LEVELS
+                ),
+            ));
+        }
         if config.max_ddl_per_transaction == 0 {
             return Err(ConfigError::at(
                 0,
@@ -1972,6 +2005,8 @@ impl Config {
     /// Smallest nonzero `result_stream_bytes`: a stream's bound query, scope
     /// and description need this much before any row position.
     pub const MIN_RESULT_STREAM_BYTES: usize = 64 * KIB;
+    /// Upper bound of `write_step_levels`; rules nest no deeper in practice.
+    pub const MAX_WRITE_STEP_LEVELS: usize = 64;
 
     /// Shared resource validation for file and direct embedded startup.
     pub fn validate_runtime_resources(&self) -> Result<(), ConfigError> {
@@ -2828,6 +2863,23 @@ sql_arena_bytes = 4096
     }
 
     #[test]
+    fn write_step_levels_are_bounded() {
+        const REQUIRED: &str = "transaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nplan_build_bytes = 16MiB\nplan_build_leases = 64\nresult_stream_bytes = 256KiB\nresult_stream_slots = 2\nindex_statistics_slots = 4096\n";
+        assert_eq!(Config::parse(REQUIRED).unwrap().write_step_levels, 4);
+        assert_eq!(
+            Config::parse(&format!("write_step_levels = 8\n{REQUIRED}"))
+                .unwrap()
+                .write_step_levels,
+            8
+        );
+        for levels in [0, Config::MAX_WRITE_STEP_LEVELS + 1] {
+            let error =
+                Config::parse(&format!("write_step_levels = {levels}\n{REQUIRED}")).unwrap_err();
+            assert_eq!(error.message, "write_step_levels must be 1..64");
+        }
+    }
+
+    #[test]
     fn advisory_lock_capacity_must_be_nonzero() {
         let error = Config::parse("max_locks_per_transaction = 0\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nplan_build_bytes = 16MiB\nplan_build_leases = 64\nresult_stream_bytes = 256KiB\nresult_stream_slots = 2\nindex_statistics_slots = 4096\n")
             .unwrap_err();
@@ -3100,7 +3152,7 @@ sql_arena_bytes = 4096
             Config::parse("max_parameter_acl_entries = 0\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nplan_build_bytes = 16MiB\nplan_build_leases = 64\nresult_stream_bytes = 256KiB\nresult_stream_slots = 2\nindex_statistics_slots = 4096\n").is_err()
         );
         assert!(
-            Config::parse("max_builtin_routine_entries = 0\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nresult_stream_bytes = 256KiB\nindex_statistics_slots = 4096\n").is_err()
+            Config::parse("max_builtin_routine_entries = 0\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nplan_build_bytes = 16MiB\nplan_build_leases = 64\nresult_stream_bytes = 256KiB\nresult_stream_slots = 2\nindex_statistics_slots = 4096\n").is_err()
         );
         assert!(
             Config::parse(
@@ -3296,23 +3348,30 @@ sql_arena_bytes = 4096
             ))
             .unwrap();
         }
-        for name in [
-            "max_roles",
-            "max_role_memberships",
-            "max_role_settings",
-            "max_acl_entries",
-            "max_column_acl_entries",
-            "max_default_acl_entries",
-            "max_parameter_acl_entries",
-            "max_builtin_routine_entries",
+        for (name, maximum) in [
+            ("max_roles", crate::storage::MAX_ROLE_CATALOG_SLOTS),
+            (
+                "max_role_memberships",
+                crate::storage::MAX_ROLE_MEMBERSHIP_CATALOG_SLOTS,
+            ),
+            ("max_role_settings", 65535),
+            ("max_acl_entries", 65535),
+            ("max_column_acl_entries", 65535),
+            ("max_default_acl_entries", 65535),
+            ("max_parameter_acl_entries", 65535),
+            ("max_builtin_routine_entries", 65535),
         ] {
             let error = Config::parse(&format!(
-                "{name} = 65536\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nplan_build_bytes = 16MiB\nplan_build_leases = 64\nresult_stream_bytes = 256KiB\nresult_stream_slots = 2\nindex_statistics_slots = 4096\n"
+                "{name} = {}\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nplan_build_bytes = 16MiB\nplan_build_leases = 64\nresult_stream_bytes = 256KiB\nresult_stream_slots = 2\nindex_statistics_slots = 4096\n",
+                maximum + 1
             ))
             .unwrap_err();
-            assert!(error.message.contains("65535-slot"), "{name}: {error}");
+            assert!(
+                error.message.contains(&format!("{maximum}-slot")),
+                "{name}: {error}"
+            );
             Config::parse(&format!(
-                "{name} = 65535\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nplan_build_bytes = 16MiB\nplan_build_leases = 64\nresult_stream_bytes = 256KiB\nresult_stream_slots = 2\nindex_statistics_slots = 4096\n"
+                "{name} = {maximum}\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nplan_build_bytes = 16MiB\nplan_build_leases = 64\nresult_stream_bytes = 256KiB\nresult_stream_slots = 2\nindex_statistics_slots = 4096\n"
             ))
             .unwrap();
         }

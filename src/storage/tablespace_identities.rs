@@ -4,8 +4,7 @@ use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 use core::num::NonZeroU32;
 
-const FIRST_CUSTOM_OID: i32 = 210_000;
-const MAX_CREATION: u64 = i32::MAX as u64 - FIRST_CUSTOM_OID as u64;
+const MAX_CREATION: u64 = super::MAX_CATALOG_CREATION;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TablespaceIdentity(NonZeroU32);
@@ -21,7 +20,7 @@ impl TablespaceIdentity {
         u64::from(self.0.get())
     }
     pub(crate) fn oid(self) -> i32 {
-        FIRST_CUSTOM_OID + self.0.get() as i32
+        super::OidBand::Tablespace.oid(self.created_at())
     }
 }
 
@@ -62,7 +61,7 @@ mod tests {
         assert!(TablespaceIdentity::parse(0).is_none());
         assert_eq!(
             TablespaceIdentity::parse(MAX_CREATION).unwrap().oid(),
-            i32::MAX
+            crate::storage::OidBand::Tablespace.last()
         );
         assert!(TablespaceIdentity::parse(MAX_CREATION + 1).is_none());
         assert!(TablespaceIdentity::parse(u64::MAX).is_none());

@@ -43,6 +43,11 @@ fn set_buffer(socket: &impl AsRawFd, option: libc::c_int, bytes: libc::c_int) {
 /// shrinks an advertised window: shrinking the buffer after connecting lets
 /// Linux overrun it, drop loopback segments and recover only through
 /// backed-off retransmission timeouts, stalling the transfer for seconds.
+///
+/// macOS still grows the client's receive buffer with the arrival rate, up
+/// to `net.inet.tcp.autorcvbufmax` (4 MiB), even before the client reads: a
+/// result of a few hundred kilobytes can fit in the kernel whole and finish
+/// within the turn that opened it.
 fn socket_pair() -> (TcpStream, TcpStream) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     set_buffer(&listener, libc::SO_RCVBUF, 4096);
@@ -102,7 +107,7 @@ fn connection(fixture: &mut Fixture, id: i32) -> (Conn, TcpStream) {
     let mut conn = Conn::new(&fixture.config, &mut fixture.budget).unwrap();
     conn.open(server, id).unwrap();
     conn.auth_database = fixture.engine.database_login("postgres");
-    conn.phase = Phase::Ready;
+    conn.enter_ready_for_tests(&fixture.engine);
     (conn, client)
 }
 
@@ -738,6 +743,21 @@ fn joins_stream_rows_as_the_client_reads() {
             "SELECT b.id, b.payload, c.id FROM big b, big c WHERE c.id = b.id",
             5000,
         ),
+        // RIGHT and FULL joins read a nested loop with a flag per row of
+        // big, then return big's unmatched rows, as the general executor.
+        (
+            "SELECT b.id, b.payload, t.label FROM tags t RIGHT JOIN big b ON t.k = b.id % 8",
+            5000,
+        ),
+        (
+            "SELECT b.id, b.payload, t.label FROM tags t FULL JOIN big b ON t.k = b.id % 8",
+            5000,
+        ),
+        (
+            "SELECT coalesce(b.id, 5001), b.payload, v.x FROM big b \
+             RIGHT JOIN (VALUES (1), (2), (99)) v(x) ON v.x = b.id % 2 + 1",
+            5001,
+        ),
     ] {
         let opened = fixture.engine.result_stream_metrics().opened;
         client.write_all(&query(sql)).unwrap();
@@ -765,7 +785,8 @@ fn joins_stream_rows_as_the_client_reads() {
             "{sql}"
         );
         // The same statement through the general executor returns the same
-        // rows: compare every column.
+        // rows: compare every column. OFFSET 0 keeps the subquery from
+        // merging into a query that would stream again.
         let mut streamed: Vec<Vec<Option<Vec<u8>>>> = response
             .iter()
             .filter(|message| message.0 == b'D')
@@ -776,7 +797,7 @@ fn joins_stream_rows_as_the_client_reads() {
             &mut other,
             &mut fixture.engine,
             &mut other_client,
-            &format!("SELECT * FROM ({sql}) q ORDER BY 1"),
+            &format!("SELECT * FROM ({sql} OFFSET 0) q ORDER BY 1"),
         );
         let general: Vec<Vec<Option<Vec<u8>>>> = messages(&general)
             .iter()
@@ -835,6 +856,26 @@ fn sorted_results_stream_rows_as_the_client_reads() {
             ),
             3000,
         ),
+        (
+            "SELECT id, payload FROM big ORDER BY payload, id DESC",
+            5000,
+        ),
+        // DISTINCT ON returns each first row of the sort.
+        ("SELECT DISTINCT ON (id / 2) id, payload FROM big", 2501),
+        (
+            "SELECT DISTINCT ON (b.id / 4, t.label IS NULL) b.id, b.payload, t.label \
+             FROM big b LEFT JOIN tags t ON t.k = b.id % 4 \
+             ORDER BY t.label IS NULL, b.id / 4 DESC, b.id DESC",
+            2501,
+        ),
+        (
+            &*format!(
+                "SELECT DISTINCT ON (g / 3) g, '{}' FROM generate_series(1, 9000) g \
+                 ORDER BY g / 3 DESC, g LIMIT 2000 OFFSET 3",
+                "x".repeat(200)
+            ),
+            2000,
+        ),
     ] {
         let opened = fixture.engine.result_stream_metrics().opened;
         client.write_all(&query(sql)).unwrap();
@@ -867,6 +908,67 @@ fn sorted_results_stream_rows_as_the_client_reads() {
             .map(|message| row_values(message.1))
             .collect();
         assert!(streamed == general, "{sql}");
+    }
+}
+
+#[test]
+fn grouped_results_stream_rows_as_the_client_reads() {
+    let (mut fixture, mut conn, mut client, mut other, mut other_client) =
+        stream_fixture(crate::config::TransactionMode::Mvcc, "stream-groups");
+    run(
+        &mut other,
+        &mut fixture.engine,
+        &mut other_client,
+        "CREATE TABLE tags(k int, label text); \
+         INSERT INTO tags VALUES (0, 'zero'), (1, 'one'), (2, NULL), (3, 'three'); \
+         CREATE AGGREGATE total(int) (sfunc = int4pl, stype = int, initcond = '0')",
+    );
+    for (sql, expected) in [
+        (
+            "SELECT id, count(*), max(payload), sum(id), avg(id) FROM big GROUP BY id",
+            5000,
+        ),
+        (
+            "SELECT id % 2500 AS k, string_agg(payload, ',' ORDER BY id DESC), \
+             count(DISTINCT id % 3) FILTER (WHERE id > 10), array_agg(id), total(id) \
+             FROM big WHERE id <> 7 GROUP BY 1 HAVING count(*) > 1 ORDER BY 1",
+            2499,
+        ),
+        (
+            "SELECT b.id, t.label, count(t.k), max(b.payload) FROM big b \
+             LEFT JOIN tags t ON t.k = b.id % 4 GROUP BY b.id, t.label",
+            5000,
+        ),
+        (
+            "SELECT g % 3000, percentile_cont(0.5) WITHIN GROUP (ORDER BY g), \
+             repeat('x', 200), bool_and(g > 2) FROM generate_series(1, 6000) g GROUP BY 1 \
+             LIMIT 2900 OFFSET 7",
+            2900,
+        ),
+    ] {
+        let opened = fixture.engine.result_stream_metrics().opened;
+        client.write_all(&query(sql)).unwrap();
+        assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+        assert!(conn.result_streams.is_active(), "{sql}");
+        assert!(conn.overflow_bytes() < 1024, "{sql}");
+        let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+        let response = messages(&response);
+        assert!(response.iter().all(|message| message.0 != b'E'), "{sql}");
+        let streamed = data_rows(&response);
+        assert_eq!(streamed.len(), expected, "{sql}");
+        assert_eq!(
+            fixture.engine.result_stream_metrics().opened,
+            opened + 1,
+            "{sql}"
+        );
+        // The general executor returns the same groups in the same order.
+        let general = run(
+            &mut other,
+            &mut fixture.engine,
+            &mut other_client,
+            &format!("SELECT * FROM ({sql}) q"),
+        );
+        assert!(streamed == data_rows(&messages(&general)), "{sql}");
     }
 }
 
@@ -907,12 +1009,18 @@ fn builds_that_outgrow_plan_build_bytes_spool_instead() {
     assert!(messages(&setup).iter().all(|message| message.0 != b'E'));
     let sorted = "SELECT g, repeat('x', 200) FROM generate_series(1, 5000) g ORDER BY g DESC";
     let joined = "SELECT b.id, b.payload, c.id FROM big b JOIN big c ON c.id = b.id";
+    let grouped = "SELECT id, max(payload), count(*) FROM big GROUP BY id";
     // A routine call in the output runs the promotion attempt itself through
     // a retained reader, which also falls back before describing its result.
     // The general executor restarts at each first call, so keep it short.
     let handed_off = "SELECT same(b.id), repeat(b.payload, 10), c.id FROM big b \
                       JOIN big c ON c.id = b.id WHERE b.id <= 100";
-    for (sql, count) in [(sorted, 5000), (joined, 5000), (handed_off, 100)] {
+    for (sql, count) in [
+        (sorted, 5000),
+        (joined, 5000),
+        (grouped, 5000),
+        (handed_off, 100),
+    ] {
         let before = fixture.engine.result_stream_metrics();
         let response = run(&mut conn, &mut fixture.engine, &mut client, sql);
         let response = messages(&response);
@@ -930,11 +1038,12 @@ fn builds_that_outgrow_plan_build_bytes_spool_instead() {
             "{sql}"
         );
         let mut rows = data_rows(&response);
+        // OFFSET 0 keeps the subquery in place, in the general executor.
         let general = run(
             &mut other,
             &mut fixture.engine,
             &mut other_client,
-            &format!("SELECT * FROM ({sql}) q"),
+            &format!("SELECT * FROM ({sql} OFFSET 0) q"),
         );
         let mut general = data_rows(&messages(&general));
         if sql != sorted {
@@ -1075,14 +1184,13 @@ fn function_sources_stream_rows_as_the_client_reads() {
     ] {
         let opened = fixture.engine.result_stream_metrics().opened;
         send_large(&mut conn, &mut fixture.engine, &mut client, &query(&sql));
-        // Loopback may still be delivering the request's tail.
-        for _ in 0..50 {
+        // Loopback may still be delivering the request's tail: each turn
+        // waits for input only until the request runs. The stream may also
+        // finish within that turn when the client's kernel buffer has grown
+        // to hold the whole result (see `socket_pair`).
+        while fixture.engine.result_stream_metrics().opened == opened {
             assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
-            if conn.result_streams.is_active() {
-                break;
-            }
         }
-        assert!(conn.result_streams.is_active(), "{sql:.80}");
         // The stream holds the call's position, not its rows.
         assert!(conn.overflow_bytes() < 1024);
         let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
@@ -1097,6 +1205,50 @@ fn function_sources_stream_rows_as_the_client_reads() {
         }
         assert_eq!(response[response.len() - 2].1, b"SELECT 12000\0");
         assert_eq!(fixture.engine.result_stream_metrics().opened, opened + 1);
+    }
+}
+
+#[test]
+fn union_all_streams_append_their_queries_as_the_client_reads() {
+    let (mut fixture, mut conn, mut client, _, _) =
+        stream_fixture(crate::config::TransactionMode::Mvcc, "stream-union");
+    for (sql, expected) in [
+        (
+            "SELECT id, payload FROM big UNION ALL \
+             SELECT g, repeat('x', 200) FROM generate_series(5001, 8000) g",
+            8000,
+        ),
+        // Each query keeps its own filter and bounds; the outer LIMIT and
+        // OFFSET apply to the combined rows.
+        (
+            "(SELECT id, payload FROM big WHERE id <= 2000) UNION ALL \
+             (SELECT g, repeat('y', 200) FROM generate_series(2001, 9000) g LIMIT 3000) \
+             LIMIT 4500",
+            4500,
+        ),
+        // A bigint column coerces the combined type.
+        (
+            "SELECT id, payload FROM big UNION ALL \
+             SELECT g::bigint, repeat('z', 200) FROM generate_series(5001, 6000) g",
+            6000,
+        ),
+    ] {
+        let expected: usize = expected;
+        let opened = fixture.engine.result_stream_metrics().opened;
+        client.write_all(&query(sql)).unwrap();
+        while fixture.engine.result_stream_metrics().opened == opened {
+            assert_eq!(readable(&mut conn, &mut fixture.engine), After::Continue);
+        }
+        // The stream holds each query's position, not the rows.
+        assert!(conn.overflow_bytes() < 1024);
+        let response = drain(&mut conn, &mut fixture.engine, &mut client, 1);
+        let response = messages(&response);
+        assert!(response.iter().all(|message| message.0 != b'E'), "{sql}");
+        let rows: Vec<_> = response
+            .iter()
+            .filter(|message| message.0 == b'D')
+            .collect();
+        assert_rows(&rows, expected);
     }
 }
 
@@ -1744,7 +1896,7 @@ fn tls_result_streams_resume_while_the_client_reads_ciphertext() {
     let mut conn = Conn::new(&fixture.config, &mut fixture.budget).unwrap();
     conn.open(server, 3).unwrap();
     conn.auth_database = fixture.engine.database_login("postgres");
-    conn.phase = Phase::Ready;
+    conn.enter_ready_for_tests(&fixture.engine);
     let mut client = tls_client(&mut conn, &mut socket);
     let mut input = query("SELECT id, payload FROM big");
     input.extend_from_slice(&query("SELECT 2"));

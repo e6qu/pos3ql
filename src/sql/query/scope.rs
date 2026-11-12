@@ -830,39 +830,17 @@ impl<'d> QueryScope<'d> {
             return error;
         }
         let mut found = None;
-        let mut visit = |expression: &Expr<'_>| {
-            visit_unqualified_columns(expression, &mut |name| {
-                if found.is_some()
-                    || select
-                        .from
-                        .is_some_and(|from| from_may_have_column(storage, txid, &from, name))
-                {
-                    return;
-                }
-                let message = crate::stack_format!(96, "column \"{}\" does not exist", name);
-                if error.message.as_str() != message.as_str() {
-                    return;
-                }
-                found = (0..self.n)
-                    .find(|&table| self.scope_column_index(table, name).is_some())
-                    .map(|table| (table, StackStr::<64>::from_str(name)));
-            });
-        };
-        for item in select.items {
-            if let crate::sql::ast::SelectItem::Expr { expression, .. }
-            | crate::sql::ast::SelectItem::RecordStar(expression) = item
-            {
-                visit(expression);
+        // The derived table cannot see the items beside it; any FROM item
+        // inside it that may have the column shadows them.
+        visit_hidden_columns(storage, txid, select, &|_| false, &mut |name| {
+            let message = crate::stack_format!(96, "column \"{}\" does not exist", name);
+            if found.is_some() || error.message.as_str() != message.as_str() {
+                return;
             }
-        }
-        for expression in select
-            .where_clause
-            .into_iter()
-            .chain(select.group_by.iter().copied())
-            .chain(select.having)
-        {
-            visit(expression);
-        }
+            found = (0..self.n)
+                .find(|&table| self.scope_column_index(table, name).is_some())
+                .map(|table| (table, StackStr::<64>::from_str(name)));
+        });
         let Some((table, name)) = found else {
             return error;
         };
@@ -2384,30 +2362,89 @@ impl<'d> QueryScope<'d> {
 
 /// Calls `each` for every unqualified column of `expression` outside nested
 /// subqueries.
-fn visit_unqualified_columns(expression: &Expr<'_>, each: &mut dyn FnMut(&str)) {
-    if let Expr::Column {
-        qualifier: None,
-        name,
-    } = expression
+/// Visits the unqualified column names in `select`, and in the subqueries
+/// nested in it, that no FROM item visible at the reference may have.
+/// `shadowed` names the columns the levels enclosing `select` may supply.
+fn visit_hidden_columns(
+    storage: &Storage,
+    txid: u32,
+    select: &crate::sql::ast::Select<'_>,
+    shadowed: &dyn Fn(&str) -> bool,
+    each: &mut dyn FnMut(&str),
+) {
+    let here = |name: &str| {
+        shadowed(name)
+            || select
+                .from
+                .is_some_and(|from| from_may_have_column(storage, txid, &from, name))
+    };
+    for item in select.items {
+        if let crate::sql::ast::SelectItem::Expr { expression, .. }
+        | crate::sql::ast::SelectItem::RecordStar(expression) = item
+        {
+            visit_hidden_expression(storage, txid, expression, &here, each);
+        }
+    }
+    for expression in select
+        .where_clause
+        .into_iter()
+        .chain(select.group_by.iter().copied())
+        .chain(select.having)
     {
-        each(name);
-        return;
+        visit_hidden_expression(storage, txid, expression, &here, each);
     }
-    if matches!(
-        expression,
-        Expr::Subquery(_)
-            | Expr::Exists(_)
-            | Expr::ArraySubquery(_)
-            | Expr::RowSubquery { .. }
-            | Expr::InSubquery { .. }
-            | Expr::QuantifiedSubquery { .. }
-    ) {
-        return;
+    if let Some(from) = select.from {
+        for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
+            if let Some(derived) = table.subquery {
+                // A derived table sees its siblings only when it is LATERAL.
+                if table.lateral {
+                    visit_hidden_columns(storage, txid, derived, &here, each);
+                } else {
+                    visit_hidden_columns(storage, txid, derived, shadowed, each);
+                }
+            }
+        }
     }
-    let _ = super::walk_children(expression, &mut |child| {
-        visit_unqualified_columns(child, each);
-        Ok(())
-    });
+}
+
+fn visit_hidden_expression(
+    storage: &Storage,
+    txid: u32,
+    expression: &Expr<'_>,
+    shadowed: &dyn Fn(&str) -> bool,
+    each: &mut dyn FnMut(&str),
+) {
+    match expression {
+        Expr::Column {
+            qualifier: None,
+            name,
+        } => {
+            if !shadowed(name) {
+                each(name);
+            }
+        }
+        Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => {
+            visit_hidden_columns(storage, txid, select, shadowed, each);
+        }
+        Expr::RowSubquery { select, .. } => {
+            visit_hidden_columns(storage, txid, select, shadowed, each);
+        }
+        Expr::InSubquery {
+            operand, select, ..
+        }
+        | Expr::QuantifiedSubquery {
+            operand, select, ..
+        } => {
+            visit_hidden_expression(storage, txid, operand, shadowed, each);
+            visit_hidden_columns(storage, txid, select, shadowed, each);
+        }
+        _ => {
+            let _ = super::walk_children(expression, &mut |child| {
+                visit_hidden_expression(storage, txid, child, shadowed, each);
+                Ok(())
+            });
+        }
+    }
 }
 
 /// Whether an item of `from` may have a column `name`. Only an ordinary

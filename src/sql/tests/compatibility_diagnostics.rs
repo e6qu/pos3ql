@@ -1380,16 +1380,33 @@ fn a_plain_source_subquery_cannot_see_the_target_columns() {
                 "{sql}"
             );
         }
-        // An item to the left could be read through LATERAL.
-        let sql = "SELECT * FROM lt, (SELECT v) s";
+        // An item to the left could be read through LATERAL, also from a
+        // subquery nested in the derived table or in its own FROM item.
+        for sql in [
+            "SELECT * FROM lt, (SELECT v) s",
+            "SELECT * FROM lt, (SELECT (SELECT v)) s",
+            "SELECT * FROM lt, (SELECT 1 FROM (SELECT (SELECT v)) x) s",
+        ] {
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, sql)),
+                [format!(
+                    "ERROR 42703 column \"v\" does not exist @{} hint: To reference that \
+                     column, you must mark this subquery with LATERAL. detail: There is a \
+                     column named \"v\" in table \"lt\", but it cannot be referenced from \
+                     this part of the query.",
+                    sql.find("v)").unwrap() + 1
+                )],
+                "{sql}"
+            );
+        }
+        // A FROM item inside the derived table supplies the column.
         assert_eq!(
-            diagnostics(&run_with(engine, budget, sql)),
-            [format!(
-                "ERROR 42703 column \"v\" does not exist @{} hint: To reference that column, \
-                 you must mark this subquery with LATERAL. detail: There is a column named \
-                 \"v\" in table \"lt\", but it cannot be referenced from this part of the query.",
-                sql.find("v)").unwrap() + 1
-            )]
+            diagnostics(&run_with(
+                engine,
+                budget,
+                "SELECT * FROM lt, (SELECT (SELECT v) FROM lt l2) s"
+            )),
+            ["SELECT 0"]
         );
         let sql = "UPDATE lt SET v = 1 FROM (SELECT lt.v) s";
         assert_eq!(

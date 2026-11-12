@@ -223,7 +223,12 @@ pub(crate) fn pseudo_type_value(kind: crate::sql::types::PseudoType) -> SqlError
 
 pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     if let ColType::Pseudo(kind) = target {
-        return Err(pseudo_type_value(kind));
+        // A `cstring` value is the text its source's output produced; the
+        // cast that made it already checked the source type.
+        return match (kind, v) {
+            (crate::sql::types::PseudoType::Cstring, Datum::Null | Datum::Text(_)) => Ok(v),
+            _ => Err(pseudo_type_value(kind)),
+        };
     }
     if v.is_null() {
         return Ok(Datum::Null);

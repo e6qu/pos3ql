@@ -7108,6 +7108,16 @@ pub enum BinaryOp {
     /// (`ILike` is the case-insensitive form). Plain `x LIKE y` uses `Expr::Like`.
     Like,
     ILike,
+    /// POSIX match, used only as the operator of a quantified `~ ANY/ALL`
+    /// (`RegexIMatch` is `~*`). Plain `x ~ y` uses `Expr::Match`.
+    RegexMatch,
+    RegexIMatch,
+    /// The negated forms (`!~~`, `!~~*`, `!~`, `!~*`) of the quantified
+    /// pattern operators above.
+    NotLike,
+    NotILike,
+    RegexNotMatch,
+    RegexNotIMatch,
 }
 
 impl BinaryOp {
@@ -7217,7 +7227,15 @@ impl BinaryOp {
             Self::AbovePoint => ">^",
             Self::NetContainedEq => "<<=",
             Self::NetContainsEq => ">>=",
-            Self::And | Self::Or | Self::Like | Self::ILike => return None,
+            Self::Like => "~~",
+            Self::ILike => "~~*",
+            Self::RegexMatch => "~",
+            Self::RegexIMatch => "~*",
+            Self::NotLike => "!~~",
+            Self::NotILike => "!~~*",
+            Self::RegexNotMatch => "!~",
+            Self::RegexNotIMatch => "!~*",
+            Self::And | Self::Or => return None,
         })
     }
 
@@ -7249,7 +7267,14 @@ impl BinaryOp {
             | Self::BelowPoint
             | Self::AbovePoint => 4,
             Self::NetContainedEq | Self::NetContainsEq => 4,
-            Self::Like | Self::ILike => 4,
+            Self::Like
+            | Self::ILike
+            | Self::RegexMatch
+            | Self::RegexIMatch
+            | Self::NotLike
+            | Self::NotILike
+            | Self::RegexNotMatch
+            | Self::RegexNotIMatch => 4,
             Self::JsonExists | Self::JsonExistsAny | Self::JsonExistsAll | Self::JsonPathExists => {
                 4
             }

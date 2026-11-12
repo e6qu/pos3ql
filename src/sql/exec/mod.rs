@@ -802,6 +802,10 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
         crate::sql::eval::qualifier_answers_target(self.def, self.alias, table)
             .then_some(ColType::Record)
     }
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        crate::sql::eval::qualifier_answers_target(self.def, self.alias, table)
+            .then(|| (self.def.schema.as_str(), self.def.name.as_str()))
+    }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         if let Some(q) = qualifier
@@ -976,6 +980,13 @@ impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
         .column_type_mod(qualifier, name)
     }
 
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        self.whole_row_type(table)?;
+        Some((
+            self.definition.schema.as_str(),
+            self.definition.name.as_str(),
+        ))
+    }
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         (self.image(table).is_some()
             || crate::sql::eval::qualifier_answers_target(
@@ -3314,6 +3325,8 @@ fn drop_foreign_table_slot(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
     binding_slot: usize,
     definition: crate::storage::foreign::ForeignTableDefinition,
     cascade: bool,
@@ -3331,7 +3344,7 @@ fn drop_foreign_table_slot(
         cascade,
     };
     let outcome = responder.without_command_complete(|responder| {
-        drop_table_kind(
+        drop_table_kind_with_columns(
             storage,
             wal,
             txn,
@@ -3339,6 +3352,10 @@ fn drop_foreign_table_slot(
             Some(crate::storage::TableKind::Foreign),
             "DROP FOREIGN TABLE",
             arena,
+            RowTypeColumnCascade {
+                scratch: &mut *scratch,
+                seq_session,
+            },
             responder,
         )
     });
@@ -3366,10 +3383,13 @@ fn drop_foreign_table_slot(
     sql_ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mark_foreign_server_drop(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
     slot: usize,
     cascade: bool,
     arena: &Arena,
@@ -3413,7 +3433,16 @@ fn mark_foreign_server_drop(
             storage.first_foreign_table_for_server(slot as u16, txn.txid)
         {
             match drop_foreign_table_slot(
-                storage, wal, txn, binding, definition, true, arena, responder,
+                storage,
+                wal,
+                txn,
+                &mut *scratch,
+                seq_session,
+                binding,
+                definition,
+                true,
+                arena,
+                responder,
             ) {
                 Ok(Ok(())) => {}
                 other => return other,
@@ -3440,10 +3469,12 @@ fn mark_foreign_server_drop(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn drop_foreign_server(
+pub(crate) fn drop_foreign_server(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
     names: &[&str],
     if_exists: bool,
     cascade: bool,
@@ -3480,7 +3511,16 @@ pub fn drop_foreign_server(
     })();
     run_reported_drop(report, responder, |responder| {
         drop_foreign_servers(
-            storage, wal, txn, names, if_exists, cascade, arena, responder,
+            storage,
+            wal,
+            txn,
+            &mut *scratch,
+            seq_session,
+            names,
+            if_exists,
+            cascade,
+            arena,
+            responder,
         )
     })
 }
@@ -3490,6 +3530,8 @@ fn drop_foreign_servers(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
     names: &[&str],
     if_exists: bool,
     cascade: bool,
@@ -3519,7 +3561,17 @@ fn drop_foreign_servers(
         ) {
             return sql_fail(error);
         }
-        match mark_foreign_server_drop(storage, wal, txn, slot, cascade, arena, responder) {
+        match mark_foreign_server_drop(
+            storage,
+            wal,
+            txn,
+            &mut *scratch,
+            seq_session,
+            slot,
+            cascade,
+            arena,
+            responder,
+        ) {
             Ok(Ok(())) => {}
             other => return other,
         }
@@ -3529,10 +3581,12 @@ fn drop_foreign_servers(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn drop_foreign_data_wrapper(
+pub(crate) fn drop_foreign_data_wrapper(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
     names: &[&str],
     if_exists: bool,
     cascade: bool,
@@ -3569,7 +3623,16 @@ pub fn drop_foreign_data_wrapper(
     })();
     run_reported_drop(report, responder, |responder| {
         drop_foreign_data_wrappers(
-            storage, wal, txn, names, if_exists, cascade, arena, responder,
+            storage,
+            wal,
+            txn,
+            &mut *scratch,
+            seq_session,
+            names,
+            if_exists,
+            cascade,
+            arena,
+            responder,
         )
     })
 }
@@ -3579,6 +3642,8 @@ fn drop_foreign_data_wrappers(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
     names: &[&str],
     if_exists: bool,
     cascade: bool,
@@ -3638,7 +3703,17 @@ fn drop_foreign_data_wrappers(
             while let Some((server, _)) =
                 storage.first_foreign_server_for_wrapper(slot as u16, txn.txid)
             {
-                match mark_foreign_server_drop(storage, wal, txn, server, true, arena, responder) {
+                match mark_foreign_server_drop(
+                    storage,
+                    wal,
+                    txn,
+                    &mut *scratch,
+                    seq_session,
+                    server,
+                    true,
+                    arena,
+                    responder,
+                ) {
                     Ok(Ok(())) => {}
                     other => return other,
                 }
@@ -3703,10 +3778,10 @@ pub(crate) fn drop_foreign_table(
         Some(crate::storage::TableKind::Foreign),
         "DROP FOREIGN TABLE",
         arena,
-        Some(RowTypeColumnCascade {
+        RowTypeColumnCascade {
             scratch,
             seq_session,
-        }),
+        },
         responder,
     ) {
         Ok(Ok(())) => {}
@@ -6750,6 +6825,10 @@ where
         self.outer?.column_type_oid(qualifier, name)
     }
 
+    fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
+        self.outer?.row_variable(name)
+    }
+
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,
@@ -7493,10 +7572,10 @@ pub(crate) fn drop_table(
         Some(crate::storage::TableKind::Local),
         "DROP TABLE",
         arena,
-        Some(RowTypeColumnCascade {
+        RowTypeColumnCascade {
             scratch,
             seq_session,
-        }),
+        },
         responder,
     )
 }
@@ -7868,7 +7947,7 @@ fn drop_row_type_domains(
     creation: crate::storage::TypeCreation,
     dropped_schema: &dyn Fn(SqlName) -> bool,
     cascade: bool,
-    columns: Option<RowTypeColumnCascade<'_>>,
+    columns: RowTypeColumnCascade<'_>,
     arena: &Arena,
     responder: &mut Responder,
 ) -> Result<(), SqlError> {
@@ -7892,18 +7971,10 @@ fn drop_row_type_domains(
             relation_name.as_str()
         ));
     }
-    let Some(RowTypeColumnCascade {
+    let RowTypeColumnCascade {
         scratch,
         seq_session,
-    }) = columns
-    else {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "this statement cannot drop domains over the row type of {} {}",
-            relation_kind,
-            relation_name.as_str()
-        ));
-    };
+    } = columns;
     drop_domain_selection(
         storage,
         wal,
@@ -7932,7 +8003,7 @@ fn drop_row_type_users(
     excluded: &[usize],
     dropped_schema: &dyn Fn(SqlName) -> bool,
     cascade: bool,
-    mut columns: Option<RowTypeColumnCascade<'_>>,
+    mut columns: RowTypeColumnCascade<'_>,
     arena: &Arena,
     responder: &mut Responder,
 ) -> Result<(), SqlError> {
@@ -7946,7 +8017,7 @@ fn drop_row_type_users(
         excluded,
         dropped_schema,
         cascade,
-        columns.as_mut().map(RowTypeColumnCascade::reborrow),
+        columns.reborrow(),
         arena,
         responder,
     )?;
@@ -7975,7 +8046,7 @@ fn drop_row_type_columns(
     excluded: &[usize],
     dropped_schema: &dyn Fn(SqlName) -> bool,
     cascade: bool,
-    columns: Option<RowTypeColumnCascade<'_>>,
+    columns: RowTypeColumnCascade<'_>,
     arena: &Arena,
     responder: &mut Responder,
 ) -> Result<(), SqlError> {
@@ -8095,26 +8166,6 @@ fn drop_row_type_columns(
             relation_name.as_str()
         ));
     }
-    let has_columns = {
-        let mut found = false;
-        row_type_column_users(storage, txn.txid, creation, excluded, |_, _, _, _| {
-            found = true;
-            Ok(())
-        })?;
-        found
-    };
-    let columns = match columns {
-        Some(columns) => Some(columns),
-        None if !has_columns => None,
-        None => {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "this statement cannot drop columns of the row type of {} {}",
-                relation_kind,
-                relation_name.as_str()
-            ));
-        }
-    };
     dependency_report::send_cascade_lines(responder, detail.as_str(), count)?;
     while let Some(slot) = composite_users
         .then(|| {
@@ -8135,13 +8186,10 @@ fn drop_row_type_columns(
             Ok(row_type_field_use(field, creation).is_some())
         })?;
     }
-    let Some(RowTypeColumnCascade {
+    let RowTypeColumnCascade {
         scratch,
         seq_session,
-    }) = columns
-    else {
-        return Ok(());
-    };
+    } = columns;
     loop {
         let mut target = None;
         row_type_column_users(storage, txn.txid, creation, excluded, |slot, _, _, _| {
@@ -8183,30 +8231,6 @@ fn drop_row_type_columns(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn drop_table_kind(
-    storage: &mut Storage,
-    wal: &mut Wal,
-    txn: &mut TxnState,
-    statement: &DropTable,
-    expected_kind: Option<crate::storage::TableKind>,
-    tag: &'static str,
-    arena: &Arena,
-    responder: &mut Responder,
-) -> Outcome {
-    drop_table_kind_with_columns(
-        storage,
-        wal,
-        txn,
-        statement,
-        expected_kind,
-        tag,
-        arena,
-        None,
-        responder,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 fn drop_table_kind_with_columns(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -8215,7 +8239,7 @@ fn drop_table_kind_with_columns(
     expected_kind: Option<crate::storage::TableKind>,
     tag: &'static str,
     arena: &Arena,
-    mut row_type_columns: Option<RowTypeColumnCascade<'_>>,
+    mut row_type_columns: RowTypeColumnCascade<'_>,
     responder: &mut Responder,
 ) -> Outcome {
     let report = (|| {
@@ -8427,9 +8451,7 @@ fn drop_table_kind_with_columns(
                                 None,
                                 tag,
                                 arena,
-                                row_type_columns
-                                    .as_mut()
-                                    .map(RowTypeColumnCascade::reborrow),
+                                row_type_columns.reborrow(),
                                 responder,
                             )
                         });
@@ -8448,9 +8470,7 @@ fn drop_table_kind_with_columns(
                         &selected_tables[..selected_table_count],
                         &|_| false,
                         statement.cascade,
-                        row_type_columns
-                            .as_mut()
-                            .map(RowTypeColumnCascade::reborrow),
+                        row_type_columns.reborrow(),
                         arena,
                         responder,
                     ) {
@@ -8563,13 +8583,11 @@ fn drop_table_kind_with_columns(
                                 routines: dependent_routines,
                                 rules: dependent_rules,
                             },
-                            row_type_columns
-                                .as_mut()
-                                .map(|columns| ViewRowTypeColumnCascade {
-                                    columns: columns.reborrow(),
-                                    arena,
-                                    responder: &mut *responder,
-                                }),
+                            ViewRowTypeColumnCascade {
+                                columns: row_type_columns.reborrow(),
+                                arena,
+                                responder: &mut *responder,
+                            },
                         ) {
                             return sql_fail(error);
                         }
@@ -13106,14 +13124,14 @@ pub(crate) fn drop_owned(
             routines,
             rules: dependent_rules,
         },
-        Some(ViewRowTypeColumnCascade {
+        ViewRowTypeColumnCascade {
             columns: RowTypeColumnCascade {
                 scratch: &mut *scratch,
                 seq_session,
             },
             arena,
             responder,
-        }),
+        },
     ) {
         return sql_fail(error);
     }
@@ -13216,7 +13234,16 @@ pub(crate) fn drop_owned(
                 "cannot drop owned operator because other objects depend on it"
             ));
         }
-        if let Err(error) = cascade_operator_dependencies(storage, wal, txn, operator_oid, arena) {
+        if let Err(error) = cascade_operator_dependencies(
+            storage,
+            wal,
+            txn,
+            &mut *scratch,
+            seq_session,
+            &mut *responder,
+            operator_oid,
+            arena,
+        ) {
             return sql_fail(error);
         }
         if let Err(error) = stage_operator_drop(storage, wal, txn, slot) {
@@ -13388,7 +13415,7 @@ pub(crate) fn drop_owned(
             cascade,
         };
         let outcome = responder.without_command_complete(|responder| {
-            drop_table_kind(
+            drop_table_kind_with_columns(
                 storage,
                 wal,
                 txn,
@@ -13396,6 +13423,10 @@ pub(crate) fn drop_owned(
                 None,
                 "DROP TABLE",
                 arena,
+                RowTypeColumnCascade {
+                    scratch: &mut *scratch,
+                    seq_session,
+                },
                 responder,
             )
         });
@@ -13444,6 +13475,8 @@ pub(crate) fn drop_owned(
                         storage,
                         wal,
                         txn,
+                        &mut *scratch,
+                        seq_session,
                         core::slice::from_ref(&qualified),
                         false,
                         cascade,
@@ -13478,6 +13511,8 @@ pub(crate) fn drop_owned(
                         storage,
                         wal,
                         txn,
+                        &mut *scratch,
+                        seq_session,
                         core::slice::from_ref(&name.as_str()),
                         false,
                         cascade,
@@ -13488,6 +13523,8 @@ pub(crate) fn drop_owned(
                         storage,
                         wal,
                         txn,
+                        &mut *scratch,
+                        seq_session,
                         core::slice::from_ref(&name.as_str()),
                         false,
                         cascade,
@@ -13671,7 +13708,17 @@ pub(crate) fn drop_owned(
         if !selected || !storage.text_search_object(slot).visible_to(txn.txid) {
             continue;
         }
-        if let Err(error) = drop_text_search_slot(storage, wal, txn, slot, cascade, arena) {
+        if let Err(error) = drop_text_search_slot(
+            storage,
+            wal,
+            txn,
+            &mut *scratch,
+            seq_session,
+            &mut *responder,
+            slot,
+            cascade,
+            arena,
+        ) {
             return sql_fail(error);
         }
     }
@@ -16810,10 +16857,10 @@ pub(crate) fn drop_schema(
                         &[],
                         &dropped_schema,
                         true,
-                        Some(RowTypeColumnCascade {
+                        RowTypeColumnCascade {
                             scratch: &mut *scratch,
                             seq_session,
-                        }),
+                        },
                         arena,
                         responder,
                     ) {
@@ -16853,6 +16900,9 @@ pub(crate) fn drop_schema(
                             storage,
                             wal,
                             txn,
+                            &mut *scratch,
+                            seq_session,
+                            &mut *responder,
                             routine_oid,
                             arena,
                         ) {
@@ -16869,6 +16919,14 @@ pub(crate) fn drop_schema(
                         no_matviews,
                         selected_routines,
                         no_rules,
+                        ViewRowTypeColumnCascade {
+                            columns: RowTypeColumnCascade {
+                                scratch: &mut *scratch,
+                                seq_session,
+                            },
+                            arena,
+                            responder: &mut *responder,
+                        },
                     ) {
                         return sql_fail(error);
                     }
@@ -16950,8 +17008,17 @@ pub(crate) fn drop_schema(
                 }
                 SchemaObject::TextSearch(slot) => {
                     if storage.text_search_object(*slot).visible_to(txn.txid)
-                        && let Err(error) =
-                            drop_text_search_slot(storage, wal, txn, *slot, true, arena)
+                        && let Err(error) = drop_text_search_slot(
+                            storage,
+                            wal,
+                            txn,
+                            &mut *scratch,
+                            seq_session,
+                            &mut *responder,
+                            *slot,
+                            true,
+                            arena,
+                        )
                     {
                         return sql_fail(error);
                     }
@@ -16979,10 +17046,10 @@ pub(crate) fn drop_schema(
                         &[],
                         &dropped_schema,
                         true,
-                        Some(RowTypeColumnCascade {
+                        RowTypeColumnCascade {
                             scratch: &mut *scratch,
                             seq_session,
-                        }),
+                        },
                         arena,
                         responder,
                     ) {
@@ -17057,7 +17124,17 @@ pub(crate) fn drop_schema(
                         Err(_) => return sql_fail(arena_full()),
                     };
                     if let Err(error) = drop_type_dependent_routines(
-                        storage, wal, txn, selected, None, None, true, arena, responder,
+                        storage,
+                        wal,
+                        txn,
+                        &mut *scratch,
+                        seq_session,
+                        selected,
+                        None,
+                        None,
+                        true,
+                        arena,
+                        responder,
                     ) {
                         return sql_fail(error);
                     }
@@ -17101,6 +17178,8 @@ pub(crate) fn drop_schema(
                         storage,
                         wal,
                         txn,
+                        &mut *scratch,
+                        seq_session,
                         &[],
                         Some(*enumeration),
                         None,
@@ -17164,9 +17243,16 @@ pub(crate) fn drop_schema(
                 SchemaObject::Operator(operator) => {
                     if storage.operator(*operator).visible_to(txn.txid) {
                         let operator_oid = storage.operator(*operator).oid();
-                        if let Err(error) =
-                            cascade_operator_dependencies(storage, wal, txn, operator_oid, arena)
-                        {
+                        if let Err(error) = cascade_operator_dependencies(
+                            storage,
+                            wal,
+                            txn,
+                            &mut *scratch,
+                            seq_session,
+                            &mut *responder,
+                            operator_oid,
+                            arena,
+                        ) {
                             return sql_fail(error);
                         }
                         if let Err(error) = stage_operator_drop(storage, wal, txn, *operator) {
@@ -17336,10 +17422,10 @@ pub(crate) fn drop_schema(
                         &[],
                         &dropped_schema,
                         true,
-                        Some(RowTypeColumnCascade {
+                        RowTypeColumnCascade {
                             scratch: &mut *scratch,
                             seq_session,
-                        }),
+                        },
                         arena,
                         responder,
                     ) {
@@ -20594,6 +20680,13 @@ where
         (TriggerRecordName::parse(table).is_some() && self.definition.n_columns > 0)
             .then_some(ColType::Record)
     }
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        self.whole_row_type(table)?;
+        Some((
+            self.definition.schema.as_str(),
+            self.definition.name.as_str(),
+        ))
+    }
 
     // A record that holds no row (`NEW` in a DELETE trigger) reads as NULL,
     // with the relation's fields.
@@ -20903,6 +20996,14 @@ impl<'v> ColumnLookup<'v> for TriggerDmlScope<'_, '_, 'v, '_> {
         self.outer.column_type_oid(qualifier, name)
     }
 
+    /// The row's own relation shadows an outer variable of its name.
+    fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
+        if self.row.whole_row_type(name).is_some() {
+            return None;
+        }
+        self.outer.row_variable(name)
+    }
+
     fn column_user_type(
         &self,
         qualifier: Option<&str>,
@@ -20997,6 +21098,14 @@ where
 
     fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
         self.outer.column_type_oid(qualifier, name)
+    }
+
+    /// The row's own relation shadows an outer variable of its name.
+    fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
+        if self.row.whole_row_type(name).is_some() {
+            return None;
+        }
+        self.outer.row_variable(name)
     }
 
     fn column_user_type(
@@ -27142,6 +27251,34 @@ impl<'a> PlpgsqlVariable<'a> {
     }
 }
 
+/// A local's row-variable shape: a NULL row keeps its declared fields, and a
+/// `record` has none until it is assigned.
+fn plpgsql_row_variable(
+    locals: &[TriggerLocalDecl],
+    values: &[Datum<'_>],
+    name: &str,
+) -> Option<crate::sql::eval::RowVariable> {
+    use crate::sql::eval::RowVariable;
+    let index = locals
+        .iter()
+        .rposition(|local| local.name.as_str() == name)?;
+    let local = locals[index];
+    match values[index] {
+        // A table row variable's fields come from its table, which the
+        // value scope reads.
+        Datum::Null => match (local.record_shape, local.ctype) {
+            (Some(PlpgsqlRecordShape::Table(_)), _) => None,
+            (_, ColType::Composite(Some(creation))) => Some(RowVariable::Declared(creation)),
+            (_, ColType::Record) => Some(RowVariable::Unassigned),
+            _ => None,
+        },
+        Datum::Record(_) | Datum::Composite { .. } | Datum::CompositeText { .. } => {
+            Some(RowVariable::Assigned)
+        }
+        _ => None,
+    }
+}
+
 fn plpgsql_variable<'a>(
     locals: &[TriggerLocalDecl],
     values: &[Datum<'a>],
@@ -27533,6 +27670,10 @@ where
         self.transition.whole_row_present(table)
     }
 
+    fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
+        plpgsql_row_variable(self.locals, self.values, name)
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
         if self.names_trigger_record(qualifier) {
             return self.transition.lookup(qualifier, name);
@@ -27862,6 +28003,10 @@ where
         self.variable(qualifier?)?
             .record_field(name)
             .map(|field| field.type_oid)
+    }
+
+    fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
+        plpgsql_row_variable(self.locals, self.values, name)
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
@@ -29983,6 +30128,8 @@ fn execute_bound_plpgsql_utility<'a>(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
+                    &mut engine.dml_scratch,
+                    guc.seq_session(),
                     names,
                     *if_exists,
                     *cascade,
@@ -30178,6 +30325,8 @@ fn execute_bound_plpgsql_utility<'a>(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
+                    &mut engine.dml_scratch,
+                    guc.seq_session(),
                     identities,
                     *if_exists,
                     *cascade,
@@ -30287,6 +30436,8 @@ fn execute_bound_plpgsql_utility<'a>(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
+                    &mut engine.dml_scratch,
+                    guc.seq_session(),
                     super::exec::DropRoutineCommand {
                         targets: super::exec::DropRoutineTargets::Routines(functions),
                         if_exists: *if_exists,
@@ -30304,6 +30455,8 @@ fn execute_bound_plpgsql_utility<'a>(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
+                    &mut engine.dml_scratch,
+                    guc.seq_session(),
                     super::exec::DropRoutineCommand {
                         targets: super::exec::DropRoutineTargets::Routines(procedures),
                         if_exists: *if_exists,
@@ -30321,6 +30474,8 @@ fn execute_bound_plpgsql_utility<'a>(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
+                    &mut engine.dml_scratch,
+                    guc.seq_session(),
                     super::exec::DropRoutineCommand {
                         targets: super::exec::DropRoutineTargets::Routines(routines),
                         if_exists: *if_exists,
@@ -30338,6 +30493,8 @@ fn execute_bound_plpgsql_utility<'a>(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
+                    &mut engine.dml_scratch,
+                    guc.seq_session(),
                     aggregates,
                     *if_exists,
                     *cascade,
@@ -30841,6 +30998,8 @@ fn execute_bound_plpgsql_utility<'a>(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
+                    &mut engine.dml_scratch,
+                    guc.seq_session(),
                     *kind,
                     name,
                     *if_exists,
@@ -30903,6 +31062,8 @@ fn execute_bound_plpgsql_utility<'a>(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
+                    &mut engine.dml_scratch,
+                    guc.seq_session(),
                     names,
                     *if_exists,
                     *cascade,
@@ -30932,6 +31093,8 @@ fn execute_bound_plpgsql_utility<'a>(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
+                    &mut engine.dml_scratch,
+                    guc.seq_session(),
                     names,
                     *if_exists,
                     *cascade,
@@ -31092,6 +31255,8 @@ fn execute_bound_plpgsql_utility<'a>(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
+                    &mut engine.dml_scratch,
+                    guc.seq_session(),
                     names,
                     *if_exists,
                     *cascade,
@@ -36950,7 +37115,10 @@ fn execute_trigger_step_in<'a>(
                             | TriggerForSource::Dml(_)
                             | TriggerForSource::DynamicQuery(_)
                     );
-                    let record_target = locals[target].ctype == ColType::Record;
+                    let record_target = matches!(
+                        locals[target].ctype,
+                        ColType::Record | ColType::Composite(_)
+                    );
                     let mut dynamic = None;
                     let dml_rows = match program.source {
                         // The data change waited for its AFTER triggers with
@@ -37040,7 +37208,10 @@ fn execute_trigger_step_in<'a>(
                                 source,
                                 captured,
                                 transition_relations,
-                                locals[target].ctype == ColType::Record,
+                                matches!(
+                                    locals[target].ctype,
+                                    ColType::Record | ColType::Composite(_)
+                                ),
                                 status,
                                 retained_parent,
                             )?)
@@ -37092,7 +37263,10 @@ fn execute_trigger_step_in<'a>(
                                         invocation.fresh_snapshots && dml_ctes.is_empty(),
                                         None,
                                         |storage, sequence| {
-                                            if locals[target].ctype == ColType::Record {
+                                            if matches!(
+                                                locals[target].ctype,
+                                                ColType::Record | ColType::Composite(_)
+                                            ) {
                                                 materialize_trigger_for_record_query(
                                                     storage, query, arena, arena, txid, params,
                                                     sequence, &scope,
@@ -42869,10 +43043,14 @@ pub fn alter_text_search(
     sql_ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drop_text_search_slot(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder,
     slot: usize,
     cascade: bool,
     arena: &Arena,
@@ -42907,7 +43085,23 @@ fn drop_text_search_slot(
         }
         if has_stored_dependents {
             drop_policy_dependents(storage, wal, txn, policy_root, views, matviews, routines)?;
-            drop_selected_stored_queries(storage, wal, txn, views, matviews, routines, rules)?;
+            drop_selected_stored_queries(
+                storage,
+                wal,
+                txn,
+                views,
+                matviews,
+                routines,
+                rules,
+                ViewRowTypeColumnCascade {
+                    columns: RowTypeColumnCascade {
+                        scratch: &mut *scratch,
+                        seq_session,
+                    },
+                    arena,
+                    responder: &mut *responder,
+                },
+            )?;
         }
     }
     let direct_dependent = |candidate_slot, candidate| {
@@ -42965,7 +43159,17 @@ fn drop_text_search_slot(
             },
         );
         let Some(dependent) = dependent else { break };
-        drop_text_search_slot(storage, wal, txn, dependent, true, arena)?;
+        drop_text_search_slot(
+            storage,
+            wal,
+            txn,
+            &mut *scratch,
+            seq_session,
+            &mut *responder,
+            dependent,
+            true,
+            arena,
+        )?;
     }
     // A configuration depends on every dictionary its mappings name, so it
     // goes with the dictionary, as PostgreSQL's dependency walk drops it.
@@ -42978,16 +43182,28 @@ fn drop_text_search_slot(
         let Some(config_slot) = config_slot else {
             break;
         };
-        drop_text_search_slot(storage, wal, txn, config_slot, true, arena)?;
+        drop_text_search_slot(
+            storage,
+            wal,
+            txn,
+            &mut *scratch,
+            seq_session,
+            &mut *responder,
+            config_slot,
+            true,
+            arena,
+        )?;
     }
     stage_text_search_drop(storage, wal, txn, slot)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn drop_text_search(
+pub(crate) fn drop_text_search(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
     kind: crate::sql::ast::TextSearchObjectKind,
     name: &QualName<'_>,
     if_exists: bool,
@@ -43048,7 +43264,17 @@ pub fn drop_text_search(
         responder,
     );
     run_reported_drop(report, responder, |responder| {
-        if let Err(error) = drop_text_search_slot(storage, wal, txn, slot, cascade, arena) {
+        if let Err(error) = drop_text_search_slot(
+            storage,
+            wal,
+            txn,
+            &mut *scratch,
+            seq_session,
+            &mut *responder,
+            slot,
+            cascade,
+            arena,
+        ) {
             return sql_fail(error);
         }
         responder.command_complete(match kind {
@@ -43542,6 +43768,14 @@ fn drop_collation_slot(
                 dependent_matviews,
                 dependent_routines,
                 dependent_rules,
+                ViewRowTypeColumnCascade {
+                    columns: RowTypeColumnCascade {
+                        scratch: &mut *scratch,
+                        seq_session,
+                    },
+                    arena,
+                    responder: &mut *responder,
+                },
             ) {
                 return sql_fail(error);
             }
@@ -43717,10 +43951,14 @@ fn operator_has_dependents(storage: &Storage, txid: u32, operator_oid: i32) -> b
             })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cascade_operator_dependencies(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder,
     operator_oid: i32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
@@ -43744,7 +43982,23 @@ fn cascade_operator_dependencies(
         };
         drop_policy_dependents(storage, wal, txn, root, views, matviews, routines)?;
     }
-    drop_selected_stored_queries(storage, wal, txn, views, matviews, routines, rules)?;
+    drop_selected_stored_queries(
+        storage,
+        wal,
+        txn,
+        views,
+        matviews,
+        routines,
+        rules,
+        ViewRowTypeColumnCascade {
+            columns: RowTypeColumnCascade {
+                scratch: &mut *scratch,
+                seq_session,
+            },
+            arena,
+            responder: &mut *responder,
+        },
+    )?;
     loop {
         let dependent = storage
             .operator_classes_visible_to(txn.txid)
@@ -43878,6 +44132,8 @@ pub(crate) fn drop_operators(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
     identities: &[crate::sql::ast::OperatorIdentity<'_>],
     if_exists: bool,
     cascade: bool,
@@ -44052,9 +44308,16 @@ pub(crate) fn drop_operators(
             {
                 return sql_fail(error);
             }
-            if let Err(error) =
-                cascade_operator_dependencies(storage, wal, txn, operator_oid, arena)
-            {
+            if let Err(error) = cascade_operator_dependencies(
+                storage,
+                wal,
+                txn,
+                &mut *scratch,
+                seq_session,
+                &mut *responder,
+                operator_oid,
+                arena,
+            ) {
                 return sql_fail(error);
             }
             if let Err(error) = stage_operator_drop(storage, wal, txn, slot) {
@@ -48191,10 +48454,12 @@ pub fn alter_aggregate(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn drop_aggregate(
+pub(crate) fn drop_aggregate(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
     aggregates: &[super::ast::AggregateIdentity<'_>],
     if_exists: bool,
     cascade: bool,
@@ -48205,6 +48470,8 @@ pub fn drop_aggregate(
         storage,
         wal,
         txn,
+        &mut *scratch,
+        seq_session,
         DropRoutineCommand {
             targets: DropRoutineTargets::Aggregates(aggregates),
             if_exists,
@@ -48868,10 +49135,14 @@ fn routine_has_cast_operator_dependents(storage: &Storage, txid: u32, routine_oi
             .any(|(_, class)| class.owns_function(routine_oid))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cascade_routine_cast_operator_dependents(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder,
     routine_oid: i32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
@@ -48910,7 +49181,16 @@ fn cascade_routine_cast_operator_dependents(
             });
         let Some(slot) = dependent else { break };
         let operator_oid = storage.operator(slot).oid();
-        cascade_operator_dependencies(storage, wal, txn, operator_oid, arena)?;
+        cascade_operator_dependencies(
+            storage,
+            wal,
+            txn,
+            &mut *scratch,
+            seq_session,
+            &mut *responder,
+            operator_oid,
+            arena,
+        )?;
         stage_operator_drop(storage, wal, txn, slot)?;
     }
     loop {
@@ -48952,10 +49232,13 @@ fn resolve_drop_routine_target<'a>(
     Ok(found)
 }
 
-pub fn drop_routine(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drop_routine(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
     command: DropRoutineCommand<'_>,
     arena: &Arena,
     responder: &mut Responder,
@@ -49181,6 +49464,14 @@ pub fn drop_routine(
                     dependent_matviews,
                     dependent_routines,
                     dependent_rules,
+                    ViewRowTypeColumnCascade {
+                        columns: RowTypeColumnCascade {
+                            scratch: &mut *scratch,
+                            seq_session,
+                        },
+                        arena,
+                        responder: &mut *responder,
+                    },
                 )
             {
                 return sql_fail(error);
@@ -49194,8 +49485,16 @@ pub fn drop_routine(
                 ));
             }
             if cascade
-                && let Err(error) =
-                    cascade_routine_cast_operator_dependents(storage, wal, txn, support_oid, arena)
+                && let Err(error) = cascade_routine_cast_operator_dependents(
+                    storage,
+                    wal,
+                    txn,
+                    &mut *scratch,
+                    seq_session,
+                    &mut *responder,
+                    support_oid,
+                    arena,
+                )
             {
                 return sql_fail(error);
             }
@@ -49236,9 +49535,16 @@ pub fn drop_routine(
                 };
                 // The aggregate takes its own views, rules, policies and
                 // routines with it, as the dependency report listed them.
-                if let Err(error) =
-                    drop_routine_stored_dependents(storage, wal, txn, dependent, arena)
-                {
+                if let Err(error) = drop_routine_stored_dependents(
+                    storage,
+                    wal,
+                    txn,
+                    &mut *scratch,
+                    seq_session,
+                    &mut *responder,
+                    dependent,
+                    arena,
+                ) {
                     return sql_fail(error);
                 }
                 let definition = storage.routine_for(dependent, txn.txid);
@@ -53427,12 +53733,12 @@ pub fn create_table_as(
         } else {
             rename[i]
         };
-        if matches!(ctype, ColType::Record | ColType::Array(ArrElem::Record)) {
+        if let Some(type_name) = ctype.rejected_column_pseudo_type() {
             return sql_fail(sql_err!(
                 sqlstate::INVALID_TABLE_DEFINITION,
                 "column \"{}\" has pseudo-type {}",
                 col_name,
-                ctype.internal_name()
+                type_name
             ));
         }
         let parsed = match SqlName::parse(col_name) {
@@ -54122,14 +54428,14 @@ pub(crate) fn drop_materialized_view(
                         routines: dependent_routines,
                         rules: dependent_rules,
                     },
-                    Some(ViewRowTypeColumnCascade {
+                    ViewRowTypeColumnCascade {
                         columns: RowTypeColumnCascade {
                             scratch,
                             seq_session,
                         },
                         arena,
                         responder,
-                    }),
+                    },
                 ) {
                     return sql_fail(error);
                 }
@@ -54143,10 +54449,10 @@ pub(crate) fn drop_materialized_view(
                 &[],
                 &|_| false,
                 cascade,
-                Some(RowTypeColumnCascade {
+                RowTypeColumnCascade {
                     scratch,
                     seq_session,
-                }),
+                },
                 arena,
                 responder,
             ) {
@@ -54990,7 +55296,8 @@ pub(super) fn column_default_dependencies(
     arena: &Arena,
 ) -> Result<crate::storage::StoredQueryDependencies, SqlError> {
     use core::fmt::Write;
-    if column.default.constant().is_some() || column.default.is_generated() {
+    // A folded constant keeps its source, whose casts still name types.
+    if column.default.is_generated() {
         return Ok(crate::storage::StoredQueryDependencies::EMPTY);
     }
     let Some(source) = column.default.expression() else {
@@ -55162,10 +55469,12 @@ fn remove_sequence_column_defaults(
 
 /// DROP SEQUENCE [IF EXISTS].
 #[allow(clippy::too_many_arguments)]
-pub fn drop_sequence(
+pub(crate) fn drop_sequence(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
     names: &[crate::sql::ast::QualName],
     if_exists: bool,
     cascade: bool,
@@ -55373,6 +55682,14 @@ pub fn drop_sequence(
                     dependent_matviews,
                     dependent_routines,
                     dependent_rules,
+                    ViewRowTypeColumnCascade {
+                        columns: RowTypeColumnCascade {
+                            scratch: &mut *scratch,
+                            seq_session,
+                        },
+                        arena,
+                        responder: &mut *responder,
+                    },
                 ) {
                     return sql_fail(error);
                 }
@@ -55873,6 +56190,8 @@ fn drop_type_dependent_routines(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
     selected_domains: &[bool],
     selected_enum: Option<usize>,
     selected_composite: Option<usize>,
@@ -55949,7 +56268,16 @@ fn drop_type_dependent_routines(
                 });
             let Some(slot) = dependent else { break };
             let operator_oid = storage.operator(slot).oid();
-            cascade_operator_dependencies(storage, wal, txn, operator_oid, arena)?;
+            cascade_operator_dependencies(
+                storage,
+                wal,
+                txn,
+                &mut *scratch,
+                seq_session,
+                &mut *responder,
+                operator_oid,
+                arena,
+            )?;
             stage_operator_drop(storage, wal, txn, slot)?;
         }
         loop {
@@ -56096,6 +56424,14 @@ fn drop_type_dependent_routines(
         matviews,
         selected,
         dependent_rules,
+        ViewRowTypeColumnCascade {
+            columns: RowTypeColumnCascade {
+                scratch: &mut *scratch,
+                seq_session,
+            },
+            arena,
+            responder: &mut *responder,
+        },
     )?;
 
     loop {
@@ -56120,6 +56456,9 @@ fn drop_type_dependent_routines(
             storage,
             wal,
             txn,
+            &mut *scratch,
+            seq_session,
+            &mut *responder,
             crate::storage::routine_oid(&routine),
             arena,
         )?;
@@ -56303,6 +56642,8 @@ fn drop_domain_selection(
             storage,
             wal,
             txn,
+            &mut *scratch,
+            seq_session,
             selected,
             selected_enum,
             None,
@@ -56314,6 +56655,9 @@ fn drop_domain_selection(
             storage,
             wal,
             txn,
+            &mut *scratch,
+            seq_session,
+            &mut *responder,
             selected,
             selected_enum,
             None,
@@ -57875,6 +58219,8 @@ fn drop_composite_type(
         storage,
         wal,
         txn,
+        &mut *scratch,
+        seq_session,
         &[],
         None,
         Some(slot),
@@ -57997,7 +58343,7 @@ fn drop_composite_type(
             cascade: true,
         };
         match responder.without_command_complete(|responder| {
-            drop_table_kind(
+            drop_table_kind_with_columns(
                 storage,
                 wal,
                 txn,
@@ -58005,6 +58351,10 @@ fn drop_composite_type(
                 None,
                 "DROP TABLE",
                 arena,
+                RowTypeColumnCascade {
+                    scratch: &mut *scratch,
+                    seq_session,
+                },
                 responder,
             )
         }) {
@@ -58080,14 +58430,14 @@ fn drop_composite_type(
                 routines: dependent_routines,
                 rules: dependent_rules,
             },
-            Some(ViewRowTypeColumnCascade {
+            ViewRowTypeColumnCascade {
                 columns: RowTypeColumnCascade {
                     scratch: &mut *scratch,
                     seq_session,
                 },
                 arena,
                 responder: &mut *responder,
-            }),
+            },
         )?;
         drop_domain_selection(
             storage,
@@ -58456,6 +58806,9 @@ fn apply_type_drop_to_stored_queries(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder,
     selected_domains: &[bool],
     selected_enum: Option<usize>,
     selected_composite: Option<usize>,
@@ -58537,6 +58890,14 @@ fn apply_type_drop_to_stored_queries(
         matviews,
         dependent_routines,
         dependent_rules,
+        ViewRowTypeColumnCascade {
+            columns: RowTypeColumnCascade {
+                scratch: &mut *scratch,
+                seq_session,
+            },
+            arena,
+            responder: &mut *responder,
+        },
     )
 }
 
@@ -58909,6 +59270,8 @@ fn apply_column_drop_dependencies(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
     table: usize,
     column: usize,
     column_name: SqlName,
@@ -59092,6 +59455,14 @@ fn apply_column_drop_dependencies(
         matviews,
         dependent_routines,
         dependent_rules,
+        ViewRowTypeColumnCascade {
+            columns: RowTypeColumnCascade {
+                scratch: &mut *scratch,
+                seq_session,
+            },
+            arena,
+            responder: &mut *responder,
+        },
     )
 }
 
@@ -59899,10 +60270,14 @@ fn report_stored_query_dependents(
 
 /// Drops every stored query and policy that depends on routine `slot`, for a
 /// cascade whose dependency report already listed them.
+#[allow(clippy::too_many_arguments)]
 fn drop_routine_stored_dependents(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder,
     slot: usize,
     arena: &Arena,
 ) -> Result<(), SqlError> {
@@ -59928,9 +60303,26 @@ fn drop_routine_stored_dependents(
         matviews,
         routines,
     )?;
-    drop_selected_stored_queries(storage, wal, txn, views, matviews, routines, rules)
+    drop_selected_stored_queries(
+        storage,
+        wal,
+        txn,
+        views,
+        matviews,
+        routines,
+        rules,
+        ViewRowTypeColumnCascade {
+            columns: RowTypeColumnCascade {
+                scratch: &mut *scratch,
+                seq_session,
+            },
+            arena,
+            responder: &mut *responder,
+        },
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drop_selected_stored_queries(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -59939,6 +60331,7 @@ fn drop_selected_stored_queries(
     matviews: &[bool],
     routines: &[bool],
     rules: &[bool],
+    columns: ViewRowTypeColumnCascade<'_, '_>,
 ) -> Result<(), SqlError> {
     drop_selected_stored_queries_with_columns(
         storage,
@@ -59950,7 +60343,7 @@ fn drop_selected_stored_queries(
             routines,
             rules,
         },
-        None,
+        columns,
     )
 }
 
@@ -59969,15 +60362,15 @@ struct ViewRowTypeColumnCascade<'c, 'b> {
     responder: &'c mut Responder<'b>,
 }
 
-/// Drops selected stored queries; with `columns`, a dropped view also takes
-/// other tables' columns of its row type, otherwise such a column fails the
-/// drop with `0A000`.
+/// Drops selected stored queries. A dropped view or materialized view also
+/// takes the table columns, composite attributes and domains of its row type,
+/// as PostgreSQL's dependency walk does.
 fn drop_selected_stored_queries_with_columns(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
     selection: StoredQuerySelectionDrop<'_>,
-    mut columns: Option<ViewRowTypeColumnCascade<'_, '_>>,
+    mut columns: ViewRowTypeColumnCascade<'_, '_>,
 ) -> Result<(), SqlError> {
     let StoredQuerySelectionDrop {
         views,
@@ -60004,44 +60397,40 @@ fn drop_selected_stored_queries_with_columns(
     // immediately reusing a just-freed low slot while this plan is executing.
     for slot in (0..storage.view_count()).rev() {
         if views[slot] && storage.view(slot).visible_to(txn.txid) {
-            if let Some(cascade) = columns.as_mut() {
-                let name = storage.view_column_shape(slot, txn.txid).0;
-                drop_row_type_users(
-                    storage,
-                    wal,
-                    txn,
-                    ("view", name),
-                    crate::storage::RowTypeRelation::View(slot),
-                    &[],
-                    &|_| false,
-                    true,
-                    Some(cascade.columns.reborrow()),
-                    cascade.arena,
-                    cascade.responder,
-                )?;
-            }
+            let name = storage.view_column_shape(slot, txn.txid).0;
+            drop_row_type_users(
+                storage,
+                wal,
+                txn,
+                ("view", name),
+                crate::storage::RowTypeRelation::View(slot),
+                &[],
+                &|_| false,
+                true,
+                columns.columns.reborrow(),
+                columns.arena,
+                columns.responder,
+            )?;
             drop_view_slot(storage, wal, txn, slot)?;
         }
     }
     for slot in (0..storage.matview_count()).rev() {
         if matviews[slot] && storage.matview(slot).visible_to(txn.txid) {
-            if let Some(cascade) = columns.as_mut() {
-                let table = storage.matview_table(slot);
-                let name = storage.table_def(table, txn.txid).name;
-                drop_row_type_users(
-                    storage,
-                    wal,
-                    txn,
-                    ("materialized view", name),
-                    crate::storage::RowTypeRelation::Table(table),
-                    &[],
-                    &|_| false,
-                    true,
-                    Some(cascade.columns.reborrow()),
-                    cascade.arena,
-                    cascade.responder,
-                )?;
-            }
+            let table = storage.matview_table(slot);
+            let name = storage.table_def(table, txn.txid).name;
+            drop_row_type_users(
+                storage,
+                wal,
+                txn,
+                ("materialized view", name),
+                crate::storage::RowTypeRelation::Table(table),
+                &[],
+                &|_| false,
+                true,
+                columns.columns.reborrow(),
+                columns.arena,
+                columns.responder,
+            )?;
             drop_matview_slot(storage, wal, txn, slot)?;
         }
     }
@@ -62521,10 +62910,10 @@ pub(crate) fn drop_view(
                     &[],
                     &|_| false,
                     cascade,
-                    Some(RowTypeColumnCascade {
+                    RowTypeColumnCascade {
                         scratch: &mut *scratch,
                         seq_session,
-                    }),
+                    },
                     arena,
                     responder,
                 ) {
@@ -62552,14 +62941,14 @@ pub(crate) fn drop_view(
                             routines: dependent_routines,
                             rules: dependent_rules,
                         },
-                        Some(ViewRowTypeColumnCascade {
+                        ViewRowTypeColumnCascade {
                             columns: RowTypeColumnCascade {
                                 scratch: &mut *scratch,
                                 seq_session,
                             },
                             arena,
                             responder: &mut *responder,
-                        }),
+                        },
                     ) {
                         return sql_fail(error);
                     }
@@ -66391,10 +66780,12 @@ pub fn create_access_method(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn drop_access_method(
+pub(crate) fn drop_access_method(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
     names: &[&str],
     if_exists: bool,
     cascade: bool,
@@ -66456,7 +66847,7 @@ pub fn drop_access_method(
                 cascade: true,
             };
             let outcome = responder.without_command_complete(|responder| {
-                drop_table_kind(
+                drop_table_kind_with_columns(
                     storage,
                     wal,
                     txn,
@@ -66464,6 +66855,10 @@ pub fn drop_access_method(
                     Some(crate::storage::TableKind::Local),
                     "DROP TABLE",
                     arena,
+                    RowTypeColumnCascade {
+                        scratch: &mut *scratch,
+                        seq_session,
+                    },
                     responder,
                 )
             });
@@ -86269,6 +86664,8 @@ fn alter_table_relation(
                         storage,
                         wal,
                         txn,
+                        &mut *scratch,
+                        seq_session,
                         table_index,
                         original_index,
                         original_column,

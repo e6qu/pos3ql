@@ -377,6 +377,152 @@ macro_rules! sql_err {
     };
 }
 
+/// NOTICE and WARNING messages a builtin raised while evaluating. Evaluation
+/// has no client connection, so they wait here and the session's responder
+/// sends them, in order, before its next protocol message. A statement that
+/// raises more than this many before sending anything fails with SQLSTATE
+/// 54000 instead of dropping one.
+pub const MAX_PENDING_EVAL_MESSAGES: usize = 64;
+pub const MAX_EVAL_MESSAGE_BYTES: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvalMessageLevel {
+    Notice,
+    Warning,
+}
+
+#[derive(Clone, Copy)]
+pub struct EvalMessage {
+    pub level: EvalMessageLevel,
+    pub sqlstate: SqlState,
+    pub message: StackStr<MAX_EVAL_MESSAGE_BYTES>,
+    pub detail: Option<&'static str>,
+}
+
+struct PendingEvalMessages {
+    messages: [Option<EvalMessage>; MAX_PENDING_EVAL_MESSAGES],
+    head: usize,
+    len: usize,
+}
+
+std::thread_local! {
+    static PENDING_EVAL_MESSAGES: core::cell::RefCell<PendingEvalMessages> =
+        const {
+            core::cell::RefCell::new(PendingEvalMessages {
+                messages: [None; MAX_PENDING_EVAL_MESSAGES],
+                head: 0,
+                len: 0,
+            })
+        };
+}
+
+/// Queues a client message raised by builtin evaluation.
+pub fn raise_eval_message(
+    level: EvalMessageLevel,
+    sqlstate: &'static str,
+    message: core::fmt::Arguments<'_>,
+) -> Result<(), SqlError> {
+    queue_eval_message(level, sqlstate, message, None)
+}
+
+/// [`raise_eval_message`] with a fixed DETAIL line.
+pub fn raise_eval_message_with_detail(
+    level: EvalMessageLevel,
+    sqlstate: &'static str,
+    message: core::fmt::Arguments<'_>,
+    detail: &'static str,
+) -> Result<(), SqlError> {
+    queue_eval_message(level, sqlstate, message, Some(detail))
+}
+
+fn queue_eval_message(
+    level: EvalMessageLevel,
+    sqlstate: &'static str,
+    message: core::fmt::Arguments<'_>,
+    detail: Option<&'static str>,
+) -> Result<(), SqlError> {
+    let mut text = StackStr::<MAX_EVAL_MESSAGE_BYTES>::new();
+    if core::fmt::Write::write_fmt(&mut text, message).is_err() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "message exceeds {} bytes",
+            MAX_EVAL_MESSAGE_BYTES
+        ));
+    }
+    PENDING_EVAL_MESSAGES.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        if pending.len == MAX_PENDING_EVAL_MESSAGES {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "more than {} notices and warnings raised before the next output message",
+                MAX_PENDING_EVAL_MESSAGES
+            ));
+        }
+        let at = (pending.head + pending.len) % MAX_PENDING_EVAL_MESSAGES;
+        pending.messages[at] = Some(EvalMessage {
+            level,
+            sqlstate: SqlState::from(sqlstate),
+            message: text,
+            detail,
+        });
+        pending.len += 1;
+        Ok(())
+    })
+}
+
+/// The oldest queued evaluation message, left queued until
+/// [`pop_eval_message`] confirms it was sent.
+pub fn peek_eval_message() -> Option<EvalMessage> {
+    PENDING_EVAL_MESSAGES.with(|pending| {
+        let pending = pending.borrow();
+        if pending.len == 0 {
+            None
+        } else {
+            pending.messages[pending.head]
+        }
+    })
+}
+
+pub fn pop_eval_message() {
+    PENDING_EVAL_MESSAGES.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        if pending.len > 0 {
+            let head = pending.head;
+            pending.messages[head] = None;
+            pending.head = (head + 1) % MAX_PENDING_EVAL_MESSAGES;
+            pending.len -= 1;
+        }
+    });
+}
+
+/// The number of queued evaluation messages, for [`truncate_eval_messages`].
+pub fn eval_message_mark() -> usize {
+    PENDING_EVAL_MESSAGES.with(|pending| pending.borrow().len)
+}
+
+/// Drops the messages queued after `mark`, from an evaluation whose result
+/// is discarded and recomputed.
+pub fn truncate_eval_messages(mark: usize) {
+    PENDING_EVAL_MESSAGES.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        while pending.len > mark {
+            pending.len -= 1;
+            let at = (pending.head + pending.len) % MAX_PENDING_EVAL_MESSAGES;
+            pending.messages[at] = None;
+        }
+    });
+}
+
+/// Discards messages another session's evaluation left on this worker.
+pub fn clear_eval_messages() {
+    PENDING_EVAL_MESSAGES.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        pending.messages = [None; MAX_PENDING_EVAL_MESSAGES];
+        pending.head = 0;
+        pending.len = 0;
+    });
+}
+
 pub mod sqlstate {
     pub const SYNTAX_ERROR: &str = "42601";
     pub const INVALID_NAME: &str = "42602";
@@ -880,6 +1026,11 @@ pub trait ColumnLookup<'a> {
         None
     }
 
+    /// The PL/pgSQL row or record variable `name`, when this scope has one.
+    fn row_variable(&self, _name: &str) -> Option<RowVariable> {
+        None
+    }
+
     /// Declared collation of a resolved column.  The default makes synthetic
     /// scalar contexts explicitly non-collatable instead of guessing from the
     /// datum after expression identity has already been erased.
@@ -911,16 +1062,44 @@ pub trait ColumnLookup<'a> {
     fn whole_row_type(&self, _table: &str) -> Option<ColType> {
         None
     }
+
+    /// The stored relation whose row a whole-row reference to `table` reads,
+    /// as its qualified name, when this lookup knows only its definition.
+    /// [`declared_whole_row_type`] gives such a row the relation's row type.
+    fn whole_row_relation(&self, _table: &str) -> Option<(&str, &str)> {
+        None
+    }
+}
+
+/// A whole-row reference's declared type: the lookup's own answer, or the
+/// row type of the stored relation it names.
+pub(crate) fn declared_whole_row_type<'a>(
+    row: &(impl ColumnLookup<'a> + ?Sized),
+    catalog: Option<&dyn CatalogAccess>,
+    table: &str,
+) -> Option<ColType> {
+    let declared = row.whole_row_type(table)?;
+    if declared != ColType::Record {
+        return Some(declared);
+    }
+    Some(
+        row.whole_row_relation(table)
+            .and_then(|(schema, name)| catalog?.relation_row_type(schema, name))
+            .map_or(ColType::Record, |creation| {
+                ColType::Composite(Some(creation))
+            }),
+    )
 }
 
 /// A whole-row reference to a relation has the relation's row type; any other
 /// FROM item yields an anonymous record.
 fn whole_row_value<'a>(
     row: &dyn ColumnLookup<'a>,
+    catalog: Option<&dyn CatalogAccess>,
     table: &str,
     fields: &'a [RecordField<'a>],
 ) -> Datum<'a> {
-    match row.whole_row_type(table) {
+    match declared_whole_row_type(row, catalog, table) {
         Some(ColType::Composite(Some(slot))) => Datum::Composite { slot, fields },
         _ => Datum::Record(fields),
     }
@@ -961,6 +1140,61 @@ impl ExpressionTypeIdentity {
     }
 }
 
+/// A PL/pgSQL row or record variable named as a qualifier (`r.f`).
+#[derive(Clone, Copy)]
+pub enum RowVariable {
+    /// A row-typed variable: its declared fields exist even while it is NULL.
+    Declared(crate::storage::TypeCreation),
+    /// A `record` variable not yet assigned: it has no fields.
+    Unassigned,
+    /// An assigned row or record: its value carries the fields.
+    Assigned,
+}
+
+/// The declared type of `variable.field` when `variable` is a NULL PL/pgSQL
+/// row or an unassigned record, whose value carries no fields. PostgreSQL
+/// reads a NULL row's field types from its declaration and rejects any field
+/// of an unassigned record. `None` leaves the reference to the value scope.
+pub(crate) fn row_variable_field(
+    row: &dyn ColumnLookup<'_>,
+    catalog: Option<&dyn CatalogAccess>,
+    variable: &str,
+    field: &str,
+) -> Option<Result<crate::sql::exec::StaticTypeMeta, SqlError>> {
+    match row.row_variable(variable)? {
+        RowVariable::Assigned => None,
+        RowVariable::Unassigned => {
+            stash_diagnostic(
+                Some(StackStr::from_str(
+                    "The tuple structure of a not-yet-assigned record is indeterminate.",
+                )),
+                None,
+            );
+            Some(Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "record \"{}\" is not assigned yet",
+                variable
+            )))
+        }
+        RowVariable::Declared(creation) => {
+            let mut found = None;
+            catalog?.visit_composite_fields(Some(creation), &mut |name, meta| {
+                if name == field && found.is_none() {
+                    found = Some(meta);
+                }
+            })?;
+            Some(found.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "record \"{}\" has no field \"{}\"",
+                    variable,
+                    field
+                )
+            }))
+        }
+    }
+}
+
 pub(crate) fn expression_type_identity<'a>(
     expression: &Expr<'a>,
     row: &dyn ColumnLookup<'a>,
@@ -976,6 +1210,33 @@ pub(crate) fn expression_type_identity<'a>(
         && let Some(type_oid) = row.column_type_oid(*qualifier, name)
     {
         return Ok(ExpressionTypeIdentity::Known(type_oid));
+    }
+    // A field of a NULL row-typed variable has its declared field type.
+    if let Expr::Column {
+        qualifier: Some(variable),
+        name,
+    } = expression
+        && row.col_type(Some(variable), name).is_none()
+        && let Some(field) = row_variable_field(row, hooks.catalog, variable, name)
+    {
+        return Ok(ExpressionTypeIdentity::Known(field?.type_oid));
+    }
+    if let Expr::Column {
+        qualifier: Some(variable),
+        name,
+    } = expression
+        && let Some(ColType::Composite(creation)) = row.col_type(None, variable)
+        && let Some(catalog) = hooks.catalog
+    {
+        let mut found = None;
+        catalog.visit_composite_fields(creation, &mut |field, meta| {
+            if field == *name && found.is_none() {
+                found = Some(meta.type_oid);
+            }
+        });
+        if let Some(type_oid) = found {
+            return Ok(ExpressionTypeIdentity::Known(type_oid));
+        }
     }
     if let Expr::Column { qualifier, name } = expression
         && let Some(identity) = row.column_user_type(*qualifier, name)
@@ -1245,7 +1506,9 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
                 collation: super::types::ColDesc::of_type(name, ctype).collation,
             });
         }
-        let ctype = self.row.col_type(qualifier, name)?;
+        let Some(ctype) = self.row.col_type(qualifier, name) else {
+            return row_variable_field(self.row, self.catalog, qualifier?, name)?.ok();
+        };
         let type_oid = match self.row.column_user_type(qualifier, name) {
             Some(identity) => self.catalog?.declared_user_type_oid(ctype, identity)?,
             None => ctype.oid(),
@@ -1273,12 +1536,33 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
                     )
                 })
         } else {
-            self.row.resolve_column_type(qualifier, name)
+            self.row
+                .resolve_column_type(qualifier, name)
+                .map(|ctype| match (ctype, qualifier) {
+                    // A bare relation name is its whole row.
+                    (ColType::Record, None) if self.row.col_type(None, name).is_none() => {
+                        declared_whole_row_type(self.row, self.catalog, name).unwrap_or(ctype)
+                    }
+                    _ => ctype,
+                })
+                .or_else(|error| {
+                    match qualifier.and_then(|variable| {
+                        row_variable_field(self.row, self.catalog, variable, name)
+                    }) {
+                        Some(field) => field.map(|field| field.ctype),
+                        None => Err(error),
+                    }
+                })
         }
     }
 
     fn is_whole_row(&self, name: &str) -> bool {
         self.row.whole_row_type(name).is_some()
+    }
+
+    fn whole_row_composite_type(&self, name: &str) -> Option<ColType> {
+        declared_whole_row_type(self.row, self.catalog, name)
+            .filter(|ctype| matches!(ctype, ColType::Composite(_)))
     }
 
     fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
@@ -1521,6 +1805,10 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
         (**self).column_type_oid(qualifier, name)
     }
 
+    fn row_variable(&self, name: &str) -> Option<RowVariable> {
+        (**self).row_variable(name)
+    }
+
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
         (**self).collation(qualifier, name)
     }
@@ -1531,6 +1819,10 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
 
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         (**self).whole_row_type(table)
+    }
+
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        (**self).whole_row_relation(table)
     }
 
     fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
@@ -1925,6 +2217,15 @@ pub enum RoutineCallAccess {
 }
 
 pub trait CatalogAccess {
+    /// The row type of the stored table or view `schema.name`.
+    fn relation_row_type(
+        &self,
+        _schema: &str,
+        _name: &str,
+    ) -> Option<crate::storage::TypeCreation> {
+        None
+    }
+
     fn validate_enum_input_literal(&self, _text: &str, _target_oid: i32) -> Result<(), SqlError> {
         Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -3152,6 +3453,10 @@ pub struct SubqueryList<'a> {
     pub probe: Option<core::ptr::NonNull<dyn SubqueryListProbe>>,
     pub saw_null: bool,
     pub witness: Datum<'a>,
+    /// Declared types of the compared columns (one per row field). Operator
+    /// resolution reads these: a pseudo-type such as `cstring` has no value
+    /// witness, and an empty set must still resolve the operator.
+    pub column_types: &'a [i32],
     pub collations: &'a [Collation],
 }
 
@@ -3194,6 +3499,8 @@ pub struct DeferredSubqueryCache {
     /// A list's comparison collations in `owner`'s persistent tail, as an
     /// address and length so the cache does not fix the hooks' lifetime.
     collations: (usize, usize),
+    /// A list's declared column types, kept the same way.
+    column_types: (usize, usize),
 }
 
 const LIST_CACHE_CHUNK: usize = 1024;
@@ -3223,7 +3530,21 @@ impl<'h> DeferredSubquery<'h> {
                     saved.collations.1,
                 )
             };
-            return decode_cached_subquery(bytes, saved.list, collations, self.node, arena);
+            // SAFETY: as for the collations.
+            let column_types: &[i32] = unsafe {
+                core::slice::from_raw_parts(
+                    saved.column_types.0 as *const i32,
+                    saved.column_types.1,
+                )
+            };
+            return decode_cached_subquery(
+                bytes,
+                saved.list,
+                collations,
+                column_types,
+                self.node,
+                arena,
+            );
         }
         let result = self.executor.evaluate(
             expression,
@@ -3241,10 +3562,10 @@ impl<'h> DeferredSubquery<'h> {
 
     fn save(&self, result: &SubqueryResult<'_>) -> Result<DeferredSubqueryCache, SqlError> {
         let header;
-        let (list, members, collations) = match result {
+        let (list, members, collations, column_types) = match result {
             SubqueryResult::Scalar { value, witness } => {
                 header = [*value, *witness];
-                (false, &[][..], &[][..])
+                (false, &[][..], &[][..], &[][..])
             }
             SubqueryResult::List(list) => {
                 if list.probe.is_some() {
@@ -3254,7 +3575,7 @@ impl<'h> DeferredSubquery<'h> {
                     ));
                 }
                 header = [list.witness, Datum::Bool(list.saw_null)];
-                (true, list.values, list.collations)
+                (true, list.values, list.collations, list.column_types)
             }
         };
         let mut length = 0usize;
@@ -3283,6 +3604,10 @@ impl<'h> DeferredSubquery<'h> {
             .owner
             .alloc_persistent_slice_with(collations.len(), |index| collations[index])
             .map_err(|_| arena_full())?;
+        let column_types = self
+            .owner
+            .alloc_persistent_slice_with(column_types.len(), |index| column_types[index])
+            .map_err(|_| arena_full())?;
         Ok(DeferredSubqueryCache {
             bytes: Some(
                 self.owner
@@ -3291,6 +3616,7 @@ impl<'h> DeferredSubquery<'h> {
             ),
             list,
             collations: (collations.as_ptr() as usize, collations.len()),
+            column_types: (column_types.as_ptr() as usize, column_types.len()),
         })
     }
 }
@@ -3299,6 +3625,7 @@ fn decode_cached_subquery<'a>(
     bytes: &'a [u8],
     list: bool,
     collations: &[Collation],
+    column_types: &[i32],
     node: *const (),
     arena: &'a Arena,
 ) -> Result<SubqueryResult<'a>, SqlError> {
@@ -3348,6 +3675,9 @@ fn decode_cached_subquery<'a>(
         probe: None,
         saw_null: matches!(second, Datum::Bool(true)),
         witness: first,
+        column_types: arena
+            .alloc_slice_copy(column_types)
+            .map_err(|_| arena_full())?,
         collations: arena
             .alloc_slice_copy(collations)
             .map_err(|_| arena_full())?,
@@ -3410,7 +3740,26 @@ pub fn check_constant_errors<'a>(
     arena: &'a Arena,
     catalog: Option<&dyn CatalogAccess>,
 ) -> Result<(), SqlError> {
-    fold_check(expression, arena, catalog).map(|_| ())
+    probe_constants(|| fold_check(expression, arena, catalog).map(|_| ()))
+}
+
+std::thread_local! {
+    static CONSTANT_PROBE_DEPTH: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Runs a planning-time probe that evaluates constant expressions only to
+/// report their errors. A probe that succeeds is evaluated again at run time,
+/// which raises its notices then; a failing one is the statement's error, and
+/// PostgreSQL has sent the notices its folding raised before it.
+pub fn probe_constants(probe: impl FnOnce() -> Result<(), SqlError>) -> Result<(), SqlError> {
+    let messages = eval_message_mark();
+    let depth = CONSTANT_PROBE_DEPTH.with(|depth| depth.replace(depth.get() + 1));
+    let result = probe();
+    CONSTANT_PROBE_DEPTH.with(|probe_depth| probe_depth.set(depth));
+    if depth == 0 && result.is_ok() {
+        truncate_eval_messages(messages);
+    }
+    result
 }
 
 fn catalog_evaluation(
@@ -3633,6 +3982,7 @@ fn fold_check<'a>(
         } else {
             eval(expression, arena, NO_PARAMS, &NoColumns)
         };
+
         return Ok(match result {
             Ok(Datum::Bool(b)) => Some(b),
             Ok(_) => None,
@@ -3953,7 +4303,8 @@ fn validate_enum_operator_types<'a>(
 }
 
 /// `cstring` has no operators of its own: PostgreSQL only concatenates it
-/// with text through `anytextcat`, so `'a'::cstring = 'a'::cstring` and
+/// with text through `anytextcat` and with `cstring[]` through the array
+/// operators, so `'a'::cstring = 'a'::cstring` and
 /// `'a'::cstring || 1` fail with `42883`.
 fn validate_cstring_operator_types<'a>(
     operator: &str,
@@ -3964,20 +4315,30 @@ fn validate_cstring_operator_types<'a>(
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<(), SqlError> {
     use super::types::oid;
-    // Only casts and calls produce `cstring`; other operands skip the lookup.
-    let may_be_cstring = |expression: &Expr<'_>| match expression {
-        Expr::Cast { type_name, .. } => {
-            ColType::from_sql_name(type_name)
-                == Some(ColType::Pseudo(super::types::PseudoType::Cstring))
-        }
-        Expr::Call { .. } => true,
-        _ => false,
-    };
     if !may_be_cstring(left) && !may_be_cstring(right) {
         return Ok(());
     }
     let left_type = expression_type_identity(left, row, hooks)?.routine_argument_oid();
     let right_type = expression_type_identity(right, row, hooks)?.routine_argument_oid();
+    let name = operator_type_name;
+    // `cstring[]` concatenates only with `cstring` elements and arrays; its
+    // comparisons fail per element when they run.
+    if concatenation && (left_type == oid::CSTRING_ARRAY || right_type == oid::CSTRING_ARRAY) {
+        let other = if left_type == oid::CSTRING_ARRAY {
+            right_type
+        } else {
+            left_type
+        };
+        if matches!(other, oid::CSTRING | oid::CSTRING_ARRAY | oid::UNKNOWN) {
+            return Ok(());
+        }
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist: {} || {}",
+            name(left_type),
+            name(right_type)
+        ));
+    }
     if left_type != oid::CSTRING && right_type != oid::CSTRING {
         return Ok(());
     }
@@ -3986,21 +4347,15 @@ fn validate_cstring_operator_types<'a>(
     } else {
         left_type
     };
+    // `cstring[] || cstring` appends through `anycompatiblearray`.
     if concatenation
         && matches!(
             other,
-            oid::TEXT | oid::UNKNOWN | oid::VARCHAR | oid::BPCHAR | oid::NAME
+            oid::TEXT | oid::UNKNOWN | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::CSTRING_ARRAY
         )
     {
         return Ok(());
     }
-    let name = |type_oid: i32| {
-        if type_oid == oid::UNKNOWN {
-            "unknown"
-        } else {
-            ColType::from_oid(type_oid).map_or("unknown", ColType::name)
-        }
-    };
     Err(sql_err!(
         sqlstate::UNDEFINED_FUNCTION,
         "operator does not exist: {} {} {}",
@@ -4008,6 +4363,146 @@ fn validate_cstring_operator_types<'a>(
         operator,
         name(right_type)
     ))
+}
+
+/// Only casts, calls and array constructors produce `cstring` or
+/// `cstring[]`; other operands skip the type lookup.
+fn may_be_cstring(expression: &Expr<'_>) -> bool {
+    match expression {
+        Expr::Cast { type_name, .. } => matches!(
+            ColType::from_sql_name(type_name),
+            Some(
+                ColType::Pseudo(super::types::PseudoType::Cstring)
+                    | ColType::Array(super::types::ArrElem::Cstring)
+            )
+        ),
+        Expr::Call { .. } | Expr::Array(_) => true,
+        _ => false,
+    }
+}
+
+/// A type as an operator-resolution error names it.
+fn operator_type_name(type_oid: i32) -> &'static str {
+    if type_oid == super::types::oid::UNKNOWN {
+        "unknown"
+    } else {
+        ColType::from_oid(type_oid).map_or("unknown", ColType::name)
+    }
+}
+
+/// A pattern match (`LIKE` is `~~`, a regular expression `~`) between
+/// operands that are not strings has no operator, as in PostgreSQL.
+fn pattern_operator_undefined<'a>(
+    operator: &str,
+    operand: &Expr<'a>,
+    pattern: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<SqlError, SqlError> {
+    let left = expression_type_identity(operand, row, hooks)?.routine_argument_oid();
+    let right = expression_type_identity(pattern, row, hooks)?.routine_argument_oid();
+    Ok(sql_err!(
+        sqlstate::UNDEFINED_FUNCTION,
+        "operator does not exist: {} {} {}",
+        operator_type_name(left),
+        operator,
+        operator_type_name(right)
+    ))
+}
+
+/// A quantified `LIKE`/`ILIKE`/`~`/`~*` resolves its operator from the
+/// declared operand and element types before reading an element, so an empty
+/// array still fails for a non-string side.
+fn validate_quantified_pattern<'a>(
+    operator: BinaryOp,
+    operand: &Expr<'a>,
+    element: super::types::ArrElem,
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<(), SqlError> {
+    use super::types::oid;
+    if !matches!(
+        operator,
+        BinaryOp::Like
+            | BinaryOp::ILike
+            | BinaryOp::RegexMatch
+            | BinaryOp::RegexIMatch
+            | BinaryOp::NotLike
+            | BinaryOp::NotILike
+            | BinaryOp::RegexNotMatch
+            | BinaryOp::RegexNotIMatch
+    ) {
+        return Ok(());
+    }
+    let base = |type_oid: i32| {
+        hooks
+            .catalog
+            .and_then(|catalog| catalog.domain_base_type(type_oid))
+            .map_or(type_oid, ColType::oid)
+    };
+    let left = base(expression_type_identity(operand, row, hooks)?.routine_argument_oid());
+    let right = base(element.element_oid());
+    let string = |type_oid: i32| {
+        matches!(
+            type_oid,
+            oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::UNKNOWN
+        )
+    };
+    let valid = (string(left) && string(right))
+        || (matches!(operator, BinaryOp::Like | BinaryOp::NotLike)
+            && matches!(left, oid::BYTEA | oid::UNKNOWN)
+            && right == oid::BYTEA);
+    if valid {
+        return Ok(());
+    }
+    Err(sql_err!(
+        sqlstate::UNDEFINED_FUNCTION,
+        "operator does not exist: {} {} {}",
+        operator_type_name(left),
+        operator.operator_name().unwrap_or("?"),
+        operator_type_name(right)
+    ))
+}
+
+/// `x IN (SELECT c ...)` and `x op ANY/ALL (SELECT c ...)` compare through
+/// an operator that PostgreSQL resolves from the declared types before any
+/// row is read, and `cstring` has none, so either side being `cstring` fails
+/// with `42883` even over an empty subquery. A row operand pairs its fields
+/// with the subquery's columns.
+fn validate_cstring_subquery_comparison<'a>(
+    operator: &str,
+    operand: &Expr<'a>,
+    column_types: &[i32],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<(), SqlError> {
+    use super::types::oid;
+    let single = [operand];
+    let fields: &[&Expr<'a>] = match operand {
+        Expr::Call {
+            kind: super::ast::CallKind::SqlSyntax,
+            name,
+            args,
+            ..
+        } if column_types.len() > 1 && name.eq_ignore_ascii_case("row") => args,
+        _ => &single,
+    };
+    for (field, &column_type) in fields.iter().copied().zip(column_types) {
+        if column_type != oid::CSTRING && !may_be_cstring(field) {
+            continue;
+        }
+        let field_type = expression_type_identity(field, row, hooks)?.routine_argument_oid();
+        if field_type == oid::CSTRING || column_type == oid::CSTRING {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "operator does not exist: {} {} {}",
+                operator_type_name(field_type),
+                operator,
+                operator_type_name(column_type)
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn eval_binary_expression<'a>(
@@ -4131,7 +4626,7 @@ fn require_builtin_operator_execute<'a>(
 }
 
 /// The fields of a `ROW(...)` or `(a, b)` constructor.
-fn row_constructor_fields<'a>(expression: &Expr<'a>) -> Option<&'a [&'a Expr<'a>]> {
+pub(crate) fn row_constructor_fields<'a>(expression: &Expr<'a>) -> Option<&'a [&'a Expr<'a>]> {
     match expression {
         Expr::Call {
             kind: super::ast::CallKind::SqlSyntax,
@@ -5596,6 +6091,7 @@ fn eval_full_inner<'a>(
             probe: None,
             saw_null: false,
             witness: Datum::Null,
+            column_types: &[],
             collations: &[],
         }];
         let values = match result {
@@ -5689,7 +6185,7 @@ fn eval_full_inner<'a>(
             Some(fields) if row.whole_row_is_scalar(table) => {
                 Ok(fields.first().map(|f| f.value).unwrap_or(Datum::Null))
             }
-            Some(fields) => Ok(whole_row_value(row, table, fields)),
+            Some(fields) => Ok(whole_row_value(row, hooks.catalog, table, fields)),
             None => Ok(Datum::Null), // outer-join null row
         },
         Expr::Bool(b) => Ok(Datum::Bool(b)),
@@ -5718,7 +6214,7 @@ fn eval_full_inner<'a>(
                     Ok(Some(fields)) if row.whole_row_is_scalar(name) => {
                         Ok(fields.first().map(|f| f.value).unwrap_or(Datum::Null))
                     }
-                    Ok(Some(fields)) => Ok(whole_row_value(row, name, fields)),
+                    Ok(Some(fields)) => Ok(whole_row_value(row, hooks.catalog, name, fields)),
                     Ok(None) => Ok(Datum::Null),
                     Err(_) => Err(crate::sql::error_position::column_reference(
                         e, qualifier, name,
@@ -5909,11 +6405,48 @@ fn eval_full_inner<'a>(
             if let Some(ColType::Pseudo(kind)) = target_type {
                 return pseudo_type_cast(kind, v, source_identity()?.routine_argument_oid(), arena);
             }
-            if source_identity()?.routine_argument_oid() == super::types::oid::CSTRING
-                && !matches!(
-                    target_type,
-                    Some(ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name)
+            // `cstring` converts only to the string types, element by element
+            // for arrays; an array constructor converts each `cstring` item.
+            let accepts_cstring = |target: Option<ColType>| {
+                matches!(
+                    target,
+                    Some(
+                        ColType::Text
+                            | ColType::Varchar
+                            | ColType::Bpchar
+                            | ColType::Name
+                            | ColType::Pseudo(super::types::PseudoType::Cstring)
+                    )
                 )
+            };
+            if let (Expr::Array(items), Some(element)) = (operand, constructor_element)
+                && !accepts_cstring(Some(element.to_coltype()))
+            {
+                for item in *items {
+                    if matches!(item, Expr::Cast { .. } | Expr::Call { .. })
+                        && expression_type_identity(item, row, hooks)?.routine_argument_oid()
+                            == super::types::oid::CSTRING
+                    {
+                        return Err(sql_err!(
+                            sqlstate::CANNOT_COERCE,
+                            "cannot cast type cstring to {}",
+                            element.to_coltype().name()
+                        ));
+                    }
+                }
+            }
+            if let Some(ColType::Array(element)) = target_type
+                && !accepts_cstring(Some(element.to_coltype()))
+                && source_identity()?.routine_argument_oid() == super::types::oid::CSTRING_ARRAY
+            {
+                return Err(sql_err!(
+                    sqlstate::CANNOT_COERCE,
+                    "cannot cast type cstring[] to {}",
+                    ColType::Array(element).name()
+                ));
+            }
+            if source_identity()?.routine_argument_oid() == super::types::oid::CSTRING
+                && !accepts_cstring(target_type)
             {
                 let error = match target_type {
                     Some(target) => sql_err!(
@@ -6392,12 +6925,18 @@ fn eval_full_inner<'a>(
                         like_match(s, pat, case_insensitive, escape.unwrap_or(Some('\\')))?;
                     Ok(Datum::Bool(matched != negated))
                 }
-                (l, r) => Err(sql_err!(
-                    sqlstate::DATATYPE_MISMATCH,
-                    "LIKE requires text operands, got {:?} and {:?}",
-                    l,
-                    r
-                )),
+                _ => Err(pattern_operator_undefined(
+                    match (negated, case_insensitive) {
+                        (false, false) => "~~",
+                        (true, false) => "!~~",
+                        (false, true) => "~~*",
+                        (true, true) => "!~~*",
+                    },
+                    operand,
+                    pattern,
+                    row,
+                    hooks,
+                )?),
             }
         }
         Expr::Match {
@@ -6415,12 +6954,18 @@ fn eval_full_inner<'a>(
                     let matched = super::regex::regex_search(pat, s, case_insensitive)?;
                     Ok(Datum::Bool(matched != negated))
                 }
-                (l, r) => Err(sql_err!(
-                    sqlstate::DATATYPE_MISMATCH,
-                    "regex match requires text operands, got {:?} and {:?}",
-                    l,
-                    r
-                )),
+                _ => Err(pattern_operator_undefined(
+                    match (negated, case_insensitive) {
+                        (false, false) => "~",
+                        (true, false) => "!~",
+                        (false, true) => "~*",
+                        (true, true) => "!~*",
+                    },
+                    operand,
+                    pattern,
+                    row,
+                    hooks,
+                )?),
             }
         }
         Expr::Case {
@@ -6530,6 +7075,7 @@ fn eval_full_inner<'a>(
                     "subqueries are not allowed in this context (or are correlated)"
                 ));
             };
+            validate_cstring_subquery_comparison("=", operand, list.column_types, row, hooks)?;
             let witness = list.witness;
             let collations = effective_quantified_collations(
                 operand,
@@ -6662,6 +7208,19 @@ fn eval_full_inner<'a>(
                         "subqueries are not allowed in this context (or are correlated)"
                     )
                 })?;
+            let operator_name = operator.operator_name().ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "quantified comparison has no operator name"
+                )
+            })?;
+            validate_cstring_subquery_comparison(
+                operator_name,
+                operand,
+                list.column_types,
+                row,
+                hooks,
+            )?;
             let value = materialize_named_composite(
                 single_column_row_constructor(
                     operand,
@@ -7189,6 +7748,39 @@ fn eval_full_inner<'a>(
                         "op ANY/ALL (array) requires array on right side"
                     ));
                 }
+            };
+            validate_quantified_pattern(operator, operand, element, row, hooks)?;
+            // An unknown literal operand takes the element type, as PostgreSQL
+            // resolves `'1' = ANY (integer[])`.
+            let lhs = match lhs {
+                Datum::Text(_)
+                    if is_unknown_literal(operand)
+                        && !matches!(
+                            element,
+                            super::types::ArrElem::Text
+                                | super::types::ArrElem::Varchar
+                                | super::types::ArrElem::Bpchar
+                                | super::types::ArrElem::Name
+                                | super::types::ArrElem::Enum(_)
+                        )
+                        && operators::Comparison::from_binary(operator).is_some() =>
+                {
+                    use super::types::GeometryKind;
+                    // Points, paths and polygons have no comparison operators.
+                    if let super::types::ArrElem::Geometry(
+                        GeometryKind::Point | GeometryKind::Path | GeometryKind::Polygon,
+                    ) = element
+                    {
+                        return Err(sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "operator does not exist: unknown {} {}",
+                            operator.operator_name().unwrap_or("?"),
+                            operator_type_name(element.element_oid())
+                        ));
+                    }
+                    cast_to(lhs, element.to_coltype(), arena)?
+                }
+                lhs => lhs,
             };
             let mut saw_null = false;
             for el in super::array::structured_elements(raw, element, arena) {
@@ -9098,6 +9690,11 @@ fn call<'a>(
     }
     if argument_names.is_empty()
         && let Some(result) = funcs::lsn::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
+    if argument_names.is_empty()
+        && let Some(result) = funcs::typmod::dispatch(name, args, star, arena, params, row, hooks)
     {
         return result;
     }
@@ -11556,6 +12153,21 @@ fn array_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
         (Datum::Array { element: left, .. }, Datum::Array { element: right, .. }) => {
             super::types::common_array_element(*left, *right).map_err(|_| invalid())?
         }
+        // A `cstring` element is text-shaped; operator resolution admitted it.
+        (
+            Datum::Array {
+                element: ArrElem::Cstring,
+                ..
+            },
+            Datum::Text(_),
+        )
+        | (
+            Datum::Text(_),
+            Datum::Array {
+                element: ArrElem::Cstring,
+                ..
+            },
+        ) => ArrElem::Cstring,
         (Datum::Array { element, .. }, scalar) | (scalar, Datum::Array { element, .. }) => {
             match ArrElem::from_datum(scalar) {
                 Some(scalar) => {
@@ -13456,6 +14068,7 @@ mod tests {
                         probe: None,
                         saw_null: false,
                         witness: Datum::Int4(0),
+                        column_types: &[crate::sql::types::oid::INT4],
                         collations: &[],
                     })),
                     _ => panic!("unexpected subquery"),

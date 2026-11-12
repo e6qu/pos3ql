@@ -967,6 +967,10 @@ impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
         self.0.column_type_oid(qualifier, name)
     }
 
+    fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
+        self.0.row_variable(name)
+    }
+
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         self.0.whole_row_is_scalar(table)
     }
@@ -1108,6 +1112,12 @@ impl<'d> QueryScope<'d> {
             arena,
         )?;
         scope.slots[0] = usize::MAX;
+        // The RETURNING row has the target relation's row type.
+        scope.row_types[0] = storage
+            .find_visible(definition.schema.as_str(), definition.name.as_str(), txid)
+            .map(|slot| {
+                storage.relation_row_type_creation(crate::storage::RowTypeRelation::Table(slot))
+            });
         scope.n = 1;
         scope.target_aliases = arena
             .alloc_slice_copy(output_aliases)

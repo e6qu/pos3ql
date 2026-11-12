@@ -16479,7 +16479,7 @@ impl Engine {
             self.work.reset();
             self.storage.set_read_snapshot(source_snapshot);
             invocations.begin_attempt();
-            let output_mark = responder.mark();
+            let output_mark = responder.attempt_mark();
             let outcome = self.execute_select_once(
                 statement,
                 arena,
@@ -16495,7 +16495,7 @@ impl Engine {
             if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
                 return Ok(Err(error));
             }
-            if let Err(error) = responder.truncate_to(output_mark) {
+            if let Err(error) = responder.restart_attempt(output_mark) {
                 // Rows already sent cannot be withdrawn for another attempt.
                 return Ok(Err(error));
             }
@@ -16587,7 +16587,7 @@ impl Engine {
                 self.work.reset();
                 self.storage.set_read_snapshot(source_snapshot);
                 invocations.begin_attempt();
-                let output_mark = responder.mark();
+                let output_mark = responder.attempt_mark();
                 let outcome = {
                     let sequence =
                         sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
@@ -16602,7 +16602,7 @@ impl Engine {
                 if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
                     return Ok(Err(error));
                 }
-                if let Err(error) = responder.truncate_to(output_mark) {
+                if let Err(error) = responder.restart_attempt(output_mark) {
                     // Rows already sent cannot be withdrawn for another attempt.
                     return Ok(Err(error));
                 }
@@ -16960,7 +16960,8 @@ impl Engine {
             self.storage.set_read_snapshot(source_snapshot);
             invocations.begin_attempt();
             let attempt_arena_mark = arena.mark();
-            let output_mark = responder.mark();
+            let attempt_mark = responder.attempt_mark();
+            let output_mark = attempt_mark.output();
             let (wal, lock) = (self.wal.stage_mark(txn.txid), self.storage.lock_mark());
             let statement_mark = txn.statement_mark(wal, lock);
             let effects = txn.transaction_effect_mark();
@@ -17082,7 +17083,7 @@ impl Engine {
                 unfinished.map_or((statement_mark, output_mark), |row| (row.mark, row.output));
             self.rollback_waiting_statement(txn, rollback);
             self.dml_scratch.clear();
-            if let Err(error) = responder.truncate_to(output_mark) {
+            if let Err(error) = responder.restart_attempt(attempt_mark.from_output(output_mark)) {
                 // Rows already sent cannot be withdrawn for another attempt.
                 return Ok(Err(error));
             }
@@ -20502,6 +20503,9 @@ impl Engine {
         // install this session's effective search path in the worker-local
         // execution context used by every name resolution below.
         let _ = eval::take_diagnostic();
+        if reset_workspace {
+            eval::clear_eval_messages();
+        }
         exec::reset_record_shapes();
         for (_, composite) in self.storage.composites_with_slots_visible_to(txn.txid) {
             if let Err(error) = exec::register_named_composite_shape(
@@ -21055,6 +21059,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 identities,
                 *if_exists,
                 *cascade,
@@ -21315,6 +21321,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 exec::DropRoutineCommand {
                     targets: exec::DropRoutineTargets::Routines(functions),
                     if_exists: *if_exists,
@@ -21332,6 +21340,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 exec::DropRoutineCommand {
                     targets: exec::DropRoutineTargets::Routines(procedures),
                     if_exists: *if_exists,
@@ -21349,6 +21359,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 exec::DropRoutineCommand {
                     targets: exec::DropRoutineTargets::Routines(routines),
                     if_exists: *if_exists,
@@ -21366,6 +21378,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 aggregates,
                 *if_exists,
                 *cascade,
@@ -21480,6 +21494,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 names,
                 *if_exists,
                 *cascade,
@@ -21502,6 +21518,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 names,
                 *if_exists,
                 *cascade,
@@ -21590,6 +21608,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 *kind,
                 name,
                 *if_exists,
@@ -21879,6 +21899,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 names,
                 *if_exists,
                 *cascade,
@@ -22165,6 +22187,8 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
+                guc.seq_session(),
                 names,
                 *if_exists,
                 *cascade,

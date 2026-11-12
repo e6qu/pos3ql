@@ -388,11 +388,7 @@ behavior; being listed in the catalog is not support. Keep the SQLAlchemy,
 Alembic, psycopg2 and other client comparisons passing, and turn every
 unsupported case into an explicit error. Known gaps: renaming or moving a
 built-in function fails with `0A000` where PostgreSQL changes the catalog
-entry (every built-in name lookup must consult a renamed or moved row);
-arrays of `cstring` (`ARRAY['a'::cstring]`, `'{a}'::cstring[]`) fail with
-`0A000`, and `SELECT DISTINCT`, `ORDER BY`, `IN` and `GREATEST` over
-`cstring` values succeed where PostgreSQL reports that `cstring` has no
-equality or ordering operator; `pg_type` lists all 473
+entry (every built-in name lookup must consult a renamed or moved row); `pg_type` lists all 473
 `pg_catalog` types but of `information_schema`'s 148 only its domains and their
 arrays (the row types of its views, whose OIDs initdb assigns after importing
 the platform's collations, need the pinned reference image); a
@@ -418,10 +414,13 @@ conditions are printed in PostgreSQL's analyzed form (`'x'::text`,
 operators, `IN`, `LIKE`, `IS NULL`, `IS [NOT] DISTINCT FROM`, `IS [NOT]
 TRUE/FALSE`, `CASE`, casts, SQL value functions and built-in function calls;
 other expressions (subqueries, user-defined function calls, `$n` parameters,
-array constructors and whole-row references) are still printed as stored, and
-an index expression or view that passes a whole-row reference to a function
-taking the table's row type (`CREATE INDEX ON t (f(t.*))`) fails with `42883`
-because its validation types the reference as `record`. `pg_get_viewdef` uses PostgreSQL's
+array constructors outside a quantified comparison, and whole-row
+references) are still printed as stored. A whole-row reference in an index
+expression or `CHECK` (`CREATE INDEX ON t (f(t.*))`) fails with `0A000`
+until column dependencies record whole-row users, and a view passing `t.*`
+to a function taking the table's row type fails with `42883` because view
+dependency recording still types the reference as `record` (the bare `t`
+spelling works). `pg_get_viewdef` uses PostgreSQL's
 layout, including its wrap column, only for a view
 over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
 comma or `USING` joins, subqueries or set operations; other views return their
@@ -517,10 +516,7 @@ that walk, so a cascade lists its objects in the order the statement drops
 them (`DROP TABLE t CASCADE` lists a view over a materialized view of `t`
 before the materialized view) where PostgreSQL follows the walk; the walk's
 objects would have to be described before they are dropped, into a fixed
-per-statement buffer; `pg_depend` still lacks PostgreSQL's rows for types named only inside
-expressions (a cast to a domain in a default or routine body) and the
-column-level rows of views that read a sequence (`SELECT last_value FROM sq`
-depends on `column last_value of sequence sq`). `pg_rewrite` lists no rules of built-in views (PostgreSQL has 145
+per-statement buffer. `pg_rewrite` lists no rules of built-in views (PostgreSQL has 145
 `_RETURN` rules, at OID `reltype + 1`, and `pg_settings_u`/`pg_settings_n`),
 and `ALTER VIEW` and `ALTER MATERIALIZED VIEW` accept only their own actions,
 so `ALTER VIEW v DISABLE RULE r` fails with `42601` where PostgreSQL reports

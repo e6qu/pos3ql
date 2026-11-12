@@ -348,7 +348,8 @@ Row types:
 - Every table, partitioned table, foreign table, materialized view and view has
   a row type named like the relation. `ROW(1, 'a')::orders`, `'(1,a)'::orders`,
   `orders[]`, whole-row references (`SELECT o FROM orders o` has type
-  `orders`), routine parameters and results (`RETURNS SETOF orders`) and table
+  `orders`, as do `orders.*` and `orders` in `UPDATE`/`DELETE` conditions and
+  `RETURNING`), routine parameters and results (`RETURNS SETOF orders`) and table
   columns (`CREATE TABLE archive(o orders)`) and prepared statement
   parameters (`PREPARE q(orders) AS SELECT $1.note`) behave as in PostgreSQL. A routine
   or column using the row type blocks `DROP TABLE orders`; `CASCADE` drops the
@@ -363,15 +364,11 @@ Row types:
 - While a column uses the row type, `ALTER TABLE orders ADD COLUMN ... DEFAULT`
   and `ALTER COLUMN ... TYPE` fail with `0A000` as in PostgreSQL, and `ALTER
   COLUMN ... TYPE` also fails while a view, rule, policy or SQL-standard routine
-  body reads the column. `DROP TABLE` and `DROP VIEW` with `CASCADE` drop
-  other tables' columns and domains of the dropped relation's row type.
-  Dropping a relation through `DROP SCHEMA ... CASCADE`, `DROP MATERIALIZED
-  VIEW`, `DROP FOREIGN TABLE ... CASCADE` or the cascade of another object
-  (`DROP FUNCTION`) while another schema's column or domain uses its row type
-  fails with `0A000` instead of dropping that column or domain.
-- A composite type attribute of a relation's row type (`CREATE TYPE wrap AS
-  (o orders)`) fails with `42704`, and a PL/pgSQL variable of a relation's row
-  type with `0A000`.
+  body reads the column. Every drop with `CASCADE` that removes a relation,
+  including the cascade of another object (`DROP FUNCTION f CASCADE` where
+  view `v` calls `f`, `DROP SCHEMA`, `DROP OWNED`), also drops other tables'
+  columns, composite type attributes (`CREATE TYPE wrap AS (o orders)`) and
+  domains of the relation's row type, as PostgreSQL does.
 
 Functions and expressions:
 
@@ -502,9 +499,21 @@ Functions and expressions:
   `name_column::cstring` and `'abc'::unknown` are values of those types, as in
   PostgreSQL, and a cast to `"any"` keeps its operand; other sources fail
   with `42846` (`cannot cast type integer to cstring`). A `cstring` only
-  concatenates with text (`'a'::cstring || 'b'` is `ab`); comparing or
-  matching it (`'a'::cstring = 'a'`) fails with `42883`. Limits: renaming or
-  moving a built-in fails with `0A000`; `cstring` arrays fail with `0A000`.
+  concatenates with text (`'a'::cstring || 'b'` is `ab`) and with `cstring[]`;
+  comparing or matching it (`'a'::cstring = 'a'`), sorting, grouping or
+  removing duplicates over it (`SELECT DISTINCT`, `ORDER BY`, `count(DISTINCT
+  ...)`), `IN` lists and `GREATEST`/`LEAST` fail with PostgreSQL's `42883`
+  messages. `cstring[]` values (`'{a,b}'::cstring[]`, `ARRAY['a'::cstring]`,
+  `'{a}'::_cstring`) work with the array functions that need no element
+  comparison, and a SQL routine may take or return one; a table or view
+  column of either type fails with `42P16`. `x IN (SELECT c ...)` and `x op
+  ANY (SELECT c ...)` resolve their operator from the subquery column's
+  declared type before reading a row, so a `cstring` side fails with `42883`
+  even over an empty result. The type-modifier input functions
+  (`numerictypmodin('{10,2}')` is `655366`) encode and validate modifiers as
+  PostgreSQL does; a temporal precision above 6 (`timetypmodin('{7}')`) is
+  clamped to 6 with PostgreSQL's `WARNING`. Limits: renaming or moving a
+  built-in fails with `0A000`.
   Dropping a built-in fails with `2BP01`, as in PostgreSQL.
 - PostgreSQL 18.6's predefined roles exist from the start, with their
   OIDs, and initdb's memberships of `pg_monitor` in `pg_read_all_settings`,
@@ -577,8 +586,28 @@ Functions and expressions:
   `'missing'::text::order_status` converts only when run.
 - `aclitem[]` must be one-dimensional (`22023`, `ACL arrays must be
   one-dimensional`); `aclexplode(NULL)` returns no rows.
+- Assigning an array element (`UPDATE t SET a[5] = 1`, `x[2][1] := 8` or a
+  record field's element `r.f[1] := 3` in PL/pgSQL) works as in PostgreSQL: a
+  one-dimensional array grows to the subscript and fills the gap with NULLs,
+  a NULL array becomes `[5:5]={1}`, and a multidimensional array fails with
+  `2202E` outside its bounds. Assigning a slice (`a[1:2] = ...`) fails.
 - Point coordinates use `(point(1,2))[0]`. Converting an open path to a polygon
   fails with `22023`.
+- A PL/pgSQL row variable (`r t`, `r t%ROWTYPE`, `r composite_type`) has
+  its declared row type from the start: while it is NULL, `pg_typeof(r.a)`
+  names the field's declared type, `pg_typeof(r)` names the table, and an
+  unknown field fails with `42703` (`record "r" has no field "zz"`). A field
+  of an unassigned `record` variable fails with `55000`. `FOR r IN SELECT
+  ...` fills a row variable from each row's columns.
+- `x LIKE ANY (SELECT ...)`, `NOT LIKE ALL` and `ILIKE` match against a
+  subquery's rows as they do against an array. The operator spellings `~~`,
+  `!~~`, `~~*` and `!~~*` are `LIKE`, `NOT LIKE`, `ILIKE` and `NOT ILIKE`,
+  quantified forms included (`x ~~ ANY (array['a%'])`). The POSIX operators
+  `~`, `~*`, `!~` and `!~*` quantify the same way (`x ~ ANY (array['^a'])`),
+  as does `OPERATOR(pg_catalog.~) ANY (...)`; a quantified user-defined
+  operator fails with `0A000`. A pattern match between non-string operands
+  (`1 LIKE 'a'`, or `1 ~ ANY (array['a'])` over an empty array too) fails
+  with `42883` (`operator does not exist: integer ~~ unknown`).
 - An unmatched PL/pgSQL `CASE` without `ELSE` raises `20000` (`case not found`,
   hint `CASE statement is missing ELSE part.`).
 - PL/pgSQL bound cursors (`c [NO] [SCROLL] CURSOR [(lo int, hi int)] FOR
@@ -767,6 +796,7 @@ why none of these numbers is a throughput rate.
 | Simultaneously tracked function calls (`track_functions`) per SQL worker | 1,024 | `54000` |
 | Error message text, including a `RAISE` message | 27,824 bytes | `54000` |
 | `RAISE ... USING DETAIL` or `HINT` text | 12,288 bytes each | `54000` |
+| Built-in function NOTICE/WARNING messages raised before the next output message; one message's text | 64; 256 bytes | `54000` |
 | Transaction identities and command counters | 32-bit, checked | `54000` before reuse |
 | JSON nesting / jsonpath depth | 1,000 / 128 | see [SQL/JSON](sql-json.md) |
 | XML nesting, XPath work, constructor output | see [SQL/XML](sql-xml.md) | program-limit error |

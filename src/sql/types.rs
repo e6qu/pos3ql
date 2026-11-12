@@ -268,6 +268,7 @@ pub mod oid {
     pub const INTERNAL: i32 = 2281;
     pub const FDW_HANDLER: i32 = 3115;
     pub const CSTRING: i32 = 2275;
+    pub const CSTRING_ARRAY: i32 = 1263;
     pub const LANGUAGE_HANDLER: i32 = 2280;
     pub const INDEX_AM_HANDLER: i32 = 325;
     pub const TABLE_AM_HANDLER: i32 = 269;
@@ -2631,8 +2632,10 @@ impl ColType {
             self,
             Self::Json
                 | Self::Refcursor
+                | Self::Pseudo(PseudoType::Cstring)
                 | Self::Array(ArrElem::Json)
                 | Self::Array(ArrElem::Refcursor)
+                | Self::Array(ArrElem::Cstring)
         )
     }
 
@@ -2669,6 +2672,22 @@ impl ColType {
         match self {
             Self::Array(element) => element.to_coltype().is_collatable(),
             _ => matches!(self, Self::Text | Self::Varchar | Self::Bpchar | Self::Name),
+        }
+    }
+
+    /// The type PostgreSQL names when a table or view column of this type is
+    /// rejected (`column "a" has pseudo-type cstring`); an array of
+    /// `cstring` is rejected for its element. `unknown` columns become text.
+    pub fn rejected_column_pseudo_type(self) -> Option<&'static str> {
+        match self {
+            Self::Array(ArrElem::Record) => Some("record[]"),
+            Self::Array(ArrElem::Cstring) => Some("cstring"),
+            Self::Pseudo(PseudoType::Unknown) => None,
+            Self::Pseudo(kind) => Some(kind.display_name()),
+            Self::Void | Self::Internal | Self::PgDdlCommand | Self::AnyArray | Self::Record => {
+                Some(self.internal_name())
+            }
+            _ => None,
         }
     }
 
@@ -2746,6 +2765,14 @@ impl ColType {
         // `element[]` is an array of a scalar element type.
         if let Some(base) = name.strip_suffix("[]") {
             return ArrElem::from_coltype(ColType::from_sql_name(base)?).map(ColType::Array);
+        }
+        // `_element` is the array type's own `pg_type` name.
+        if name.starts_with('_')
+            && let Some(element) = ArrElem::BUILTIN
+                .into_iter()
+                .find(|element| element.catalog_name() == name)
+        {
+            return Some(Self::Array(element));
         }
         if let Some(k) = RangeKind::from_name(name) {
             return Some(Self::Range(k));
@@ -3455,6 +3482,9 @@ pub enum ArrElem {
     Float8,
     Text,
     Refcursor,
+    /// `cstring[]`: text-shaped elements of the pseudo-type that typmod input
+    /// functions take. It is never a stored column type.
+    Cstring,
     /// `aclitem[]` uses text-shaped values with PostgreSQL's distinct catalog
     /// and wire identity. An individual aclitem is not a general stored type.
     AclItem,
@@ -3534,7 +3564,7 @@ impl ArrElem {
     /// transmits as an array. This is the single inventory for OID decoding
     /// and catalog synthesis, so adding an accepted array cannot leave its
     /// `pg_type` identity behind.
-    pub const BUILTIN: [Self; 73] = [
+    pub const BUILTIN: [Self; 74] = [
         Self::Bool,
         Self::Char,
         Self::Int2,
@@ -3553,6 +3583,7 @@ impl ArrElem {
         Self::Float8,
         Self::Text,
         Self::Refcursor,
+        Self::Cstring,
         Self::AclItem,
         Self::Name,
         Self::Varchar,
@@ -3656,6 +3687,7 @@ impl ArrElem {
             ArrElem::Float8 => "_float8",
             ArrElem::Text => "_text",
             ArrElem::Refcursor => "_refcursor",
+            ArrElem::Cstring => "_cstring",
             ArrElem::AclItem => "_aclitem",
             ArrElem::Numeric => "_numeric",
             ArrElem::Date => "_date",
@@ -3747,6 +3779,7 @@ impl ArrElem {
             ArrElem::Float8 => "double precision[]",
             ArrElem::Text => "text[]",
             ArrElem::Refcursor => "refcursor[]",
+            ArrElem::Cstring => "cstring[]",
             ArrElem::AclItem => "aclitem[]",
             ArrElem::Numeric => "numeric[]",
             ArrElem::Date => "date[]",
@@ -3903,6 +3936,7 @@ impl ArrElem {
             ColType::Bpchar => return Some(ArrElem::Bpchar),
             ColType::Name => return Some(ArrElem::Name),
             ColType::Refcursor => return Some(ArrElem::Refcursor),
+            ColType::Pseudo(PseudoType::Cstring) => return Some(ArrElem::Cstring),
             ColType::Oid => return Some(ArrElem::Oid),
             ColType::Xid => return Some(ArrElem::Xid),
             ColType::Tid => return Some(ArrElem::Tid),
@@ -3988,6 +4022,7 @@ impl ArrElem {
             ArrElem::Float8 => ColType::Float8,
             ArrElem::Text => ColType::Text,
             ArrElem::Refcursor => ColType::Refcursor,
+            ArrElem::Cstring => ColType::Pseudo(PseudoType::Cstring),
             ArrElem::AclItem => ColType::AclItem,
             ArrElem::Numeric => ColType::Numeric,
             ArrElem::Date => ColType::Date,
@@ -4071,6 +4106,7 @@ impl ArrElem {
             ArrElem::Float8 => 1022,
             ArrElem::Text => 1009,
             ArrElem::Refcursor => oid::REFCURSOR_ARRAY,
+            ArrElem::Cstring => oid::CSTRING_ARRAY,
             ArrElem::AclItem => oid::ACLITEM_ARRAY,
             ArrElem::Numeric => 1231,
             ArrElem::Date => 1182,
@@ -4151,6 +4187,7 @@ impl ArrElem {
             ArrElem::Float8 => 3,
             ArrElem::Text => 4,
             ArrElem::Refcursor => 166,
+            ArrElem::Cstring => 169,
             ArrElem::AclItem => 125,
             ArrElem::Numeric => 5,
             ArrElem::Date => 6,
@@ -4225,6 +4262,7 @@ impl ArrElem {
             3 => ArrElem::Float8,
             4 => ArrElem::Text,
             166 => ArrElem::Refcursor,
+            169 => ArrElem::Cstring,
             125 => ArrElem::AclItem,
             5 => ArrElem::Numeric,
             6 => ArrElem::Date,

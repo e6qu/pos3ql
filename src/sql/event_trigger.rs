@@ -751,6 +751,7 @@ impl EventObjectRef {
                     ObjectRef::View(_) => "view column",
                     ObjectRef::MaterializedView(_) => "materialized view column",
                     ObjectRef::Composite(_) => "composite type column",
+                    ObjectRef::Sequence(_) => "sequence column",
                     _ => "table column",
                 });
                 object.object_name = None;
@@ -2332,14 +2333,30 @@ pub(crate) fn catalog_object_address(
     names: &[&str],
     arguments: &[&str],
 ) -> Result<(i32, i32, i32), SqlError> {
+    // `pg_identify_object` names these, but PostgreSQL's object type map has
+    // no entry to resolve them back.
+    if matches!(
+        object_type,
+        "view column"
+            | "materialized view column"
+            | "composite type column"
+            | "sequence column"
+            | "index column"
+            | "toast table"
+            | "toast table column"
+    ) {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "unsupported object type \"{}\"",
+            object_type
+        ));
+    }
     if !matches!(
         object_type,
         "table"
             | "table column"
             | "view"
-            | "view column"
             | "materialized view"
-            | "materialized view column"
             | "sequence"
             | "index"
             | "composite type"
@@ -2463,7 +2480,15 @@ pub(crate) fn catalog_object_address(
     }
     for slot in 0..storage.sequence_count() {
         if storage.sequence_slot_visible_to(slot, txid) {
-            consider!(EventObjectRef::Primary(ObjectRef::Sequence(slot)));
+            let relation = ObjectRef::Sequence(slot);
+            consider!(EventObjectRef::Primary(relation));
+            for (column, name) in SEQUENCE_COLUMNS.iter().enumerate() {
+                consider!(EventObjectRef::RelationColumn {
+                    relation,
+                    attnum: (column + 1) as u16,
+                    name: crate::storage::SqlName::parse(name)?,
+                });
+            }
         }
     }
     for slot in 0..storage.index_count() {
@@ -2600,9 +2625,7 @@ pub(crate) fn catalog_object_address(
         "table"
             | "table column"
             | "view"
-            | "view column"
             | "materialized view"
-            | "materialized view column"
             | "sequence"
             | "index"
             | "composite type"
@@ -2674,6 +2697,9 @@ fn relation_object_ref(storage: &Storage, txid: u32, object_id: i32) -> Option<E
     None
 }
 
+/// A sequence relation's attributes, by attribute number.
+const SEQUENCE_COLUMNS: [&str; 3] = ["last_value", "log_cnt", "is_called"];
+
 /// A TOAST relation's attributes, by attribute number.
 const TOAST_COLUMNS: [&str; 3] = ["chunk_id", "chunk_seq", "chunk_data"];
 
@@ -2712,6 +2738,10 @@ fn relation_column_ref(
                 .find(|field| i32::from(field.attribute_number) == attnum)?;
             (ObjectRef::Composite(usize::from(slot)), field.name)
         }
+        EventObjectRef::Primary(reference @ ObjectRef::Sequence(_)) => (
+            reference,
+            crate::storage::SqlName::parse(SEQUENCE_COLUMNS.get(index)?).ok()?,
+        ),
         _ => return None,
     };
     Some(EventObjectRef::RelationColumn {

@@ -451,6 +451,48 @@ fn object_address_parts<'a, const N: usize>(
     })
 }
 
+/// An untyped literal argument (`'{public,t}'`) is read as the declared
+/// `text[]`; other values keep their type.
+/// An unknown-type literal argument takes the routine's declared type, as
+/// PostgreSQL's function resolution coerces it.
+fn unknown_as<'a>(
+    expression: &Expr<'a>,
+    value: Datum<'a>,
+    target: ColType,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if matches!(value, Datum::Text(_)) && matches!(expression, Expr::Str(_)) {
+        crate::sql::eval::cast_to(value, target, arena)
+    } else {
+        Ok(value)
+    }
+}
+
+fn transaction_type(legacy: bool) -> ColType {
+    if legacy { ColType::Int8 } else { ColType::Xid8 }
+}
+
+fn snapshot_type(legacy: bool) -> ColType {
+    if legacy {
+        ColType::TxidSnapshot
+    } else {
+        ColType::PgSnapshot
+    }
+}
+
+fn untyped_text_array<'a>(
+    value: Datum<'a>,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Datum<'a>, SqlError> {
+    match value {
+        Datum::Text(literal) => Ok(Datum::Array {
+            element: ArrElem::Text,
+            raw: array::parse_literal(literal, ArrElem::Text, arena)?,
+        }),
+        other => Ok(other),
+    }
+}
+
 fn text_array_parts<'a>(
     value: Datum<'a>,
 ) -> Result<
@@ -1602,7 +1644,12 @@ pub(crate) fn dispatch<'a>(
             | "txid_snapshot_xmax" => {
                 arity(1)?;
                 let expected_legacy = name.starts_with("txid_");
-                let snapshot = match eval_full(args[0], arena, params, row, hooks)? {
+                let snapshot = match unknown_as(
+                    args[0],
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    snapshot_type(expected_legacy),
+                    arena,
+                )? {
                     Datum::Snapshot { value, legacy } if legacy == expected_legacy => value,
                     Datum::Null => return Ok(Datum::Null),
                     other => {
@@ -1625,7 +1672,12 @@ pub(crate) fn dispatch<'a>(
             "pg_visible_in_snapshot" | "txid_visible_in_snapshot" => {
                 arity(2)?;
                 let expected_legacy = name.starts_with("txid_");
-                let transaction_id = match eval_full(args[0], arena, params, row, hooks)? {
+                let transaction_id = match unknown_as(
+                    args[0],
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    transaction_type(expected_legacy),
+                    arena,
+                )? {
                     Datum::Xid8(value) if !expected_legacy => value,
                     Datum::Int8(value) if expected_legacy => {
                         u64::try_from(value).map_err(|_| {
@@ -1648,7 +1700,12 @@ pub(crate) fn dispatch<'a>(
                         return Err(crate::sql::eval::function_argument_mismatch(name, &other));
                     }
                 };
-                let snapshot = match eval_full(args[1], arena, params, row, hooks)? {
+                let snapshot = match unknown_as(
+                    args[1],
+                    eval_full(args[1], arena, params, row, hooks)?,
+                    snapshot_type(expected_legacy),
+                    arena,
+                )? {
                     Datum::Snapshot { value, legacy } if legacy == expected_legacy => value,
                     Datum::Null => return Ok(Datum::Null),
                     other => {
@@ -1660,7 +1717,12 @@ pub(crate) fn dispatch<'a>(
             "pg_xact_status" | "txid_status" => {
                 arity(1)?;
                 let legacy = name == "txid_status";
-                let transaction_id = match eval_full(args[0], arena, params, row, hooks)? {
+                let transaction_id = match unknown_as(
+                    args[0],
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    transaction_type(legacy),
+                    arena,
+                )? {
                     Datum::Xid8(value) if !legacy => value,
                     Datum::Int8(value) if legacy => u64::try_from(value).map_err(|_| {
                         sql_err!(
@@ -2323,13 +2385,17 @@ pub(crate) fn dispatch<'a>(
                         ));
                     }
                 };
-                let Some((names, name_count)) =
-                    text_array_parts(eval_full(args[1], arena, params, row, hooks)?)?
+                let Some((names, name_count)) = text_array_parts(untyped_text_array(
+                    eval_full(args[1], arena, params, row, hooks)?,
+                    arena,
+                )?)?
                 else {
                     return Ok(Datum::Null);
                 };
-                let Some((arguments, argument_count)) =
-                    text_array_parts(eval_full(args[2], arena, params, row, hooks)?)?
+                let Some((arguments, argument_count)) = text_array_parts(untyped_text_array(
+                    eval_full(args[2], arena, params, row, hooks)?,
+                    arena,
+                )?)?
                 else {
                     return Ok(Datum::Null);
                 };

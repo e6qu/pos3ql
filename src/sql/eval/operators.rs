@@ -3278,6 +3278,44 @@ pub(crate) fn binary<'a>(
             operator.operator_name().unwrap_or("?"),
             type_name_of(&r)
         )),
+        NotLike | NotILike | RegexNotMatch | RegexNotIMatch => {
+            let positive = match operator {
+                NotLike => Like,
+                NotILike => ILike,
+                RegexNotMatch => RegexMatch,
+                _ => RegexIMatch,
+            };
+            match binary(positive, l, r, l_unknown, r_unknown, arena) {
+                Ok(Datum::Bool(matched)) => Ok(Datum::Bool(!matched)),
+                Err(error) if error.sqlstate == sqlstate::UNDEFINED_FUNCTION => Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "operator does not exist: {} {} {}",
+                    type_name_of(&l),
+                    operator.operator_name().unwrap_or("?"),
+                    type_name_of(&r)
+                )),
+                other => other,
+            }
+        }
+        // Only reached as the per-element operator of a quantified `~ ANY/ALL`.
+        RegexMatch | RegexIMatch => match (l, r) {
+            (Datum::Null, _) | (_, Datum::Null) => Ok(Datum::Null),
+            (
+                Datum::Text(text) | Datum::Bpchar(text),
+                Datum::Text(pattern) | Datum::Bpchar(pattern),
+            ) => Ok(Datum::Bool(super::super::regex::regex_search(
+                pattern,
+                text,
+                operator == RegexIMatch,
+            )?)),
+            _ => Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "operator does not exist: {} {} {}",
+                type_name_of(&l),
+                operator.operator_name().unwrap_or("?"),
+                type_name_of(&r)
+            )),
+        },
         // Only reached as the per-element operator of a quantified `LIKE ANY/ALL`.
         Like | ILike => {
             if l.is_null() || r.is_null() {

@@ -586,9 +586,9 @@ fn write_rows_keep_progress_across_routine_calls() {
     }
 }
 
-/// Orders whose rows check foreign keys against three cold tables, with
-/// BEFORE and AFTER row triggers that write and call a sequence, and
-/// transition tables.
+/// Orders whose rows read three cold tables in a BEFORE row trigger (their
+/// foreign key checks run at the statement's end), with BEFORE and AFTER row
+/// triggers that write and call a sequence, and transition tables.
 const ORDER_SETUP: &str = "CREATE TABLE hot_log(stage text); CREATE SEQUENCE numbers; \
      CREATE TABLE audit(stage text, n bigint); \
      CREATE TABLE cold_more(id integer PRIMARY KEY); \
@@ -599,6 +599,9 @@ const ORDER_SETUP: &str = "CREATE TABLE hot_log(stage text); CREATE SEQUENCE num
      item integer REFERENCES cold_items, more integer REFERENCES cold_more, \
      extra integer REFERENCES cold_extra, note text); \
      CREATE FUNCTION audit_order() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+     PERFORM 1 FROM cold_items WHERE id = NEW.item; \
+     PERFORM 1 FROM cold_more WHERE id = NEW.more; \
+     PERFORM 1 FROM cold_extra WHERE id = NEW.extra; \
      INSERT INTO audit VALUES (TG_OP || '-' || NEW.note, nextval('numbers')); \
      NEW.note := NEW.note || '+'; RETURN NEW; END$$; \
      CREATE TRIGGER audit_order BEFORE INSERT OR UPDATE ON orders \
@@ -618,8 +621,8 @@ const ORDER_SETUP: &str = "CREATE TABLE hot_log(stage text); CREATE SEQUENCE num
      REFERENCING NEW TABLE AS changed \
      FOR EACH STATEMENT EXECUTE FUNCTION changed_orders()";
 
-/// Storage waits inside a write's rows, several rows in: a foreign key check
-/// of a later row reads the cold parent table. The write keeps its earlier
+/// Storage waits inside a write's rows, several rows in: the BEFORE trigger
+/// of a later row reads a cold parent table. The write keeps its earlier
 /// rows, lets another client run, and continues at the waiting row: sequence
 /// defaults, BEFORE ROW trigger bodies with their own writes and sequence
 /// calls, AFTER ROW triggers, transition tables of AFTER STATEMENT triggers
@@ -772,7 +775,23 @@ fn write_steps_resume_after_storage_waits() {
                  INSERT INTO log VALUES ('deleting-' || OLD.id || '-' || seen, NULL); \
                  END IF; RETURN OLD; END$$; \
                  CREATE TRIGGER links_delete BEFORE DELETE ON links \
-                 FOR EACH ROW EXECUTE FUNCTION check_delete()",
+                 FOR EACH ROW EXECUTE FUNCTION check_delete(); \
+                 CREATE FUNCTION read_more() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+                 PERFORM 1 FROM cold_more WHERE id = NEW.more; RETURN NEW; END$$; \
+                 CREATE TRIGGER links_read BEFORE INSERT ON links \
+                 FOR EACH ROW EXECUTE FUNCTION read_more(); \
+                 CREATE FUNCTION read_extra() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+                 PERFORM 1 FROM cold_extra WHERE id = NEW.more; RETURN NEW; END$$; \
+                 CREATE TRIGGER log_read BEFORE INSERT ON log \
+                 FOR EACH ROW EXECUTE FUNCTION read_extra(); \
+                 CREATE FUNCTION read_gone() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+                 PERFORM 1 FROM cold_gone WHERE id = NEW.more; RETURN NEW; END$$; \
+                 CREATE TRIGGER gone_read BEFORE INSERT ON gone_log \
+                 FOR EACH ROW EXECUTE FUNCTION read_gone(); \
+                 CREATE FUNCTION read_pairs() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+                 PERFORM 1 FROM cold_pairs WHERE id = NEW.more; RETURN NEW; END$$; \
+                 CREATE TRIGGER pairs_read BEFORE INSERT OR UPDATE ON pairs \
+                 FOR EACH ROW EXECUTE FUNCTION read_pairs()",
             );
             cold.rows("INSERT INTO pairs VALUES (1, NULL, 'p1'), (2, NULL, 'p2')");
             for &(sql, returned) in statements {

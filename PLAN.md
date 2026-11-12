@@ -113,12 +113,12 @@ is owned.
   `DO` bodies (see the
   [execution model](docs/architecture.md#execution-model)). Remaining: a
   write whose scan ran a volatile built-in reads its rows synchronously.
-  A top-level write's `AFTER` events and immediate constraint checks
-  yield; reads after an event's first effect block until that event ends,
+  A top-level write's `AFTER` events, foreign key checks and immediate
+  constraint checks yield; reads after an event's first effect block until that event ends,
   so a trigger body that writes and then reads cold data still blocks.
   The next step's selection in a multi-step write, `AFTER` triggers between
-  the steps of a rule-rewritten write, and `AFTER` work of writes inside
-  routine bodies read synchronously. Letting the next step's selection
+  the steps of a rule-rewritten write, and `AFTER` work (foreign key checks
+  included) of writes inside routine bodies read synchronously. Letting the next step's selection
   yield and roll back to the step's start is not enough: with empty caches
   each retried selection issued a new GET and never finished (a rule action
   joining a cold table), so the step must keep the blocks it downloaded

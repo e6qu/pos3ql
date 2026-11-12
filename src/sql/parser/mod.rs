@@ -3571,9 +3571,40 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    /// The rest of a set operation whose first leaf is `left`.
+    fn set_union_after(&mut self, left: &'a SetTree<'a>) -> Result<&'a SetTree<'a>, ParseError> {
+        let mut left = self.set_intersect_after(left)?;
+        loop {
+            let operator = if self.eat_ident("union")? {
+                SetOp::Union
+            } else if self.eat_ident("except")? {
+                SetOp::Except
+            } else {
+                break;
+            };
+            let all = self.set_all()?;
+            let right = self.set_intersect()?;
+            left = self.alloc_set(SetTree::Op {
+                syntax: crate::sql::ast::SetOperationSyntax::Explicit,
+                operator,
+                all,
+                left,
+                right,
+            })?;
+        }
+        Ok(left)
+    }
+
     /// INTERSECT level (binds tighter than UNION / EXCEPT).
     fn set_intersect(&mut self) -> Result<&'a SetTree<'a>, ParseError> {
-        let mut left = self.set_leaf()?;
+        let left = self.set_leaf()?;
+        self.set_intersect_after(left)
+    }
+
+    fn set_intersect_after(
+        &mut self,
+        mut left: &'a SetTree<'a>,
+    ) -> Result<&'a SetTree<'a>, ParseError> {
         while self.eat_ident("intersect")? {
             let all = self.set_all()?;
             let right = self.set_leaf()?;
@@ -6487,20 +6518,13 @@ impl<'a> Parser<'a> {
         if self.peeked == Tok::Ident("owner") {
             return self.alter_owner(AlterOwnerKind::View, name, if_exists);
         }
-        let action = if self.eat_ident("alter")? {
-            let _ = self.eat_ident("column")?;
-            let column = self.col_ident("view column name")?;
-            if self.eat_ident("set")? {
-                self.expect_ident("default")?;
-                let start = self.peek_at;
-                let _ = self.expression(0)?;
-                let expression = self.text[start..self.peek_at].trim();
-                crate::sql::ast::AlterViewAction::SetDefault { column, expression }
-            } else {
-                self.expect_ident("drop")?;
-                self.expect_ident("default")?;
-                crate::sql::ast::AlterViewAction::DropDefault { column }
-            }
+        let action = if self.peeked != Tok::Ident("rename")
+            && self.peeked != Tok::Ident("set")
+            && self.peeked != Tok::Ident("reset")
+        {
+            crate::sql::ast::AlterViewAction::TableActions(
+                self.alter_view_table_actions(name, if_exists)?,
+            )
         } else if self.eat_ident("rename")? {
             if self.eat_ident("to")? {
                 crate::sql::ast::AlterViewAction::RenameTo(self.col_ident("new view name")?)
@@ -6514,9 +6538,11 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("set")? {
             if self.eat_ident("schema")? {
                 crate::sql::ast::AlterViewAction::SetSchema(self.col_ident("schema name")?)
-            } else {
-                self.expect_op("(")?;
+            } else if self.eat_op("(")? {
                 crate::sql::ast::AlterViewAction::SetOptions(self.view_options()?)
+            } else {
+                let action = self.alter_table_set_action()?;
+                crate::sql::ast::AlterViewAction::TableActions(self.arena_slice(&[action])?)
             }
         } else {
             self.expect_ident("reset")?;
@@ -6528,6 +6554,19 @@ impl<'a> Parser<'a> {
             if_exists,
             action,
         })
+    }
+
+    /// `ALTER TABLE` subcommands written after `ALTER VIEW` or `ALTER
+    /// MATERIALIZED VIEW name`.
+    fn alter_view_table_actions(
+        &mut self,
+        name: QualName<'a>,
+        if_exists: bool,
+    ) -> Result<&'a [crate::sql::ast::AlterAction<'a>], ParseError> {
+        match self.alter_table_actions(false, name, if_exists, false)? {
+            Stmt::AlterTable(alter) => Ok(alter.actions),
+            _ => Err(self.err_here("expected ALTER TABLE subcommands")),
+        }
     }
 
     fn alter_materialized_view(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -6570,7 +6609,8 @@ impl<'a> Parser<'a> {
                 )
             }
         } else {
-            let first = if self.eat_ident("set")? {
+            if self.peeked == Tok::Ident("set") {
+                self.expect_ident("set")?;
                 if self.eat_ident("schema")? {
                     return Ok(Stmt::AlterMaterializedView {
                         name,
@@ -6580,74 +6620,21 @@ impl<'a> Parser<'a> {
                         ),
                     });
                 }
-                self.materialized_view_table_action_after_set()?
+                let action = self.alter_table_set_action()?;
+                crate::sql::ast::AlterMaterializedViewAction::TableActions(
+                    self.arena_slice(&[action])?,
+                )
             } else {
-                self.materialized_view_table_action()?
-            };
-            let mut actions = ArenaList::new(self.arena);
-            self.push(&mut actions, first)?;
-            while self.eat_op(",")? {
-                let action = self.materialized_view_table_action()?;
-                self.push(&mut actions, action)?;
+                crate::sql::ast::AlterMaterializedViewAction::TableActions(
+                    self.alter_view_table_actions(name, if_exists)?,
+                )
             }
-            crate::sql::ast::AlterMaterializedViewAction::TableActions(actions.as_slice())
         };
         Ok(Stmt::AlterMaterializedView {
             name,
             if_exists,
             action,
         })
-    }
-
-    fn materialized_view_table_action_after_set(
-        &mut self,
-    ) -> Result<crate::sql::ast::AlterAction<'a>, ParseError> {
-        if self.eat_ident("tablespace")? {
-            return Ok(crate::sql::ast::AlterAction::SetTablespace(
-                self.col_ident("tablespace name")?,
-            ));
-        }
-        if self.eat_ident("access")? {
-            self.expect_ident("method")?;
-            let method = self.any_ident("table access method")?;
-            return Ok(crate::sql::ast::AlterAction::SetAccessMethod(
-                if method == "heap" {
-                    crate::sql::ast::TableAccessMethod::Heap
-                } else {
-                    crate::sql::ast::TableAccessMethod::Named(method)
-                },
-            ));
-        }
-        self.expect_op("(")?;
-        let options = self.relation_storage_options()?;
-        self.expect_op(")")?;
-        Ok(crate::sql::ast::AlterAction::SetStorageOptions(options))
-    }
-
-    fn materialized_view_table_action(
-        &mut self,
-    ) -> Result<crate::sql::ast::AlterAction<'a>, ParseError> {
-        if self.eat_ident("set")? {
-            return self.materialized_view_table_action_after_set();
-        }
-        if self.eat_ident("reset")? {
-            self.expect_op("(")?;
-            let options = self.relation_storage_option_names()?;
-            self.expect_op(")")?;
-            return Ok(crate::sql::ast::AlterAction::ResetStorageOptions(options));
-        }
-        self.expect_ident("alter")?;
-        let _ = self.eat_ident("column")?;
-        let column = self.col_ident("materialized view column name")?;
-        self.expect_ident("set")?;
-        self.expect_ident("statistics")?;
-        let target = if self.eat_ident("default")? {
-            -1
-        } else {
-            i16::try_from(self.seq_int()?)
-                .map_err(|_| self.err_here("statistics target is out of range"))?
-        };
-        Ok(crate::sql::ast::AlterAction::SetStatistics { column, target })
     }
 
     fn view_options(&mut self) -> Result<&'a [crate::sql::ast::ViewOption], ParseError> {
@@ -6682,10 +6669,34 @@ impl<'a> Parser<'a> {
                 };
                 (2, ViewOption::CheckOption(value))
             } else {
-                return Err(self.err_here("unrecognized view option"));
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(
+                        PARSE_MESSAGE_BYTES,
+                        "unrecognized parameter \"{}\"",
+                        option
+                    ),
+                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
+                    hint: None,
+                    near: None,
+                    detail: None,
+                });
             };
             if core::mem::replace(&mut seen[index], true) {
-                return Err(self.err_here("view option specified more than once"));
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(
+                        PARSE_MESSAGE_BYTES,
+                        "parameter \"{}\" specified more than once",
+                        option
+                    ),
+                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
+                    hint: None,
+                    near: None,
+                    detail: None,
+                });
             }
             options[count] = parsed;
             count += 1;
@@ -6714,19 +6725,59 @@ impl<'a> Parser<'a> {
             } else if option.eq_ignore_ascii_case("check_option") {
                 (2, ViewOptionName::CheckOption)
             } else {
-                return Err(self.err_here("unrecognized view option"));
+                // Resetting a parameter a view does not have changes nothing.
+                if !self.eat_op(",")? {
+                    break;
+                }
+                continue;
             };
-            if core::mem::replace(&mut seen[index], true) {
-                return Err(self.err_here("view option specified more than once"));
+            if !core::mem::replace(&mut seen[index], true) {
+                names[count] = parsed;
+                count += 1;
             }
-            names[count] = parsed;
-            count += 1;
             if !self.eat_op(",")? {
                 break;
             }
         }
         self.expect_op(")")?;
         self.arena_slice(&names[..count])
+    }
+
+    /// One `ALTER TABLE ... SET` subcommand, after `SET`.
+    fn alter_table_set_action(&mut self) -> Result<AlterAction<'a>, ParseError> {
+        Ok(if self.eat_ident("schema")? {
+            AlterAction::SetSchema(self.col_ident("schema name")?)
+        } else if self.eat_ident("logged")? {
+            AlterAction::SetPersistence(crate::sql::ast::RelationPersistence::Permanent)
+        } else if self.eat_ident("unlogged")? {
+            AlterAction::SetPersistence(crate::sql::ast::RelationPersistence::Unlogged)
+        } else if self.eat_ident("tablespace")? {
+            AlterAction::SetTablespace(self.col_ident("tablespace name")?)
+        } else if self.eat_ident("without")? {
+            if self.eat_ident("cluster")? {
+                AlterAction::ClearCluster
+            } else {
+                self.expect_ident("oids")?;
+                AlterAction::SetWithoutOids
+            }
+        } else if self.eat_op("(")? {
+            let options = self.relation_storage_options()?;
+            self.expect_op(")")?;
+            AlterAction::SetStorageOptions(options)
+        } else {
+            self.expect_ident("access")?;
+            self.expect_ident("method")?;
+            if self.eat_ident("default")? {
+                AlterAction::ResetAccessMethod
+            } else {
+                let method = self.any_ident("table access method")?;
+                AlterAction::SetAccessMethod(if method == "heap" {
+                    crate::sql::ast::TableAccessMethod::Heap
+                } else {
+                    crate::sql::ast::TableAccessMethod::Named(method)
+                })
+            }
+        })
     }
 
     fn alter_table_relation(&mut self, foreign: bool) -> Result<Stmt<'a>, ParseError> {
@@ -6749,43 +6800,24 @@ impl<'a> Parser<'a> {
                 if_exists,
             );
         }
+        self.alter_table_actions(foreign, table, if_exists, only)
+    }
+
+    /// The subcommands after `ALTER TABLE name`, which `ALTER VIEW` and
+    /// `ALTER MATERIALIZED VIEW` also accept; their execution rejects the
+    /// ones the relation's kind does not support.
+    fn alter_table_actions(
+        &mut self,
+        foreign: bool,
+        table: QualName<'a>,
+        if_exists: bool,
+        only: bool,
+    ) -> Result<Stmt<'a>, ParseError> {
         // RENAME … and SET SCHEMA are standalone forms: PostgreSQL does not
         // combine them with a comma-separated subcommand list, so they parse to
         // a single-element list on their own.
         if self.eat_ident("set")? {
-            let action = if self.eat_ident("schema")? {
-                AlterAction::SetSchema(self.col_ident("schema name")?)
-            } else if self.eat_ident("logged")? {
-                AlterAction::SetPersistence(crate::sql::ast::RelationPersistence::Permanent)
-            } else if self.eat_ident("unlogged")? {
-                AlterAction::SetPersistence(crate::sql::ast::RelationPersistence::Unlogged)
-            } else if self.eat_ident("tablespace")? {
-                AlterAction::SetTablespace(self.col_ident("tablespace name")?)
-            } else if self.eat_ident("without")? {
-                if self.eat_ident("cluster")? {
-                    AlterAction::ClearCluster
-                } else {
-                    self.expect_ident("oids")?;
-                    AlterAction::SetWithoutOids
-                }
-            } else if self.eat_op("(")? {
-                let options = self.relation_storage_options()?;
-                self.expect_op(")")?;
-                AlterAction::SetStorageOptions(options)
-            } else {
-                self.expect_ident("access")?;
-                self.expect_ident("method")?;
-                if self.eat_ident("default")? {
-                    AlterAction::ResetAccessMethod
-                } else {
-                    let method = self.any_ident("table access method")?;
-                    AlterAction::SetAccessMethod(if method == "heap" {
-                        crate::sql::ast::TableAccessMethod::Heap
-                    } else {
-                        crate::sql::ast::TableAccessMethod::Named(method)
-                    })
-                }
-            };
+            let action = self.alter_table_set_action()?;
             return Ok(Self::alter_table_statement(
                 foreign,
                 AlterTable {
@@ -6798,7 +6830,12 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("cluster")? {
             self.expect_ident("on")?;
-            let index = self.qual_name("index name")?;
+            // PostgreSQL's grammar takes an unqualified name, looked up in the
+            // table's schema.
+            let index = QualName {
+                schema: None,
+                name: self.col_ident("index name")?,
+            };
             return Ok(Self::alter_table_statement(
                 foreign,
                 AlterTable {
@@ -7307,7 +7344,7 @@ impl<'a> Parser<'a> {
         foreign: bool,
         table: &str,
     ) -> Result<AlterAction<'a>, ParseError> {
-        if foreign && self.eat_ident("options")? {
+        if self.eat_ident("options")? {
             Ok(AlterAction::SetForeignOptions(
                 self.alter_foreign_options()?,
             ))
@@ -7633,7 +7670,7 @@ impl<'a> Parser<'a> {
             // | DROP NOT NULL }.
             let _ = self.eat_ident("column")?;
             let column = self.col_ident("column name")?;
-            if foreign && self.eat_ident("options")? {
+            if self.eat_ident("options")? {
                 return Ok(AlterAction::SetColumnForeignOptions {
                     column,
                     options: self.alter_foreign_options()?,
@@ -8015,7 +8052,12 @@ impl<'a> Parser<'a> {
         self.expect_ident("insert")?;
         self.expect_ident("into")?;
         let table = self.qual_name("table name")?;
-        let targets = if self.peeked == Tok::Op("(") {
+        // `(` starts the column list unless it opens a parenthesized query.
+        let targets = if self.peeked == Tok::Op("(")
+            && !matches!(
+                self.lookahead(1)?,
+                Tok::Ident("select" | "values" | "with" | "table") | Tok::Op("(")
+            ) {
             self.insert_targets()?
         } else {
             InsertTargets::EMPTY
@@ -8070,6 +8112,23 @@ impl<'a> Parser<'a> {
                 if !self.eat_op(",")? {
                     break;
                 }
+            }
+            // `VALUES ...` followed by a set operation, ORDER BY or LIMIT is
+            // the first part of a query, as PostgreSQL's grammar reads it.
+            if matches!(
+                self.peeked,
+                Tok::Ident(
+                    "union" | "intersect" | "except" | "order" | "limit" | "offset" | "fetch"
+                )
+            ) {
+                let query = self.insert_values_query(rows.as_slice())?;
+                select = Some(
+                    self.arena
+                        .alloc(query)
+                        .map_err(|_| self.arena_full("statement too large for SQL arena"))?
+                        as &_,
+                );
+                rows = ArenaList::new(self.arena);
             }
         }
         let mut columns = targets.names;
@@ -8180,6 +8239,66 @@ impl<'a> Parser<'a> {
             returning,
             overriding,
         }))
+    }
+
+    /// A query whose first leaf is the already-parsed `VALUES` `rows`.
+    fn insert_values_query(
+        &mut self,
+        rows: &[&'a [&'a Expr<'a>]],
+    ) -> Result<Select<'a>, ParseError> {
+        let mut tree: Option<&'a SetTree<'a>> = None;
+        for row in rows {
+            let mut items = ArenaList::new(self.arena);
+            for expression in row.iter().copied() {
+                let alias = self
+                    .arena
+                    .alloc_str_display(format_args!("column{}", items.len() + 1))
+                    .map_err(|_| self.err_here("VALUES too large"))?;
+                self.push(
+                    &mut items,
+                    SelectItem::Expr {
+                        expression,
+                        alias: Some(alias),
+                    },
+                )?;
+            }
+            let leaf = self.alloc_set(SetTree::Select(
+                self.arena
+                    .alloc(Select {
+                        items: items.as_slice(),
+                        ..Select::EMPTY
+                    })
+                    .map_err(|_| self.err_here("VALUES too large"))?,
+            ))?;
+            tree = Some(match tree {
+                None => leaf,
+                Some(left) => self.alloc_set(SetTree::Op {
+                    syntax: crate::sql::ast::SetOperationSyntax::Values,
+                    operator: SetOp::Union,
+                    all: true,
+                    left,
+                    right: leaf,
+                })?,
+            });
+        }
+        let first = tree.ok_or_else(|| self.syntax_error_here())?;
+        let enclosing_windows = core::mem::replace(&mut self.windows, ArenaList::new(self.arena));
+        let saved_allow = self.allow_into;
+        self.allow_into = false;
+        let body = self.set_union_after(first)?;
+        let (order_by, limit, offset, with_ties) = self.order_limit()?;
+        let locking = self.locking_clauses()?;
+        self.allow_into = saved_allow;
+        self.windows = enclosing_windows;
+        Ok(Select {
+            order_by,
+            limit,
+            offset,
+            with_ties,
+            set_body: Some(body),
+            locking,
+            ..Select::EMPTY
+        })
     }
 
     /// `(column[indirection], ...)` of an INSERT, with PostgreSQL's

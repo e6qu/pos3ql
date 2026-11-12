@@ -34,6 +34,19 @@ struct BoundQuery<'a> {
     statement: CursorStatement<'a>,
     params: &'a [Datum<'a>],
     parameter_types: &'a [i32],
+    /// The parse inputs, kept so a query whose `WITH` queries write can be
+    /// parsed again into the arena of the statement that first reads it.
+    source: &'a str,
+    bindings: &'a [crate::sql::parser::NamedParameter<'a>],
+    inputs: &'a [crate::sql::type_inputs::Binding<'a>],
+}
+
+/// A cursor query parsed again into a statement's arena.
+pub(crate) struct ReparsedQuery<'w> {
+    pub statement: &'w Select<'w>,
+    pub params: &'w [Datum<'w>],
+    pub parameter_types: &'w [i32],
+    pub owner: crate::sql::type_input_plans::Owner,
 }
 
 fn query_full() -> SqlError {
@@ -195,6 +208,84 @@ impl CursorQuery {
             .transpose()
     }
 
+    /// The query has data-modifying `WITH` queries: PostgreSQL runs it
+    /// whole, once, when the cursor is first read.
+    pub(crate) fn writes(&self) -> bool {
+        self.bound.as_ref().is_some_and(|bound| {
+            let with = match bound.statement {
+                CursorStatement::Select(select) => select.with,
+                CursorStatement::SetQuery(query) => query.with,
+            };
+            with.iter().any(|cte| cte.dml.is_some())
+        })
+    }
+
+    /// Parses the bound query again into `arena`, so it can run while the
+    /// cursor pool lends its buffers and lets nested statements use it.
+    pub(crate) fn reparse_into<'w>(&self, arena: &'w Arena) -> Result<ReparsedQuery<'w>, SqlError> {
+        let bound = self.bound.as_ref().ok_or_else(|| {
+            sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "cursor query is not bound"
+            )
+        })?;
+        let full = crate::sql::query::arena_full_pub;
+        let source = arena.alloc_str(bound.source).map_err(|_| full())?;
+        let params = copy_values(arena, bound.params, full)?;
+        let parameter_types = arena
+            .alloc_slice_copy(bound.parameter_types)
+            .map_err(|_| full())?;
+        let bindings = arena
+            .alloc_slice_with(bound.bindings.len(), |_| {
+                crate::sql::parser::NamedParameter {
+                    qualifier: None,
+                    name: "",
+                    index: 0,
+                    conflict: crate::sql::guc::VariableConflict::Error,
+                }
+            })
+            .map_err(|_| full())?;
+        for (copy, binding) in bindings.iter_mut().zip(bound.bindings) {
+            *copy = crate::sql::parser::NamedParameter {
+                qualifier: match binding.qualifier {
+                    Some(qualifier) => Some(arena.alloc_str(qualifier).map_err(|_| full())?),
+                    None => None,
+                },
+                name: arena.alloc_str(binding.name).map_err(|_| full())?,
+                index: binding.index,
+                conflict: binding.conflict,
+            };
+        }
+        let bytes = arena
+            .alloc_slice_with(crate::sql::type_inputs::encoded_len(bound.inputs)?, |_| 0u8)
+            .map_err(|_| full())?;
+        crate::sql::type_inputs::encode_into(bound.inputs, bytes)?;
+        let inputs = crate::sql::type_inputs::decode(bytes, arena)?;
+        let statement = crate::sql::type_input_plans::with_owner(self.owner, || {
+            crate::sql::exec::with_bound_parameter_types(parameter_types, || {
+                crate::sql::parser::parse_cursor_command(
+                    source,
+                    arena,
+                    bindings,
+                    inputs,
+                    |_| Ok(()),
+                )
+            })
+        })?;
+        let Stmt::Select(statement) = statement else {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a cursor query with data-modifying WITH queries must be a SELECT"
+            ));
+        };
+        Ok(ReparsedQuery {
+            statement,
+            params,
+            parameter_types,
+            owner: self.owner,
+        })
+    }
+
     pub(crate) fn finish_source(&mut self) {
         self.retained = None;
         self.retained_mark = None;
@@ -250,6 +341,9 @@ impl CursorQuery {
             statement,
             params: parameters,
             parameter_types,
+            source,
+            bindings,
+            inputs,
         };
         // The parser only borrows the copied source and this private arena.
         // Parameter encoding and structural decoding copy every borrowed

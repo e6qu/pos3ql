@@ -24739,6 +24739,32 @@ impl Engine {
                                 let sequence =
                                     sequence::SeqEval::new(storage, guc.seq_session(), txid);
                                 match parsed {
+                                    cursor::CursorStatement::Select(select)
+                                        if select.with.iter().any(|cte| cte.dml.is_some()) =>
+                                    {
+                                        // Described now; it runs on its first read.
+                                        let mut columns =
+                                            [ColDesc::new("", 0, 0); crate::sql::MAX_PROJ];
+                                        let described =
+                                            query::expand_ctes(select, storage, txid, work)
+                                                .and_then(|select| {
+                                                    query::describe_select(
+                                                        select,
+                                                        storage,
+                                                        txid,
+                                                        work,
+                                                        &mut columns,
+                                                        exec::DescriptionTarget::Wire,
+                                                        None,
+                                                    )
+                                                });
+                                        match described {
+                                            Ok(count) => {
+                                                capture.row_description(&columns[..count]).map(Ok)
+                                            }
+                                            Err(error) => Ok(Err(error)),
+                                        }
+                                    }
                                     cursor::CursorStatement::Select(select) => {
                                         let select = match query::expand_ctes_exec(
                                             select,
@@ -25387,6 +25413,151 @@ impl Engine {
         Ok(())
     }
 
+    /// Runs a cursor query with data-modifying `WITH` queries once, whole,
+    /// on its first read, saving every row as PostgreSQL fills such a
+    /// portal's store: the `WITH` queries the main query reads first, then
+    /// the main query into the cursor's rows, then the rest. Routine calls
+    /// and the writes' triggers report to the client; a full row store is
+    /// the named `cursor_bytes` limit.
+    #[allow(clippy::too_many_arguments)]
+    fn fill_writing_cursor(
+        &mut self,
+        at: usize,
+        arena: &Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<(), SqlError> {
+        let (query, mut description, mut rows) = cursors.begin_write_fill(at, arena)?;
+        let description_mark = description.mark();
+        let filled = type_input_plans::with_owner(query.owner, || {
+            exec::with_bound_parameter_types(query.parameter_types, || {
+                self.run_writing_cursor_query(
+                    query.statement,
+                    query.params,
+                    &mut description,
+                    &mut rows,
+                    arena,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    responder,
+                )
+            })
+        });
+        // The description was written when the cursor opened.
+        description.truncate_to(description_mark);
+        cursors.end_write_fill(at, description, rows, filled.is_ok())?;
+        filled
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_writing_cursor_query(
+        &mut self,
+        statement: &ast::Select<'_>,
+        params: &[Datum],
+        description: &mut crate::mem::buffer::FixedBuf,
+        rows: &mut crate::mem::buffer::FixedBuf,
+        arena: &Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<(), SqlError> {
+        let source_snapshot = txn.command_id().saturating_add(1);
+        let invocations = query::RoutineInvocationState::new(
+            arena,
+            crate::sql::query::RoutineExecution::StatementReplay,
+        );
+        let replay = sequence::begin_replay_cursor()?;
+        let main = query::CteReader::Select(statement);
+        loop {
+            sequence::rewind_replay_cursor(replay)?;
+            self.work.reset();
+            self.storage.set_read_snapshot(source_snapshot);
+            invocations.begin_attempt();
+            rows.clear();
+            let attempt_arena_mark = arena.mark();
+            let statement_mark =
+                txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+            let outcome = query::with_routine_invocation_scope(
+                Some(query::RoutineInvocationContext::new(&invocations, arena)),
+                || {
+                    let written = self
+                        .bind_dml_ctes(statement.with, main, txn, arena, params, guc, responder)?
+                        .unwrap_or(&[]);
+                    let mut capture = Responder::for_cursor(
+                        description,
+                        crate::pg::respond::CursorRowOutput::Save(rows),
+                    )
+                    .rows_only();
+                    capture.set_render(guc.render());
+                    self.execute_select_main(
+                        statement,
+                        written,
+                        arena,
+                        params,
+                        txn,
+                        guc,
+                        Some(&invocations),
+                        &mut capture,
+                    )
+                    .map_err(|_| cursor_result_too_large())??;
+                    let output_mark = responder.mark();
+                    self.finish_dml_ctes(
+                        statement.with,
+                        main,
+                        written,
+                        output_mark,
+                        txn,
+                        arena,
+                        params,
+                        guc,
+                        responder,
+                    )
+                },
+            );
+            let Err(error) = outcome else {
+                return Ok(());
+            };
+            if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
+                return Err(error);
+            }
+            // A data-modifying WITH query's changes are repeated by the next
+            // attempt, so this attempt's are undone first.
+            self.rollback_waiting_statement(txn, statement_mark);
+            self.dml_scratch.clear();
+            unsafe { arena.rewind_to(attempt_arena_mark) };
+            let pending = invocations.take_pending().ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "routine invocation yielded without a pending call"
+                )
+            })?;
+            self.complete_pending_routine(
+                pending,
+                &invocations,
+                arena,
+                arena,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                responder,
+            )
+            .map_err(|WireFull| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "routine output while filling a cursor exceeds conn_send_buffer_bytes"
+                )
+            })??;
+        }
+    }
+
     pub(crate) fn fetch_cursor(
         &mut self,
         name: &str,
@@ -25404,6 +25575,9 @@ impl Engine {
             ..
         } = context;
         let result = (|| {
+            if let Some(at) = cursors.pending_write_fill(name)? {
+                self.fill_writing_cursor(at, arena, txn, sqlprep, cursors, guc, responder)?;
+            }
             if let Some(at) = cursors.scroll_slot(name) {
                 cursors.begin_scroll(at, motion, move_only)?;
                 let count =

@@ -423,10 +423,20 @@ constant written inside a routine body. `INSERT INTO t (a[1], b) SELECT 1` repor
 `INSERT has more target columns than expressions` without its position; other
 target and expression count errors are positioned. PL/pgSQL statements, writes, `EXECUTE` and FOR queries run their `WITH`
 queries, including data-modifying ones, in one new command as PostgreSQL
-does. Remaining: `OPEN ... FOR` a query with data-modifying `WITH` queries
-fails with `0A000` (the cursor reruns its query at each `FETCH` and cannot
-keep the written rows); and a PL/pgSQL write with `WITH` queries whose nested
-AFTER trigger waits fails with `0A000` instead of resuming. A `LATERAL` item on the right of
+does; a cursor's query with data-modifying `WITH` queries runs at its first
+read. Remaining: a PL/pgSQL write with `WITH` queries whose nested AFTER
+trigger waits fails with `0A000` instead of resuming; and a data-modifying
+`WITH` query runs whole before the main query reads it, so a trigger's or
+called function's notices arrive in a different order than PostgreSQL's
+interleaved execution. `ALTER TABLE` subcommands other than column, constraint and
+storage-option ones (`ENABLE TRIGGER`, `SET LOGGED`, `CLUSTER ON`, `INHERIT`,
+`OF`, `REPLICA IDENTITY`, row security) must be written alone, where
+PostgreSQL accepts them in a comma-separated list, and `ALTER TABLE` on a view
+rejects view options (`SET (security_barrier = true)`) as unknown storage
+parameters. A set operation's type or column-count error and a misplaced
+`DEFAULT` are reported without their cursor position. A cursor whose query
+cannot stream runs it at `DECLARE` or `OPEN`, so a volatile function's side
+effects happen before the first `FETCH` rather than at it. A `LATERAL` item on the right of
 a `RIGHT` or `FULL` join that reads only FROM items outside that join
 (`SELECT * FROM b, a RIGHT JOIN LATERAL (SELECT b.y) s ON true`) fails with
 `0A000` where PostgreSQL accepts it. A derived table computes output
@@ -439,9 +449,11 @@ PostgreSQL types it as the table's row type `t`. A row constructor casts to a ta
 (`ARRAY[ROW(1, 'a')::t]`) fails with `0A000`, where PostgreSQL accepts both.
 A PL/pgSQL variable declared with a view's row type (`r v;` or
 `r v%ROWTYPE`) fails with `0A000`; a table's works. In a trigger function,
-`FETCH ... INTO NEW.col`, a write's `RETURNING ... INTO NEW.col`, any
-`INTO OLD.col`, and assigning `NEW` in an AFTER trigger fail with `0A000`,
-where PostgreSQL assigns the field; `SELECT` and `EXECUTE ... INTO NEW.col`
+`FETCH ... INTO NEW.col`, any `INTO OLD.col`, and assigning `NEW` in an AFTER
+trigger fail with `0A000`, and a write's `RETURNING ... INTO NEW.col` fails
+with `42601` (`"new.a" is not a known variable`), where PostgreSQL assigns the
+field; `OPEN` and `FETCH` in a trigger fired by an ordinary statement fail with
+`0A000` (`SQL cursors are not available in trigger execution`); `SELECT` and `EXECUTE ... INTO NEW.col`
 in a BEFORE trigger work. A `CONSTANT`
 assignment error has no cursor position: PL/pgSQL assignment targets do not
 keep their place in the routine body.

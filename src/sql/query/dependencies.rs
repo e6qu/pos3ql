@@ -195,12 +195,15 @@ impl<'a> CollectionContext<'a> {
 #[derive(Clone, Copy)]
 struct CteNames<'a> {
     names: [&'a str; MAX_STORED_QUERY_DEPENDENCIES],
+    /// Each visible `WITH` query, so a level reading one can describe it.
+    definitions: [Option<&'a crate::sql::ast::Cte<'a>>; MAX_STORED_QUERY_DEPENDENCIES],
     len: usize,
 }
 
 impl<'a> CteNames<'a> {
     const EMPTY: Self = Self {
         names: [""; MAX_STORED_QUERY_DEPENDENCIES],
+        definitions: [None; MAX_STORED_QUERY_DEPENDENCIES],
         len: 0,
     };
 
@@ -208,7 +211,7 @@ impl<'a> CteNames<'a> {
         self.names[..self.len].contains(&name)
     }
 
-    fn push(&mut self, name: &'a str) -> Result<(), SqlError> {
+    fn push(&mut self, cte: &'a crate::sql::ast::Cte<'a>) -> Result<(), SqlError> {
         if self.len == self.names.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -216,9 +219,27 @@ impl<'a> CteNames<'a> {
                 self.names.len()
             ));
         }
-        self.names[self.len] = name;
+        self.names[self.len] = cte.name;
+        self.definitions[self.len] = Some(cte);
         self.len += 1;
         Ok(())
+    }
+
+    /// The visible `WITH` queries in order, the latest definition of a
+    /// repeated name last.
+    fn definitions_in(&self, arena: &'a Arena) -> Result<&'a [crate::sql::ast::Cte<'a>], SqlError> {
+        let mut definitions = crate::mem::arena::ArenaList::new(arena);
+        for (index, definition) in self.definitions[..self.len].iter().enumerate() {
+            let Some(definition) = definition else {
+                continue;
+            };
+            // An inner level's definition hides an outer one of the same name.
+            if self.names[index + 1..self.len].contains(&definition.name) {
+                continue;
+            }
+            definitions.push(**definition).map_err(|_| arena_full())?;
+        }
+        Ok(definitions.as_slice())
     }
 }
 
@@ -2755,7 +2776,7 @@ fn collect_select<'a>(
             // A CTE can reference earlier entries, not itself unless recursive.
             let definition_scope = if cte.recursive {
                 let mut scope = visible_ctes;
-                scope.push(cte.name)?;
+                scope.push(cte)?;
                 scope
             } else {
                 visible_ctes
@@ -2769,7 +2790,7 @@ fn collect_select<'a>(
                 arena,
                 context,
             )?;
-            visible_ctes.push(cte.name)?;
+            visible_ctes.push(cte)?;
         }
         // A level reading only tables has a schema its subqueries' outer
         // references resolve in.
@@ -3502,14 +3523,20 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
     }
 }
 
-fn collect_routine_dependencies(
-    select: &Select<'_>,
+fn from_reads_cte(from: &FromClause<'_>, ctes: CteNames<'_>) -> bool {
+    core::iter::once(&from.base)
+        .chain(from.joins.iter().map(|join| &join.table))
+        .any(|table| table.schema.is_none() && table.cte.is_none() && ctes.contains(table.table))
+}
+
+fn collect_routine_dependencies<'a>(
+    select: &'a Select<'a>,
     storage: &Storage,
     txid: u32,
     dependencies: &mut StoredQueryDependencies,
-    arena: &Arena,
+    arena: &'a Arena,
     context: CollectionContext<'_>,
-    ctes: CteNames<'_>,
+    ctes: CteNames<'a>,
 ) -> Result<(), SqlError> {
     let resolver = DependencyTypes {
         hidden: None,
@@ -3529,7 +3556,27 @@ fn collect_routine_dependencies(
         };
         let mark = arena.mark();
         let result = (|| {
-            let bound = context.bound_from(from, storage, txid, ctes, arena)?;
+            let from = if from_reads_cte(from, ctes) {
+                // A level reading `WITH` queries describes them in place.
+                let level = arena
+                    .alloc(Select {
+                        with: ctes.definitions_in(arena)?,
+                        from: Some(*from),
+                        ..*select
+                    })
+                    .map_err(|_| arena_full())?;
+                super::expand_ctes(level, storage, txid, arena)?
+                    .from
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "WITH expansion removed a FROM clause"
+                        )
+                    })?
+            } else {
+                *from
+            };
+            let bound = context.bound_from(&from, storage, txid, ctes, arena)?;
             let scope = super::QueryScope::resolve_schema(storage, &bound, txid, arena, None)?;
             let resolver = DependencyTypes {
                 hidden: None,

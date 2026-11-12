@@ -50855,7 +50855,7 @@ fn generated_expression_evolution_rewrites_rows_and_survives_cold_recovery() {
             "ALTER TABLE generated_expression_evolution \
              ALTER COLUMN b DROP EXPRESSION IF EXISTS"
         ))
-        .contains("not a stored generated column, skipping")
+        .contains("not a generated column, skipping")
     );
     cold.commit_wal().unwrap();
     assert!(cold.checkpoint().unwrap());

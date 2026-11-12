@@ -28,6 +28,17 @@ impl FixedBuf {
         })
     }
 
+    /// A zero-capacity placeholder for a buffer lent elsewhere; it owns no
+    /// heap memory.
+    pub fn detached() -> Self {
+        Self {
+            buffer: Box::default(),
+            start: 0,
+            end: 0,
+            tail: 0,
+        }
+    }
+
     /// Unread bytes.
     pub fn readable(&self) -> &[u8] {
         &self.buffer[self.start..self.end]

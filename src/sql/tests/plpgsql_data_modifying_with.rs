@@ -153,16 +153,110 @@ fn plpgsql_writes_run_with_queries_in_one_command() {
             data_rows(&run_with(engine, budget, "SELECT b FROM t WHERE a = 41")),
             ["1"]
         );
-        // A cursor reruns its query at each FETCH and cannot keep the rows
-        // its WITH queries wrote.
+    });
+}
+
+/// PostgreSQL runs a cursor query with data-modifying `WITH` queries whole on
+/// its first read and keeps the rows; a cursor nothing reads never writes.
+#[test]
+fn cursors_with_data_modifying_with_queries_run_on_first_read() {
+    with_engine("cursor-data-modifying-with", |engine, budget| {
+        for sql in [
+            "CREATE TABLE c (a int)",
+            "CREATE FUNCTION nf(x int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN x; END $$",
+        ] {
+            run_with(engine, budget, sql);
+        }
         assert_eq!(
             diagnostics(&run_with(
                 engine,
                 budget,
-                "DO $$ DECLARE c refcursor; BEGIN \
-                 OPEN c FOR WITH i AS (INSERT INTO t VALUES (9, 9) RETURNING a) SELECT a FROM i; END $$",
+                "DO $$ DECLARE r refcursor; v int; n bigint; BEGIN \
+                 OPEN r FOR WITH w AS (INSERT INTO c VALUES (1) RETURNING a) SELECT a FROM w; \
+                 RAISE NOTICE 'unread %', (SELECT count(*) FROM c); CLOSE r; \
+                 OPEN r FOR WITH w AS (INSERT INTO c VALUES (1), (2) RETURNING a) \
+                 SELECT nf(a), (SELECT count(*) FROM c) FROM w ORDER BY a; \
+                 INSERT INTO c VALUES (7); \
+                 FETCH r INTO v, n; RAISE NOTICE 'first % sees %', v, n; \
+                 RAISE NOTICE 'written %', (SELECT count(*) FROM c); \
+                 FETCH LAST FROM r INTO v; FETCH PRIOR FROM r INTO v; RAISE NOTICE 'prior %', v; \
+                 MOVE ABSOLUTE 0 IN r; FETCH r INTO v; RAISE NOTICE 'again %', v; \
+                 RAISE NOTICE 'once %', (SELECT count(*) FROM c); END $$",
+            )),
+            [
+                "NOTICE 00000 unread 0",
+                "NOTICE 00000 first 1 sees 1",
+                "NOTICE 00000 written 3",
+                "NOTICE 00000 prior 1",
+                "NOTICE 00000 again 1",
+                "NOTICE 00000 once 3",
+                "DO"
+            ]
+        );
+        assert_eq!(
+            diagnostics(&run_with(
+                engine,
+                budget,
+                "DO $$ DECLARE r refcursor; v int; BEGIN \
+                 OPEN r NO SCROLL FOR EXECUTE \
+                 'WITH w AS (DELETE FROM c WHERE a = $1 RETURNING a) SELECT a FROM w' USING 7; \
+                 FETCH r INTO v; RAISE NOTICE 'deleted %', v; FETCH PRIOR FROM r INTO v; END $$",
+            )),
+            [
+                "NOTICE 00000 deleted 7",
+                "ERROR 55000 cursor can only scan forward \
+                 hint: Declare it with SCROLL option to enable backward scan."
+            ]
+        );
+        // The cursor's saved rows are bounded by cursor_bytes.
+        assert_eq!(
+            diagnostics(&run_with(
+                engine,
+                budget,
+                "DO $$ DECLARE r refcursor; v int; BEGIN \
+                 OPEN r FOR WITH w AS (INSERT INTO c SELECT g FROM generate_series(1, 900) g \
+                 RETURNING a, repeat('x', 2000) AS b) SELECT a, b FROM w; FETCH r INTO v; END $$",
             ))[0],
-            "ERROR 0A000 OPEN of a query with data-modifying WITH queries is not supported"
+            "ERROR 54000 cursor result exceeds cursor_bytes; raise it or narrow the query"
+        );
+        assert_eq!(
+            data_rows(&run_with(engine, budget, "SELECT count(*) FROM c")),
+            ["3"]
+        );
+    });
+}
+
+/// A PL/pgSQL query reading a `WITH` query passes its columns to routines.
+#[test]
+fn plpgsql_routine_calls_read_with_query_columns() {
+    with_engine("plpgsql-with-routine-arguments", |engine, budget| {
+        run_with(
+            engine,
+            budget,
+            "CREATE FUNCTION nf(x int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN x; END $$",
+        );
+        assert_eq!(
+            diagnostics(&run_with(
+                engine,
+                budget,
+                "DO $$ DECLARE v int; r refcursor; BEGIN \
+                 WITH w AS (SELECT 1 a), x AS (SELECT a + 1 b FROM w) \
+                 SELECT nf(b) INTO v FROM x JOIN w ON true; RAISE NOTICE 'v %', v; \
+                 OPEN r FOR WITH w AS (SELECT 5 a) SELECT nf(a) FROM w; \
+                 FETCH r INTO v; RAISE NOTICE 'c %', v; END $$",
+            )),
+            ["NOTICE 00000 v 2", "NOTICE 00000 c 5", "DO"]
+        );
+        // FETCH INTO ignores extra columns and leaves missing targets NULL.
+        assert_eq!(
+            diagnostics(&run_with(
+                engine,
+                budget,
+                "DO $$ DECLARE r refcursor; v int; w int := 9; BEGIN \
+                 OPEN r FOR SELECT 1, 2; FETCH r INTO v; CLOSE r; \
+                 OPEN r FOR SELECT 3; FETCH r INTO v, w; RAISE NOTICE '% %', v, w; END $$",
+            )),
+            ["NOTICE 00000 3 <NULL>", "DO"]
         );
     });
 }

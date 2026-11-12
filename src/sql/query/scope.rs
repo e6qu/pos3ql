@@ -1755,7 +1755,8 @@ impl<'d> QueryScope<'d> {
             outer,
             catalog_scan(&from.base, predicate, from.joins.is_empty()),
         )?;
-        for j in from.joins {
+        for (index, j) in from.joins.iter().enumerate() {
+            scope.merge_left_of(from, index, arena)?;
             scope.right_of_outer_join = j.kind.is_right_or_full();
             scope.add_exec(
                 storage,
@@ -2276,7 +2277,8 @@ impl<'d> QueryScope<'d> {
         let mut scope = QueryScope::empty(storage, txid, arena, from)?;
         scope.add_schema(storage, &from.base, txid, arena, outer)?;
         scope.lateral_from = lateral_from;
-        for j in from.joins {
+        for (index, j) in from.joins.iter().enumerate() {
+            scope.merge_left_of(from, index, arena)?;
             scope.right_of_outer_join = j.kind.is_right_or_full();
             scope.add_schema(storage, &j.table, txid, arena, outer)?;
         }
@@ -2877,6 +2879,30 @@ impl<'d> QueryScope<'d> {
     /// output columns (and the join tree's output order) and synthesizes the
     /// equality predicates (when `arena` is given — the schema-only Describe
     /// path passes None and never evaluates joins).
+    /// Before `from.joins[index]`'s item is described: a `LATERAL` item or a
+    /// table function may name a `USING`/`NATURAL`-merged column of the
+    /// joins to its left, so those merges must exist while it is typed.
+    fn merge_left_of(
+        &mut self,
+        from: &FromClause<'d>,
+        index: usize,
+        arena: &'d Arena,
+    ) -> Result<(), SqlError> {
+        let item = &from.joins[index].table;
+        if (item.lateral || item.is_function_source())
+            && from.joins[..index]
+                .iter()
+                .any(|join| join.natural || join.using.is_some())
+        {
+            let left = FromClause {
+                base: from.base,
+                joins: &from.joins[..index],
+            };
+            self.build_merges(&left, arena, None)?;
+        }
+        Ok(())
+    }
+
     fn build_merges(
         &mut self,
         from: &FromClause<'d>,
@@ -2907,6 +2933,9 @@ impl<'d> QueryScope<'d> {
                 ctype: ColType::Bool,
             })
             .map_err(|_| arena_full())?;
+        // Built again once every item is described, after an earlier pass
+        // for a LATERAL item over the joins to its left.
+        self.n_merged = 0;
         // The left join tree's output columns, updated join by join.
         let out = scratch_arena
             .alloc_slice_with(self.total_columns(), |_| ResolvedColumn::Table(0, 0))

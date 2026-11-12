@@ -100,11 +100,9 @@ Schemas and catalogs:
   PostgreSQL's detail, and a body that names none runs once.
 - A comma starts a new join tree: in `FROM x, a JOIN b USING (id)` the
   `USING` and `NATURAL` columns come from `a` and `b` only, and lead their
-  tree's columns after `x`'s. A `RIGHT` or `FULL` join after a comma (`FROM x,
-  a RIGHT JOIN b ON ...`) fails with `0A000`: joins run left to right over
-  the whole list, which PostgreSQL's `x` crossed with `a RIGHT JOIN b` does
-  not match. A join condition may still name items before the comma, which
-  PostgreSQL rejects with `42P01`.
+  tree's columns after `x`'s. `FROM x, a RIGHT JOIN b ON ...` crosses `x`
+  with `a RIGHT JOIN b`, and a join condition naming an item before the comma
+  fails with PostgreSQL's `42P01` and detail.
 
 Data-modifying statements:
 

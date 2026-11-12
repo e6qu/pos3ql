@@ -420,10 +420,10 @@ functions fails with `0A000`. An aggregate whose argument is a scalar subquery
 (`SELECT sum((SELECT v FROM u LIMIT 1)) FROM t`) fails with `42725`
 (`function sum is not unique`), and `CREATE VIEW` over a query with a
 correlated scalar subquery fails with `XX000` (`column dependency has no
-owning relation dependency`). An uncorrelated `IN`, `ANY` or `ALL` subquery
-runs before the query's first row, where PostgreSQL runs it at its first use:
-`SELECT id FROM t WHERE id IN (SELECT 1/x FROM z) AND false` fails with
-`22012` here and returns no rows in PostgreSQL. A SQL function whose earlier
+owning relation dependency`). An aggregate of an `UPDATE` or `DELETE`
+target in a subquery of its `WHERE` (`UPDATE t SET v = 2 WHERE (SELECT
+max(t.v) FROM u) > 0`) is not rejected with PostgreSQL's `aggregate functions
+are not allowed in WHERE`. A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final
@@ -549,15 +549,10 @@ where PostgreSQL accepts it. Under `READ COMMITTED`, a locked row's recheck
 fails with `0A000` for a simple `LATERAL` subquery that reads tables when
 several of its source rows produced the values the statement read but
 recheck differently, or when it is a `UNION ALL` branch that reads tables
-(PostgreSQL keeps the rows it first joined). `RETURNING`
-of `UPDATE ... FROM` and `DELETE ... USING` cannot read the `FROM`/`USING`
-items (`42P01`; `RETURNING *` fails with `0A000`). A parameter used inside a
+(PostgreSQL keeps the rows it first joined). A parameter used inside a
 `FROM` subquery of `PREPARE` (`PREPARE p AS SELECT * FROM (SELECT 1 + $1) s`)
 is typed `text` before the subquery is described, so the statement fails
-with `42883`. Joins run left to right over the whole FROM list, so a `RIGHT`
-or `FULL` join after a comma-separated item fails with `0A000`, and a join
-condition naming an item before the comma is accepted where PostgreSQL
-fails with `42P01`; both need nested join trees. A subquery's `t.*` naming an
+with `42883`. A subquery's `t.*` naming an
 enclosing query's item (`FROM t, LATERAL (SELECT t.*) s`, `SELECT (SELECT
 t.*) FROM t`) fails with `42601` or `42P01`; PostgreSQL expands the outer
 row's columns. The

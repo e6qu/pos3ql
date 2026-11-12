@@ -83,10 +83,10 @@ pub(super) mod predicate_safety;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
 pub(crate) use cte::{
-    RuleTransitionType, attach_rule_source, expand_set_tree, expand_stored_query,
-    expand_stored_query_exec, expand_stored_rule_action_exec, expand_stored_rule_expression_exec,
-    expand_stored_statement_exec, restrict_rule_original, rule_original_transition,
-    rule_transition_source,
+    RuleTransitionType, attach_rule_source, describe_stored_set_query, expand_set_tree,
+    expand_stored_query, expand_stored_query_exec, expand_stored_rule_action_exec,
+    expand_stored_rule_expression_exec, expand_stored_statement_exec, restrict_rule_original,
+    rule_original_transition, rule_transition_source,
 };
 pub use cte::{
     describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under, expand_dml_ctes,
@@ -2177,6 +2177,31 @@ pub(crate) fn execute_bound_routine_query<'a>(
     )
 }
 
+/// The creator's search path that binds a SQL-standard body; string bodies
+/// resolve names when they run.
+pub(crate) fn stored_routine_path(
+    storage: &Storage,
+    routine: &crate::storage::RoutineDef,
+    txid: u32,
+) -> Option<crate::storage::PathContext> {
+    (routine.body_kind != crate::storage::RoutineBodyKind::String).then(|| {
+        let user = super::eval::funcs::system::session_user_owned();
+        storage.compute_path(routine.creation_path.as_str(), user.as_str(), txid)
+    })
+}
+
+/// Binds a stored expression's routine and type names to the identities they
+/// captured at CREATE, spelled under their current names.
+pub(crate) fn bind_stored_expression<'a>(
+    expression: &'a Expr<'a>,
+    storage: &Storage,
+    txid: u32,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    cte::expand_stored_expression(expression, storage, txid, dependencies, arena)
+}
+
 pub(crate) fn bind_routine_parameter_default<'a>(
     source: &str,
     parameter: usize,
@@ -3585,6 +3610,8 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 routine,
                 self.routine_workspace,
             )?,
+            stored_routine_path(self.storage, routine, self.txid)
+                .map(|path| (path, dependencies.view())),
             self.routine_workspace,
         )?;
         let program_access = routine_program_access(&function_program);

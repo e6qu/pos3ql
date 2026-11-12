@@ -6035,6 +6035,8 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 )?,
                 routine.arguments(),
                 super::RoutineResultContract::stored(storage, txid, routine, arena)?,
+                super::stored_routine_path(storage, routine, txid)
+                    .map(|path| (path, dependencies.view())),
                 arena,
             )?;
             let access = super::routine_program_access(&program);

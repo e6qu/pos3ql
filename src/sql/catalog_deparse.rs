@@ -64,6 +64,17 @@ pub(crate) fn deparse<'a>(
     let Ok(expression) = crate::sql::parser::parse_expr(source, arena) else {
         return Ok(None);
     };
+    deparse_expression(context, expression, destination, arena)
+}
+
+/// Deparses a parsed expression, such as one whose names were bound to the
+/// catalog identities they captured at CREATE.
+pub(crate) fn deparse_expression<'a>(
+    context: &Context<'_>,
+    expression: &Expr<'_>,
+    destination: Destination,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
     let mut output = Output {
         arena,
         text: ArenaString::new(arena),
@@ -233,6 +244,7 @@ impl Context<'_> {
             name,
             args,
             argument_names,
+            bound_oid,
             variadic: false,
             star: false,
             distinct: false,
@@ -248,6 +260,13 @@ impl Context<'_> {
             || argument_names.iter().any(Option::is_some)
         {
             return Ok(None);
+        }
+        // A bound call keeps the routine its stored body selected at CREATE.
+        if let Some(slot) =
+            bound_oid.and_then(|oid| self.storage.routine_slot_by_oid(oid, self.txid))
+        {
+            let routine = self.storage.routine_for(slot, self.txid);
+            return Ok((routine.argument_count == args.len()).then_some((slot, routine)));
         }
         let mut argument_oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
         for (target, argument) in argument_oids.iter_mut().zip(*args) {
@@ -445,7 +464,9 @@ impl Context<'_> {
         if type_oid == oid::BPCHAR {
             return output.push("bpchar");
         }
-        if let Some(ctype) = ColType::from_oid(type_oid) {
+        if let Some(ctype) = ColType::from_oid(type_oid)
+            && crate::storage::NamedTypeKind::from_oid(type_oid).is_none()
+        {
             return output.push(ctype.name());
         }
         match super::user_type_name_fixed(self.storage, self.txid, type_oid)? {
@@ -574,6 +595,8 @@ impl Context<'_> {
                     Err(_) => return output.unsupported(),
                 }
             }
+            // `enum_out(enum_in(label))` is the label itself.
+            Some(ColType::Enum(_)) => text,
             Some(ctype) if !ctype.is_collatable() || ctype == ColType::Name => {
                 match crate::sql::eval::cast_to(
                     crate::sql::types::Datum::Text(text),

@@ -155,9 +155,10 @@ Row types:
   `WHEN` condition or domain constraint names it, because those are stored
   as SQL text; for example, after
   `CREATE TABLE t (a int CHECK (f(a) > 0))`, `ALTER FUNCTION f(int) RENAME TO g`
-  is refused. Views, rules, policies and SQL-standard procedure bodies follow
+  is refused. Views, rules, policies and SQL-standard routine bodies follow
   the rename, and so do enum literals that a domain constraint or an enum
-  column's default binds.
+  column's default binds. After `ALTER FUNCTION s.f(int) RENAME TO g`, a
+  function `RETURN s.f(1)` still calls it and prints as `RETURN s.g(1)`.
 - Index keys and predicates must be immutable (`42P17` `functions in index
   expression must be marked IMMUTABLE`), judged as PostgreSQL does after
   inlining simple SQL functions: `CREATE INDEX ON orders ((placed_at::date))`
@@ -218,8 +219,8 @@ Functions and expressions:
   body`). `pg_get_function_sqlbody` returns a `RETURN` or `BEGIN ATOMIC` body
   (`RETURN (x * 2)`; `BEGIN ATOMIC` then one statement per line) and NULL for
   a quoted body; a `SELECT` of expressions without `FROM` is printed in
-  PostgreSQL's analyzed form (`SELECT (x + 1);`), other statements as
-  written.
+  PostgreSQL's analyzed form with each column's name (`SELECT (x + 1);`,
+  `SELECT abs(x) AS abs;`), other statements as written.
 - PL/pgSQL `CALL` assigns output parameters to the variables written as
   their arguments: `CALL doubled(x, y)` updates `x` and `y`, and a constant in
   an output position fails with `42601` (`procedure parameter "b" is an output

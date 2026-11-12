@@ -38961,6 +38961,7 @@ pub(crate) fn check_called_sql_routine_result(
     record_columns: &[crate::storage::RoutineArgumentDef],
     arguments: &[crate::storage::RoutineArgumentDef],
     contract: super::query::RoutineResultContract<'_>,
+    stored: Option<StoredRoutineBinding<'_>>,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let super::query::RoutineResultContract::Returns(declared) = contract else {
@@ -38993,14 +38994,26 @@ pub(crate) fn check_called_sql_routine_result(
         kind,
         record_columns,
         declared,
+        stored,
         arena,
     )
 }
+
+/// The creator's search path and captured identities of a SQL-standard body,
+/// which bind its names to the objects they named at CREATE.
+pub(crate) type StoredRoutineBinding<'a> = (
+    crate::storage::PathContext,
+    crate::storage::StoredQueryDependencyView<'a>,
+);
 
 /// PostgreSQL's `check_sql_stmt_retval` type checks at CREATE: a scalar
 /// result takes exactly one column that converts to it by assignment, and a
 /// row result takes one such column per field. An untyped literal output is
 /// `text`, as parse analysis leaves it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the check reads the declaration, the parsed body and its stored binding"
+)]
 pub(crate) fn check_sql_routine_result(
     storage: &Storage,
     txid: u32,
@@ -39008,6 +39021,7 @@ pub(crate) fn check_sql_routine_result(
     kind: crate::storage::RoutineKind,
     record_columns: &[crate::storage::RoutineArgumentDef],
     declared: &str,
+    stored: Option<StoredRoutineBinding<'_>>,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     use crate::sql::types::oid;
@@ -39081,7 +39095,17 @@ pub(crate) fn check_sql_routine_result(
     let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
     let count = match program.result {
         super::query::RoutineFunctionResult::Query(super::query::RoutineQuery::Select(select)) => {
-            let select = super::query::expand_ctes(select, storage, txid, arena)?;
+            let select = match stored {
+                Some((path, dependencies)) => super::query::expand_stored_query(
+                    select,
+                    storage,
+                    txid,
+                    path,
+                    dependencies,
+                    arena,
+                )?,
+                None => super::query::expand_ctes(select, storage, txid, arena)?,
+            };
             super::query::describe_select(
                 select,
                 storage,
@@ -39093,16 +39117,39 @@ pub(crate) fn check_sql_routine_result(
             )?
         }
         super::query::RoutineFunctionResult::Query(super::query::RoutineQuery::Set(query)) => {
-            super::query::describe_set_query(
-                storage,
-                txid,
-                query,
-                &mut described,
-                arena,
-                DescriptionTarget::Sql,
-            )?
+            match stored {
+                Some((path, dependencies)) => super::query::describe_stored_set_query(
+                    storage,
+                    txid,
+                    query,
+                    (path, dependencies),
+                    &mut described,
+                    arena,
+                )?,
+                None => super::query::describe_set_query(
+                    storage,
+                    txid,
+                    query,
+                    &mut described,
+                    arena,
+                    DescriptionTarget::Sql,
+                )?,
+            }
         }
         super::query::RoutineFunctionResult::DataModification(statement) => {
+            let statement = match stored {
+                Some((path, dependencies)) => super::query::expand_stored_statement_exec(
+                    statement,
+                    storage,
+                    txid,
+                    path,
+                    dependencies,
+                    arena,
+                    &[],
+                    None,
+                )?,
+                None => statement,
+            };
             describe_data_modification_columns(
                 storage,
                 statement,
@@ -39309,6 +39356,7 @@ pub(crate) fn validate_routine_body(
                             arena,
                         )?,
                         declared,
+                        None,
                         arena,
                     )?;
                 }
@@ -39390,6 +39438,7 @@ pub(crate) fn validate_routine_body(
                             arena,
                         )?,
                         declared,
+                        None,
                         arena,
                     )?;
                 }
@@ -39465,6 +39514,7 @@ pub(crate) fn validate_routine_body(
                             arena,
                         )?,
                         declared,
+                        None,
                         arena,
                     )?;
                 }

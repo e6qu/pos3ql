@@ -108,6 +108,9 @@ impl SqlSource {
             &self.columns,
             &self.parameters,
             self.result_contract(storage, transaction, arena)?,
+            self.stored
+                .as_ref()
+                .map(|stored| (stored.path, stored.view())),
             arena,
         )?;
         Ok(ParsedSource {

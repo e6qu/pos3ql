@@ -14823,7 +14823,7 @@ pub fn function_def_text<'a>(
             let _ = write!(definition, "AS {0}{body}{0}", delimiter.as_str());
         }
         crate::storage::RoutineBodyKind::Return | crate::storage::RoutineBodyKind::Atomic => {
-            write_sql_body(&mut definition, storage, txid, &routine, arena)?;
+            write_sql_body(&mut definition, storage, txid, slot, &routine, arena)?;
         }
     }
     let _ = definition.write_char('\n');
@@ -14840,11 +14840,14 @@ pub fn function_def_text<'a>(
 /// PostgreSQL's `pg_get_function_sqlbody` of a SQL-standard body:
 /// `RETURN expression`, or `BEGIN ATOMIC` with one statement per line. A
 /// `RETURN` expression and a `SELECT` of expressions without `FROM` are
-/// printed in analyzed form (`SELECT (x + 1);`); other statements as written.
+/// printed in analyzed form (`SELECT (x + 1);`) with their names bound to the
+/// objects they named at CREATE, so renamed routines and types print under
+/// their current names; other statements are printed as written.
 fn write_sql_body(
     output: &mut impl core::fmt::Write,
     storage: &Storage,
     txid: u32,
+    slot: usize,
     routine: &crate::storage::RoutineDef,
     arena: &Arena,
 ) -> Result<(), SqlError> {
@@ -14856,6 +14859,16 @@ fn write_sql_body(
         joined: &[],
         pretty: false,
     };
+    let dependencies = storage.snapshot_routine_dependencies_for(slot, txid, arena)?;
+    let _formal = super::exec::enter_routine_parameter_types(
+        routine.arguments(),
+        Some(&super::query::storage_catalog(storage, arena, txid)),
+        crate::sql::ast::Collation::None,
+    )?;
+    let body = SqlBody {
+        context: &context,
+        dependencies: dependencies.view(),
+    };
     match routine.body_kind {
         crate::storage::RoutineBodyKind::Return => {
             let deparsed = match routine
@@ -14863,8 +14876,7 @@ fn write_sql_body(
                 .and_then(|result| storage.routine_type_oid(result.ctype, result.user_type, txid))
                 .filter(|type_oid| crate::storage::PolymorphicType::from_oid(*type_oid).is_none())
             {
-                Some(type_oid) => deparse::deparse(
-                    &context,
+                Some(type_oid) => body.deparse(
                     routine.body.as_str(),
                     deparse::Destination::Assignment(type_oid),
                     arena,
@@ -14881,7 +14893,7 @@ fn write_sql_body(
             let _ = output.write_str("BEGIN ATOMIC\n");
             for statement in split_sql_statements(routine.body.as_str()) {
                 let _ = output.write_char(' ');
-                write_atomic_statement(output, &context, statement, arena)?;
+                body.write_statement(output, statement, arena)?;
                 let _ = output.write_str(";\n");
             }
             let _ = output.write_str("END");
@@ -14891,56 +14903,121 @@ fn write_sql_body(
     Ok(())
 }
 
-/// One `BEGIN ATOMIC` statement: a `SELECT` of expressions without `FROM`
-/// in analyzed form, any other statement as written.
-fn write_atomic_statement(
-    output: &mut impl core::fmt::Write,
-    context: &deparse::Context<'_>,
-    statement: &str,
-    arena: &Arena,
-) -> Result<(), SqlError> {
-    let items = statement
-        .get(..7)
-        .filter(|keyword| keyword.eq_ignore_ascii_case("select "))
-        .map(|_| statement[7..].trim());
-    if let Some(items) = items.filter(|items| !items.is_empty()) {
+/// A SQL-standard body's deparse context and the identities its names
+/// captured at CREATE.
+struct SqlBody<'c, 'd> {
+    context: &'c deparse::Context<'c>,
+    dependencies: crate::storage::StoredQueryDependencyView<'d>,
+}
+
+impl SqlBody<'_, '_> {
+    /// Deparses one expression after binding its routine and type names to
+    /// their captured identities.
+    fn deparse<'a>(
+        &self,
+        source: &str,
+        destination: deparse::Destination,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        let source = arena
+            .alloc_str(source)
+            .map_err(|_| super::eval::arena_full())?;
+        let Ok(expression) = crate::sql::parser::parse_expr(source, arena) else {
+            return Ok(None);
+        };
+        self.deparse_parsed(expression, destination, arena)
+    }
+
+    fn deparse_parsed<'a>(
+        &self,
+        expression: &'a crate::sql::ast::Expr<'a>,
+        destination: deparse::Destination,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        let bound = super::query::bind_stored_expression(
+            expression,
+            self.context.storage,
+            self.context.txid,
+            self.dependencies,
+            arena,
+        )?;
+        deparse::deparse_expression(self.context, bound, destination, arena)
+    }
+
+    /// One `BEGIN ATOMIC` statement: a `SELECT` of expressions without
+    /// `FROM` in analyzed form, any other statement as written. Each item is
+    /// named as PostgreSQL's parse analysis named it at CREATE: its alias, or
+    /// the name the written expression implies unless that is `?column?`.
+    fn write_statement(
+        &self,
+        output: &mut impl core::fmt::Write,
+        statement: &str,
+        arena: &Arena,
+    ) -> Result<(), SqlError> {
         let mark = arena.mark();
-        let mut printed = StackStr::<{ crate::storage::ROUTINE_SQL_MAX }>::from_str("SELECT ");
-        let mut complete = true;
-        for (index, item) in split_top_level_commas(items).enumerate() {
-            match deparse::deparse(context, item, deparse::Destination::Value, arena)? {
-                Some(deparsed) => {
-                    // PostgreSQL wraps each later item onto its own line and
-                    // names a bare parameter, whose column is not `?column?`.
-                    let _ = write!(
-                        printed,
-                        "{}{deparsed}",
-                        if index == 0 { "" } else { ",\n     " }
-                    );
-                    if let Ok(crate::sql::ast::Expr::Column {
-                        qualifier: None,
-                        name,
-                    }) = crate::sql::parser::parse_expr(item, arena)
-                    {
-                        let _ = printed.write_str(" AS ");
-                        write_identifier(&mut printed, name);
-                    }
-                }
-                None => {
-                    complete = false;
-                    break;
-                }
-            }
+        let printed = self.select_items(statement, arena)?;
+        if let Some(printed) = &printed {
+            let _ = output.write_str(printed.as_str());
         }
         // The printed items were copied out of the workspace.
         unsafe { arena.rewind_to(mark) };
-        if complete && !printed.is_truncated() {
-            let _ = output.write_str(printed.as_str());
-            return Ok(());
+        if printed.is_none() {
+            let _ = output.write_str(statement);
         }
+        Ok(())
     }
-    let _ = output.write_str(statement);
-    Ok(())
+
+    fn select_items(
+        &self,
+        statement: &str,
+        arena: &Arena,
+    ) -> Result<Option<StackStr<{ crate::storage::ROUTINE_SQL_MAX }>>, SqlError> {
+        use crate::sql::ast::SelectItem;
+        let source = arena
+            .alloc_str(statement)
+            .map_err(|_| super::eval::arena_full())?;
+        let Ok(select) = crate::sql::parser::parse_query(source, arena) else {
+            return Ok(None);
+        };
+        if select.from.is_some()
+            || select.where_clause.is_some()
+            || select.distinct
+            || !select.group_by.is_empty()
+            || !select.grouping_sets.is_empty()
+            || select.having.is_some()
+            || !select.order_by.is_empty()
+            || select.limit.is_some()
+            || select.offset.is_some()
+            || !select.with.is_empty()
+            || select.set_body.is_some()
+            || !select.locking.is_empty()
+        {
+            return Ok(None);
+        }
+        let mut printed = StackStr::<{ crate::storage::ROUTINE_SQL_MAX }>::from_str("SELECT ");
+        for (index, item) in select.items.iter().enumerate() {
+            let SelectItem::Expr { expression, alias } = item else {
+                return Ok(None);
+            };
+            let Some(deparsed) =
+                self.deparse_parsed(expression, deparse::Destination::Value, arena)?
+            else {
+                return Ok(None);
+            };
+            // PostgreSQL wraps each later item onto its own line.
+            let _ = write!(
+                printed,
+                "{}{deparsed}",
+                if index == 0 { "" } else { ",\n     " }
+            );
+            let name = alias.unwrap_or_else(|| super::exec::derived_name(expression));
+            if name != "?column?" {
+                let _ = printed.write_str(" AS ");
+                write_identifier(&mut printed, name);
+            }
+        }
+        Ok((!printed.is_truncated()).then_some(printed))
+    }
 }
 
 /// The `;`-separated statements of a `BEGIN ATOMIC` body, outside quotes,
@@ -15021,7 +15098,7 @@ pub fn function_sqlbody_text<'a>(
         return Ok(None);
     }
     let mut body = crate::util::StackStr::<{ crate::storage::ROUTINE_SQL_MAX * 2 }>::new();
-    write_sql_body(&mut body, storage, txid, &routine, arena)?;
+    write_sql_body(&mut body, storage, txid, slot, &routine, arena)?;
     if body.is_truncated() {
         return Err(routine_definition_too_large());
     }

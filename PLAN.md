@@ -301,10 +301,10 @@ predicates, statistics expressions, trigger `WHEN` conditions, domain
 constraints keep routine and type names as SQL text, so renaming or moving a
 routine or type one of them names, or renaming an enum value it casts to,
 fails with `0A000` (PostgreSQL stores them bound by OID and follows the
-rename); views, rules, policies and procedure bodies are bound and follow it.
-A SQL-standard function whose body is a `SELECT` (`BEGIN ATOMIC SELECT
-s.f(1); END`) is not: after `s.f` or a type its body casts to is renamed, the
-call fails with `42883` or a `42P13` return-type mismatch. `pg_get_viewdef` of a view with an enum literal (`'b'::e`) prints its
+rename); views, rules, policies and SQL-standard routine bodies are bound and
+follow it. Renaming an enum value that a cast literal in a SQL-standard routine
+body spells (`RETURN 'a'::e`) leaves the body spelling the old label, so the
+call fails with `22P02`. `pg_get_viewdef` of a view with an enum literal (`'b'::e`) prints its
 bound query as spaced tokens with a doubled cast instead of PostgreSQL's
 form. An index key whose value is a row
 (`CREATE INDEX ON t ((t))`) fails with `0A000`, since row values have no stored
@@ -320,8 +320,9 @@ layout, including its wrap column, only for a view
 over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
 comma or `USING` joins, subqueries or set operations; other views return their
 query text. In a `BEGIN ATOMIC` body only a `SELECT` of expressions without `FROM` is
-deparsed (`SELECT (x + 1);`); other statements are printed one per line as
-written, where PostgreSQL prints its analyzed form (`INSERT INTO t (a, b)
+deparsed (`SELECT (x + 1);`, under the current names of the routines and types
+it named); other statements are printed one per line as written, keeping names
+that were since renamed, where PostgreSQL prints its analyzed form (`INSERT INTO t (a, b)
 VALUES (f.x, 'q'::text);`); rule actions (`DO INSERT ...`) are printed as written, and their pretty
 form fails with `0A000`; policy expressions are not deparsed. Syntax and scanner errors in a client's
 query report PostgreSQL's wording and cursor position (the `P` field that psql shows as `LINE 1:` and a caret), but

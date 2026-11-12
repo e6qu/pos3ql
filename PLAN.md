@@ -357,10 +357,10 @@ that walk, so a cascade lists its objects in the order the statement drops
 them (`DROP TABLE t CASCADE` lists a view over a materialized view of `t`
 before the materialized view) where PostgreSQL follows the walk; the walk's
 objects would have to be described before they are dropped, into a fixed
-per-statement buffer; `pg_depend` still lacks PostgreSQL's rows for TOAST tables, types
-named only inside
-expressions (a cast in a default or routine body) and the column-level
-rows of views that read a sequence. `pg_rewrite` lists no rules of built-in views (PostgreSQL has 145
+per-statement buffer; `pg_depend` still lacks PostgreSQL's rows for types named only inside
+expressions (a cast to a domain in a default or routine body) and the
+column-level rows of views that read a sequence (`SELECT last_value FROM sq`
+depends on `column last_value of sequence sq`). `pg_rewrite` lists no rules of built-in views (PostgreSQL has 145
 `_RETURN` rules, at OID `reltype + 1`, and `pg_settings_u`/`pg_settings_n`),
 and `ALTER VIEW` and `ALTER MATERIALIZED VIEW` accept only their own actions,
 so `ALTER VIEW v DISABLE RULE r` fails with `42601` where PostgreSQL reports

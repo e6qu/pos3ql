@@ -53302,6 +53302,52 @@ impl Storage {
         .map(move |(slot, operator)| (slot, operator.definition_for(txid)))
     }
 
+    /// Whether a visible operator of this database named `name` lives in a
+    /// schema on the search path. Builtin operator evaluation asks this per
+    /// row, so it scans under one lock and copies only matching names.
+    pub(crate) fn has_operator_named_on_path(&self, name: &str, txid: u32) -> bool {
+        const BATCH: usize = 16;
+        let mut next = 0;
+        loop {
+            let mut schemas = [None; BATCH];
+            let mut found = 0;
+            let mut resume = None;
+            {
+                let catalog = self
+                    .operator_catalog
+                    .lock()
+                    .expect("operator catalog lock poisoned");
+                for (slot, operator) in catalog.operators.iter().enumerate().skip(next) {
+                    if !(operator.database == current_database() && operator.visible_to(txid)) {
+                        continue;
+                    }
+                    let definition = operator.definition_for(txid);
+                    if definition.name.as_str() != name {
+                        continue;
+                    }
+                    if found == BATCH {
+                        resume = Some(slot);
+                        break;
+                    }
+                    schemas[found] = Some(definition.schema);
+                    found += 1;
+                }
+            }
+            // The search path is read without the operator catalog's lock.
+            if schemas[..found]
+                .iter()
+                .flatten()
+                .any(|schema| self.schema_is_on_path(*schema, txid))
+            {
+                return true;
+            }
+            match resume {
+                Some(slot) => next = slot,
+                None => return false,
+            }
+        }
+    }
+
     pub(crate) fn operator_count(&self) -> usize {
         self.operator_catalog
             .lock()

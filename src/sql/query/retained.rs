@@ -270,6 +270,11 @@ pub(crate) struct RetainedSelect<'a> {
     sublinks: &'a [&'a Expr<'a>],
     /// Their results, kept in the reader's allocation once run.
     subqueries: Option<crate::sql::eval::SubqueryValues<'a, 'a>>,
+    /// The statement's `WHERE`, whose conjuncts that read no column run once
+    /// before the first row (PostgreSQL's one-time filter).
+    one_time: Option<&'a Expr<'a>>,
+    /// A one-time filter was not true: the statement returns no rows.
+    filtered_out: bool,
 }
 
 fn description_too_large(mode: RetainedMode) -> SqlError {
@@ -3100,6 +3105,7 @@ impl<'a> RetainedSelect<'a> {
         let subqueries = SubqueryValues {
             scalars: &[],
             lists: &[],
+            initplans: None,
         };
         patch_subquery_column_types(
             statement.items,
@@ -3371,6 +3377,8 @@ impl<'a> RetainedSelect<'a> {
             description,
             sublinks,
             subqueries: None,
+            one_time: statement.where_clause,
+            filtered_out: false,
         }))
     }
 
@@ -3457,6 +3465,7 @@ impl<'a> RetainedSelect<'a> {
         let subqueries = SubqueryValues {
             scalars: &[],
             lists: &[],
+            initplans: None,
         };
         patch_subquery_column_types(
             statement.items,
@@ -3643,6 +3652,8 @@ impl<'a> RetainedSelect<'a> {
             description,
             sublinks,
             subqueries: None,
+            one_time: statement.where_clause,
+            filtered_out: false,
         }))
     }
 
@@ -3664,30 +3675,42 @@ impl<'a> RetainedSelect<'a> {
             matches!(self.plan.bounds(), RowBounds::Active { .. }),
             "statement bounds must be prepared"
         );
+        if self.filtered_out {
+            return Ok(false);
+        }
+        let first = self.subqueries.is_none();
         if !self.sublinks.is_empty() && self.subqueries.is_none() {
-            // Before any build or row, as the general executor runs them
-            // before its scan; a wait here reruns them, no row exists yet.
-            let values = super::subquery::eval_subquery_nodes(
+            // Each runs when an expression first reads it, as PostgreSQL's
+            // initPlans do, and keeps its value in the reader's allocation.
+            let initplans = super::subquery::UncorrelatedSubqueries::plans(
                 self.sublinks,
                 storage,
                 txid,
-                work,
-                params,
-                super::SUBQUERY_DEPTH,
-                None,
-                None,
-            )?;
-            self.subqueries = Some(
-                super::subquery::detach_subquery_values(values, state_arena).map_err(|_| {
-                    // Like a build that does not fit: the statement runs
-                    // spooled, or in the general executor, instead.
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "subquery results exceed the retained reader's allocation"
-                    )
-                    .plan_build_exhausted()
-                })?,
-            );
+                state_arena,
+            )
+            .map_err(|_| {
+                // Like a build that does not fit: the statement runs
+                // spooled, or in the general executor, instead.
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "subquery plans exceed the retained reader's allocation"
+                )
+                .plan_build_exhausted()
+            })?;
+            self.subqueries = Some(crate::sql::eval::SubqueryValues {
+                scalars: &[],
+                lists: &[],
+                initplans,
+            });
+        }
+        // A grouping still returns its one row over no input, so it filters
+        // its input row by row instead.
+        if first
+            && self.plan.group().is_none()
+            && !self.one_time_filter_passes(storage, txid, work, params)?
+        {
+            self.filtered_out = true;
+            return Ok(false);
         }
         self.plan.advance(&mut Pull {
             scope: &self.scope,
@@ -3700,6 +3723,29 @@ impl<'a> RetainedSelect<'a> {
             params,
             subqueries: self.subqueries.as_ref(),
         })
+    }
+
+    /// Evaluates the statement's one-time filter before its first row.
+    fn one_time_filter_passes<'w>(
+        &'w self,
+        storage: &'w Storage,
+        txid: u32,
+        work: &'w Arena,
+        params: &[Datum<'w>],
+    ) -> Result<bool, SqlError> {
+        let catalog = StorageCatalog {
+            storage,
+            routine_workspace: work,
+            txid,
+            invocations: None,
+            statement_arena: None,
+        };
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            subs: self.subqueries.as_ref(),
+            ..super::super::eval::NO_HOOKS
+        };
+        super::scan::one_time_filter_passes(self.one_time, &self.scope, work, params, &hooks, None)
     }
 
     /// Moves an appended query to its next row.

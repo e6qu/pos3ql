@@ -60929,7 +60929,7 @@ fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
     };
     match expression {
         Expr::Column { qualifier, name } => column(*qualifier, name),
-        Expr::RoutineParam { .. } => Ok(()),
+        Expr::RoutineParam { .. } | Expr::OuterAggregate { .. } => Ok(()),
         Expr::SchemaColumn {
             schema,
             table,

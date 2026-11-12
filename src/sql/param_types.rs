@@ -61,13 +61,17 @@ impl ParameterInference<'_> {
         oids: &mut [i32],
     ) {
         match statement {
-            Stmt::Select(select) => self.infer_resolved_select_params(select, txid, arena, oids),
+            Stmt::Select(select) => {
+                self.infer_resolved_select_params(select, None, txid, arena, oids)
+            }
             Stmt::SetQuery(query) => {
-                self.infer_resolved_set_tree_params(query.body, txid, arena, oids);
+                self.infer_resolved_set_tree_params(query.body, None, txid, arena, oids);
                 for cte in query.with {
                     match cte.dml {
                         Some(dml) => self.infer_resolved_stmt_params(dml, txid, arena, oids),
-                        None => self.infer_resolved_select_params(cte.query, txid, arena, oids),
+                        None => {
+                            self.infer_resolved_select_params(cte.query, None, txid, arena, oids)
+                        }
                     }
                 }
             }
@@ -75,14 +79,16 @@ impl ParameterInference<'_> {
                 for cte in *ctes {
                     match cte.dml {
                         Some(dml) => self.infer_resolved_stmt_params(dml, txid, arena, oids),
-                        None => self.infer_resolved_select_params(cte.query, txid, arena, oids),
+                        None => {
+                            self.infer_resolved_select_params(cte.query, None, txid, arena, oids)
+                        }
                     }
                 }
                 self.infer_resolved_stmt_params(statement, txid, arena, oids);
             }
             Stmt::Insert(insert) => {
                 if let Some(select) = insert.select {
-                    self.infer_resolved_select_params(select, txid, arena, oids);
+                    self.infer_resolved_select_params(select, None, txid, arena, oids);
                 }
             }
             Stmt::Call {
@@ -133,35 +139,39 @@ impl ParameterInference<'_> {
     fn infer_resolved_set_tree_params<'a>(
         &'a self,
         tree: &'a ast::SetTree<'a>,
+        outer: Option<&query::QueryScope<'a>>,
         txid: u32,
         arena: &'a Arena,
         oids: &mut [i32],
     ) {
         match tree {
             ast::SetTree::Select(select) => {
-                self.infer_resolved_select_params(select, txid, arena, oids)
+                self.infer_resolved_select_params(select, outer, txid, arena, oids)
             }
             ast::SetTree::Op { left, right, .. } => {
-                self.infer_resolved_set_tree_params(left, txid, arena, oids);
-                self.infer_resolved_set_tree_params(right, txid, arena, oids);
+                self.infer_resolved_set_tree_params(left, outer, txid, arena, oids);
+                self.infer_resolved_set_tree_params(right, outer, txid, arena, oids);
             }
         }
     }
 
+    /// `outer` is the enclosing query's scope, which a correlated subquery's
+    /// columns resolve against after its own.
     fn infer_resolved_select_params<'a>(
         &'a self,
         select: &'a ast::Select<'a>,
+        outer: Option<&query::QueryScope<'a>>,
         txid: u32,
         arena: &'a Arena,
         oids: &mut [i32],
     ) {
         if let Some(tree) = select.set_body {
-            self.infer_resolved_set_tree_params(tree, txid, arena, oids);
+            self.infer_resolved_set_tree_params(tree, outer, txid, arena, oids);
         }
         for cte in select.with {
             match cte.dml {
                 Some(dml) => self.infer_resolved_stmt_params(dml, txid, arena, oids),
-                None => self.infer_resolved_select_params(cte.query, txid, arena, oids),
+                None => self.infer_resolved_select_params(cte.query, outer, txid, arena, oids),
             }
         }
 
@@ -174,13 +184,24 @@ impl ParameterInference<'_> {
             }
             None => None,
         };
-        let resolver = scope.as_ref().map(|scope| query::CatalogScopeCols {
-            scope,
-            outer_scope: None,
-            storage: self.storage,
-            txid,
-            arena: self.arena,
-        });
+        let resolver = match (scope.as_ref(), outer) {
+            (Some(scope), outer) => Some(query::CatalogScopeCols {
+                scope,
+                outer_scope: outer,
+                storage: self.storage,
+                txid,
+                arena: self.arena,
+            }),
+            (None, Some(outer)) => Some(query::CatalogScopeCols {
+                scope: outer,
+                outer_scope: None,
+                storage: self.storage,
+                txid,
+                arena: self.arena,
+            }),
+            (None, None) => None,
+        };
+        let nested = scope.as_ref().or(outer);
         let infer = |expression: &Expr<'a>| {
             let inferred = match &resolver {
                 Some(resolver) => exec::infer_type_res(expression, resolver),
@@ -191,8 +212,9 @@ impl ParameterInference<'_> {
             (inferred != types::oid::UNKNOWN).then_some(inferred)
         };
 
-        let mut visit =
-            |expression| self.infer_expression_params(expression, txid, arena, oids, &infer);
+        let mut visit = |expression| {
+            self.infer_expression_params(expression, nested, txid, arena, oids, &infer)
+        };
         for item in select.items {
             match item {
                 ast::SelectItem::Expr { expression, .. }
@@ -223,6 +245,7 @@ impl ParameterInference<'_> {
     fn infer_expression_params<'a>(
         &'a self,
         expression: &'a Expr<'a>,
+        scope: Option<&query::QueryScope<'a>>,
         txid: u32,
         arena: &'a Arena,
         oids: &mut [i32],
@@ -349,15 +372,15 @@ impl ParameterInference<'_> {
                 }
             }
             Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => {
-                self.infer_resolved_select_params(select, txid, arena, oids);
+                self.infer_resolved_select_params(select, scope, txid, arena, oids);
             }
             Expr::InSubquery { select, .. } | Expr::QuantifiedSubquery { select, .. } => {
-                self.infer_resolved_select_params(select, txid, arena, oids);
+                self.infer_resolved_select_params(select, scope, txid, arena, oids);
             }
             _ => {}
         }
         query::walk_children(expression, &mut |child| {
-            self.infer_expression_params(child, txid, arena, oids, infer);
+            self.infer_expression_params(child, scope, txid, arena, oids, infer);
             Ok(())
         })
         .expect("parameter expression walk cannot fail");

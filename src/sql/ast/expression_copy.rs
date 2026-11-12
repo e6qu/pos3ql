@@ -178,6 +178,7 @@ pub(crate) fn duplicate_expression<'a>(
         | Expr::Column { .. }
         | Expr::RoutineParam { .. }
         | Expr::Param(_)
+        | Expr::OuterAggregate { .. }
         | Expr::DefaultMarker
         | Expr::Subquery(_)
         | Expr::RowSubquery { .. }
@@ -274,6 +275,7 @@ pub(crate) fn map_expression<'a, E: From<ArenaFull>>(
         | Expr::Column { .. }
         | Expr::RoutineParam { .. }
         | Expr::Param(_)
+        | Expr::OuterAggregate { .. }
         | Expr::DefaultMarker
         | Expr::Subquery(_)
         | Expr::RowSubquery { .. }

@@ -556,6 +556,12 @@ pub trait ColumnLookup<'a> {
         None
     }
 
+    /// The current group's value of an aggregate that this scope's query, or
+    /// an enclosing one, computes for a nested subquery (`Expr::OuterAggregate`).
+    fn outer_aggregate(&self, _call: *const Expr<'_>) -> Option<Datum<'a>> {
+        None
+    }
+
     /// Declared size/precision, or the registered shape of a record column.
     fn column_type_mod(&self, _qualifier: Option<&str>, _name: &str) -> i32 {
         -1
@@ -1232,6 +1238,10 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
 /// A reference to a lookup is itself a lookup, so `&dyn ColumnLookup` can be
 /// passed to the generic `eval`/`where_passes` helpers.
 impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
+    fn outer_aggregate(&self, call: *const Expr<'_>) -> Option<Datum<'a>> {
+        (**self).outer_aggregate(call)
+    }
+
     fn procedural_variable(
         &self,
         qualifier: Option<&str>,
@@ -2793,6 +2803,42 @@ pub struct SubqueryValues<'h, 'a> {
     /// all-NULL, matching PostgreSQL (which type-checks `x IN (...)` regardless
     /// of contents).
     pub lists: &'h [SubqueryList<'a>],
+    /// Uncorrelated scalar subqueries that run when first read.
+    pub initplans: Option<InitPlans<'a>>,
+}
+
+/// Uncorrelated scalar subqueries that run when an expression first reads
+/// them, as PostgreSQL's initPlans do, so an expression no row reaches never
+/// runs its subquery. Each keeps its value for the rest of the statement in
+/// the arena's persistent tail, which per-row recycling does not reclaim.
+#[derive(Clone, Copy)]
+pub struct InitPlans<'a> {
+    pub(crate) plans: &'a [InitPlan<'a>],
+    pub(crate) runner: &'a dyn InitPlanRunner,
+    /// The arena whose persistent tail keeps the results: the statement's,
+    /// or a retained reader's own, which outlives each row's work arena.
+    pub(crate) arena: &'a Arena,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct InitPlan<'a> {
+    pub(crate) node: *const Expr<'a>,
+    /// Once run, the address and length of the value and type witness,
+    /// encoded as one projected row in the persistent tail. A raw extent
+    /// keeps hooks covariant; the handle rejects a reset arena.
+    pub(crate) result: crate::mem::arena::ArenaHandle<Option<(*const u8, usize)>>,
+}
+
+pub(crate) trait InitPlanRunner {
+    /// Runs one uncorrelated scalar subquery and returns its value and type
+    /// witness encoded as one projected row in `arena`.
+    fn run<'a>(
+        &self,
+        node: &Expr<'a>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        sequences: Option<&dyn SequenceAccess>,
+    ) -> Result<&'a [u8], SqlError>;
 }
 
 pub enum SubqueryResult<'a> {
@@ -3103,6 +3149,7 @@ fn fold_check<'a>(
         | Expr::SchemaColumn { .. }
         | Expr::RecursiveState { .. }
         | Expr::Param(_)
+        | Expr::OuterAggregate { .. }
         | Expr::DefaultMarker => Ok(None),
         // Boolean connectives short-circuit like PostgreSQL's folding: a FALSE
         // (AND) / TRUE (OR) operand settles the result and drops the sibling,
@@ -3469,7 +3516,20 @@ fn eval_binary_values<'a>(
             return Ok(value);
         }
     }
-    if comparison_collation.is_some() {
+    // A number or boolean is never an enum's value, so neither operand's
+    // declared type can be an enum or a domain over one.
+    let not_enum = |value: &Datum<'_>| {
+        matches!(
+            value,
+            Datum::Bool(_)
+                | Datum::Int2(_)
+                | Datum::Int4(_)
+                | Datum::Int8(_)
+                | Datum::Float4(_)
+                | Datum::Float8(_)
+        )
+    };
+    if comparison_collation.is_some() && !(not_enum(&l) && not_enum(&r)) {
         validate_enum_operator_types(operator, left, right, row, hooks, arena)?;
     }
     if nulls == OperatorNulls::ReturnNull {
@@ -4270,6 +4330,70 @@ fn eval_full_inner<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
+    if matches!(
+        expression,
+        Expr::Subquery(_) | Expr::RowSubquery { .. } | Expr::ArraySubquery(_) | Expr::Exists(_)
+    ) && let Some(subs) = hooks.subs
+        && let Some(plans) = subs.initplans
+        && !subs
+            .scalars
+            .iter()
+            .any(|(node, _, _)| core::ptr::eq(*node, expression))
+        && let Some(plan) = plans
+            .plans
+            .iter()
+            .find(|plan| core::ptr::eq(plan.node, expression))
+    {
+        let encoded: &'a [u8] = match plans.arena.retained(plan.result) {
+            // SAFETY: the handle matched the owning arena's current identity,
+            // so the persistent-tail extent it records is still allocated, and
+            // that arena outlives this evaluation's.
+            Some(Some((start, len))) => unsafe { core::slice::from_raw_parts(start, len) },
+            Some(None) => {
+                let encoded = plans
+                    .runner
+                    .run(expression, arena, params, hooks.sequences)?;
+                let kept = plans
+                    .arena
+                    .alloc_persistent_slice_with(encoded.len(), |index| encoded[index])
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "an uncorrelated subquery's value exceeds the statement's memory"
+                        )
+                    })?;
+                plans
+                    .arena
+                    .replace_retained(plan.result, Some((kept.as_ptr(), kept.len())));
+                kept
+            }
+            None => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "an uncorrelated subquery's value outlived its statement"
+                ));
+            }
+        };
+        let scalars = [(
+            expression as *const Expr,
+            super::exec::decode_projected_col_record(encoded, 0, arena)?,
+            super::exec::decode_projected_col_record(encoded, 1, arena)?,
+        )];
+        return eval_full_inner(
+            expression,
+            arena,
+            params,
+            row,
+            &EvalHooks {
+                subs: Some(&SubqueryValues {
+                    scalars: &scalars,
+                    lists: subs.lists,
+                    initplans: subs.initplans,
+                }),
+                ..*hooks
+            },
+        );
+    }
     if let Some(executor) = hooks.subquery_executor
         && matches!(
             expression,
@@ -4308,6 +4432,7 @@ fn eval_full_inner<'a>(
                 SubqueryValues {
                     scalars: &scalars,
                     lists: &[],
+                    initplans: hooks.subs.and_then(|subs| subs.initplans),
                 }
             }
             SubqueryResult::List(list) => {
@@ -4318,6 +4443,7 @@ fn eval_full_inner<'a>(
                 SubqueryValues {
                     scalars: &[],
                     lists: &lists,
+                    initplans: hooks.subs.and_then(|subs| subs.initplans),
                 }
             }
         };
@@ -4476,6 +4602,19 @@ fn eval_full_inner<'a>(
         Expr::RecursiveState {
             qualifier, index, ..
         } => row.recursive_state(qualifier, index as usize),
+        Expr::OuterAggregate { call, .. } => {
+            let value = row.outer_aggregate(call).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "outer-level aggregate is evaluated outside its query's groups"
+                )
+            })?;
+            materialize_enum_values(
+                materialize_acl_value(value, hooks, arena)?,
+                hooks.catalog,
+                arena,
+            )
+        }
         Expr::Param(n) => params.get(n as usize - 1).copied().ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_PARAMETER,

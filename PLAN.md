@@ -118,7 +118,12 @@ is owned.
     and uncorrelated scalar, `EXISTS`, `ARRAY` and row subqueries of unsorted,
     ungrouped streams (correlated ones, `IN`/`ANY`/`ALL` lists, subqueries
     under a sort or grouping, grouped or bounded derived tables, and scans of
-    CTEs that run once),
+    CTEs that run once). A correlated subquery is analysed again for each
+    outer row: the general executor resolves its FROM scope, aggregate calls
+    and output type, and evaluates its operators without binding them first
+    (about 1 ms per outer row for a 50-row inner scan in a debug build).
+    Binding the subquery once per statement and rewinding a retained child
+    tree per row removes that,
     set operations other than `UNION ALL` (and `UNION ALL` under
     `ORDER BY`, in a declared cursor, or with volatile or routine-calling
     expressions), sorts in object-store mode (external runs
@@ -322,14 +327,24 @@ rejected with `0A000`, and a label-qualified loop variable (`<<l>> FOR i IN
 1..2 LOOP ... l.i`) fails as an unknown table; exception conditions are
 limited to a fixed list of names (`SQLSTATE` codes work for every condition);
 trigger functions cannot open cursors (`OPEN`, cursor `FOR` loops) and fail
-with `0A000`. An aggregate inside a subquery whose arguments read only an
-outer query's columns belongs to that outer query in PostgreSQL (`SELECT
-(SELECT max(t.id) FROM u) FROM t` aggregates `t`), but is computed per outer
-row here. An uncorrelated subquery runs before the query's first row,
-where PostgreSQL runs it at its first use (an initPlan) unless it sits in a
-`WHERE` or `HAVING` conjunct that reads no column of the query (a one-time
-filter): `SELECT (SELECT 1/x FROM z) FROM empty_table` fails with `22012`
-here and returns no rows in PostgreSQL. A SQL function whose earlier
+with `0A000`. An aggregate in a subquery that reads only an outer query's columns
+belongs to that query, as in PostgreSQL, except through a subquery in `FROM`
+or a set operation, whose outer references fail as missing FROM-clause
+entries (see below); a `UNION` subquery reading an outer column fails the same
+way, and a correlated `LIMIT` or `JOIN ... ON` inside a subquery cannot read
+an outer column. A subquery reading an aggregate of a query that also has
+window functions fails with `0A000`. `UPDATE` and `DELETE` run their
+subqueries once per statement, so a subquery correlated with the target table
+fails as a missing FROM-clause entry, and an aggregate of the target table in
+one is not rejected as PostgreSQL's `aggregate functions are not allowed in
+UPDATE`. An aggregate whose argument is a scalar subquery (`SELECT
+sum((SELECT v FROM u LIMIT 1)) FROM t`) fails with `42725` (`function sum is
+not unique`), and `CREATE VIEW` over a query with a correlated scalar
+subquery fails with `XX000` (`column dependency has no owning relation
+dependency`). An uncorrelated `IN`, `ANY` or `ALL` subquery runs before
+the query's first row, where PostgreSQL runs it at its first use: `SELECT id
+FROM t WHERE id IN (SELECT 1/x FROM z) AND false` fails with `22012` here and
+returns no rows in PostgreSQL. A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final

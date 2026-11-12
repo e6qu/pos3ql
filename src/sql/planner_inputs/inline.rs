@@ -1252,6 +1252,7 @@ fn expression_properties(
         Expr::Column { .. }
         | Expr::SchemaColumn { .. }
         | Expr::WholeRow(_)
+        | Expr::OuterAggregate { .. }
         | Expr::RoutineParam { .. }
         | Expr::Param(_) => Properties {
             constant: false,

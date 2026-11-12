@@ -4414,6 +4414,12 @@ impl Chained<'_, '_> {
 }
 
 impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
+    fn outer_aggregate(&self, call: *const Expr<'_>) -> Option<Datum<'a>> {
+        self.inner
+            .outer_aggregate(call)
+            .or_else(|| self.outer?.outer_aggregate(call))
+    }
+
     fn procedural_variable(
         &self,
         qualifier: Option<&str>,
@@ -5775,6 +5781,113 @@ pub(super) fn admit_sources(
     Ok(current_role)
 }
 
+/// Evaluates once, before any row, each `WHERE` conjunct that reads an
+/// uncorrelated subquery and no column of this query, as PostgreSQL's
+/// one-time filter does: one that is false or null leaves the scan empty
+/// without reading a row, and its error surfaces even over an empty source.
+/// The scan still applies the whole condition per row.
+pub(super) fn one_time_filter_passes<'a>(
+    where_clause: Option<&'a Expr<'a>>,
+    scope: &QueryScope<'_>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<bool, SqlError> {
+    let Some(predicate) = where_clause else {
+        return Ok(true);
+    };
+    let mut conjuncts = [&Expr::Null; MAX_ONE_TIME_CONJUNCTS];
+    let mut count = 0;
+    if !super::plan::flatten_and(predicate, &mut conjuncts, &mut count) {
+        // Longer conditions keep per-row evaluation only.
+        count = 0;
+    }
+    let row = Chained {
+        inner: &NoColumns,
+        outer,
+    };
+    for conjunct in &conjuncts[..count] {
+        // Only a conjunct reading an uncorrelated subquery can behave
+        // differently once than per row: that subquery runs when first read.
+        if !conjunct.contains_subquery()
+            || conjunct.contains_volatile_function().is_some()
+            || !reads_no_query_column(conjunct, scope, hooks)
+        {
+            continue;
+        }
+        // A value that is not boolean is left to the per-row evaluation,
+        // which reports it.
+        if matches!(
+            eval_full(conjunct, arena, params, &row, hooks)?,
+            Datum::Bool(false) | Datum::Null
+        ) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+const MAX_ONE_TIME_CONJUNCTS: usize = 64;
+
+/// Whether an expression reads no column of `scope`, and every subquery in it
+/// is one the query prepared without a row (an uncorrelated one).
+fn reads_no_query_column(
+    expression: &Expr<'_>,
+    scope: &QueryScope<'_>,
+    hooks: &EvalHooks<'_, '_>,
+) -> bool {
+    let prepared = |node: &Expr<'_>| {
+        let address = (node as *const Expr<'_>).cast::<()>();
+        hooks.subs.is_some_and(|subs| {
+            subs.scalars
+                .iter()
+                .any(|(candidate, _, _)| core::ptr::eq(candidate.cast::<()>(), address))
+                || subs
+                    .lists
+                    .iter()
+                    .any(|list| core::ptr::eq(list.node.cast::<()>(), address))
+                || subs.initplans.is_some_and(|plans| {
+                    plans
+                        .plans
+                        .iter()
+                        .any(|plan| core::ptr::eq(plan.node.cast::<()>(), address))
+                })
+        })
+    };
+    match expression {
+        // A name this query binds as a column or a whole row, or one it would
+        // reject, is the query's.
+        Expr::Column { qualifier, name } => {
+            matches!(
+                scope.find_column(*qualifier, name),
+                Err(error) if matches!(
+                    error.sqlstate.as_str(),
+                    sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+                )
+            ) && scope.table_index(qualifier.unwrap_or(name)).is_err()
+        }
+        Expr::WholeRow(name) => scope.table_index(name).is_err(),
+        Expr::SchemaColumn { .. } | Expr::RecursiveState { .. } | Expr::OuterAggregate { .. } => {
+            false
+        }
+        Expr::Subquery(_) | Expr::Exists(_) | Expr::ArraySubquery(_) | Expr::RowSubquery { .. } => {
+            prepared(expression)
+        }
+        Expr::InSubquery { operand, .. } | Expr::QuantifiedSubquery { operand, .. } => {
+            prepared(expression) && reads_no_query_column(operand, scope, hooks)
+        }
+        _ => {
+            let mut free = true;
+            let _ = super::subquery::walk_children(expression, &mut |child| {
+                free &= reads_no_query_column(child, scope, hooks);
+                Ok(())
+            });
+            free
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_source_mode<'a>(
     storage: &'a Storage,
@@ -5795,6 +5908,9 @@ fn scan_source_mode<'a>(
 ) -> Result<(), SqlError> {
     let current_role = admit_sources(storage, scope, txid, pax_demand)?;
     validate_materialized_view_reads(storage, scope, where_clause, arena, txid)?;
+    if !one_time_filter_passes(where_clause, scope, arena, params, hooks, outer)? {
+        return Ok(());
+    }
     let sample_plans = arena
         .alloc_slice_with(scope.n, |_| None::<TableSamplePlan>)
         .map_err(|_| arena_full())?;

@@ -305,6 +305,12 @@ pub(crate) fn expression_error(
     let message = error.message.as_str();
     match expression {
         Expr::Column { qualifier, name } => column_reference(error, *qualifier, name),
+        // An aggregate placed where its query cannot compute it.
+        Expr::Call {
+            source_position, ..
+        } if state == sqlstate::GROUPING_ERROR && message.starts_with("aggregate function") => {
+            at_parsed_offset(error, source_position.get())
+        }
         Expr::Cast {
             type_name,
             operand,

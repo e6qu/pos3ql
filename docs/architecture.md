@@ -243,6 +243,16 @@ driver itself, so a routine call there hands off on its row; a filter under a
 sort or grouping runs as that node reads its input
 (`src/sql/query/retained/tree.rs`).
 
+**Aggregate levels.** Before a query is planned, each aggregate call is
+given to the query PostgreSQL assigns it: the innermost one whose columns its
+arguments read. `SELECT (SELECT max(t.id) FROM u) FROM t` aggregates `t` and
+returns one row. Analysis rewrites such a call inside a subquery as an outer
+aggregate; the owning query folds it with its own aggregates and evaluates
+that subquery once per group, whose row supplies the value. The same pass
+reports PostgreSQL's placement errors (an aggregate in `WHERE`, `JOIN ... ON`,
+`GROUP BY`, `FILTER`, `LIMIT`, a function in `FROM`, or nested in another of
+its level) before any row is read (`src/sql/query/aggregate_levels.rs`).
+
 **Subqueries in FROM.** Before a query is planned, each simple subquery in its
 FROM clause is merged into it, as PostgreSQL's `pull_up_subqueries` does: the
 subquery's FROM items join the outer query in its place, its `WHERE` joins the
@@ -286,12 +296,15 @@ MATERIALIZED` spools (`src/sql/query/cte.rs`, `expand_stream_ctes`).
 
 **Built: uncorrelated subqueries.** A stream, or a top-level `SELECT` run in
 place, keeps scalar, `EXISTS`, `ARRAY` and row subqueries that read no column
-of its query and call no volatile or user-defined function. It runs them once
-before its first row, as the general executor runs them before its scan, and
-keeps their values in its own allocation (`result_stream_bytes`; one that
-does not fit spools for `capacity`), so `SELECT id, payload FROM orders WHERE
-id > (SELECT max(id) - 1000 FROM orders)` streams. A wait inside a subquery
-runs it again; no row exists yet. Correlated subqueries, `IN` and `ANY`/`ALL`
+of its query and call no volatile or user-defined function. Each runs when an
+expression first reads it, as PostgreSQL's initPlans do (in the general
+executor too), and keeps its value for the rest of the statement in the
+reader's allocation (`result_stream_bytes`) or the statement arena's
+persistent tail, so `SELECT (SELECT 1/x FROM z) FROM empty_table` returns no
+rows. A `WHERE` conjunct that reads no column of its query runs once before
+the scan, as PostgreSQL's one-time filter: `SELECT id, payload FROM orders
+WHERE id > (SELECT max(id) - 1000 FROM orders)` streams, and a false one
+returns no rows without reading any. A wait inside a subquery runs it again. Correlated subqueries, `IN` and `ANY`/`ALL`
 lists, subqueries in a sorted or grouped stream, in a `UNION ALL` query or
 in a declared cursor still spool or save their rows.
 
@@ -408,7 +421,7 @@ being built and are released when it is delivered.
 | `DISTINCT` (built: plain, as a grouping by the output list) | Each distinct output row | `plan_build_bytes` |
 | Sort (built: local mode, also for `DISTINCT ON`) | Sort keys, saved output and input columns of every row | `plan_build_bytes`; object-store mode: the external sorter's runs on the block grid (not built) |
 | Set operations (built: `UNION ALL` in streams) | `UNION ALL`: each query's own plan and the current query; others: sorted runs of both inputs with counts | Stream allocation; others: external runs |
-| Scalar, `EXISTS`, `ARRAY` and row subquery (built: uncorrelated, unsorted and ungrouped, run once before the first row) | Each value; correlated: a per-outer-row child tree, rewound per row | Stream allocation |
+| Scalar, `EXISTS`, `ARRAY` and row subquery (built: uncorrelated, unsorted and ungrouped, run when first read) | Each value; correlated: a per-outer-row child tree, rewound per row | Stream allocation |
 | `IN`/`ANY`/`ALL` subquery | A cached sorted run when uncorrelated, or a per-outer-row child tree | External run |
 | Derived table, CTE read once | Child tree in place | Its nodes |
 

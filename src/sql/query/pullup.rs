@@ -64,7 +64,10 @@ pub(super) fn pull_up_subqueries<'a>(
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<&'a Select<'a>, SqlError> {
-    let mut current = select;
+    // Aggregates are placed before any merge, as PostgreSQL's parse analysis
+    // assigns their levels before planning.
+    let mut current =
+        super::aggregate_levels::assign_aggregate_levels(select, storage, txid, arena)?;
     let mut next = 0usize;
     while let Some(from) = current.from.as_ref()
         && candidate_query(current)
@@ -1390,6 +1393,31 @@ impl<'a> Rewrite<'_, 'a> {
                     Ok(None)
                 } else {
                     self.column(*qualifier, name)
+                }
+            }
+            // The call reads the columns of the query that owns it; one owned
+            // outside the query being rewritten keeps its references.
+            Expr::OuterAggregate { call, levels_up } => {
+                let mut owner = level;
+                for _ in 1..*levels_up {
+                    owner = owner.and_then(|level| level.parent);
+                }
+                let Some(owner) = owner else {
+                    return Ok(None);
+                };
+                let mapped = self.expression(call, owner.parent)?;
+                if core::ptr::eq(mapped, *call) {
+                    Ok(None)
+                } else {
+                    Ok(Some(
+                        &*self
+                            .arena
+                            .alloc(Expr::OuterAggregate {
+                                call: mapped,
+                                levels_up: *levels_up,
+                            })
+                            .map_err(|_| Stop::full())?,
+                    ))
                 }
             }
             Expr::WholeRow(name) => {

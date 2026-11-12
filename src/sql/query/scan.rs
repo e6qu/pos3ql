@@ -7653,6 +7653,13 @@ fn scan_source_mode<'a>(
             ));
         }
     }
+    for (index, join) in from.joins.iter().enumerate() {
+        if join.kind == JoinKind::Full
+            && let Some(on) = join.on
+        {
+            super::plan::check_full_join_condition(on, scope, index + 1)?;
+        }
+    }
     let all_cross = from.joins.iter().all(|j| matches!(j.kind, JoinKind::Cross));
     let order = arena
         .alloc_slice_with(scope.n, |index| index)

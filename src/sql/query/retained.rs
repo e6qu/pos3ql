@@ -2119,7 +2119,9 @@ impl<'a> RetainedSelect<'a> {
     /// for a scrollable portal. LIMIT and OFFSET apply again. No row may be
     /// pending; nothing is allocated.
     pub(crate) fn rewind(&mut self, state_arena: &Arena) -> Result<(), SqlError> {
-        if !self.rewindable() || self.has_pending() {
+        // A join's outer levels hold rows for their inner levels between
+        // fetches; the join drops them itself.
+        if !self.rewindable() || self.plan.join().is_none() && self.has_pending() {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "retained cursor input cannot be rewound here"

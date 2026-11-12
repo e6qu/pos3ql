@@ -111,8 +111,9 @@ without grouping sets, other set operations, subqueries (a simple subquery in
 FROM is merged into its query first, below), CTEs that run once, row locking
 or row security, whose read position (one
 record per resident row of each table plus the query text) fits
-`result_stream_bytes`. A retained join uses inner, cross and `LEFT` joins
-whose `ON`/`USING` conditions are scalar, non-volatile and call no
+`result_stream_bytes`. A retained join uses inner, cross and `LEFT` joins,
+or one `RIGHT` or `FULL` join of two items whose right item is a table or
+`VALUES` list, whose `ON`/`USING` conditions are scalar, non-volatile and call no
 SQL-language routine; a join whose inner table the general executor would
 probe through an index for each outer row spools for `shape` instead. A
 sorted stream's keys and filter must be non-volatile and call no
@@ -289,6 +290,19 @@ indexed join into a full nested loop: a two-table equality join the general
 executor would hash is read as a hash join that builds the same side, and a
 join it would probe through an index per outer row is not retained.
 
+**Built: `RIGHT` and `FULL` joins.** As in the general executor, a `RIGHT`
+or `FULL` join of two items is a nested loop over the left item that keeps
+one flag per row of the right item, in a `plan_build_bytes` lease that
+grows as the first left row's pass reads the right item. Each right row that
+passes `ON` sets its flag; a `FULL JOIN` also returns each unmatched left
+row NULL-extended. After the last left row, the right item is read once
+more and each row whose flag is clear is returned with the left columns
+NULL, in the right item's order. A `FULL JOIN` whose `ON` condition, once
+constant conjuncts fold away, has no equality between an expression of the
+left tables and one of the right table fails with `0A000`, as PostgreSQL
+plans it only as a merge or hash join. A scrollable cursor rewinds both
+items and clears the flags.
+
 **Built: hash joins.** The build level reads its whole table once, at the
 join's first row (a declared cursor's at `DECLARE`), into three `plan_build_bytes` leases owned by the level:
 bucket heads sized from the planner's row estimate, one entry per row, and
@@ -358,7 +372,7 @@ being built and are released when it is delivered.
 |---|---|---|
 | Scan (built: table, literal list, generator calls, FROM-less row) | The read position and current row | Stream or cursor allocation |
 | Filter, projection, `LIMIT`/`OFFSET` (built) | The condition, items, and remaining counts | Node record |
-| Nested-loop join (built: inner, cross and `LEFT`) | Each level's row bytes, position and matched flag | The stream or cursor allocation; the inner source rewinds as scrollable cursors do |
+| Nested-loop join (built: inner, cross and `LEFT`; `RIGHT` and `FULL` of two items) | Each level's row bytes, position and matched flag; a flag per right row for `RIGHT`/`FULL` | The stream or cursor allocation, the right-row flags in `plan_build_bytes`; the inner source rewinds as scrollable cursors do |
 | Hash join (built: two tables, inner, cross and `LEFT`) | Build-side rows, entries and bucket heads | `plan_build_bytes` / `plan_build_leases`; exhaustion is `54000` naming them |
 | Grouping (built: `GROUP BY`, `HAVING`, aggregates) | Each group's key, states and held values; or every input row's keys and aggregated columns, then each group's keys and results | `plan_build_bytes` |
 | `DISTINCT` (built: plain, as a grouping by the output list) | Each distinct output row | `plan_build_bytes` |

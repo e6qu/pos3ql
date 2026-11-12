@@ -47,6 +47,51 @@ pub(super) struct JoinLevel<'a> {
     /// A hash join's build side: this level's source is read once into the
     /// table, which each row above probes.
     hash: Option<HashTable>,
+    /// A RIGHT or FULL join's inner level: which of its rows found a partner.
+    right: Option<RightMatches>,
+}
+
+/// One flag per row of a RIGHT or FULL join's inner source, by its position
+/// in the source's order, which every rescan repeats under the snapshot.
+/// After the outer rows, the unmatched rows return NULL-extended, as the
+/// general executor's post-pass returns them.
+struct RightMatches {
+    flags: MutableSlice<u8>,
+    /// Rows read in the current pass.
+    read: usize,
+    /// The pending row's position.
+    current: usize,
+}
+
+impl RightMatches {
+    /// Extends the flags to cover row `index` of the right item.
+    fn cover(&mut self, index: usize) -> Result<(), SqlError> {
+        while self.flags.len() <= index {
+            if self.flags.len() == self.flags.capacity_entries() {
+                // Grow geometrically, as a hash join's rows do.
+                let grown = self
+                    .flags
+                    .capacity_entries()
+                    .saturating_mul(2)
+                    .min(self.flags.max_entries())
+                    .max(index + 1);
+                self.flags.reserve_exact(grown).map_err(build_full)?;
+            }
+            self.flags.push_reserved(0).map_err(build_full)?;
+        }
+        Ok(())
+    }
+}
+
+/// How far a RIGHT or FULL join has read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RightPass {
+    /// No RIGHT or FULL join.
+    None,
+    Joining,
+    /// Returning the inner rows nothing matched.
+    Unmatched,
+    Done,
 }
 
 /// The equi-keys of a hash join the general executor would choose.
@@ -227,6 +272,7 @@ pub(super) struct JoinState<'a> {
     order: &'a [usize],
     levels: OwnedArenaSlice<'a, JoinLevel<'a>>,
     depth: usize,
+    right: RightPass,
 }
 
 fn source_ref<'a>(from: &'a FromClause<'a>, table: usize) -> &'a TableRef<'a> {
@@ -328,13 +374,25 @@ pub(super) fn join_shape<'a>(
         }
         *item = Some(shape);
     }
-    if !from.joins.iter().all(|join| {
-        matches!(
-            join.kind,
-            JoinKind::Inner | JoinKind::Cross | JoinKind::Left
-        )
-    }) {
-        return Ok(None);
+    // A RIGHT or FULL join reads as the general executor's nested loop with
+    // match flags: two items whose inner one is a table or literal list.
+    for (index, join) in from.joins.iter().enumerate() {
+        match join.kind {
+            JoinKind::Inner | JoinKind::Cross | JoinKind::Left => {}
+            JoinKind::Right | JoinKind::Full
+                if scope.n == 2
+                    && matches!(items[1], Some(ItemShape::Table | ItemShape::Literals(_))) =>
+            {
+                if join.kind == JoinKind::Full
+                    && let Some(on) = join.on
+                    && crate::sql::query::plan::check_full_join_condition(on, scope, index + 1)
+                        .is_err()
+                {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None),
+        }
     }
     let catalog = storage_catalog(storage, arena, txid);
     let columns = CatalogScopeCols {
@@ -551,6 +609,26 @@ pub(super) fn open_levels<'a>(
         Some(hash) if !eliminated => Some(HashTable::new(storage, hash)?),
         _ => None,
     };
+    let outer_join = |table: usize| (table > 0).then(|| from.joins[table - 1].kind);
+    let right_join = from
+        .joins
+        .iter()
+        .any(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full));
+    // The flags grow as the joining pass reads the right item: counting
+    // its rows first would read storage before the join could wait.
+    let mut right = if right_join {
+        let rows = scope.derived[shape.order[1]].map_or(64, <[_]>::len);
+        Some(RightMatches {
+            flags: storage
+                .plan_build()
+                .lease::<u8>(rows.max(1))
+                .map_err(build_full)?,
+            read: 0,
+            current: 0,
+        })
+    } else {
+        None
+    };
     let mut failure = None;
     let levels = arena
         .alloc_owned_slice_with(scope.n, |depth| {
@@ -584,13 +662,14 @@ pub(super) fn open_levels<'a>(
                     pending: None,
                     decoded_columns: masks[depth],
                 },
-                left: table > 0 && from.joins[table - 1].kind == JoinKind::Left,
+                left: matches!(outer_join(table), Some(JoinKind::Left | JoinKind::Full)),
                 on: on[depth],
                 pushdown: pushdown[depth],
                 matched: false,
                 checked: false,
                 restart: true,
                 hash: if depth == 1 { hash.take() } else { None },
+                right: if depth == 1 { right.take() } else { None },
             }
         })
         .map_err(|_| arena_full())?;
@@ -601,6 +680,11 @@ pub(super) fn open_levels<'a>(
         order: shape.order,
         levels,
         depth: 0,
+        right: if right_join {
+            RightPass::Joining
+        } else {
+            RightPass::None
+        },
     })
 }
 
@@ -630,9 +714,19 @@ impl<'a> JoinState<'a> {
         }
     }
 
-    /// Returns every level to its first row under the same snapshot. No row
-    /// may be pending.
+    /// Returns every level to its first row under the same snapshot. The
+    /// driver holds no joined row; the rows the outer levels still hold for
+    /// their inner levels are dropped, deepest first.
     pub(super) fn rewind(&mut self, state_arena: &Arena) -> Result<(), SqlError> {
+        if self.complete_row() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "retained join rewound with a joined row"
+            ));
+        }
+        for level in self.levels.iter_mut().rev() {
+            level.scan.release(state_arena);
+        }
         for level in self.levels.iter_mut() {
             if level.hash.is_none() {
                 level.scan.source.rewind(state_arena)?;
@@ -640,8 +734,15 @@ impl<'a> JoinState<'a> {
             level.matched = false;
             level.checked = false;
             level.restart = true;
+            if let Some(right) = &mut level.right {
+                right.flags.as_mut_slice().fill(0);
+                right.read = 0;
+            }
         }
         self.depth = 0;
+        if self.right != RightPass::None {
+            self.right = RightPass::Joining;
+        }
         Ok(())
     }
 
@@ -690,6 +791,10 @@ impl<'a> JoinState<'a> {
             if self.complete_row() {
                 return Ok(true);
             }
+            if self.right == RightPass::Done {
+                return Ok(false);
+            }
+            let pass = self.right;
             let depth = self.depth;
             if self.levels[depth].restart {
                 if self.levels[depth].hash.is_some() {
@@ -722,6 +827,9 @@ impl<'a> JoinState<'a> {
                 let level = &mut self.levels[depth];
                 level.restart = false;
                 level.matched = false;
+                if let Some(right) = &mut level.right {
+                    right.read = 0;
+                }
             }
             let level = &mut self.levels[depth];
             if level.scan.pending.is_none() {
@@ -771,8 +879,31 @@ impl<'a> JoinState<'a> {
                             saved: None,
                         });
                         level.checked = false;
+                        if let Some(right) = &mut level.right {
+                            right.current = right.read;
+                            right.read += 1;
+                            if pass == RightPass::Joining {
+                                right.cover(right.current)?;
+                            } else {
+                                // Rows no left row reached (none, when the
+                                // left item is empty) have no flag.
+                                let matched = right
+                                    .flags
+                                    .as_slice()
+                                    .get(right.current)
+                                    .copied()
+                                    .unwrap_or(0);
+                                if matched != 0 {
+                                    level.scan.pending = None;
+                                    unsafe { state_arena.rewind_to(mark) };
+                                    continue;
+                                }
+                                // The outer levels are NULL: no condition runs.
+                                level.checked = true;
+                            }
+                        }
                     }
-                    None if level.left && !level.matched => {
+                    None if level.left && !level.matched && pass != RightPass::Unmatched => {
                         // No partner: the levels above join a NULL row here.
                         level.matched = true;
                         level.scan.pending = Some(PendingRow {
@@ -785,7 +916,30 @@ impl<'a> JoinState<'a> {
                     }
                     None => {
                         unsafe { state_arena.rewind_to(mark) };
+                        if depth == 0 && pass == RightPass::Joining {
+                            // The outer rows are done: the inner level is
+                            // read once more, below a NULL outer row.
+                            self.right = RightPass::Unmatched;
+                            let outer = &mut self.levels[0];
+                            outer.scan.pending = Some(PendingRow {
+                                row: RetainedRow::Null,
+                                mark,
+                                counted: true,
+                                saved: None,
+                            });
+                            outer.checked = true;
+                            self.depth = 1;
+                            self.levels[1].restart = true;
+                            continue;
+                        }
                         if depth == 0 {
+                            return Ok(false);
+                        }
+                        if pass == RightPass::Unmatched {
+                            self.right = RightPass::Done;
+                            self.levels[1].restart = true;
+                            self.depth = 0;
+                            self.finish_row(state_arena);
                             return Ok(false);
                         }
                         // This level is exhausted for the row above it.
@@ -806,6 +960,15 @@ impl<'a> JoinState<'a> {
                 }
                 level.checked = true;
                 level.matched = true;
+                if let Some(right) = &mut level.right {
+                    *right
+                        .flags
+                        .as_mut_slice()
+                        .get_mut(right.current)
+                        .ok_or_else(|| {
+                            sql_err!(sqlstate::INTERNAL_ERROR, "join row count changed")
+                        })? = 1;
+                }
             }
             if depth + 1 < self.levels.len() {
                 self.depth += 1;

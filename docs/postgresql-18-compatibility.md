@@ -190,6 +190,15 @@ Syntax and errors:
   earlier writes, runs once for its row as in PostgreSQL: the write stops at
   that row, the whole trigger body runs, and the write continues with the
   row the body returned. Its notices, sequence values and writes appear once.
+- A trigger function may `RETURN` any row-valued expression, as in
+  PostgreSQL: `RETURN coalesce(NEW, OLD)` serves INSERT, UPDATE and DELETE
+  alike, and NULL skips the row in a `BEFORE` trigger. A `BEFORE INSERT` or
+  `UPDATE` trigger's row becomes the written row. A row whose column count or
+  types (by position) differ from the table's fails with `42804` (`returned
+  row structure does not match the structure of the triggering table`) at
+  function exit, and a non-row value fails at the `RETURN`. A whole-row
+  reference such as `NEW` or `t` keeps each column's declared domain, enum or
+  composite type.
 - `session_replication_role` (superusers, or roles granted `SET` on it)
   chooses which triggers and rules fire, as in PostgreSQL: `replica` fires
   those enabled `REPLICA` or `ALWAYS`; `origin` (the default) and `local`

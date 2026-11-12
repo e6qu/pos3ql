@@ -128,6 +128,30 @@ pub(super) fn routine_exit_error(
     invocation: TriggerInvocation<'_>,
     error: SqlError,
 ) -> SqlError {
+    exit_phase_error(
+        context,
+        invocation,
+        error,
+        "while casting return value to function's return type",
+    )
+}
+
+/// Runs a trigger function's check of its returned row, which PostgreSQL
+/// reports `during function exit`.
+pub(super) fn at_trigger_exit<T>(
+    context: &TriggerExecContext<'_, '_, '_>,
+    invocation: TriggerInvocation<'_>,
+    run: impl FnOnce() -> Result<T, SqlError>,
+) -> Result<T, SqlError> {
+    run().map_err(|error| exit_phase_error(context, invocation, error, "during function exit"))
+}
+
+fn exit_phase_error(
+    context: &TriggerExecContext<'_, '_, '_>,
+    invocation: TriggerInvocation<'_>,
+    error: SqlError,
+    phase: &'static str,
+) -> SqlError {
     if error.sqlstate.internal_control().is_some() {
         return error;
     }
@@ -140,7 +164,7 @@ pub(super) fn routine_exit_error(
     } else {
         ProceduralActivity::Phase {
             source: None,
-            text: "while casting return value to function's return type",
+            text: phase,
         }
     };
     let frame = ProceduralFrame::new(signature, None, activity);

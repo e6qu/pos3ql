@@ -383,6 +383,11 @@ SQL/JSON result types) are reported when the statement would run. In a
 `SELECT`, an unknown relation, a modifier's unknown type and an output column
 written before the failing modifier are reported first, as PostgreSQL's
 analysis order finds them; in other statements the modifier error comes first.
+A trigger's returned row is checked by column type identity only: a
+`varchar(5)` column accepts a returned `varchar(10)` field where PostgreSQL
+also compares type modifiers. A field selected from a function's row result
+(`(coalesce(NEW, OLD)).label`) has its storage type, not a domain column's
+declared type. `ROW(...)::t` for a table's row type fails with `42846`.
 Foreign key internal triggers (`RI_ConstraintTrigger_*` in `pg_trigger`)
 always stay `ORIGIN`: `ALTER TABLE ... DISABLE TRIGGER ALL`, `ENABLE ALWAYS
 TRIGGER ALL` and naming one of them leave foreign key checks and actions as

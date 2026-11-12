@@ -142,6 +142,14 @@ impl<'values, 'schema, 'rows> TriggerFiring<'values, 'schema, 'rows> {
                 TriggerReturnValue::New if self.binding.before && self.binding.new.is_none() => {
                     Ok(false)
                 }
+                TriggerReturnValue::Value(Datum::Null) => Ok(!self.binding.before),
+                TriggerReturnValue::Value(row) => {
+                    let invocation = self.binding.invocation;
+                    control_flow::at_trigger_exit(context, invocation, || {
+                        self.adopt_returned_row(context, row)
+                    })?;
+                    Ok(true)
+                }
                 _ => Ok(true),
             },
             None => control_flow::at_routine_exit(context, self.binding.invocation, || {
@@ -154,6 +162,74 @@ impl<'values, 'schema, 'rows> TriggerFiring<'values, 'schema, 'rows> {
                 Err(unsupported_trigger_body())
             }
         }
+    }
+
+    /// A row trigger's returned row must have the triggering relation's
+    /// column types by position (PostgreSQL's `convert_tuples_by_position`);
+    /// a BEFORE INSERT or UPDATE trigger's row becomes the written row.
+    fn adopt_returned_row(
+        &mut self,
+        context: &TriggerExecContext<'_, 'values, '_>,
+        row: Datum<'values>,
+    ) -> Result<(), SqlError> {
+        let fields = match row {
+            Datum::Record(fields) | Datum::Composite { fields, .. } => fields,
+            _ => {
+                return Err(invalid("trigger returned row was not materialized"));
+            }
+        };
+        let storage = context.storage();
+        let txid = context.txn.txid;
+        let mismatch = |detail: core::fmt::Arguments<'_>| {
+            let mut text = crate::util::StackStr::<512>::new();
+            let _ = core::fmt::Write::write_fmt(&mut text, detail);
+            crate::sql::eval::stash_object_diagnostic(
+                Some(text.as_str()),
+                crate::sql::eval::ErrorObjects::default(),
+            );
+            sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "returned row structure does not match the structure of the triggering table"
+            )
+        };
+        let columns = &self.binding.definition.columns[..self.binding.definition.n_columns];
+        for (position, column) in columns.iter().enumerate() {
+            let Some(field) = fields.get(position) else {
+                break;
+            };
+            let expected = storage
+                .routine_type_oid(column.ctype, column.user_type, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "column type identity is unavailable"
+                    )
+                })?;
+            if field.type_oid != expected {
+                return Err(mismatch(format_args!(
+                    "Returned type {} does not match expected type {} in column \"{}\" (position {}).",
+                    crate::sql::catalog::format_type_name(storage, txid, field.type_oid)?.as_str(),
+                    crate::sql::catalog::format_type_name(storage, txid, expected)?.as_str(),
+                    column.name.as_str(),
+                    position + 1
+                )));
+            }
+        }
+        if fields.len() != columns.len() {
+            return Err(mismatch(format_args!(
+                "Number of returned columns ({}) does not match expected column count ({}).",
+                fields.len(),
+                columns.len()
+            )));
+        }
+        if self.binding.before
+            && let Some(new) = self.binding.new.as_deref_mut()
+        {
+            for (slot, field) in new.iter_mut().zip(fields) {
+                *slot = field.value;
+            }
+        }
+        Ok(())
     }
 
     #[expect(

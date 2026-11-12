@@ -3806,6 +3806,36 @@ pub(crate) fn routine_input_handoff(
     handoff
 }
 
+/// A whole-row value's fields carry their declared column types, as
+/// PostgreSQL's row type does: a domain, enum or composite column keeps its
+/// own type rather than its storage type.
+fn declared_whole_row_fields<'a>(
+    row: &impl ColumnLookup<'a>,
+    table: &str,
+    fields: &'a [super::types::RecordField<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    arena: &'a Arena,
+) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
+    let declared = |index: usize| {
+        row.whole_row_field_metadata(table, index, hooks.catalog)
+            .map(|(_, metadata)| metadata.type_oid)
+    };
+    if !fields
+        .iter()
+        .enumerate()
+        .any(|(index, field)| declared(index).is_some_and(|oid| oid != field.type_oid))
+    {
+        return Ok(fields);
+    }
+    let copy = arena.alloc_slice_copy(fields).map_err(|_| arena_full())?;
+    for (index, field) in copy.iter_mut().enumerate() {
+        if let Some(oid) = declared(index) {
+            field.type_oid = oid;
+        }
+    }
+    Ok(copy)
+}
+
 pub fn eval_full<'a>(
     expression: &Expr<'a>,
     arena: &'a Arena,
@@ -4453,7 +4483,9 @@ fn eval_full_inner<'a>(
             Some(fields) if row.whole_row_is_scalar(table) => {
                 Ok(fields.first().map(|f| f.value).unwrap_or(Datum::Null))
             }
-            Some(fields) => Ok(Datum::Record(fields)),
+            Some(fields) => Ok(Datum::Record(declared_whole_row_fields(
+                row, table, fields, hooks, arena,
+            )?)),
             None => Ok(Datum::Null), // outer-join null row
         },
         Expr::Bool(b) => Ok(Datum::Bool(b)),
@@ -4478,7 +4510,9 @@ fn eval_full_inner<'a>(
                     Ok(Some(fields)) if row.whole_row_is_scalar(name) => {
                         Ok(fields.first().map(|f| f.value).unwrap_or(Datum::Null))
                     }
-                    Ok(Some(fields)) => Ok(Datum::Record(fields)),
+                    Ok(Some(fields)) => Ok(Datum::Record(declared_whole_row_fields(
+                        row, name, fields, hooks, arena,
+                    )?)),
                     Ok(None) => Ok(Datum::Null),
                     Err(_) => Err(crate::sql::error_position::column_reference(
                         e, qualifier, name,

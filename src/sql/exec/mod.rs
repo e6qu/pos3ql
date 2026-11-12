@@ -21176,6 +21176,9 @@ fn parse_trigger_return<'a>(
         PlpgsqlProgramKind::Trigger if value.eq_ignore_ascii_case("new") => TriggerReturn::New,
         PlpgsqlProgramKind::Trigger if value.eq_ignore_ascii_case("old") => TriggerReturn::Old,
         PlpgsqlProgramKind::Trigger if value.eq_ignore_ascii_case("null") => TriggerReturn::Null,
+        PlpgsqlProgramKind::Trigger if !value.is_empty() => {
+            TriggerReturn::Value(parse_plpgsql_expression(value, arena)?)
+        }
         PlpgsqlProgramKind::EventTrigger
         | PlpgsqlProgramKind::Procedure
         | PlpgsqlProgramKind::Anonymous
@@ -30159,12 +30162,29 @@ fn execute_trigger_step_in<'a>(
                             invocation,
                             transition: &transition,
                         };
-                        TriggerReturnValue::Value(eval_procedural_expression(
+                        let value = eval_procedural_expression(
                             context,
                             expression,
                             &scope,
                             retained_parent.then_some(&mut status.pending_query),
-                        )?)
+                        )?;
+                        // A trigger function returns a row: PostgreSQL's
+                        // `exec_stmt_return` rejects any other non-NULL value.
+                        if invocation.program_kind == PlpgsqlProgramKind::Trigger
+                            && !matches!(
+                                value,
+                                Datum::Null
+                                    | Datum::Record(_)
+                                    | Datum::Composite { .. }
+                                    | Datum::CompositeText { .. }
+                            )
+                        {
+                            return Err(sql_err!(
+                                sqlstate::DATATYPE_MISMATCH,
+                                "cannot return non-composite value from function returning composite type"
+                            ));
+                        }
+                        TriggerReturnValue::Value(value)
                     }
                 };
                 Ok(Some(TriggerFlow::Return(result)))

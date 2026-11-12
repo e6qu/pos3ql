@@ -3245,47 +3245,371 @@ const MAX_VIEW_DEPTH: u32 = 12;
 /// Number of references to the unqualified table name `name` anywhere in a
 /// select — FROM items (recursing into derived-table subqueries), the set-op
 /// body, and expression subqueries.
-fn select_references(s: &Select, name: &str) -> usize {
-    let mut count = s.set_body.map_or(0, |tree| set_tree_references(tree, name));
+fn select_references(select: &Select, name: &str) -> usize {
+    select_relations(select, &mut |table| unqualified_reference(table, name))
+}
+
+fn statement_references(statement: &Stmt<'_>, name: &str) -> usize {
+    statement_relations(statement, &mut |table| unqualified_reference(table, name))
+}
+
+fn cte_references(cte: &Cte<'_>, name: &str) -> usize {
+    cte_relations(cte, &mut |table| unqualified_reference(table, name))
+}
+
+fn set_tree_references(tree: &SetTree, name: &str) -> usize {
+    set_tree_relations(tree, &mut |table| unqualified_reference(table, name))
+}
+
+/// [`select_relations`] for a set-operation query.
+pub(crate) fn set_query_relations(
+    query: &crate::sql::ast::SetQuery<'_>,
+    visit: &mut dyn FnMut(&TableRef<'_>) -> usize,
+) -> usize {
+    statement_relations(&Stmt::SetQuery(*query), visit)
+}
+
+fn unqualified_reference(table: &TableRef<'_>, name: &str) -> usize {
+    usize::from(table.schema.is_none() && !table.is_function_source() && table.table == name)
+}
+
+/// Visits every relation reference of `select`, in its `FROM` lists, `WITH`
+/// queries and expression subqueries, summing what `visit` counts. A derived
+/// table is visited through its query.
+pub(crate) fn select_relations(s: &Select, visit: &mut dyn FnMut(&TableRef<'_>) -> usize) -> usize {
+    let mut count = s.set_body.map_or(0, |tree| set_tree_relations(tree, visit));
     if let Some(f) = &s.from {
-        count += from_references(f, name);
+        count += from_relations(f, visit);
     }
     for it in s.items {
-        count += select_item_references(it, name);
+        count += select_item_relations(it, visit);
     }
     count += s
         .where_clause
-        .map_or(0, |expression| expr_references(expression, name));
+        .map_or(0, |expression| expr_relations(expression, visit));
     count += s
         .having
-        .map_or(0, |expression| expr_references(expression, name));
+        .map_or(0, |expression| expr_relations(expression, visit));
     count += s
         .group_by
         .iter()
-        .map(|expression| expr_references(expression, name))
+        .map(|expression| expr_relations(expression, visit))
         .sum::<usize>();
     count += s
         .distinct_on
         .iter()
-        .map(|expression| expr_references(expression, name))
+        .map(|expression| expr_relations(expression, visit))
         .sum::<usize>();
     count += s
         .order_by
         .iter()
-        .map(|order| expr_references(order.expression, name))
+        .map(|order| expr_relations(order.expression, visit))
         .sum::<usize>();
     count += s
         .limit
-        .map_or(0, |expression| expr_references(expression, name));
+        .map_or(0, |expression| expr_relations(expression, visit));
     count += s
         .offset
-        .map_or(0, |expression| expr_references(expression, name));
+        .map_or(0, |expression| expr_relations(expression, visit));
     count += s
         .with
         .iter()
-        .map(|cte| cte_references(cte, name))
+        .map(|cte| cte_relations(cte, visit))
         .sum::<usize>();
     count
+}
+
+fn cte_relations(cte: &Cte<'_>, visit: &mut dyn FnMut(&TableRef<'_>) -> usize) -> usize {
+    match cte.dml {
+        Some(statement) => statement_relations(statement, visit),
+        None => select_relations(cte.query, visit),
+    }
+}
+
+fn select_item_relations(
+    item: &SelectItem<'_>,
+    visit: &mut dyn FnMut(&TableRef<'_>) -> usize,
+) -> usize {
+    match item {
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+            expr_relations(expression, visit)
+        }
+        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => 0,
+    }
+}
+
+fn from_relations(from: &FromClause<'_>, visit: &mut dyn FnMut(&TableRef<'_>) -> usize) -> usize {
+    tref_relations(&from.base, visit)
+        + from
+            .joins
+            .iter()
+            .map(|join| {
+                tref_relations(&join.table, visit)
+                    + join.on.map_or(0, |on| expr_relations(on, visit))
+            })
+            .sum::<usize>()
+}
+
+fn returning_relations(
+    items: &[SelectItem<'_>],
+    visit: &mut dyn FnMut(&TableRef<'_>) -> usize,
+) -> usize {
+    items
+        .iter()
+        .map(|item| select_item_relations(item, visit))
+        .sum()
+}
+
+fn statement_relations(
+    statement: &Stmt<'_>,
+    visit: &mut dyn FnMut(&TableRef<'_>) -> usize,
+) -> usize {
+    match statement {
+        Stmt::Select(select) => select_relations(select, visit),
+        Stmt::SetQuery(query) => {
+            set_tree_relations(query.body, visit)
+                + query
+                    .order_by
+                    .iter()
+                    .map(|order| expr_relations(order.expression, visit))
+                    .sum::<usize>()
+                + query
+                    .limit
+                    .map_or(0, |expression| expr_relations(expression, visit))
+                + query
+                    .offset
+                    .map_or(0, |expression| expr_relations(expression, visit))
+        }
+        Stmt::With { ctes, statement } => {
+            ctes.iter()
+                .map(|cte| cte_relations(cte, visit))
+                .sum::<usize>()
+                + statement_relations(statement, visit)
+        }
+        Stmt::Insert(insert) => {
+            insert
+                .select
+                .map_or(0, |select| select_relations(select, visit))
+                + insert
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.iter())
+                    .map(|expression| expr_relations(expression, visit))
+                    .sum::<usize>()
+                + insert.on_conflict.map_or(0, |conflict| {
+                    conflict
+                        .target
+                        .iter()
+                        .map(|target| expr_relations(target.expression, visit))
+                        .sum::<usize>()
+                        + conflict.update.map_or(0, |assignments| {
+                            assignments
+                                .iter()
+                                .map(|(_, expression)| expr_relations(expression, visit))
+                                .sum::<usize>()
+                        })
+                        + conflict
+                            .update_where
+                            .map_or(0, |expression| expr_relations(expression, visit))
+                })
+                + returning_relations(insert.returning.items, visit)
+        }
+        Stmt::Update(update) => {
+            update.from.map_or(0, |from| from_relations(from, visit))
+                + update
+                    .assignments
+                    .iter()
+                    .map(|(_, expression)| expr_relations(expression, visit))
+                    .sum::<usize>()
+                + update
+                    .where_clause
+                    .map_or(0, |expression| expr_relations(expression, visit))
+                + returning_relations(update.returning.items, visit)
+        }
+        Stmt::Delete(delete) => {
+            delete.using.map_or(0, |from| from_relations(from, visit))
+                + delete
+                    .where_clause
+                    .map_or(0, |expression| expr_relations(expression, visit))
+                + returning_relations(delete.returning.items, visit)
+        }
+        Stmt::Merge(merge) => {
+            tref_relations(&merge.source, visit)
+                + expr_relations(merge.on, visit)
+                + merge
+                    .whens
+                    .iter()
+                    .map(|when| {
+                        when.condition()
+                            .map_or(0, |condition| expr_relations(condition, visit))
+                            + match when.action() {
+                                crate::sql::ast::MergeActionRef::Update(assignments) => assignments
+                                    .iter()
+                                    .map(|(_, expression)| expr_relations(expression, visit))
+                                    .sum(),
+                                crate::sql::ast::MergeActionRef::Insert { values, .. } => values
+                                    .iter()
+                                    .map(|expression| expr_relations(expression, visit))
+                                    .sum(),
+                                crate::sql::ast::MergeActionRef::Delete
+                                | crate::sql::ast::MergeActionRef::DoNothing => 0,
+                            }
+                    })
+                    .sum::<usize>()
+                + returning_relations(merge.returning.items, visit)
+        }
+        _ => 0,
+    }
+}
+
+fn tref_relations(t: &TableRef, visit: &mut dyn FnMut(&TableRef<'_>) -> usize) -> usize {
+    if let Some(sub) = t.subquery {
+        return select_relations(sub, visit);
+    }
+    let argument_references = t.func_args.map_or(0, |arguments| {
+        arguments
+            .iter()
+            .map(|argument| expr_relations(argument, visit))
+            .sum()
+    });
+    let grouped_references = t.rows_from.map_or(0, |functions| {
+        functions
+            .iter()
+            .map(|function| tref_relations(function, visit))
+            .sum()
+    });
+    let sample_references = t.sample.map_or(0, |sample| {
+        expr_relations(sample.percentage, visit)
+            + sample
+                .repeatable
+                .map_or(0, |repeatable| expr_relations(repeatable, visit))
+    });
+    argument_references + grouped_references + sample_references + visit(t)
+}
+
+fn set_tree_relations(tree: &SetTree, visit: &mut dyn FnMut(&TableRef<'_>) -> usize) -> usize {
+    match tree {
+        SetTree::Select(s) => select_relations(s, visit),
+        SetTree::Op { left, right, .. } => {
+            set_tree_relations(left, visit) + set_tree_relations(right, visit)
+        }
+    }
+}
+
+/// Number of references to `name` inside expression subqueries of `e`.
+fn expr_relations(e: &Expr, visit: &mut dyn FnMut(&TableRef<'_>) -> usize) -> usize {
+    match e {
+        Expr::Subquery(s)
+        | Expr::Exists(s)
+        | Expr::ArraySubquery(s)
+        | Expr::RowSubquery { select: s, .. } => select_relations(s, visit),
+        Expr::InSubquery {
+            operand, select, ..
+        }
+        | Expr::QuantifiedSubquery {
+            operand, select, ..
+        } => expr_relations(operand, visit) + select_relations(select, visit),
+        Expr::Unary { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::BoundDefault {
+            expression: operand,
+            ..
+        }
+        | Expr::Collate { operand, .. }
+        | Expr::IsNull { operand, .. } => expr_relations(operand, visit),
+        Expr::Binary { left, right, .. } => {
+            expr_relations(left, visit) + expr_relations(right, visit)
+        }
+        Expr::Call {
+            args,
+            order_by,
+            over,
+            filter,
+            ..
+        } => {
+            args.iter()
+                .map(|argument| expr_relations(argument, visit))
+                .sum::<usize>()
+                + order_by
+                    .iter()
+                    .map(|order| expr_relations(order.expression, visit))
+                    .sum::<usize>()
+                + over.map_or(0, |window| {
+                    window
+                        .partition_by
+                        .iter()
+                        .map(|expression| expr_relations(expression, visit))
+                        .sum::<usize>()
+                        + window
+                            .order_by
+                            .iter()
+                            .map(|order| expr_relations(order.expression, visit))
+                            .sum::<usize>()
+                        + window.frame.map_or(0, |frame| {
+                            frame_bound_relations(frame.start, visit)
+                                + frame_bound_relations(frame.end, visit)
+                        })
+                })
+                + filter.map_or(0, |expression| expr_relations(expression, visit))
+        }
+        Expr::InList { operand, list, .. } => {
+            expr_relations(operand, visit)
+                + list.iter().map(|x| expr_relations(x, visit)).sum::<usize>()
+        }
+        Expr::Like {
+            operand,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_relations(operand, visit)
+                + expr_relations(pattern, visit)
+                + escape.map_or(0, |expression| expr_relations(expression, visit))
+        }
+        Expr::Match {
+            operand, pattern, ..
+        } => expr_relations(operand, visit) + expr_relations(pattern, visit),
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+            ..
+        } => {
+            operand.map_or(0, |o| expr_relations(o, visit))
+                + whens
+                    .iter()
+                    .map(|(c, r)| expr_relations(c, visit) + expr_relations(r, visit))
+                    .sum::<usize>()
+                + otherwise.map_or(0, |o| expr_relations(o, visit))
+        }
+        Expr::Array(items) => items.iter().map(|x| expr_relations(x, visit)).sum(),
+        Expr::Subscript { base, index } => {
+            expr_relations(base, visit) + expr_relations(index, visit)
+        }
+        Expr::Slice { base, lower, upper } => {
+            expr_relations(base, visit)
+                + lower.map_or(0, |expression| expr_relations(expression, visit))
+                + upper.map_or(0, |expression| expr_relations(expression, visit))
+        }
+        Expr::Field { base, .. } => expr_relations(base, visit),
+        Expr::AnyAll { operand, array, .. } => {
+            expr_relations(operand, visit) + expr_relations(array, visit)
+        }
+        _ => 0,
+    }
+}
+
+fn frame_bound_relations(
+    bound: crate::sql::ast::FrameBound<'_>,
+    visit: &mut dyn FnMut(&TableRef<'_>) -> usize,
+) -> usize {
+    match bound {
+        crate::sql::ast::FrameBound::Preceding(expression)
+        | crate::sql::ast::FrameBound::Following(expression) => expr_relations(expression, visit),
+        crate::sql::ast::FrameBound::UnboundedPreceding
+        | crate::sql::ast::FrameBound::CurrentRow
+        | crate::sql::ast::FrameBound::UnboundedFollowing => 0,
+    }
 }
 
 /// The query a `WITH` list belongs to.
@@ -3308,290 +3632,6 @@ pub(crate) fn dml_cte_runs_after(with: &[Cte<'_>], index: usize, main: CteReader
             .iter()
             .enumerate()
             .all(|(other, cte)| other == index || cte_references(cte, name) == 0)
-}
-
-fn cte_references(cte: &Cte<'_>, name: &str) -> usize {
-    cte.dml.map_or_else(
-        || select_references(cte.query, name),
-        |statement| statement_references(statement, name),
-    )
-}
-
-fn select_item_references(item: &SelectItem<'_>, name: &str) -> usize {
-    match item {
-        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-            expr_references(expression, name)
-        }
-        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => 0,
-    }
-}
-
-fn from_references(from: &FromClause<'_>, name: &str) -> usize {
-    tref_references(&from.base, name)
-        + from
-            .joins
-            .iter()
-            .map(|join| {
-                tref_references(&join.table, name)
-                    + join.on.map_or(0, |on| expr_references(on, name))
-            })
-            .sum::<usize>()
-}
-
-fn returning_references(items: &[SelectItem<'_>], name: &str) -> usize {
-    items
-        .iter()
-        .map(|item| select_item_references(item, name))
-        .sum()
-}
-
-fn statement_references(statement: &Stmt<'_>, name: &str) -> usize {
-    match statement {
-        Stmt::Select(select) => select_references(select, name),
-        Stmt::SetQuery(query) => {
-            set_tree_references(query.body, name)
-                + query
-                    .order_by
-                    .iter()
-                    .map(|order| expr_references(order.expression, name))
-                    .sum::<usize>()
-                + query
-                    .limit
-                    .map_or(0, |expression| expr_references(expression, name))
-                + query
-                    .offset
-                    .map_or(0, |expression| expr_references(expression, name))
-        }
-        Stmt::With { ctes, statement } => {
-            ctes.iter()
-                .map(|cte| cte_references(cte, name))
-                .sum::<usize>()
-                + statement_references(statement, name)
-        }
-        Stmt::Insert(insert) => {
-            insert
-                .select
-                .map_or(0, |select| select_references(select, name))
-                + insert
-                    .rows
-                    .iter()
-                    .flat_map(|row| row.iter())
-                    .map(|expression| expr_references(expression, name))
-                    .sum::<usize>()
-                + insert.on_conflict.map_or(0, |conflict| {
-                    conflict
-                        .target
-                        .iter()
-                        .map(|target| expr_references(target.expression, name))
-                        .sum::<usize>()
-                        + conflict.update.map_or(0, |assignments| {
-                            assignments
-                                .iter()
-                                .map(|(_, expression)| expr_references(expression, name))
-                                .sum::<usize>()
-                        })
-                        + conflict
-                            .update_where
-                            .map_or(0, |expression| expr_references(expression, name))
-                })
-                + returning_references(insert.returning.items, name)
-        }
-        Stmt::Update(update) => {
-            update.from.map_or(0, |from| from_references(from, name))
-                + update
-                    .assignments
-                    .iter()
-                    .map(|(_, expression)| expr_references(expression, name))
-                    .sum::<usize>()
-                + update
-                    .where_clause
-                    .map_or(0, |expression| expr_references(expression, name))
-                + returning_references(update.returning.items, name)
-        }
-        Stmt::Delete(delete) => {
-            delete.using.map_or(0, |from| from_references(from, name))
-                + delete
-                    .where_clause
-                    .map_or(0, |expression| expr_references(expression, name))
-                + returning_references(delete.returning.items, name)
-        }
-        Stmt::Merge(merge) => {
-            tref_references(&merge.source, name)
-                + expr_references(merge.on, name)
-                + merge
-                    .whens
-                    .iter()
-                    .map(|when| {
-                        when.condition()
-                            .map_or(0, |condition| expr_references(condition, name))
-                            + match when.action() {
-                                crate::sql::ast::MergeActionRef::Update(assignments) => assignments
-                                    .iter()
-                                    .map(|(_, expression)| expr_references(expression, name))
-                                    .sum(),
-                                crate::sql::ast::MergeActionRef::Insert { values, .. } => values
-                                    .iter()
-                                    .map(|expression| expr_references(expression, name))
-                                    .sum(),
-                                crate::sql::ast::MergeActionRef::Delete
-                                | crate::sql::ast::MergeActionRef::DoNothing => 0,
-                            }
-                    })
-                    .sum::<usize>()
-                + returning_references(merge.returning.items, name)
-        }
-        _ => 0,
-    }
-}
-
-fn tref_references(t: &TableRef, name: &str) -> usize {
-    if let Some(sub) = t.subquery {
-        return select_references(sub, name);
-    }
-    let argument_references = t.func_args.map_or(0, |arguments| {
-        arguments
-            .iter()
-            .map(|argument| expr_references(argument, name))
-            .sum()
-    });
-    let grouped_references = t.rows_from.map_or(0, |functions| {
-        functions
-            .iter()
-            .map(|function| tref_references(function, name))
-            .sum()
-    });
-    let sample_references = t.sample.map_or(0, |sample| {
-        expr_references(sample.percentage, name)
-            + sample
-                .repeatable
-                .map_or(0, |repeatable| expr_references(repeatable, name))
-    });
-    argument_references
-        + grouped_references
-        + sample_references
-        + usize::from(t.schema.is_none() && !t.is_function_source() && t.table == name)
-}
-
-fn set_tree_references(tree: &SetTree, name: &str) -> usize {
-    match tree {
-        SetTree::Select(s) => select_references(s, name),
-        SetTree::Op { left, right, .. } => {
-            set_tree_references(left, name) + set_tree_references(right, name)
-        }
-    }
-}
-
-/// Number of references to `name` inside expression subqueries of `e`.
-fn expr_references(e: &Expr, name: &str) -> usize {
-    match e {
-        Expr::Subquery(s)
-        | Expr::Exists(s)
-        | Expr::ArraySubquery(s)
-        | Expr::RowSubquery { select: s, .. } => select_references(s, name),
-        Expr::InSubquery {
-            operand, select, ..
-        }
-        | Expr::QuantifiedSubquery {
-            operand, select, ..
-        } => expr_references(operand, name) + select_references(select, name),
-        Expr::Unary { operand, .. }
-        | Expr::Cast { operand, .. }
-        | Expr::BoundDefault {
-            expression: operand,
-            ..
-        }
-        | Expr::Collate { operand, .. }
-        | Expr::IsNull { operand, .. } => expr_references(operand, name),
-        Expr::Binary { left, right, .. } => {
-            expr_references(left, name) + expr_references(right, name)
-        }
-        Expr::Call {
-            args,
-            order_by,
-            over,
-            filter,
-            ..
-        } => {
-            args.iter()
-                .map(|argument| expr_references(argument, name))
-                .sum::<usize>()
-                + order_by
-                    .iter()
-                    .map(|order| expr_references(order.expression, name))
-                    .sum::<usize>()
-                + over.map_or(0, |window| {
-                    window
-                        .partition_by
-                        .iter()
-                        .map(|expression| expr_references(expression, name))
-                        .sum::<usize>()
-                        + window
-                            .order_by
-                            .iter()
-                            .map(|order| expr_references(order.expression, name))
-                            .sum::<usize>()
-                        + window.frame.map_or(0, |frame| {
-                            frame_bound_references(frame.start, name)
-                                + frame_bound_references(frame.end, name)
-                        })
-                })
-                + filter.map_or(0, |expression| expr_references(expression, name))
-        }
-        Expr::InList { operand, list, .. } => {
-            expr_references(operand, name)
-                + list.iter().map(|x| expr_references(x, name)).sum::<usize>()
-        }
-        Expr::Like {
-            operand,
-            pattern,
-            escape,
-            ..
-        } => {
-            expr_references(operand, name)
-                + expr_references(pattern, name)
-                + escape.map_or(0, |expression| expr_references(expression, name))
-        }
-        Expr::Match {
-            operand, pattern, ..
-        } => expr_references(operand, name) + expr_references(pattern, name),
-        Expr::Case {
-            operand,
-            whens,
-            otherwise,
-            ..
-        } => {
-            operand.map_or(0, |o| expr_references(o, name))
-                + whens
-                    .iter()
-                    .map(|(c, r)| expr_references(c, name) + expr_references(r, name))
-                    .sum::<usize>()
-                + otherwise.map_or(0, |o| expr_references(o, name))
-        }
-        Expr::Array(items) => items.iter().map(|x| expr_references(x, name)).sum(),
-        Expr::Subscript { base, index } => {
-            expr_references(base, name) + expr_references(index, name)
-        }
-        Expr::Slice { base, lower, upper } => {
-            expr_references(base, name)
-                + lower.map_or(0, |expression| expr_references(expression, name))
-                + upper.map_or(0, |expression| expr_references(expression, name))
-        }
-        Expr::Field { base, .. } => expr_references(base, name),
-        Expr::AnyAll { operand, array, .. } => {
-            expr_references(operand, name) + expr_references(array, name)
-        }
-        _ => 0,
-    }
-}
-
-fn frame_bound_references(bound: crate::sql::ast::FrameBound<'_>, name: &str) -> usize {
-    match bound {
-        crate::sql::ast::FrameBound::Preceding(expression)
-        | crate::sql::ast::FrameBound::Following(expression) => expr_references(expression, name),
-        crate::sql::ast::FrameBound::UnboundedPreceding
-        | crate::sql::ast::FrameBound::CurrentRow
-        | crate::sql::ast::FrameBound::UnboundedFollowing => 0,
-    }
 }
 
 fn select_mentions_column(select: &Select<'_>, qualifier: &str, name: &str) -> bool {

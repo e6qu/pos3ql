@@ -2840,8 +2840,96 @@ enum CursorRowSink {
     FilterOnly,
 }
 
-/// Runs a bound cursor query whole into its saved rows. A query with
-/// data-modifying `WITH` queries is only described; it runs on its first read.
+type RelationVisitor<'v> = dyn FnMut(&ast::TableRef<'_>) -> usize + 'v;
+
+/// Describes a bound cursor query when it opens; it runs on its first read.
+/// Returns whether its plan scans backward, which makes a cursor declared
+/// without `SCROLL` or `NO SCROLL` scrollable.
+fn describe_cursor_rows(
+    cursors: &mut cursor::CursorPool,
+    at: usize,
+    storage: &Storage,
+    txid: u32,
+    work: &Arena,
+) -> Result<bool, SqlError> {
+    let (query, description, rows, mut tables) = cursors.describe_parts(at);
+    let mut capture =
+        Responder::for_cursor(description, crate::pg::respond::CursorRowOutput::Save(rows));
+    let mut mark_tables = |relations: &dyn Fn(&mut RelationVisitor<'_>)| {
+        let mut marked = Ok(());
+        relations(&mut |table| {
+            let slot = match table.bound_table {
+                Some(slot) => Some(usize::from(slot)),
+                None if table.subquery.is_none()
+                    && table.cte.is_none()
+                    && !table.is_function_source() =>
+                {
+                    match storage.resolve_relation(table.schema, table.table, txid) {
+                        Some(crate::storage::ResolvedRelation::Table(slot)) => Some(slot),
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            if let Some(slot) = slot
+                && marked.is_ok()
+            {
+                marked = tables.mark(slot);
+            }
+            0
+        });
+        marked
+    };
+    let out = query.with_query(|parsed, _, _| {
+        let mut columns = [ColDesc::new("", 0, 0); crate::sql::MAX_PROJ];
+        let described = match parsed {
+            cursor::CursorStatement::Select(select) => {
+                query::expand_ctes(select, storage, txid, work).and_then(|select| {
+                    mark_tables(&|visit| {
+                        query::select_relations(select, visit);
+                    })?;
+                    let count = query::describe_select(
+                        select,
+                        storage,
+                        txid,
+                        work,
+                        &mut columns,
+                        exec::DescriptionTarget::Wire,
+                        None,
+                    )?;
+                    Ok((count, query::select_scans_backward(select, storage, txid)))
+                })
+            }
+            cursor::CursorStatement::SetQuery(query) => mark_tables(&|visit| {
+                query::set_query_relations(query, visit);
+            })
+            .and_then(|()| {
+                query::describe_set_query(
+                    storage,
+                    txid,
+                    query,
+                    &mut columns,
+                    work,
+                    exec::DescriptionTarget::Wire,
+                )
+            })
+            .map(|count| (count, query::set_query_scans_backward(query, storage, txid))),
+        };
+        match described {
+            Ok((count, backward)) => capture
+                .row_description(&columns[..count])
+                .map(|()| Ok(backward)),
+            Err(error) => Ok(Err(error)),
+        }
+    })?;
+    let backward = out.map_err(|_| cursor_description_too_large())??;
+    cursors.set_plan_scroll(at, backward);
+    Ok(backward)
+}
+
+/// Runs a pending read-only cursor query whole into its saved rows, with the
+/// snapshot the cursor opened with. Its description follows the opening one,
+/// which [`cursor::CursorPool::end_fill`] checks it against.
 fn save_cursor_rows(
     cursors: &mut cursor::CursorPool,
     at: usize,
@@ -2849,104 +2937,77 @@ fn save_cursor_rows(
     txid: u32,
     work: &Arena,
     render: guc::RenderContext,
-    seq_session: &guc::SeqSession,
+    sequence: &dyn SequenceAccess,
 ) -> Result<(), SqlError> {
     let out = {
         let (query, description, rows) = cursors.execution_parts(at);
+        let _snapshot = query.enter_snapshot(storage)?;
         let mut capture =
             Responder::for_cursor(description, crate::pg::respond::CursorRowOutput::Save(rows));
         capture.set_render(render);
-        query.with_query(|parsed, params, _| {
-            let sequence = sequence::SeqEval::new(storage, seq_session, txid);
-            match parsed {
-                cursor::CursorStatement::Select(select)
-                    if select.with.iter().any(|cte| cte.dml.is_some()) =>
-                {
-                    // Described now; it runs on its first read.
-                    let mut columns = [ColDesc::new("", 0, 0); crate::sql::MAX_PROJ];
-                    let described =
-                        query::expand_ctes(select, storage, txid, work).and_then(|select| {
-                            query::describe_select(
-                                select,
-                                storage,
-                                txid,
-                                work,
-                                &mut columns,
-                                exec::DescriptionTarget::Wire,
-                                None,
-                            )
-                        });
-                    match described {
-                        Ok(count) => capture.row_description(&columns[..count]).map(Ok),
-                        Err(error) => Ok(Err(error)),
-                    }
-                }
-                cursor::CursorStatement::Select(select) => {
-                    let select = match query::expand_ctes_exec(
-                        select,
-                        storage,
-                        txid,
-                        work,
-                        params,
-                        &[],
-                        Some(&sequence),
-                    ) {
-                        Ok(select) => select,
-                        Err(error) => {
-                            return Ok(Err(error));
-                        }
-                    };
-                    if let Err(error) = query::validate_locking(select, storage, txid, work) {
-                        return Ok(Err(error));
-                    }
-                    if select.from.is_none() {
-                        query::constant_select(
-                            storage,
-                            txid,
-                            select,
-                            work,
-                            params,
-                            Some(&sequence),
-                            &mut capture,
-                        )
-                    } else {
-                        query::select_query(
-                            storage,
-                            txid,
-                            select,
-                            work,
-                            params,
-                            Some(&sequence),
-                            &mut capture,
-                        )
-                    }
-                }
-                cursor::CursorStatement::SetQuery(query) => query::set_query(
+        query.with_query(|parsed, params, _| match parsed {
+            cursor::CursorStatement::Select(select) => {
+                let select = match query::expand_ctes_exec(
+                    select,
                     storage,
                     txid,
-                    query,
                     work,
                     params,
-                    Some(&sequence),
-                    &mut capture,
-                ),
+                    &[],
+                    Some(sequence),
+                ) {
+                    Ok(select) => select,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if let Err(error) = query::validate_locking(select, storage, txid, work) {
+                    return Ok(Err(error));
+                }
+                if select.from.is_none() {
+                    query::constant_select(
+                        storage,
+                        txid,
+                        select,
+                        work,
+                        params,
+                        Some(sequence),
+                        &mut capture,
+                    )
+                } else {
+                    query::select_query(
+                        storage,
+                        txid,
+                        select,
+                        work,
+                        params,
+                        Some(sequence),
+                        &mut capture,
+                    )
+                }
             }
+            cursor::CursorStatement::SetQuery(query) => query::set_query(
+                storage,
+                txid,
+                query,
+                work,
+                params,
+                Some(sequence),
+                &mut capture,
+            ),
         })?
     };
-    out.map_err(|_| cursor_description_too_large())?
+    out.map_err(|_| cursor_result_too_large())?
 }
 
 /// Opens a cursor for a trigger fired inside a statement that holds the
-/// engine's storage. The query runs whole at `OPEN` into the cursor's saved
-/// rows, so later reads need no engine. `locals` are the trigger's captured
-/// variables, read as the query's parameters.
+/// engine's storage. The query is described and takes its snapshot now; it
+/// runs on its first read. `locals` are the trigger's captured variables,
+/// read as the query's parameters.
 #[expect(
     clippy::too_many_arguments,
     reason = "a trigger cursor carries its statement services, query and variables"
 )]
 pub(crate) fn open_trigger_cursor(
     storage: &Storage,
-    seq_session: &guc::SeqSession,
     cursors: &mut cursor::CursorPool,
     name: &str,
     sql: &str,
@@ -2955,6 +3016,7 @@ pub(crate) fn open_trigger_cursor(
     arena: &Arena,
     params: &[Datum],
     txid: u32,
+    command: u32,
 ) -> Result<(), SqlError> {
     let (source, position) = type_inputs::active_source_position(sql)?.ok_or_else(|| {
         sql_err!(
@@ -2982,22 +3044,14 @@ pub(crate) fn open_trigger_cursor(
             let inputs = type_inputs::bindings_for_active_source(sql, arena)?.unwrap_or(&[]);
             cursors.bind_query(at, sql, params, locals, inputs, storage, txid)?;
         }
-        if cursors.execution_parts(at).0.writes() {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "a cursor query with data-modifying WITH is not supported in trigger execution"
-            ));
-        }
         cursors.restart_opening_output(attempt)?;
-        cursors
-            .execution_parts(at)
-            .0
-            .prepare_result_types(storage, txid)?;
-        let render = guc::with_active_state(|guc| Ok(guc.render()))?;
-        save_cursor_rows(cursors, at, storage, txid, arena, render, seq_session)?;
+        let (query, _, _) = cursors.execution_parts(at);
+        query.prepare_result_types(storage, txid)?;
+        query.retain_snapshot(storage, txid, command)?;
+        describe_cursor_rows(cursors, at, storage, txid, arena)?;
         cursors.seal(at)
     })();
-    // The cursor copied its SQL, values, descriptors and rows.
+    // The cursor copied its SQL, values, descriptors and description.
     unsafe { arena.rewind_to(mark) };
     if let Err(error) = result {
         cursors.abandon_attempt(attempt)?;
@@ -3008,17 +3062,48 @@ pub(crate) fn open_trigger_cursor(
 
 /// Moves a cursor for a trigger fired inside a statement that holds the
 /// engine's storage, and returns the row count as [`Engine::fetch_cursor`].
-/// Only saved rows can be read there: a cursor that evaluates its query as it
-/// is fetched needs the session's engine.
+/// A pending read-only query runs here with the cursor's snapshot; a cursor
+/// that evaluates its rows as fetched, or whose data-modifying `WITH`
+/// queries have not run, needs the session's engine.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a trigger fetch carries its statement services and motion"
+)]
 pub(crate) fn fetch_trigger_cursor(
+    storage: &Storage,
+    seq_session: &guc::SeqSession,
     cursors: &mut cursor::CursorPool,
+    arena: &Arena,
+    txid: u32,
     name: &str,
     motion: cursor::FetchMotion,
     move_only: bool,
 ) -> Result<usize, SqlError> {
     let result = (|| {
-        if cursors.pending_write_fill(name)?.is_some()
-            || cursors.scroll_slot(name).is_some()
+        match cursors.pending_fill(name)? {
+            Some((_, cursor::PendingFill::Write)) => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cursor \"{}\" runs data-modifying WITH queries when first fetched, which is not supported in trigger execution",
+                    name
+                ));
+            }
+            Some((at, cursor::PendingFill::Read)) => {
+                let described = cursors.begin_read_fill(at);
+                let mark = arena.mark();
+                let render = guc::with_active_state(|guc| Ok(guc.render()));
+                let filled = render.and_then(|render| {
+                    let sequence = sequence::SeqEval::new(storage, seq_session, txid);
+                    save_cursor_rows(cursors, at, storage, txid, arena, render, &sequence)
+                });
+                // The cursor copied its rows.
+                unsafe { arena.rewind_to(mark) };
+                cursors.end_fill(at, filled.is_ok(), Some(described))?;
+                filled?;
+            }
+            None => {}
+        }
+        if cursors.scroll_slot(name).is_some()
             || cursors.read_request(name, motion, move_only)?.is_some()
         {
             return Err(sql_err!(
@@ -3029,10 +3114,23 @@ pub(crate) fn fetch_trigger_cursor(
         }
         cursors.fetch(name, motion, move_only)
     })();
-    if result.is_err() {
+    if result
+        .as_ref()
+        .is_err_and(|error| !cursor_input_wait(error))
+    {
         cursors.fail(name);
     }
     result
+}
+
+/// The command bound of a cursor opened now: a statement that reads all of
+/// its transaction's changes so far opens a cursor that reads every change
+/// before the next command.
+pub(crate) fn cursor_snapshot_command(storage: &Storage, command: u32) -> u32 {
+    match storage.read_snapshot() {
+        crate::storage::SNAPSHOT_ALL => command.saturating_add(1),
+        snapshot => snapshot,
+    }
 }
 
 fn cursor_input_wait(error: &SqlError) -> bool {
@@ -23699,7 +23797,76 @@ impl Engine {
             }
         }
         let txid = txn.txid;
-        let snapshot = self.storage.read_snapshot();
+        let command = cursor_snapshot_command(&self.storage, txn.command_id());
+        let out = (|| {
+            cursors
+                .execution_parts(at)
+                .0
+                .retain_snapshot(&self.storage, txid, command)?;
+            self.run_cursor_query(
+                at,
+                command,
+                arena,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                responder,
+                |storage, work, _sequence, cursors| {
+                    cursors.restart_opening_output(attempt)?;
+                    let prepared = {
+                        let (query, description, rows) = cursors.execution_parts(at);
+                        let mut capture = Responder::for_cursor(
+                            description,
+                            crate::pg::respond::CursorRowOutput::Save(rows),
+                        );
+                        query.prepare_source(storage, txid, &mut capture)
+                    };
+                    match prepared {
+                        Ok(true) => Ok(()),
+                        Ok(false) => {
+                            describe_cursor_rows(cursors, at, storage, txid, work).map(|_| ())
+                        }
+                        Err(error) => Err(error),
+                    }
+                },
+            )
+        })();
+        if let Err(error) = out {
+            if !cursor_input_wait(&error) {
+                cursors.abandon_attempt(attempt)?;
+            }
+            return Err(error);
+        }
+        if let Err(error) = cursors.seal(at) {
+            cursors.abandon_attempt(attempt)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Runs `evaluate` over a bound cursor query after preparing its planner
+    /// inputs, completing any routine calls it waits for. Own-transaction
+    /// changes are read before `command`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_cursor_query(
+        &mut self,
+        at: usize,
+        command: u32,
+        arena: &Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+        mut evaluate: impl FnMut(
+            &Storage,
+            &Arena,
+            &dyn SequenceAccess,
+            &mut cursor::CursorPool,
+        ) -> Result<(), SqlError>,
+    ) -> Result<(), SqlError> {
+        let txid = txn.txid;
         let owner = cursors.plan_owner(at)?;
         let out = arena.with_remaining_region(|frame| {
             let captured = cursors
@@ -23735,59 +23902,60 @@ impl Engine {
             self.execute_retained_expression(
                 frame,
                 None,
-                snapshot,
+                command,
                 txn,
                 sqlprep,
                 cursors,
                 guc,
                 responder,
-                |storage, work, _sequence, _invocations, cursors| {
-                    cursors.restart_opening_output(attempt)?;
-                    let prepared = {
-                        let (query, description, rows) = cursors.execution_parts(at);
-                        let mut capture = Responder::for_cursor(
-                            description,
-                            crate::pg::respond::CursorRowOutput::Save(rows),
-                        );
-                        query.prepare_source(storage, txid, &mut capture)
-                    };
-                    match prepared {
-                        Ok(true) => return Ok(()),
-                        Ok(false) => {}
-                        Err(error) => return Err(error),
-                    }
-                    save_cursor_rows(
-                        cursors,
-                        at,
-                        storage,
-                        txid,
-                        work,
-                        guc.render(),
-                        guc.seq_session(),
-                    )
+                |storage, work, sequence, _invocations, cursors| {
+                    evaluate(storage, work, sequence, cursors)
                 },
             )
         });
-        let out = match out {
+        match out {
             Ok(Ok(out)) => out,
             Ok(Err(WireFull)) => Err(cursor_description_too_large()),
             Err(error) => Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "cursor opening exceeds statement memory: {}",
+                "cursor query exceeds statement memory: {}",
                 error
             )),
-        };
-        if let Err(error) = out {
-            if !cursor_input_wait(&error) {
-                cursors.abandon_attempt(attempt)?;
-            }
-            return Err(error);
         }
-        if let Err(error) = cursors.seal(at) {
-            cursors.abandon_attempt(attempt)?;
-            return Err(error);
-        }
-        Ok(())
+    }
+
+    /// Runs a pending read-only cursor query whole on its first read, with
+    /// the snapshot it opened with.
+    #[allow(clippy::too_many_arguments)]
+    fn fill_reading_cursor(
+        &mut self,
+        at: usize,
+        arena: &Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<(), SqlError> {
+        let txid = txn.txid;
+        let command = cursors.execution_parts(at).0.snapshot_command()?;
+        let described = cursors.begin_read_fill(at);
+        let filled = self.run_cursor_query(
+            at,
+            command,
+            arena,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            responder,
+            |storage, work, sequence, cursors| {
+                cursors.restart_fill_output(at, described);
+                save_cursor_rows(cursors, at, storage, txid, work, guc.render(), sequence)
+            },
+        );
+        cursors.end_fill(at, filled.is_ok(), Some(described))?;
+        filled
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -24242,7 +24410,7 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
-        if cursors.next_hold_source().is_none() {
+        if cursors.next_hold_source().is_none() && cursors.next_hold_fill().is_none() {
             return Ok(());
         }
         // Only a client session declares WITH HOLD cursors.
@@ -24252,6 +24420,16 @@ impl Engine {
                 "a held cursor has no session prepared-statement pool"
             )
         })?;
+        while let Some((at, fill)) = cursors.next_hold_fill() {
+            match fill {
+                cursor::PendingFill::Write => {
+                    self.fill_writing_cursor(at, arena, txn, sqlprep, cursors, guc, responder)?;
+                }
+                cursor::PendingFill::Read => {
+                    self.fill_reading_cursor(at, arena, txn, sqlprep, cursors, guc, responder)?;
+                }
+            }
+        }
         while let Some(at) = cursors.next_hold_source() {
             if cursors.begin_scroll_hold(at) {
                 self.run_scroll_command(at, arena, txn, sqlprep, cursors, guc, responder)?;
@@ -24293,6 +24471,7 @@ impl Engine {
                 self.run_writing_cursor_query(
                     query.statement,
                     query.params,
+                    query.snapshot,
                     &mut description,
                     &mut rows,
                     arena,
@@ -24315,6 +24494,7 @@ impl Engine {
         &mut self,
         statement: &ast::Select<'_>,
         params: &[Datum],
+        snapshot: (u32, u64),
         description: &mut crate::mem::buffer::FixedBuf,
         rows: &mut crate::mem::buffer::FixedBuf,
         arena: &Arena,
@@ -24324,7 +24504,10 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
-        let source_snapshot = txn.command_id().saturating_add(1);
+        let source_snapshot = snapshot.0;
+        let _commit_snapshot = self
+            .storage
+            .cursor_snapshot(crate::storage::SNAPSHOT_ALL, snapshot.1);
         let invocations = query::RoutineInvocationState::new(
             arena,
             crate::sql::query::RoutineExecution::StatementReplay,
@@ -24441,8 +24624,14 @@ impl Engine {
             ..
         } = context;
         let result = (|| {
-            if let Some(at) = cursors.pending_write_fill(name)? {
-                self.fill_writing_cursor(at, arena, txn, sqlprep, cursors, guc, responder)?;
+            match cursors.pending_fill(name)? {
+                Some((at, cursor::PendingFill::Write)) => {
+                    self.fill_writing_cursor(at, arena, txn, sqlprep, cursors, guc, responder)?;
+                }
+                Some((at, cursor::PendingFill::Read)) => {
+                    self.fill_reading_cursor(at, arena, txn, sqlprep, cursors, guc, responder)?;
+                }
+                None => {}
             }
             if let Some(at) = cursors.scroll_slot(name) {
                 cursors.begin_scroll(at, motion, move_only)?;

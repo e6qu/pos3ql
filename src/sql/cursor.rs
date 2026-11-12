@@ -114,11 +114,15 @@ pub(crate) fn require_table_idle(table: usize, name: &str, command: &str) -> Res
         pool.is_some_and(|pool| {
             pool.slots.iter().any(|slot| {
                 slot.active
-                    && slot
+                    && (slot
                         .query
                         .retained
                         .as_ref()
                         .is_some_and(|query| query.uses_table(table))
+                        || slot
+                            .tables
+                            .get(table / 64)
+                            .is_some_and(|word| word & (1 << (table % 64)) != 0))
             })
         })
     });
@@ -143,11 +147,12 @@ pub(crate) struct CursorInfo<'a> {
     pub created_at: i64,
 }
 
-/// A cursor whose query has data-modifying `WITH` queries runs that query
-/// whole when it is first read, as PostgreSQL fills such a portal's store.
+/// A cursor whose query does not stream runs it whole when it is first read,
+/// with the snapshot taken when it opened, as PostgreSQL's executor first
+/// runs a portal's plan at its first fetch.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum WriteFill {
-    /// The query streams, or already ran when the cursor opened.
+enum Fill {
+    /// The query streams its rows as they are fetched.
     None,
     /// Opened and described; nothing has read it yet.
     Pending,
@@ -155,6 +160,15 @@ enum WriteFill {
     Running,
     /// Its rows are stored and its query is released.
     Done,
+}
+
+/// How a pending cursor's query runs on its first read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PendingFill {
+    /// A read-only query: it saves its rows under the cursor's snapshot.
+    Read,
+    /// Its data-modifying `WITH` queries need a new command and the session.
+    Write,
 }
 
 struct CursorSlot {
@@ -182,7 +196,7 @@ struct CursorSlot {
     scan: Option<ScrollScan>,
     /// A held scroll cursor is saving its rows at commit.
     holding: bool,
-    write_fill: WriteFill,
+    fill: Fill,
     locking: RowLocking,
     /// Logical input rows before the first saved row of the current fetch.
     row_base: usize,
@@ -192,6 +206,10 @@ struct CursorSlot {
     /// PostgreSQL's cursor position: 0 before the first row, `1..=n` on a
     /// row, `n + 1` after the last.
     position: i64,
+    /// Tables a cursor that does not stream reads, one bit per table slot:
+    /// until it closes or is held past commit, they cannot be dropped or
+    /// altered, as an open PostgreSQL portal keeps them in use.
+    tables: Box<[u64]>,
 }
 
 impl CursorSlot {
@@ -349,6 +367,23 @@ struct RowLocking {
     recheck: bool,
 }
 
+/// The tables an opening cursor's query reads.
+pub(crate) struct TableUse<'a>(&'a mut [u64]);
+
+impl TableUse<'_> {
+    pub(crate) fn mark(&mut self, table: usize) -> Result<(), SqlError> {
+        let word = self.0.get_mut(table / 64).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "cursor table slot {} is outside max_tables",
+                table
+            )
+        })?;
+        *word |= 1 << (table % 64);
+        Ok(())
+    }
+}
+
 /// PostgreSQL's error for backward motion on a NO SCROLL cursor.
 pub(crate) fn forward_only() -> SqlError {
     super::eval::stash_diagnostic(
@@ -370,33 +405,42 @@ pub(crate) fn history_full() -> SqlError {
     )
 }
 
+const fn table_words(config: &Config) -> usize {
+    config.max_tables.div_ceil(64)
+}
+
 const fn cursor_row_capacity(config: &Config) -> usize {
     config.cursor_bytes / MIN_CURSOR_ROW_BYTES
 }
 
 fn seal_description(description: &mut FixedBuf) -> Result<usize, SqlError> {
+    let range = run_description(description.readable())?;
+    let mut types = [0; crate::pg::respond::MAX_RESULT_COLS];
+    let columns = description_type_oids(&description.readable()[range.clone()], &mut types)?;
+    description.filled_mut().copy_within(range.clone(), 0);
+    description.truncate_to(range.len());
+    Ok(columns)
+}
+
+/// Where the one RowDescription message is among a query run's captured
+/// messages.
+fn run_description(bytes: &[u8]) -> Result<core::ops::Range<usize>, SqlError> {
     let malformed = || {
         sql_err!(
             sqlstate::INTERNAL_ERROR,
             "cursor captured a torn description"
         )
     };
-    let bytes = description.readable();
     let mut at = 0usize;
     let mut captured = None;
     while at < bytes.len() {
         let header = bytes.get(at..at.saturating_add(5)).ok_or_else(malformed)?;
         let length = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
-        if length < 4 {
-            return Err(malformed());
-        }
         let end = at
             .checked_add(1)
             .and_then(|at| at.checked_add(length))
+            .filter(|end| length >= 4 && *end <= bytes.len())
             .ok_or_else(malformed)?;
-        if end > bytes.len() {
-            return Err(malformed());
-        }
         if header[0] == b'T' {
             if captured.is_some() {
                 return Err(sql_err!(
@@ -404,21 +448,16 @@ fn seal_description(description: &mut FixedBuf) -> Result<usize, SqlError> {
                     "cursor captured two descriptions"
                 ));
             }
-            captured = Some((at, end));
+            captured = Some(at..end);
         }
         at = end;
     }
-    let (start, end) = captured.ok_or_else(|| {
+    captured.ok_or_else(|| {
         sql_err!(
             sqlstate::INTERNAL_ERROR,
             "cursor did not capture a description"
         )
-    })?;
-    let mut types = [0; crate::pg::respond::MAX_RESULT_COLS];
-    let columns = description_type_oids(&bytes[start..end], &mut types)?;
-    description.filled_mut().copy_within(start..end, 0);
-    description.truncate_to(end - start);
-    Ok(columns)
+    })
 }
 
 fn seal_rows(rows: &FixedBuf, columns: usize, spans: &mut RowIndex) -> Result<(), SqlError> {
@@ -540,9 +579,8 @@ impl CursorPool {
                     .saturating_add(config.cursor_query_bytes)
                     .saturating_add(DESCRIPTION_BYTES)
                     .saturating_add(core::mem::size_of::<CursorSlot>())
-                    .saturating_add(
-                        row_capacity.saturating_mul(core::mem::size_of::<(u32, u32)>()),
-                    ),
+                    .saturating_add(row_capacity.saturating_mul(core::mem::size_of::<(u32, u32)>()))
+                    .saturating_add(table_words(config).saturating_mul(8)),
             )
             .saturating_add(row_capacity.saturating_mul(core::mem::size_of::<u32>()))
     }
@@ -561,6 +599,7 @@ impl CursorPool {
                 core::mem::size_of::<(u32, u32)>(),
                 "cursor_row_spans",
             )?;
+            budget.draw_array(table_words(config), 8, "cursor_tables")?;
             slots.push(CursorSlot {
                 active: false,
                 plan_generation: None,
@@ -579,12 +618,13 @@ impl CursorPool {
                 spans: RowIndex::new(row_capacity),
                 scan: None,
                 holding: false,
-                write_fill: WriteFill::None,
+                fill: Fill::None,
                 locking: RowLocking::default(),
                 row_base: 0,
                 produced: 0,
                 request: None,
                 position: 0,
+                tables: vec![0; table_words(config)].into_boxed_slice(),
             });
         }
         budget.draw_array(row_capacity, core::mem::size_of::<u32>(), "cursor_emit")?;
@@ -697,7 +737,8 @@ impl CursorPool {
         slot.produced = 0;
         slot.request = None;
         slot.position = 0;
-        slot.write_fill = WriteFill::None;
+        slot.fill = Fill::None;
+        slot.tables.fill(0);
         Ok(at)
     }
 
@@ -844,6 +885,34 @@ impl CursorPool {
         (&mut slot.query, &mut slot.description, &mut slot.rows)
     }
 
+    /// The opening cursor's query, its description and row storage, and the
+    /// set of tables it reads.
+    pub(crate) fn describe_parts(
+        &mut self,
+        at: usize,
+    ) -> (&CursorQuery, &mut FixedBuf, &mut FixedBuf, TableUse<'_>) {
+        let slot = &mut self.slots[at];
+        (
+            &slot.query,
+            &mut slot.description,
+            &mut slot.rows,
+            TableUse(&mut slot.tables),
+        )
+    }
+
+    /// Settles a cursor declared without `SCROLL` or `NO SCROLL` from whether
+    /// its plan scans backward.
+    pub(crate) fn set_plan_scroll(&mut self, at: usize, backward: bool) {
+        let slot = &mut self.slots[at];
+        if slot.scroll == CursorScroll::Default {
+            slot.scroll = if backward {
+                CursorScroll::Scroll
+            } else {
+                CursorScroll::NoScroll
+            };
+        }
+    }
+
     /// Validates the description and indexes complete typed rows.
     pub fn seal(&mut self, at: usize) -> Result<(), SqlError> {
         let slot = &mut self.slots[at];
@@ -859,8 +928,8 @@ impl CursorPool {
                 CursorScroll::NoScroll
             };
         }
-        if slot.query.writes() {
-            slot.write_fill = WriteFill::Pending;
+        if slot.query.retained.is_none() {
+            slot.fill = Fill::Pending;
         }
         slot.scan = slot
             .query
@@ -902,21 +971,25 @@ impl CursorPool {
         Ok(Some((at, needed)))
     }
 
-    /// The open cursor `name` whose writing query has not run yet.
-    pub(crate) fn pending_write_fill(&self, name: &str) -> Result<Option<usize>, SqlError> {
+    /// The open cursor `name` whose query has not run yet.
+    pub(crate) fn pending_fill(
+        &self,
+        name: &str,
+    ) -> Result<Option<(usize, PendingFill)>, SqlError> {
         let Some(at) = self.find(name) else {
             return Ok(None);
         };
         let slot = &self.slots[at];
         slot.require_runnable()?;
-        match slot.write_fill {
-            WriteFill::Pending => Ok(Some(at)),
-            WriteFill::Running => Err(sql_err!(
+        match slot.fill {
+            Fill::Pending if slot.query.writes() => Ok(Some((at, PendingFill::Write))),
+            Fill::Pending => Ok(Some((at, PendingFill::Read))),
+            Fill::Running => Err(sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                 "portal \"{}\" cannot be run",
                 slot.name.as_str()
             )),
-            WriteFill::None | WriteFill::Done => Ok(None),
+            Fill::None | Fill::Done => Ok(None),
         }
     }
 
@@ -929,7 +1002,7 @@ impl CursorPool {
     ) -> Result<(query::ReparsedQuery<'w>, FixedBuf, FixedBuf), SqlError> {
         let slot = &mut self.slots[at];
         let query = slot.query.reparse_into(arena)?;
-        slot.write_fill = WriteFill::Running;
+        slot.fill = Fill::Running;
         slot.reset_rows();
         let description = core::mem::replace(&mut slot.description, FixedBuf::detached());
         let rows = core::mem::replace(&mut slot.rows, FixedBuf::detached());
@@ -949,18 +1022,76 @@ impl CursorPool {
         let slot = &mut self.slots[at];
         slot.description = description;
         slot.rows = rows;
+        self.end_fill(at, filled, None)
+    }
+
+    /// Clears a read fill's output before another attempt.
+    pub(crate) fn restart_fill_output(&mut self, at: usize, described: usize) {
+        let slot = &mut self.slots[at];
+        slot.description.truncate_to(described);
+        slot.reset_rows();
+    }
+
+    /// Starts a pending read-only cursor's run into its own row storage. The
+    /// run describes its result after the opening description; the returned
+    /// mark separates them for [`Self::end_fill`].
+    pub(crate) fn begin_read_fill(&mut self, at: usize) -> usize {
+        let slot = &mut self.slots[at];
+        slot.fill = Fill::Running;
+        slot.reset_rows();
+        slot.description.mark()
+    }
+
+    /// Ends a fill. When `filled`, the saved rows become the cursor's whole
+    /// result and its query and snapshot are released; otherwise the cursor
+    /// waits to run again. A read fill's own description, after
+    /// `described_from`, must match the one the cursor opened with.
+    pub(crate) fn end_fill(
+        &mut self,
+        at: usize,
+        filled: bool,
+        described_from: Option<usize>,
+    ) -> Result<(), SqlError> {
+        let slot = &mut self.slots[at];
+        let executed = match described_from {
+            Some(mark) if filled => {
+                let mut executed = FixedBuf::detached();
+                core::mem::swap(&mut executed, &mut slot.description);
+                let result = (|| {
+                    let bytes = executed.readable();
+                    let opened = bytes.get(..mark).ok_or_else(|| {
+                        sql_err!(sqlstate::INTERNAL_ERROR, "cursor description was truncated")
+                    })?;
+                    let ran = &bytes[mark..];
+                    if &ran[run_description(ran)?] != opened {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "cursor result shape changed between opening and first read"
+                        ));
+                    }
+                    Ok(())
+                })();
+                core::mem::swap(&mut executed, &mut slot.description);
+                Some(result)
+            }
+            _ => None,
+        };
+        if let Some(mark) = described_from {
+            slot.description.truncate_to(mark);
+        }
         if !filled {
             slot.reset_rows();
-            slot.write_fill = WriteFill::Pending;
+            slot.fill = Fill::Pending;
             return Ok(());
         }
+        executed.transpose()?;
         let mut types = [0; crate::pg::respond::MAX_RESULT_COLS];
         let columns = description_type_oids(slot.description.readable(), &mut types)?;
         seal_rows(&slot.rows, columns, &mut slot.spans)?;
         slot.produced = slot.spans.len();
         slot.row_base = 0;
         slot.query.finish_source();
-        slot.write_fill = WriteFill::Done;
+        slot.fill = Fill::Done;
         Ok(())
     }
 
@@ -1568,6 +1699,20 @@ impl CursorPool {
         }
     }
 
+    /// A held cursor created in this transaction whose query has not run;
+    /// commit runs it whole, as PostgreSQL persists a holdable portal.
+    pub(crate) fn next_hold_fill(&self) -> Option<(usize, PendingFill)> {
+        let at = self.slots.iter().position(|slot| {
+            slot.active && slot.tentative && slot.hold && slot.fill == Fill::Pending
+        })?;
+        let fill = if self.slots[at].query.writes() {
+            PendingFill::Write
+        } else {
+            PendingFill::Read
+        };
+        Some((at, fill))
+    }
+
     pub(crate) fn next_hold_source(&self) -> Option<usize> {
         self.slots.iter().position(|slot| {
             slot.active && slot.tentative && slot.hold && slot.query.retained.is_some()
@@ -1635,6 +1780,8 @@ impl CursorPool {
             if s.active || s.plan_generation.is_some() {
                 if s.active && s.hold {
                     s.tentative = false;
+                    // A held cursor's rows are saved; it reads no table.
+                    s.tables.fill(0);
                 } else {
                     s.query.clear();
                     s.active = false;

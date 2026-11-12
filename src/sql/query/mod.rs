@@ -24,7 +24,9 @@ use super::eval::{
 use super::exec::{MAX_PROJ, describe_items};
 use super::types::{ColDesc, ColType, Datum};
 
+mod backward_scan;
 pub(super) mod input_progress;
+pub(crate) use backward_scan::{select_scans_backward, set_query_scans_backward};
 mod invocation_results;
 mod suspended_invocations;
 pub(crate) use invocation_results::OwnedRoutineResult;
@@ -72,7 +74,7 @@ pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 
 mod cte;
 pub(crate) use cte::captured_type_oid;
-pub(crate) use cte::{CteReader, dml_cte_runs_after};
+pub(crate) use cte::{CteReader, dml_cte_runs_after, select_relations, set_query_relations};
 mod dependencies;
 mod procedural_names;
 pub(crate) use procedural_names::{

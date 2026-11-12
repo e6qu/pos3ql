@@ -51216,6 +51216,21 @@ impl Storage {
         }
     }
 
+    /// Reads as a cursor's opening statement did: its own transaction's
+    /// changes made before `command`, and commits through `commit_lsn`.
+    pub(crate) fn cursor_snapshot(&self, command: u32, commit_lsn: u64) -> ReadSnapshotScope {
+        let previous = execution_visibility();
+        replace_execution_visibility(VisibilityContext {
+            read_snapshot: command,
+            commit_snapshot: commit_lsn,
+            ..previous
+        });
+        ReadSnapshotScope {
+            previous,
+            thread: core::marker::PhantomData,
+        }
+    }
+
     /// Keeps the running statement's visibility and restores it on drop.
     pub(crate) fn same_statement_snapshot(&self) -> ReadSnapshotScope {
         ReadSnapshotScope {

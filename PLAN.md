@@ -95,14 +95,11 @@ is owned.
   into `portal_result_bytes`), `FETCH` output, `COPY TO`, and more retained
   shapes (joins, sorting, grouping, subqueries, set operations, and more
   set-returning functions than `generate_series` and one-array `unnest`).
-  Cursors over those shapes still run at `DECLARE`, so a scrollable sorted
-  cursor returns saved values where PostgreSQL evaluates a volatile output
-  list again, and a row-locking cursor over a join, or ordered by an
-  expression that is not a source column, locks its rows at `DECLARE`.
-  Such a cursor declared without `SCROLL` or `NO SCROLL` shows
-  `is_scrollable` false in `pg_cursors` yet accepts backward fetches, where
-  PostgreSQL decides from its plan (a sort scans backward, an aggregate
-  rejects it with `55000`).
+  A cursor over those shapes runs its query whole at its first read, with the
+  snapshot taken when it opened, so a scrollable sorted cursor returns saved
+  values where PostgreSQL evaluates a volatile output list again, and a
+  row-locking cursor over a join, or ordered by an expression that is not a
+  source column, locks all its rows at that first read.
   PL/pgSQL bound cursor declarations (`c CURSOR FOR ...` in `DECLARE`) are
   rejected with `0A000`; a `refcursor` opened with `OPEN ... FOR` works. Saving a held cursor at
   commit yields during storage waits. Cursors keep declared record and domain
@@ -304,9 +301,7 @@ marked `NO INHERIT` fails with `0A000`, and exclusion constraints support only
 GiST over range columns (`EXCLUDE USING btree (a WITH =)` fails with `0A000`).
 `pg_constraint` omits the system catalogs' own not-null constraints. A rewrite rule `INSERT` action whose `VALUES` rows write
 `DEFAULT` in different columns runs as one insert per pattern, so `RETURNING`
-from such an action fails with `0A000`. A cursor whose query
-cannot stream runs it at `DECLARE` or `OPEN`, so a volatile function's side
-effects happen before the first `FETCH` rather than at it. A derived table computes output
+from such an action fails with `0A000`. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1
 FROM (SELECT 10 / t.x) s)` fails with division by zero on a zero `x` where
 PostgreSQL, which drops unread subquery outputs, returns the row. A
@@ -316,12 +311,9 @@ PostgreSQL types it as the table's row type `t`. A row constructor casts to a ta
 (`ARRAY[ROW(1, 'a')::t]`) fails with `0A000`, where PostgreSQL accepts both.
 A PL/pgSQL variable declared with a view's row type (`r v;` or
 `r v%ROWTYPE`) fails with `0A000`; a table's works. A trigger fired
-inside a writing statement runs a cursor's `OPEN` query whole at `OPEN`, so a
-cursor it leaves open for the caller does not see the row its BEFORE trigger
-was inserting, where PostgreSQL's cursor reads it at the first `FETCH`; it
-cannot `FETCH` from a session cursor that evaluates rows as fetched, or open
-one with data-modifying `WITH` queries (`0A000`). A PL/pgSQL cursor variable
-named with its block label (`CLOSE b.c`) fails as a syntax error, and a
+inside a writing statement cannot `FETCH` from a session cursor that
+evaluates rows as fetched, or first read one whose data-modifying `WITH`
+queries have not run (`0A000`). A
 parameter used as a cursor is type-checked when the statement runs rather
 than when the routine is created. `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.

@@ -1269,7 +1269,7 @@ fn quoted_cursor_names_use_tokens_in_open_fetch_move_and_close() {
                     )
                     .unwrap()
                     .unwrap();
-                    assert_eq!(open.variable.as_str(), "cursor \" name");
+                    assert_eq!(open.variable.name.as_str(), "cursor \" name");
                     for source in [
                         "FETCH NEXT FROM \"cursor \"\" name\" INTO \"output value\"",
                         "MOVE NEXT FROM \"cursor \"\" name\"",

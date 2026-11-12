@@ -2429,9 +2429,11 @@ fn cursor_typed_rows_use_exact_capacity_and_release_failed_declarations() {
             "BEGIN; DECLARE fits CURSOR FOR SELECT FROM (VALUES(1)) source(id) GROUP BY id; FETCH ALL FROM fits; COMMIT",
             true,
         );
+        // The query runs, and runs out of row storage, at its first read.
         let failed = session.execute(
             &mut engine,
-            "BEGIN; DECLARE too_wide CURSOR FOR SELECT id FROM (VALUES(1)) source(id) GROUP BY id",
+            "BEGIN; DECLARE too_wide CURSOR FOR SELECT id FROM (VALUES(1)) source(id) GROUP BY id; \
+             FETCH too_wide",
             true,
         );
         assert_eq!(error_sqlstates(&failed), ["54000"]);
@@ -2986,5 +2988,183 @@ fn locking_cursors_reject_repeatable_read_changes_and_bound_sorted_rows() {
             true
         )),
         ["10"]
+    );
+}
+
+#[test]
+fn cursor_queries_run_at_their_first_read_with_the_opening_snapshot() {
+    let config = test_config("cursor-opening-snapshot");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    reader.success(
+        &mut engine,
+        "CREATE TABLE snap(a integer); INSERT INTO snap VALUES (1), (2); \
+         CREATE TABLE snap_log(a integer); \
+         CREATE FUNCTION snap_open() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         DECLARE c refcursor := 'opened'; BEGIN \
+           OPEN c FOR SELECT a FROM snap ORDER BY a; \
+           INSERT INTO snap_log VALUES (NEW.a); RETURN NEW; END $$; \
+         CREATE TRIGGER snap_before BEFORE INSERT ON snap FOR EACH ROW \
+           EXECUTE FUNCTION snap_open(); \
+         CREATE FUNCTION snap_read() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         DECLARE c refcursor; r record; BEGIN \
+           OPEN c FOR SELECT count(*) AS n FROM snap_log; \
+           INSERT INTO snap_log VALUES (NEW.a); \
+           FETCH c INTO r; RAISE NOTICE 'logged %', r.n; CLOSE c; RETURN NEW; END $$",
+        true,
+    );
+    // The cursor opened in the BEFORE trigger reads the row its statement
+    // inserts afterwards, and not the trigger's own later write.
+    assert_eq!(
+        data_rows(&reader.success(
+            &mut engine,
+            "BEGIN; INSERT INTO snap VALUES (3); FETCH ALL FROM opened; \
+             SELECT name, is_scrollable FROM pg_cursors; CLOSE opened; COMMIT",
+            true,
+        )),
+        ["1", "2", "3", "opened|t"]
+    );
+    reader.success(
+        &mut engine,
+        "DROP TRIGGER snap_before ON snap; \
+         CREATE TRIGGER snap_reader BEFORE INSERT ON snap FOR EACH ROW \
+           EXECUTE FUNCTION snap_read()",
+        true,
+    );
+    let output = reader.success(&mut engine, "INSERT INTO snap VALUES (4)", true);
+    assert!(String::from_utf8_lossy(&output).contains("logged 1"));
+    // Later commands of the transaction and later commits stay invisible;
+    // the cursor's snapshot is held until it closes.
+    reader.success(
+        &mut engine,
+        "BEGIN; DECLARE later CURSOR FOR SELECT a FROM snap ORDER BY a DESC",
+        true,
+    );
+    let held = engine.storage.oldest_snapshot();
+    assert!(held.is_some());
+    writer.success(&mut engine, "UPDATE snap SET a = a + 10 WHERE a = 4", true);
+    reader.success(&mut engine, "DELETE FROM snap WHERE a = 1", true);
+    assert_eq!(
+        data_rows(&reader.success(&mut engine, "FETCH ALL FROM later", true)),
+        ["4", "3", "2", "1"]
+    );
+    assert_eq!(engine.storage.oldest_snapshot(), None);
+    reader.success(&mut engine, "ROLLBACK", true);
+    // An error the query raises is reported by the read that runs it.
+    reader.success(
+        &mut engine,
+        "BEGIN; DECLARE failing CURSOR FOR SELECT 1 / (a - a) FROM snap ORDER BY 1",
+        true,
+    );
+    let failed = reader.execute(&mut engine, "FETCH failing", true);
+    assert_eq!(error_sqlstates(&failed), ["22012"]);
+    reader.success(&mut engine, "ROLLBACK", true);
+}
+
+#[test]
+fn default_cursor_scrollability_follows_the_plan_shape() {
+    let config = test_config("cursor-plan-scrollability");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE s(a integer, b text); INSERT INTO s VALUES (1,'x'),(2,'y'),(3,'z'); \
+         CREATE TABLE u(a integer); INSERT INTO u VALUES (1),(2); \
+         CREATE VIEW joined AS SELECT s.a FROM s JOIN u USING (a)",
+        true,
+    );
+    for (query, scrollable) in [
+        ("SELECT * FROM s", true),
+        ("SELECT * FROM s ORDER BY b", true),
+        ("VALUES (1), (2)", true),
+        ("VALUES (1)", false),
+        ("SELECT 1", false),
+        ("SELECT * FROM s JOIN u USING (a)", false),
+        ("SELECT * FROM s JOIN u USING (a) ORDER BY b", true),
+        ("SELECT * FROM s JOIN u USING (a) ORDER BY a", false),
+        ("SELECT * FROM joined", false),
+        ("SELECT count(*) FROM s", false),
+        ("SELECT a FROM s GROUP BY a", false),
+        ("SELECT a, count(*) FROM s GROUP BY a ORDER BY a", true),
+        ("SELECT DISTINCT a FROM s", false),
+        ("SELECT DISTINCT ON (a) a FROM s ORDER BY a", false),
+        ("SELECT * FROM s FOR UPDATE", false),
+        ("SELECT * FROM s UNION ALL SELECT * FROM s", true),
+        ("SELECT * FROM s UNION ALL SELECT 9, 'q'", false),
+        ("SELECT * FROM s UNION SELECT 9, 'q'", false),
+        ("SELECT generate_series(1, 3)", false),
+        ("SELECT * FROM generate_series(1, 3)", true),
+        ("SELECT * FROM s WHERE a IN (SELECT a FROM u)", false),
+        ("SELECT * FROM s WHERE EXISTS (SELECT 1 FROM u)", true),
+        (
+            "SELECT * FROM s WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.a = s.a)",
+            false,
+        ),
+        ("SELECT a, row_number() OVER () FROM s", false),
+        ("SELECT a, row_number() OVER () FROM s ORDER BY a", true),
+        ("SELECT * FROM (SELECT a FROM s LIMIT 2) q", true),
+        ("SELECT * FROM s TABLESAMPLE SYSTEM (100)", false),
+        ("SELECT * FROM s CROSS JOIN (SELECT 1) x", true),
+    ] {
+        let output = session.success(
+            &mut engine,
+            &format!(
+                "BEGIN; DECLARE shaped CURSOR FOR {query}; \
+                 SELECT is_scrollable FROM pg_cursors WHERE name = 'shaped'"
+            ),
+            true,
+        );
+        assert_eq!(
+            data_rows(&output),
+            [if scrollable { "t" } else { "f" }],
+            "{query}"
+        );
+        let backward = session.execute(
+            &mut engine,
+            "FETCH 2 FROM shaped; FETCH PRIOR FROM shaped",
+            true,
+        );
+        assert_eq!(error_sqlstates(&backward).is_empty(), scrollable, "{query}");
+        session.success(&mut engine, "ROLLBACK", true);
+    }
+}
+
+#[test]
+fn open_cursors_keep_the_tables_they_read_in_use() {
+    let config = test_config("cursor-tables-in-use");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE used(a integer); INSERT INTO used VALUES (1), (2)",
+        true,
+    );
+    for (prelude, command) in [
+        ("", "DROP TABLE used"),
+        ("", "ALTER TABLE used ADD COLUMN b integer"),
+        ("FETCH ALL FROM keeper;", "DROP TABLE used"),
+    ] {
+        session.success(
+            &mut engine,
+            &format!("BEGIN; DECLARE keeper CURSOR FOR SELECT a FROM used ORDER BY a; {prelude}"),
+            true,
+        );
+        let failed = session.execute(&mut engine, command, true);
+        assert_eq!(error_sqlstates(&failed), ["55006"], "{command}");
+        session.success(&mut engine, "ROLLBACK", true);
+    }
+    session.success(
+        &mut engine,
+        "BEGIN; DECLARE keeper CURSOR WITH HOLD FOR SELECT a FROM used ORDER BY a; COMMIT; \
+         DROP TABLE used",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "FETCH ALL FROM keeper; CLOSE keeper", true)),
+        ["1", "2"]
     );
 }

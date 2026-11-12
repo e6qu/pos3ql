@@ -17820,7 +17820,7 @@ enum PlpgsqlCursorQuery<'a> {
 
 #[derive(Clone, Copy)]
 struct PlpgsqlCursorOpen<'a> {
-    variable: SqlName,
+    variable: PlpgsqlVariableName,
     /// The variable as written, for its compile-time check.
     written: &'a str,
     scroll: super::cursor::CursorScroll,
@@ -17829,13 +17829,13 @@ struct PlpgsqlCursorOpen<'a> {
 
 #[derive(Clone, Copy)]
 struct PlpgsqlCursorClose<'a> {
-    variable: SqlName,
+    variable: PlpgsqlVariableName,
     written: &'a str,
 }
 
 #[derive(Clone, Copy)]
 struct PlpgsqlCursorMotion<'a> {
-    variable: SqlName,
+    variable: PlpgsqlVariableName,
     /// The variable as written, for its compile-time check.
     written: &'a str,
     /// How the direction's first word reads, which depends on whether it
@@ -17853,7 +17853,7 @@ struct PlpgsqlCursorMotion<'a> {
 /// count expression.
 #[derive(Clone, Copy)]
 struct MotionLeading<'a> {
-    name: SqlName,
+    name: PlpgsqlVariableName,
     written: &'a str,
     /// The token after the name when it was read as a count expression; a
     /// lone name was read as the cursor variable.
@@ -21235,8 +21235,16 @@ fn parse_plpgsql_cursor_open<'a>(
         return Ok(None);
     };
     let body = body.trim();
-    let (variable, split) = parse_plpgsql_identifier_prefix(body, arena)?;
+    let (_, mut split) = parse_plpgsql_identifier_prefix(body, arena)?;
+    // A block label may qualify the variable.
+    if let Some(name) = body[split..].trim_start().strip_prefix('.') {
+        let at = body.len() - name.len();
+        let name = name.trim_start();
+        split = body.len() - name.len() + parse_plpgsql_identifier_prefix(name, arena)?.1;
+        debug_assert!(at < split);
+    }
     let written = body[..split].trim_end();
+    let variable = parse_plpgsql_variable_name(written, arena)?;
     let body = body[split..].trim();
     let Some(for_at) = trigger_top_level_keyword(body, "for", arena)? else {
         return Err(unsupported_trigger_body());
@@ -21438,7 +21446,7 @@ fn parse_plpgsql_cursor_motion<'a>(
                 && tokens.get(1).map(|token| token.word) != Some(MotionWord::Open) =>
         {
             Some(MotionLeading {
-                name: parse_plpgsql_identifier(token_text(0), arena)?.name,
+                name: parse_plpgsql_variable_name(token_text(0), arena)?,
                 written: token_text(0),
                 next: tokens.get(1).map(|_| token_text(1)),
                 end: &statement[statement.len()..],
@@ -21449,7 +21457,7 @@ fn parse_plpgsql_cursor_motion<'a>(
     let (variable, written) = match &tokens[next.min(tokens.len())..] {
         [token] if token.word != MotionWord::Open && token.word != MotionWord::Close => {
             let written = &text[token.start..token.end];
-            (parse_plpgsql_identifier(written, arena)?.name, written)
+            (parse_plpgsql_variable_name(written, arena)?, written)
         }
         _ => {
             return Err(sql_err!(
@@ -21489,8 +21497,10 @@ enum MotionWord {
     From,
     Open,
     Close,
-    /// Any other identifier.
+    /// Any other identifier, possibly qualified by a block label.
     Name,
+    /// `.` between a label and a name.
+    Dot,
     Other,
 }
 
@@ -21538,8 +21548,27 @@ fn plpgsql_motion_tokens<'a>(text: &str, arena: &'a Arena) -> Result<&'a [Motion
                     Tok::QuotedIdent(_) => MotionWord::Name,
                     Tok::Op("(") => MotionWord::Open,
                     Tok::Op(")") => MotionWord::Close,
+                    Tok::Op(".") => MotionWord::Dot,
                     _ => MotionWord::Other,
                 };
+                // A block label qualifies the name after it: `b.c` is one
+                // cursor variable, as PostgreSQL's scanner reads it.
+                if matches!(token, Tok::Ident(_) | Tok::QuotedIdent(_))
+                    && count >= 2
+                    && tokens[count - 1].word == MotionWord::Dot
+                    && !matches!(
+                        tokens[count - 2].word,
+                        MotionWord::Open | MotionWord::Close | MotionWord::Dot | MotionWord::Other
+                    )
+                {
+                    tokens[count - 2] = MotionToken {
+                        word: MotionWord::Name,
+                        start: tokens[count - 2].start,
+                        end: lexer.token_end(),
+                    };
+                    count -= 1;
+                    continue;
+                }
                 if count == MAX_MOTION_TOKENS {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -21572,7 +21601,7 @@ fn parse_plpgsql_cursor_close<'a>(
     };
     let body = body.trim();
     Ok(Some(PlpgsqlCursorClose {
-        variable: parse_plpgsql_identifier(body, arena)?.name,
+        variable: parse_plpgsql_variable_name(body, arena)?,
         written: body,
     }))
 }
@@ -22653,51 +22682,61 @@ fn validate_plpgsql_variable_uses(
             };
             // PostgreSQL's grammar accepts only a declared refcursor
             // variable as a cursor; a parameter's type is checked when it runs.
-            let cursor_variable = |name: SqlName, written: &str| -> Result<(), SqlError> {
-                let target = PlpgsqlVariableName::plain(name);
-                let error = match binding_constant(target, locals, shadowed, has_parameter) {
-                    None => sql_err!(
-                        sqlstate::SYNTAX_ERROR,
-                        "\"{}\" is not a known variable",
-                        name.as_str()
-                    ),
-                    Some(_) => {
-                        let mut scoped = shadowed;
-                        let mut loop_variable = false;
-                        while let Some(local) = scoped {
-                            loop_variable |= local.name == name;
-                            scoped = local.parent;
-                        }
-                        match locals.iter().rfind(|local| target.names(local)) {
-                            _ if loop_variable => sql_err!(
-                                sqlstate::DATATYPE_MISMATCH,
-                                "variable \"{}\" must be of type cursor or refcursor",
+            let cursor_variable =
+                |target: PlpgsqlVariableName, written: &str| -> Result<(), SqlError> {
+                    let name = target.name;
+                    let error = match binding_constant(target, locals, shadowed, has_parameter) {
+                        None => match target.label {
+                            Some(label) => sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "\"{}.{}\" is not a known variable",
+                                label.as_str(),
                                 name.as_str()
                             ),
-                            None => return Ok(()),
-                            Some(local) if local.ctype == ColType::Refcursor => return Ok(()),
-                            Some(local)
-                                if local.record_shape.is_some()
-                                    || matches!(
-                                        local.ctype,
-                                        ColType::Record | ColType::Composite(_)
-                                    ) =>
-                            {
-                                sql_err!(
-                                    sqlstate::DATATYPE_MISMATCH,
-                                    "cursor variable must be a simple variable"
-                                )
+                            None => sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "\"{}\" is not a known variable",
+                                name.as_str()
+                            ),
+                        },
+                        Some(_) => {
+                            let mut scoped = shadowed;
+                            let mut loop_variable = false;
+                            while let Some(local) = scoped {
+                                loop_variable |= local.name == name
+                                    && target.label.is_none_or(|label| local.label == Some(label));
+                                scoped = local.parent;
                             }
-                            Some(_) => sql_err!(
-                                sqlstate::DATATYPE_MISMATCH,
-                                "variable \"{}\" must be of type cursor or refcursor",
-                                name.as_str()
-                            ),
+                            match locals.iter().rfind(|local| target.names(local)) {
+                                _ if loop_variable => sql_err!(
+                                    sqlstate::DATATYPE_MISMATCH,
+                                    "variable \"{}\" must be of type cursor or refcursor",
+                                    name.as_str()
+                                ),
+                                None => return Ok(()),
+                                Some(local) if local.ctype == ColType::Refcursor => return Ok(()),
+                                Some(local)
+                                    if local.record_shape.is_some()
+                                        || matches!(
+                                            local.ctype,
+                                            ColType::Record | ColType::Composite(_)
+                                        ) =>
+                                {
+                                    sql_err!(
+                                        sqlstate::DATATYPE_MISMATCH,
+                                        "cursor variable must be a simple variable"
+                                    )
+                                }
+                                Some(_) => sql_err!(
+                                    sqlstate::DATATYPE_MISMATCH,
+                                    "variable \"{}\" must be of type cursor or refcursor",
+                                    name.as_str()
+                                ),
+                            }
                         }
-                    }
+                    };
+                    Err(crate::sql::error_position::at_subject(error, written))
                 };
-                Err(crate::sql::error_position::at_subject(error, written))
-            };
             match *statement {
                 TriggerStatement::LocalAssign(assignment) => reject(assignment.name, None)?,
                 TriggerStatement::SelectInto(statement) => {
@@ -22719,14 +22758,7 @@ fn validate_plpgsql_variable_uses(
                             written,
                             next: Some(next),
                             ..
-                        }) if binding_constant(
-                            PlpgsqlVariableName::plain(name),
-                            locals,
-                            shadowed,
-                            has_parameter,
-                        )
-                        .is_some() =>
-                        {
+                        }) if binding_constant(name, locals, shadowed, has_parameter).is_some() => {
                             cursor_variable(name, written)?;
                             return Err(crate::sql::error_position::at_subject(
                                 sql_err!(
@@ -22744,14 +22776,7 @@ fn validate_plpgsql_variable_uses(
                             next: None,
                             end,
                             ..
-                        }) if binding_constant(
-                            PlpgsqlVariableName::plain(name),
-                            locals,
-                            shadowed,
-                            has_parameter,
-                        )
-                        .is_none() =>
-                        {
+                        }) if binding_constant(name, locals, shadowed, has_parameter).is_none() => {
                             return Err(crate::sql::error_position::at_subject(
                                 sql_err!(
                                     sqlstate::SYNTAX_ERROR,
@@ -30593,13 +30618,13 @@ fn execute_trigger_step_in<'a>(
         TriggerStatement::CursorOpen(statement) => execute_trigger_statement(|| {
             let changed = [CursorOutputSlot::Local(trigger_local_index(
                 locals,
-                PlpgsqlVariableName::plain(statement.variable),
+                statement.variable,
             )?)];
             cursor_statement_effect(
                 context,
                 &invocation,
                 CursorReceiptOperation::Open {
-                    variable: statement.variable,
+                    variable: statement.variable.name,
                     scroll: statement.scroll,
                 },
                 &changed,
@@ -30607,15 +30632,12 @@ fn execute_trigger_step_in<'a>(
                 records,
                 status,
                 |context, local_values, records, status, completed| {
-                    let local = trigger_local_index(
-                        locals,
-                        PlpgsqlVariableName::plain(statement.variable),
-                    )?;
+                    let local = trigger_local_index(locals, statement.variable)?;
                     if locals[local].ctype != ColType::Refcursor {
                         return Err(sql_err!(
                             sqlstate::DATATYPE_MISMATCH,
                             "variable \"{}\" must be of type cursor or refcursor",
-                            statement.variable.as_str()
+                            statement.variable.name.as_str()
                         ));
                     }
                     let assign_name = local_values[local].is_null();
@@ -30623,7 +30645,7 @@ fn execute_trigger_step_in<'a>(
                         return Err(sql_err!(
                             sqlstate::ERROR_IN_ASSIGNMENT,
                             "variable \"{}\" is declared CONSTANT",
-                            statement.variable.as_str()
+                            statement.variable.name.as_str()
                         ));
                     }
                     let generated;
@@ -30650,7 +30672,7 @@ fn execute_trigger_step_in<'a>(
                             return Err(sql_err!(
                                 sqlstate::DATATYPE_MISMATCH,
                                 "variable \"{}\" must be of type cursor or refcursor",
-                                statement.variable.as_str()
+                                statement.variable.name.as_str()
                             ));
                         }
                     };
@@ -30760,6 +30782,7 @@ fn execute_trigger_step_in<'a>(
                         let fresh_snapshot = invocation.fresh_snapshots;
                         let arena = context.arena;
                         let txid = context.txn.txid;
+                        let command = context.txn.command_id();
                         let mut open = || match &mut context.host {
                             PlpgsqlExecHost::Routine {
                                 engine,
@@ -30791,7 +30814,6 @@ fn execute_trigger_step_in<'a>(
                                 });
                                 super::open_trigger_cursor(
                                     storage,
-                                    services.seq_session,
                                     services.cursors,
                                     name,
                                     source,
@@ -30800,6 +30822,7 @@ fn execute_trigger_step_in<'a>(
                                     arena,
                                     arguments,
                                     txid,
+                                    super::cursor_snapshot_command(storage, command),
                                 )
                             }
                         };
@@ -30820,7 +30843,7 @@ fn execute_trigger_step_in<'a>(
                             context,
                             locals,
                             local_values,
-                            PlpgsqlVariableName::plain(statement.variable),
+                            statement.variable,
                             Datum::Text(name),
                         )?;
                     }
@@ -30911,7 +30934,7 @@ fn execute_trigger_step_in<'a>(
                 context,
                 &invocation,
                 CursorReceiptOperation::Motion {
-                    variable: statement.variable,
+                    variable: statement.variable.name,
                     motion,
                     move_only: statement.move_only,
                 },
@@ -30920,22 +30943,19 @@ fn execute_trigger_step_in<'a>(
                 records,
                 status,
                 |context, local_values, records, status, completed| {
-                    let local = trigger_local_index(
-                        locals,
-                        PlpgsqlVariableName::plain(statement.variable),
-                    )?;
+                    let local = trigger_local_index(locals, statement.variable)?;
                     if locals[local].ctype != ColType::Refcursor {
                         return Err(sql_err!(
                             sqlstate::DATATYPE_MISMATCH,
                             "variable \"{}\" must be of type cursor or refcursor",
-                            statement.variable.as_str()
+                            statement.variable.name.as_str()
                         ));
                     }
                     let Datum::Text(name) = local_values[local] else {
                         return Err(sql_err!(
                             sqlstate::NULL_VALUE_NOT_ALLOWED,
                             "cursor variable \"{}\" is null",
-                            statement.variable.as_str()
+                            statement.variable.name.as_str()
                         ));
                     };
                     let arena = context.arena;
@@ -30964,9 +30984,13 @@ fn execute_trigger_step_in<'a>(
                                 )?,
                                 &**cursors,
                             ),
-                            PlpgsqlExecHost::Atomic { services, .. } => (
+                            PlpgsqlExecHost::Atomic { storage, services } => (
                                 super::fetch_trigger_cursor(
+                                    storage,
+                                    services.seq_session,
                                     services.cursors,
+                                    arena,
+                                    context.txn.txid,
                                     name,
                                     motion,
                                     statement.move_only,
@@ -30982,7 +31006,10 @@ fn execute_trigger_step_in<'a>(
                     // A query with data-modifying WITH queries runs on its
                     // first read, in a new command as PostgreSQL runs it.
                     let fills = matches!(context.host, PlpgsqlExecHost::Routine { .. })
-                        && context.host.cursors().pending_write_fill(name)?.is_some();
+                        && matches!(
+                            context.host.cursors().pending_fill(name)?,
+                            Some((_, super::cursor::PendingFill::Write))
+                        );
                     let (count, rows) = if fills {
                         in_new_plpgsql_command(context, fetch)?
                     } else {
@@ -31094,26 +31121,27 @@ fn execute_trigger_step_in<'a>(
                 cursor_statement_effect(
                     context,
                     &invocation,
-                    CursorReceiptOperation::Close { variable },
+                    CursorReceiptOperation::Close {
+                        variable: variable.name,
+                    },
                     changed,
                     local_values,
                     records,
                     status,
                     |context, local_values, _records, _status, _completed| {
-                        let local =
-                            trigger_local_index(locals, PlpgsqlVariableName::plain(variable))?;
+                        let local = trigger_local_index(locals, variable)?;
                         if locals[local].ctype != ColType::Refcursor {
                             return Err(sql_err!(
                                 sqlstate::DATATYPE_MISMATCH,
                                 "variable \"{}\" must be of type cursor or refcursor",
-                                variable.as_str()
+                                variable.name.as_str()
                             ));
                         }
                         let Datum::Text(name) = local_values[local] else {
                             return Err(sql_err!(
                                 sqlstate::NULL_VALUE_NOT_ALLOWED,
                                 "cursor variable \"{}\" is null",
-                                variable.as_str()
+                                variable.name.as_str()
                             ));
                         };
                         let cursors = context.host.cursors_mut();
@@ -31591,9 +31619,13 @@ fn execute_trigger_step_in<'a>(
                                     )?;
                                     &**cursors
                                 }
-                                PlpgsqlExecHost::Atomic { services, .. } => {
+                                PlpgsqlExecHost::Atomic { storage, services } => {
                                     super::fetch_trigger_cursor(
+                                        storage,
+                                        services.seq_session,
                                         services.cursors,
+                                        arena,
+                                        context.txn.txid,
                                         name,
                                         *motion,
                                         false,

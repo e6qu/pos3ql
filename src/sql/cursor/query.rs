@@ -26,6 +26,16 @@ pub(crate) struct CursorQuery {
     result_type_oids: Option<crate::mem::arena::FrozenArenaSliceHandle<i32>>,
     arena: Arena,
     owner: crate::sql::type_input_plans::Owner,
+    snapshot: Option<CursorSnapshot>,
+}
+
+/// The snapshot a cursor's query reads, taken when the cursor opens: its
+/// transaction's changes from earlier commands and commits through the
+/// opening statement's commit position. The lease keeps those row versions
+/// until the query has produced its rows or the cursor closes.
+struct CursorSnapshot {
+    command: u32,
+    lease: crate::storage::StatementSnapshotLease,
 }
 
 struct BoundQuery<'a> {
@@ -45,6 +55,15 @@ pub(crate) struct ReparsedQuery<'w> {
     pub params: &'w [Datum<'w>],
     pub parameter_types: &'w [i32],
     pub owner: crate::sql::type_input_plans::Owner,
+    /// The opening command and commit position the query reads.
+    pub snapshot: (u32, u64),
+}
+
+fn missing_snapshot() -> SqlError {
+    sql_err!(
+        sqlstate::INTERNAL_ERROR,
+        "cursor query has no retained snapshot"
+    )
 }
 
 fn query_full() -> SqlError {
@@ -85,10 +104,12 @@ impl CursorQuery {
             result_type_oids: None,
             arena: Arena::new(budget, "cursor_query_bytes", bytes)?,
             owner: crate::sql::type_input_plans::Owner::Unlocated,
+            snapshot: None,
         })
     }
 
     pub(crate) fn clear(&mut self) {
+        self.snapshot = None;
         self.retained = None;
         self.result_type_oids = None;
         self.bound = None;
@@ -138,6 +159,11 @@ impl CursorQuery {
                 "cursor query is not bound"
             )
         })?;
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| (snapshot.command, snapshot.lease.snapshot()))
+            .ok_or_else(missing_snapshot)?;
         let full = crate::sql::query::arena_full_pub;
         let source = arena.alloc_str(bound.source).map_err(|_| full())?;
         let params = copy_values_or(arena, bound.params, full)?;
@@ -192,10 +218,48 @@ impl CursorQuery {
             params,
             parameter_types,
             owner: self.owner,
+            snapshot,
         })
     }
 
+    /// Takes the opening statement's snapshot: `command` is its command
+    /// identifier, and the storage's current commit snapshot is retained.
+    pub(crate) fn retain_snapshot(
+        &mut self,
+        storage: &crate::storage::Storage,
+        txid: u32,
+        command: u32,
+    ) -> Result<(), SqlError> {
+        if self.snapshot.is_none() {
+            self.snapshot = Some(CursorSnapshot {
+                command,
+                lease: storage.retain_cursor_snapshot(txid, storage.commit_snapshot())?,
+            });
+        }
+        Ok(())
+    }
+
+    /// The opening command, which bounds the own-transaction changes the
+    /// query reads.
+    pub(crate) fn snapshot_command(&self) -> Result<u32, SqlError> {
+        self.snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.command)
+            .ok_or_else(missing_snapshot)
+    }
+
+    /// Reads with the cursor's snapshot until the scope drops.
+    pub(crate) fn enter_snapshot(
+        &self,
+        storage: &crate::storage::Storage,
+    ) -> Result<crate::storage::ReadSnapshotScope, SqlError> {
+        let snapshot = self.snapshot.as_ref().ok_or_else(missing_snapshot)?;
+        snapshot.lease.validate_storage(storage)?;
+        Ok(storage.cursor_snapshot(snapshot.command, snapshot.lease.snapshot()))
+    }
+
     pub(crate) fn finish_source(&mut self) {
+        self.snapshot = None;
         self.retained = None;
         self.bound = None;
         // Held rows keep their declared types after the query and its readers

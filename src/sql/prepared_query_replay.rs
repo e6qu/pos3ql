@@ -318,12 +318,27 @@ pub(super) fn stage_query_record(
             table,
             new_name,
             enabled,
+            when,
         } => {
             let target = trigger_target(storage, *target, table_schema, table, txid)?;
             let slot = checked_trigger(storage, *identity, target, name, txid)?;
             let enabled = TriggerEnabled::from_code(*enabled)
                 .ok_or_else(|| invalid("trigger enabled mode"))?;
-            let change = storage.alter_trigger(slot, SqlName::parse(new_name)?, enabled, txid)?;
+            let prior = storage.trigger(slot).pending_definition();
+            let renamed = storage.alter_trigger(slot, SqlName::parse(new_name)?, enabled, txid)?;
+            let conditioned = storage.alter_trigger_when(
+                slot,
+                when.map(crate::storage::trigger_when_stackstr)
+                    .transpose()?,
+                txid,
+            )?;
+            let change = match (renamed, conditioned) {
+                (
+                    crate::storage::TriggerAlter::Unchanged,
+                    crate::storage::TriggerAlter::Unchanged,
+                ) => crate::storage::TriggerAlter::Unchanged,
+                _ => crate::storage::TriggerAlter::Changed { prior },
+            };
             record_trigger_change(storage, transaction, slot, change)?;
         }
         WalOp::SetPartitionTrigger { expected, image } => {

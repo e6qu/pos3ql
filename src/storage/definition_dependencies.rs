@@ -18,7 +18,11 @@ impl Storage {
         };
         let source = match name.binding {
             super::type_references::TypeBinding::Captured(source) => source,
-            super::type_references::TypeBinding::Polymorphic(_) => return Ok(()),
+            // A relation row type is published with its relation, whose
+            // catalog lock the dependent statement already holds.
+            super::type_references::TypeBinding::Polymorphic(_)
+            | super::type_references::TypeBinding::Relation(_)
+            | super::type_references::TypeBinding::InformationSchema(_) => return Ok(()),
             super::type_references::TypeBinding::Stored(_)
             | super::type_references::TypeBinding::Declaration => {
                 catalog

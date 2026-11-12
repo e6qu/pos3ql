@@ -35,7 +35,8 @@ pub(crate) struct JoinedFromRow<'a>(&'a [u8]);
 impl<'a> JoinedFromRow<'a> {
     fn encode(row: &JoinRow<'_, '_, '_>, arena: &'a Arena) -> Result<Self, SqlError> {
         let scope = row.scope;
-        let columns = scope.total_columns();
+        // Every stored column, a parenthesized join's members included.
+        let columns = scope.stored_columns();
         let width = columns + 2 * scope.n;
         let value = |index: usize| {
             if index >= columns + scope.n {
@@ -53,7 +54,7 @@ impl<'a> JoinedFromRow<'a> {
             }
             let mut column = index;
             for table in 0..scope.n {
-                let n_columns = scope.defs.get(table).expect("resolved").n_columns;
+                let n_columns = scope.stored_width(table);
                 if column < n_columns {
                     return row
                         .table_values(table)
@@ -75,7 +76,7 @@ impl<'a> JoinedFromRow<'a> {
     /// The sources of this row, bound for a scope resolved from the same FROM
     /// clause: `None` for a null-extended source.
     fn bind(self, scope: &QueryScope<'_>, arena: &'a Arena) -> Result<BoundSources<'a>, SqlError> {
-        let columns = scope.total_columns();
+        let columns = scope.stored_columns();
         let width = columns + 2 * scope.n;
         let decoded = arena
             .alloc_slice_with(width, |_| Datum::Null)
@@ -90,7 +91,7 @@ impl<'a> JoinedFromRow<'a> {
         let mut offset = 0;
         let bound = arena
             .alloc_slice_with(scope.n, |table| {
-                let n_columns = scope.defs.get(table).expect("resolved").n_columns;
+                let n_columns = scope.stored_width(table);
                 let values = &decoded[offset..offset + n_columns];
                 offset += n_columns;
                 matches!(decoded[columns + table], Datum::Bool(true))
@@ -305,9 +306,10 @@ pub(crate) fn recheck_joined_from_match<'a, 'r>(
 }
 
 /// Calls `each` with the target row `target` joined to the retained FROM row
-/// `row`, the scope assignments and `RETURNING` read.
+/// `row`, the scope assignments and `RETURNING` read. `matched_row` receives
+/// the FROM items' values for `RETURNING`.
 #[expect(clippy::too_many_arguments, reason = "joined DML scope inputs")]
-pub(crate) fn with_joined_from_row<'a, R>(
+pub(crate) fn with_joined_from_row<'a, 'r, R>(
     storage: &'a Storage,
     from: &'a FromClause<'a>,
     txid: u32,
@@ -318,6 +320,7 @@ pub(crate) fn with_joined_from_row<'a, R>(
     target: &dyn ColumnLookup<'a>,
     row: JoinedFromRow<'a>,
     each: impl FnOnce(&dyn ColumnLookup<'a>) -> Result<R, SqlError>,
+    matched_row: Option<super::MatchedFromRow<'_, 'r>>,
 ) -> Result<R, SqlError> {
     let scope = QueryScope::resolve_exec_outer(
         storage,
@@ -334,6 +337,9 @@ pub(crate) fn with_joined_from_row<'a, R>(
         .alloc_slice_with(scope.n, |table| table)
         .map_err(|_| arena_full())?;
     let sources = super::materialize::sources_row(&scope, sources.bound, order, sources.rowids);
+    if let Some(matched_row) = matched_row {
+        *matched_row.values = super::detached_join_values(&sources, arena, matched_row.arena)?;
+    }
     each(&Chained {
         inner: &sources,
         outer: Some(target),
@@ -511,7 +517,7 @@ fn project_items<'a>(
                     expression, arena, params, &lookup, hooks,
                 )?)?;
             }
-            crate::sql::ast::SelectItem::Wildcard => {
+            crate::sql::ast::SelectItem::Wildcard(_) => {
                 for index in 0..scope.star_columns() {
                     push(column(scope.star_entry(index))?)?;
                 }

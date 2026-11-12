@@ -8,6 +8,8 @@ pub(crate) struct CursorLocal<'a> {
     pub name: SqlName,
     pub type_oid: i32,
     pub value: Datum<'a>,
+    /// The body's rule for a column that shares this variable's name.
+    pub conflict: crate::sql::guc::VariableConflict,
 }
 
 #[derive(Clone, Copy)]
@@ -21,15 +23,52 @@ pub(crate) struct CursorQuery {
     // bound value before resetting or freeing that allocation.
     bound: Option<BoundQuery<'static>>,
     pub(crate) retained: Option<crate::sql::query::RetainedSelect<'static>>,
+    /// Where the retained source's bytes start in `arena`.
+    retained_mark: Option<crate::mem::arena::ArenaMark>,
     result_type_oids: Option<crate::mem::arena::FrozenArenaSliceHandle<i32>>,
+    /// The client query that opened the cursor, as `pg_cursors` shows it;
+    /// retained at the arena's tail while the query and its rows are released.
+    statement: Option<crate::mem::arena::FrozenArenaSliceHandle<u8>>,
     arena: Arena,
     owner: crate::sql::type_input_plans::Owner,
+    snapshot: Option<CursorSnapshot>,
+}
+
+/// The snapshot a cursor's query reads, taken when the cursor opens: its
+/// transaction's changes from earlier commands and commits through the
+/// opening statement's commit position. The lease keeps those row versions
+/// until the query has produced its rows or the cursor closes.
+struct CursorSnapshot {
+    command: u32,
+    lease: crate::storage::StatementSnapshotLease,
 }
 
 struct BoundQuery<'a> {
     statement: CursorStatement<'a>,
     params: &'a [Datum<'a>],
     parameter_types: &'a [i32],
+    /// The parse inputs, kept so a query whose `WITH` queries write can be
+    /// parsed again into the arena of the statement that first reads it.
+    source: &'a str,
+    bindings: &'a [crate::sql::parser::NamedParameter<'a>],
+    inputs: &'a [crate::sql::type_inputs::Binding<'a>],
+}
+
+/// A cursor query parsed again into a statement's arena.
+pub(crate) struct ReparsedQuery<'w> {
+    pub statement: &'w Select<'w>,
+    pub params: &'w [Datum<'w>],
+    pub parameter_types: &'w [i32],
+    pub owner: crate::sql::type_input_plans::Owner,
+    /// The opening command and commit position the query reads.
+    pub snapshot: (u32, u64),
+}
+
+fn missing_snapshot() -> SqlError {
+    sql_err!(
+        sqlstate::INTERNAL_ERROR,
+        "cursor query has no retained snapshot"
+    )
 }
 
 fn query_full() -> SqlError {
@@ -111,6 +150,7 @@ pub(crate) fn bind_locals<'a>(
                 qualifier: None,
                 name: "",
                 index: 0,
+                conflict: crate::sql::guc::VariableConflict::Error,
             }
         })
         .map_err(|_| full())?;
@@ -124,6 +164,7 @@ pub(crate) fn bind_locals<'a>(
             qualifier: None,
             name,
             index: at as u32 + 1,
+            conflict: local.conflict,
         };
         at += 1;
         if let Datum::Record(fields) | Datum::Composite { fields, .. } = copied {
@@ -134,6 +175,7 @@ pub(crate) fn bind_locals<'a>(
                     qualifier: Some(name),
                     name: field.name,
                     index: at as u32 + 1,
+                    conflict: local.conflict,
                 };
                 at += 1;
             }
@@ -151,18 +193,47 @@ impl CursorQuery {
         Ok(Self {
             bound: None,
             retained: None,
+            retained_mark: None,
             result_type_oids: None,
+            statement: None,
             arena: Arena::new(budget, "cursor_query_bytes", bytes)?,
             owner: crate::sql::type_input_plans::Owner::Unlocated,
+            snapshot: None,
         })
     }
 
     pub(crate) fn clear(&mut self) {
+        self.snapshot = None;
         self.retained = None;
+        self.retained_mark = None;
         self.result_type_oids = None;
+        self.statement = None;
         self.bound = None;
         self.arena.reset();
         self.owner = crate::sql::type_input_plans::Owner::Unlocated;
+    }
+
+    /// Records the opening client query; called once on a cleared query.
+    pub(crate) fn set_statement(&mut self, statement: &str) -> Result<(), SqlError> {
+        let bytes = statement.as_bytes();
+        let retained = self
+            .arena
+            .retain_slice_with(bytes.len(), |index| bytes[index])
+            .map_err(|_| query_full())?;
+        self.statement = Some(
+            self.arena
+                .freeze_retained_slice(retained)
+                .map_err(|_| query_full())?,
+        );
+        Ok(())
+    }
+
+    /// The opening client query, or empty once the cursor's query failed.
+    pub(crate) fn statement(&self) -> &str {
+        self.statement
+            .and_then(|handle| self.arena.retained_slice(handle).ok())
+            .and_then(|bytes| core::str::from_utf8(bytes).ok())
+            .unwrap_or("")
     }
 
     pub(crate) fn owner(&self) -> crate::sql::type_input_plans::Owner {
@@ -186,8 +257,130 @@ impl CursorQuery {
             .transpose()
     }
 
+    /// The query has data-modifying `WITH` queries: PostgreSQL runs it
+    /// whole, once, when the cursor is first read.
+    pub(crate) fn writes(&self) -> bool {
+        self.bound.as_ref().is_some_and(|bound| {
+            let with = match bound.statement {
+                CursorStatement::Select(select) => select.with,
+                CursorStatement::SetQuery(query) => query.with,
+            };
+            with.iter().any(|cte| cte.dml.is_some())
+        })
+    }
+
+    /// Parses the bound query again into `arena`, so it can run while the
+    /// cursor pool lends its buffers and lets nested statements use it.
+    pub(crate) fn reparse_into<'w>(&self, arena: &'w Arena) -> Result<ReparsedQuery<'w>, SqlError> {
+        let bound = self.bound.as_ref().ok_or_else(|| {
+            sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "cursor query is not bound"
+            )
+        })?;
+        let snapshot = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| (snapshot.command, snapshot.lease.snapshot()))
+            .ok_or_else(missing_snapshot)?;
+        let full = crate::sql::query::arena_full_pub;
+        let source = arena.alloc_str(bound.source).map_err(|_| full())?;
+        let params = copy_values(arena, bound.params, full)?;
+        let parameter_types = arena
+            .alloc_slice_copy(bound.parameter_types)
+            .map_err(|_| full())?;
+        let bindings = arena
+            .alloc_slice_with(bound.bindings.len(), |_| {
+                crate::sql::parser::NamedParameter {
+                    qualifier: None,
+                    name: "",
+                    index: 0,
+                    conflict: crate::sql::guc::VariableConflict::Error,
+                }
+            })
+            .map_err(|_| full())?;
+        for (copy, binding) in bindings.iter_mut().zip(bound.bindings) {
+            *copy = crate::sql::parser::NamedParameter {
+                qualifier: match binding.qualifier {
+                    Some(qualifier) => Some(arena.alloc_str(qualifier).map_err(|_| full())?),
+                    None => None,
+                },
+                name: arena.alloc_str(binding.name).map_err(|_| full())?,
+                index: binding.index,
+                conflict: binding.conflict,
+            };
+        }
+        let bytes = arena
+            .alloc_slice_with(crate::sql::type_inputs::encoded_len(bound.inputs)?, |_| 0u8)
+            .map_err(|_| full())?;
+        crate::sql::type_inputs::encode_into(bound.inputs, bytes)?;
+        let inputs = crate::sql::type_inputs::decode(bytes, arena)?;
+        let statement = crate::sql::type_input_plans::with_owner(self.owner, || {
+            crate::sql::exec::with_bound_parameter_types(parameter_types, || {
+                crate::sql::parser::parse_cursor_command(
+                    source,
+                    arena,
+                    bindings,
+                    inputs,
+                    |_| Ok(()),
+                )
+            })
+        })?;
+        let Stmt::Select(statement) = statement else {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a cursor query with data-modifying WITH queries must be a SELECT"
+            ));
+        };
+        Ok(ReparsedQuery {
+            statement,
+            params,
+            parameter_types,
+            owner: self.owner,
+            snapshot,
+        })
+    }
+
+    /// Takes the opening statement's snapshot: `command` is its command
+    /// identifier, and the storage's current commit snapshot is retained.
+    pub(crate) fn retain_snapshot(
+        &mut self,
+        storage: &crate::storage::Storage,
+        txid: u32,
+        command: u32,
+    ) -> Result<(), SqlError> {
+        if self.snapshot.is_none() {
+            self.snapshot = Some(CursorSnapshot {
+                command,
+                lease: storage.retain_cursor_snapshot(txid, storage.commit_snapshot())?,
+            });
+        }
+        Ok(())
+    }
+
+    /// The opening command, which bounds the own-transaction changes the
+    /// query reads.
+    pub(crate) fn snapshot_command(&self) -> Result<u32, SqlError> {
+        self.snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.command)
+            .ok_or_else(missing_snapshot)
+    }
+
+    /// Reads with the cursor's snapshot until the scope drops.
+    pub(crate) fn enter_snapshot(
+        &self,
+        storage: &crate::storage::Storage,
+    ) -> Result<crate::storage::ReadSnapshotScope, SqlError> {
+        let snapshot = self.snapshot.as_ref().ok_or_else(missing_snapshot)?;
+        snapshot.lease.validate_storage(storage)?;
+        Ok(storage.cursor_snapshot(snapshot.command, snapshot.lease.snapshot()))
+    }
+
     pub(crate) fn finish_source(&mut self) {
+        self.snapshot = None;
         self.retained = None;
+        self.retained_mark = None;
         self.bound = None;
         // Held rows keep their declared types after the query and its readers
         // end. Their checked tail storage survives front reclamation.
@@ -204,7 +397,12 @@ impl CursorQuery {
         owner: crate::sql::type_input_plans::Owner,
         validate: impl FnOnce(&crate::sql::parser::Parser<'_>) -> Result<(), SqlError>,
     ) -> Result<(), SqlError> {
-        self.clear();
+        // The opening statement stays at the arena's tail.
+        self.snapshot = None;
+        self.retained = None;
+        self.result_type_oids = None;
+        self.bound = None;
+        self.arena.recycle_front();
         self.owner = owner;
         let full = query_full;
         let source = self.arena.alloc_str(sql).map_err(|_| full())?;
@@ -240,6 +438,9 @@ impl CursorQuery {
             statement,
             params: parameters,
             parameter_types,
+            source,
+            bindings,
+            inputs,
         };
         // The parser only borrows the copied source and this private arena.
         // Parameter encoding and structural decoding copy every borrowed
@@ -250,12 +451,12 @@ impl CursorQuery {
         Ok(())
     }
 
-    pub(crate) fn prepare_source(
+    /// Records the SQL result types of the bound query once.
+    pub(crate) fn prepare_result_types(
         &mut self,
         storage: &crate::storage::Storage,
         txid: u32,
-        responder: &mut crate::pg::respond::Responder<'_>,
-    ) -> Result<bool, SqlError> {
+    ) -> Result<(), SqlError> {
         let bound = self.bound.as_ref().expect("bound cursor query");
         if self.result_type_oids.is_none() {
             let mut types = [0; crate::sql::MAX_PROJ];
@@ -312,10 +513,50 @@ impl CursorQuery {
                     )
                 })?);
         }
-        let CursorStatement::Select(statement) = bound.statement else {
-            return Ok(false);
-        };
+        Ok(())
+    }
+
+    pub(crate) fn prepare_source(
+        &mut self,
+        storage: &crate::storage::Storage,
+        txid: u32,
+        responder: &mut crate::pg::respond::Responder<'_>,
+        reader_use: crate::sql::query::RetainedUse,
+    ) -> Result<bool, SqlError> {
+        self.prepare_result_types(storage, txid)?;
+        let bound = self.bound.as_ref().expect("bound cursor query");
         let mark = self.arena.mark();
+        // A stream appends the queries of a UNION ALL itself.
+        let statement = match (bound.statement, reader_use) {
+            (CursorStatement::Select(statement), crate::sql::query::RetainedUse::Stream) => {
+                crate::sql::query::stream_query(statement, storage, txid, &self.arena)
+            }
+            (CursorStatement::Select(statement), crate::sql::query::RetainedUse::Cursor) => {
+                Ok(Some(statement))
+            }
+            (CursorStatement::SetQuery(query), crate::sql::query::RetainedUse::Stream) => {
+                crate::sql::query::set_query_select(query, &self.arena).and_then(|select| {
+                    crate::sql::query::stream_query(select, storage, txid, &self.arena)
+                })
+            }
+            (CursorStatement::SetQuery(_), crate::sql::query::RetainedUse::Cursor) => {
+                return Ok(false);
+            }
+        };
+        let statement = match statement {
+            Ok(Some(statement)) => statement,
+            // A CTE that runs once: the cursor saves its rows instead.
+            Ok(None) => {
+                // SAFETY: nothing borrows the rejected query's bytes.
+                unsafe { self.arena.rewind_to(mark) };
+                return Ok(false);
+            }
+            Err(error) => {
+                // SAFETY: nothing borrows the rejected query's bytes.
+                unsafe { self.arena.rewind_to(mark) };
+                return Err(error);
+            }
+        };
         let source = crate::sql::type_input_plans::with_owner(self.owner, || {
             crate::sql::exec::with_bound_parameter_types(bound.parameter_types, || {
                 crate::sql::query::RetainedSelect::open(
@@ -325,6 +566,7 @@ impl CursorQuery {
                     bound.params,
                     &self.arena,
                     responder,
+                    reader_use,
                 )
             })
         });
@@ -348,6 +590,7 @@ impl CursorQuery {
                         crate::sql::query::RetainedSelect<'static>,
                     >(source)
                 });
+                self.retained_mark = Some(mark);
                 Ok(true)
             }
             None => {
@@ -383,6 +626,41 @@ impl CursorQuery {
                 )
             })
         })
+    }
+
+    /// Builds the retained source's hash tables; see
+    /// [`crate::sql::query::RetainedSelect::build_tables`].
+    pub(crate) fn build_tables(
+        &mut self,
+        storage: &crate::storage::Storage,
+        txid: u32,
+        observed_at: i64,
+        work: &Arena,
+        buffers: &mut crate::storage::RowCursorBuffers,
+    ) -> Result<(), SqlError> {
+        let source = self.retained.as_mut().expect("retained cursor input");
+        // Retention stores bytes in this allocation, never the movable Arena object.
+        let arena: &'static Arena = unsafe { &*(&self.arena as *const Arena) };
+        source.build_tables(storage, txid, observed_at, arena, buffers, work)
+    }
+
+    /// Drops a retained source whose builds did not fit, with its leases,
+    /// so the cursor saves its rows instead.
+    pub(crate) fn discard_source(&mut self) {
+        self.retained = None;
+        if let Some(mark) = self.retained_mark.take() {
+            // SAFETY: the dropped source was the last user of its bytes.
+            unsafe { self.arena.rewind_to(mark) };
+        }
+    }
+
+    /// Returns the retained source to its first row; see
+    /// [`crate::sql::query::RetainedSelect::rewind`].
+    pub(crate) fn rewind_source(&mut self) -> Result<(), SqlError> {
+        let source = self.retained.as_mut().expect("retained cursor input");
+        // Retention stores bytes in this allocation, never the movable Arena object.
+        let arena: &'static Arena = unsafe { &*(&self.arena as *const Arena) };
+        source.rewind(arena)
     }
 
     pub(crate) fn source(&self) -> Option<&crate::sql::query::RetainedSelect<'static>> {
@@ -442,7 +720,7 @@ impl CursorQuery {
         txid: u32,
         work: &Arena,
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-        invocations: &crate::sql::query::RoutineInvocationState,
+        invocations: Option<&crate::sql::query::RoutineInvocationState>,
         frame: &Arena,
     ) -> Result<bool, SqlError> {
         let bound = self.bound.as_ref().expect("bound cursor query");
@@ -457,7 +735,7 @@ impl CursorQuery {
                         work,
                         bound.params,
                         sequences,
-                        Some(invocations),
+                        invocations,
                         frame,
                     )
             })
@@ -482,7 +760,7 @@ impl CursorQuery {
         txid: u32,
         work: &Arena,
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-        invocations: &crate::sql::query::RoutineInvocationState,
+        invocations: Option<&crate::sql::query::RoutineInvocationState>,
         frame: &'frame Arena,
     ) -> Result<&'frame [Datum<'frame>], SqlError> {
         let bound = self.bound.as_ref().expect("bound cursor query");
@@ -498,7 +776,7 @@ impl CursorQuery {
                         work,
                         bound.params,
                         sequences,
-                        Some(invocations),
+                        invocations,
                         frame,
                     )
             })
@@ -719,16 +997,19 @@ mod tests {
                 name: SqlName::parse("r").unwrap(),
                 type_oid: oid::RECORD,
                 value: Datum::Record(&fields),
+                conflict: crate::sql::guc::VariableConflict::Error,
             },
             CursorLocal {
                 name: SqlName::parse("d").unwrap(),
                 type_oid: oid::DATE,
                 value: Datum::Null,
+                conflict: crate::sql::guc::VariableConflict::Error,
             },
             CursorLocal {
                 name: SqlName::parse("found").unwrap(),
                 type_oid: oid::BOOL,
                 value: Datum::Bool(true),
+                conflict: crate::sql::guc::VariableConflict::Error,
             },
         ];
         crate::mem::guard::forbid_alloc(|| {
@@ -791,6 +1072,7 @@ mod tests {
             name: SqlName::parse("r").unwrap(),
             type_oid: oid::RECORD,
             value: Datum::Record(&fields),
+            conflict: crate::sql::guc::VariableConflict::Error,
         };
         crate::mem::guard::forbid_alloc(|| {
             query.bind(
@@ -871,6 +1153,7 @@ mod tests {
                         name: SqlName::parse("p").unwrap(),
                         type_oid: oid::DATE,
                         value: Datum::Null,
+                        conflict: crate::sql::guc::VariableConflict::Error,
                     }],
                     &[],
                     crate::sql::type_input_plans::Owner::Unlocated,

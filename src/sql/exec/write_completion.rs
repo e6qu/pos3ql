@@ -267,6 +267,9 @@ pub(super) enum NestedWriteOutput {
     Rows {
         values: local_values::SavedValues,
         rows: u64,
+        /// A dynamic statement's `USING` values, which a `STRICT` failure
+        /// lists after the write resumes.
+        arguments: local_values::SavedValues,
     },
     NoResult,
 }
@@ -288,6 +291,7 @@ impl PendingNestedWrite {
         &mut self,
         values: Option<&[Datum<'_>]>,
         rows: u64,
+        arguments: &[Datum<'_>],
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<(), SqlError> {
         if self.output.is_some() {
@@ -300,9 +304,12 @@ impl PendingNestedWrite {
             Some(values) => {
                 let mut saved = local_values::SavedValues::new(pool)?;
                 saved.replace(values)?;
+                let mut saved_arguments = local_values::SavedValues::new(pool)?;
+                saved_arguments.replace(arguments)?;
                 NestedWriteOutput::Rows {
                     values: saved,
                     rows,
+                    arguments: saved_arguments,
                 }
             }
             None => NestedWriteOutput::NoResult,

@@ -2,13 +2,22 @@
 """A client that stops reading a large result must not stall other sessions.
 
 Client A sends a large simple Query, then the same result through an unpaged
-extended Execute (Parse/Bind/Execute(0)/Sync), and stops reading with a small
-receive buffer. Two results are used: a generated series (pos3ql queues it in
-the result spool) and a scan of one table (pos3ql resumes it row by row). Client B, a psycopg session, must keep completing queries
-while A is stalled. A then reads everything: exactly one RowDescription per
-simple query, every row once and in order, one CommandComplete and one
-ReadyForQuery. With --pg, the same protocol transcript summary is compared
-with PostgreSQL 18.
+extended Execute (Parse/Bind/Execute(0)/Sync) and through a paged portal
+(Execute with a row limit, repeated, then Execute(0)), and stops reading with
+a small receive buffer. The results are a generated series, a scan
+of one table, joins, sorts, groupings, DISTINCT and UNION ALL (pos3ql resumes them row by row, and evaluates
+a paged portal's rows as each Execute asks for them). --storage-mode names
+the server's mode: object-store mode sorts in external runs, so its sorted
+result spools and is not paged.
+Client B, a psycopg session, must keep completing queries while A is stalled.
+A `COPY ... TO STDOUT` of the table is stalled the same way. A then reads
+everything: exactly one RowDescription per simple query, every row once and
+in order, PortalSuspended after each full page, one CommandComplete and one
+ReadyForQuery. With --pg, the same protocol
+transcript summary is compared with PostgreSQL 18. With --operations, each
+result must also have streamed (or spooled, where noted) by the server's
+pos3ql_result_streams_total counter, so a shape that silently stopped
+streaming fails instead of passing on its spooled output.
 
 PostgreSQL references:
 https://www.postgresql.org/docs/18/protocol-flow.html
@@ -19,6 +28,7 @@ import argparse
 import socket
 import struct
 import time
+import urllib.request
 
 import psycopg
 
@@ -26,12 +36,106 @@ ROWS = 20000
 TABLE_ROWS = 5000
 # Results must exceed what loopback socket buffers can absorb (Linux grows a
 # send buffer to 4 MiB), so the server really holds output for a stalled client.
+ALL_PROTOCOLS = ("simple", "extended", "paged")
+# Where each result streams: in both storage modes, only in local mode, or
+# nowhere (it spools).
+BOTH = ("local", "object-store")
+LOCAL = ("local",)
+NOWHERE = ()
+# Paged only in local storage mode; see the sorted query below.
+LOCAL_PAGED = ("simple", "extended", "local-paged")
+COPY_TABLE = "COPY result_stream_rows TO STDOUT"
 QUERIES = (
-    (f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g", ROWS),
-    ("SELECT id, payload FROM result_stream_rows", TABLE_ROWS),
+    (f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g", ROWS, ALL_PROTOCOLS, BOTH),
+    ("SELECT id, payload FROM result_stream_rows", TABLE_ROWS, ALL_PROTOCOLS, BOTH),
+    # Nested-loop joins resume row by row, paged portals included.
+    (
+        f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g, (VALUES (1)) v",
+        ROWS,
+        ALL_PROTOCOLS,
+        BOTH,
+    ),
+    (
+        "SELECT r.id, r.payload, t.k FROM result_stream_rows r "
+        "LEFT JOIN (VALUES (0), (1)) t(k) ON t.k = r.id % 2",
+        TABLE_ROWS,
+        ALL_PROTOCOLS,
+        BOTH,
+    ),
+    # Local-mode sorts and hash joins resume row by row after their build;
+    # rows must still arrive as 1..n, so the sort key reverses a descending
+    # expression. Object-store mode sorts in external runs: that result
+    # spools, and a paged portal would buffer more than portal_result_bytes.
+    (
+        "SELECT id, payload FROM result_stream_rows ORDER BY -id DESC",
+        TABLE_ROWS,
+        LOCAL_PAGED,
+        LOCAL,
+    ),
+    # Two tables' read positions exceed the starter result_stream_bytes, so
+    # this hash join spools; a paged portal would buffer more than
+    # portal_result_bytes, so it is not paged here.
+    (
+        "SELECT r.id, r.payload, s.id FROM result_stream_rows r "
+        "JOIN result_stream_rows s ON s.id = r.id ORDER BY r.id",
+        TABLE_ROWS,
+        ("simple", "extended"),
+        NOWHERE,
+    ),
+    # Groupings resume row by row after reading their input, in both
+    # storage modes; rows must arrive as 1..n, so the key orders them.
+    (
+        "SELECT id, max(payload) FROM result_stream_rows GROUP BY id ORDER BY id",
+        TABLE_ROWS,
+        ALL_PROTOCOLS,
+        BOTH,
+    ),
+    # Fixed-size aggregate states fold per group as the input is read.
+    (
+        "SELECT id, repeat('x', 199 + count(*)::int), sum(id) FROM result_stream_rows "
+        "GROUP BY id ORDER BY id",
+        TABLE_ROWS,
+        ALL_PROTOCOLS,
+        BOTH,
+    ),
+    # Plain DISTINCT groups by its output list the same way.
+    (
+        "SELECT DISTINCT id, payload FROM result_stream_rows ORDER BY id",
+        TABLE_ROWS,
+        ALL_PROTOCOLS,
+        BOTH,
+    ),
+    # DISTINCT ON keeps each first row of a local-mode sort.
+    (
+        "SELECT DISTINCT ON (-id) id, payload FROM result_stream_rows ORDER BY -id DESC",
+        TABLE_ROWS,
+        LOCAL_PAGED,
+        LOCAL,
+    ),
+    # UNION ALL appends its queries' streams, in both storage modes.
+    (
+        "SELECT id, payload FROM result_stream_rows UNION ALL "
+        f"SELECT g, repeat('x', 200) FROM generate_series({TABLE_ROWS + 1}, {ROWS}) g",
+        ROWS,
+        ALL_PROTOCOLS,
+        BOTH,
+    ),
+    # COPY TO STDOUT of one table resumes row by row too, as does one of a
+    # UNION ALL.
+    (COPY_TABLE, TABLE_ROWS, ("simple",), BOTH),
+    (
+        "COPY (SELECT id, payload FROM result_stream_rows UNION ALL "
+        f"SELECT g, repeat('x', 200) FROM generate_series({TABLE_ROWS + 1}, {ROWS}) g) "
+        "TO STDOUT",
+        ROWS,
+        ("simple",),
+        BOTH,
+    ),
 )
 OTHER_QUERIES = 100
 STALL_SECONDS = 2.0
+PAGE = 1500
+PAGES = 2
 
 
 def message(kind, payload=b""):
@@ -82,17 +186,23 @@ def summarize(messages):
     shape = []
     expected = 1
     for kind, payload in messages:
-        if kind == b"D":
-            (length,) = struct.unpack("!i", payload[2:6])
-            value = int(payload[6 : 6 + length])
+        if kind in (b"D", b"d"):
+            if kind == b"D":
+                (length,) = struct.unpack("!i", payload[2:6])
+                value = int(payload[6 : 6 + length])
+            else:
+                # A COPY text line: the first field, then a tab.
+                value = int(payload.split(b"\t", 1)[0])
             assert value == expected, f"row {value} arrived where {expected} was due"
             expected += 1
-            if shape and shape[-1][0] == "D":
-                shape[-1] = ("D", shape[-1][1] + 1)
+            label = kind.decode()
+            if shape and shape[-1][0] == label:
+                shape[-1] = (label, shape[-1][1] + 1)
             else:
-                shape.append(("D", 1))
+                shape.append((label, 1))
             continue
-        if expected != 1:
+        # A suspended portal continues its numbering on the next Execute.
+        if kind != b"s":
             expected = 1
         if kind == b"C":
             shape.append(("C", payload.rstrip(b"\0").decode()))
@@ -136,8 +246,10 @@ def other_session_progress(host, port, user, database):
         for value in range(OTHER_QUERIES):
             connection.execute("INSERT INTO result_stream_progress VALUES (%s)", (value,))
             assert connection.execute("SELECT 1").fetchone() == (1,)
-        (count,) = connection.execute("SELECT count(*) FROM result_stream_progress").fetchone()
-        assert count == OTHER_QUERIES
+        # A plain read: an aggregate would open a result stream of its own in
+        # object-store mode and count in the stalled result's metrics.
+        rows = connection.execute("SELECT v FROM result_stream_progress").fetchall()
+        assert len(rows) == OTHER_QUERIES
         connection.execute("DROP TABLE result_stream_progress")
     return time.monotonic() - started
 
@@ -156,21 +268,94 @@ def create_table(host, port, user, database):
             )
 
 
-def probe(host, port, user, database):
+def interleaved_portals(host, port, user, database):
+    """Two paged portals of one transaction read in turns by a stalled client.
+
+    pos3ql holds each suspended portal in its own result stream slot
+    (result_stream_slots), so both evaluate rows per Execute.
+    """
+    sock = stalled_client(host, port, user, database)
+    portals = (
+        (b"a", f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g".encode()),
+        (b"b", b"SELECT id, payload FROM result_stream_rows"),
+    )
+    request = message(b"Q", b"BEGIN\0")
+    for name, query in portals:
+        request += message(b"P", name + b"\0" + query + b"\0\0\0")
+        request += message(b"B", name + b"\0" + name + b"\0\0\0\0\0\0\0")
+        request += message(b"E", name + b"\0" + struct.pack("!i", PAGE))
+    for name, _ in portals:
+        request += message(b"E", name + b"\0" + struct.pack("!i", PAGE))
+    for name, _ in portals:
+        request += message(b"E", name + b"\0\0\0\0\0")
+    request += message(b"S") + message(b"Q", b"COMMIT\0")
+    sock.sendall(request)
+    time.sleep(STALL_SECONDS / 2)
+    elapsed = other_session_progress(host, port, user, database)
+    assert elapsed < 60, f"interleaved portals: another session needed {elapsed:.1f}s"
+    shape = []
+    for kind, payload in read_until_ready(sock, 3):
+        if kind == b"D":
+            (length,) = struct.unpack("!i", payload[2:6])
+            value = int(payload[6 : 6 + length])
+            if shape and shape[-1][0] == "D" and shape[-1][2] + 1 == value:
+                shape[-1] = ("D", shape[-1][1], value)
+            else:
+                shape.append(("D", value, value))
+        elif kind == b"C":
+            shape.append(("C", payload.rstrip(b"\0").decode()))
+        else:
+            shape.append((kind.decode(), None))
+    sock.close()
+    print(f"interleaved portals: {shape} (other session {elapsed:.2f}s)", flush=True)
+    return shape
+
+
+def protocols_for(protocols, mode):
+    for protocol in protocols:
+        if protocol == "local-paged":
+            if mode == "local":
+                yield "paged"
+        else:
+            yield protocol
+
+
+def stream_counters(operations):
+    """pos3ql's (streamed, spooled) result counters, or None without --operations."""
+    if operations is None:
+        return None
+    with urllib.request.urlopen(f"http://{operations}/metrics", timeout=5) as response:
+        text = response.read().decode()
+    streamed = spooled = 0
+    for line in text.splitlines():
+        name, _, value = line.rpartition(" ")
+        if name == "pos3ql_result_streams_total":
+            streamed += int(value)
+        elif name.startswith("pos3ql_result_stream_spooled_total{"):
+            spooled += int(value)
+    return streamed, spooled
+
+
+def probe(host, port, user, database, mode, operations=None):
     create_table(host, port, user, database)
-    results = {}
-    for (query, rows), protocol in [
-        (entry, protocol) for entry in QUERIES for protocol in ("simple", "extended")
+    results = {"interleaved": interleaved_portals(host, port, user, database)}
+    for query, rows, protocol, streams_in in [
+        (query, rows, protocol, streams_in)
+        for query, rows, protocols, streams_in in QUERIES
+        for protocol in protocols_for(protocols, mode)
     ]:
+        before = stream_counters(operations)
         sock = stalled_client(host, port, user, database)
         if protocol == "simple":
             request = message(b"Q", query.encode() + b"\0") + message(b"Q", b"SELECT 1\0")
             ready_count = 2
         else:
+            limit = PAGE if protocol == "paged" else 0
             request = (
                 message(b"P", b"\0" + query.encode() + b"\0\0\0")
                 + message(b"B", b"\0\0\0\0\0\0\0\0")
-                + message(b"E", b"\0\0\0\0\0")
+                + message(b"E", b"\0" + struct.pack("!i", limit)) * (PAGES if limit else 1)
+                + (message(b"E", b"\0\0\0\0\0") if limit else b"")
                 + message(b"S")
             )
             ready_count = 1
@@ -185,7 +370,27 @@ def probe(host, port, user, database):
         sock.close()
         results[(query, protocol)] = transcript
         print(f"{protocol} {query!r}: {transcript} (other session {elapsed:.2f}s)", flush=True)
-        if protocol == "simple":
+        after = stream_counters(operations)
+        if after is not None:
+            streamed = after[0] - before[0]
+            spooled = after[1] - before[1]
+            if mode in streams_in:
+                assert (streamed, spooled) == (1, 0), (protocol, query, streamed, spooled)
+            else:
+                assert (streamed, spooled) == (0, 1), (protocol, query, streamed, spooled)
+        if query.startswith("COPY "):
+            expected = [
+                ("H", None),
+                ("d", rows),
+                ("c", None),
+                ("C", f"COPY {rows}"),
+                ("Z", None),
+                ("T", None),
+                ("D", 1),
+                ("C", "SELECT 1"),
+                ("Z", None),
+            ]
+        elif protocol == "simple":
             expected = [
                 ("T", None),
                 ("D", rows),
@@ -196,8 +401,14 @@ def probe(host, port, user, database):
                 ("C", "SELECT 1"),
                 ("Z", None),
             ]
-        else:
+        elif protocol == "extended":
             expected = [("1", None), ("2", None), ("D", rows), ("C", f"SELECT {rows}"), ("Z", None)]
+        else:
+            rest = rows - PAGE * PAGES
+            expected = [("1", None), ("2", None)]
+            for _ in range(PAGES):
+                expected += [("D", PAGE), ("s", None)]
+            expected += [("D", rest), ("C", f"SELECT {rest}"), ("Z", None)]
         assert transcript == expected, transcript
     with psycopg.connect(
         host=host, port=port, user=user, dbname=database, autocommit=True, connect_timeout=5
@@ -213,15 +424,27 @@ def main():
     parser.add_argument("--pg", type=int, help="PostgreSQL 18 reference port")
     parser.add_argument("--user", default="postgres")
     parser.add_argument("--database", default="postgres")
+    parser.add_argument(
+        "--storage-mode",
+        choices=("local", "object-store"),
+        required=True,
+        help="pos3ql's storage mode, which decides whether its sorts stream",
+    )
+    parser.add_argument(
+        "--operations",
+        help="pos3ql's operations endpoint (host:port), to check each result streamed",
+    )
     args = parser.parse_args()
-    actual = probe(args.host, args.p3, args.user, args.database)
+    actual = probe(
+        args.host, args.p3, args.user, args.database, args.storage_mode, args.operations
+    )
     if args.pg is not None:
         with psycopg.connect(
             host=args.host, port=args.pg, user=args.user, dbname="postgres", connect_timeout=5
         ) as connection:
             version = connection.info.server_version
         assert version // 10000 == 18, f"reference is PostgreSQL {version}"
-        reference = probe(args.host, args.pg, args.user, args.database)
+        reference = probe(args.host, args.pg, args.user, args.database, args.storage_mode)
         assert actual == reference, (actual, reference)
     print("ok: stalled result clients do not stall other sessions")
 

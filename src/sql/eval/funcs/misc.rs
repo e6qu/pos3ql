@@ -193,7 +193,10 @@ pub(crate) fn dispatch<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Option<Result<Datum<'a>, SqlError>> {
-    if !matches!(name, "row" | "pg_size_pretty" | "format" | "to_number") {
+    if !matches!(
+        name,
+        "row" | crate::sql::parser::ROWS_NOT_DISTINCT | "pg_size_pretty" | "format" | "to_number"
+    ) {
         return None;
     }
     let arity = |n: usize| -> Result<(), SqlError> {
@@ -250,6 +253,41 @@ pub(crate) fn dispatch<'a>(
                     }
                 }
                 Ok(Datum::Record(fields.as_slice()))
+            }
+            crate::sql::parser::ROWS_NOT_DISTINCT => {
+                arity(2)?;
+                let (
+                    Datum::Record(left) | Datum::Composite { fields: left, .. },
+                    Datum::Record(right) | Datum::Composite { fields: right, .. },
+                ) = (
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    eval_full(args[1], arena, params, row, hooks)?,
+                )
+                else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "row constructor did not produce a record"
+                    ));
+                };
+                if left.len() != right.len() {
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "unequal number of entries in row expressions"
+                    ));
+                }
+                for (left, right) in left.iter().zip(right) {
+                    let same = match (left.value.is_null(), right.value.is_null()) {
+                        (true, true) => true,
+                        (false, false) => {
+                            crate::sql::eval::compare_datums(&left.value, &right.value)?.is_eq()
+                        }
+                        _ => false,
+                    };
+                    if !same {
+                        return Ok(Datum::Bool(false));
+                    }
+                }
+                Ok(Datum::Bool(true))
             }
             "pg_size_pretty" => {
                 // Human-readable byte size, matching PostgreSQL's pg_size_pretty:

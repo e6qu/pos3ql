@@ -21,7 +21,9 @@ mod scroll;
 mod stream;
 pub(crate) use query::{CursorLocal, CursorQuery, CursorStatement, bind_locals};
 pub(crate) use scroll::{Revisit, ScrollAction, ScrollInput, ScrollScan, VisitOutcome};
-pub(crate) use stream::{ResultStream, StreamProtocol, StreamState};
+pub(crate) use stream::{
+    FetchStream, ResultStream, ResultStreams, STREAM_HEADER_BYTES, StreamProtocol, StreamState,
+};
 
 /// One FETCH/MOVE motion, normalized by the parser: positive counts move
 /// forward, negative backward (`NEXT` is `Count(1)`, `PRIOR` is `Count(-1)`,
@@ -73,9 +75,17 @@ pub struct CursorPool {
     emit: Vec<u32>,
     next_unnamed: u64,
     next_plan_generation: u64,
+    /// The tables each of this connection's held result streams reads. A
+    /// suspended portal keeps them open between statements, and a running
+    /// stream's routine calls run nested statements, so DDL on them must see
+    /// them.
+    stream_tables: Box<[StreamTables]>,
 }
 
-const CURSOR_STATEMENT_BYTES: usize = 4096;
+/// The physical tables one result stream reads.
+pub(crate) type StreamTables = [Option<usize>; crate::sql::query::MAX_RETAINED_SOURCES];
+pub(crate) const NO_STREAM_TABLES: StreamTables = [None; crate::sql::query::MAX_RETAINED_SOURCES];
+
 pub(crate) const DESCRIPTION_BYTES: usize = 1024;
 
 thread_local! {
@@ -114,12 +124,19 @@ pub(crate) fn require_table_idle(table: usize, name: &str, command: &str) -> Res
         pool.is_some_and(|pool| {
             pool.slots.iter().any(|slot| {
                 slot.active
-                    && slot
+                    && (slot
                         .query
                         .retained
                         .as_ref()
                         .is_some_and(|query| query.uses_table(table))
-            })
+                        || slot
+                            .tables
+                            .get(table / 64)
+                            .is_some_and(|word| word & (1 << (table % 64)) != 0))
+            }) || pool
+                .stream_tables
+                .iter()
+                .any(|tables| tables.contains(&Some(table)))
         })
     });
     if busy {
@@ -143,12 +160,35 @@ pub(crate) struct CursorInfo<'a> {
     pub created_at: i64,
 }
 
+/// A cursor whose query does not stream runs it whole when it is first read,
+/// with the snapshot taken when it opened, as PostgreSQL's executor first
+/// runs a portal's plan at its first fetch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fill {
+    /// The query streams its rows as they are fetched.
+    None,
+    /// Opened and described; nothing has read it yet.
+    Pending,
+    /// Its query is running and has its row storage.
+    Running,
+    /// Its rows are stored and its query is released.
+    Done,
+}
+
+/// How a pending cursor's query runs on its first read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PendingFill {
+    /// A read-only query: it saves its rows under the cursor's snapshot.
+    Read,
+    /// Its data-modifying `WITH` queries need a new command and the session.
+    Write,
+}
+
 struct CursorSlot {
     active: bool,
     plan_generation: Option<core::num::NonZeroU64>,
     open_site: Option<CursorOpenSite>,
     name: SqlName,
-    statement: StackStr<CURSOR_STATEMENT_BYTES>,
     created_at: i64,
     scroll: CursorScroll,
     hold: bool,
@@ -156,6 +196,9 @@ struct CursorSlot {
     /// Created in the still-open transaction: a rollback closes it even WITH
     /// HOLD (holdability begins at commit, as PostgreSQL has it).
     tentative: bool,
+    /// A PL/pgSQL cursor `FOR` loop is reading it: it cannot be closed
+    /// until the loop ends, as PostgreSQL pins the loop's portal.
+    pinned: bool,
     failed: bool,
     query: CursorQuery,
     description: FixedBuf,
@@ -168,18 +211,46 @@ struct CursorSlot {
     scan: Option<ScrollScan>,
     /// A held scroll cursor is saving its rows at commit.
     holding: bool,
+    fill: Fill,
     locking: RowLocking,
     /// Logical input rows before the first saved row of the current fetch.
     row_base: usize,
     produced: usize,
     /// An I/O retry must keep the current fetch's saved rows.
     request: Option<(FetchMotion, bool)>,
+    /// A windowed scroll cursor rereading its input from the first row:
+    /// rows `lo..=hi` are saved for the current fetch.
+    refill: Option<(usize, usize)>,
+    /// The input's row count once it has ended; a windowed cursor that read
+    /// its input again may have produced fewer rows since.
+    input_rows: Option<usize>,
     /// PostgreSQL's cursor position: 0 before the first row, `1..=n` on a
     /// row, `n + 1` after the last.
     position: i64,
+    /// Tables a cursor that does not stream reads, one bit per table slot:
+    /// until it closes or is held past commit, they cannot be dropped or
+    /// altered, as an open PostgreSQL portal keeps them in use.
+    tables: Box<[u64]>,
+}
+
+fn pinned_portal(name: &str) -> SqlError {
+    sql_err!(
+        sqlstate::INVALID_CURSOR_STATE,
+        "cannot drop pinned portal \"{}\"",
+        name
+    )
 }
 
 impl CursorSlot {
+    fn close(&mut self) {
+        self.query.clear();
+        self.active = false;
+        self.tentative = false;
+        self.pinned = false;
+        self.plan_generation = None;
+        self.open_site = None;
+    }
+
     fn reset_rows(&mut self) {
         self.rows.clear();
         self.rows.clear_tail();
@@ -188,6 +259,13 @@ impl CursorSlot {
         self.scan = None;
         self.holding = false;
         self.locking = RowLocking::default();
+        self.refill = None;
+        self.input_rows = None;
+    }
+
+    /// Rows the cursor knows of: all of them once the input has ended.
+    fn known_rows(&self) -> i64 {
+        self.input_rows.unwrap_or(self.produced).max(self.produced) as i64
     }
 
     fn require_runnable(&self) -> Result<(), SqlError> {
@@ -208,7 +286,7 @@ impl CursorSlot {
         input_finished: bool,
     ) -> Result<(), SqlError> {
         self.require_runnable()?;
-        let on_row = self.position >= 1 && self.position <= self.produced as i64;
+        let on_row = self.position >= 1 && self.position <= self.known_rows();
         let backward = matches!(motion, FetchMotion::Count(k) | FetchMotion::Relative(k) if k < 0)
             || (!move_only && motion == FetchMotion::BackwardZero)
             || (matches!(motion, FetchMotion::BackwardAll) && !(move_only && self.position == 0))
@@ -334,6 +412,83 @@ struct RowLocking {
     recheck: bool,
 }
 
+/// Applies one FETCH/MOVE motion to a cursor position over `n` known rows:
+/// visits each row position the motion steps onto, in order, and returns the
+/// new position (0 before the first row, `n + 1` after the last).
+fn motion_rows(mut position: i64, n: i64, motion: FetchMotion, mut visit: impl FnMut(i64)) -> i64 {
+    match motion {
+        FetchMotion::Count(0) | FetchMotion::BackwardZero => {
+            // Re-fetch the current row, position unchanged.
+            visit(position);
+        }
+        FetchMotion::Count(k) if k > 0 => {
+            for _ in 0..k {
+                if position > n {
+                    break;
+                }
+                position += 1;
+                visit(position);
+            }
+            position = position.min(n + 1);
+        }
+        FetchMotion::Count(k) => {
+            for _ in 0..-i64::from(k) {
+                if position < 1 {
+                    break;
+                }
+                position -= 1;
+                visit(position);
+            }
+            position = position.max(0);
+        }
+        FetchMotion::All => {
+            while position <= n {
+                position += 1;
+                visit(position);
+            }
+            position = n + 1;
+        }
+        FetchMotion::BackwardAll => {
+            while position >= 1 {
+                position -= 1;
+                visit(position);
+            }
+            position = 0;
+        }
+        FetchMotion::Absolute(k) => {
+            let target = if k >= 0 {
+                i64::from(k)
+            } else {
+                n + 1 + i64::from(k)
+            };
+            position = target.clamp(0, n + 1);
+            visit(position);
+        }
+        FetchMotion::Relative(k) => {
+            position = (position + i64::from(k)).clamp(0, n + 1);
+            visit(position);
+        }
+    }
+    position
+}
+
+/// The tables an opening cursor's query reads.
+pub(crate) struct TableUse<'a>(&'a mut [u64]);
+
+impl TableUse<'_> {
+    pub(crate) fn mark(&mut self, table: usize) -> Result<(), SqlError> {
+        let word = self.0.get_mut(table / 64).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "cursor table slot {} is outside max_tables",
+                table
+            )
+        })?;
+        *word |= 1 << (table % 64);
+        Ok(())
+    }
+}
+
 /// PostgreSQL's error for backward motion on a NO SCROLL cursor.
 pub(crate) fn forward_only() -> SqlError {
     super::eval::stash_diagnostic(
@@ -355,33 +510,42 @@ pub(crate) fn history_full() -> SqlError {
     )
 }
 
+const fn table_words(config: &Config) -> usize {
+    config.max_tables.div_ceil(64)
+}
+
 const fn cursor_row_capacity(config: &Config) -> usize {
     config.cursor_bytes / MIN_CURSOR_ROW_BYTES
 }
 
 fn seal_description(description: &mut FixedBuf) -> Result<usize, SqlError> {
+    let range = run_description(description.readable())?;
+    let mut types = [0; crate::pg::respond::MAX_RESULT_COLS];
+    let columns = description_type_oids(&description.readable()[range.clone()], &mut types)?;
+    description.filled_mut().copy_within(range.clone(), 0);
+    description.truncate_to(range.len());
+    Ok(columns)
+}
+
+/// Where the one RowDescription message is among a query run's captured
+/// messages.
+fn run_description(bytes: &[u8]) -> Result<core::ops::Range<usize>, SqlError> {
     let malformed = || {
         sql_err!(
             sqlstate::INTERNAL_ERROR,
             "cursor captured a torn description"
         )
     };
-    let bytes = description.readable();
     let mut at = 0usize;
     let mut captured = None;
     while at < bytes.len() {
         let header = bytes.get(at..at.saturating_add(5)).ok_or_else(malformed)?;
         let length = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
-        if length < 4 {
-            return Err(malformed());
-        }
         let end = at
             .checked_add(1)
             .and_then(|at| at.checked_add(length))
+            .filter(|end| length >= 4 && *end <= bytes.len())
             .ok_or_else(malformed)?;
-        if end > bytes.len() {
-            return Err(malformed());
-        }
         if header[0] == b'T' {
             if captured.is_some() {
                 return Err(sql_err!(
@@ -389,21 +553,16 @@ fn seal_description(description: &mut FixedBuf) -> Result<usize, SqlError> {
                     "cursor captured two descriptions"
                 ));
             }
-            captured = Some((at, end));
+            captured = Some(at..end);
         }
         at = end;
     }
-    let (start, end) = captured.ok_or_else(|| {
+    captured.ok_or_else(|| {
         sql_err!(
             sqlstate::INTERNAL_ERROR,
             "cursor did not capture a description"
         )
-    })?;
-    let mut types = [0; crate::pg::respond::MAX_RESULT_COLS];
-    let columns = description_type_oids(&bytes[start..end], &mut types)?;
-    description.filled_mut().copy_within(start..end, 0);
-    description.truncate_to(end - start);
-    Ok(columns)
+    })
 }
 
 fn seal_rows(rows: &FixedBuf, columns: usize, spans: &mut RowIndex) -> Result<(), SqlError> {
@@ -515,7 +674,7 @@ impl CursorPool {
             }
         }
     }
-    pub fn budget_bytes(config: &Config) -> usize {
+    pub const fn budget_bytes(config: &Config) -> usize {
         let row_capacity = cursor_row_capacity(config);
         config
             .max_cursors
@@ -525,11 +684,15 @@ impl CursorPool {
                     .saturating_add(config.cursor_query_bytes)
                     .saturating_add(DESCRIPTION_BYTES)
                     .saturating_add(core::mem::size_of::<CursorSlot>())
-                    .saturating_add(
-                        row_capacity.saturating_mul(core::mem::size_of::<(u32, u32)>()),
-                    ),
+                    .saturating_add(row_capacity.saturating_mul(core::mem::size_of::<(u32, u32)>()))
+                    .saturating_add(table_words(config).saturating_mul(8)),
             )
             .saturating_add(row_capacity.saturating_mul(core::mem::size_of::<u32>()))
+            .saturating_add(
+                config
+                    .result_stream_slots
+                    .saturating_mul(core::mem::size_of::<StreamTables>()),
+            )
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
@@ -546,17 +709,18 @@ impl CursorPool {
                 core::mem::size_of::<(u32, u32)>(),
                 "cursor_row_spans",
             )?;
+            budget.draw_array(table_words(config), 8, "cursor_tables")?;
             slots.push(CursorSlot {
                 active: false,
                 plan_generation: None,
                 open_site: None,
                 name: SqlName::parse("").expect("empty fits"),
-                statement: StackStr::new(),
                 created_at: 0,
                 scroll: CursorScroll::Default,
                 hold: false,
                 binary: false,
                 tentative: false,
+                pinned: false,
                 failed: false,
                 query: CursorQuery::new(budget, config.cursor_query_bytes)?,
                 description: FixedBuf::new(budget, "cursor_description", DESCRIPTION_BYTES)?,
@@ -564,20 +728,41 @@ impl CursorPool {
                 spans: RowIndex::new(row_capacity),
                 scan: None,
                 holding: false,
+                fill: Fill::None,
                 locking: RowLocking::default(),
                 row_base: 0,
                 produced: 0,
                 request: None,
+                refill: None,
+                input_rows: None,
                 position: 0,
+                tables: vec![0; table_words(config)].into_boxed_slice(),
             });
         }
         budget.draw_array(row_capacity, core::mem::size_of::<u32>(), "cursor_emit")?;
+        budget.draw_array(
+            config.result_stream_slots,
+            core::mem::size_of::<StreamTables>(),
+            "result_stream_tables",
+        )?;
         Ok(Self {
             slots,
             emit: Vec::with_capacity(row_capacity),
             next_unnamed: 1,
             next_plan_generation: 1,
+            stream_tables: vec![NO_STREAM_TABLES; config.result_stream_slots].into_boxed_slice(),
         })
+    }
+
+    /// A one-cursor pool for tests that fire triggers outside a session.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        let mut config = Config::default_dev();
+        config.max_cursors = 1;
+        config.cursor_bytes = 4096;
+        config.cursor_query_bytes = 4096;
+        let mut budget = Budget::new(Self::budget_bytes(&config));
+        Self::new(&config, &mut budget).expect("test cursor pool fits its budget")
     }
 
     /// Closes every cursor — used when a connection slot is recycled for a new
@@ -591,6 +776,13 @@ impl CursorPool {
         }
         self.emit.clear();
         self.next_unnamed = 1;
+        self.stream_tables.fill(NO_STREAM_TABLES);
+    }
+
+    /// Records the tables a newly held result stream reads, or none once the
+    /// stream is released.
+    pub(crate) fn hold_stream_tables(&mut self, stream: usize, tables: StreamTables) {
+        self.stream_tables[stream] = tables;
     }
 
     fn find(&self, name: &str) -> Option<usize> {
@@ -631,14 +823,6 @@ impl CursorPool {
             ));
         };
         let name = SqlName::parse(name)?;
-        let statement = StackStr::<CURSOR_STATEMENT_BYTES>::from_str(statement);
-        if statement.is_truncated() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "cursor statement exceeds {} bytes",
-                CURSOR_STATEMENT_BYTES
-            ));
-        }
         let exhausted = || {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -656,20 +840,26 @@ impl CursorPool {
         slot.plan_generation = Some(generation);
         slot.open_site = None;
         slot.name = name;
-        slot.statement = statement;
         slot.created_at = created_at;
         slot.scroll = scroll;
         slot.hold = hold;
         slot.binary = binary;
         slot.tentative = true;
+        slot.pinned = false;
         slot.failed = false;
         slot.query.clear();
+        if let Err(error) = slot.query.set_statement(statement) {
+            slot.plan_generation = None;
+            return Err(error);
+        }
         slot.description.clear();
         slot.reset_rows();
         slot.row_base = 0;
         slot.produced = 0;
         slot.request = None;
         slot.position = 0;
+        slot.fill = Fill::None;
+        slot.tables.fill(0);
         Ok(at)
     }
 
@@ -691,7 +881,7 @@ impl CursorPool {
             !slot.active && slot.plan_generation.is_some() && slot.open_site == Some(site)
         }) {
             if slot.name.as_str() != name
-                || slot.statement.as_str() != statement
+                || slot.query.statement() != statement
                 || slot.scroll != scroll
                 || slot.hold != hold
                 || slot.binary != binary
@@ -816,6 +1006,34 @@ impl CursorPool {
         (&mut slot.query, &mut slot.description, &mut slot.rows)
     }
 
+    /// The opening cursor's query, its description and row storage, and the
+    /// set of tables it reads.
+    pub(crate) fn describe_parts(
+        &mut self,
+        at: usize,
+    ) -> (&CursorQuery, &mut FixedBuf, &mut FixedBuf, TableUse<'_>) {
+        let slot = &mut self.slots[at];
+        (
+            &slot.query,
+            &mut slot.description,
+            &mut slot.rows,
+            TableUse(&mut slot.tables),
+        )
+    }
+
+    /// Settles a cursor declared without `SCROLL` or `NO SCROLL` from whether
+    /// its plan scans backward.
+    pub(crate) fn set_plan_scroll(&mut self, at: usize, backward: bool) {
+        let slot = &mut self.slots[at];
+        if slot.scroll == CursorScroll::Default {
+            slot.scroll = if backward {
+                CursorScroll::Scroll
+            } else {
+                CursorScroll::NoScroll
+            };
+        }
+    }
+
     /// Validates the description and indexes complete typed rows.
     pub fn seal(&mut self, at: usize) -> Result<(), SqlError> {
         let slot = &mut self.slots[at];
@@ -830,6 +1048,14 @@ impl CursorPool {
             } else {
                 CursorScroll::NoScroll
             };
+        }
+        if slot.scroll == CursorScroll::Scroll
+            && let Some(source) = slot.query.retained.as_mut()
+        {
+            source.keep_finished_input();
+        }
+        if slot.query.retained.is_none() {
+            slot.fill = Fill::Pending;
         }
         slot.scan = slot
             .query
@@ -871,12 +1097,199 @@ impl CursorPool {
         Ok(Some((at, needed)))
     }
 
+    /// The open cursor `name` whose query has not run yet.
+    pub(crate) fn pending_fill(
+        &self,
+        name: &str,
+    ) -> Result<Option<(usize, PendingFill)>, SqlError> {
+        let Some(at) = self.find(name) else {
+            return Ok(None);
+        };
+        let slot = &self.slots[at];
+        slot.require_runnable()?;
+        match slot.fill {
+            Fill::Pending if slot.query.writes() => Ok(Some((at, PendingFill::Write))),
+            Fill::Pending => Ok(Some((at, PendingFill::Read))),
+            Fill::Running => Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "portal \"{}\" cannot be run",
+                slot.name.as_str()
+            )),
+            Fill::None | Fill::Done => Ok(None),
+        }
+    }
+
+    /// Lends the row storage of a pending writing cursor to the run that
+    /// fills it, with its query parsed again into `arena`.
+    pub(crate) fn begin_write_fill<'w>(
+        &mut self,
+        at: usize,
+        arena: &'w Arena,
+    ) -> Result<(query::ReparsedQuery<'w>, FixedBuf, FixedBuf), SqlError> {
+        let slot = &mut self.slots[at];
+        let query = slot.query.reparse_into(arena)?;
+        slot.fill = Fill::Running;
+        slot.reset_rows();
+        let description = core::mem::replace(&mut slot.description, FixedBuf::detached());
+        let rows = core::mem::replace(&mut slot.rows, FixedBuf::detached());
+        Ok((query, description, rows))
+    }
+
+    /// Returns lent storage. When `filled`, the rows become the cursor's
+    /// whole result and its query is released; otherwise the cursor waits to
+    /// run again.
+    pub(crate) fn end_write_fill(
+        &mut self,
+        at: usize,
+        description: FixedBuf,
+        rows: FixedBuf,
+        filled: bool,
+    ) -> Result<(), SqlError> {
+        let slot = &mut self.slots[at];
+        slot.description = description;
+        slot.rows = rows;
+        self.end_fill(at, filled, None)
+    }
+
+    /// Clears a read fill's output before another attempt.
+    pub(crate) fn restart_fill_output(&mut self, at: usize, described: usize) {
+        let slot = &mut self.slots[at];
+        slot.description.truncate_to(described);
+        slot.reset_rows();
+    }
+
+    /// Starts a pending read-only cursor's run into its own row storage. The
+    /// run describes its result after the opening description; the returned
+    /// mark separates them for [`Self::end_fill`].
+    pub(crate) fn begin_read_fill(&mut self, at: usize) -> usize {
+        let slot = &mut self.slots[at];
+        slot.fill = Fill::Running;
+        slot.reset_rows();
+        slot.description.mark()
+    }
+
+    /// Ends a fill. When `filled`, the saved rows become the cursor's whole
+    /// result and its query and snapshot are released; otherwise the cursor
+    /// waits to run again. A read fill's own description, after
+    /// `described_from`, must match the one the cursor opened with.
+    pub(crate) fn end_fill(
+        &mut self,
+        at: usize,
+        filled: bool,
+        described_from: Option<usize>,
+    ) -> Result<(), SqlError> {
+        let slot = &mut self.slots[at];
+        let executed = match described_from {
+            Some(mark) if filled => {
+                let mut executed = FixedBuf::detached();
+                core::mem::swap(&mut executed, &mut slot.description);
+                let result = (|| {
+                    let bytes = executed.readable();
+                    let opened = bytes.get(..mark).ok_or_else(|| {
+                        sql_err!(sqlstate::INTERNAL_ERROR, "cursor description was truncated")
+                    })?;
+                    let ran = &bytes[mark..];
+                    if &ran[run_description(ran)?] != opened {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "cursor result shape changed between opening and first read"
+                        ));
+                    }
+                    Ok(())
+                })();
+                core::mem::swap(&mut executed, &mut slot.description);
+                Some(result)
+            }
+            _ => None,
+        };
+        if let Some(mark) = described_from {
+            slot.description.truncate_to(mark);
+        }
+        if !filled {
+            slot.reset_rows();
+            slot.fill = Fill::Pending;
+            return Ok(());
+        }
+        executed.transpose()?;
+        let mut types = [0; crate::pg::respond::MAX_RESULT_COLS];
+        let columns = description_type_oids(slot.description.readable(), &mut types)?;
+        seal_rows(&slot.rows, columns, &mut slot.spans)?;
+        slot.produced = slot.spans.len();
+        slot.row_base = 0;
+        slot.query.finish_source();
+        slot.fill = Fill::Done;
+        Ok(())
+    }
+
     pub(crate) fn produced_rows(&self, at: usize) -> usize {
         self.slots[at].produced
     }
 
     pub(crate) fn saves_history(&self, at: usize) -> bool {
-        self.slots[at].scroll == CursorScroll::Scroll
+        self.slots[at].scroll == CursorScroll::Scroll && !self.windowed(at)
+    }
+
+    /// A scrollable cursor that keeps only its current fetch's rows: its
+    /// output cannot change when evaluated again and its input can return to
+    /// the first row, so backward motion rereads the input from the start
+    /// (with the cursor's snapshot) instead of saving every visited row.
+    pub(crate) fn windowed(&self, at: usize) -> bool {
+        let slot = &self.slots[at];
+        slot.scroll == CursorScroll::Scroll
+            && slot.scan.is_none()
+            && slot
+                .query
+                .retained
+                .as_ref()
+                .is_some_and(|query| query.rewindable())
+    }
+
+    /// The rows the current refill saves, while one runs.
+    pub(crate) fn refill(&self, at: usize) -> Option<(usize, usize)> {
+        self.slots[at].refill
+    }
+
+    /// The rows a windowed cursor's FETCH returns that its window does not
+    /// hold, as `(first, last)`; `None` when the window covers them.
+    pub(crate) fn window_miss(
+        &self,
+        at: usize,
+        motion: FetchMotion,
+        move_only: bool,
+    ) -> Option<(usize, usize)> {
+        let slot = &self.slots[at];
+        if move_only || !self.windowed(at) {
+            return None;
+        }
+        let n = slot.known_rows();
+        let (mut lo, mut hi) = (i64::MAX, 0i64);
+        motion_rows(slot.position, n, motion, |row| {
+            if row >= 1 && row <= n {
+                lo = lo.min(row);
+                hi = hi.max(row);
+            }
+        });
+        let first = slot.row_base as i64 + 1;
+        let last = slot.row_base as i64 + slot.spans.len() as i64;
+        (hi != 0 && (lo < first || hi > last)).then_some((lo as usize, hi as usize))
+    }
+
+    /// Rereads a windowed cursor's input from the first row, saving rows
+    /// `lo..=hi`. The cursor keeps its position.
+    pub(crate) fn restart_window(
+        &mut self,
+        at: usize,
+        lo: usize,
+        hi: usize,
+    ) -> Result<(), SqlError> {
+        let slot = &mut self.slots[at];
+        slot.query.rewind_source()?;
+        slot.rows.clear();
+        slot.spans.clear();
+        slot.produced = 0;
+        slot.row_base = 0;
+        slot.refill = Some((lo, hi));
+        Ok(())
     }
 
     /// The named cursor's slot when it moves by [`ScrollScan`].
@@ -1017,6 +1430,13 @@ impl CursorPool {
         Ok(true)
     }
 
+    /// Moves an ordered cursor past the sorted input it just evaluated.
+    pub(crate) fn finish_sorted_row(&mut self, at: usize) {
+        if let Some(next) = self.slots[at].locking.sorted.as_mut() {
+            *next += 1;
+        }
+    }
+
     /// Ends the pending row of a locking cursor.
     pub(crate) fn finish_locked_row(&mut self, at: usize) {
         let locking = &mut self.slots[at].locking;
@@ -1130,12 +1550,15 @@ impl CursorPool {
         self.slots[at].spans.len()
     }
 
+    /// Starts a FETCH that may produce rows up to `needed`.
     pub(crate) fn begin_fetch(
         &mut self,
         at: usize,
         motion: FetchMotion,
         move_only: bool,
+        needed: usize,
     ) -> Result<(), SqlError> {
+        let windowed = self.windowed(at);
         let slot = &mut self.slots[at];
         if let Some(request) = slot.request {
             if request != (motion, move_only) {
@@ -1146,13 +1569,77 @@ impl CursorPool {
             }
             return Ok(());
         }
-        if slot.scroll == CursorScroll::NoScroll {
+        // A windowed cursor replaces its window when the fetch reads input.
+        if slot.scroll == CursorScroll::NoScroll || (windowed && needed > slot.produced) {
             slot.rows.clear();
             slot.spans.clear();
             slot.row_base = slot.produced;
         }
         slot.request = Some((motion, move_only));
         Ok(())
+    }
+
+    /// The slot of a cursor whose forward FETCH can stream its rows to the
+    /// client as they are evaluated: a retained source that saves neither
+    /// history nor locks, with no interrupted FETCH. Other cursors buffer a
+    /// FETCH's rows in `cursor_bytes`.
+    pub(crate) fn stream_fetch_slot(
+        &self,
+        name: &str,
+        motion: FetchMotion,
+        move_only: bool,
+    ) -> Option<usize> {
+        let at = self.find(name)?;
+        let slot = &self.slots[at];
+        let forward = matches!(motion, FetchMotion::All)
+            || matches!(motion, FetchMotion::Count(count) if count > 0);
+        (!move_only
+            && forward
+            && !slot.failed
+            && (slot.scroll != CursorScroll::Scroll
+                || (self.windowed(at) && slot.position >= slot.produced as i64))
+            && slot.scan.is_none()
+            && slot.request.is_none()
+            && slot
+                .query
+                .retained
+                .as_ref()
+                .is_some_and(|query| !query.locks_rows()))
+        .then_some(at)
+    }
+
+    /// Starts a streamed FETCH: no row of it is saved.
+    pub(crate) fn begin_streamed_fetch(&mut self, at: usize) {
+        let slot = &mut self.slots[at];
+        slot.rows.clear();
+        slot.spans.clear();
+        slot.row_base = slot.produced;
+    }
+
+    /// A streamed row reached the client: the cursor is now on it.
+    pub(crate) fn record_streamed_row(&mut self, at: usize) -> Result<(), SqlError> {
+        self.record_row(at, false)?;
+        let slot = &mut self.slots[at];
+        slot.position = slot.produced as i64;
+        Ok(())
+    }
+
+    /// A streamed FETCH reached the end of its cursor's rows: the cursor is
+    /// after the last row.
+    pub(crate) fn finish_streamed_fetch(&mut self, at: usize) {
+        let slot = &mut self.slots[at];
+        slot.input_rows = Some(slot.produced);
+        slot.position = slot.produced as i64 + 1;
+    }
+
+    /// The cursor's input has no more rows.
+    pub(crate) fn finish_input(&mut self, at: usize) {
+        let slot = &mut self.slots[at];
+        slot.input_rows = Some(slot.produced);
+    }
+
+    pub(crate) fn slot_name(&self, at: usize) -> &str {
+        self.slots[at].name.as_str()
     }
 
     pub(crate) fn record_row(&mut self, at: usize, saved: bool) -> Result<(), SqlError> {
@@ -1203,11 +1690,7 @@ impl CursorPool {
 
     /// Drops a half-built slot after a failed DECLARE.
     pub fn abandon(&mut self, at: usize) {
-        self.slots[at].query.clear();
-        self.slots[at].active = false;
-        self.slots[at].tentative = false;
-        self.slots[at].plan_generation = None;
-        self.slots[at].open_site = None;
+        self.slots[at].close();
     }
 
     pub fn exists(&self, name: &str) -> bool {
@@ -1221,7 +1704,7 @@ impl CursorPool {
             }
             emit(CursorInfo {
                 name: slot.name.as_str(),
-                statement: slot.statement.as_str(),
+                statement: slot.query.statement(),
                 holdable: slot.hold,
                 binary: slot.binary,
                 scrollable: slot.scroll == CursorScroll::Scroll,
@@ -1235,6 +1718,16 @@ impl CursorPool {
     }
 
     pub(crate) fn unnamed_name(&mut self) -> Result<StackStr<128>, SqlError> {
+        // An OPEN that waited while opening resumes under the name it was
+        // given, so the waiting reservation and its variable agree.
+        if let Some(slot) = self.slots.iter().find(|slot| {
+            !slot.active
+                && slot.plan_generation.is_some()
+                && slot.open_site.is_some()
+                && slot.name.as_str().starts_with("<unnamed portal ")
+        }) {
+            return Ok(crate::stack_format!(128, "{}", slot.name.as_str()));
+        }
         for _ in 0..=self.slots.len() {
             let name = crate::stack_format!(128, "<unnamed portal {}>", self.next_unnamed);
             self.next_unnamed = self.next_unnamed.checked_add(1).ok_or_else(|| {
@@ -1328,82 +1821,37 @@ impl CursorPool {
         };
         let slot = &mut self.slots[at];
         slot.validate_motion(motion, move_only, true)?;
-        let n = slot.produced as i64;
+        let n = slot.known_rows();
         self.emit.clear();
         let out_rows = &mut self.emit;
         let row_base = slot.row_base;
         let buffered = slot.spans.len();
         let mut count = 0usize;
-        let mut push_row = |row: i64, out: &mut Vec<u32>| -> Result<(), SqlError> {
-            if row >= 1 && row <= n {
-                count += 1;
-                if !move_only {
-                    let local = (row as usize)
-                        .checked_sub(row_base + 1)
-                        .filter(|local| *local < buffered)
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::INTERNAL_ERROR,
-                                "cursor result is outside its retained fetch"
-                            )
-                        })?;
-                    out.push(local as u32);
+        let mut failed = None;
+        slot.position = motion_rows(slot.position, n, motion, |row| {
+            if failed.is_some() || row < 1 || row > n {
+                return;
+            }
+            count += 1;
+            if move_only {
+                return;
+            }
+            match (row as usize)
+                .checked_sub(row_base + 1)
+                .filter(|local| *local < buffered)
+            {
+                Some(local) => out_rows.push(local as u32),
+                None => {
+                    failed = Some(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "cursor result is outside its retained fetch"
+                    ))
                 }
             }
-            Ok(())
-        };
-        match motion {
-            FetchMotion::Count(0) | FetchMotion::BackwardZero => {
-                // Re-fetch the current row, position unchanged.
-                push_row(slot.position, out_rows)?;
-            }
-            FetchMotion::Count(k) if k > 0 => {
-                for _ in 0..k {
-                    if slot.position > n {
-                        break;
-                    }
-                    slot.position += 1;
-                    push_row(slot.position, out_rows)?;
-                }
-                slot.position = slot.position.min(n + 1);
-            }
-            FetchMotion::Count(k) => {
-                for _ in 0..-i64::from(k) {
-                    if slot.position < 1 {
-                        break;
-                    }
-                    slot.position -= 1;
-                    push_row(slot.position, out_rows)?;
-                }
-                slot.position = slot.position.max(0);
-            }
-            FetchMotion::All => {
-                while slot.position <= n {
-                    slot.position += 1;
-                    push_row(slot.position, out_rows)?;
-                }
-                slot.position = n + 1;
-            }
-            FetchMotion::BackwardAll => {
-                while slot.position >= 1 {
-                    slot.position -= 1;
-                    push_row(slot.position, out_rows)?;
-                }
-                slot.position = 0;
-            }
-            FetchMotion::Absolute(k) => {
-                let target = if k >= 0 {
-                    i64::from(k)
-                } else {
-                    n + 1 + i64::from(k)
-                };
-                slot.position = target.clamp(0, n + 1);
-                push_row(slot.position, out_rows)?;
-            }
-            FetchMotion::Relative(k) => {
-                slot.position = (slot.position + i64::from(k)).clamp(0, n + 1);
-                push_row(slot.position, out_rows)?;
-            }
+        });
+        slot.refill = None;
+        if let Some(error) = failed {
+            return Err(error);
         }
         slot.request = None;
         Ok(count)
@@ -1450,29 +1898,77 @@ impl CursorPool {
     }
 
     /// CLOSE name — false when no such cursor exists.
-    pub fn close(&mut self, name: &str) -> bool {
-        match self.find(name) {
-            Some(at) => {
-                self.slots[at].query.clear();
-                self.slots[at].active = false;
-                self.slots[at].tentative = false;
-                self.slots[at].plan_generation = None;
-                self.slots[at].open_site = None;
-                true
-            }
-            None => false,
+    /// Closes cursor `name`; `false` when no such cursor is open. A cursor
+    /// a `FOR` loop reads is pinned and cannot be closed.
+    pub fn close(&mut self, name: &str) -> Result<bool, SqlError> {
+        let Some(at) = self.find(name) else {
+            return Ok(false);
+        };
+        if self.slots[at].pinned {
+            return Err(pinned_portal(name));
         }
+        self.slots[at].close();
+        Ok(true)
     }
 
     /// CLOSE ALL.
-    pub fn close_all(&mut self) {
-        for s in &mut self.slots {
-            s.query.clear();
-            s.active = false;
-            s.tentative = false;
-            s.plan_generation = None;
-            s.open_site = None;
+    pub fn close_all(&mut self) -> Result<(), SqlError> {
+        if let Some(slot) = self.slots.iter().find(|slot| slot.active && slot.pinned) {
+            return Err(pinned_portal(slot.name.as_str()));
         }
+        for slot in &mut self.slots {
+            slot.close();
+        }
+        Ok(())
+    }
+
+    /// Pins open cursor `name` for a `FOR` loop that reads it.
+    pub(crate) fn pin(&mut self, name: &str) -> Result<(), SqlError> {
+        let at = self.find(name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_CURSOR,
+                "cursor \"{}\" does not exist",
+                name
+            )
+        })?;
+        self.slots[at].pinned = true;
+        Ok(())
+    }
+
+    /// Closes the cursor a finished `FOR` loop pinned; a transaction or
+    /// savepoint rollback may have closed it already.
+    pub(crate) fn close_pinned(&mut self, name: &str) {
+        if let Some(at) = self.find(name) {
+            self.slots[at].close();
+        }
+    }
+
+    /// Makes every pinned cursor holdable before a procedure ends its
+    /// transaction, as PostgreSQL's `HoldPinnedPortals` does, so a `FOR`
+    /// loop keeps reading after `COMMIT` or `ROLLBACK`.
+    pub(crate) fn hold_pinned(&mut self) -> bool {
+        let mut held = false;
+        for slot in &mut self.slots {
+            if slot.active && slot.pinned && !slot.hold {
+                slot.hold = true;
+                held = true;
+            }
+        }
+        held
+    }
+
+    /// A held cursor created in this transaction whose query has not run;
+    /// commit runs it whole, as PostgreSQL persists a holdable portal.
+    pub(crate) fn next_hold_fill(&self) -> Option<(usize, PendingFill)> {
+        let at = self.slots.iter().position(|slot| {
+            slot.active && slot.tentative && slot.hold && slot.fill == Fill::Pending
+        })?;
+        let fill = if self.slots[at].query.writes() {
+            PendingFill::Write
+        } else {
+            PendingFill::Read
+        };
+        Some((at, fill))
     }
 
     pub(crate) fn next_hold_source(&self) -> Option<usize> {
@@ -1485,6 +1981,7 @@ impl CursorPool {
         let slot = &mut self.slots[at];
         slot.query.finish_source();
         slot.request = None;
+        slot.refill = None;
         slot.holding = false;
         slot.rows.clear_tail();
         slot.spans.clear_inputs();
@@ -1536,17 +2033,26 @@ impl CursorPool {
             .any(|slot| slot.active && slot.tentative && slot.hold)
     }
 
+    /// The pinned cursors a procedure's `ROLLBACK` saved survive it, as
+    /// committed holdable cursors do.
+    pub(crate) fn keep_held_pinned(&mut self) {
+        for slot in &mut self.slots {
+            if slot.active && slot.pinned && slot.hold {
+                slot.tentative = false;
+            }
+        }
+    }
+
     /// Transaction commit: cursors become holdable or die.
     pub fn on_commit(&mut self) {
         for s in &mut self.slots {
             if s.active || s.plan_generation.is_some() {
                 if s.active && s.hold {
                     s.tentative = false;
+                    // A held cursor's rows are saved; it reads no table.
+                    s.tables.fill(0);
                 } else {
-                    s.query.clear();
-                    s.active = false;
-                    s.plan_generation = None;
-                    s.open_site = None;
+                    s.close();
                 }
             }
         }
@@ -1557,10 +2063,7 @@ impl CursorPool {
     pub fn on_rollback(&mut self) {
         for s in &mut self.slots {
             if (s.active || s.plan_generation.is_some()) && (s.tentative || !s.hold) {
-                s.query.clear();
-                s.active = false;
-                s.plan_generation = None;
-                s.open_site = None;
+                s.close();
             }
         }
     }
@@ -1792,7 +2295,7 @@ mod ownership_tests {
             pool.on_commit();
             pool.on_rollback();
             assert!(pool.contains_plan_owner(held));
-            assert!(pool.close("same"));
+            assert!(pool.close("same").unwrap());
             assert!(!pool.contains_plan_owner(held));
             let at = pool
                 .open("same", "SELECT 3", CursorScroll::Default, false, false, 1)
@@ -1854,7 +2357,7 @@ mod ownership_tests {
                 sqlstate::DUPLICATE_CURSOR
             );
             pool.fail("failed");
-            assert!(pool.close("failed"));
+            assert!(pool.close("failed").unwrap());
             assert!(!pool.exists("failed"));
         });
     }
@@ -1929,7 +2432,7 @@ mod tests {
                         Ok(_) => panic!("cursor pool accepted an incomplete reservation"),
                         Err(error) => error,
                     };
-                    assert_eq!(error.what, "cursor_emit");
+                    assert_eq!(error.what, "result_stream_tables");
                     assert_eq!(error.requested, error.remaining + 1);
                 }
             }

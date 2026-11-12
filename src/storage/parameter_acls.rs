@@ -18,10 +18,12 @@ use crate::sql_err;
 pub(crate) struct ParameterAclOid(NonZeroU32);
 
 impl ParameterAclOid {
-    const USER_FLOOR: u32 = 16_384;
+    const USER_FLOOR: u32 = super::OidBand::ParameterAcl.base() as u32;
 
     pub(crate) fn parse(value: u32) -> Option<Self> {
-        (value > Self::USER_FLOOR).then(|| Self(NonZeroU32::new(value).unwrap()))
+        i32::try_from(value)
+            .is_ok_and(|value| super::OidBand::ParameterAcl.contains(value))
+            .then(|| Self(NonZeroU32::new(value).unwrap()))
     }
 
     pub(crate) const fn get(self) -> u32 {
@@ -185,7 +187,7 @@ mod tests {
         let role = reader(&storage);
         let role_oid = storage.role_oid(usize::from(role)) as u32;
         let arena = Arena::new(&mut budget, "ACL images", 8192).unwrap();
-        let oid = ParameterAclOid::parse(18000).unwrap();
+        let oid = ParameterAclOid::parse(20_001_000).unwrap();
         let empty = ParameterAclImage::new(oid, ParameterAclGrants::from_slice(&[])).unwrap();
         let grant = ParameterAclGrant::parse(role_oid, 10, 1, 0).unwrap();
         let duplicates = [grant, grant];
@@ -313,7 +315,7 @@ mod tests {
             ParameterAclGrant::parse(storage.role_oid(usize::from(role)) as u32, 10, 1, 0).unwrap(),
         ];
         let image = ParameterAclImage::new(
-            ParameterAclOid::parse(19000).unwrap(),
+            ParameterAclOid::parse(20_002_000).unwrap(),
             ParameterAclGrants::from_slice(&grants),
         )
         .unwrap();
@@ -390,7 +392,7 @@ mod tests {
             ParameterAclGrant::parse(0, 10, 2, 0).unwrap(),
         ];
         let image = ParameterAclImage::new(
-            ParameterAclOid::parse(19001).unwrap(),
+            ParameterAclOid::parse(20_002_001).unwrap(),
             ParameterAclGrants::from_slice(&grants),
         )
         .unwrap();

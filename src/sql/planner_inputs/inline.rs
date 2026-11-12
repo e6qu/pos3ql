@@ -668,7 +668,15 @@ pub(crate) fn argument_facts<'a>(
             type_oid: infer_routine_argument_oid(argument, columns)?,
             known_null: known_null(argument, columns, storage, txid, arena, 0)?,
             constant: capture_constant(argument, columns, storage, txid, arena)?,
-            properties: expression_properties(argument, columns, storage, txid, arena, 0)?,
+            properties: expression_properties(
+                argument,
+                columns,
+                storage,
+                txid,
+                arena,
+                0,
+                Analysis::Planner,
+            )?,
         };
     }
     Ok(facts)
@@ -872,7 +880,7 @@ fn known_null(
     })
 }
 
-fn simple_expression<'a>(statements: &'a [Stmt<'a>]) -> Option<&'a Expr<'a>> {
+pub(super) fn simple_expression<'a>(statements: &'a [Stmt<'a>]) -> Option<&'a Expr<'a>> {
     let [Stmt::Select(select)] = statements else {
         return None;
     };
@@ -920,6 +928,7 @@ pub(crate) fn accepted(
         context.txid,
         context.arena,
         0,
+        Analysis::Planner,
     )?;
     let source = infer_routine_argument_oid(expression, context.body_columns)?;
     let target = context
@@ -1014,7 +1023,7 @@ fn count_parameters(
     if let Expr::Param(index)
     | Expr::RoutineParam {
         index,
-        source: ast::ParameterSource::SqlRoutine,
+        source: ast::ParameterSource::SqlRoutine | ast::ParameterSource::SqlRoutineField,
         ..
     } = expression
     {
@@ -1074,7 +1083,9 @@ fn cast_properties(
     target: i32,
     binding: CastBinding,
 ) -> Result<Properties, SqlError> {
-    if source == target {
+    // PostgreSQL coerces an unknown-type literal while parsing, so the
+    // result is a constant and no input function runs later.
+    if source == target || source == oid::UNKNOWN {
         return Ok(Properties::EMPTY);
     }
     let source = storage
@@ -1208,6 +1219,15 @@ fn operator_properties(
     Ok(properties)
 }
 
+/// Whether an expression analysis prices the planner's inlining decision or
+/// asks PostgreSQL's `CheckMutability` question, which judges a SQL function
+/// the planner would inline by its body instead of its declaration.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Analysis {
+    Planner,
+    Mutability,
+}
+
 fn expression_properties(
     expression: &Expr<'_>,
     columns: &dyn ColTypeResolver,
@@ -1215,6 +1235,7 @@ fn expression_properties(
     txid: u32,
     arena: &Arena,
     depth: usize,
+    analysis: Analysis,
 ) -> Result<Properties, SqlError> {
     if depth >= 512 {
         return Err(sql_err!(
@@ -1231,6 +1252,7 @@ fn expression_properties(
             txid,
             arena,
             depth + 1,
+            analysis,
         )?);
         Ok(())
     })?;
@@ -1252,6 +1274,7 @@ fn expression_properties(
         Expr::Column { .. }
         | Expr::SchemaColumn { .. }
         | Expr::WholeRow(_)
+        | Expr::OuterAggregate { .. }
         | Expr::RoutineParam { .. }
         | Expr::Param(_) => Properties {
             constant: false,
@@ -1469,6 +1492,16 @@ fn expression_properties(
                             *variadic,
                             txid,
                         ) {
+                            if analysis == Analysis::Mutability
+                                && argument_names.is_empty()
+                                && !*variadic
+                                && let Some(body) = inlined_body_properties(
+                                    &routine, args, columns, storage, txid, arena, depth,
+                                )?
+                            {
+                                result.volatility = body.volatility;
+                                result.known &= body.known;
+                            }
                             let Some(mapping) =
                                 routine.call_input_mapping(argument_names, args.len(), *variadic)
                             else {
@@ -1545,6 +1578,7 @@ fn expression_properties(
                                     txid,
                                     arena,
                                     depth + 1,
+                                    analysis,
                                 )?);
                                 result.include(cast_properties(
                                     storage,
@@ -1607,6 +1641,7 @@ fn expression_properties(
                                         txid,
                                         arena,
                                         depth + 1,
+                                        analysis,
                                     )?);
                                     result.include(cast_properties(
                                         storage,
@@ -1629,6 +1664,101 @@ fn expression_properties(
     };
     properties.include(own);
     Ok(properties.folded())
+}
+
+/// PostgreSQL's `CheckMutability` for an index key or predicate: the
+/// expression, after the planner's SQL-function inlining, calls a function,
+/// operator or cast implementation that is not immutable. `None` means a step
+/// has no known implementation to judge.
+pub(crate) fn index_expression_is_mutable(
+    expression: &Expr<'_>,
+    columns: &dyn ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<Option<bool>, SqlError> {
+    let properties = expression_properties(
+        expression,
+        columns,
+        storage,
+        txid,
+        arena,
+        0,
+        Analysis::Mutability,
+    )?;
+    Ok(properties.known.then_some(properties.volatility > 0))
+}
+
+/// The properties of a SQL function's body when PostgreSQL's planner would
+/// inline the call, or `None` when the call keeps its declaration.
+fn inlined_body_properties(
+    routine: &RoutineDef,
+    arguments: &[&Expr<'_>],
+    columns: &dyn ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    depth: usize,
+) -> Result<Option<Properties>, SqlError> {
+    if !declaration(routine, arguments.len(), false, true) {
+        return Ok(None);
+    }
+    let facts = argument_facts(arguments, columns, storage, txid, arena)?;
+    let body = arena
+        .alloc_str(routine.body.as_str())
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let name = arena
+        .alloc_str(routine.name.as_str())
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let mut parser = crate::sql::parser::Parser::new(body, arena)
+        .and_then(|parser| parser.with_routine_parameters(name, routine.arguments()))
+        .map_err(|error| crate::sql::parse_error_to_sql(&error))?;
+    let mut statements = crate::mem::arena::ArenaList::new(arena);
+    while let Some(statement) = parser
+        .next_stmt()
+        .map_err(|error| crate::sql::parse_error_to_sql(&error))?
+    {
+        statements
+            .push(statement)
+            .map_err(|_| crate::sql::eval::arena_full())?;
+    }
+    let statements = statements.as_slice();
+    let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+    let _parameters = crate::sql::exec::enter_routine_parameter_types(
+        routine.arguments(),
+        Some(&catalog),
+        ast::Collation::None,
+    )?;
+    let body_columns = crate::sql::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    let context = Context {
+        storage,
+        txid,
+        arena,
+        body_columns: &body_columns,
+    };
+    if !accepted(routine, statements, facts, &context)? {
+        return Ok(None);
+    }
+    let Some(expression) = simple_expression(statements) else {
+        return Ok(None);
+    };
+    expression_properties(
+        expression,
+        &body_columns,
+        storage,
+        txid,
+        arena,
+        depth + 1,
+        Analysis::Mutability,
+    )
+    .map(Some)
 }
 
 fn syntax_properties(

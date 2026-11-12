@@ -3,7 +3,10 @@
 use super::SnapshotCleanup;
 use core::mem::size_of;
 use core::num::NonZeroU64;
-use {crate::mem::mutex::Mutex, std::sync::Arc};
+use {
+    crate::mem::mutex::{Mutex, MutexGuard},
+    std::sync::Arc,
+};
 
 use super::{DatabaseOid, LockState, SnapshotState, Storage};
 use crate::config::Config;
@@ -51,10 +54,14 @@ pub(super) struct StatementSnapshot {
 
 const STATEMENT_SNAPSHOT_SLOTS_PER_WORKSPACE: usize = 1024;
 
+/// Executing statements share `query_workspace_slots`-derived slots; every
+/// open SQL cursor of every connection has its own, so cursors cannot starve
+/// statements.
 pub(super) fn statement_snapshot_capacity(config: &Config) -> usize {
     config
         .query_workspace_slots
         .saturating_mul(STATEMENT_SNAPSHOT_SLOTS_PER_WORKSPACE)
+        .saturating_add((config.max_connections as usize).saturating_mul(config.max_cursors))
 }
 
 pub(super) fn snapshot_owner_bytes() -> usize {
@@ -257,8 +264,31 @@ impl Storage {
         select: impl FnOnce(u64) -> u64,
     ) -> Result<StatementSnapshotLease, SqlError> {
         let owner = self.transaction_wait_owner(transaction);
-        let mut snapshots = self.snapshot_state();
+        let snapshots = self.snapshot_state();
         let visible = snapshots.admission.select(owner, &self.locks)?;
+        self.retain_selected_snapshot(snapshots, transaction, owner, || select(visible))
+    }
+
+    /// Retains the running statement's commit snapshot for a cursor that
+    /// reads it after that statement ends. The statement's own lease still
+    /// holds `lsn`, so no admission is needed and no history is lost between.
+    pub(crate) fn retain_cursor_snapshot(
+        &self,
+        transaction: u32,
+        lsn: u64,
+    ) -> Result<StatementSnapshotLease, SqlError> {
+        let owner = self.transaction_wait_owner(transaction);
+        let snapshots = self.snapshot_state();
+        self.retain_selected_snapshot(snapshots, transaction, owner, || lsn)
+    }
+
+    fn retain_selected_snapshot(
+        &self,
+        mut snapshots: MutexGuard<'_, SnapshotState>,
+        transaction: u32,
+        owner: WaitOwner,
+        select: impl FnOnce() -> u64,
+    ) -> Result<StatementSnapshotLease, SqlError> {
         let next = snapshots
             .next_statement
             .checked_add(1)
@@ -277,7 +307,7 @@ impl Storage {
             ));
         }
         let files = self.spill_roots.retain_statement()?;
-        let lsn = select(visible);
+        let lsn = select();
         snapshots
             .statements
             .push(StatementSnapshot {

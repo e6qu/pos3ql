@@ -1156,6 +1156,18 @@ impl BlockStore for OwnedObjectStore {
         self.read_capacity_generation
     }
 
+    fn owner_awaits_read(&self, owner: ReadOwner) -> bool {
+        let owned = || {
+            self.slots
+                .iter()
+                .filter(move |slot| slot.owners.contains(&owner))
+        };
+        owned().any(|slot| slot.pending_id.is_some())
+            && !owned().any(|slot| {
+                slot.ready_id.is_some() || slot.error_id.is_some() || slot.pending_error.is_some()
+            })
+    }
+
     fn io_stats(&self) -> BlockIoStats {
         self.stats
     }

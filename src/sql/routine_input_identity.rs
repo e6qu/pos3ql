@@ -90,31 +90,27 @@ fn encode(
     let composite = match routine.kind {
         RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {
             if let super::types::ColType::Composite(Some(creation)) = result.ctype {
-                let target = crate::storage::TypeDefinitionTarget::by_creation(
-                    storage,
-                    crate::storage::NamedTypeKind::Composite,
+                Some((
                     creation,
-                )?;
-                Some(
                     storage
-                        .read_composite_definition(target, txid)?
+                        .row_type_definition(creation, txid)?
                         .ok_or_else(|| {
                             sql_err!(
                                 sqlstate::UNDEFINED_OBJECT,
                                 "SQL routine result type is unavailable"
                             )
                         })?,
-                )
+                ))
             } else {
                 None
             }
         }
         _ => None,
     };
-    if let Some(composite) = composite {
+    if let Some((creation, composite)) = composite {
         emit(&[1])?;
-        emit(&super::types::oid::composite_oid(composite.creation()).to_le_bytes())?;
-        emit(&(composite.n_fields as u32).to_le_bytes())?;
+        emit(&super::types::oid::composite_oid(creation).to_le_bytes())?;
+        emit(&(composite.physical_field_count() as u32).to_le_bytes())?;
         for field in composite.fields() {
             emit(&(field.name.as_str().len() as u32).to_le_bytes())?;
             emit(field.name.as_str().as_bytes())?;

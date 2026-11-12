@@ -11,6 +11,19 @@ impl<'a> CatalogNode<'a> {
     pub(crate) fn from_encoded(encoded: &'a str) -> Option<Self> {
         let body = encoded.strip_prefix(HEADER)?;
         let (kind, rest) = body.split_once('\n')?;
+        let kind = match (kind.strip_prefix("assignment "), kind.strip_prefix("list ")) {
+            (Some(type_oid), _) => {
+                number(type_oid)?;
+                "expression"
+            }
+            (None, Some(types)) => {
+                for type_oid in types.split(',') {
+                    number(type_oid)?;
+                }
+                "list"
+            }
+            (None, None) => kind,
+        };
         if !matches!(kind, "expression" | "list" | "partition" | "query") {
             return None;
         }

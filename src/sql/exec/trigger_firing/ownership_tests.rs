@@ -92,6 +92,8 @@ fn firing_environment_keeps_original_clocks_and_consumed_timeouts() {
 
 #[test]
 fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destruction() {
+    let mut test_cursors = crate::sql::cursor::CursorPool::for_tests();
+    let mut test_row_buffers = crate::storage::RowCursorBuffers::for_tests();
     let _clock = crate::sql::datetime::test_clock::enter(812_345_678_901_234);
     let mut config = crate::storage::tests::test_config();
     config.max_tables = 1;
@@ -190,7 +192,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             columns: &columns,
         };
         let old_note = original.alloc_slice_with(8192, |_| b'x').unwrap();
-        let old = [
+        let mut old = [
             Datum::Int4(10),
             Datum::Text(core::str::from_utf8(old_note).unwrap()),
         ];
@@ -221,7 +223,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             &storage,
             100,
             &original,
-            &|_| false,
+            &|_| None,
         )
         .unwrap();
         let transition_row = encode_projected_pub(&new, &original).unwrap();
@@ -255,6 +257,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             input_collation: crate::sql::ast::Collation::None,
             input_sites: program.input_sites,
             variable_conflict: crate::sql::guc::VariableConflict::Error,
+            print_strict_params: false,
             fresh_snapshots: true,
             materialized_relations: Some(relations),
             nargs: 1,
@@ -288,7 +291,11 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
         let mut context = TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage: &mut storage,
-                seq_session: guc.seq_session(),
+                services: crate::sql::exec::TriggerServices::new(
+                    guc.seq_session(),
+                    &mut test_cursors,
+                    &mut test_row_buffers,
+                ),
             },
             txn: &mut transaction,
             arena: &original,
@@ -302,10 +309,13 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             FiringBinding {
                 invocation,
                 definition,
-                old: Some(&old),
-                new: Some(&mut new),
+                rows: super::TriggerRows {
+                    old: super::TriggerRecord::new(&mut old, true),
+                    new: super::TriggerRecord::new(&mut new, true),
+                    before: true,
+                },
+                caller_new: true,
                 level: TriggerLevel::Row,
-                before: true,
             },
             CallEnvironment::new(Some(settings), Some(security)),
         )
@@ -381,7 +391,11 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
         let mut context = TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
                 storage: &mut storage,
-                seq_session: guc.seq_session(),
+                services: crate::sql::exec::TriggerServices::new(
+                    guc.seq_session(),
+                    &mut test_cursors,
+                    &mut test_row_buffers,
+                ),
             },
             txn: &mut transaction,
             arena: &small,
@@ -419,7 +433,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
                 let FiringState::Paused(frame) = &saved.state else {
                     panic!("paused firing")
                 };
-                let (parsed, _code) = frame.source().parse(scratch).unwrap();
+                let (parsed, _code) = frame.source().parse(scratch, None).unwrap();
                 let values = saved.saved.values.decode(scratch).unwrap();
                 let binding = saved
                     .saved
@@ -452,7 +466,11 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
                 let mut context = TriggerExecContext {
                     host: PlpgsqlExecHost::Atomic {
                         storage: &mut storage,
-                        seq_session: guc.seq_session(),
+                        services: crate::sql::exec::TriggerServices::new(
+                            guc.seq_session(),
+                            &mut test_cursors,
+                            &mut test_row_buffers,
+                        ),
                     },
                     txn: &mut transaction,
                     arena: scratch,
@@ -493,7 +511,11 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             let mut context = TriggerExecContext {
                 host: PlpgsqlExecHost::Atomic {
                     storage: &mut storage,
-                    seq_session: guc.seq_session(),
+                    services: crate::sql::exec::TriggerServices::new(
+                        guc.seq_session(),
+                        &mut test_cursors,
+                        &mut test_row_buffers,
+                    ),
                 },
                 txn: &mut transaction,
                 arena: &resumed,

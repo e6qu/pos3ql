@@ -202,7 +202,34 @@ pub(crate) fn validate_catalog_reference_cast(
     Ok(())
 }
 
+/// A value of a routine-contract pseudo-type. PostgreSQL's input functions
+/// for triggers and handlers refuse every value, NULL included; `cstring`,
+/// `"any"` and `unknown` values are not modeled.
+pub(crate) fn pseudo_type_value(kind: crate::sql::types::PseudoType) -> SqlError {
+    use crate::sql::types::PseudoType;
+    match kind {
+        PseudoType::Cstring | PseudoType::Any | PseudoType::Unknown => sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "values of type {} are not supported",
+            kind.display_name()
+        ),
+        _ => sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot accept a value of type {}",
+            kind.display_name()
+        ),
+    }
+}
+
 pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    if let ColType::Pseudo(kind) = target {
+        // A `cstring` value is the text its source's output produced; the
+        // cast that made it already checked the source type.
+        return match (kind, v) {
+            (crate::sql::types::PseudoType::Cstring, Datum::Null | Datum::Text(_)) => Ok(v),
+            _ => Err(pseudo_type_value(kind)),
+        };
+    }
     if v.is_null() {
         return Ok(Datum::Null);
     }
@@ -225,6 +252,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             _ => return Err(cast_unsupported(&v, "pg_ddl_command")),
         },
         ColType::AnyArray => return Err(cast_unsupported(&v, "anyarray")),
+        ColType::Pseudo(kind) => return Err(pseudo_type_value(kind)),
         ColType::Refcursor => match v {
             Datum::Text(_) => v,
             _ => return Err(cast_unsupported(&v, "refcursor")),
@@ -262,8 +290,9 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         }
         // A cast *to* record has no source but a record itself; PostgreSQL
         // has no input conversion for anonymous records either.
+        // A named composite value is already a record; it keeps its type.
         ColType::Record => match v {
-            Datum::Record(_) => v,
+            Datum::Record(_) | Datum::Composite { .. } | Datum::CompositeText { .. } => v,
             _ => return Err(cast_unsupported(&v, "record")),
         },
         ColType::Int2Vector => match v {
@@ -318,7 +347,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         },
         ColType::Regtype => match v {
             Datum::Regtype { .. } => v,
-            Datum::Text(name) => super::regtype_of_name(name)?,
+            Datum::Text(name) => super::regtype_of_name(name, arena)?,
             Datum::Oid(oid) => super::regtype_of_oid(i64::from(oid), arena)?,
             Datum::Int4(oid) => super::regtype_of_oid(i64::from(oid), arena)?,
             Datum::Int8(oid) => super::regtype_of_oid(oid, arena)?,
@@ -552,7 +581,8 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             };
             Datum::Char(byte)
         }
-        ColType::Text | ColType::Varchar | ColType::Bpchar => Datum::Text(cast_to_text(v, arena)?),
+        ColType::Text | ColType::Varchar => Datum::Text(cast_to_text(v, arena)?),
+        ColType::Bpchar => Datum::Bpchar(cast_to_text(v, arena)?),
         ColType::Name => {
             // PostgreSQL truncates name input to NAMEDATALEN-1 = 63 bytes,
             // silently, on a character boundary.
@@ -751,9 +781,18 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         },
         ColType::TsQuery => match v {
             Datum::TsQuery(_) => v,
-            Datum::Text(text) => Datum::TsQuery(crate::sql::full_text::restore_query(
-                crate::sql::full_text::canonical_query(text, arena)?,
-            )),
+            Datum::Text(text) => {
+                let query = crate::sql::full_text::canonical_query(text, arena)?;
+                // PostgreSQL's `parse_tsquery` notices an input without operands.
+                if query.is_empty() {
+                    crate::sql::eval::raise_eval_message(
+                        crate::sql::eval::EvalMessageLevel::Notice,
+                        crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                        format_args!("text-search query doesn't contain lexemes: \"{text}\""),
+                    )?;
+                }
+                Datum::TsQuery(crate::sql::full_text::restore_query(query))
+            }
             _ => return Err(cast_unsupported(&v, "tsquery")),
         },
         ColType::Array(element) => match v {

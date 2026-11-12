@@ -59,8 +59,8 @@ struct SuspendedProcedureState {
     inputs: local_values::SavedValues,
     environment: SavedCallEnvironment,
     timing: super::super::statistics::PausedFunctionTiming,
-    /// The name-conflict rule the body started with; a resumed body keeps it.
-    variable_conflict: super::super::guc::VariableConflict,
+    /// The PL/pgSQL settings the body started with; a resumed body keeps them.
+    settings: super::super::guc::PlpgsqlSettings,
     execution: Option<execution_frame::SuspendedExecutionFrame>,
     progress: super::super::sequence::SavedStatementPosition,
 }
@@ -121,7 +121,10 @@ pub(super) fn execute<'a>(
                     inputs: saved_inputs,
                     environment: saved_environment,
                     timing: timing.pause(),
-                    variable_conflict: body.invocation.variable_conflict,
+                    settings: super::super::guc::PlpgsqlSettings {
+                        variable_conflict: body.invocation.variable_conflict,
+                        print_strict_params: body.invocation.print_strict_params,
+                    },
                     execution: Some(execution),
                     progress,
                 })
@@ -169,8 +172,8 @@ fn run<'a>(
             body.invocation,
             TriggerTransition {
                 definition,
-                old: None,
-                new: None,
+                old: TriggerRecordValue::Empty,
+                new: TriggerRecordValue::Empty,
             },
             body.code,
             body.seeded,
@@ -179,9 +182,7 @@ fn run<'a>(
             context,
             definition,
             body.invocation,
-            None,
-            &mut None,
-            false,
+            &mut TriggerRows::none(),
             None,
             body.code,
         )
@@ -215,7 +216,7 @@ fn run<'a>(
 impl SuspendedProcedure {
     /// Continues the saved body at its waiting statement. `invocation` builds
     /// the call's invocation from the restored program's input sites and its
-    /// saved name-conflict rule, and
+    /// saved PL/pgSQL settings, and
     /// `seeded` maps the saved inputs to named locals. A failed attachment
     /// leaves the saved body in `retention` unchanged.
     pub(super) fn resume<'a>(
@@ -224,7 +225,7 @@ impl SuspendedProcedure {
         identity: ProcedureIdentity,
         invocation: &dyn Fn(
             &'a [super::super::plpgsql_inputs::Site<'a>],
-            super::super::guc::VariableConflict,
+            super::super::guc::PlpgsqlSettings,
         ) -> Result<TriggerInvocation<'a>, SqlError>,
         seeded: &dyn Fn(&'a [Datum<'a>]) -> Result<&'a [Datum<'a>], SqlError>,
         retention: &mut Option<SuspendedProcedure>,
@@ -257,7 +258,7 @@ impl SuspendedProcedure {
                     Ok(environment) => environment,
                     Err(error) => return Err((frame, error)),
                 };
-                let (parsed, code) = match frame.source().parse(arena) {
+                let (parsed, code) = match frame.source().parse(arena, None) {
                     Ok(parsed) => parsed,
                     Err(error) => return Err((frame, error)),
                 };
@@ -265,7 +266,7 @@ impl SuspendedProcedure {
                     Ok(inputs) => inputs,
                     Err(error) => return Err((frame, error)),
                 };
-                let invocation = match invocation(parsed.input_sites, state.variable_conflict) {
+                let invocation = match invocation(parsed.input_sites, state.settings) {
                     Ok(invocation) => invocation,
                     Err(error) => return Err((frame, error)),
                 };

@@ -42,11 +42,11 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
         index: usize,
         catalog: Option<&dyn super::super::eval::CatalogAccess>,
     ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
-        ScopeSchema::new(self.scope).whole_row_field_metadata(table, index, catalog)
+        ScopeSchema(self.scope).whole_row_field_metadata(table, index, catalog)
     }
 
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
-        ScopeSchema::new(self.scope).column_type_mod(qualifier, name)
+        ScopeSchema(self.scope).column_type_mod(qualifier, name)
     }
 
     fn resolve_column_type(
@@ -54,7 +54,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ColType, SqlError> {
-        ScopeSchema::new(self.scope).resolve_column_type(qualifier, name)
+        ScopeSchema(self.scope).resolve_column_type(qualifier, name)
     }
 
     fn is_empty_scope(&self) -> bool {
@@ -63,10 +63,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         let flat_of = |t: usize, c: usize| -> usize {
-            (0..t)
-                .map(|i| self.scope.defs.get(i).expect("resolved").n_columns)
-                .sum::<usize>()
-                + c
+            (0..t).map(|i| self.scope.stored_width(i)).sum::<usize>() + c
         };
         match self.scope.find_column(qualifier, name)? {
             ResolvedColumn::Table(t, c) => crate::sql::exec::decode_projected_col_record(
@@ -99,9 +96,9 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
                 if error.sqlstate == sqlstate::UNDEFINED_COLUMN
                     && qualifier.is_none()
                     && (self.scope.using_alias(name).is_some()
-                        || self.scope.table_index(name).is_ok()) =>
+                        || self.scope.source(name).is_ok()) =>
             {
-                Some(self.scope.func_scalar_type(name).unwrap_or(ColType::Record))
+                self.scope.whole_row_type(name)
             }
             Err(_) => None,
         }
@@ -116,7 +113,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
     }
 
     fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> Collation {
-        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols::new(self.scope))
+        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(self.scope))
             .map_or(Collation::None, |meta| meta.collation)
     }
 
@@ -145,31 +142,40 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
     }
 
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
-        self.scope.qualified_star_columns(table).ok()?;
-        Some(
-            self.scope
-                .func_scalar_type(table)
-                .unwrap_or(ColType::Record),
-        )
+        self.scope.whole_row_type(table)
     }
 
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
         if self.scope.using_alias(table).is_some() {
             return Ok(true);
         }
-        let source = self.scope.table_index(table)?;
+        let source = self.scope.source(table)?;
         let value = crate::sql::exec::decode_projected_col_record(
             self.bytes,
-            self.raw_at + self.scope.total_columns() + source,
+            self.raw_at + self.scope.stored_columns() + source.table,
             self.arena,
         )?;
-        match value {
-            Datum::Bool(present) => Ok(present),
-            _ => Err(sql_err!(
-                sqlstate::DATA_EXCEPTION,
-                "saved projection source-presence flag is not boolean"
-            )),
-        }
+        let present = match value {
+            Datum::Bool(present) => present,
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "saved projection source-presence flag is not boolean"
+                ));
+            }
+        };
+        let Some(column) = source.presence.filter(|_| present) else {
+            return Ok(present);
+        };
+        let offset = (0..source.table)
+            .map(|table| self.scope.stored_width(table))
+            .sum::<usize>()
+            + column;
+        super::scope::member_present(crate::sql::exec::decode_projected_col_record(
+            self.bytes,
+            self.raw_at + offset,
+            self.arena,
+        )?)
     }
 
     fn whole_row_fields(
@@ -358,7 +364,7 @@ fn materialized_value_at<'a>(
             .unwrap_or(Datum::Null);
     }
     let mut raw_index = index - width - n_keys;
-    let source_columns = scope.total_columns();
+    let source_columns = scope.stored_columns();
     if raw_index >= source_columns {
         let table = raw_index - source_columns;
         let present = row
@@ -367,7 +373,7 @@ fn materialized_value_at<'a>(
         return Datum::Bool(present);
     }
     for table in 0..scope.n {
-        let column_count = scope.defs.get(table).expect("resolved").n_columns;
+        let column_count = scope.stored_width(table);
         if raw_index < column_count {
             if !raw_columns
                 .is_some_and(|columns| columns.references_column(table, raw_index, column_count))
@@ -615,7 +621,7 @@ fn semi_join_exists(select: &Select<'_>, storage: &Storage, txid: u32) -> bool {
                 super::expr_has_window(expression)
                     || expression_has_aggregate_use(expression, storage, txid)
             }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => false,
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => false,
         })
         && !select.where_clause.is_some_and(|predicate| {
             super::cte::expression_contains_function(predicate, &|name, arguments| {
@@ -876,7 +882,7 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
         use super::scan::BoundRow;
         let scope = self.scope;
         let raw_at = self.plan.width + self.plan.n_keys;
-        let presence_at = raw_at + scope.total_columns();
+        let presence_at = raw_at + scope.stored_columns();
         // `read` holds every source as the statement read it; `bound` swaps in
         // the latest versions of the changed sources.
         let read = arena
@@ -887,7 +893,8 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
             .map_err(|_| arena_full())?;
         let mut column_at = raw_at;
         for table in 0..scope.n {
-            let n_columns = scope.defs.get(table).expect("resolved").n_columns;
+            // Raw rows lay each source out at its stored width.
+            let n_columns = scope.stored_width(table);
             if matches!(
                 crate::sql::exec::decode_projected_pub(row, presence_at + table),
                 Datum::Bool(true)
@@ -922,14 +929,13 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                             let order = arena
                                 .alloc_slice_with(scope.n, |table| table)
                                 .map_err(|_| arena_full())?;
-                            let mut as_read_row = sources_row(scope, read, order, rowids);
-                            as_read_row.visible = table;
+                            let as_read_row =
+                                sources_row(scope, read, order, rowids).left_of(table);
                             let as_read = Chained {
                                 inner: &as_read_row,
                                 outer: self.outer,
                             };
-                            let mut left = sources_row(scope, bound, order, rowids);
-                            left.visible = table;
+                            let left = sources_row(scope, bound, order, rowids).left_of(table);
                             let latest = Chained {
                                 inner: &left,
                                 outer: self.outer,
@@ -955,6 +961,7 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                                             self.from.joins[table - 1].kind,
                                             crate::sql::ast::JoinKind::Inner
                                                 | crate::sql::ast::JoinKind::Cross
+                                                | crate::sql::ast::JoinKind::Comma
                                         )
                                     {
                                         return Ok(None);
@@ -970,8 +977,7 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                         let order = arena
                             .alloc_slice_with(scope.n, |table| table)
                             .map_err(|_| arena_full())?;
-                        let mut left = sources_row(scope, bound, order, rowids);
-                        left.visible = table;
+                        let left = sources_row(scope, bound, order, rowids).left_of(table);
                         let chained = Chained {
                             inner: &left,
                             outer: self.outer,
@@ -995,6 +1001,7 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                                     self.from.joins[table - 1].kind,
                                     crate::sql::ast::JoinKind::Inner
                                         | crate::sql::ast::JoinKind::Cross
+                                        | crate::sql::ast::JoinKind::Comma
                                 ))
                         {
                             return Ok(None);
@@ -1078,7 +1085,9 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                 continue;
             }
             match join.kind {
-                crate::sql::ast::JoinKind::Inner | crate::sql::ast::JoinKind::Cross => {
+                crate::sql::ast::JoinKind::Inner
+                | crate::sql::ast::JoinKind::Cross
+                | crate::sql::ast::JoinKind::Comma => {
                     return Ok(None);
                 }
                 crate::sql::ast::JoinKind::Left => bound[right] = None,
@@ -1170,66 +1179,10 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
 /// yields NULL — while resolving no values. Value lookups fail exactly as an
 /// empty row's would, so grouped columns still resolve through the group hook
 /// and bare ungrouped references remain the same error.
-#[derive(Clone, Copy)]
-pub(crate) struct ScopeSchema<'s, 'd> {
-    pub(crate) scope: &'s QueryScope<'d>,
-    /// Names resolve over the first `visible` FROM items; a `LATERAL`
-    /// item's body sees only the items to its left.
-    visible: usize,
-    /// The body of a `LATERAL` item on the right of a RIGHT or FULL join:
-    /// a name found among the items fails as PostgreSQL's
-    /// `check_lateral_ref_ok` does.
-    refused: bool,
-}
-
-impl<'s, 'd> ScopeSchema<'s, 'd> {
-    pub(crate) fn new(scope: &'s QueryScope<'d>) -> Self {
-        Self::prefix(scope, scope.n)
-    }
-
-    pub(crate) fn prefix(scope: &'s QueryScope<'d>, visible: usize) -> Self {
-        Self {
-            scope,
-            visible,
-            refused: false,
-        }
-    }
-
-    pub(crate) fn refusing(scope: &'s QueryScope<'d>, visible: usize) -> Self {
-        Self {
-            refused: true,
-            ..Self::prefix(scope, visible)
-        }
-    }
-
-    pub(crate) fn refuses(&self) -> bool {
-        self.refused
-    }
-
-    fn refuse(&self, table: &str) -> SqlError {
-        crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
-            detail: Some(crate::stack_format!(
-                crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
-                "The combining JOIN type must be INNER or LEFT for a LATERAL reference."
-            )),
-            hint: None,
-            objects: crate::sql::eval::ErrorObjects::default(),
-        });
-        sql_err!(
-            sqlstate::INVALID_COLUMN_REFERENCE,
-            "invalid reference to FROM-clause entry for table \"{}\"",
-            table
-        )
-    }
-
-    fn columns(&self) -> super::ScopeCols<'s, 'd> {
-        super::ScopeCols::prefix(self.scope, self.visible)
-    }
-}
-
+pub(crate) struct ScopeSchema<'s, 'd>(pub(crate) &'s QueryScope<'d>);
 impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
-        crate::sql::exec::ColTypeResolver::column_meta(&self.columns(), qualifier, name)
+        crate::sql::exec::ColTypeResolver::column_meta(&super::ScopeCols(self.0), qualifier, name)
             .map_or(-1, |column| column.type_mod)
     }
 
@@ -1239,24 +1192,21 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         index: usize,
         catalog: Option<&dyn super::super::eval::CatalogAccess>,
     ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
-        let entry = self
-            .scope
-            .qualified_star_entry_among(self.visible, table, index)
-            .ok()?;
+        let entry = self.0.qualified_star_entry(table, index).ok()?;
         match entry {
             super::scope::ResolvedColumn::Table(table, column) => {
                 super::super::eval::stored_row_field_metadata(
-                    self.scope.defs.get(table)?.columns().get(column)?,
+                    self.0.defs.get(table)?.columns().get(column)?,
                     catalog,
                 )
             }
             super::scope::ResolvedColumn::Merged(_) => Some((
-                crate::util::StackStr::from_str(self.scope.output_name(entry)),
+                crate::util::StackStr::from_str(self.0.output_name(entry)),
                 crate::sql::exec::StaticTypeMeta {
-                    type_oid: self.scope.output_type(entry).oid(),
-                    ctype: self.scope.output_type(entry),
+                    type_oid: self.0.output_type(entry).oid(),
+                    ctype: self.0.output_type(entry),
                     type_mod: -1,
-                    collation: self.scope.output_collation(entry),
+                    collation: self.0.output_collation(entry),
                 },
             )),
         }
@@ -1267,36 +1217,17 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ColType, SqlError> {
-        match self.scope.find_column_among(self.visible, qualifier, name) {
-            Ok(column) if self.refused => {
-                let table = match column {
-                    super::scope::ResolvedColumn::Table(table, _) => table,
-                    super::scope::ResolvedColumn::Merged(merged) => {
-                        self.scope.merged[merged].parts[0].0
-                    }
-                };
-                Err(crate::sql::error_position::at_reference(
-                    self.refuse(self.scope.names[table]),
-                    qualifier.unwrap_or(name),
-                ))
-            }
-            Ok(column) => Ok(self.scope.output_type(column)),
+        match self.0.find_column(qualifier, name) {
+            Ok(column) => Ok(self.0.output_type(column)),
             Err(error) if qualifier.is_none() && error.sqlstate == sqlstate::UNDEFINED_COLUMN => {
-                match self.whole_row_type(name) {
-                    Some(_) if self.refused => Err(crate::sql::error_position::at_reference(
-                        self.refuse(name),
-                        name,
-                    )),
-                    Some(ctype) => Ok(ctype),
-                    None => Err(error),
-                }
+                self.whole_row_type(name).ok_or(error)
             }
             Err(error) => Err(error),
         }
     }
 
     fn is_empty_scope(&self) -> bool {
-        self.visible == 0
+        self.0.n == 0
     }
 
     fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
@@ -1307,32 +1238,27 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         ))
     }
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        match self.scope.find_column_among(self.visible, qualifier, name) {
-            Ok(entry) => Some(self.scope.output_type(entry)),
+        match self.0.find_column(qualifier, name) {
+            Ok(entry) => Some(self.0.output_type(entry)),
             Err(error)
                 if error.sqlstate == sqlstate::UNDEFINED_COLUMN
                     && qualifier.is_none()
-                    && (self.scope.using_alias(name).is_some()
-                        || self.scope.table_index_among(self.visible, name).is_ok()) =>
+                    && (self.0.using_alias(name).is_some() || self.0.source(name).is_ok()) =>
             {
-                Some(
-                    self.scope
-                        .func_scalar_type_among(self.visible, name)
-                        .unwrap_or(ColType::Record),
-                )
+                self.0.whole_row_type(name)
             }
             Err(_) => None,
         }
     }
     fn collation(&self, qualifier: Option<&str>, name: &str) -> Collation {
-        self.scope
-            .find_column_among(self.visible, qualifier, name)
+        self.0
+            .find_column(qualifier, name)
             .ok()
-            .map(|entry| self.scope.output_collation(entry))
+            .map(|entry| self.0.output_collation(entry))
             .unwrap_or(Collation::None)
     }
     fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> Collation {
-        crate::sql::exec::record_field_metadata(base, field, &self.columns())
+        crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(self.0))
             .map_or(Collation::None, |meta| meta.collation)
     }
     fn column_user_type(
@@ -1340,42 +1266,184 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        match self
-            .scope
-            .find_column_among(self.visible, qualifier, name)
-            .ok()?
-        {
+        match self.0.find_column(qualifier, name).ok()? {
+            super::scope::ResolvedColumn::Table(table, column) => {
+                self.0.defs.get(table)?.columns.get(column)?.user_type
+            }
+            super::scope::ResolvedColumn::Merged(_) => None,
+        }
+    }
+    fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
+        match self.0.find_column(qualifier, name).ok()? {
+            super::scope::ResolvedColumn::Table(t, c) => Some((t as u32, c as u32)),
+            super::scope::ResolvedColumn::Merged(m) => Some((u32::MAX, m as u32)),
+        }
+    }
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.0.func_scalar_type(table).is_some()
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.0.whole_row_type(table)
+    }
+}
+
+/// [`ScopeSchema`] over the first `visible` FROM items of a scope: what a
+/// `LATERAL` item's body reads of the items to its left, never its own or a
+/// later item's columns.
+#[derive(Clone, Copy)]
+pub(crate) struct ScopePrefix<'s, 'd> {
+    pub(crate) scope: &'s QueryScope<'d>,
+    pub(crate) visible: usize,
+}
+
+impl ScopePrefix<'_, '_> {
+    fn whole(&self) -> bool {
+        self.visible >= self.scope.n
+    }
+
+    fn entry(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<super::scope::ResolvedColumn, SqlError> {
+        self.scope.find_column_among(self.visible, qualifier, name)
+    }
+
+    fn names_visible_item(&self, table: &str) -> bool {
+        self.scope
+            .source(table)
+            .is_ok_and(|source| source.table < self.visible)
+    }
+}
+
+impl<'a> ColumnLookup<'a> for ScopePrefix<'_, '_> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        if self.whole() {
+            return ColumnLookup::<'a>::column_type_mod(&ScopeSchema(self.scope), qualifier, name);
+        }
+        match self.entry(qualifier, name) {
+            Ok(super::scope::ResolvedColumn::Table(table, column)) => self
+                .scope
+                .defs
+                .get(table)
+                .and_then(|definition| definition.columns.get(column))
+                .map_or(-1, |column| column.type_mod),
+            _ => -1,
+        }
+    }
+
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn super::super::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        if !self.whole() && !self.names_visible_item(table) {
+            return None;
+        }
+        ColumnLookup::<'a>::whole_row_field_metadata(
+            &ScopeSchema(self.scope),
+            table,
+            index,
+            catalog,
+        )
+    }
+
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        if self.whole() {
+            return ColumnLookup::<'a>::resolve_column_type(
+                &ScopeSchema(self.scope),
+                qualifier,
+                name,
+            );
+        }
+        match self.entry(qualifier, name) {
+            Ok(column) => Ok(self.scope.output_type(column)),
+            Err(error)
+                if qualifier.is_none()
+                    && error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    && self.names_visible_item(name) =>
+            {
+                self.scope.whole_row_type(name).ok_or(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.visible.min(self.scope.n) == 0
+    }
+
+    fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" does not exist",
+            name
+        ))
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        if self.whole() {
+            return ColumnLookup::<'a>::col_type(&ScopeSchema(self.scope), qualifier, name);
+        }
+        match self.entry(qualifier, name) {
+            Ok(entry) => Some(self.scope.output_type(entry)),
+            Err(error)
+                if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    && qualifier.is_none()
+                    && self.names_visible_item(name) =>
+            {
+                self.scope.whole_row_type(name)
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> Collation {
+        self.entry(qualifier, name)
+            .ok()
+            .map(|entry| self.scope.output_collation(entry))
+            .unwrap_or(Collation::None)
+    }
+
+    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> Collation {
+        ScopeSchema(self.scope).record_field_collation(base, field)
+    }
+
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
+        match self.entry(qualifier, name).ok()? {
             super::scope::ResolvedColumn::Table(table, column) => {
                 self.scope.defs.get(table)?.columns.get(column)?.user_type
             }
             super::scope::ResolvedColumn::Merged(_) => None,
         }
     }
+
     fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
-        match self
-            .scope
-            .find_column_among(self.visible, qualifier, name)
-            .ok()?
-        {
+        match self.entry(qualifier, name).ok()? {
             super::scope::ResolvedColumn::Table(t, c) => Some((t as u32, c as u32)),
             super::scope::ResolvedColumn::Merged(m) => Some((u32::MAX, m as u32)),
         }
     }
+
     fn whole_row_is_scalar(&self, table: &str) -> bool {
-        self.scope
-            .func_scalar_type_among(self.visible, table)
-            .is_some()
+        (self.whole() || self.names_visible_item(table))
+            && self.scope.func_scalar_type(table).is_some()
     }
 
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
-        self.scope
-            .qualified_star_columns_among(self.visible, table)
-            .ok()?;
-        Some(
-            self.scope
-                .func_scalar_type_among(self.visible, table)
-                .unwrap_or(ColType::Record),
-        )
+        (self.whole() || self.names_visible_item(table))
+            .then(|| self.scope.whole_row_type(table))
+            .flatten()
     }
 }
 
@@ -1423,7 +1491,7 @@ pub(crate) fn finalize_projected_row<'a>(
     let mut slot = 0usize;
     for (i, item) in statement.items.iter().enumerate() {
         match item {
-            SelectItem::Wildcard => slot += scope.star_columns(),
+            SelectItem::Wildcard(_) => slot += scope.star_columns(),
             SelectItem::TableWildcard(q) => {
                 slot += scope.qualified_star_columns(q)?;
             }
@@ -1478,7 +1546,7 @@ fn projected_collations<'a>(
     for item in statement.items {
         let remaining = match item {
             SelectItem::Expr { .. } => 1,
-            SelectItem::Wildcard => scope.star_columns(),
+            SelectItem::Wildcard(_) => scope.star_columns(),
             SelectItem::TableWildcard(qualifier) => scope.qualified_star_columns(qualifier)?,
             SelectItem::RecordStar(base) => {
                 record_star_width(base, Some(scope), storage, txid, arena)?
@@ -1495,7 +1563,7 @@ fn projected_collations<'a>(
                 collations[width] = scope.expression_collation(storage, arena, expression)?;
                 width += 1;
             }
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 for index in 0..scope.star_columns() {
                     collations[width] = scope.output_collation(scope.star_entry(index));
                     width += 1;
@@ -1513,7 +1581,7 @@ fn projected_collations<'a>(
                     base,
                     &super::CatalogScopeCols {
                         scope,
-                        outer_scope: None,
+                        outer: None,
                         storage,
                         txid,
                         arena,
@@ -1529,9 +1597,12 @@ fn projected_collations<'a>(
     Ok(collations)
 }
 
+/// DISTINCT over encoded rows; a stable sort keeps each group's first input
+/// row, the representative PostgreSQL's hashed DISTINCT returns.
 fn sort_dedup_collated(
     storage: &Storage,
     txid: u32,
+    arena: &Arena,
     rows: &mut [&[u8]],
     width: usize,
     collations: &[Collation],
@@ -1544,37 +1615,30 @@ fn sort_dedup_collated(
             )?;
         }
     }
-    rows.sort_unstable_by(|left, right| {
+    let compare = |left: &[u8], right: &[u8]| {
         for (index, &collation) in collations.iter().take(width).enumerate() {
             let ordering = compare_materialized_key(
                 storage,
                 txid,
                 collation,
-                &crate::sql::exec::decode_projected_pub(left, index),
-                &crate::sql::exec::decode_projected_pub(right, index),
-            )
-            .expect("validated DISTINCT values compare without error");
+                crate::sql::exec::ProjectedValue::column(left, index),
+                crate::sql::exec::ProjectedValue::column(right, index),
+            )?;
             if !ordering.is_eq() {
-                return ordering;
+                return Ok(ordering);
             }
         }
-        core::cmp::Ordering::Equal
-    });
+        Ok(core::cmp::Ordering::Equal)
+    };
+    crate::mem::arena::try_stable_sort_via(
+        arena,
+        rows,
+        |left, right| compare(left, right),
+        |_| arena_full(),
+    )?;
     let mut unique = 0;
     for index in 0..rows.len() {
-        if index == 0
-            || (0..width).any(|column| {
-                !compare_materialized_key(
-                    storage,
-                    txid,
-                    collations[column],
-                    &crate::sql::exec::decode_projected_pub(rows[index - 1], column),
-                    &crate::sql::exec::decode_projected_pub(rows[index], column),
-                )
-                .expect("validated DISTINCT values compare without error")
-                .is_eq()
-            })
-        {
+        if index == 0 || !compare(rows[index - 1], rows[index])?.is_eq() {
             rows[unique] = rows[index];
             unique += 1;
         }
@@ -1615,7 +1679,7 @@ pub(super) fn prepare_materialization<'a>(
         order_exprs[key] = Some(resolved);
     }
     for (index, on) in statement.distinct_on.iter().enumerate() {
-        let resolved = super::resolve_sort_key(
+        let resolved = super::resolve_distinct_on_key(
             on,
             statement.items,
             scope,
@@ -1624,20 +1688,20 @@ pub(super) fn prepare_materialization<'a>(
             txid,
             &order_exprs[..n_order + index],
         )?;
-        if n_order > 0
-            && (index >= n_order
-                || *order_exprs[index].expect("resolved").expression != *resolved.expression)
-        {
-            return Err(sql_err!(
-                sqlstate::INVALID_COLUMN_REFERENCE,
-                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
-            ));
-        }
         key_collations[n_order + index] =
             scope.expression_collation(storage, arena, resolved.expression)?;
         order_exprs[n_order + index] = Some(resolved);
     }
     let n_keys = n_order + n_on;
+    let mut order_targets = [&Expr::Null; MAX_PROJ];
+    for (target, key) in order_targets.iter_mut().zip(&order_exprs[..n_keys]) {
+        *target = key.expect("resolved").expression;
+    }
+    check_distinct_on_order(
+        &order_targets[..n_order],
+        &order_targets[n_order..n_keys],
+        statement.distinct_on,
+    )?;
     if statement.distinct && n_on == 0 {
         for expression in order_exprs.iter().take(n_order) {
             let target = expression.expect("resolved").expression;
@@ -1656,7 +1720,7 @@ pub(super) fn prepare_materialization<'a>(
     let mut width = 0usize;
     for item in statement.items {
         width += match item {
-            SelectItem::Wildcard => scope.star_columns(),
+            SelectItem::Wildcard(_) => scope.star_columns(),
             SelectItem::TableWildcard(qualifier) => scope.qualified_star_columns(qualifier)?,
             SelectItem::RecordStar(base) => {
                 record_star_width(base, Some(scope), storage, txid, arena)?
@@ -1676,7 +1740,7 @@ pub(super) fn prepare_materialization<'a>(
     let mut any_postponed = false;
     let mut raw_needed = false;
     if defer_allowed {
-        let schema = ScopeSchema::new(scope);
+        let schema = ScopeSchema(scope);
         let row = Chained {
             inner: &schema,
             outer,
@@ -1751,7 +1815,7 @@ pub(super) fn prepare_materialization<'a>(
     };
     // Presence is independent of field NULLs, including zero-column rows.
     let n_raw = if raw_needed || locking {
-        scope.total_columns() + scope.n
+        scope.stored_columns() + scope.n
     } else {
         0
     };
@@ -1812,7 +1876,7 @@ fn observed_source_columns<'a>(
     if statement
         .items
         .iter()
-        .any(|item| matches!(item, SelectItem::Wildcard | SelectItem::TableWildcard(_)))
+        .any(|item| matches!(item, SelectItem::Wildcard(_) | SelectItem::TableWildcard(_)))
     {
         return super::scan::PaxReadDemand::full_row(
             super::scan::PaxFullRowReason::WildcardProjection,
@@ -1831,7 +1895,9 @@ fn observed_source_columns<'a>(
                 expressions[count] = expression;
                 count += 1;
             }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => unreachable!("returned above"),
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
+                unreachable!("returned above")
+            }
         }
     }
     if let Some(predicate) = statement.where_clause {
@@ -2026,7 +2092,7 @@ pub(crate) fn materialized_rows<'a>(
     // row per key in ORDER BY order survives.
     let mut live = rows.len();
     if statement.distinct && n_on == 0 {
-        live = sort_dedup_collated(storage, txid, rows, width, &visible_collations)?;
+        live = sort_dedup_collated(storage, txid, arena, rows, width, &visible_collations)?;
     }
     let rows = &mut rows[..live];
 
@@ -2044,63 +2110,25 @@ pub(crate) fn materialized_rows<'a>(
                 )?;
             }
         }
-        crate::mem::arena::stable_sort_via(arena, rows, |a, b| {
-            for (k, ob) in statement.order_by.iter().enumerate() {
-                let ka = crate::sql::exec::decode_projected_pub(a, width + k);
-                let kb = crate::sql::exec::decode_projected_pub(b, width + k);
-                // NULL placement follows NULLS FIRST/LAST (absolute, not
-                // affected by ASC/DESC); only the value comparison reverses
-                // for DESC.
-                let ord = match (ka.is_null(), kb.is_null()) {
-                    (true, true) => core::cmp::Ordering::Equal,
-                    (true, false) => {
-                        if ob.nulls_first {
-                            core::cmp::Ordering::Less
-                        } else {
-                            core::cmp::Ordering::Greater
-                        }
-                    }
-                    (false, true) => {
-                        if ob.nulls_first {
-                            core::cmp::Ordering::Greater
-                        } else {
-                            core::cmp::Ordering::Less
-                        }
-                    }
-                    (false, false) => {
-                        let c =
-                            compare_materialized_key(storage, txid, key_collations[k], &ka, &kb)
-                                .expect("validated materialized sort keys compare without error");
-                        if ob.descending { c.reverse() } else { c }
-                    }
-                };
-                if !ord.is_eq() {
-                    return ord;
-                }
-            }
-            for j in 0..n_on {
-                let ka = crate::sql::exec::decode_projected_pub(a, width + n_order + j);
-                let kb = crate::sql::exec::decode_projected_pub(b, width + n_order + j);
-                let ord = match (ka.is_null(), kb.is_null()) {
-                    (true, true) => core::cmp::Ordering::Equal,
-                    (true, false) => core::cmp::Ordering::Greater,
-                    (false, true) => core::cmp::Ordering::Less,
-                    (false, false) => compare_materialized_key(
-                        storage,
-                        txid,
-                        key_collations[n_order + j],
-                        &ka,
-                        &kb,
-                    )
-                    .expect("validated materialized sort keys compare without error"),
-                };
-                if !ord.is_eq() {
-                    return ord;
-                }
-            }
-            core::cmp::Ordering::Equal
-        })
-        .map_err(|_| arena_full())?;
+        crate::mem::arena::try_stable_sort_via(
+            arena,
+            rows,
+            |a, b| {
+                compare_materialized_rows(
+                    storage,
+                    txid,
+                    &key_collations,
+                    statement,
+                    width,
+                    n_order,
+                    n_on,
+                    false,
+                    a,
+                    b,
+                )
+            },
+            |_| arena_full(),
+        )?;
     }
 
     // DISTINCT ON: keep the first row of each run of equal ON keys.
@@ -2114,20 +2142,11 @@ pub(crate) fn materialized_rows<'a>(
             }
             let mut same = true;
             for j in 0..n_on {
-                let ka = crate::sql::exec::decode_projected_pub(rows[i], width + n_order + j);
-                let kb = crate::sql::exec::decode_projected_pub(rows[i - 1], width + n_order + j);
-                let equal = match (ka.is_null(), kb.is_null()) {
-                    (true, true) => true,
-                    (true, false) | (false, true) => false,
-                    (false, false) => compare_materialized_key(
-                        storage,
-                        txid,
-                        key_collations[n_order + j],
-                        &ka,
-                        &kb,
-                    )?
-                    .is_eq(),
-                };
+                let ka = crate::sql::exec::ProjectedValue::column(rows[i], width + n_order + j);
+                let kb = crate::sql::exec::ProjectedValue::column(rows[i - 1], width + n_order + j);
+                let equal =
+                    compare_materialized_key(storage, txid, key_collations[n_order + j], ka, kb)?
+                        .is_eq();
                 if !equal {
                     same = false;
                     break;
@@ -2150,21 +2169,24 @@ pub(crate) fn materialized_rows<'a>(
     Ok((rows, width, deferred, identities_at))
 }
 
+/// Orders two encoded key values, NULL last, under `collation`; see
+/// [`crate::sql::exec::compare_projected_key`].
 pub(crate) fn compare_materialized_key(
     storage: &Storage,
     txid: u32,
     collation: Collation,
-    left: &Datum<'_>,
-    right: &Datum<'_>,
+    left: crate::sql::exec::ProjectedValue<'_>,
+    right: crate::sql::exec::ProjectedValue<'_>,
 ) -> Result<core::cmp::Ordering, SqlError> {
-    match (left.is_null(), right.is_null()) {
-        (true, true) => Ok(core::cmp::Ordering::Equal),
-        (true, false) => Ok(core::cmp::Ordering::Greater),
-        (false, true) => Ok(core::cmp::Ordering::Less),
-        (false, false) => {
-            crate::sql::eval::compare_datums_collated(storage, txid, collation, left, right)
-        }
-    }
+    crate::sql::exec::compare_projected_key(
+        collation,
+        (false, false),
+        left,
+        right,
+        &|collation, x, y| {
+            crate::sql::eval::compare_datums_collated(storage, txid, collation, x, y)
+        },
+    )
 }
 
 /// Whether two sorted rows tie on their `n_order` hidden ORDER BY key columns
@@ -2180,18 +2202,34 @@ fn order_keys_equal_collated(
     n_order: usize,
 ) -> Result<bool, SqlError> {
     for (k, &collation) in collations.iter().enumerate().take(n_order) {
-        let ka = crate::sql::exec::decode_projected_pub(a, width + k);
-        let kb = crate::sql::exec::decode_projected_pub(b, width + k);
-        let equal = match (ka.is_null(), kb.is_null()) {
-            (true, true) => true,
-            (false, false) => compare_materialized_key(storage, txid, collation, &ka, &kb)?.is_eq(),
-            _ => false,
-        };
-        if !equal {
+        let ka = crate::sql::exec::ProjectedValue::column(a, width + k);
+        let kb = crate::sql::exec::ProjectedValue::column(b, width + k);
+        if !compare_materialized_key(storage, txid, collation, ka, kb)?.is_eq() {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Orders one encoded key under its `ORDER BY` direction `(descending,
+/// nulls_first)`; see [`crate::sql::exec::compare_projected_key`].
+pub(crate) fn compare_ordered_key(
+    storage: &Storage,
+    txid: u32,
+    collation: Collation,
+    direction: (bool, bool),
+    left: crate::sql::exec::ProjectedValue<'_>,
+    right: crate::sql::exec::ProjectedValue<'_>,
+) -> Result<core::cmp::Ordering, SqlError> {
+    crate::sql::exec::compare_projected_key(
+        collation,
+        direction,
+        left,
+        right,
+        &|collation, x, y| {
+            crate::sql::eval::compare_datums_collated(storage, txid, collation, x, y)
+        },
+    )
 }
 
 #[expect(
@@ -2206,66 +2244,80 @@ fn compare_materialized_rows(
     width: usize,
     n_order: usize,
     n_on: usize,
+    distinct_prefix: bool,
     a: &[u8],
     b: &[u8],
 ) -> Result<core::cmp::Ordering, SqlError> {
     for (key, order) in statement.order_by.iter().enumerate() {
-        let left = crate::sql::exec::decode_projected_pub(a, width + key);
-        let right = crate::sql::exec::decode_projected_pub(b, width + key);
-        let ordering = match (left.is_null(), right.is_null()) {
-            (true, true) => core::cmp::Ordering::Equal,
-            (true, false) => {
-                if order.nulls_first {
-                    core::cmp::Ordering::Less
-                } else {
-                    core::cmp::Ordering::Greater
-                }
-            }
-            (false, true) => {
-                if order.nulls_first {
-                    core::cmp::Ordering::Greater
-                } else {
-                    core::cmp::Ordering::Less
-                }
-            }
-            (false, false) => {
-                let compared =
-                    compare_materialized_key(storage, txid, key_collations[key], &left, &right)?;
-                if order.descending {
-                    compared.reverse()
-                } else {
-                    compared
-                }
-            }
-        };
+        let ordering = compare_ordered_key(
+            storage,
+            txid,
+            key_collations[key],
+            (order.descending, order.nulls_first),
+            crate::sql::exec::ProjectedValue::column(a, width + key),
+            crate::sql::exec::ProjectedValue::column(b, width + key),
+        )?;
         if !ordering.is_eq() {
             return Ok(ordering);
         }
     }
     for index in 0..n_on {
-        let left = crate::sql::exec::decode_projected_pub(a, width + n_order + index);
-        let right = crate::sql::exec::decode_projected_pub(b, width + n_order + index);
-        let ordering = match (left.is_null(), right.is_null()) {
-            (true, true) => core::cmp::Ordering::Equal,
-            (true, false) => core::cmp::Ordering::Greater,
-            (false, true) => core::cmp::Ordering::Less,
-            (false, false) => compare_materialized_key(
-                storage,
-                txid,
-                key_collations[n_order + index],
-                &left,
-                &right,
-            )?,
-        };
+        let ordering = compare_materialized_key(
+            storage,
+            txid,
+            key_collations[n_order + index],
+            crate::sql::exec::ProjectedValue::column(a, width + n_order + index),
+            crate::sql::exec::ProjectedValue::column(b, width + n_order + index),
+        )?;
         if !ordering.is_eq() {
             return Ok(ordering);
         }
     }
-    Ok(if statement.distinct && n_on == 0 {
-        crate::sql::exec::compare_projected_prefix(a, b, width)
+    if distinct_prefix {
+        crate::sql::exec::compare_projected_prefix(storage, txid, a, b, width)
     } else {
-        core::cmp::Ordering::Equal
-    })
+        Ok(core::cmp::Ordering::Equal)
+    }
+}
+
+/// PostgreSQL's rule for `DISTINCT ON` with `ORDER BY`: the leading
+/// `ORDER BY` items are the `DISTINCT ON` expressions, in any order, and
+/// those missing from `ORDER BY` are allowed only when every item is one.
+/// The sort then uses `ORDER BY`, followed by the `DISTINCT ON` expressions
+/// ascending. `on` are the resolved `DISTINCT ON` expressions, `written`
+/// their text, which a mismatch points at.
+pub(super) fn check_distinct_on_order(
+    order: &[&Expr<'_>],
+    on: &[&Expr<'_>],
+    written: &[&Expr<'_>],
+) -> Result<(), SqlError> {
+    let mismatch = |index: usize| {
+        crate::sql::error_position::at_expression(
+            sql_err!(
+                sqlstate::INVALID_COLUMN_REFERENCE,
+                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+            ),
+            written[index],
+        )
+    };
+    let mut skipped = false;
+    for key in order {
+        if let Some(index) = on.iter().position(|expression| **expression == **key) {
+            if skipped {
+                return Err(mismatch(index));
+            }
+        } else {
+            skipped = true;
+        }
+    }
+    if skipped
+        && let Some(index) = on
+            .iter()
+            .position(|expression| !order.iter().any(|key| **key == **expression))
+    {
+        return Err(mismatch(index));
+    }
+    Ok(())
 }
 
 #[expect(
@@ -2283,17 +2335,11 @@ fn distinct_on_keys_equal(
     n_on: usize,
 ) -> Result<bool, SqlError> {
     for index in 0..n_on {
-        let left = crate::sql::exec::decode_projected_pub(a, width + n_order + index);
-        let right = crate::sql::exec::decode_projected_pub(b, width + n_order + index);
-        let equal = match (left.is_null(), right.is_null()) {
-            (true, true) => true,
-            (false, false) => {
-                compare_materialized_key(storage, txid, collations[n_order + index], &left, &right)?
-                    .is_eq()
-            }
-            _ => false,
-        };
-        if !equal {
+        let left = crate::sql::exec::ProjectedValue::column(a, width + n_order + index);
+        let right = crate::sql::exec::ProjectedValue::column(b, width + n_order + index);
+        if !compare_materialized_key(storage, txid, collations[n_order + index], left, right)?
+            .is_eq()
+        {
             return Ok(false);
         }
     }
@@ -2372,7 +2418,10 @@ fn prelock_external_run<'a>(
             } = context;
             let duplicate = if let Some(prior) = previous {
                 if statement.distinct && plan.n_on == 0 {
-                    crate::sql::exec::compare_projected_prefix(row, prior, plan.width).is_eq()
+                    crate::sql::exec::compare_projected_prefix(
+                        storage, txid, row, prior, plan.width,
+                    )?
+                    .is_eq()
                 } else if plan.n_on > 0 {
                     distinct_on_keys_equal(
                         storage,
@@ -2590,6 +2639,7 @@ pub(crate) fn external_materialized_into<'a>(
             plan.width,
             plan.n_order,
             plan.n_on,
+            statement.distinct && plan.n_on == 0,
             left,
             right,
         )
@@ -2737,7 +2787,10 @@ pub(crate) fn external_materialized_into<'a>(
             } = context;
             let duplicate = if let Some(prior) = previous {
                 if statement.distinct && plan.n_on == 0 {
-                    crate::sql::exec::compare_projected_prefix(row, prior, plan.width).is_eq()
+                    crate::sql::exec::compare_projected_prefix(
+                        storage, txid, row, prior, plan.width,
+                    )?
+                    .is_eq()
                 } else if plan.n_on > 0 {
                     distinct_on_keys_equal(
                         storage,

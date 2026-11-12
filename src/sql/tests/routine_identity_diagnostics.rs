@@ -482,13 +482,17 @@ fn built_in_routine_targets_follow_postgresql() {
             )],
         ),
         ("DROP FUNCTION public.lower(text)", NONE),
+        ("ALTER FUNCTION lower(text) STABLE", NONE),
         (
-            "ALTER FUNCTION lower(text) STABLE",
+            "ALTER FUNCTION lower(text) RENAME TO lowered",
             &[(
                 'E',
                 "0A000",
                 "built-in function lower(text) cannot be changed",
             )],
         ),
+        ("ALTER FUNCTION lower(text) CALLED ON NULL INPUT", NONE),
+        ("ALTER FUNCTION lower(text) SET search_path = public", NONE),
+        ("ALTER FUNCTION lower(text) RESET ALL", NONE),
     ]);
 }

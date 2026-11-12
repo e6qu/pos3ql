@@ -8,8 +8,8 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::{
-    Expr, FrameBound, FromClause, Join, JoinKind, QualName, RelationInheritance, Select,
-    SelectItem, SetQuery, SetTree, Stmt, TableRef,
+    Expr, FrameBound, FromClause, Join, JoinKind, QualName, Select, SelectItem, SetQuery, SetTree,
+    Stmt, TableRef,
 };
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::exec::{ColTypeResolver, StaticTypeMeta, intrinsic_record_field_meta};
@@ -195,12 +195,15 @@ impl<'a> CollectionContext<'a> {
 #[derive(Clone, Copy)]
 struct CteNames<'a> {
     names: [&'a str; MAX_STORED_QUERY_DEPENDENCIES],
+    /// Each visible `WITH` query, so a level reading one can describe it.
+    definitions: [Option<&'a crate::sql::ast::Cte<'a>>; MAX_STORED_QUERY_DEPENDENCIES],
     len: usize,
 }
 
 impl<'a> CteNames<'a> {
     const EMPTY: Self = Self {
         names: [""; MAX_STORED_QUERY_DEPENDENCIES],
+        definitions: [None; MAX_STORED_QUERY_DEPENDENCIES],
         len: 0,
     };
 
@@ -208,7 +211,7 @@ impl<'a> CteNames<'a> {
         self.names[..self.len].contains(&name)
     }
 
-    fn push(&mut self, name: &'a str) -> Result<(), SqlError> {
+    fn push(&mut self, cte: &'a crate::sql::ast::Cte<'a>) -> Result<(), SqlError> {
         if self.len == self.names.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -216,9 +219,27 @@ impl<'a> CteNames<'a> {
                 self.names.len()
             ));
         }
-        self.names[self.len] = name;
+        self.names[self.len] = cte.name;
+        self.definitions[self.len] = Some(cte);
         self.len += 1;
         Ok(())
+    }
+
+    /// The visible `WITH` queries in order, the latest definition of a
+    /// repeated name last.
+    fn definitions_in(&self, arena: &'a Arena) -> Result<&'a [crate::sql::ast::Cte<'a>], SqlError> {
+        let mut definitions = crate::mem::arena::ArenaList::new(arena);
+        for (index, definition) in self.definitions[..self.len].iter().enumerate() {
+            let Some(definition) = definition else {
+                continue;
+            };
+            // An inner level's definition hides an outer one of the same name.
+            if self.names[index + 1..self.len].contains(&definition.name) {
+                continue;
+            }
+            definitions.push(**definition).map_err(|_| arena_full())?;
+        }
+        Ok(definitions.as_slice())
     }
 }
 
@@ -626,6 +647,139 @@ fn collect_set_query(
     result
 }
 
+/// The table or view a stored `INSERT` or `UPDATE` writes.
+fn written_relation(
+    name: crate::sql::ast::QualName<'_>,
+    storage: &Storage,
+    txid: u32,
+    path: &PathContext,
+) -> Option<(DependencyClass, usize)> {
+    match storage.resolve_relation_under(path, name.schema, name.name, txid)? {
+        ResolvedRelation::Table(slot) => Some((DependencyClass::Table, slot)),
+        ResolvedRelation::View(slot) => Some((DependencyClass::View, slot)),
+        ResolvedRelation::Catalog => None,
+    }
+}
+
+/// Records an `INSERT`'s target columns, as PostgreSQL's target list names
+/// them: the column list, or the leading columns its values fill, and every
+/// column for `ON CONFLICT DO UPDATE`.
+#[allow(clippy::too_many_arguments)]
+fn record_insert_targets(
+    insert: &crate::sql::ast::Insert<'_>,
+    scope: &super::QueryScope<'_>,
+    storage: &Storage,
+    txid: u32,
+    path: &PathContext,
+    dependencies: &mut StoredQueryDependencies,
+    arena: &Arena,
+    context: CollectionContext<'_>,
+) -> Result<(), SqlError> {
+    let Some((class, slot)) = written_relation(insert.table, storage, txid, path) else {
+        return Ok(());
+    };
+    let target = scope.defs.get(0).expect("target resolved");
+    let width = target.columns().len();
+    if insert
+        .on_conflict
+        .is_some_and(|conflict| conflict.update.is_some())
+    {
+        for column in 0..width {
+            dependencies.mark_written_column(class, slot, column)?;
+        }
+        return Ok(());
+    }
+    if !insert.columns.is_empty() {
+        for name in insert.columns {
+            if let Some(column) = target.column_index(name) {
+                dependencies.mark_written_column(class, slot, column)?;
+            }
+        }
+        return Ok(());
+    }
+    let values = match (insert.rows.first(), insert.select) {
+        (Some(row), _) => row.len(),
+        (None, Some(select)) => select_output_width(select, storage, txid, arena, context)?,
+        (None, None) => 0,
+    };
+    for column in 0..values.min(width) {
+        dependencies.mark_written_column(class, slot, column)?;
+    }
+    Ok(())
+}
+
+/// The number of output columns of a stored `SELECT` (its first set-operation
+/// branch), with `*` expanded.
+fn select_output_width(
+    select: &Select<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    context: CollectionContext<'_>,
+) -> Result<usize, SqlError> {
+    if let Some(body) = select.set_body {
+        let mut tree = body;
+        loop {
+            match tree {
+                SetTree::Select(first) => {
+                    return select_output_width(first, storage, txid, arena, context);
+                }
+                SetTree::Op { left, .. } => tree = left,
+            }
+        }
+    }
+    // The query's own WITH list names some of its FROM items.
+    let select = if select.with.is_empty() {
+        select
+    } else {
+        super::expand_ctes(select, storage, txid, arena)?
+    };
+    // A routine's variables are the levels around a stored body's query.
+    let outer = context.transition.map(super::scope::ResolverColumns);
+    let scope = select
+        .from
+        .as_ref()
+        .map(|from| {
+            super::QueryScope::resolve_schema(
+                storage,
+                from,
+                txid,
+                arena,
+                outer
+                    .as_ref()
+                    .map(|outer| outer as &dyn crate::sql::eval::ColumnLookup<'_>),
+            )
+        })
+        .transpose()?;
+    let columns = DependencyTypes {
+        hidden: None,
+        scope: scope.as_ref(),
+        excluded: None,
+        transition: context.transition,
+        storage,
+        txid,
+        returning_output: None,
+        arena,
+    };
+    let mut width = 0usize;
+    for item in select.items {
+        width += match item {
+            SelectItem::Expr { .. } => 1,
+            SelectItem::Wildcard(_) => scope.as_ref().map_or(0, |scope| scope.star_columns()),
+            SelectItem::TableWildcard(name) => match &scope {
+                Some(scope) => scope.qualified_star_columns(name)?,
+                None => 0,
+            },
+            SelectItem::RecordStar(expression) => {
+                let mut fields = 0usize;
+                crate::sql::exec::record_shape_metadata(expression, &columns, |_, _| fields += 1)?;
+                fields
+            }
+        };
+    }
+    Ok(width)
+}
+
 fn record_routine_target(
     name: crate::sql::ast::QualName<'_>,
     storage: &Storage,
@@ -668,6 +822,7 @@ fn record_routine_target(
         slot: slot as u16,
         identity,
         referenced_columns: crate::storage::ColumnSet::EMPTY,
+        written_columns: crate::storage::ColumnSet::EMPTY,
         schema,
         name: catalog_name,
         referenced_schema: SqlName::parse(name.schema.unwrap_or(""))?,
@@ -816,8 +971,25 @@ fn collect_statement(
             let mark = arena.mark();
             let result = (|| {
                 record_routine_target(insert.table, storage, txid, path, dependencies)?;
-                let scope =
-                    dml_dependency_scope(storage, insert.table, None, None, txid, arena, None)?;
+                let scope = dml_dependency_scope(
+                    storage,
+                    insert.table,
+                    insert.alias,
+                    None,
+                    txid,
+                    arena,
+                    None,
+                )?;
+                record_insert_targets(
+                    insert,
+                    &scope,
+                    storage,
+                    txid,
+                    path,
+                    dependencies,
+                    arena,
+                    context,
+                )?;
                 let excluded = match storage.resolve_relation_under(
                     path,
                     insert.table.schema,
@@ -896,6 +1068,14 @@ fn collect_statement(
                         .as_ref()
                         .map(|columns| columns as &dyn crate::sql::eval::ColumnLookup<'_>),
                 )?;
+                if let Some((class, slot)) = written_relation(update.table, storage, txid, path) {
+                    let target = scope.defs.get(0).expect("target resolved");
+                    for (name, _) in update.assignments {
+                        if let Some(column) = target.column_index(name) {
+                            dependencies.mark_written_column(class, slot, column)?;
+                        }
+                    }
+                }
                 if let Some(from) = update.from {
                     collect_table_ref(
                         &from.base,
@@ -1215,6 +1395,44 @@ fn collect_returning_expression<'a>(
 
 /// Check declared assignment types before row selection, triggers, or defaults
 /// can run. A typed NULL and an empty array still carry a cast contract.
+/// `SET (a, b) = (SELECT ...)`: the sub-SELECT must produce one column per
+/// target, checked once at its first target before any row is read.
+pub(super) fn check_multiple_assignment_source(
+    expression: &Expr<'_>,
+    scope: &super::QueryScope<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let Expr::RecordFieldIndex {
+        base: base @ Expr::RowSubquery { select, arity },
+        index: 0,
+    } = expression
+    else {
+        return Ok(());
+    };
+    let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); crate::sql::exec::MAX_PROJ];
+    let width = super::describe_select(
+        select,
+        storage,
+        txid,
+        arena,
+        &mut columns,
+        crate::sql::exec::DescriptionTarget::Sql,
+        Some(&super::ScopeSchema(scope)),
+    )?;
+    if width == usize::from(*arity) {
+        return Ok(());
+    }
+    Err(crate::sql::error_position::at_node(
+        sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "number of columns does not match number of values"
+        ),
+        base,
+    ))
+}
+
 pub(crate) fn validate_dml_assignment_casts(
     statement: &Stmt<'_>,
     storage: &Storage,
@@ -1245,6 +1463,7 @@ pub(crate) fn validate_dml_assignment_casts(
         let target = match statement {
             Stmt::Insert(insert) => insert.table,
             Stmt::Update(update) => update.table,
+            Stmt::Delete(delete) => delete.table,
             Stmt::Merge(merge) => merge.target,
             _ => return Ok(()),
         };
@@ -1257,8 +1476,9 @@ pub(crate) fn validate_dml_assignment_casts(
         let statement =
             super::cte::expand_dml_ctes_schema(statement, with, storage, txid, None, None, arena)?;
         let (alias, extra) = match statement {
-            Stmt::Insert(_) => (None, None),
+            Stmt::Insert(insert) => (insert.alias, None),
             Stmt::Update(update) => (update.alias, update.from),
+            Stmt::Delete(delete) => (delete.alias, delete.using),
             Stmt::Merge(merge) => {
                 let source = arena
                     .alloc(FromClause {
@@ -1272,6 +1492,10 @@ pub(crate) fn validate_dml_assignment_casts(
         };
         let target_name = target.name;
         let scope = dml_dependency_scope(storage, target, alias, extra, txid, arena, transition)?;
+        // Each subquery level converts a constant compared with its columns
+        // before any row is read, as PostgreSQL's analysis does: the WHERE
+        // clause first, then the assignments or inserted values.
+        use super::subquery::check_subquery_literals as subquery_literals;
         let target = scope.defs.get(0).expect("assignment target resolved");
         let catalog = super::storage_catalog(storage, arena, txid);
         let transition = transition.map(|row| crate::sql::eval::RuntimeColumnTypes {
@@ -1290,33 +1514,26 @@ pub(crate) fn validate_dml_assignment_casts(
             returning_output: None,
             arena,
         };
-        let assign = |name: &str, expression: &Expr<'_>| -> Result<(), SqlError> {
-            let index = target.column_index(name).ok_or_else(|| {
-                crate::sql::error_position::at_reference(
-                    sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" of relation \"{}\" does not exist",
-                        name,
-                        target_name
-                    ),
-                    name,
+        let assign =
+            |name: &str, expression: &Expr<'_>, alias: Option<&str>| -> Result<(), SqlError> {
+                let index = target
+                    .column_index(name)
+                    .ok_or_else(|| undefined_set_target(name, target_name, alias, expression))?;
+                validate_assignment_expression(
+                    expression,
+                    Some(name),
+                    &target.columns()[index],
+                    &columns,
+                    storage,
+                    txid,
                 )
-            })?;
-            validate_assignment_expression(
-                expression,
-                Some(name),
-                &target.columns()[index],
-                &columns,
-                storage,
-                txid,
-            )
-        };
+            };
         // An INSERT's VALUES rows read no relation, only the enclosing
         // routine's variables and trigger rows.
         let values_columns = DependencyTypes {
             scope: None,
             excluded: None,
-            hidden: Some(target_name),
+            hidden: Some((target_name, target)),
             ..columns
         };
         let merge_columns = &columns;
@@ -1362,9 +1579,33 @@ pub(crate) fn validate_dml_assignment_casts(
                     }
                 }
                 for row in insert.rows {
+                    for expression in row.iter() {
+                        subquery_literals(expression, None, storage, txid, arena)?;
+                    }
                     insert_values(insert.columns, row, &values_columns)?;
                 }
                 if let Some(select) = insert.select {
+                    // A rule action's trailing VALUES row number is not assigned.
+                    let assigned;
+                    let select = if insert.values_defaults.is_empty() {
+                        select
+                    } else {
+                        assigned = Select {
+                            items: &select.items[..select.items.len().saturating_sub(1)],
+                            ..*select
+                        };
+                        &assigned
+                    };
+                    check_insert_counts(
+                        select,
+                        insert.columns,
+                        target.n_columns,
+                        storage,
+                        txid,
+                        arena,
+                        transition.as_ref().map(|columns| columns.row),
+                    )?;
+                    super::subquery::check_select_literals(select, None, storage, txid, arena)?;
                     validate_insert_projection(
                         select,
                         insert.columns,
@@ -1381,12 +1622,54 @@ pub(crate) fn validate_dml_assignment_casts(
                     .into_iter()
                     .flatten()
                 {
-                    assign(name, expression)?;
+                    assign(name, expression, insert.alias)?;
+                }
+                // A target aliased `excluded` makes the name ambiguous where
+                // the proposed row is also in scope.
+                if let Some(alias) = insert.alias
+                    && alias == "excluded"
+                    && let Some(conflict) = insert.on_conflict
+                    && let Some(assignments) = conflict.update
+                {
+                    let mut ambiguous = None;
+                    for expression in assignments
+                        .iter()
+                        .map(|(_, expression)| *expression)
+                        .chain(conflict.update_where)
+                    {
+                        expression.for_each_column_reference(&mut |qualifier, _| {
+                            if ambiguous.is_none()
+                                && let Some(qualifier) = qualifier
+                                && qualifier == "excluded"
+                            {
+                                ambiguous = Some(crate::sql::error_position::at_subject(
+                                    sql_err!(
+                                        sqlstate::AMBIGUOUS_ALIAS,
+                                        "table reference \"excluded\" is ambiguous"
+                                    ),
+                                    qualifier,
+                                ));
+                            }
+                        });
+                    }
+                    if let Some(error) = ambiguous {
+                        return Err(error);
+                    }
                 }
             }
             Stmt::Update(update) => {
+                if let Some(predicate) = update.where_clause {
+                    subquery_literals(predicate, Some(&scope), storage, txid, arena)?;
+                }
                 for (name, expression) in update.assignments {
-                    assign(name, expression)?;
+                    check_multiple_assignment_source(expression, &scope, storage, txid, arena)?;
+                    subquery_literals(expression, Some(&scope), storage, txid, arena)?;
+                    assign(name, expression, update.alias)?;
+                }
+            }
+            Stmt::Delete(delete) => {
+                if let Some(predicate) = delete.where_clause {
+                    subquery_literals(predicate, Some(&scope), storage, txid, arena)?;
                 }
             }
             Stmt::Merge(merge) => {
@@ -1394,7 +1677,10 @@ pub(crate) fn validate_dml_assignment_casts(
                     match when.action() {
                         crate::sql::ast::MergeActionRef::Update(assignments) => {
                             for (name, expression) in assignments {
-                                assign(name, expression)?;
+                                check_multiple_assignment_source(
+                                    expression, &scope, storage, txid, arena,
+                                )?;
+                                assign(name, expression, merge.target_alias)?;
                             }
                         }
                         crate::sql::ast::MergeActionRef::Insert {
@@ -1406,11 +1692,217 @@ pub(crate) fn validate_dml_assignment_casts(
             }
             _ => unreachable!(),
         }
+        let returning = match statement {
+            Stmt::Insert(insert) => insert.returning.items,
+            Stmt::Update(update) => update.returning.items,
+            Stmt::Delete(delete) => delete.returning.items,
+            _ => &[],
+        };
+        for item in returning {
+            if let SelectItem::Expr { expression, .. } = item {
+                subquery_literals(expression, Some(&scope), storage, txid, arena)?;
+            }
+        }
         Ok(())
     })();
     // Validation returns no arena-backed values or catalog owners.
     unsafe { arena.rewind_to(mark) };
     result
+}
+
+/// PostgreSQL checks `EXECUTE` on every function a data-changing plan calls
+/// when its executor starts, so a revoked function fails even when no row
+/// matches: assignments, conditions, `ON CONFLICT` and `MERGE` actions and
+/// `RETURNING` lists. Rows reaching evaluation are checked again there.
+pub(crate) fn require_dml_builtin_execute<'a, 'o: 'a>(
+    statement: &Stmt<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&dyn crate::sql::eval::ColumnLookup<'o>>,
+) -> Result<(), SqlError> {
+    let outer = outer.map(crate::sql::eval::EnclosingRow);
+    let outer = outer
+        .as_ref()
+        .map(|row| row as &dyn crate::sql::eval::ColumnLookup<'a>);
+    let catalog = super::storage_catalog(storage, arena, txid);
+    if !crate::sql::eval::CatalogAccess::routine_privileges_present(&catalog) {
+        return Ok(());
+    }
+    let (target, alias) = match statement {
+        Stmt::Update(update) => (update.table, update.alias),
+        Stmt::Delete(delete) => (delete.table, delete.alias),
+        // `VALUES` and `SELECT` sources are checked as they are evaluated.
+        Stmt::Insert(insert)
+            if insert.returning.items.is_empty()
+                && insert
+                    .on_conflict
+                    .is_none_or(|conflict| conflict.update.is_none()) =>
+        {
+            return Ok(());
+        }
+        Stmt::Insert(insert) => (insert.table, None),
+        Stmt::Merge(merge) => (merge.target, merge.target_alias),
+        _ => return Ok(()),
+    };
+    if !matches!(
+        storage.resolve_relation(target.schema, target.name, txid),
+        Some(ResolvedRelation::Table(_))
+    ) {
+        return Ok(());
+    }
+    let mark = arena.mark();
+    let result = (|| {
+        let extra = match statement {
+            Stmt::Update(update) => update.from,
+            Stmt::Delete(delete) => delete.using,
+            // `ON CONFLICT DO UPDATE` reads the proposed row as `excluded`.
+            Stmt::Insert(insert)
+                if insert
+                    .on_conflict
+                    .is_some_and(|conflict| conflict.update.is_some()) =>
+            {
+                Some(
+                    &*arena
+                        .alloc(FromClause {
+                            base: super::dml_target_ref(target, Some("excluded")),
+                            joins: &[],
+                        })
+                        .map_err(|_| super::arena_full())?,
+                )
+            }
+            Stmt::Merge(merge) => Some(
+                &*arena
+                    .alloc(FromClause {
+                        base: merge.source,
+                        joins: &[],
+                    })
+                    .map_err(|_| super::arena_full())?,
+            ),
+            _ => None,
+        };
+        let scope = dml_dependency_scope(storage, target, alias, extra, txid, arena, outer)?;
+        let hooks = crate::sql::eval::EvalHooks {
+            catalog: Some(&catalog),
+            ..crate::sql::eval::NO_HOOKS
+        };
+        let schema = super::ScopeSchema(&scope);
+        // A routine's variables read in the statement type its expressions.
+        let row = super::Chained {
+            inner: &schema,
+            outer,
+        };
+        let check = |expression: &Expr<'a>| {
+            crate::sql::eval::require_expression_builtin_execute(expression, &row, &hooks)
+        };
+        let assignments = |assignments: &[(&str, &'a Expr<'a>)]| {
+            assignments
+                .iter()
+                .try_for_each(|(_, expression)| check(expression))
+        };
+        let returning = |returning: &crate::sql::ast::Returning<'a>| {
+            returning.items.iter().try_for_each(|item| match item {
+                SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                    check(expression)
+                }
+                _ => Ok(()),
+            })
+        };
+        match statement {
+            Stmt::Update(update) => {
+                assignments(update.assignments)?;
+                update.where_clause.map_or(Ok(()), check)?;
+                returning(&update.returning)
+            }
+            Stmt::Delete(delete) => {
+                delete.where_clause.map_or(Ok(()), check)?;
+                returning(&delete.returning)
+            }
+            Stmt::Insert(insert) => {
+                if let Some(conflict) = insert.on_conflict {
+                    assignments(conflict.update.unwrap_or(&[]))?;
+                    conflict.update_where.map_or(Ok(()), check)?;
+                }
+                returning(&insert.returning)
+            }
+            Stmt::Merge(merge) => {
+                check(merge.on)?;
+                for when in merge.whens {
+                    when.condition().map_or(Ok(()), check)?;
+                    match when.action() {
+                        crate::sql::ast::MergeActionRef::Update(list) => assignments(list)?,
+                        crate::sql::ast::MergeActionRef::Insert { values, .. } => {
+                            values.iter().try_for_each(|value| check(value))?
+                        }
+                        crate::sql::ast::MergeActionRef::Delete
+                        | crate::sql::ast::MergeActionRef::DoNothing => {}
+                    }
+                }
+                returning(&merge.returning)
+            }
+            _ => Ok(()),
+        }
+    })();
+    // The check returns no arena-backed values.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
+
+/// PostgreSQL compares the numbers of target columns and query outputs of an
+/// `INSERT ... SELECT` before converting any value, positioning the error at
+/// the first target or expression without a partner. Targets with subscripts
+/// or fields are counted as written.
+fn check_insert_counts(
+    select: &Select<'_>,
+    names: &[&str],
+    table_columns: usize,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
+) -> Result<(), SqlError> {
+    let (source, targets) = match select.from {
+        Some(FromClause {
+            base:
+                TableRef {
+                    alias: Some(crate::sql::ast::INSERT_SUBSCRIPT_SOURCE),
+                    subquery: Some(written),
+                    col_alias: Some(written_targets),
+                    ..
+                },
+            ..
+        }) => (written, written_targets.len()),
+        _ if names.is_empty() => (select, table_columns),
+        _ => (select, names.len()),
+    };
+    let mut width = 0usize;
+    visit_projection_types(source, storage, txid, arena, outer, &mut |_, _| {
+        width += 1;
+        Ok(())
+    })?;
+    if width > targets {
+        let error = sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "INSERT has more expressions than target columns"
+        );
+        return Err(
+            match crate::sql::exec::select_output_expression(source, targets) {
+                Some(expression) => crate::sql::error_position::at_expression(error, expression),
+                None => error,
+            },
+        );
+    }
+    if width < targets && !names.is_empty() {
+        let error = sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "INSERT has more target columns than expressions"
+        );
+        return Err(match names.get(width).filter(|_| names.len() == targets) {
+            Some(column) => crate::sql::error_position::at_reference(error, column),
+            None => error,
+        });
+    }
+    Ok(())
 }
 
 fn validate_insert_projection(
@@ -1468,7 +1960,20 @@ fn validate_insert_projection(
             else {
                 continue;
             };
-            let mut source_of = |_: &Expr<'_>| Ok(source);
+            // A merged target reads each written column it assigns.
+            let mut source_of = |value: &Expr<'_>| {
+                Ok(match value {
+                    Expr::Column {
+                        qualifier: Some(crate::sql::ast::INSERT_SUBSCRIPT_SOURCE),
+                        name,
+                    } => name
+                        .strip_prefix("column")
+                        .and_then(|ordinal| ordinal.parse::<usize>().ok())
+                        .and_then(|ordinal| sources[..count.min(sources.len())].get(ordinal - 1))
+                        .map_or(source, |(source, _)| *source),
+                    _ => source,
+                })
+            };
             let target_name = names.get(index).copied();
             if validate_subscript_assignment(
                 expression,
@@ -1485,7 +1990,11 @@ fn validate_insert_projection(
                     Some(expression) => {
                         crate::sql::error_position::at_expression(error, expression)
                     }
-                    None => error,
+                    // A column a star expanded is reported at the star.
+                    None => match star_item(written) {
+                        Some(item) => crate::sql::error_position::at_item(error, item),
+                        None => error,
+                    },
                 }
             })?;
         }
@@ -1529,7 +2038,11 @@ fn validate_insert_projection(
                     Some(expression) => {
                         crate::sql::error_position::at_expression(error, expression)
                     }
-                    None => error,
+                    // A column a star expanded is reported at the star.
+                    None => match star_item(select) {
+                        Some(item) => crate::sql::error_position::at_item(error, item),
+                        None => error,
+                    },
                 },
             )
         },
@@ -1758,7 +2271,7 @@ fn visit_dml_assignment_inputs(
         let statement =
             super::cte::expand_dml_ctes_schema(statement, with, storage, txid, None, None, arena)?;
         let (target, alias, extra) = match statement {
-            Stmt::Insert(insert) => (insert.table, None, None),
+            Stmt::Insert(insert) => (insert.table, insert.alias, None),
             Stmt::Update(update) => (update.table, update.alias, update.from),
             Stmt::Merge(merge) => {
                 let source = arena
@@ -1799,10 +2312,10 @@ pub(super) fn visit_resolved_dml_assignment_inputs(
 ) -> Result<(), SqlError> {
     let mark = arena.mark();
     let result = (|| {
-        let target_name = match statement {
-            Stmt::Insert(insert) => insert.table.name,
-            Stmt::Update(update) => update.table.name,
-            Stmt::Merge(merge) => merge.target.name,
+        let (target_name, alias) = match statement {
+            Stmt::Insert(insert) => (insert.table.name, insert.alias),
+            Stmt::Update(update) => (update.table.name, update.alias),
+            Stmt::Merge(merge) => (merge.target.name, merge.target_alias),
             _ => return Ok(()),
         };
         let target = scope.defs.get(0).expect("assignment target resolved");
@@ -1828,7 +2341,7 @@ pub(super) fn visit_resolved_dml_assignment_inputs(
         let values_columns = DependencyTypes {
             scope: None,
             excluded: None,
-            hidden: Some(target_name),
+            hidden: Some((target_name, target)),
             ..columns
         };
         let values = match statement {
@@ -1848,15 +2361,19 @@ pub(super) fn visit_resolved_dml_assignment_inputs(
             let ordinal = index;
             let index = match name {
                 Some(name) => target.column_index(name).ok_or_else(|| {
-                    crate::sql::error_position::at_reference(
-                        sql_err!(
-                            sqlstate::UNDEFINED_COLUMN,
-                            "column \"{}\" of relation \"{}\" does not exist",
+                    if matches!(statement, Stmt::Insert(_)) {
+                        crate::sql::error_position::at_reference(
+                            sql_err!(
+                                sqlstate::UNDEFINED_COLUMN,
+                                "column \"{}\" of relation \"{}\" does not exist",
+                                name,
+                                target_name
+                            ),
                             name,
-                            target_name
-                        ),
-                        name,
-                    )
+                        )
+                    } else {
+                        undefined_set_target(name, target_name, alias, expression)
+                    }
                 })?,
                 None => index,
             };
@@ -1967,7 +2484,7 @@ pub(crate) fn visit_projection_types(
                         Some(&catalog),
                     )?,
                 )?,
-                SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
+                SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {
                     if let Some(scope) = &scope {
                         let count = match item {
                             SelectItem::TableWildcard(name) => {
@@ -2071,6 +2588,25 @@ fn validate_subscript_assignment(
     storage: &Storage,
     txid: u32,
 ) -> Result<bool, SqlError> {
+    if let Expr::Call {
+        name: "__assign_path",
+        args: [base, value, _, Expr::Str(kinds), operands @ ..],
+        ..
+    } = expression
+    {
+        validate_subscript_assignment(base, target_name, column, source_of, storage, txid)?;
+        validate_assignment_path(
+            value,
+            kinds,
+            operands,
+            target_name,
+            column,
+            source_of,
+            storage,
+            txid,
+        )?;
+        return Ok(true);
+    }
     let Expr::Call {
         name: name @ ("__jsonb_subscript_set" | "__array_subscript_set"),
         args: [base, value, ..],
@@ -2112,6 +2648,184 @@ fn validate_subscript_assignment(
     })
 }
 
+/// PostgreSQL's unknown `SET` target: `SET t.a = 1` reads as column `t`,
+/// field `a`, so a target named like the relation gets a hint.
+pub(crate) fn undefined_set_target(
+    name: &str,
+    relation: &str,
+    alias: Option<&str>,
+    expression: &Expr<'_>,
+) -> SqlError {
+    let error = crate::sql::error_position::at_reference(
+        sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" of relation \"{}\" does not exist",
+            name,
+            relation
+        ),
+        name,
+    );
+    if is_indirect_assignment(expression) && name == alias.unwrap_or(relation) {
+        crate::sql::error_position::with_hint(
+            error,
+            "SET target columns cannot be qualified with the relation name.",
+        )
+    } else {
+        error
+    }
+}
+
+/// The first `*` or `t.*` item of a query's first select list, which every
+/// output column without its own expression in a common `SELECT *` comes
+/// from.
+fn star_item<'s>(select: &'s Select<'s>) -> Option<&'s SelectItem<'s>> {
+    let mut select = select;
+    while let Some(body) = select.set_body {
+        let mut tree = body;
+        while let crate::sql::ast::SetTree::Op { left, .. } = tree {
+            tree = left;
+        }
+        let crate::sql::ast::SetTree::Select(first) = tree else {
+            return None;
+        };
+        select = first;
+    }
+    select
+        .items
+        .iter()
+        .find(|item| matches!(item, SelectItem::Wildcard(_) | SelectItem::TableWildcard(_)))
+}
+
+/// Whether an assigned value writes through a field or subscript.
+pub(crate) fn is_indirect_assignment(expression: &Expr<'_>) -> bool {
+    matches!(
+        expression,
+        Expr::Call {
+            name: "__assign_path" | "__jsonb_subscript_set" | "__array_subscript_set",
+            ..
+        }
+    )
+}
+
+/// PostgreSQL's `transformAssignmentIndirection` for a target through
+/// fields and element subscripts: each field must exist in a composite, and
+/// the value must coerce to the last field or element in assignment context.
+/// Errors are positioned at the target column.
+#[allow(clippy::too_many_arguments)]
+fn validate_assignment_path(
+    value: &Expr<'_>,
+    kinds: &str,
+    operands: &[&Expr<'_>],
+    target_name: Option<&str>,
+    column: &crate::storage::ColumnMeta,
+    source_of: &mut dyn FnMut(&Expr<'_>) -> Result<i32, SqlError>,
+    storage: &Storage,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let at_target = |error| match target_name {
+        Some(name) => crate::sql::error_position::at_reference(error, name),
+        None => error,
+    };
+    let type_name = |type_oid| crate::sql::catalog::format_type_name(storage, txid, type_oid);
+    let Some(mut container) = storage.routine_type_oid(column.ctype, column.user_type, txid) else {
+        return Ok(());
+    };
+    let mut target = crate::util::StackStr::<64>::from_str(column.name.as_str());
+    let mut subscripted = false;
+    let mut operands = operands.iter();
+    for kind in kinds.bytes() {
+        if kind != b'f' {
+            for _ in 0..match kind {
+                b'e' | b'l' | b'u' => 1,
+                b's' => 2,
+                _ => 0,
+            } {
+                operands.next();
+            }
+            let Some(element) = crate::sql::assignment_path::element_type_oid(container) else {
+                return Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "cannot subscript type {} because it does not support subscripting",
+                    type_name(container)?.as_str()
+                ));
+            };
+            // A slice assigns an array of the container's type.
+            if kind == b'e' {
+                container = element;
+            }
+            subscripted = true;
+            continue;
+        }
+        let Some(Expr::Str(field)) = operands.next().copied() else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "assignment field step lacks its name"
+            ));
+        };
+        let creation = match crate::storage::NamedTypeKind::from_oid(container) {
+            Some((crate::storage::NamedTypeKind::Composite, creation, false)) => Some(creation),
+            _ => None,
+        };
+        let mut found = None;
+        let fields = crate::sql::exec::visit_catalog_composite_fields(
+            storage,
+            txid,
+            creation,
+            &mut |name, metadata| {
+                if found.is_none() && name == *field {
+                    found = Some(metadata.type_oid);
+                }
+            },
+        );
+        if fields.is_none() {
+            return Err(at_target(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "cannot assign to field \"{}\" of column \"{}\" because its type {} is not a composite type",
+                field,
+                target.as_str(),
+                type_name(container)?.as_str()
+            )));
+        }
+        let Some(field_type) = found else {
+            return Err(at_target(sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "cannot assign to field \"{}\" of column \"{}\" because there is no such column in data type {}",
+                field,
+                target.as_str(),
+                type_name(container)?.as_str()
+            )));
+        };
+        container = field_type;
+        target = crate::util::StackStr::from_str(field);
+        subscripted = false;
+    }
+    let source = source_of(value)?;
+    if crate::sql::catalog::can_coerce_assignment(storage, txid, source, container) {
+        return Ok(());
+    }
+    let error = if subscripted {
+        sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "subscripted assignment to \"{}\" requires type {} but expression is of type {}",
+            target.as_str(),
+            type_name(container)?.as_str(),
+            type_name(source)?.as_str()
+        )
+    } else {
+        sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "subfield \"{}\" is of type {} but expression is of type {}",
+            target.as_str(),
+            type_name(container)?.as_str(),
+            type_name(source)?.as_str()
+        )
+    };
+    Err(at_target(crate::sql::error_position::with_hint(
+        error,
+        "You will need to rewrite or cast the expression.",
+    )))
+}
+
 /// [`validate_assignment_expression`] for a value of a known type.
 fn validate_assignment_type(
     source_oid: i32,
@@ -2142,7 +2856,7 @@ fn validate_assignment_type(
     ))
 }
 
-pub(super) fn dml_dependency_scope<'a>(
+pub(crate) fn dml_dependency_scope<'a>(
     storage: &'a Storage,
     target: QualName<'a>,
     alias: Option<&'a str>,
@@ -2151,26 +2865,7 @@ pub(super) fn dml_dependency_scope<'a>(
     arena: &'a Arena,
     outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
 ) -> Result<super::QueryScope<'a>, SqlError> {
-    let base = TableRef {
-        schema: target.schema,
-        table: target.name,
-        alias,
-        subquery: None,
-        func_args: None,
-        func_argument_names: &[],
-        func_variadic: false,
-        func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
-        rows_from: None,
-        col_alias: None,
-        inheritance: RelationInheritance::Descendants,
-        sample: None,
-        cte: None,
-        with_ordinality: false,
-        lateral: false,
-        authorization_role: None,
-        bound_table: None,
-        view_access: None,
-    };
+    let base = super::dml_target_ref(target, alias);
     let joins = match extra {
         None => &[][..],
         Some(extra) => {
@@ -2179,11 +2874,10 @@ pub(super) fn dml_dependency_scope<'a>(
                     if index == 0 {
                         Join {
                             table: extra.base,
-                            kind: JoinKind::Cross,
+                            kind: JoinKind::Comma,
                             on: None,
                             using: None,
                             natural: false,
-                            list_item: true,
                         }
                     } else {
                         extra.joins[index - 1]
@@ -2197,7 +2891,7 @@ pub(super) fn dml_dependency_scope<'a>(
         .alloc(FromClause { base, joins })
         .map_err(|_| super::arena_full())?;
     let from = super::cte::expand_from_schema(from, storage, txid, arena)?;
-    super::QueryScope::resolve_schema(storage, from, txid, arena, outer)
+    super::QueryScope::resolve_dml_schema(storage, from, txid, arena, outer)
 }
 
 fn collect_select<'a>(
@@ -2216,7 +2910,7 @@ fn collect_select<'a>(
             // A CTE can reference earlier entries, not itself unless recursive.
             let definition_scope = if cte.recursive {
                 let mut scope = visible_ctes;
-                scope.push(cte.name)?;
+                scope.push(cte)?;
                 scope
             } else {
                 visible_ctes
@@ -2230,7 +2924,7 @@ fn collect_select<'a>(
                 arena,
                 context,
             )?;
-            visible_ctes.push(cte.name)?;
+            visible_ctes.push(cte)?;
         }
         // A level reading only tables has a schema its subqueries' outer
         // references resolve in.
@@ -2286,7 +2980,7 @@ fn collect_select<'a>(
                         nested,
                     )?;
                 }
-                SelectItem::Wildcard | SelectItem::TableWildcard(_) => {}
+                SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {}
             }
         }
         for expression in select.distinct_on {
@@ -2375,7 +3069,7 @@ fn collect_select<'a>(
                                 ReferenceScope::Query,
                             )?;
                         }
-                        SelectItem::Wildcard => {
+                        SelectItem::Wildcard(_) => {
                             for table in 0..scope.n {
                                 for column in 0..scope.defs.get(table).expect("resolved").n_columns
                                 {
@@ -2457,9 +3151,12 @@ struct DependencyTypes<'scope, 'definition, 'storage> {
         crate::storage::RelationDefinition<'storage>,
         [&'definition str; 2],
     )>,
-    /// The name of an INSERT target its `VALUES` rows cannot reference;
-    /// they read only `transition`.
-    hidden: Option<&'definition str>,
+    /// The INSERT target, by name and definition, that its `VALUES` rows
+    /// cannot reference; they read only `transition`.
+    hidden: Option<(
+        &'definition str,
+        crate::storage::RelationDefinition<'storage>,
+    )>,
     arena: &'storage Arena,
 }
 
@@ -2610,19 +3307,27 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         {
             return transition.resolve(qualifier, name);
         }
-        if let Some(hidden) = self.hidden {
+        if let Some((hidden, definition)) = self.hidden {
             if let Some(metadata) = self
                 .transition
                 .and_then(|columns| columns.column_meta(qualifier, name))
             {
                 return Ok(metadata.ctype);
             }
+            // PostgreSQL names the target the rows cannot reference.
             return Err(match qualifier {
-                Some(qualifier) if qualifier == hidden => sql_err!(
-                    sqlstate::UNDEFINED_TABLE,
-                    "invalid reference to FROM-clause entry for table \"{}\"",
-                    qualifier
-                ),
+                Some(qualifier) if qualifier == hidden => {
+                    super::scope::unreachable_entry(qualifier)
+                }
+                None if definition.column_index(name).is_some() => {
+                    crate::sql::error_position::with_detail(
+                        crate::sql::eval::empty_scope_column_error(None, name),
+                        format_args!(
+                            "There is a column named \"{}\" in table \"{}\", but it cannot be referenced from this part of the query.",
+                            name, hidden
+                        ),
+                    )
+                }
                 _ => crate::sql::eval::empty_scope_column_error(qualifier, name),
             });
         }
@@ -2641,7 +3346,7 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
                 });
         }
         let resolved = match self.scope {
-            Some(scope) => super::ScopeCols::new(scope).resolve(qualifier, name),
+            Some(scope) => super::ScopeCols(scope).resolve(qualifier, name),
             None => crate::sql::exec::NoCols.resolve(qualifier, name),
         };
         if resolved.as_ref().is_err_and(|error| {
@@ -2704,7 +3409,7 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
             ColTypeResolver::column_meta(
                 &super::CatalogScopeCols {
                     scope,
-                    outer_scope: None,
+                    outer: None,
                     storage: self.storage,
                     txid: self.txid,
                     arena: self.arena,
@@ -2884,6 +3589,25 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
             .or_else(|| self.scope.and_then(|scope| scope.func_scalar_type(name)))
     }
 
+    fn whole_row_composite_type(&self, name: &str) -> Option<ColType> {
+        // RETURNING's OLD/NEW rows and ON CONFLICT's EXCLUDED row have the
+        // target relation's row type.
+        if let Some(definition) = self.output_definition(name) {
+            let slot = self.storage.find_visible(
+                definition.schema.as_str(),
+                definition.name.as_str(),
+                self.txid,
+            )?;
+            return Some(ColType::Composite(Some(
+                self.storage
+                    .relation_row_type_creation(crate::storage::RowTypeRelation::Table(slot)),
+            )));
+        }
+        self.scope?
+            .whole_row_type(name)
+            .filter(|ctype| matches!(ctype, ColType::Composite(_)))
+    }
+
     fn table_columns(&self, name: &str) -> Option<&[crate::storage::ColumnMeta]> {
         if let Some(definition) = self.output_definition(name) {
             return Some(definition.columns());
@@ -2895,8 +3619,8 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
             return Some(columns);
         }
         let scope = self.scope?;
-        let table = scope.table_index(name).ok()?;
-        Some(scope.defs.get(table)?.columns())
+        let source = scope.source(name).ok()?;
+        Some(scope.source_columns(source))
     }
 
     fn whole_row_field(
@@ -2916,7 +3640,7 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
             .or_else(|| {
                 super::CatalogScopeCols {
                     scope: self.scope?,
-                    outer_scope: None,
+                    outer: None,
                     storage: self.storage,
                     txid: self.txid,
                     arena: self.arena,
@@ -2946,14 +3670,20 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
     }
 }
 
-fn collect_routine_dependencies(
-    select: &Select<'_>,
+fn from_reads_cte(from: &FromClause<'_>, ctes: CteNames<'_>) -> bool {
+    core::iter::once(&from.base)
+        .chain(from.joins.iter().map(|join| &join.table))
+        .any(|table| table.schema.is_none() && table.cte.is_none() && ctes.contains(table.table))
+}
+
+fn collect_routine_dependencies<'a>(
+    select: &'a Select<'a>,
     storage: &Storage,
     txid: u32,
     dependencies: &mut StoredQueryDependencies,
-    arena: &Arena,
+    arena: &'a Arena,
     context: CollectionContext<'_>,
-    ctes: CteNames<'_>,
+    ctes: CteNames<'a>,
 ) -> Result<(), SqlError> {
     let resolver = DependencyTypes {
         hidden: None,
@@ -2973,7 +3703,27 @@ fn collect_routine_dependencies(
         };
         let mark = arena.mark();
         let result = (|| {
-            let bound = context.bound_from(from, storage, txid, ctes, arena)?;
+            let from = if from_reads_cte(from, ctes) {
+                // A level reading `WITH` queries describes them in place.
+                let level = arena
+                    .alloc(Select {
+                        with: ctes.definitions_in(arena)?,
+                        from: Some(*from),
+                        ..*select
+                    })
+                    .map_err(|_| arena_full())?;
+                super::expand_ctes(level, storage, txid, arena)?
+                    .from
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "WITH expansion removed a FROM clause"
+                        )
+                    })?
+            } else {
+                *from
+            };
+            let bound = context.bound_from(&from, storage, txid, ctes, arena)?;
             let scope = super::QueryScope::resolve_schema(storage, &bound, txid, arena, None)?;
             let resolver = DependencyTypes {
                 hidden: None,
@@ -3183,6 +3933,7 @@ fn record_support_routine(
         slot: slot as u16,
         identity: StoredDependencyIdentity::RoutineOid(oid),
         referenced_columns: crate::storage::ColumnSet::EMPTY,
+        written_columns: crate::storage::ColumnSet::EMPTY,
         schema: routine.schema_for(txid),
         name: routine.name_for(txid),
         referenced_schema: routine.schema_for(txid),
@@ -3250,6 +4001,21 @@ fn record_routine_call(
     }
     let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
     for (slot, argument) in argument_oids.iter_mut().zip(args.iter().copied()) {
+        // Without the FROM scope a whole-row reference has no row type yet;
+        // the caller retries with the scope instead of selecting `record`.
+        if let Expr::WholeRow(table) = argument
+            && resolver.scope.is_none()
+            && !ColTypeResolver::is_whole_row(resolver, table)
+        {
+            if unresolved.is_none() {
+                *unresolved = Some(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "missing FROM-clause entry for table \"{}\"",
+                    table
+                ));
+            }
+            return Ok(());
+        }
         match crate::sql::exec::infer_routine_argument_oid(argument, resolver) {
             Ok(oid) => *slot = oid,
             Err(error)
@@ -3357,6 +4123,7 @@ fn record_routine_call(
         slot: slot as u16,
         identity: StoredDependencyIdentity::RoutineOid(crate::storage::routine_oid(&routine)),
         referenced_columns: crate::storage::ColumnSet::EMPTY,
+        written_columns: crate::storage::ColumnSet::EMPTY,
         schema: routine.schema_for(txid),
         name: routine.name_for(txid),
         referenced_schema: SqlName::parse(referenced_schema)?,
@@ -3451,6 +4218,7 @@ fn record_operator_call(
         slot: slot as u16,
         identity: StoredDependencyIdentity::OperatorOid(storage.operator(slot).oid()),
         referenced_columns: crate::storage::ColumnSet::EMPTY,
+        written_columns: crate::storage::ColumnSet::EMPTY,
         schema: operator.schema,
         name: operator.name,
         referenced_schema: SqlName::parse(schema.unwrap_or(""))?,
@@ -3662,7 +4430,7 @@ fn collect_routine_dependencies_with_resolver(
                     &mut unresolved,
                 )?
             }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {}
+            SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {}
         }
     }
     for expression_node in select
@@ -3770,6 +4538,9 @@ fn collect_routine_dependencies_with_resolver(
     Ok(unresolved)
 }
 
+/// The columns of a sequence read as a relation, in attribute order.
+const SEQUENCE_RELATION_COLUMNS: [&str; 3] = ["last_value", "log_cnt", "is_called"];
+
 #[derive(Clone, Copy)]
 struct RelationSource<'a> {
     class: DependencyClass,
@@ -3814,6 +4585,44 @@ fn record_relation_column_references<'a>(
         }
         let Some(relation) = context.resolve_relation(storage, txid, table.schema, table.table)?
         else {
+            // A sequence read as a relation records the columns it reads.
+            let name = crate::sql::types::acl_identifier(table.table);
+            let reference = match table.schema {
+                Some(schema) => crate::stack_format!(
+                    264,
+                    "{}.{}",
+                    crate::sql::types::acl_identifier(schema).as_str(),
+                    name.as_str()
+                ),
+                None => crate::stack_format!(264, "{}", name.as_str()),
+            };
+            let (Some(slot), _, _) =
+                resolve_sequence_reference(reference.as_str(), storage, txid, context.path)?
+            else {
+                continue;
+            };
+            let source = &mut sources[n_sources];
+            source.exposed = table.alias.unwrap_or(table.table);
+            source.class = DependencyClass::Sequence;
+            source.slot = slot;
+            source.n_columns = SEQUENCE_RELATION_COLUMNS.len();
+            for (column, name) in SEQUENCE_RELATION_COLUMNS.iter().enumerate() {
+                source.columns[column] = table
+                    .col_alias
+                    .and_then(|aliases| aliases.get(column).copied())
+                    .unwrap_or(name);
+            }
+            if table.alias.is_none() {
+                let schema = storage.sequence_for(slot, txid).schema;
+                let name = crate::stack_format!(
+                    130,
+                    "{}.{}",
+                    table.schema.unwrap_or(schema.as_str()),
+                    table.table
+                );
+                source.qualified = Some(arena.alloc_str(name.as_str()).map_err(|_| arena_full())?);
+            }
+            n_sources += 1;
             continue;
         };
         let source = &mut sources[n_sources];
@@ -3900,7 +4709,7 @@ fn record_relation_column_references<'a>(
                     }
                 }
             }
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 for source in sources {
                     for column in 0..source.n_columns {
                         dependencies.mark_referenced_column(source.class, source.slot, column)?;
@@ -4296,6 +5105,7 @@ fn collect_table_ref<'a>(
                     slot: slot as u16,
                     identity,
                     referenced_columns: crate::storage::ColumnSet::EMPTY,
+                    written_columns: crate::storage::ColumnSet::EMPTY,
                     schema: definition.schema,
                     name: definition.name,
                     referenced_schema: SqlName::parse(table.schema.unwrap_or(""))?,
@@ -4311,13 +5121,35 @@ fn collect_table_ref<'a>(
                     slot: slot as u16,
                     identity,
                     referenced_columns: crate::storage::ColumnSet::EMPTY,
+                    written_columns: crate::storage::ColumnSet::EMPTY,
                     schema: view.schema_for(txid),
                     name: view.name_for(txid),
                     referenced_schema: SqlName::parse(table.schema.unwrap_or(""))?,
                     referenced_name: SqlName::parse(table.table)?,
                 })?;
             }
-            Some(ResolvedRelation::Catalog) | None => {}
+            Some(ResolvedRelation::Catalog) => {}
+            // Reading a sequence as a relation depends on it, as PostgreSQL
+            // records.
+            None => {
+                let name = crate::sql::types::acl_identifier(table.table);
+                let reference = match table.schema {
+                    Some(schema) => crate::stack_format!(
+                        264,
+                        "{}.{}",
+                        crate::sql::types::acl_identifier(schema).as_str(),
+                        name.as_str()
+                    ),
+                    None => crate::stack_format!(264, "{}", name.as_str()),
+                };
+                collect_sequence(
+                    reference.as_str(),
+                    storage,
+                    txid,
+                    context.path,
+                    dependencies,
+                )?;
+            }
         }
     }
     if let Some(arguments) = table.func_args {
@@ -4413,6 +5245,7 @@ fn collect_expression<'a>(
             slot: slot as u16,
             identity: StoredDependencyIdentity::Collation(storage.collation(slot).binding()),
             referenced_columns: crate::storage::ColumnSet::EMPTY,
+            written_columns: crate::storage::ColumnSet::EMPTY,
             schema: definition.schema,
             name: definition.name,
             referenced_schema: SqlName::parse(name.schema.unwrap_or(""))?,
@@ -4604,6 +5437,79 @@ fn collect_expression<'a>(
     }
 }
 
+/// A routine whose declared parameter or result type is a relation's row type
+/// depends on that relation, as PostgreSQL records for the row type.
+pub(crate) fn collect_routine_signature_row_types(
+    types: impl IntoIterator<Item = crate::storage::RoutineResult>,
+    storage: &Storage,
+    txid: u32,
+    dependencies: &mut StoredQueryDependencies,
+) -> Result<(), SqlError> {
+    for result in types {
+        let Some(identity) = result.user_type else {
+            continue;
+        };
+        let Some(creation) = identity.relation_row_type_creation() else {
+            continue;
+        };
+        let relation = storage.row_type_relation(creation, txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "type \"{}\" does not exist",
+                identity.name.as_str()
+            )
+        })?;
+        record_relation_row_type(
+            relation,
+            identity.schema,
+            identity.name,
+            storage,
+            txid,
+            dependencies,
+        )?;
+    }
+    Ok(())
+}
+
+/// Records a dependency on the relation that owns a referenced row type.
+fn record_relation_row_type(
+    relation: crate::storage::RowTypeRelation,
+    referenced_schema: SqlName,
+    referenced_name: SqlName,
+    storage: &Storage,
+    txid: u32,
+    dependencies: &mut StoredQueryDependencies,
+) -> Result<(), SqlError> {
+    let (class, resolved, slot) = match relation {
+        crate::storage::RowTypeRelation::Table(slot) => {
+            (DependencyClass::Table, ResolvedRelation::Table(slot), slot)
+        }
+        crate::storage::RowTypeRelation::View(slot) => {
+            (DependencyClass::View, ResolvedRelation::View(slot), slot)
+        }
+    };
+    let identity = storage.capture_stored_query_relation(resolved, txid)?;
+    if dependencies
+        .entries()
+        .iter()
+        .any(|dependency| dependency.identity == identity)
+    {
+        return Ok(());
+    }
+    let (schema, name) = storage.row_type_relation_name(relation, txid);
+    dependencies.push(StoredQueryDependency {
+        class,
+        slot: slot as u16,
+        identity,
+        referenced_columns: crate::storage::ColumnSet::EMPTY,
+        written_columns: crate::storage::ColumnSet::EMPTY,
+        schema,
+        name,
+        referenced_schema,
+        referenced_name,
+    })
+}
+
 fn collect_type_oid(
     type_oid: i32,
     source: &Expr<'_>,
@@ -4615,6 +5521,12 @@ fn collect_type_oid(
     let Some((kind, creation, _)) = crate::storage::NamedTypeKind::from_oid(type_oid) else {
         return Ok(());
     };
+    if kind == crate::storage::NamedTypeKind::Composite
+        && let Some(relation) = storage.row_type_relation(creation, txid)
+    {
+        let (schema, name) = storage.row_type_relation_name(relation, txid);
+        return record_relation_row_type(relation, schema, name, storage, txid, dependencies);
+    }
     let crate::storage::TypeDefinitionTarget::Bound(reference) =
         crate::storage::TypeDefinitionTarget::by_creation(storage, kind, creation)?
     else {
@@ -4707,6 +5619,7 @@ fn collect_type_oid(
                 slot: reference.catalog_slot(),
                 identity,
                 referenced_columns: crate::storage::ColumnSet::EMPTY,
+                written_columns: crate::storage::ColumnSet::EMPTY,
                 schema,
                 name,
                 referenced_schema,
@@ -4736,6 +5649,7 @@ fn collect_type(
             slot: slot as u16,
             identity: storage.capture_type_dependency(class, slot, txid)?,
             referenced_columns: crate::storage::ColumnSet::EMPTY,
+            written_columns: crate::storage::ColumnSet::EMPTY,
             schema,
             name,
             referenced_schema,
@@ -4770,6 +5684,16 @@ fn collect_type(
                 slot,
                 definition.schema,
                 definition.name,
+                dependencies,
+            );
+        }
+        if let Some(relation) = storage.resolve_relation_row_type(bare, txid) {
+            return record_relation_row_type(
+                relation,
+                referenced_schema,
+                referenced_name,
+                storage,
+                txid,
                 dependencies,
             );
         }
@@ -4813,6 +5737,16 @@ fn collect_type(
                 }
             }
         }
+    }
+    if let Some(relation) = storage.resolve_relation_row_type(bare, txid) {
+        return record_relation_row_type(
+            relation,
+            referenced_schema,
+            referenced_name,
+            storage,
+            txid,
+            dependencies,
+        );
     }
     Ok(())
 }
@@ -4859,6 +5793,7 @@ fn collect_regcollation(
         slot: slot as u16,
         identity: StoredDependencyIdentity::Collation(storage.collation(slot).binding()),
         referenced_columns: crate::storage::ColumnSet::EMPTY,
+        written_columns: crate::storage::ColumnSet::EMPTY,
         schema: definition.schema,
         name: definition.name,
         referenced_schema: SqlName::parse(referenced_schema.unwrap_or(""))?,
@@ -4914,6 +5849,7 @@ fn collect_text_search_configuration(
         slot: slot as u16,
         identity: StoredDependencyIdentity::TextSearchConfigurationOid(definition.oid()),
         referenced_columns: crate::storage::ColumnSet::EMPTY,
+        written_columns: crate::storage::ColumnSet::EMPTY,
         schema: definition.schema(),
         name: definition.name(),
         referenced_schema: SqlName::parse(schema.unwrap_or(""))?,
@@ -4949,6 +5885,33 @@ fn collect_sequence(
     dependencies: &mut StoredQueryDependencies,
 ) -> Result<(), SqlError> {
     let (slot, referenced_schema, referenced_name) =
+        resolve_sequence_reference(sequence_name, storage, txid, path)?;
+    if let Some(slot) = slot {
+        let sequence = storage.sequence_for(slot, txid);
+        dependencies.push(StoredQueryDependency {
+            class: DependencyClass::Sequence,
+            slot: slot as u16,
+            identity: StoredDependencyIdentity::Name,
+            referenced_columns: crate::storage::ColumnSet::EMPTY,
+            written_columns: crate::storage::ColumnSet::EMPTY,
+            schema: sequence.schema,
+            name: sequence.name,
+            referenced_schema,
+            referenced_name,
+        })?;
+    }
+    Ok(())
+}
+
+/// The sequence slot a `regclass` text or a relation name selects, with the
+/// schema and name as written.
+fn resolve_sequence_reference(
+    sequence_name: &str,
+    storage: &Storage,
+    txid: u32,
+    path: &PathContext,
+) -> Result<(Option<usize>, SqlName, SqlName), SqlError> {
+    Ok(
         match crate::sql::identifiers::ObjectReference::parse(sequence_name)? {
             crate::sql::identifiers::ObjectReference::Oid(oid) => {
                 let slot = (0..storage.sequence_count()).find(|slot| {
@@ -5005,19 +5968,6 @@ fn collect_sequence(
                 };
                 (slot, parsed.schema.unwrap_or(SqlName::EMPTY), parsed.name)
             }
-        };
-    if let Some(slot) = slot {
-        let sequence = storage.sequence_for(slot, txid);
-        dependencies.push(StoredQueryDependency {
-            class: DependencyClass::Sequence,
-            slot: slot as u16,
-            identity: StoredDependencyIdentity::Name,
-            referenced_columns: crate::storage::ColumnSet::EMPTY,
-            schema: sequence.schema,
-            name: sequence.name,
-            referenced_schema,
-            referenced_name,
-        })?;
-    }
-    Ok(())
+        },
+    )
 }

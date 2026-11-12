@@ -37,6 +37,18 @@ struct SqlSource {
     /// is a single plain `SELECT` of one expression into its caller, which
     /// then reports no context line for it.
     inlinable: bool,
+    /// PostgreSQL's planner runs an IMMUTABLE function called with constant
+    /// arguments instead of inlining it.
+    planned_with_constants: bool,
+}
+
+impl SqlSource {
+    fn inlining(
+        &self,
+        program: &query::RoutineFunctionProgram<'_>,
+    ) -> crate::sql::error_context::SqlFunctionInlining {
+        choose_inlining(self.planned_with_constants, self.inlinable, program)
+    }
 }
 
 struct ParsedSource<'a> {
@@ -112,6 +124,9 @@ impl SqlSource {
             &self.columns,
             &self.parameters,
             self.result_contract(storage, transaction, arena)?,
+            self.stored
+                .as_ref()
+                .map(|stored| (stored.path, stored.view())),
             arena,
         )?;
         Ok(ParsedSource {
@@ -208,12 +223,54 @@ impl SqlResult {
                 Ok(())
             }
             Self::Rows(rows) => {
-                let width =
-                    if matches!(source.kind, crate::storage::RoutineKind::SetFunction { .. }) {
-                        1
-                    } else {
-                        source.columns.len()
-                    };
+                let set_function =
+                    matches!(source.kind, crate::storage::RoutineKind::SetFunction { .. });
+                // A set of composite values takes each row's columns as the
+                // fields unless the row is one value of that composite type.
+                if set_function
+                    && let ColType::Composite(Some(creation)) = source.return_type.ctype
+                    && !matches!(values, [Datum::Composite { slot, .. } | Datum::CompositeText { slot, .. }] if *slot == creation)
+                    && !matches!(values, [Datum::Null])
+                {
+                    let width = storage
+                        .require_row_type_definition(creation, txid)?
+                        .active_field_count();
+                    if values.len() != width {
+                        return Err(query::routine_result_width_mismatch(
+                            source.declared_result(storage, txid, arena)?,
+                            false,
+                            values.len(),
+                            width,
+                        ));
+                    }
+                    let fields = arena
+                        .alloc_slice_with(values.len(), |index| crate::sql::types::RecordField {
+                            name: "",
+                            type_oid: values[index].type_oid(),
+                            value: values[index],
+                        })
+                        .map_err(|_| query::arena_full_pub())?;
+                    for field in fields.iter_mut() {
+                        field.value = detach_routine_datum(field.value, arena)?;
+                    }
+                    let converted = arena
+                        .alloc_slice_with(1, |_| Datum::Null)
+                        .map_err(|_| query::arena_full_pub())?;
+                    converted[0] = coerce_routine_argument(
+                        Datum::Record(fields),
+                        source.return_type,
+                        storage,
+                        txid,
+                        arena,
+                        Some(sequences),
+                    )?;
+                    return rows.append(converted);
+                }
+                let width = if set_function {
+                    1
+                } else {
+                    source.columns.len()
+                };
                 if values.len() != width {
                     return Err(query::routine_result_width_mismatch(
                         source.declared_result(storage, txid, arena)?,
@@ -253,6 +310,53 @@ impl SqlResult {
 /// Whether PostgreSQL's `inline_function` would replace a call of this body
 /// by its expression: one `SELECT` of one expression with no other clause,
 /// subquery or set-returning call.
+/// Whether PostgreSQL's planner may inline a call of `routine`, by its
+/// declaration alone.
+fn inlinable_declaration(routine: &crate::storage::RoutineDef) -> bool {
+    !routine.attributes.security_definer
+        && !routine.attributes.strict
+        && routine.config_count == 0
+        && !routine.kind.is_set_returning()
+        && routine.kind.function_result() != Some(ColType::Record)
+}
+
+/// How PostgreSQL's planner treats a call of a SQL-language function, which
+/// decides its error context: an IMMUTABLE function called with constant
+/// arguments runs at plan time, a body of one plain expression is inlined,
+/// and any other body runs as its own statements. A folded body's errors are
+/// raised in planning, so a call that runs is never `during inlining`.
+pub(crate) fn sql_function_inlining(
+    routine: &crate::storage::RoutineDef,
+    program: &query::RoutineFunctionProgram<'_>,
+    constant_arguments: bool,
+) -> crate::sql::error_context::SqlFunctionInlining {
+    choose_inlining(
+        planned_with_constants(routine, constant_arguments),
+        inlinable_declaration(routine),
+        program,
+    )
+}
+
+fn planned_with_constants(routine: &crate::storage::RoutineDef, constant_arguments: bool) -> bool {
+    constant_arguments
+        && routine.attributes.volatility == crate::storage::RoutineVolatility::Immutable
+}
+
+fn choose_inlining(
+    planned_with_constants: bool,
+    inlinable: bool,
+    program: &query::RoutineFunctionProgram<'_>,
+) -> crate::sql::error_context::SqlFunctionInlining {
+    use crate::sql::error_context::SqlFunctionInlining;
+    // A body that fails while folded with constants fails in planning; one
+    // that runs here was inlined and its errors carry no frame.
+    if planned_with_constants || !inlinable || !inlined_by_postgresql(program) {
+        SqlFunctionInlining::Executed
+    } else {
+        SqlFunctionInlining::Inlined
+    }
+}
+
 fn inlined_by_postgresql(program: &query::RoutineFunctionProgram<'_>) -> bool {
     let query::RoutineFunctionResult::Query(query::RoutineQuery::Select(select)) = program.result
     else {
@@ -441,11 +545,12 @@ impl SqlExecution {
             statement_end: false,
         });
         let name = self.source.name;
+        let inlining = self.source.inlining(&parsed.program);
         let frame = crate::sql::error_context::SqlFunctionFrame {
             name: name.as_str(),
             body: parsed.text,
             statement: core::cell::Cell::new(0),
-            inlined: self.source.inlinable && inlined_by_postgresql(&parsed.program),
+            inlining,
         };
         let result = crate::sql::error_context::within(&frame, || {
             crate::sql::error_position::with_internal_source(parsed.text, || {
@@ -592,6 +697,29 @@ impl SqlExecution {
         context: &mut TriggerExecContext<'_, 'a, '_>,
         capture: bool,
     ) -> Result<(), SqlError> {
+        // Data-modifying WITH queries run before the query that reads them,
+        // under the statement's snapshot, as in a top-level query. A query
+        // resuming after a wait continues from its saved state; its WITH
+        // writes already ran and must not run again.
+        if let query::RoutineQuery::Select(select) = query
+            && select.with.iter().any(|cte| cte.dml.is_some())
+            && self.pending_query.is_none()
+        {
+            let params = core::mem::replace(&mut context.params, arguments);
+            let bound = super::bind_plpgsql_dml_ctes(context, select, &super::NoColumns);
+            context.params = params;
+            let (bound, written) = bound?;
+            self.query(
+                &query::RoutineQuery::Select(bound),
+                arguments,
+                context,
+                capture,
+            )?;
+            let params = core::mem::replace(&mut context.params, arguments);
+            let finished = super::finish_plpgsql_dml_ctes(context, select, written);
+            context.params = params;
+            return finished;
+        }
         let arena = context.arena;
         let txid = context.txn.txid;
         let PlpgsqlExecHost::Routine {
@@ -957,6 +1085,7 @@ pub(in crate::sql) fn execute_sql_function<'a>(
     environment: &CallEnvironment,
     policy: query::RoutineExecution,
     suspended: &mut Option<SuspendedFunction>,
+    constant_arguments: bool,
 ) -> Result<FunctionOutput<'a>, SqlError> {
     let controls = &engine.storage.execution_control;
     let rows = &engine.storage.row_work;
@@ -1080,11 +1209,8 @@ pub(in crate::sql) fn execute_sql_function<'a>(
                 owner: body_inputs.owner,
                 input_source: body_inputs.source,
                 stored,
-                inlinable: !routine.attributes.security_definer
-                    && !routine.attributes.strict
-                    && routine.config_count == 0
-                    && !routine.kind.is_set_returning()
-                    && routine.kind.function_result() != Some(ColType::Record),
+                inlinable: inlinable_declaration(routine),
+                planned_with_constants: planned_with_constants(routine, constant_arguments),
             },
             arguments,
             result,
@@ -1106,6 +1232,15 @@ pub(in crate::sql) fn execute_sql_function<'a>(
         .source
         .parse(context.storage(), context.txn.txid, arena)?;
     let arguments = state[0].arguments.decode(arena)?;
+    check_polymorphic_sql_result(
+        context.storage(),
+        context.txn.txid,
+        routine,
+        arguments,
+        parsed.text,
+        &parsed.program,
+        arena,
+    )?;
     let result = state[0].execute(&parsed, arguments, &mut context);
     if policy == query::RoutineExecution::Retained
         && result.as_ref().is_err_and(control_flow::is_execution_wait)
@@ -1116,6 +1251,135 @@ pub(in crate::sql) fn execute_sql_function<'a>(
         *suspended = Some(SuspendedFunction::Sql(SuspendedSqlFunction { state }));
     }
     result
+}
+
+/// PostgreSQL's `check_sql_fn_retval` for a function declared to return a
+/// polymorphic type, once this call's arguments resolve it, and for any other
+/// scalar result: an inlinable body fails `during inlining`, any other at its
+/// final statement.
+pub(crate) fn check_polymorphic_sql_result<'a>(
+    storage: &Storage,
+    txid: u32,
+    routine: &crate::storage::RoutineDef,
+    arguments: &[Datum<'_>],
+    body: &str,
+    program: &query::RoutineFunctionProgram<'a>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    if routine.kind.is_set_returning() || arguments.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
+        return Ok(());
+    }
+    let mut argument_oids = [0; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    for (target, argument) in argument_oids.iter_mut().zip(arguments) {
+        *target = argument.type_oid();
+    }
+    check_polymorphic_result(
+        storage,
+        txid,
+        routine,
+        &argument_oids[..arguments.len()],
+        body,
+        program,
+        inlined_by_postgresql(program),
+        arena,
+    )
+}
+
+#[expect(clippy::too_many_arguments, reason = "SQL function check context")]
+fn check_polymorphic_result<'a>(
+    storage: &Storage,
+    txid: u32,
+    routine: &crate::storage::RoutineDef,
+    argument_oids: &[i32],
+    body: &str,
+    program: &query::RoutineFunctionProgram<'a>,
+    inlined: bool,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let _ = argument_oids;
+    // Other results are checked at CREATE and by the called-routine check;
+    // a polymorphic one only resolves with a call's argument types.
+    let polymorphic = routine
+        .function_result_contract()
+        .is_some_and(|result| result.polymorphic_type().is_some())
+        || routine
+            .arguments()
+            .iter()
+            .any(|argument| argument.polymorphic_type().is_some());
+    if !polymorphic {
+        return Ok(());
+    }
+    // A polymorphic call runs an instance whose result is already resolved.
+    let scalar = routine.kind.function_result().is_some_and(|result| {
+        !matches!(
+            result,
+            ColType::Composite(_) | ColType::Record | ColType::Void
+        )
+    });
+    let Some(resolved) = scalar
+        .then(|| storage.routine_function_result_oid(routine, txid))
+        .flatten()
+    else {
+        return Ok(());
+    };
+    let declared = crate::sql::catalog::format_type_name(storage, txid, resolved)?;
+    let frame = crate::sql::error_context::SqlFunctionFrame {
+        name: routine.name.as_str(),
+        body,
+        // PostgreSQL 18 checks the final query as it prepares that statement.
+        statement: core::cell::Cell::new(program.preceding.len() + 1),
+        inlining: if inlined && inlinable_declaration(routine) {
+            crate::sql::error_context::SqlFunctionInlining::Folded
+        } else {
+            crate::sql::error_context::SqlFunctionInlining::Executed
+        },
+    };
+    crate::sql::error_context::within(&frame, || {
+        query::check_routine_scalar_result(
+            program,
+            resolved,
+            declared.as_str(),
+            storage,
+            txid,
+            arena,
+        )
+    })
+}
+
+/// The planner's inlining attempt for a call of `routine` checks a
+/// polymorphic result as PostgreSQL's `inline_function` does.
+#[expect(clippy::too_many_arguments, reason = "planner inlining context")]
+pub(crate) fn check_inlined_polymorphic_result<'a>(
+    storage: &Storage,
+    txid: u32,
+    routine: &crate::storage::RoutineDef,
+    argument_oids: &[i32],
+    body: &'a str,
+    statement: &'a crate::sql::ast::Stmt<'a>,
+    inlinable: bool,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let query = match statement {
+        crate::sql::ast::Stmt::Select(select) => query::RoutineQuery::Select(select),
+        crate::sql::ast::Stmt::SetQuery(set) => query::RoutineQuery::Set(set),
+        _ => return Ok(()),
+    };
+    let program = query::RoutineFunctionProgram {
+        preceding: &[],
+        result: query::RoutineFunctionResult::Query(
+            arena.alloc(query).map_err(|_| query::arena_full_pub())?,
+        ),
+    };
+    check_polymorphic_result(
+        storage,
+        txid,
+        routine,
+        argument_oids,
+        body,
+        &program,
+        inlinable,
+        arena,
+    )
 }
 
 fn response_full(_: WireFull) -> SqlError {

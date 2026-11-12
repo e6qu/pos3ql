@@ -20,6 +20,9 @@ use super::types::{IntervalField, IntervalRange, TypeMod};
 /// Any future desugaring of syntax-only constructs belongs here too.
 pub(crate) const SIMILAR_TO: &str = "similar to";
 pub(crate) const OVERLAPS_PERIODS: &str = "overlaps periods";
+/// `ROW(...) IS NOT DISTINCT FROM ROW(...)`: field-by-field distinctness, where
+/// two NULL fields are not distinct.
+pub(crate) const ROWS_NOT_DISTINCT: &str = "rows not distinct";
 
 /// PostgreSQL's maximum target-list width also bounds the flat set of distinct
 /// grouping expressions, because grouping expressions absent from the visible
@@ -74,6 +77,7 @@ fn alter_pass(action: &AlterAction) -> u8 {
         AlterAction::SetForeignOptions(_)
         | AlterAction::SetColumnForeignOptions { .. }
         | AlterAction::SetStorageOptions(_)
+        | AlterAction::SetViewOptions { .. }
         | AlterAction::ResetStorageOptions(_) => 4,
         // Standalone forms; never appear in a multi-action list.
         AlterAction::RenameTable(_)
@@ -365,6 +369,10 @@ pub struct Parser<'a> {
     defer_analysis_errors: bool,
     /// The first analysis error in the statement being parsed.
     analysis_error: Option<ParseError>,
+    /// The first `DEFAULT` of the statement not written as a whole
+    /// INSERT value or assigned value, and the most recent `DEFAULT`.
+    misplaced_default: Option<usize>,
+    last_default: usize,
     /// The type a deferred "type modifier is not allowed" error names, which
     /// PostgreSQL reports as unknown instead when no such type exists.
     analysis_error_type: Option<&'a str>,
@@ -398,6 +406,58 @@ pub struct Parser<'a> {
     routine_name: Option<&'a str>,
     /// Local variables and record fields captured by a procedural OPEN.
     named_parameters: &'a [NamedParameter<'a>],
+    /// `$n.field` selections, kept so a parameter whose type stays undetermined
+    /// reports PostgreSQL's `unknown` composite error.
+    parameter_fields: core::cell::RefCell<ArenaList<'a, (u32, &'a str)>>,
+}
+
+/// One step of an assignment target after its column: a field of a
+/// composite, or the subscripts of an array or other subscriptable value.
+#[derive(Clone, Copy)]
+enum Indirection<'a> {
+    Field(&'a str),
+    Subscripts(&'a [AssignmentSubscript<'a>]),
+}
+
+/// A parsed INSERT target list: the written column names, each target's
+/// indirection by position, and where each target was written.
+#[derive(Clone, Copy)]
+struct InsertTargets<'a> {
+    names: &'a [&'a str],
+    steps: &'a [(usize, &'a [Indirection<'a>])],
+    positions: &'a [usize],
+}
+
+impl<'a> InsertTargets<'a> {
+    const EMPTY: Self = Self {
+        names: &[],
+        steps: &[],
+        positions: &[],
+    };
+
+    fn path(&self, target: usize) -> Option<&'a [Indirection<'a>]> {
+        self.steps
+            .iter()
+            .find(|(at, _)| *at == target)
+            .map(|(_, path)| *path)
+    }
+
+    /// Whether several targets write `column`, all through indirection, so
+    /// they merge into one value.
+    fn merged(&self, column: &str) -> bool {
+        let mut written = self
+            .names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| **name == column);
+        written.clone().count() > 1 && written.all(|(index, _)| self.path(index).is_some())
+    }
+
+    /// Whether target `index` is a merged column's first.
+    fn kept(&self, index: usize) -> bool {
+        let name = self.names[index];
+        !(self.merged(name) && self.names[..index].contains(&name))
+    }
 }
 
 /// One subscript of an assignment target.
@@ -415,6 +475,7 @@ pub(crate) struct NamedParameter<'a> {
     pub qualifier: Option<&'a str>,
     pub name: &'a str,
     pub index: u32,
+    pub conflict: crate::sql::guc::VariableConflict,
 }
 
 /// The parts of PostgreSQL's `TypeNameToString` for a parsed type name.
@@ -970,6 +1031,8 @@ impl<'a> Parser<'a> {
             truncation_reported_to: 0,
             defer_analysis_errors: false,
             analysis_error: None,
+            misplaced_default: None,
+            last_default: 0,
             analysis_error_type: None,
             rejected_statement: None,
             analysis_error_reported: false,
@@ -980,6 +1043,7 @@ impl<'a> Parser<'a> {
             routine_parameters: [None; crate::storage::MAX_ROUTINE_ARGUMENTS],
             routine_name: None,
             named_parameters: &[],
+            parameter_fields: core::cell::RefCell::new(ArenaList::new(arena)),
         };
         parser.note_token_source()?;
         Ok(parser)
@@ -1075,6 +1139,11 @@ impl<'a> Parser<'a> {
             cursor: None,
             raw: true,
         })
+    }
+
+    /// The `$n.field` selections parsed so far.
+    pub(crate) fn parameter_fields(&self) -> &'a [(u32, &'a str)] {
+        self.parameter_fields.borrow().as_slice()
     }
 
     pub(crate) fn capture_type_inputs(&mut self) {
@@ -1314,7 +1383,7 @@ impl<'a> Parser<'a> {
                     .map(|parameter| {
                         (
                             parameter.index,
-                            crate::sql::ast::ParameterSource::PlpgsqlCursor,
+                            crate::sql::ast::ParameterSource::PlpgsqlCursor(parameter.conflict),
                         )
                     })
             })
@@ -1332,13 +1401,31 @@ impl<'a> Parser<'a> {
         {
             return Some((
                 parameter.index,
-                crate::sql::ast::ParameterSource::PlpgsqlCursor,
+                crate::sql::ast::ParameterSource::PlpgsqlCursor(parameter.conflict),
             ));
         }
         self.routine_name
             .is_some_and(|routine| routine == qualifier)
             .then(|| self.routine_parameter(name))
             .flatten()
+            .or_else(|| self.routine_parameter_field(qualifier))
+    }
+
+    /// `parameter.field` in a SQL-language routine body; the qualifier names
+    /// the parameter and the reference's column name is the field.
+    pub(super) fn routine_parameter_field(
+        &self,
+        parameter: &str,
+    ) -> Option<(u32, crate::sql::ast::ParameterSource)> {
+        self.routine_parameters
+            .iter()
+            .position(|candidate| candidate.is_some_and(|candidate| candidate == parameter))
+            .map(|index| {
+                (
+                    index as u32 + 1,
+                    crate::sql::ast::ParameterSource::SqlRoutineField,
+                )
+            })
     }
 
     fn column_default_expression(&mut self) -> Result<&'a Expr<'a>, ParseError> {
@@ -1378,7 +1465,19 @@ impl<'a> Parser<'a> {
         if self.peeked == Tok::Eof {
             return Ok(None);
         }
+        self.misplaced_default = None;
         let statement = self.statement()?;
+        if let Some(at) = self.misplaced_default.take() {
+            self.analysis_error(ParseError {
+                at,
+                message: StackStr::from_str("DEFAULT is not allowed in this context"),
+                sqlstate: sqlstate::SYNTAX_ERROR,
+                cursor: Some(at),
+                hint: None,
+                near: None,
+                detail: None,
+            })?;
+        }
         match self.peeked {
             Tok::Op(";") | Tok::Eof => match self.analysis_error.take() {
                 Some(error) => {
@@ -1441,16 +1540,66 @@ impl<'a> Parser<'a> {
             start: self.peek_at,
             end: self.lexer.token_end(),
         };
+        let at = self.peek_at;
         let first = self.col_ident(what)?;
         if self.eat_op(".")? {
             self.record_namespace(source)?;
+            let second = self.col_ident(what)?;
+            if self.eat_op(".")? {
+                let (schema, name) = self.catalog_qualified_name(at, first, second, what)?;
+                return Ok(QualName {
+                    schema: Some(schema),
+                    name,
+                });
+            }
             Ok(QualName {
                 schema: Some(first),
-                name: self.col_ident(what)?,
+                name: second,
             })
         } else {
             Ok(QualName::bare(first))
         }
+    }
+
+    /// The rest of a dotted name after `first.second` when another `.`
+    /// follows: `database.schema.name` must name the session's database, and
+    /// a longer name is improper, as in PostgreSQL's parse analysis.
+    pub(super) fn catalog_qualified_name(
+        &mut self,
+        at: usize,
+        first: &'a str,
+        second: &'a str,
+        what: &str,
+    ) -> Result<(&'a str, &'a str), ParseError> {
+        let third = self.col_ident(what)?;
+        let mut written = stack_format!(PARSE_MESSAGE_BYTES, "{first}.{second}.{third}");
+        let mut parts = 3;
+        while self.eat_op(".")? {
+            let part = self.col_ident(what)?;
+            let _ = core::fmt::Write::write_fmt(&mut written, format_args!(".{part}"));
+            parts += 1;
+        }
+        let error = |sqlstate: &'static str, message: core::fmt::Arguments<'_>| ParseError {
+            at,
+            message: stack_format!(PARSE_MESSAGE_BYTES, "{}", message),
+            sqlstate,
+            cursor: Some(at),
+            hint: None,
+            near: None,
+            detail: None,
+        };
+        if parts > 3 {
+            return Err(error(
+                sqlstate::SYNTAX_ERROR,
+                format_args!("improper qualified name (too many dotted names): {written}"),
+            ));
+        } else if !crate::sql::eval::funcs::system::is_current_database(first) {
+            self.analysis_error(error(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                format_args!("cross-database references are not implemented: \"{written}\""),
+            ))?;
+        }
+        Ok((second, third))
     }
 
     fn any_qual_name(&mut self, what: &str) -> Result<QualName<'a>, ParseError> {
@@ -1458,12 +1607,21 @@ impl<'a> Parser<'a> {
             start: self.peek_at,
             end: self.lexer.token_end(),
         };
+        let at = self.peek_at;
         let first = self.any_ident(what)?;
         if self.eat_op(".")? {
             self.record_namespace(source)?;
+            let second = self.any_ident(what)?;
+            if self.eat_op(".")? {
+                let (schema, name) = self.catalog_qualified_name(at, first, second, what)?;
+                return Ok(QualName {
+                    schema: Some(schema),
+                    name,
+                });
+            }
             Ok(QualName {
                 schema: Some(first),
-                name: self.any_ident(what)?,
+                name: second,
             })
         } else {
             Ok(QualName::bare(first))
@@ -2572,9 +2730,14 @@ impl<'a> Parser<'a> {
         let mut items = ArenaList::new(self.arena);
         loop {
             let item = if self.peeked == Tok::Op("*") {
+                let at = self.peek_at;
                 self.advance()?;
-                SelectItem::Wildcard
+                SelectItem::Wildcard(crate::sql::ast::SourcePosition::new(Some(at)))
             } else if let Some(table) = self.table_wildcard()? {
+                // PostgreSQL expands `t.* AS x` like `t.*`, ignoring the label.
+                if self.eat_ident("as")? {
+                    let _ = self.any_ident("alias")?;
+                }
                 SelectItem::TableWildcard(table)
             } else {
                 let expression_start = self.peek_at;
@@ -2627,14 +2790,43 @@ impl<'a> Parser<'a> {
         };
         let mark = self.lexer.mark();
         let (saved_peeked, saved_peek_at) = (self.peeked, self.peek_at);
+        let saved_previous = self.previous_token;
         self.advance()?;
         if self.peeked == Tok::Op(".") {
             self.advance()?;
             if self.peeked == Tok::Op("*") {
                 self.advance()?;
-                return Ok(Some(table));
+                // `t.* IS NULL`, `t.* = u.*`: an operand continues it into an
+                // expression over the whole row.
+                let item_ends = match self.peeked {
+                    Tok::Op("," | ")" | ";") | Tok::Eof => true,
+                    Tok::Ident(word) => matches!(
+                        word,
+                        "as" | "from"
+                            | "into"
+                            | "where"
+                            | "group"
+                            | "having"
+                            | "window"
+                            | "order"
+                            | "limit"
+                            | "offset"
+                            | "fetch"
+                            | "for"
+                            | "union"
+                            | "intersect"
+                            | "except"
+                            | "returning"
+                            | "on"
+                    ),
+                    _ => false,
+                };
+                if item_ends {
+                    return Ok(Some(table));
+                }
             }
         }
+        self.previous_token = saved_previous;
         self.lexer.reset(mark);
         self.peeked = saved_peeked;
         self.peek_at = saved_peek_at;
@@ -2803,10 +2995,16 @@ impl<'a> Parser<'a> {
         if self.eat_ident("window")? {
             self.window_definitions()?;
         }
+        let mut windows = ArenaList::new(self.arena);
+        for &(_, spec) in self.windows.as_slice().iter().flatten() {
+            self.push(&mut windows, spec)?;
+        }
+        let windows = windows.as_slice();
         Ok(Select {
             items,
             distinct,
             distinct_on,
+            windows,
             from,
             where_clause,
             group_by,
@@ -3042,6 +3240,7 @@ impl<'a> Parser<'a> {
             items: &[],
             distinct: false,
             distinct_on: &[],
+            windows: &[],
             from: None,
             where_clause: None,
             group_by: &[],
@@ -3071,6 +3270,7 @@ impl<'a> Parser<'a> {
                 items: &[],
                 distinct: false,
                 distinct_on: &[],
+                windows: &[],
                 from: None,
                 where_clause: None,
                 group_by: &[],
@@ -3151,6 +3351,7 @@ impl<'a> Parser<'a> {
                 items: &[],
                 distinct: false,
                 distinct_on: &[],
+                windows: &[],
                 from: None,
                 where_clause: None,
                 group_by: &[],
@@ -3249,9 +3450,7 @@ impl<'a> Parser<'a> {
                 None
             };
             if (search.is_some() || cycle.is_some()) && (!recursive || dml.is_some()) {
-                return Err(self.err_here(
-                    "SEARCH and CYCLE clauses require a recursive SELECT common table expression",
-                ));
+                return Err(self.err_here("WITH query is not recursive"));
             }
             self.push(
                 &mut ctes,
@@ -3391,9 +3590,40 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    /// The rest of a set operation whose first leaf is `left`.
+    fn set_union_after(&mut self, left: &'a SetTree<'a>) -> Result<&'a SetTree<'a>, ParseError> {
+        let mut left = self.set_intersect_after(left)?;
+        loop {
+            let operator = if self.eat_ident("union")? {
+                SetOp::Union
+            } else if self.eat_ident("except")? {
+                SetOp::Except
+            } else {
+                break;
+            };
+            let all = self.set_all()?;
+            let right = self.set_intersect()?;
+            left = self.alloc_set(SetTree::Op {
+                syntax: crate::sql::ast::SetOperationSyntax::Explicit,
+                operator,
+                all,
+                left,
+                right,
+            })?;
+        }
+        Ok(left)
+    }
+
     /// INTERSECT level (binds tighter than UNION / EXCEPT).
     fn set_intersect(&mut self) -> Result<&'a SetTree<'a>, ParseError> {
-        let mut left = self.set_leaf()?;
+        let left = self.set_leaf()?;
+        self.set_intersect_after(left)
+    }
+
+    fn set_intersect_after(
+        &mut self,
+        mut left: &'a SetTree<'a>,
+    ) -> Result<&'a SetTree<'a>, ParseError> {
         while self.eat_ident("intersect")? {
             let all = self.set_all()?;
             let right = self.set_leaf()?;
@@ -3436,6 +3666,7 @@ impl<'a> Parser<'a> {
                     items: &[],
                     distinct: false,
                     distinct_on: &[],
+                    windows: &[],
                     from: None,
                     where_clause: None,
                     group_by: &[],
@@ -3490,6 +3721,7 @@ impl<'a> Parser<'a> {
                     items: items.as_slice(),
                     distinct: false,
                     distinct_on: &[],
+                    windows: &[],
                     from: None,
                     where_clause: None,
                     group_by: &[],
@@ -3566,11 +3798,15 @@ impl<'a> Parser<'a> {
                 authorization_role: None,
                 bound_table: None,
                 view_access: None,
+                join_members: None,
             };
             let select = Select {
-                items: self.arena_slice(&[SelectItem::Wildcard])?,
+                items: self.arena_slice(&[SelectItem::Wildcard(
+                    crate::sql::ast::SourcePosition::UNKNOWN,
+                )])?,
                 distinct: false,
                 distinct_on: &[],
+                windows: &[],
                 from: Some(FromClause {
                     base: source,
                     joins: &[],
@@ -3694,16 +3930,24 @@ impl<'a> Parser<'a> {
                     authorization_role: None,
                     bound_table: None,
                     view_access: None,
+                    join_members: None,
                 });
             }
             self.lexer.reset(mark);
             self.peeked = saved_peeked;
             self.peek_at = saved_peek_at;
         }
+        if self.peeked == Tok::Op("(")
+            && inheritance == RelationInheritance::Descendants
+            && !lateral
+            && self.parenthesized_join_ahead()?
+        {
+            return self.parenthesized_join();
+        }
         // Derived table: `(SELECT ...) [[AS] alias]`. PostgreSQL 16 and newer
         // permit an omitted alias; the scope layer gives that otherwise
         // unaddressable relation an internal name.
-        if self.peeked == Tok::Op("(") {
+        if self.peeked == Tok::Op("(") && inheritance == RelationInheritance::Descendants {
             self.advance()?;
             let select = self.query_select()?;
             self.expect_op(")")?;
@@ -3711,11 +3955,13 @@ impl<'a> Parser<'a> {
                 .arena
                 .alloc(select)
                 .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+            // After `AS`, only an alias may follow: anything else, including
+            // a reserved word, is PostgreSQL's syntax error at that token.
             let explicit_as = self.eat_ident("as")?;
             let alias = if let Tok::Ident(word) = self.peeked {
                 if is_column_name_keyword(word) {
                     if explicit_as {
-                        return Err(self.err_here("subquery alias is missing"));
+                        return Err(self.syntax_error_here());
                     }
                     None
                 } else {
@@ -3723,7 +3969,7 @@ impl<'a> Parser<'a> {
                     Some(word)
                 }
             } else if explicit_as {
-                return Err(self.err_here("subquery alias is missing"));
+                return Err(self.syntax_error_here());
             } else {
                 None
             };
@@ -3749,6 +3995,7 @@ impl<'a> Parser<'a> {
                 authorization_role: None,
                 bound_table: None,
                 view_access: None,
+                join_members: None,
             });
         }
         let parenthesized = inheritance == RelationInheritance::Only && self.eat_op("(")?;
@@ -3757,10 +4004,18 @@ impl<'a> Parser<'a> {
             end: self.lexer.token_end(),
         };
         let quoted_function_name = matches!(self.peeked, Tok::QuotedIdent(_));
+        let name_at = self.peek_at;
         let first = self.col_ident("table name")?;
         let (schema, table) = if self.eat_op(".")? {
             self.record_namespace(source)?;
-            (Some(first), self.col_ident("table name")?)
+            let second = self.col_ident("table name")?;
+            if self.peeked == Tok::Op(".") && self.eat_op(".")? {
+                let (schema, table) =
+                    self.catalog_qualified_name(name_at, first, second, "table name")?;
+                (Some(schema), table)
+            } else {
+                (Some(first), second)
+            }
         } else {
             (None, first)
         };
@@ -3906,6 +4161,7 @@ impl<'a> Parser<'a> {
             authorization_role: None,
             bound_table: None,
             view_access: None,
+            join_members: None,
         };
         // PostgreSQL expands only an unqualified FROM UNNEST with multiple
         // positional inputs into independent catalog calls in lockstep.
@@ -4401,16 +4657,319 @@ impl<'a> Parser<'a> {
         Ok(Some(columns.as_slice()))
     }
 
+    /// Whether the `(` in `peeked` opens PostgreSQL's parenthesized
+    /// `joined_table` rather than a query. Looks ahead without consuming.
+    fn parenthesized_join_ahead(&mut self) -> Result<bool, ParseError> {
+        let mark = self.lexer.mark();
+        let join = self.parenthesized_join_tail();
+        self.lexer.reset(mark);
+        join
+    }
+
+    /// Classifies the parenthesized item whose `(` was just lexed and lexes
+    /// through its matching `)`. A query starts with a query keyword; a
+    /// nested parenthesized item followed by anything but a set operation
+    /// or a query's trailing clause is a table reference inside a join.
+    fn parenthesized_join_tail(&mut self) -> Result<bool, ParseError> {
+        let mut depth = 1usize;
+        let join = match self.lex_ahead()? {
+            Tok::Ident("select" | "values" | "with" | "table") => false,
+            Tok::Op("(") => {
+                let inner = self.parenthesized_join_tail()?;
+                match self.lex_ahead()? {
+                    Tok::Op(")") => return Ok(inner),
+                    Tok::Ident(
+                        "union" | "intersect" | "except" | "order" | "limit" | "offset" | "fetch"
+                        | "for",
+                    ) => false,
+                    Tok::Op("(") => {
+                        depth += 1;
+                        true
+                    }
+                    Tok::Eof => return Ok(true),
+                    _ => true,
+                }
+            }
+            Tok::Op(")") | Tok::Eof => return Ok(false),
+            _ => true,
+        };
+        loop {
+            match self.lex_ahead()? {
+                Tok::Op("(") => depth += 1,
+                Tok::Op(")") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(join);
+                    }
+                }
+                Tok::Eof => return Ok(join),
+                _ => {}
+            }
+        }
+    }
+
+    fn lex_ahead(&mut self) -> Result<Tok<'a>, ParseError> {
+        self.lexer
+            .next_token()
+            .map_err(|error| ParseError::lexical(error, self.text))
+    }
+
+    /// `( joined_table ) [[AS] alias [(columns)]]`. With an alias the join is
+    /// an ordinary derived table; without one it exposes its members.
+    fn parenthesized_join(&mut self) -> Result<TableRef<'a>, ParseError> {
+        let star_at = self.peek_at;
+        self.expect_op("(")?;
+        let mut inner = self.join_chain(false)?;
+        if inner.joins.is_empty() {
+            // `((a JOIN b ...))`: a parenthesized join is itself a joined
+            // table; anything else in parentheses is not.
+            match inner.base {
+                TableRef {
+                    alias: None,
+                    join_members: Some(_),
+                    subquery:
+                        Some(Select {
+                            from: Some(from), ..
+                        }),
+                    ..
+                } => inner = *from,
+                _ => return Err(self.syntax_error_here()),
+            }
+        }
+        self.expect_op(")")?;
+        let explicit_as = self.eat_ident("as")?;
+        let alias = match self.peeked {
+            Tok::Ident(word) if explicit_as || !is_column_name_keyword(word) => {
+                Some(self.col_ident("alias")?)
+            }
+            Tok::QuotedIdent(_) => Some(self.col_ident("alias")?),
+            _ if explicit_as => return Err(self.syntax_error_here()),
+            _ => None,
+        };
+        let col_alias = if alias.is_some() {
+            self.column_alias_list()?
+        } else {
+            None
+        };
+        self.joined_table_ref(inner, alias, col_alias, star_at)
+    }
+
+    /// The derived table a parenthesized join runs as (see
+    /// [`TableRef::join_members`]).
+    fn joined_table_ref(
+        &mut self,
+        inner: FromClause<'a>,
+        alias: Option<&'a str>,
+        col_alias: Option<&'a [&'a str]>,
+        star_at: usize,
+    ) -> Result<TableRef<'a>, ParseError> {
+        let star = SelectItem::Wildcard(crate::sql::ast::SourcePosition::new(Some(star_at)));
+        let mut members = ArenaList::new(self.arena);
+        for table in core::iter::once(&inner.base).chain(inner.joins.iter().map(|j| &j.table)) {
+            if table.alias.is_none()
+                && let Some(nested) = table.join_members
+            {
+                for member in nested {
+                    self.push(&mut members, *member)?;
+                }
+            } else if let Some(name) = table
+                .alias
+                .or((table.subquery.is_none() && !table.table.is_empty()).then_some(table.table))
+            {
+                self.push(
+                    &mut members,
+                    JoinMember {
+                        name,
+                        using_alias: false,
+                    },
+                )?;
+            }
+        }
+        for join in inner.joins {
+            if let Some(name) = join.using.and_then(|using| using.alias) {
+                self.push(
+                    &mut members,
+                    JoinMember {
+                        name,
+                        using_alias: true,
+                    },
+                )?;
+            }
+        }
+        let members = members.as_slice();
+        let items = if alias.is_some() {
+            self.arena_slice(&[star])?
+        } else {
+            let mut items = ArenaList::new(self.arena);
+            self.push(&mut items, star)?;
+            for member in members {
+                self.push(&mut items, SelectItem::TableWildcard(member.name))?;
+            }
+            for member in members.iter().filter(|member| !member.using_alias) {
+                let row = self.arena_expr(Expr::WholeRow(member.name))?;
+                let presence = self.plain_call("pg_catalog.num_nulls", &[row])?;
+                self.push(
+                    &mut items,
+                    SelectItem::Expr {
+                        expression: presence,
+                        alias: None,
+                    },
+                )?;
+            }
+            items.as_slice()
+        };
+        let join_members = Some(members);
+        let lateral = core::iter::once(&inner.base)
+            .chain(inner.joins.iter().map(|j| &j.table))
+            .any(|table| table.lateral);
+        let select = self
+            .arena
+            .alloc(Select {
+                items,
+                distinct: false,
+                distinct_on: &[],
+                windows: &[],
+                from: Some(inner),
+                where_clause: None,
+                group_by: &[],
+                grouping_set_quantifier: crate::sql::ast::GroupingSetQuantifier::All,
+                grouping_sets: &[],
+                having: None,
+                order_by: &[],
+                limit: None,
+                offset: None,
+                with_ties: false,
+                with: &[],
+                set_body: None,
+                locking: &[],
+            })
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+        Ok(TableRef {
+            schema: None,
+            table: "",
+            alias,
+            subquery: Some(select),
+            func_args: None,
+            func_argument_names: &[],
+            func_variadic: false,
+            func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+            rows_from: None,
+            col_alias,
+            inheritance: RelationInheritance::Descendants,
+            sample: None,
+            cte: None,
+            with_ordinality: false,
+            lateral,
+            authorization_role: None,
+            bound_table: None,
+            view_access: None,
+            join_members,
+        })
+    }
+
     #[expect(
         clippy::wrong_self_convention,
         reason = "parses the FROM clause; not a conversion"
     )]
     fn from_clause(&mut self) -> Result<FromClause<'a>, ParseError> {
+        self.parse_from_list(false)
+    }
+
+    /// `UPDATE ... FROM` and `DELETE ... USING` lists, which follow their
+    /// target as if after a comma.
+    fn dml_from_clause(&mut self) -> Result<FromClause<'a>, ParseError> {
+        self.parse_from_list(true)
+    }
+
+    fn parse_from_list(&mut self, after_target: bool) -> Result<FromClause<'a>, ParseError> {
+        let from = self.join_chain(true)?;
+        // Joins run left-deep, which equals PostgreSQL's tree except where a
+        // RIGHT or FULL join follows a comma: `a, b RIGHT JOIN c ON ...`
+        // joins `c` to `b` alone, then pairs every result with `a`. Such a
+        // comma-separated item runs as its own parenthesized join.
+        let first_item_end = from
+            .joins
+            .iter()
+            .position(|join| join.kind == JoinKind::Comma)
+            .unwrap_or(from.joins.len());
+        let from = if after_target
+            && from.joins[..first_item_end]
+                .iter()
+                .any(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full))
+        {
+            let inner = FromClause {
+                base: from.base,
+                joins: self.arena_slice(&from.joins[..first_item_end])?,
+            };
+            FromClause {
+                base: self.joined_table_ref(inner, None, None, 0)?,
+                joins: self.arena_slice(&from.joins[first_item_end..])?,
+            }
+        } else {
+            from
+        };
+        let Some(first_comma) = from
+            .joins
+            .iter()
+            .position(|join| join.kind == JoinKind::Comma)
+        else {
+            return Ok(from);
+        };
+        let needs_group = |items: &[Join<'a>]| {
+            items
+                .iter()
+                .any(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full))
+        };
+        if !needs_group(&from.joins[first_comma..]) {
+            return Ok(from);
+        }
+        let mut joins = ArenaList::new(self.arena);
+        for join in &from.joins[..first_comma] {
+            self.push(&mut joins, *join)?;
+        }
+        let mut start = first_comma;
+        while start < from.joins.len() {
+            let end = from.joins[start + 1..]
+                .iter()
+                .position(|join| join.kind == JoinKind::Comma)
+                .map_or(from.joins.len(), |offset| start + 1 + offset);
+            let item = &from.joins[start..end];
+            if item.len() > 1 && needs_group(&item[1..]) {
+                let inner = FromClause {
+                    base: item[0].table,
+                    joins: self.arena_slice(&item[1..])?,
+                };
+                let table = self.joined_table_ref(inner, None, None, 0)?;
+                self.push(
+                    &mut joins,
+                    Join {
+                        table,
+                        kind: JoinKind::Comma,
+                        on: None,
+                        using: None,
+                        natural: false,
+                    },
+                )?;
+            } else {
+                for join in item {
+                    self.push(&mut joins, *join)?;
+                }
+            }
+            start = end;
+        }
+        Ok(FromClause {
+            base: from.base,
+            joins: joins.as_slice(),
+        })
+    }
+
+    /// A FROM list (`commas` true) or the join chain inside a parenthesized
+    /// join, where a comma ends the chain.
+    fn join_chain(&mut self, commas: bool) -> Result<FromClause<'a>, ParseError> {
         let base = self.table_ref()?;
         let mut joins = ArenaList::new(self.arena);
         loop {
             let natural = self.eat_ident("natural")?;
-            let mut list_item = false;
             let kind = if natural {
                 if self.eat_ident("inner")? {
                     self.expect_ident("join")?;
@@ -4431,9 +4990,8 @@ impl<'a> Parser<'a> {
                     self.expect_ident("join")?;
                     JoinKind::Inner
                 }
-            } else if self.eat_op(",")? {
-                list_item = true;
-                JoinKind::Cross
+            } else if commas && self.eat_op(",")? {
+                JoinKind::Comma
             } else if self.eat_ident("cross")? {
                 self.expect_ident("join")?;
                 JoinKind::Cross
@@ -4459,7 +5017,7 @@ impl<'a> Parser<'a> {
             };
             let table = self.table_ref()?;
             let mut using = None;
-            let on = if natural || kind == JoinKind::Cross {
+            let on = if natural || kind.is_cross() {
                 None
             } else if self.eat_ident("using")? {
                 // The merged-column semantics (single output column, resolved
@@ -4495,7 +5053,6 @@ impl<'a> Parser<'a> {
                     on,
                     using,
                     natural,
-                    list_item,
                 },
             )?;
         }
@@ -5980,21 +6537,7 @@ impl<'a> Parser<'a> {
         if self.peeked == Tok::Ident("owner") {
             return self.alter_owner(AlterOwnerKind::View, name, if_exists);
         }
-        let action = if self.eat_ident("alter")? {
-            let _ = self.eat_ident("column")?;
-            let column = self.col_ident("view column name")?;
-            if self.eat_ident("set")? {
-                self.expect_ident("default")?;
-                let start = self.peek_at;
-                let _ = self.expression(0)?;
-                let expression = self.text[start..self.peek_at].trim();
-                crate::sql::ast::AlterViewAction::SetDefault { column, expression }
-            } else {
-                self.expect_ident("drop")?;
-                self.expect_ident("default")?;
-                crate::sql::ast::AlterViewAction::DropDefault { column }
-            }
-        } else if self.eat_ident("rename")? {
+        let action = if self.eat_ident("rename")? {
             if self.eat_ident("to")? {
                 crate::sql::ast::AlterViewAction::RenameTo(self.col_ident("new view name")?)
             } else {
@@ -6004,23 +6547,31 @@ impl<'a> Parser<'a> {
                 let to = self.col_ident("new view column name")?;
                 crate::sql::ast::AlterViewAction::RenameColumn { from, to }
             }
-        } else if self.eat_ident("set")? {
-            if self.eat_ident("schema")? {
-                crate::sql::ast::AlterViewAction::SetSchema(self.col_ident("schema name")?)
-            } else {
-                self.expect_op("(")?;
-                crate::sql::ast::AlterViewAction::SetOptions(self.view_options()?)
-            }
         } else {
-            self.expect_ident("reset")?;
-            self.expect_op("(")?;
-            crate::sql::ast::AlterViewAction::ResetOptions(self.view_option_names()?)
+            // SET SCHEMA, options and column defaults parse as ALTER TABLE
+            // subcommands, which may form a list.
+            crate::sql::ast::AlterViewAction::TableActions(
+                self.alter_view_table_actions(name, if_exists)?,
+            )
         };
         Ok(Stmt::AlterView {
             name,
             if_exists,
             action,
         })
+    }
+
+    /// `ALTER TABLE` subcommands written after `ALTER VIEW` or `ALTER
+    /// MATERIALIZED VIEW name`.
+    fn alter_view_table_actions(
+        &mut self,
+        name: QualName<'a>,
+        if_exists: bool,
+    ) -> Result<&'a [crate::sql::ast::AlterAction<'a>], ParseError> {
+        match self.alter_table_actions(false, name, if_exists, false)? {
+            Stmt::AlterTable(alter) => Ok(alter.actions),
+            _ => Err(self.err_here("expected ALTER TABLE subcommands")),
+        }
     }
 
     fn alter_materialized_view(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -6063,7 +6614,8 @@ impl<'a> Parser<'a> {
                 )
             }
         } else {
-            let first = if self.eat_ident("set")? {
+            if self.peeked == Tok::Ident("set") {
+                self.expect_ident("set")?;
                 if self.eat_ident("schema")? {
                     return Ok(Stmt::AlterMaterializedView {
                         name,
@@ -6073,17 +6625,15 @@ impl<'a> Parser<'a> {
                         ),
                     });
                 }
-                self.materialized_view_table_action_after_set()?
+                let action = self.alter_table_set_action()?;
+                crate::sql::ast::AlterMaterializedViewAction::TableActions(
+                    self.arena_slice(&[action])?,
+                )
             } else {
-                self.materialized_view_table_action()?
-            };
-            let mut actions = ArenaList::new(self.arena);
-            self.push(&mut actions, first)?;
-            while self.eat_op(",")? {
-                let action = self.materialized_view_table_action()?;
-                self.push(&mut actions, action)?;
+                crate::sql::ast::AlterMaterializedViewAction::TableActions(
+                    self.alter_view_table_actions(name, if_exists)?,
+                )
             }
-            crate::sql::ast::AlterMaterializedViewAction::TableActions(actions.as_slice())
         };
         Ok(Stmt::AlterMaterializedView {
             name,
@@ -6092,134 +6642,150 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn materialized_view_table_action_after_set(
-        &mut self,
-    ) -> Result<crate::sql::ast::AlterAction<'a>, ParseError> {
-        if self.eat_ident("tablespace")? {
-            return Ok(crate::sql::ast::AlterAction::SetTablespace(
-                self.col_ident("tablespace name")?,
-            ));
-        }
-        if self.eat_ident("access")? {
-            self.expect_ident("method")?;
-            let method = self.any_ident("table access method")?;
-            return Ok(crate::sql::ast::AlterAction::SetAccessMethod(
-                if method == "heap" {
-                    crate::sql::ast::TableAccessMethod::Heap
-                } else {
-                    crate::sql::ast::TableAccessMethod::Named(method)
-                },
-            ));
-        }
-        self.expect_op("(")?;
-        let options = self.relation_storage_options()?;
-        self.expect_op(")")?;
-        Ok(crate::sql::ast::AlterAction::SetStorageOptions(options))
-    }
-
-    fn materialized_view_table_action(
-        &mut self,
-    ) -> Result<crate::sql::ast::AlterAction<'a>, ParseError> {
-        if self.eat_ident("set")? {
-            return self.materialized_view_table_action_after_set();
-        }
-        if self.eat_ident("reset")? {
-            self.expect_op("(")?;
-            let options = self.relation_storage_option_names()?;
-            self.expect_op(")")?;
-            return Ok(crate::sql::ast::AlterAction::ResetStorageOptions(options));
-        }
-        self.expect_ident("alter")?;
-        let _ = self.eat_ident("column")?;
-        let column = self.col_ident("materialized view column name")?;
-        self.expect_ident("set")?;
-        self.expect_ident("statistics")?;
-        let target = if self.eat_ident("default")? {
-            -1
-        } else {
-            i16::try_from(self.seq_int()?)
-                .map_err(|_| self.err_here("statistics target is out of range"))?
-        };
-        Ok(crate::sql::ast::AlterAction::SetStatistics { column, target })
-    }
-
     fn view_options(&mut self) -> Result<&'a [crate::sql::ast::ViewOption], ParseError> {
-        use crate::sql::ast::{ViewCheckOption, ViewOption};
+        let (storage, options) = self.relation_options()?;
+        if storage.fillfactor.is_some() {
+            return Err(self.unrecognized_parameter("fillfactor"));
+        }
+        Ok(options)
+    }
+
+    fn unrecognized_parameter(&self, option: &str) -> ParseError {
+        ParseError {
+            at: self.peek_at,
+            message: stack_format!(PARSE_MESSAGE_BYTES, "unrecognized parameter \"{}\"", option),
+            sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            cursor: None,
+            hint: None,
+            near: None,
+            detail: None,
+        }
+    }
+
+    /// A `SET (...)` list of table storage parameters and view options,
+    /// through `)`. Which of them a relation has is checked when the
+    /// statement runs, as PostgreSQL validates them against its kind.
+    fn relation_options(
+        &mut self,
+    ) -> Result<
+        (
+            crate::sql::ast::RelationStorageOptions,
+            &'a [crate::sql::ast::ViewOption],
+        ),
+        ParseError,
+    > {
+        use crate::sql::ast::{RelationStorageOptions, ViewCheckOption, ViewOption};
+        let mut storage = RelationStorageOptions::DEFAULT;
         let mut options = [ViewOption::SecurityInvoker(false); 3];
         let mut count = 0usize;
-        let mut seen = [false; 3];
+        let mut seen = [false; 4];
         loop {
-            if count == options.len() {
-                return Err(self.limit("view options", options.len()));
-            }
-            let option = self.any_ident("view option name")?;
-            let (index, parsed) = if option.eq_ignore_ascii_case("security_invoker") {
-                (
-                    0,
-                    ViewOption::SecurityInvoker(self.subscription_bool_option(option)?),
-                )
+            let option = self.any_ident("relation option name")?;
+            let index = if option.eq_ignore_ascii_case("security_invoker") {
+                options[count] =
+                    ViewOption::SecurityInvoker(self.subscription_bool_option(option)?);
+                0
             } else if option.eq_ignore_ascii_case("security_barrier") {
-                (
-                    1,
-                    ViewOption::SecurityBarrier(self.subscription_bool_option(option)?),
-                )
+                options[count] =
+                    ViewOption::SecurityBarrier(self.subscription_bool_option(option)?);
+                1
             } else if option.eq_ignore_ascii_case("check_option") {
                 self.expect_op("=")?;
-                let value = self.any_ident("check_option value")?;
+                let value = match self.peeked {
+                    Tok::Ident(value) | Tok::Str(value) => value,
+                    _ => return Err(self.syntax_error_here()),
+                };
                 let value = if value.eq_ignore_ascii_case("local") {
                     ViewCheckOption::Local
                 } else if value.eq_ignore_ascii_case("cascaded") {
                     ViewCheckOption::Cascaded
                 } else {
-                    return Err(self.err_here("check_option must be local or cascaded"));
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            PARSE_MESSAGE_BYTES,
+                            "invalid value for enum option \"check_option\": {}",
+                            value
+                        ),
+                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        cursor: None,
+                        hint: None,
+                        near: None,
+                        detail: Some("Valid values are \"local\" and \"cascaded\"."),
+                    });
                 };
-                (2, ViewOption::CheckOption(value))
+                self.advance()?;
+                options[count] = ViewOption::CheckOption(value);
+                2
+            } else if option.eq_ignore_ascii_case("fillfactor") {
+                self.expect_op("=")?;
+                storage.fillfactor = Some(self.integer_reloption("fillfactor", 10, 100)? as u8);
+                3
             } else {
-                return Err(self.err_here("unrecognized view option"));
+                return Err(self.unrecognized_parameter(option));
             };
             if core::mem::replace(&mut seen[index], true) {
-                return Err(self.err_here("view option specified more than once"));
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(
+                        PARSE_MESSAGE_BYTES,
+                        "parameter \"{}\" specified more than once",
+                        option
+                    ),
+                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    cursor: None,
+                    hint: None,
+                    near: None,
+                    detail: None,
+                });
             }
-            options[count] = parsed;
-            count += 1;
+            if index < 3 {
+                count += 1;
+            }
             if !self.eat_op(",")? {
                 break;
             }
         }
         self.expect_op(")")?;
-        self.arena_slice(&options[..count])
+        Ok((storage, self.arena_slice(&options[..count])?))
     }
 
-    fn view_option_names(&mut self) -> Result<&'a [crate::sql::ast::ViewOptionName], ParseError> {
-        use crate::sql::ast::ViewOptionName;
-        let mut names = [ViewOptionName::SecurityInvoker; 3];
-        let mut count = 0usize;
-        let mut seen = [false; 3];
-        loop {
-            if count == names.len() {
-                return Err(self.limit("view options", names.len()));
-            }
-            let option = self.any_ident("view option name")?;
-            let (index, parsed) = if option.eq_ignore_ascii_case("security_invoker") {
-                (0, ViewOptionName::SecurityInvoker)
-            } else if option.eq_ignore_ascii_case("security_barrier") {
-                (1, ViewOptionName::SecurityBarrier)
-            } else if option.eq_ignore_ascii_case("check_option") {
-                (2, ViewOptionName::CheckOption)
+    /// One `ALTER TABLE ... SET` subcommand, after `SET`.
+    fn alter_table_set_action(&mut self) -> Result<AlterAction<'a>, ParseError> {
+        Ok(if self.eat_ident("schema")? {
+            AlterAction::SetSchema(self.col_ident("schema name")?)
+        } else if self.eat_ident("logged")? {
+            AlterAction::SetPersistence(crate::sql::ast::RelationPersistence::Permanent)
+        } else if self.eat_ident("unlogged")? {
+            AlterAction::SetPersistence(crate::sql::ast::RelationPersistence::Unlogged)
+        } else if self.eat_ident("tablespace")? {
+            AlterAction::SetTablespace(self.col_ident("tablespace name")?)
+        } else if self.eat_ident("without")? {
+            if self.eat_ident("cluster")? {
+                AlterAction::ClearCluster
             } else {
-                return Err(self.err_here("unrecognized view option"));
-            };
-            if core::mem::replace(&mut seen[index], true) {
-                return Err(self.err_here("view option specified more than once"));
+                self.expect_ident("oids")?;
+                AlterAction::SetWithoutOids
             }
-            names[count] = parsed;
-            count += 1;
-            if !self.eat_op(",")? {
-                break;
+        } else if self.eat_op("(")? {
+            match self.relation_options()? {
+                (storage, []) => AlterAction::SetStorageOptions(storage),
+                (storage, options) => AlterAction::SetViewOptions { options, storage },
             }
-        }
-        self.expect_op(")")?;
-        self.arena_slice(&names[..count])
+        } else {
+            self.expect_ident("access")?;
+            self.expect_ident("method")?;
+            if self.eat_ident("default")? {
+                AlterAction::ResetAccessMethod
+            } else {
+                let method = self.any_ident("table access method")?;
+                AlterAction::SetAccessMethod(if method == "heap" {
+                    crate::sql::ast::TableAccessMethod::Heap
+                } else {
+                    crate::sql::ast::TableAccessMethod::Named(method)
+                })
+            }
+        })
     }
 
     fn alter_table_relation(&mut self, foreign: bool) -> Result<Stmt<'a>, ParseError> {
@@ -6242,43 +6808,52 @@ impl<'a> Parser<'a> {
                 if_exists,
             );
         }
-        // RENAME … and SET SCHEMA are standalone forms: PostgreSQL does not
-        // combine them with a comma-separated subcommand list, so they parse to
-        // a single-element list on their own.
+        self.alter_table_actions(foreign, table, if_exists, only)
+    }
+
+    /// The subcommands after `ALTER TABLE name`, which `ALTER VIEW` and
+    /// `ALTER MATERIALIZED VIEW` also accept; their execution rejects the
+    /// ones the relation's kind does not support.
+    fn alter_table_actions(
+        &mut self,
+        foreign: bool,
+        table: QualName<'a>,
+        if_exists: bool,
+        only: bool,
+    ) -> Result<Stmt<'a>, ParseError> {
+        // RENAME …, SET SCHEMA and partition attachment are standalone forms:
+        // PostgreSQL does not combine them with a comma-separated subcommand
+        // list, so they parse to a single-element list on their own.
+        let mut buffer = ArenaList::new(self.arena);
         if self.eat_ident("set")? {
-            let action = if self.eat_ident("schema")? {
-                AlterAction::SetSchema(self.col_ident("schema name")?)
-            } else if self.eat_ident("logged")? {
-                AlterAction::SetPersistence(crate::sql::ast::RelationPersistence::Permanent)
-            } else if self.eat_ident("unlogged")? {
-                AlterAction::SetPersistence(crate::sql::ast::RelationPersistence::Unlogged)
-            } else if self.eat_ident("tablespace")? {
-                AlterAction::SetTablespace(self.col_ident("tablespace name")?)
-            } else if self.eat_ident("without")? {
-                if self.eat_ident("cluster")? {
-                    AlterAction::ClearCluster
-                } else {
-                    self.expect_ident("oids")?;
-                    AlterAction::SetWithoutOids
-                }
-            } else if self.eat_op("(")? {
-                let options = self.relation_storage_options()?;
-                self.expect_op(")")?;
-                AlterAction::SetStorageOptions(options)
-            } else {
-                self.expect_ident("access")?;
-                self.expect_ident("method")?;
-                if self.eat_ident("default")? {
-                    AlterAction::ResetAccessMethod
-                } else {
-                    let method = self.any_ident("table access method")?;
-                    AlterAction::SetAccessMethod(if method == "heap" {
-                        crate::sql::ast::TableAccessMethod::Heap
-                    } else {
-                        crate::sql::ast::TableAccessMethod::Named(method)
-                    })
-                }
-            };
+            if self.eat_ident("schema")? {
+                let action = AlterAction::SetSchema(self.col_ident("schema name")?);
+                return Ok(Self::alter_table_statement(
+                    foreign,
+                    AlterTable {
+                        table,
+                        if_exists,
+                        only,
+                        actions: self.arena_slice(&[action])?,
+                    },
+                ));
+            }
+            let action = self.alter_table_set_action()?;
+            self.push(&mut buffer, action)?;
+            if !self.eat_op(",")? {
+                return Ok(Self::alter_table_statement(
+                    foreign,
+                    AlterTable {
+                        table,
+                        if_exists,
+                        only,
+                        actions: buffer.as_slice(),
+                    },
+                ));
+            }
+        } else if matches!(self.peeked, Tok::Ident("attach" | "detach")) {
+            let mut column_constraints = ArenaList::new(self.arena);
+            let action = self.alter_table_cmd(foreign, table.name, &mut column_constraints)?;
             return Ok(Self::alter_table_statement(
                 foreign,
                 AlterTable {
@@ -6286,32 +6861,6 @@ impl<'a> Parser<'a> {
                     if_exists,
                     only,
                     actions: self.arena_slice(&[action])?,
-                },
-            ));
-        }
-        if self.eat_ident("cluster")? {
-            self.expect_ident("on")?;
-            let index = self.qual_name("index name")?;
-            return Ok(Self::alter_table_statement(
-                foreign,
-                AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self.arena_slice(&[AlterAction::SetCluster(index)])?,
-                },
-            ));
-        }
-        if self.eat_ident("of")? {
-            let type_name = self.qual_name("composite type name")?;
-            return Ok(Self::alter_table_statement(
-                foreign,
-                AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self
-                        .arena_slice(&[AlterAction::SetTypeMembership(Some(type_name))])?,
                 },
             ));
         }
@@ -6340,155 +6889,17 @@ impl<'a> Parser<'a> {
                 },
             ));
         }
-        if self.eat_ident("force")? {
-            self.expect_ident("row")?;
-            self.expect_ident("level")?;
-            self.expect_ident("security")?;
-            return Ok(Self::alter_table_statement(
-                foreign,
-                AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
-                        RowLevelSecurityAlteration::Force,
-                    )])?,
-                },
-            ));
-        }
-        if self.eat_ident("not")? {
-            self.expect_ident("of")?;
-            return Ok(Self::alter_table_statement(
-                foreign,
-                AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self.arena_slice(&[AlterAction::SetTypeMembership(None)])?,
-                },
-            ));
-        }
-        if self.eat_ident("no")? {
-            let action = if self.eat_ident("inherit")? {
-                AlterAction::SetInheritance {
-                    parent: self.qual_name("parent relation name")?,
-                    inherit: false,
-                }
-            } else {
-                self.expect_ident("force")?;
-                self.expect_ident("row")?;
-                self.expect_ident("level")?;
-                self.expect_ident("security")?;
-                AlterAction::SetRowLevelSecurity(RowLevelSecurityAlteration::NoForce)
-            };
-            return Ok(Self::alter_table_statement(
-                foreign,
-                AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self.arena_slice(&[action])?,
-                },
-            ));
-        }
-        let trigger_mode = if self.eat_ident("enable")? {
-            if self.eat_ident("row")? {
-                self.expect_ident("level")?;
-                self.expect_ident("security")?;
-                return Ok(Self::alter_table_statement(
-                    foreign,
-                    AlterTable {
-                        table,
-                        if_exists,
-                        only,
-                        actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
-                            RowLevelSecurityAlteration::Enable,
-                        )])?,
-                    },
-                ));
-            }
-            if self.eat_ident("replica")? {
-                Some(crate::sql::ast::TriggerEnableMode::Replica)
-            } else if self.eat_ident("always")? {
-                Some(crate::sql::ast::TriggerEnableMode::Always)
-            } else {
-                Some(crate::sql::ast::TriggerEnableMode::Origin)
-            }
-        } else if self.eat_ident("disable")? {
-            if self.eat_ident("row")? {
-                self.expect_ident("level")?;
-                self.expect_ident("security")?;
-                return Ok(Self::alter_table_statement(
-                    foreign,
-                    AlterTable {
-                        table,
-                        if_exists,
-                        only,
-                        actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
-                            RowLevelSecurityAlteration::Disable,
-                        )])?,
-                    },
-                ));
-            }
-            Some(crate::sql::ast::TriggerEnableMode::Disabled)
-        } else {
-            None
-        };
-        if let Some(enabled) = trigger_mode {
-            if self.eat_ident("rule")? {
-                if matches!(self.peeked, Tok::Ident("all" | "user")) {
-                    return Err(self.syntax_error_here());
-                }
-                let action = AlterAction::SetRuleEnabled {
-                    name: self.col_ident("rewrite rule name")?,
-                    enabled,
-                };
-                return Ok(Self::alter_table_statement(
-                    foreign,
-                    AlterTable {
-                        table,
-                        if_exists,
-                        only,
-                        actions: self.arena_slice(&[action])?,
-                    },
-                ));
-            }
-            self.expect_ident("trigger")?;
-            let target = match (enabled, self.peeked) {
-                (
-                    crate::sql::ast::TriggerEnableMode::Origin
-                    | crate::sql::ast::TriggerEnableMode::Disabled,
-                    Tok::Ident("all"),
-                ) => {
-                    self.advance()?;
-                    crate::sql::ast::TriggerEnableTarget::All
-                }
-                (
-                    crate::sql::ast::TriggerEnableMode::Origin
-                    | crate::sql::ast::TriggerEnableMode::Disabled,
-                    Tok::Ident("user"),
-                ) => {
-                    self.advance()?;
-                    crate::sql::ast::TriggerEnableTarget::User
-                }
-                _ => crate::sql::ast::TriggerEnableTarget::Name(self.col_ident("trigger name")?),
-            };
-            let action = AlterAction::SetTriggerEnabled { target, enabled };
-            return Ok(Self::alter_table_statement(
-                foreign,
-                AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self.arena_slice(&[action])?,
-                },
-            ));
-        }
-        // Otherwise a comma-separated list of ADD / DROP / ALTER subcommands.
-        let mut buffer = ArenaList::new(self.arena);
+        // Otherwise a comma-separated list of subcommands.
         loop {
-            let action = self.alter_table_cmd(foreign, table.name)?;
+            if matches!(self.peeked, Tok::Ident("attach" | "detach" | "rename")) {
+                return Err(self.syntax_error_here());
+            }
+            let mut column_constraints = ArenaList::new(self.arena);
+            let action = self.alter_table_cmd(foreign, table.name, &mut column_constraints)?;
             self.push(&mut buffer, action)?;
+            for constraint in column_constraints.as_slice() {
+                self.push(&mut buffer, AlterAction::AddConstraint(*constraint))?;
+            }
             if !self.eat_op(",")? {
                 break;
             }
@@ -6793,14 +7204,119 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The relation-level subcommands of an `ALTER TABLE` list: trigger,
+    /// rule and row-security switches, `CLUSTER ON`, `OF`, `NOT OF`, and
+    /// `NO INHERIT`.
+    fn alter_table_relation_cmd(&mut self) -> Result<Option<AlterAction<'a>>, ParseError> {
+        use crate::sql::ast::{TriggerEnableMode, TriggerEnableTarget};
+        if self.eat_ident("cluster")? {
+            self.expect_ident("on")?;
+            // PostgreSQL's grammar takes an unqualified name, looked up in the
+            // table's schema.
+            return Ok(Some(AlterAction::SetCluster(QualName {
+                schema: None,
+                name: self.col_ident("index name")?,
+            })));
+        }
+        if self.eat_ident("of")? {
+            let type_name = self.qual_name("composite type name")?;
+            return Ok(Some(AlterAction::SetTypeMembership(Some(type_name))));
+        }
+        if self.eat_ident("not")? {
+            self.expect_ident("of")?;
+            return Ok(Some(AlterAction::SetTypeMembership(None)));
+        }
+        let row_level_security = |parser: &mut Self| -> Result<(), ParseError> {
+            parser.expect_ident("row")?;
+            parser.expect_ident("level")?;
+            parser.expect_ident("security")
+        };
+        if self.eat_ident("force")? {
+            row_level_security(self)?;
+            return Ok(Some(AlterAction::SetRowLevelSecurity(
+                RowLevelSecurityAlteration::Force,
+            )));
+        }
+        if self.eat_ident("no")? {
+            if self.eat_ident("inherit")? {
+                return Ok(Some(AlterAction::SetInheritance {
+                    parent: self.qual_name("parent relation name")?,
+                    inherit: false,
+                }));
+            }
+            self.expect_ident("force")?;
+            row_level_security(self)?;
+            return Ok(Some(AlterAction::SetRowLevelSecurity(
+                RowLevelSecurityAlteration::NoForce,
+            )));
+        }
+        let enabled = if self.eat_ident("enable")? {
+            if self.peeked == Tok::Ident("row") {
+                row_level_security(self)?;
+                return Ok(Some(AlterAction::SetRowLevelSecurity(
+                    RowLevelSecurityAlteration::Enable,
+                )));
+            }
+            if self.eat_ident("replica")? {
+                TriggerEnableMode::Replica
+            } else if self.eat_ident("always")? {
+                TriggerEnableMode::Always
+            } else {
+                TriggerEnableMode::Origin
+            }
+        } else if self.eat_ident("disable")? {
+            if self.peeked == Tok::Ident("row") {
+                row_level_security(self)?;
+                return Ok(Some(AlterAction::SetRowLevelSecurity(
+                    RowLevelSecurityAlteration::Disable,
+                )));
+            }
+            TriggerEnableMode::Disabled
+        } else {
+            return Ok(None);
+        };
+        if self.eat_ident("rule")? {
+            if matches!(self.peeked, Tok::Ident("all" | "user")) {
+                return Err(self.syntax_error_here());
+            }
+            return Ok(Some(AlterAction::SetRuleEnabled {
+                name: self.col_ident("rewrite rule name")?,
+                enabled,
+            }));
+        }
+        self.expect_ident("trigger")?;
+        let target = match (enabled, self.peeked) {
+            (
+                TriggerEnableMode::Origin | TriggerEnableMode::Disabled,
+                Tok::Ident(word @ ("all" | "user")),
+            ) => {
+                self.advance()?;
+                if word == "all" {
+                    TriggerEnableTarget::All
+                } else {
+                    TriggerEnableTarget::User
+                }
+            }
+            _ => TriggerEnableTarget::Name(self.col_ident("trigger name")?),
+        };
+        Ok(Some(AlterAction::SetTriggerEnabled { target, enabled }))
+    }
+
     /// One ADD / DROP / ALTER subcommand of an ALTER TABLE (the comma-listable
     /// forms; RENAME and SET SCHEMA are handled by the caller).
+    /// One ALTER TABLE subcommand. The constraints written on an added
+    /// column are appended to `column_constraints`; PostgreSQL adds them as
+    /// separate constraint subcommands once the column exists.
     fn alter_table_cmd(
         &mut self,
         foreign: bool,
         table: &str,
+        column_constraints: &mut ArenaList<'a, TableConstraint<'a>>,
     ) -> Result<AlterAction<'a>, ParseError> {
-        if foreign && self.eat_ident("options")? {
+        if let Some(action) = self.alter_table_relation_cmd()? {
+            return Ok(action);
+        }
+        if self.eat_ident("options")? {
             Ok(AlterAction::SetForeignOptions(
                 self.alter_foreign_options()?,
             ))
@@ -6825,12 +7341,6 @@ impl<'a> Parser<'a> {
                 parent: self.qual_name("parent relation name")?,
                 inherit: true,
             })
-        } else if self.eat_ident("no")? {
-            self.expect_ident("inherit")?;
-            Ok(AlterAction::SetInheritance {
-                parent: self.qual_name("parent relation name")?,
-                inherit: false,
-            })
         } else if self.eat_ident("replica")? {
             self.expect_ident("identity")?;
             let target = if self.eat_ident("default")? {
@@ -6846,36 +7356,11 @@ impl<'a> Parser<'a> {
             };
             Ok(AlterAction::SetReplicaIdentity(target))
         } else if self.eat_ident("set")? {
-            if self.eat_ident("logged")? {
-                Ok(AlterAction::SetPersistence(
-                    crate::sql::ast::RelationPersistence::Permanent,
-                ))
-            } else if self.eat_ident("unlogged")? {
-                Ok(AlterAction::SetPersistence(
-                    crate::sql::ast::RelationPersistence::Unlogged,
-                ))
-            } else if self.eat_ident("tablespace")? {
-                Ok(AlterAction::SetTablespace(
-                    self.col_ident("tablespace name")?,
-                ))
-            } else if self.eat_op("(")? {
-                let options = self.relation_storage_options()?;
-                self.expect_op(")")?;
-                Ok(AlterAction::SetStorageOptions(options))
-            } else {
-                self.expect_ident("access")?;
-                self.expect_ident("method")?;
-                if self.eat_ident("default")? {
-                    Ok(AlterAction::ResetAccessMethod)
-                } else {
-                    let method = self.any_ident("table access method")?;
-                    Ok(AlterAction::SetAccessMethod(if method == "heap" {
-                        crate::sql::ast::TableAccessMethod::Heap
-                    } else {
-                        crate::sql::ast::TableAccessMethod::Named(method)
-                    }))
-                }
+            // SET SCHEMA stands alone.
+            if self.peeked == Tok::Ident("schema") {
+                return Err(self.syntax_error_here());
             }
+            self.alter_table_set_action()
         } else if self.eat_ident("reset")? {
             self.expect_op("(")?;
             let names = self.relation_storage_option_names()?;
@@ -6883,9 +7368,10 @@ impl<'a> Parser<'a> {
             Ok(AlterAction::ResetStorageOptions(names))
         } else if self.eat_ident("add")? {
             // ADD [CONSTRAINT name] <table constraint> vs ADD [COLUMN] <def>.
+            let constraint_at = SourcePosition::new(Some(self.peek_at));
             if self.eat_ident("constraint")? {
                 let cname = self.col_ident("constraint name")?;
-                return self.alter_table_add_constraint(Some(cname));
+                return self.alter_table_add_constraint(Some(cname), constraint_at);
             }
             if matches!(
                 self.peeked,
@@ -6893,8 +7379,9 @@ impl<'a> Parser<'a> {
                     | Tok::Ident("unique")
                     | Tok::Ident("check")
                     | Tok::Ident("foreign")
+                    | Tok::Ident("exclude")
             ) {
-                return self.alter_table_add_constraint(None);
+                return self.alter_table_add_constraint(None, constraint_at);
             }
             let _ = self.eat_ident("column")?;
             let if_not_exists = if self.eat_ident("if")? {
@@ -6932,63 +7419,7 @@ impl<'a> Parser<'a> {
             } else {
                 crate::sql::ast::ParsedCollation::DEFAULT
             };
-            let mut not_null = false;
-            let mut not_null_name = None;
-            let mut null_clause = None;
-            let mut not_null_inheritable = true;
-            let mut unique = false;
-            let mut default = None;
-            let mut default_text = None;
-            let mut generated_text = None;
-            let mut identity = None;
-            loop {
-                let constraint_at = self.peek_at;
-                let constraint_name = if self.eat_ident("constraint")? {
-                    Some(self.col_ident("constraint name")?)
-                } else {
-                    None
-                };
-                if constraint_name.is_some() && !matches!(self.peeked, Tok::Ident("not")) {
-                    return Err(self.err_here("ADD COLUMN supports a named NOT NULL clause here"));
-                }
-                if self.eat_ident("not")? {
-                    self.expect_ident("null")?;
-                    if null_clause == Some(false) {
-                        return Err(self.conflicting_null_declarations(constraint_at, name, table));
-                    }
-                    null_clause = Some(true);
-                    not_null = true;
-                    if let Some(name) = constraint_name {
-                        if not_null_name.is_some_and(|previous| previous != name) {
-                            return Err(self.err_here("conflicting not-null constraint names"));
-                        }
-                        not_null_name = Some(name);
-                    }
-                    if self.eat_ident("no")? {
-                        self.expect_ident("inherit")?;
-                        not_null_inheritable = false;
-                    }
-                } else if self.eat_ident("null")? {
-                    if null_clause == Some(true) {
-                        return Err(self.conflicting_null_declarations(constraint_at, name, table));
-                    }
-                    null_clause = Some(false);
-                    not_null = false;
-                } else if self.eat_ident("default")? {
-                    let start = self.peek_at;
-                    default = Some(self.column_default_expression()?);
-                    default_text = Some(self.text[start..self.peek_at].trim_end());
-                } else if self.eat_ident("generated")? {
-                    match self.generated_clause()? {
-                        crate::sql::ast::ColGen::Generated(text) => generated_text = Some(text),
-                        crate::sql::ast::ColGen::Identity(spec) => identity = Some(spec),
-                    }
-                } else if self.eat_ident("unique")? {
-                    unique = true;
-                } else {
-                    break;
-                }
-            }
+            let clauses = self.column_clauses(name, table, false, column_constraints)?;
             Ok(AlterAction::AddColumn {
                 definition: ColumnDef {
                     name,
@@ -6998,15 +7429,15 @@ impl<'a> Parser<'a> {
                     foreign_options,
                     storage,
                     compression,
-                    not_null,
-                    not_null_name,
-                    not_null_inheritable,
-                    unique,
-                    primary: false,
-                    default,
-                    default_text,
-                    generated_text,
-                    identity,
+                    not_null: clauses.not_null,
+                    not_null_name: clauses.not_null_name,
+                    not_null_inheritable: clauses.not_null_inheritable,
+                    unique: clauses.unique,
+                    primary: clauses.primary,
+                    default: clauses.default,
+                    default_text: clauses.default_text,
+                    generated_text: clauses.generated_text,
+                    identity: clauses.identity,
                 },
                 if_not_exists,
             })
@@ -7126,7 +7557,7 @@ impl<'a> Parser<'a> {
             // | DROP NOT NULL }.
             let _ = self.eat_ident("column")?;
             let column = self.col_ident("column name")?;
-            if foreign && self.eat_ident("options")? {
+            if self.eat_ident("options")? {
                 return Ok(AlterAction::SetColumnForeignOptions {
                     column,
                     options: self.alter_foreign_options()?,
@@ -7383,6 +7814,7 @@ impl<'a> Parser<'a> {
     fn alter_table_add_constraint(
         &mut self,
         name: Option<&'a str>,
+        source_position: SourcePosition,
     ) -> Result<AlterAction<'a>, ParseError> {
         let primary = if self.eat_ident("primary")? {
             self.expect_ident("key")?;
@@ -7393,14 +7825,20 @@ impl<'a> Parser<'a> {
             None
         };
         let Some(primary) = primary else {
-            return Ok(AlterAction::AddConstraint(
-                self.table_constraint(name, true)?,
-            ));
+            return Ok(AlterAction::AddConstraint(self.table_constraint(
+                name,
+                source_position,
+                ddl::ConstraintSite::AlterTable,
+            )?));
         };
         if self.eat_ident("using")? {
             self.expect_ident("index")?;
             let index = self.qual_name("index name")?;
-            let timing = self.constraint_timing(false)?;
+            let timing = self.constraint_timing(if primary {
+                ddl::ConstraintAttributeRules::PRIMARY_KEY
+            } else {
+                ddl::ConstraintAttributeRules::UNIQUE
+            })?;
             return Ok(AlterAction::AttachIndexConstraint {
                 name,
                 index,
@@ -7414,15 +7852,21 @@ impl<'a> Parser<'a> {
             self.unique_nulls_not_distinct()?
         };
         let columns = self.column_name_list()?;
-        let timing = self.constraint_timing(false)?;
+        let timing = self.constraint_timing(if primary {
+            ddl::ConstraintAttributeRules::PRIMARY_KEY
+        } else {
+            ddl::ConstraintAttributeRules::UNIQUE
+        })?;
         Ok(AlterAction::AddConstraint(if primary {
             TableConstraint::PrimaryKey {
+                source_position,
                 name,
                 columns,
                 timing,
             }
         } else {
             TableConstraint::Unique {
+                source_position,
                 name,
                 columns,
                 timing,
@@ -7508,25 +7952,21 @@ impl<'a> Parser<'a> {
         self.expect_ident("insert")?;
         self.expect_ident("into")?;
         let table = self.qual_name("table name")?;
-        let mut column_names = ArenaList::new(self.arena);
-        // Subscripted targets (`INSERT INTO t (a[1]) ...`) by column position.
-        let mut column_subscripts: ArenaList<'a, (usize, &'a [AssignmentSubscript<'a>])> =
-            ArenaList::new(self.arena);
-        if self.peeked == Tok::Op("(") {
-            self.advance()?;
-            loop {
-                let column = self.col_ident("column name")?;
-                let subscripts = self.assignment_subscripts()?;
-                if !subscripts.is_empty() {
-                    self.push(&mut column_subscripts, (column_names.len(), subscripts))?;
-                }
-                self.push(&mut column_names, column)?;
-                if !self.eat_op(",")? {
-                    break;
-                }
-            }
-            self.expect_op(")")?;
-        }
+        let alias = if self.eat_ident("as")? {
+            Some(self.col_ident("table alias")?)
+        } else {
+            None
+        };
+        // `(` starts the column list unless it opens a parenthesized query.
+        let targets = if self.peeked == Tok::Op("(")
+            && !matches!(
+                self.lookahead(1)?,
+                Tok::Ident("select" | "values" | "with" | "table") | Tok::Op("(")
+            ) {
+            self.insert_targets()?
+        } else {
+            InsertTargets::EMPTY
+        };
         // OVERRIDING { SYSTEM | USER } VALUE for identity columns.
         let overriding = if self.eat_ident("overriding")? {
             let mode = if self.eat_ident("system")? {
@@ -7561,11 +8001,15 @@ impl<'a> Parser<'a> {
             self.push(&mut rows, &[])?;
         } else {
             self.expect_ident("values")?;
+            let mut first_default = None;
             loop {
                 self.expect_op("(")?;
                 let mut row = ArenaList::new(self.arena);
                 loop {
-                    let value = self.expression(0)?;
+                    let value = self.value_or_default()?;
+                    if matches!(value, Expr::DefaultMarker) {
+                        first_default.get_or_insert(self.last_default);
+                    }
                     self.push(&mut row, value)?;
                     if !self.eat_op(",")? {
                         break;
@@ -7578,194 +8022,403 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
-        }
-        if !column_subscripts.is_empty()
-            && let Some(query) = select
-        {
-            // PostgreSQL assigns each subscripted target from its output
-            // column into a NULL of the column's type: select the assignments
-            // from the query.
-            const SOURCE: &str = crate::sql::ast::INSERT_SUBSCRIPT_SOURCE;
-            let width = column_names.len();
-            let names = self
-                .arena
-                .alloc_slice_with(width, |_| "")
-                .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
-            let mut items = ArenaList::new(self.arena);
-            for (index, name) in names.iter_mut().enumerate() {
-                *name = self
-                    .arena
-                    .alloc_str_display(format_args!("column{}", index + 1))
-                    .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
-                let value = self.arena_expr(Expr::Column {
-                    qualifier: Some(SOURCE),
-                    name,
-                })?;
-                let expression = match column_subscripts
-                    .as_slice()
-                    .iter()
-                    .find(|(column, _)| *column == index)
-                {
-                    Some((_, subscripts)) => {
-                        let base = self.arena_expr(Expr::Null)?;
-                        self.subscript_assignment(base, value, subscripts)?
-                    }
-                    None => value,
-                };
-                self.push(
-                    &mut items,
-                    SelectItem::Expr {
-                        expression,
-                        alias: None,
-                    },
-                )?;
-            }
-            let wrapped = Select {
-                items: items.as_slice(),
-                distinct: false,
-                distinct_on: &[],
-                from: Some(FromClause {
-                    base: TableRef {
-                        schema: None,
-                        table: "",
-                        alias: Some(SOURCE),
-                        subquery: Some(query),
-                        func_args: None,
-                        func_argument_names: &[],
-                        func_variadic: false,
-                        func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
-                        rows_from: None,
-                        col_alias: Some(&*names),
-                        inheritance: crate::sql::ast::RelationInheritance::Descendants,
-                        sample: None,
-                        cte: None,
-                        with_ordinality: false,
-                        lateral: false,
-                        authorization_role: None,
-                        bound_table: None,
-                        view_access: None,
-                    },
-                    joins: &[],
-                }),
-                where_clause: None,
-                group_by: &[],
-                grouping_sets: &[],
-                having: None,
-                order_by: &[],
-                limit: None,
-                offset: None,
-                with_ties: false,
-                with: &[],
-                set_body: None,
-                locking: &[],
-                ..*query
-            };
-            select = Some(
-                self.arena
-                    .alloc(wrapped)
-                    .map_err(|_| self.arena_full("statement too large for SQL arena"))?
-                    as &_,
-            );
-        } else if !column_subscripts.is_empty() {
-            // PostgreSQL assigns into a NULL of the column's type.
-            let rows = rows
-                .as_mut_slice()
-                .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
-            for row in rows.iter_mut() {
-                let mut values = ArenaList::new(self.arena);
-                for (index, value) in row.iter().enumerate() {
-                    let value = match column_subscripts
-                        .as_slice()
-                        .iter()
-                        .find(|(column, _)| *column == index)
-                    {
-                        Some((_, subscripts)) => {
-                            let base = self.arena_expr(Expr::Null)?;
-                            self.subscript_assignment(base, value, subscripts)?
-                        }
-                        None => *value,
-                    };
-                    self.push(&mut values, value)?;
+            // `VALUES ...` followed by a set operation, ORDER BY or LIMIT is
+            // the first part of a query, as PostgreSQL's grammar reads it.
+            if matches!(
+                self.peeked,
+                Tok::Ident(
+                    "union" | "intersect" | "except" | "order" | "limit" | "offset" | "fetch"
+                )
+            ) {
+                // A query's VALUES cannot hold DEFAULT.
+                if let Some(at) = first_default {
+                    self.misplaced_default =
+                        Some(self.misplaced_default.map_or(at, |first| first.min(at)));
                 }
-                *row = values.as_slice();
+                let query = self.insert_values_query(rows.as_slice())?;
+                select = Some(
+                    self.arena
+                        .alloc(query)
+                        .map_err(|_| self.arena_full("statement too large for SQL arena"))?
+                        as &_,
+                );
+                rows = ArenaList::new(self.arena);
             }
+        }
+        let mut columns = targets.names;
+        if !targets.steps.is_empty() {
+            // VALUES rows of another width than the targets read as the
+            // query the subscripted targets select from, which reports the
+            // count mismatch at the target or expression PostgreSQL names.
+            let written = rows.borrowed_slice();
+            if select.is_none()
+                && let Some(width) = written.first().map(|row| row.len())
+                && width != targets.names.len()
+                && written.iter().all(|row| {
+                    row.len() == width
+                        && !row.iter().any(|value| matches!(value, Expr::DefaultMarker))
+                })
+            {
+                let query = self.insert_values_query(written)?;
+                select = Some(
+                    self.arena
+                        .alloc(query)
+                        .map_err(|_| self.arena_full("statement too large for SQL arena"))?
+                        as &_,
+                );
+                rows = ArenaList::new(self.arena);
+            }
+            if let Some(query) = select {
+                // Select the assignments from the query's output columns.
+                const SOURCE: &str = crate::sql::ast::INSERT_SUBSCRIPT_SOURCE;
+                let names = self
+                    .arena
+                    .alloc_slice_with(targets.names.len(), |_| "")
+                    .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+                for (index, name) in names.iter_mut().enumerate() {
+                    *name = self
+                        .arena
+                        .alloc_str_display(format_args!("column{}", index + 1))
+                        .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+                    // An output without a written value is reported at its
+                    // target.
+                    if let Some(copies) = &self.source_copies
+                        && copies
+                            .borrow_mut()
+                            .push(crate::sql::error_position::SourceCopy {
+                                address: name.as_ptr() as usize,
+                                len: name.len(),
+                                at: targets.positions[index],
+                            })
+                            .is_err()
+                    {
+                        return Err(self.arena_full("statement too large for SQL arena"));
+                    }
+                }
+                let names = &*names;
+                let values = self.insert_target_values(&targets, &mut |parser, target| {
+                    parser.arena_expr(Expr::Column {
+                        qualifier: Some(SOURCE),
+                        name: names[target],
+                    })
+                })?;
+                let mut items = ArenaList::new(self.arena);
+                for expression in values {
+                    self.push(
+                        &mut items,
+                        SelectItem::Expr {
+                            expression,
+                            alias: None,
+                        },
+                    )?;
+                }
+                let wrapped = Select {
+                    items: items.as_slice(),
+                    distinct: false,
+                    distinct_on: &[],
+                    windows: &[],
+                    from: Some(FromClause {
+                        base: TableRef {
+                            schema: None,
+                            table: "",
+                            alias: Some(SOURCE),
+                            subquery: Some(query),
+                            func_args: None,
+                            func_argument_names: &[],
+                            func_variadic: false,
+                            func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                            rows_from: None,
+                            col_alias: Some(names),
+                            inheritance: crate::sql::ast::RelationInheritance::Descendants,
+                            sample: None,
+                            cte: None,
+                            with_ordinality: false,
+                            lateral: false,
+                            authorization_role: None,
+                            bound_table: None,
+                            view_access: None,
+                            join_members: None,
+                        },
+                        joins: &[],
+                    }),
+                    where_clause: None,
+                    group_by: &[],
+                    grouping_sets: &[],
+                    having: None,
+                    order_by: &[],
+                    limit: None,
+                    offset: None,
+                    with_ties: false,
+                    with: &[],
+                    set_body: None,
+                    locking: &[],
+                    ..*query
+                };
+                select = Some(
+                    self.arena
+                        .alloc(wrapped)
+                        .map_err(|_| self.arena_full("statement too large for SQL arena"))?
+                        as &_,
+                );
+            } else {
+                let rows = rows
+                    .as_mut_slice()
+                    .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+                for row in rows.iter_mut() {
+                    let written = *row;
+                    if written.len() != targets.names.len() {
+                        // The executor reports the count mismatch.
+                        continue;
+                    }
+                    *row =
+                        self.insert_target_values(&targets, &mut |_, target| Ok(written[target]))?;
+                }
+            }
+            columns = self.insert_target_columns(&targets)?;
         }
         let on_conflict = self.on_conflict()?;
         let returning = self.returning()?;
         Ok(Stmt::Insert(Insert {
             source_position,
             table,
-            columns: column_names.as_slice(),
+            alias,
+            columns,
             rows: rows.as_slice(),
             select,
             on_conflict,
             returning,
             overriding,
+            values_defaults: &[],
         }))
+    }
+
+    /// A query whose first leaf is the already-parsed `VALUES` `rows`.
+    fn insert_values_query(
+        &mut self,
+        rows: &[&'a [&'a Expr<'a>]],
+    ) -> Result<Select<'a>, ParseError> {
+        let mut tree: Option<&'a SetTree<'a>> = None;
+        for row in rows {
+            let mut items = ArenaList::new(self.arena);
+            for expression in row.iter().copied() {
+                let alias = self
+                    .arena
+                    .alloc_str_display(format_args!("column{}", items.len() + 1))
+                    .map_err(|_| self.err_here("VALUES too large"))?;
+                self.push(
+                    &mut items,
+                    SelectItem::Expr {
+                        expression,
+                        alias: Some(alias),
+                    },
+                )?;
+            }
+            let leaf = self.alloc_set(SetTree::Select(
+                self.arena
+                    .alloc(Select {
+                        items: items.as_slice(),
+                        ..Select::EMPTY
+                    })
+                    .map_err(|_| self.err_here("VALUES too large"))?,
+            ))?;
+            tree = Some(match tree {
+                None => leaf,
+                Some(left) => self.alloc_set(SetTree::Op {
+                    syntax: crate::sql::ast::SetOperationSyntax::Values,
+                    operator: SetOp::Union,
+                    all: true,
+                    left,
+                    right: leaf,
+                })?,
+            });
+        }
+        let first = tree.ok_or_else(|| self.syntax_error_here())?;
+        let enclosing_windows = core::mem::replace(&mut self.windows, ArenaList::new(self.arena));
+        let saved_allow = self.allow_into;
+        self.allow_into = false;
+        let body = self.set_union_after(first)?;
+        let (order_by, limit, offset, with_ties) = self.order_limit()?;
+        let locking = self.locking_clauses()?;
+        self.allow_into = saved_allow;
+        self.windows = enclosing_windows;
+        Ok(Select {
+            order_by,
+            limit,
+            offset,
+            with_ties,
+            set_body: Some(body),
+            locking,
+            ..Select::EMPTY
+        })
+    }
+
+    /// `(column[indirection], ...)` of an INSERT, with PostgreSQL's
+    /// checkInsertTargets: a whole column appears once; several targets
+    /// through indirection may share a column.
+    fn insert_targets(&mut self) -> Result<InsertTargets<'a>, ParseError> {
+        let mut names = ArenaList::new(self.arena);
+        let mut steps: ArenaList<'a, (usize, &'a [Indirection<'a>])> = ArenaList::new(self.arena);
+        let mut positions = ArenaList::new(self.arena);
+        self.expect_op("(")?;
+        loop {
+            let column_at = self.peek_at;
+            let column = self.col_ident("column name")?;
+            let path = self.assignment_indirection()?;
+            let written = names.borrowed_slice();
+            let whole = written.iter().enumerate().any(|(index, name)| {
+                *name == column && !steps.borrowed_slice().iter().any(|(at, _)| *at == index)
+            });
+            if whole || (path.is_empty() && written.contains(&column)) {
+                self.analysis_error(ParseError {
+                    at: column_at,
+                    message: stack_format!(
+                        PARSE_MESSAGE_BYTES,
+                        "column \"{}\" specified more than once",
+                        column
+                    ),
+                    sqlstate: sqlstate::DUPLICATE_COLUMN,
+                    cursor: Some(column_at),
+                    hint: None,
+                    near: None,
+                    detail: None,
+                })?;
+            }
+            if !path.is_empty() {
+                self.push(&mut steps, (names.len(), path))?;
+            }
+            self.push(&mut names, column)?;
+            self.push(&mut positions, column_at)?;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        Ok(InsertTargets {
+            names: names.as_slice(),
+            steps: steps.as_slice(),
+            positions: positions.as_slice(),
+        })
+    }
+
+    /// The INSERT columns after targets of one column merge.
+    fn insert_target_columns(
+        &mut self,
+        targets: &InsertTargets<'a>,
+    ) -> Result<&'a [&'a str], ParseError> {
+        let mut columns = ArenaList::new(self.arena);
+        for (index, name) in targets.names.iter().enumerate() {
+            if targets.kept(index) {
+                self.push(&mut columns, *name)?;
+            }
+        }
+        Ok(columns.as_slice())
+    }
+
+    /// One value per INSERT column from the values written to its targets.
+    /// PostgreSQL assigns a target with indirection into a NULL of its
+    /// column's type, and merged targets left to right.
+    fn insert_target_values(
+        &mut self,
+        targets: &InsertTargets<'a>,
+        value_at: &mut dyn FnMut(&mut Self, usize) -> Result<&'a Expr<'a>, ParseError>,
+    ) -> Result<&'a [&'a Expr<'a>], ParseError> {
+        let mut values = ArenaList::new(self.arena);
+        for (index, name) in targets.names.iter().enumerate() {
+            if !targets.kept(index) {
+                continue;
+            }
+            let merged = targets.merged(name);
+            let mut value = None;
+            for (target, target_name) in targets.names.iter().enumerate().skip(index) {
+                if target_name != name || (target != index && !merged) {
+                    continue;
+                }
+                let written = value_at(self, target)?;
+                value = Some(match targets.path(target) {
+                    Some(path) => {
+                        self.reject_default_through(written, path, targets.positions[target])?;
+                        let base = match value {
+                            Some(previous) => previous,
+                            None => self.arena_expr(Expr::Null)?,
+                        };
+                        self.indirection_assignment(base, written, path)?
+                    }
+                    None => written,
+                });
+            }
+            self.push(&mut values, value.expect("a kept target has a value"))?;
+        }
+        Ok(values.as_slice())
+    }
+
+    /// PostgreSQL cannot assign DEFAULT through a field or subscript.
+    fn reject_default_through(
+        &mut self,
+        value: &Expr<'a>,
+        path: &[Indirection<'a>],
+        target_at: usize,
+    ) -> Result<(), ParseError> {
+        if !matches!(value, Expr::DefaultMarker) {
+            return Ok(());
+        }
+        let field = path
+            .iter()
+            .any(|step| matches!(step, Indirection::Field(_)));
+        self.analysis_error(ParseError {
+            at: target_at,
+            message: StackStr::from_str(if field {
+                "cannot set a subfield to DEFAULT"
+            } else {
+                "cannot set an array element to DEFAULT"
+            }),
+            sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            cursor: Some(target_at),
+            hint: None,
+            near: None,
+            detail: None,
+        })
     }
 
     /// Parses a DML `SET` list into its scalar execution form. A row target is
     /// expanded here so every executor shares the same assignment semantics.
     fn assignment_list(&mut self) -> Result<&'a [(&'a str, &'a Expr<'a>)], ParseError> {
         let mut assignments: ArenaList<'a, (&'a str, &'a Expr<'a>)> = ArenaList::new(self.arena);
+        // Whether each assignment writes through indirection (a field or
+        // subscript), which lets later ones to its column build on it.
+        let mut indirect: ArenaList<'a, bool> = ArenaList::new(self.arena);
         loop {
             let mut names = ArenaList::new(self.arena);
-            let mut subscripts = ArenaList::new(self.arena);
-            if self.eat_op("(")? {
-                loop {
-                    let name = self.col_ident("column name")?;
-                    self.push(&mut names, name)?;
-                    if !self.eat_op(",")? {
-                        break;
-                    }
-                }
-                self.expect_op(")")?;
-            } else {
+            let mut paths: ArenaList<'a, &'a [Indirection<'a>]> = ArenaList::new(self.arena);
+            let mut positions = ArenaList::new(self.arena);
+            let multiple = self.eat_op("(")?;
+            loop {
+                self.push(&mut positions, self.peek_at)?;
                 let name = self.col_ident("column name")?;
                 self.push(&mut names, name)?;
-                for subscript in self.assignment_subscripts()? {
-                    self.push(&mut subscripts, *subscript)?;
+                let path = self.assignment_indirection()?;
+                self.push(&mut paths, path)?;
+                if !multiple || !self.eat_op(",")? {
+                    break;
                 }
+            }
+            if multiple {
+                self.expect_op(")")?;
             }
             self.expect_op("=")?;
 
             let name_count = names.len();
             let mut values = ArenaList::new(self.arena);
-            let value_count = if name_count == 1 {
-                let mut value = self.expression(0)?;
-                if !subscripts.is_empty() {
-                    let base = assignments
-                        .as_slice()
-                        .iter()
-                        .find_map(|(previous, assigned)| {
-                            (*previous == names.as_slice()[0]
-                                && matches!(
-                                    **assigned,
-                                    Expr::Call {
-                                        name: "__jsonb_subscript_set" | "__array_subscript_set",
-                                        ..
-                                    }
-                                ))
-                            .then_some(*assigned)
-                        })
-                        .map_or_else(
-                            || {
-                                self.arena_expr(Expr::Column {
-                                    qualifier: None,
-                                    name: names.as_slice()[0],
-                                })
-                            },
-                            Ok,
-                        )?;
-                    value = self.subscript_assignment(base, value, subscripts.as_slice())?;
-                }
+            let value_count = if !multiple {
+                let value = self.value_or_default()?;
                 self.push(&mut values, value)?;
                 1
             } else if self.eat_ident("row")? {
                 self.expect_op("(")?;
                 self.assignment_row_values(&mut values)?;
                 values.len()
-            } else if self.eat_op("(")? {
+            } else if self.peeked == Tok::Op("(") {
+                let open_at = self.peek_at;
+                self.advance()?;
                 if matches!(self.peeked, Tok::Ident("select") | Tok::Ident("with")) {
                     let select = self.query_select()?;
                     self.expect_op(")")?;
@@ -7775,7 +8428,8 @@ impl<'a> Parser<'a> {
                         .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
                     let arity = u8::try_from(name_count)
                         .map_err(|_| self.err_here("assignment target is too wide"))?;
-                    let record = self.arena_expr(Expr::RowSubquery { select, arity })?;
+                    let record =
+                        self.arena_expr_at(Expr::RowSubquery { select, arity }, open_at)?;
                     for index in 0..name_count {
                         let field = self.arena_expr(Expr::RecordFieldIndex {
                             base: record,
@@ -7810,37 +8464,180 @@ impl<'a> Parser<'a> {
                     detail: None,
                 });
             }
-            for (name, value) in names.as_slice().iter().zip(values.as_slice()) {
-                if let Some(previous) = assignments
+            for (((name, value), path), at) in names
+                .as_slice()
+                .iter()
+                .zip(values.as_slice())
+                .zip(paths.as_slice())
+                .zip(positions.as_slice())
+            {
+                if !path.is_empty() {
+                    self.reject_default_through(value, path, *at)?;
+                }
+                let previous = assignments
                     .borrowed_slice()
                     .iter()
-                    .position(|(previous, _)| previous == name)
-                {
-                    if !subscripts.is_empty()
-                        && matches!(
-                            *assignments.borrowed_slice()[previous].1,
-                            Expr::Call {
-                                name: "__jsonb_subscript_set" | "__array_subscript_set",
-                                ..
-                            }
-                        )
-                    {
+                    .position(|(previous, _)| previous == name);
+                if path.is_empty() {
+                    if previous.is_some() {
+                        return Err(self.multiple_assignments(name));
+                    }
+                    self.push(&mut assignments, (*name, *value))?;
+                    self.push(&mut indirect, false)?;
+                    continue;
+                }
+                // Assignments through indirection to one column apply left to
+                // right, each to the value the earlier ones built.
+                let base = match previous {
+                    Some(previous) if indirect.borrowed_slice()[previous] => {
+                        assignments.borrowed_slice()[previous].1
+                    }
+                    Some(_) => return Err(self.multiple_assignments(name)),
+                    None => self.arena_expr(Expr::Column {
+                        qualifier: None,
+                        name,
+                    })?,
+                };
+                let assigned = self.indirection_assignment(base, value, path)?;
+                match previous {
+                    Some(previous) => {
                         assignments
                             .as_mut_slice()
                             .map_err(|_| self.arena_full("assignments exceed statement arena"))?
                             [previous]
-                            .1 = *value;
-                        continue;
+                            .1 = assigned;
                     }
-                    return Err(self.err_here("multiple assignments to the same column"));
+                    None => {
+                        self.push(&mut assignments, (*name, assigned))?;
+                        self.push(&mut indirect, true)?;
+                    }
                 }
-                self.push(&mut assignments, (*name, *value))?;
             }
             if !self.eat_op(",")? {
                 break;
             }
         }
         Ok(assignments.as_slice())
+    }
+
+    /// PostgreSQL's rewriter rejects this without a cursor position.
+    fn multiple_assignments(&self, name: &str) -> ParseError {
+        ParseError {
+            at: self.peek_at,
+            message: stack_format!(
+                PARSE_MESSAGE_BYTES,
+                "multiple assignments to same column \"{}\"",
+                name
+            ),
+            sqlstate: sqlstate::SYNTAX_ERROR,
+            cursor: None,
+            hint: None,
+            near: None,
+            detail: None,
+        }
+    }
+
+    /// The fields (`.x`) and subscripts (`[i]`) after an assignment target's
+    /// column.
+    fn assignment_indirection(&mut self) -> Result<&'a [Indirection<'a>], ParseError> {
+        let mut steps = ArenaList::new(self.arena);
+        loop {
+            if self.eat_op(".")? {
+                let field = self.col_ident("field name")?;
+                self.push(&mut steps, Indirection::Field(field))?;
+            } else if self.peeked == Tok::Op("[") {
+                let subscripts = self.assignment_subscripts()?;
+                self.push(&mut steps, Indirection::Subscripts(subscripts))?;
+            } else {
+                break;
+            }
+        }
+        Ok(steps.as_slice())
+    }
+
+    /// `base<path> := value`. Subscripts alone use the subscript assignment
+    /// calls; a path through a field is one `__assign_path(base, value,
+    /// type, kinds, operands...)` call, `type` being the base's type OID when
+    /// the base is an untyped NULL (`f` steps carry a field name, `e` steps
+    /// an element subscript).
+    fn indirection_assignment(
+        &mut self,
+        base: &'a Expr<'a>,
+        value: &'a Expr<'a>,
+        path: &[Indirection<'a>],
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        if let [Indirection::Subscripts(subscripts)] = path {
+            return self.subscript_assignment(base, value, subscripts);
+        }
+        let mut kinds = StackStr::<32>::new();
+        let mut operands = ArenaList::new(self.arena);
+        for (at, step) in path.iter().enumerate() {
+            use core::fmt::Write as _;
+            match step {
+                Indirection::Field(name) => {
+                    let _ = kinds.write_char('f');
+                    let name = self.arena_expr(Expr::Str(name))?;
+                    self.push(&mut operands, name)?;
+                }
+                Indirection::Subscripts(subscripts) => {
+                    let sliced = subscripts
+                        .iter()
+                        .any(|subscript| matches!(subscript, AssignmentSubscript::Slice { .. }));
+                    if sliced && at + 1 != path.len() {
+                        return Err(ParseError {
+                            at: self.peek_at,
+                            message: stack_format!(
+                                PARSE_MESSAGE_BYTES,
+                                "assignment through an array slice is not supported"
+                            ),
+                            sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                            cursor: None,
+                            hint: None,
+                            near: None,
+                            detail: None,
+                        });
+                    }
+                    for subscript in *subscripts {
+                        // A list holding any slice is a slice throughout.
+                        let (kind, lower, upper) = match subscript {
+                            AssignmentSubscript::Element(index) if sliced => {
+                                ('u', None, Some(*index))
+                            }
+                            AssignmentSubscript::Element(index) => ('e', Some(*index), None),
+                            AssignmentSubscript::Slice { lower, upper } => (
+                                match (lower, upper) {
+                                    (Some(_), Some(_)) => 's',
+                                    (Some(_), None) => 'l',
+                                    (None, Some(_)) => 'u',
+                                    (None, None) => 'a',
+                                },
+                                *lower,
+                                *upper,
+                            ),
+                        };
+                        let _ = kinds.write_char(kind);
+                        for bound in [lower, upper].into_iter().flatten() {
+                            self.push(&mut operands, bound)?;
+                        }
+                    }
+                }
+            }
+        }
+        if kinds.is_truncated() {
+            return Err(self.err_here("assignment target is too deep"));
+        }
+        let mut call_args = ArenaList::new(self.arena);
+        self.push(&mut call_args, base)?;
+        self.push(&mut call_args, value)?;
+        let untyped = self.arena_expr(Expr::Null)?;
+        self.push(&mut call_args, untyped)?;
+        let kinds = self.arena_str(kinds.as_str())?;
+        let kinds = self.arena_expr(Expr::Str(kinds))?;
+        self.push(&mut call_args, kinds)?;
+        for operand in operands.as_slice() {
+            self.push(&mut call_args, *operand)?;
+        }
+        self.plain_call("__assign_path", call_args.as_slice())
     }
 
     /// The `[i]`, `[lower:upper]` subscripts after an assignment target.
@@ -7943,12 +8740,22 @@ impl<'a> Parser<'a> {
 
     /// Parses the comma-separated body after a multi-column assignment's
     /// opening parenthesis and consumes its closing parenthesis.
+    /// One INSERT or assigned value, where a whole `DEFAULT` is allowed.
+    fn value_or_default(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        let value = self.expression(0)?;
+        if matches!(value, Expr::DefaultMarker) && self.misplaced_default == Some(self.last_default)
+        {
+            self.misplaced_default = None;
+        }
+        Ok(value)
+    }
+
     fn assignment_row_values(
         &mut self,
         values: &mut ArenaList<'a, &'a Expr<'a>>,
     ) -> Result<(), ParseError> {
         loop {
-            let value = self.expression(0)?;
+            let value = self.value_or_default()?;
             self.push(values, value)?;
             if !self.eat_op(",")? {
                 break;
@@ -8031,7 +8838,7 @@ impl<'a> Parser<'a> {
         self.expect_ident("set")?;
         let assignments = self.assignment_list()?;
         let from = if self.eat_ident("from")? {
-            let fc = self.from_clause()?;
+            let fc = self.dml_from_clause()?;
             Some(
                 &*self
                     .arena
@@ -8178,20 +8985,12 @@ impl<'a> Parser<'a> {
             return Ok(MergeSourceAction::DoNothing);
         }
         self.expect_ident("insert")?;
-        let mut columns: &'a [&'a str] = &[];
-        if self.peeked == Tok::Op("(") {
-            self.advance()?;
-            let mut names = ArenaList::new(self.arena);
-            loop {
-                let name = self.col_ident("column name")?;
-                self.push(&mut names, name)?;
-                if !self.eat_op(",")? {
-                    break;
-                }
-            }
-            self.expect_op(")")?;
-            columns = names.as_slice();
-        }
+        let targets = if self.peeked == Tok::Op("(") {
+            self.insert_targets()?
+        } else {
+            InsertTargets::EMPTY
+        };
+        let mut columns = targets.names;
         let overriding = if self.eat_ident("overriding")? {
             let mode = if self.eat_ident("system")? {
                 crate::sql::ast::Overriding::System
@@ -8220,16 +9019,21 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         let mut vals = ArenaList::new(self.arena);
         loop {
-            let value = self.expression(0)?;
+            let value = self.value_or_default()?;
             self.push(&mut vals, value)?;
             if !self.eat_op(",")? {
                 break;
             }
         }
         self.expect_op(")")?;
+        let mut values = vals.as_slice();
+        if !targets.steps.is_empty() && values.len() == targets.names.len() {
+            values = self.insert_target_values(&targets, &mut |_, target| Ok(values[target]))?;
+            columns = self.insert_target_columns(&targets)?;
+        }
         Ok(MergeSourceAction::Insert {
             columns,
-            values: vals.as_slice(),
+            values,
             default_values: false,
             overriding,
         })
@@ -8660,7 +9464,7 @@ impl<'a> Parser<'a> {
             None
         };
         let using = if self.eat_ident("using")? {
-            let fc = self.from_clause()?;
+            let fc = self.dml_from_clause()?;
             Some(
                 &*self
                     .arena
@@ -8707,6 +9511,12 @@ impl<'a> Parser<'a> {
             end: self.lexer.token_end(),
         };
         let mut quoted = matches!(self.peeked, Tok::QuotedIdent(_));
+        // A fully reserved word never names a type (`f(x any)`); `"any"` does.
+        if let Tok::Ident(word) = self.peeked
+            && keyword_category(word) == Some(Keyword::Reserved)
+        {
+            return Err(self.syntax_error_here());
+        }
         let mut name = self.any_ident("type name")?;
         let mut written = WrittenTypeName {
             schema: None,
@@ -8754,7 +9564,7 @@ impl<'a> Parser<'a> {
                 name: base,
                 array: false,
             };
-            name = if schema == "pg_catalog" || schema == "information_schema" {
+            name = if schema == "pg_catalog" {
                 quoted = base_quoted;
                 base
             } else {
@@ -9330,6 +10140,34 @@ impl<'a> Parser<'a> {
         Ok(next == Tok::Ident(word))
     }
 
+    /// Whether the current identifier starts a call: `lower(a)`.
+    fn peek_is_function_call(&mut self) -> Result<bool, ParseError> {
+        if !matches!(self.peeked, Tok::Ident(_) | Tok::QuotedIdent(_)) {
+            return Ok(false);
+        }
+        let mark = self.lexer.mark();
+        let mut next = self
+            .lexer
+            .next_token()
+            .map_err(|error| ParseError::lexical(error, self.text))?;
+        // A qualified name: `schema.function(`.
+        while next == Tok::Op(".") {
+            let name = self
+                .lexer
+                .next_token()
+                .map_err(|error| ParseError::lexical(error, self.text))?;
+            if !matches!(name, Tok::Ident(_) | Tok::QuotedIdent(_)) {
+                break;
+            }
+            next = self
+                .lexer
+                .next_token()
+                .map_err(|error| ParseError::lexical(error, self.text))?;
+        }
+        self.lexer.reset(mark);
+        Ok(next == Tok::Op("("))
+    }
+
     fn eat_op(&mut self, operator: &str) -> Result<bool, ParseError> {
         if self.peeked == Tok::Op(operator) {
             self.advance()?;
@@ -9409,6 +10247,68 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A column reference of four or more names after `catalog.schema.table`:
+    /// `database.schema.table.column` must name the session's database, and a
+    /// longer reference is improper, as in PostgreSQL's parse analysis.
+    pub(super) fn catalog_qualified_column(
+        &mut self,
+        at: usize,
+        catalog: &'a str,
+        schema: &'a str,
+        table: &'a str,
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        let mut written = stack_format!(PARSE_MESSAGE_BYTES, "{catalog}.{schema}.{table}");
+        let mut last = None;
+        let mut parts = 3;
+        while self.eat_op(".")? {
+            let part = if self.eat_op("*")? {
+                "*"
+            } else {
+                self.any_ident("column name")?
+            };
+            let _ = core::fmt::Write::write_fmt(&mut written, format_args!(".{part}"));
+            last = Some(part);
+            parts += 1;
+            if part == "*" {
+                break;
+            }
+        }
+        let error = |sqlstate: &'static str, message: core::fmt::Arguments<'_>| ParseError {
+            at,
+            message: stack_format!(PARSE_MESSAGE_BYTES, "{}", message),
+            sqlstate,
+            cursor: Some(at),
+            hint: None,
+            near: None,
+            detail: None,
+        };
+        if parts > 4 {
+            self.analysis_error(error(
+                sqlstate::SYNTAX_ERROR,
+                format_args!("improper qualified name (too many dotted names): {written}"),
+            ))?;
+            return self.arena_expr(Expr::Null);
+        }
+        if !crate::sql::eval::funcs::system::is_current_database(catalog) {
+            self.analysis_error(error(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                format_args!("cross-database references are not implemented: {written}"),
+            ))?;
+            return self.arena_expr(Expr::Null);
+        }
+        match last.expect("a fourth name was read") {
+            "*" => {
+                let qualifier = self.composed_qualifier(schema, table)?;
+                self.arena_expr(Expr::WholeRow(qualifier))
+            }
+            name => self.arena_expr(Expr::SchemaColumn {
+                schema,
+                table,
+                name,
+            }),
+        }
+    }
+
     /// `schema.table` composed into one arena string — the qualifier form a
     /// three-part star (`schema.table.*`) resolves through.
     pub(super) fn composed_qualifier(
@@ -9435,15 +10335,39 @@ impl<'a> Parser<'a> {
             .arena
             .alloc(e)
             .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+        if let Some(copies) = &self.source_copies {
+            let mut copies = copies.borrow_mut();
+            if copies
+                .push(crate::sql::error_position::SourceCopy::node(expression, at))
+                .is_err()
+            {
+                return Err(self.arena_full("statement too large for SQL arena"));
+            }
+            // Rewrites copy a sublink node but share its query, which keeps
+            // the sublink's position.
+            if let Some(select) = crate::sql::error_position::sublink_query(expression)
+                && copies
+                    .push(crate::sql::error_position::SourceCopy::query(select, at))
+                    .is_err()
+            {
+                return Err(self.arena_full("statement too large for SQL arena"));
+            }
+        }
+        Ok(expression)
+    }
+
+    /// Records where the `WHEN` comparing `value` with a simple `CASE`'s
+    /// operand was written.
+    pub(super) fn record_case_when(&self, value: &Expr<'a>, at: usize) -> Result<(), ParseError> {
         if let Some(copies) = &self.source_copies
             && copies
                 .borrow_mut()
-                .push(crate::sql::error_position::SourceCopy::node(expression, at))
+                .push(crate::sql::error_position::SourceCopy::case_when(value, at))
                 .is_err()
         {
             return Err(self.arena_full("statement too large for SQL arena"));
         }
-        Ok(expression)
+        Ok(())
     }
 
     fn arena_expr(&self, e: Expr<'a>) -> Result<&'a Expr<'a>, ParseError> {
@@ -9487,6 +10411,15 @@ impl<'a> Parser<'a> {
                     },
                 })
                 .map_err(|_| self.arena_full("column source map exceeds SQL arena"))?;
+        }
+        if let Expr::Field { base, field } = e
+            && let Expr::Param(index) = base
+            && field != "*"
+        {
+            self.parameter_fields
+                .borrow_mut()
+                .push((*index, field))
+                .map_err(|_| self.arena_full("parameter field list exceeds SQL arena"))?;
         }
         let expression = self
             .arena
@@ -9972,17 +10905,6 @@ impl<'a> Parser<'a> {
 
     fn err_here(&self, message: &'static str) -> ParseError {
         ParseError::new(self.peek_at, message)
-    }
-
-    /// [`Self::invalid_function_definition`] with formatted text.
-    fn invalid_function_definition_owned(
-        &self,
-        message: StackStr<PARSE_MESSAGE_BYTES>,
-    ) -> ParseError {
-        ParseError {
-            message,
-            ..self.invalid_function_definition("")
-        }
     }
 
     /// A CREATE FUNCTION definition error that PostgreSQL raises after
@@ -11972,7 +12894,11 @@ mod tests {
         });
         with_parser("SELECT * FROM (SELECT 1) AS", |p| {
             let error = p.next_stmt().unwrap_err();
-            assert_eq!(error.message.as_str(), "subquery alias is missing");
+            assert_eq!(error.message.as_str(), "syntax error at end of input");
+        });
+        with_parser("SELECT * FROM (SELECT 1) AS select", |p| {
+            let error = p.next_stmt().unwrap_err();
+            assert_eq!(error.message.as_str(), "syntax error at or near \"select\"");
         });
     }
 
@@ -12215,17 +13141,81 @@ mod tests {
 
     #[test]
     fn constraint_attributes_reject_unrepresentable_states_at_parse_time() {
-        for sql in [
-            "CREATE TABLE t (id integer UNIQUE ENFORCED)",
-            "CREATE TABLE t (id integer CHECK (id > 0) DEFERRABLE)",
-            "CREATE TABLE t (id integer UNIQUE INITIALLY DEFERRED)",
-            "CREATE TABLE t (id integer, CHECK (id > 0) NOT VALID)",
-            "CREATE TABLE t (id integer, EXCLUDE USING btree (id WITH =))",
+        for (sql, message, sqlstate, cursor) in [
+            (
+                "CREATE TABLE t (id integer UNIQUE ENFORCED)",
+                "misplaced ENFORCED clause",
+                "42601",
+                34,
+            ),
+            (
+                "CREATE TABLE t (id integer CHECK (id > 0) DEFERRABLE)",
+                "misplaced DEFERRABLE clause",
+                "42601",
+                42,
+            ),
+            (
+                "CREATE TABLE t (id integer REFERENCES r DEFERRABLE NOT DEFERRABLE)",
+                "multiple DEFERRABLE/NOT DEFERRABLE clauses not allowed",
+                "42601",
+                51,
+            ),
+            (
+                "CREATE TABLE t (id integer REFERENCES r INITIALLY DEFERRED NOT DEFERRABLE)",
+                "constraint declared INITIALLY DEFERRED must be DEFERRABLE",
+                "42601",
+                59,
+            ),
+            (
+                "CREATE TABLE t (id integer, CHECK (id > 0) NOT VALID NO INHERIT DEFERRABLE)",
+                "CHECK constraints cannot be marked DEFERRABLE",
+                "0A000",
+                43,
+            ),
+            (
+                "CREATE TABLE t (id integer, UNIQUE (id) DEFERRABLE NOT DEFERRABLE)",
+                "conflicting constraint properties",
+                "42601",
+                51,
+            ),
+            (
+                "CREATE TABLE t (id integer, EXCLUDE USING gist (id WITH &&) NOT VALID)",
+                "EXCLUDE constraints cannot be marked NOT VALID",
+                "0A000",
+                60,
+            ),
         ] {
             with_parser(sql, |parser| {
-                assert!(parser.next_stmt().is_err(), "accepted {sql}")
+                let error = parser.next_stmt().expect_err(sql);
+                assert_eq!(error.message.as_str(), message, "{sql}");
+                assert_eq!(error.sqlstate, sqlstate, "{sql}");
+                assert_eq!(error.cursor, Some(cursor), "{sql}");
             });
         }
+        // INITIALLY DEFERRED implies DEFERRABLE, and a new ordinary table
+        // marks a NOT VALID check valid, as PostgreSQL does.
+        with_parser(
+            "CREATE TABLE t (id integer UNIQUE INITIALLY DEFERRED, \
+             CHECK (id > 0) NOT VALID)",
+            |parser| {
+                let Stmt::CreateTable(table) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!("CREATE TABLE did not parse");
+                };
+                assert!(matches!(
+                    table.constraints,
+                    [
+                        TableConstraint::Unique {
+                            timing: ConstraintTiming::Deferrable(ConstraintMode::Deferred),
+                            ..
+                        },
+                        TableConstraint::Check {
+                            validation: ConstraintValidation::EnforcedValidated,
+                            ..
+                        },
+                    ]
+                ));
+            },
+        );
         with_parser(
             "ALTER TABLE t ADD CONSTRAINT positive CHECK (id > 0) NOT VALID",
             |parser| assert!(parser.next_stmt().unwrap().is_some()),

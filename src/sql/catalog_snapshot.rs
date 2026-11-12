@@ -449,6 +449,7 @@ fn affected_catalogs(change: &super::txn::DdlUndo) -> &'static [&'static str] {
         ColumnAclChanged { .. } => &["pg_attribute", "pg_shdepend"],
         DefaultAclChanged { .. } => &["pg_default_acl", "pg_shdepend"],
         ParameterAclChanged { .. } => &["pg_parameter_acl", "pg_shdepend"],
+        BuiltinRoutineChanged { .. } => &["pg_proc"],
         CommentSet { .. } | CommentIdentityChanged { .. } => {
             &["pg_description", "pg_shdescription"]
         }

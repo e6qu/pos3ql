@@ -64,16 +64,7 @@ impl<'a> SqlJsonWriter<'_, 'a> {
                 )
             }
             Datum::Composite { fields, .. } | Datum::Record(fields) => {
-                out.write_char('{').map_err(|_| arena_full())?;
-                for (index, field) in fields.iter().enumerate() {
-                    if index != 0 {
-                        out.write_char(',').map_err(|_| arena_full())?;
-                    }
-                    json::write_json_raw_string(field.name, out).map_err(|_| arena_full())?;
-                    out.write_char(':').map_err(|_| arena_full())?;
-                    self.write(field.value, field.type_oid, out)?;
-                }
-                out.write_char('}').map_err(|_| arena_full())
+                self.fields(fields, ",", out)
             }
             value => {
                 if let Some(catalog) = self.catalog
@@ -106,6 +97,58 @@ impl<'a> SqlJsonWriter<'_, 'a> {
                 }
                 json::write_datum_json(&value, false, out).map_err(|_| arena_full())
             }
+        }
+    }
+
+    /// PostgreSQL's `composite_to_json`: field names as keys, each value
+    /// converted as `to_json` converts it, members joined by `separator`.
+    fn fields(
+        &self,
+        fields: &[crate::sql::types::RecordField<'a>],
+        separator: &str,
+        out: &mut dyn Write,
+    ) -> Result<(), SqlError> {
+        out.write_char('{').map_err(|_| arena_full())?;
+        for (index, field) in fields.iter().enumerate() {
+            if index != 0 {
+                out.write_str(separator).map_err(|_| arena_full())?;
+            }
+            json::write_json_raw_string(field.name, out).map_err(|_| arena_full())?;
+            out.write_char(':').map_err(|_| arena_full())?;
+            self.write(field.value, field.type_oid, out)?;
+        }
+        out.write_char('}').map_err(|_| arena_full())
+    }
+
+    /// `row_to_json(record, pretty)`: line feeds separate only the top-level
+    /// members, as PostgreSQL's `use_line_feeds` does.
+    fn row(&self, value: Datum<'a>, line_feeds: bool, out: &mut dyn Write) -> Result<(), SqlError> {
+        let separator = if line_feeds { ",\n " } else { "," };
+        match value {
+            Datum::CompositeText {
+                slot,
+                physical_fields,
+                text,
+            } => {
+                let catalog = self.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "JSON composite catalog access is unavailable"
+                    )
+                })?;
+                self.row(
+                    catalog.materialize_composite(slot, physical_fields, text, self.arena)?,
+                    line_feeds,
+                    out,
+                )
+            }
+            Datum::Composite { fields, .. } | Datum::Record(fields) => {
+                self.fields(fields, separator, out)
+            }
+            other => Err(crate::sql::eval::function_argument_mismatch(
+                "row_to_json",
+                &other,
+            )),
         }
     }
 
@@ -867,6 +910,7 @@ pub(crate) fn dispatch<'a>(
         && !name.starts_with("__json_query_")
         && name != "__jsonb_subscript_set"
         && name != "__array_subscript_set"
+        && name != "__assign_path"
         && name != "__json_format"
         && !matches!(
             name,
@@ -1005,6 +1049,96 @@ pub(crate) fn dispatch<'a>(
                 }
                 result
             }
+            "__assign_path" => {
+                // (base, value, base type OID or NULL, kinds, operands...):
+                // `f` steps name a field, `e` steps take an element index.
+                let [base_expression, value, base_type, kinds, operands @ ..] = args else {
+                    return Err(arity_err("assignment through a field", args.len()));
+                };
+                let Expr::Str(kinds) = **kinds else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "path assignment lacks its step kinds"
+                    ));
+                };
+                let base = eval_full(base_expression, arena, params, row, hooks)?;
+                let base_type = match **base_type {
+                    Expr::Int(type_oid) => Some(type_oid as i32),
+                    _ => super::super::expression_type_identity(base_expression, row, hooks)
+                        .ok()
+                        .and_then(|identity| identity.known_oid()),
+                };
+                let value_expression = value;
+                let value = eval_full(value, arena, params, row, hooks)?;
+                // `f` names a field; `e` is an element; `s`, `l`, `u` and `a`
+                // are slices with both, the lower, the upper or no bound.
+                use crate::sql::array_assignment::AssignmentSubscript::{Element, Slice};
+                use crate::sql::assignment_path::Step;
+                let mut steps = [Step::Field(""); 32];
+                if kinds.len() > steps.len() {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "path assignment has too many steps"
+                    ));
+                }
+                let mut operands = operands.iter();
+                let mut operand = || {
+                    operands.next().copied().ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "path assignment steps lack an operand"
+                        )
+                    })
+                };
+                let bound = |operand: &Expr<'a>| -> Result<i32, SqlError> {
+                    assignment_subscript(eval_full(operand, arena, params, row, hooks)?)
+                };
+                for (slot, kind) in steps.iter_mut().zip(kinds.bytes()) {
+                    *slot = match kind {
+                        b'f' => match operand()? {
+                            Expr::Str(name) => Step::Field(name),
+                            _ => {
+                                return Err(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "path assignment field step lacks its name"
+                                ));
+                            }
+                        },
+                        b'e' => Step::Subscript(Element(bound(operand()?)?)),
+                        b's' => Step::Subscript(Slice {
+                            lower: Some(bound(operand()?)?),
+                            upper: Some(bound(operand()?)?),
+                        }),
+                        b'l' => Step::Subscript(Slice {
+                            lower: Some(bound(operand()?)?),
+                            upper: None,
+                        }),
+                        b'u' => Step::Subscript(Slice {
+                            lower: None,
+                            upper: Some(bound(operand()?)?),
+                        }),
+                        _ => Step::Subscript(Slice {
+                            lower: None,
+                            upper: None,
+                        }),
+                    };
+                }
+                crate::sql::assignment_path::assign(
+                    base,
+                    base_type,
+                    &steps[..kinds.len()],
+                    value,
+                    hooks.catalog,
+                    arena,
+                )
+                // A constant fails its input conversion where it is written.
+                .map_err(|error| match **value_expression {
+                    Expr::Str(_) if error.sqlstate.as_str().starts_with("22") => {
+                        crate::sql::error_position::at_expression(error, value_expression)
+                    }
+                    _ => error,
+                })
+            }
             "__array_subscript_set" => {
                 // (base, value, kinds, bounds...): `kinds` holds one letter
                 // per subscript — `e` an element, `s` a slice with both
@@ -1035,7 +1169,10 @@ pub(crate) fn dispatch<'a>(
                             "array assignment subscripts lack a bound"
                         )
                     })?;
-                    assignment_subscript(eval_full(expression, arena, params, row, hooks)?)
+                    positioned_subscript(
+                        expression,
+                        assignment_subscript(eval_full(expression, arena, params, row, hooks)?),
+                    )
                 };
                 for (slot, kind) in subscripts.iter_mut().zip(kinds.bytes()) {
                     use crate::sql::array_assignment::AssignmentSubscript::{Element, Slice};
@@ -1078,11 +1215,33 @@ pub(crate) fn dispatch<'a>(
                 if args.len() < 3 || star {
                     return Err(arity_err("jsonb subscripting assignment", args.len()));
                 }
+                // Only arrays, jsonb and the subscripted geometric types take
+                // an element assignment; PostgreSQL rejects any other declared
+                // type while analysing it.
+                let declared = crate::sql::types::ColType::from_oid(
+                    crate::sql::eval::expression_type_identity(args[0], row, hooks)?
+                        .routine_argument_oid(),
+                );
+                if let Some(declared) = declared
+                    && !matches!(
+                        declared,
+                        crate::sql::types::ColType::Array(_)
+                            | crate::sql::types::ColType::Jsonb
+                            | crate::sql::types::ColType::Geometry(_)
+                    )
+                {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "cannot subscript type {} because it does not support subscripting",
+                        declared.name()
+                    ));
+                }
                 let base = eval_full(args[0], arena, params, row, hooks)?;
                 let array_target = match base {
                     Datum::Array { .. } => true,
                     Datum::Null => {
                         matches!(*args[0], Expr::Null)
+                            || matches!(declared, Some(crate::sql::types::ColType::Array(_)))
                             || matches!(
                                 crate::sql::eval::static_type_pub(args[0], row),
                                 Some(crate::sql::types::ColType::Array(_))
@@ -1102,9 +1261,12 @@ pub(crate) fn dispatch<'a>(
                     }
                     for (slot, expression) in subscripts.iter_mut().zip(&args[2..]) {
                         *slot = crate::sql::array_assignment::AssignmentSubscript::Element(
-                            assignment_subscript(eval_full(
-                                expression, arena, params, row, hooks,
-                            )?)?,
+                            positioned_subscript(
+                                expression,
+                                assignment_subscript(eval_full(
+                                    expression, arena, params, row, hooks,
+                                )?),
+                            )?,
                         );
                     }
                     let value = enum_element_input(
@@ -1120,6 +1282,7 @@ pub(crate) fn dispatch<'a>(
                         arena,
                     );
                 }
+                let base = eval_full(args[0], arena, params, row, hooks)?;
                 if let Datum::Geometry { kind, text } = base {
                     if args.len() != 3 {
                         return Err(arity_err("geometric subscripting assignment", args.len()));
@@ -1869,12 +2032,44 @@ pub(crate) fn dispatch<'a>(
                         name
                     ));
                 }
-                let v = eval_full(args[0], arena, params, row, hooks)?;
-                let jsonb = name == "to_jsonb";
-                let mut buf = ArenaString::new(arena);
-                json::write_datum_json(&v, jsonb, &mut buf).map_err(|_| arena_full())?;
-                let text = buf.as_str();
-                Ok(Datum::Json { text, jsonb })
+                let value = eval_full(args[0], arena, params, row, hooks)?;
+                let line_feeds = if name == "row_to_json" && args.len() == 2 {
+                    match eval_full(args[1], arena, params, row, hooks)? {
+                        Datum::Bool(line_feeds) => line_feeds,
+                        Datum::Null => return Ok(Datum::Null),
+                        other => {
+                            return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                        }
+                    }
+                } else if args.len() == 2 {
+                    return Err(arity_err(name, args.len()));
+                } else {
+                    false
+                };
+                if value.is_null() {
+                    return Ok(Datum::Null);
+                }
+                let mut buffer = ArenaString::new(arena);
+                if name == "row_to_json" {
+                    SqlJsonWriter {
+                        catalog: hooks.catalog,
+                        arena,
+                    }
+                    .row(value, line_feeds, &mut buffer)?;
+                } else {
+                    write_sql_json_argument(args[0], value, arena, row, hooks, &mut buffer)?;
+                }
+                let text = buffer.as_str();
+                if name != "to_jsonb" {
+                    return Ok(Datum::Json { text, jsonb: false });
+                }
+                // jsonb keeps PostgreSQL's key order and spacing, not the
+                // source order the json rendering has.
+                let value = json::parse(text, arena)?;
+                Ok(Datum::Json {
+                    text: json_to_text(&value, arena)?,
+                    jsonb: true,
+                })
             }
             // `jsonb_set(target, path, new_value [, create_if_missing])`.
             "jsonb_set" | "jsonb_set_lax" => {
@@ -2128,6 +2323,20 @@ pub(crate) fn dispatch<'a>(
 }
 
 /// An array subscript of an assignment target: an integer, never NULL.
+/// A constant subscript fails its integer conversion where it is written,
+/// as PostgreSQL coerces subscripts while analysing the assignment.
+fn positioned_subscript(
+    expression: &Expr<'_>,
+    result: Result<i32, SqlError>,
+) -> Result<i32, SqlError> {
+    result.map_err(|error| match expression {
+        Expr::Str(_) if error.sqlstate.as_str().starts_with("22") => {
+            crate::sql::error_position::at_expression(error, expression)
+        }
+        _ => error,
+    })
+}
+
 fn assignment_subscript(value: Datum<'_>) -> Result<i32, SqlError> {
     let value = match value {
         Datum::Int2(value) => i64::from(value),

@@ -120,6 +120,10 @@ advance the acknowledgement. A failed update or a full cache keeps earlier
 valid entries. The cache is reserved at startup: about 6.5 MiB per worker at the
 default 64 entries, or about 104 MiB across the default 16 subscription
 workers. Lowering `subscription_relation_capacity` reduces it after restart.
+Each worker also reserves one session's cursor pool (`max_cursors` cursors, see
+[cursor capacity](postgresql-18-compatibility.md#cursor-capacity)), so a
+trigger fired by an applied change can open and fetch SQL cursors; they close
+when the applied transaction ends.
 
 The [subscription catalog](https://www.postgresql.org/docs/18/catalog-pg-subscription.html)
 is shared across SQL databases. `pg_subscription.subdbid` names each

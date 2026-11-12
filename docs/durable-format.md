@@ -26,7 +26,7 @@ schema changes follow a different procedure; see
 | Object | Identity | Read | Write | Notes |
 |---|---|---:|---:|---|
 | Checkpoint manifest | `pos3ql-manifest-v40` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
-| Journal record | Version `27` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
+| Journal record | Version `30` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | Identity is SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; the LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process's writer token. |
@@ -61,6 +61,11 @@ changing the code, this table and the tests together.
   records leave the manifest, commit head and writer fence unchanged.
 - Missing, duplicate, zero, out-of-range or truncated identities are rejected;
   recovery never guesses or regenerates a missing identity.
+- Recovery fails with `22000` when a valid partitioned index lacks exactly one
+  attached index on a partition that can hold one, or an index is attached to
+  a parent index outside its table's partition parent. Earlier releases could
+  save partitions without their copy of a partitioned unique index, leaving
+  duplicates unchecked there; such a state is refused, not repaired.
 
 ### Change checklist
 
@@ -82,7 +87,7 @@ Do not keep a decoder or add a conversion solely for an older pos3ql version.
 ### Journal records
 
 Framing is 24 bytes: CRC32C, payload length and LSN in bytes 0–15; byte 16 is
-the operation kind; byte 17 is the version (`27`); bytes 18–23 are zero.
+the operation kind; byte 17 is the version (`30`); bytes 18–23 are zero.
 Field-width changes use new kind bytes. Kinds with special rules:
 
 | Kind | Meaning | Rule |
@@ -92,18 +97,21 @@ Field-width changes use new kind bytes. Kinds with special rules:
 | 141 | Trigger create | Current; requires the ten-byte position prefix. Kind 55 remains readable. |
 | 142 | Routine create | Current; 16-bit result counts. Kind 45 remains readable. |
 | 143 | Composite create | Current. Kind 58 remains readable. |
-| 144/145 | View create / view columns | Current; wide column sets. Kinds 5/126 remain readable. |
+| 144/145 | View create / view columns | Current; 16-bit column count. Each column's name is followed by its type (four-byte type OID, two-byte length, four-byte modifier, four-byte collation code), then its default and the default's four-byte `pg_attrdef` stamp. Kinds 5/126, whose columns have no types, are rejected. |
 | 148 | Composite rename or schema move | Prior name, prior schema, new schema, new name. Preserves current fields. |
 | 149 | Enum create | Current. Kinds 23 and 147 are rejected. |
 | 150 | Extended statistics ANALYZE | Current. Kind 77 enum-dependent hash summaries are retired; counts stay valid. |
 | 151 | Domain with bound checks, defaults or named array base | Kind 21 remains readable. |
-| 152 | Bound view | Previous view kinds remain readable. |
+| 152 | Bound view | Kind 144's layout for a query with bound enum literals. |
 | 153 | Row upsert | Allows tagged enum member cells and legacy cells. Kind 3 remains readable. |
 | 154 | Table with bound default source | Kind 1 remains readable. |
 | 155 | Prepared catalog row | See [prepared transactions](#prepared-transactions). |
 | 156 | Index-presence hint | Ten-byte table position, then a strict 0/1 flag. |
 | 157 | Catalog reservation | Eight-byte nonzero creation-counter reservation, kept even when a transaction creates and removes all its images. |
 | 158 | Inherited trigger change | Flags byte, then expected/replacement images: four-byte clone stamp, ten-byte trigger position, ten-byte table position, one-byte enabled mode. |
+| 159 | Built-in routine attributes | Four-byte database identifier, four-byte built-in routine OID, then strict, volatility, parallel, security-definer and leakproof bytes, cost and rows as IEEE-754 bits, a settings count (at most 16) and each `SET` setting's name and value, each after a one-byte length. Owner and privileges use the object owner and ACL kinds with the routine OID. |
+| 160 | Trigger alteration | Ten-byte position, prior name, target kind, table schema and name, new name, enabled mode, then the complete `WHEN` condition (two-byte length plus one, zero when absent). Kind 57, without the condition, is rejected. |
+| 161 | Index alteration | Schema, index name and mutable settings, then the complete key expressions (four-byte presence mask over the 32 key positions; each present expression as a two-byte length and text) and predicate (flag byte, then two-byte length and text). Kind 71, without the expressions, is rejected. |
 
 Other payload rules:
 
@@ -112,7 +120,7 @@ Other payload rules:
   another partition. Other bits are rejected. Recovery and restored prepared
   transactions keep the move flag, so a statement that waited for the row
   fails with PostgreSQL's `40001` instead of skipping it.
-- **Table definition payload** is version 19: version byte, ten-byte catalog
+- **Table definition payload** is version 18: version byte, ten-byte catalog
   position, name, then the definition. Other versions are rejected. After its
   validation code, each foreign key stores four one-byte `tgenabled` codes
   (`O`, `R`, `A`, `D`) for its delete-action, update-action, insert-check and
@@ -160,7 +168,7 @@ inserts a missing writer.
 | `table2` | Slot, creation stamp, hexadecimal checked-input image, name. Internal large-object page table keeps its reserved slot and stamp zero. |
 | `sq7`, `rtn2` | Sequence / routine slot and creation stamp. |
 | `mv6` | Materialized-view catalog position and backing-table position. |
-| `vw14` | View position and stamp, return-rule position and stamp, encoded query, checked column defaults by ordinal. |
+| `vw14` | View position and stamp, return-rule position and stamp, encoded query, then each column by ordinal: name, checked default, `pg_attrdef` stamp (zero without a default), type OID, type length, type modifier and collation code. |
 | `hidx <table-slot> <0-or-1>` | Required once per table, including tables without indexes. The large-object page table requires `0`. |
 | `col4` | Hexadecimal column name and NOT NULL constraint name (empty when nullable). Extra fields are rejected. |
 | `attributes2` | Entry count and each attribute entry as sixteen hex digits. |
@@ -172,9 +180,10 @@ inserts a missing writer.
 | `nsp` | Creation stamp, database-owner flag (`0`/`1`), hexadecimal name. Stamp zero is an initial public schema. |
 | `pub` | Creation stamp after the owner, before the flags. |
 | `pacl` | Parameter permissions; an empty row differs from removal. |
+| `brtn` | Built-in routine attributes in the preceding `dbctx` database: OID, five attribute codes, cost and rows bits, then the journal record's settings bytes in hex (at most 6,180 characters). `own` and `acl` records for class 20 name the routine OID. |
 | `ptx` | Prepared transaction; owner as decimal role identifier. |
-| `rol` | Role identifier, catalog slot, encoded name and attributes. |
-| `rmem` | Position, stamp, role/member/grantor identifiers, option flags. |
+| `rol` | Role identifier, catalog slot, encoded name and attributes. Never written for the predefined roles, which are bootstrap facts. |
+| `rmem` | Position, stamp, role/member/grantor identifiers, option flags. Every live membership is listed, so restoring a manifest first removes the initdb memberships a fresh catalog starts with. |
 | `dacl` | Position, group stamp, owner, schema stamp (`-` global), recipient (`PUBLIC` for everyone), class, privileges, grant options. |
 | `trg` / `trgs` | Declared trigger position and stamp / inherited stamp, declared-trigger position and stamp, child-table position and stamp, enabled mode. |
 | `pol` | Position and creation stamp first. |
@@ -246,7 +255,10 @@ therefore preserved, and an exhausted sequence cannot prevent loading existing
 objects. Reservations are not reused while the server runs.
 
 Public SQL identifiers (OIDs) are a fixed base plus the creation stamp, so names
-and slots never determine them. Every stamp is in 1–9,999,999; fresh creation
+and slots never determine them. Every family owns one band in a single registry
+(`src/storage/oid_bands.rs`); a compile-time check rejects a band that overlaps
+another, starts below PostgreSQL's first user OID (16,384) or passes the
+largest signed 32-bit OID, so an OID alone identifies its family. Every stamp is in 1–9,999,999; fresh creation
 past that returns `54000` and installs nothing. Recovery rejects zero,
 out-of-range, duplicate or unreserved stamps (`22000` where a SQLSTATE applies)
 before writer promotion, using fixed 8 KiB bitmaps scanned over bounded windows
@@ -255,17 +267,24 @@ rather than collections that grow with catalog churn.
 | Object | Identifier |
 |---|---|
 | Bootstrap administrator role | 10 |
-| User roles | 16,385–2,147,483,647 (`54000` on exhaustion) |
+| Predefined roles (catalog slots 1–16) | PostgreSQL 18.6's OIDs (`pg_database_owner` 6171, `pg_monitor` 3373, …) |
+| Initdb role memberships of `pg_monitor` | 10,308–10,310; journal and manifest stamps 10,000,000–10,000,002 at positions 0–2 |
+| User roles | 16,385–9,999,999 (`54000` on exhaustion) |
+| Databases | `CREATE DATABASE ... OID n` accepts any n from 16,384, as PostgreSQL does; automatic OIDs are 10,000,001–19,999,999 |
+| Parameter permissions (`pg_parameter_acl`) | 20,000,001–29,999,999 |
+| Temporary namespaces (`pg_temp_N`) | 30,000,000 + the smallest number no other live temporary namespace holds |
 | Built-in tablespaces | 1663, 1664 |
 | Initial `public` schema | 2200 |
-| Schemas | 80,000 + stamp; creation fails `54000` when `catalog_sequence` reaches 1,920,000 (temporary namespaces start at 2,000,000) |
-| Routines | 100,000 + stamp |
-| Row-security policies | 180,000 + stamp |
-| Custom tablespaces | 210,000 + stamp (bounded by the largest signed 32-bit OID) |
-| Table / view row types | 130,000,000 / 140,000,000 + stamp |
-| Table / view row-type arrays | 150,000,000 / 160,000,000 + stamp |
+| Schemas | 40,000,000 + stamp |
+| Routines | 50,000,000 + stamp |
+| Triggers / their constraint rows (`CREATE CONSTRAINT TRIGGER`) | 60,000,000 / 70,000,000 + trigger stamp |
+| Row-security policies | 80,000,000 + stamp |
+| Custom tablespaces | 90,000,000 + stamp |
+| Column defaults (`pg_attrdef`) | 100,000,000 + stamp; setting a default or generation expression, or changing its column's type, reserves a new stamp |
+| Inherited row triggers / their constraint rows | 110,000,000 / 120,000,000 + clone stamp |
 | Domains / enums / composites | 180,000,000 / 200,000,000 / 220,000,000 + stamp |
 | Their arrays | 240,000,000 / 260,000,000 / 280,000,000 + stamp |
+| Table, materialized-view and view row types (and arrays) | The composite bands above + the relation's stamp |
 | Tables, views, sequences, composite backing relations, indexes | 300,000,000 + shared relation stamp |
 | TOAST relations | 320,000,000 + owner's stamp |
 | TOAST indexes | 340,000,000 + own stamp (rebuilding changes it) |
@@ -285,8 +304,8 @@ rather than collections that grow with catalog churn.
 | Casts / operators / operator families / operator classes | 720,000,000 / 740,000,000 / 760,000,000 / 780,000,000 + stamp |
 | Access methods / event triggers | 800,000,000 / 820,000,000 + stamp |
 | Default privileges / role memberships | 840,000,000 / 860,000,000 + stamp |
-| Rewrite rules | 880,000,000 + stamp |
-| Inherited row triggers | 1,000,000,000 + stamp |
+| Rewrite rules | 880,000,000 + stamp; a materialized view's `_RETURN` rule uses the view's own stamp |
+| Large objects | Any OID; `lo_create(oid)` accepts the client's choice, as PostgreSQL does |
 
 **User example:** an application saves the OID of `orders`, drops the table and
 creates another `orders`. The saved OID cannot identify the replacement, even if
@@ -304,7 +323,9 @@ Identity rules by object family:
 - **Comments** on statistics, publications, foreign wrappers and foreign servers
   are keyed by database and creation stamp; PostgreSQL's `objsubid` is unchanged.
 - **Role memberships.** One identifier per grant from one grantor; changing ADMIN,
-  INHERIT or SET keeps it; revoke-and-regrant reserves a new one. Grantor
+  INHERIT or SET keeps it; revoke-and-regrant reserves a new one. The three
+  initdb memberships keep reserved stamps above the catalog creation range,
+  which recovery accepts only at their own positions. Grantor
   selection follows PostgreSQL 18.6
   ([`user.c`](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/commands/user.c#L2040-L2140)).
   Journal images hold the position, three four-byte identifiers and a flags byte;
@@ -337,10 +358,12 @@ detached partition CHECKs, and domain CHECK and NOT NULL constraints each have a
 creation identity. Renames preserve it; replacing a backing index changes
 `conindid` but not the constraint identifier, comments or dependencies.
 
-Table payload v19 and domain marker 251 append one four-byte little-endian
-identity per constraint. Table order: CHECKs, foreign keys, live NOT NULL
-attributes by stable attribute number, detached partition CHECK, named primary
-and unique keys, exclusions, inline keys by attribute number. Domain order:
+Table payload v18 and domain marker 251 append one four-byte little-endian
+identity per constraint and column default. Table order: CHECKs, foreign keys,
+live attributes by stable attribute number (NOT NULL, then the default or
+generation expression, each when present), detached partition CHECK, named
+primary and unique keys, exclusions, inline keys by attribute number. A column
+default's identity selects its `pg_attrdef` OID. Domain order:
 CHECKs, then NOT NULL. `dom7` appends domain identities. Positions describe the
 layout only. Recovery also rejects identities created before their owner, above
 the saved counter, or shared by distinct tables or domains in one database.
@@ -348,9 +371,9 @@ the saved counter, or shared by distinct tables or domains in one database.
 | Rule | Format |
 |---|---|
 | Per-kind capacity | 64 table constraints per kind, 64 domain checks; journal counts are bytes; the 65th returns `54000` |
-| Unique-key mode | Tag `0` NULLs distinct, `1` primary key, `2` `NULLS NOT DISTINCT`; other tags rejected. v19 stores tag, key-column count and timing as three bytes before positions |
+| Unique-key mode | Tag `0` NULLs distinct, `1` primary key, `2` `NULLS NOT DISTINCT`; other tags rejected. v18 stores tag, key-column count and timing as three bytes before positions |
 | Constraint-created indexes | Own stamp; stored beside stable attribute numbers within the 512-byte column metadata bound |
-| Inline key names | Chosen once at admission (63-byte limit, no split UTF-8, collision suffix); v19 stores two-byte attribute number plus bounded name per key |
+| Inline key names | Chosen once at admission (63-byte limit, no split UTF-8, collision suffix); v18 stores two-byte attribute number plus bounded name per key |
 | NOT NULL names | Stored for columns and domains; renaming `orders` keeps `orders_id_not_null` |
 | Deferred uniqueness | Stored; every current index-option section is required |
 
@@ -392,6 +415,7 @@ Every stored user-type name has a prefix; manifests hex-encode these fields.
 | `r:<kind>:<slot>:<creation>:<name>` | Bound type; kind `d` domain, `e` enum, `c` composite |
 | `n:<name>` | Declaration requiring binding |
 | `p:<name>` | Validated PostgreSQL polymorphic type |
+| `t:<creation>:<name>` | Row type of the table, materialized view or view created at that stamp; the relation, not the type catalog, owns it |
 
 Typed tables save their composite as `c:<slot>:<creation>`. Database copies bind
 it to the copied type. At `types_end`, recovery resolves domain chains and
@@ -425,9 +449,9 @@ Labels follow PostgreSQL's
 | Format | Rule |
 |---|---|
 | `pos3ql-catalog-expression-v1` | Retained CHECK, list, partition-bound and SQL routine-body nodes with source spans and bound column numbers; rendered via `pg_get_expr`. Not PostgreSQL's `pg_node_tree`. |
-| `pos3ql-bound-query-v1` | View SQL; `/*p3e:D:M*/` before each typed enum literal binds dependency D, member M. Unknown versions and invalid bindings fail. |
+| `pos3ql-bound-query-v1` | View SQL with its written spacing and comments dropped; `/*p3e:D:M*/` before each typed enum literal binds dependency D, member M, and a literal the query did not cast is followed by a cast to its type. Unknown versions and invalid bindings fail. |
 | `pos3ql-enum-check-v1` | Domain CHECK/DEFAULT on enum bases: `/*p3c:M*/` member, `/*p3a*/` member array, `/*p3t:N*/` N-token cast type, `/*p3o:TEXT*/` original default text (`%25`, `%2f` escaped). |
-| Stored-query dependencies | Marker `0xfc`, length-prefixed identity, complete column set, then a four-byte length and checked input image. Types `d:`/`e:`/`c:<slot>:<creation>`; tables and views `t:<creation>`/`v:<creation>` (1–9,999,999). Name-only or wrong-kind keys are rejected. |
+| Stored-query dependencies | Marker `0xfc`, length-prefixed identity, complete read and written column sets, then a four-byte length and checked input image. Types `d:`/`e:`/`c:<slot>:<creation>`; tables and views `t:<creation>`/`v:<creation>` (1–9,999,999). Name-only or wrong-kind keys are rejected. |
 | `TIP2` | Checked literal map: four-byte identity, four-byte count, 44-byte records (two eight-byte source offsets, type OID, type modifier, input kind, collation flag, collation code, eight-byte value length) each followed by its value. Ordered by span and kind. `TIP1` rejected. |
 | `STI1` | Groups `TIP2` maps by owner fragment: eight-byte header (identity, section count); each section has a two-byte kind, two-byte parameter/attribute number and eight-byte length. Nonempty images charge `table_metadata_bytes`. |
 | Record values | Tags `19`/`202` use one-byte counts and name lengths; wide tags `51`/`204` use two bytes; `202`/`204` add a four-byte type stamp. Record array elements use the same tags inside `AR01`. |

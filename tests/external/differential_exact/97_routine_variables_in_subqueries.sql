@@ -97,3 +97,5 @@ BEGIN
 END$$;
 SELECT with_sources(200);
 SELECT * FROM t WHERE a >= 200 ORDER BY a, b;
+RESET search_path;
+DROP SCHEMA routine_scopes CASCADE;

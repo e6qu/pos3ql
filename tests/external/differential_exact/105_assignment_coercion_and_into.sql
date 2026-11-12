@@ -53,3 +53,4 @@ DO $$ DECLARE x int; BEGIN UPDATE ac70_r SET v = 'q' INTO x; END $$;
 DO $$ DECLARE x int; y int; BEGIN SELECT 1, 2 INTO x; SELECT 5 INTO x, y; RAISE NOTICE '% %', x, y; END $$;
 CREATE FUNCTION ac70_q(a int) RETURNS int LANGUAGE plpgsql AS $$ DECLARE b int; BEGIN b := ac70_q.a * 2; SELECT ac70_q.a + b INTO b; RETURN b; END $$;
 SELECT ac70_q(3);
+DROP ROUTINE ac70_f1(), ac70_f2(), ac70_f3(), ac70_s4(), ac70_i1(), ac70_i2(), ac70_q(integer) CASCADE;

@@ -9,6 +9,7 @@
 # Env:
 #   PGHOST / PGPORT / PGUSER   PostgreSQL to diff against (default 127.0.0.1 / 5432 / postgres)
 #   P3_PORT                    port pos3ql should listen on (default 15599)
+#   P3_OPERATIONS_PORT         pos3ql's operations endpoint port (default 15597)
 #   SLT_LIMIT                  max sqllogictest blocks per file (default 20000 = all vendored)
 #   SLT_UNSUPPORTED_BUDGET     maximum unsupported blocks per shard (ratchet)
 #   FUZZ_COUNT / FUZZ_SEED     generative fuzz statements / seed (default 20000 / 1)
@@ -44,6 +45,7 @@ PGPORT=${PGPORT:-5432}
 PGUSER=${PGUSER:-postgres}
 export PGHOST PGPORT PGUSER
 P3_PORT=${P3_PORT:-15599}
+P3_OPERATIONS_PORT=${P3_OPERATIONS_PORT:-15597}
 SLT_LIMIT=${SLT_LIMIT:-20000}
 SLT_UNSUPPORTED_BUDGET=${SLT_UNSUPPORTED_BUDGET:-0}
 FUZZ_COUNT=${FUZZ_COUNT:-20000}
@@ -236,6 +238,8 @@ SQL
 printf 'pos3ql executable: %s\n' "$P3_BIN"
 cat > "$WORK/p3.conf" <<EOF
 listen_addr = 127.0.0.1:${P3_PORT}
+operations_listen_addr = 127.0.0.1:${P3_OPERATIONS_PORT}
+operations_max_connections = 2
 data_dir = ${WORK}/p3data
 object_store = off
 log_format = text
@@ -245,6 +249,7 @@ max_extended_statistics = 512
 max_views = 64
 max_materialized_views = 64
 max_routines = 64
+max_cursors = 24
 max_casts = 64
 max_operators = 64
 max_operator_families = 64
@@ -327,7 +332,8 @@ else bad "wire probes"; cat "$WORK/wire.out"; fi
 restart_p3_fresh || exit 1
 echo "=== stalled result clients (real PostgreSQL vs pos3ql) ==="
 if "$PY" "$EXT/result_streams.py" --host 127.0.0.1 --p3 "$P3_PORT" \
-  --pg "$PGPORT" --user "$PGUSER" > "$WORK/result_streams.out" 2>&1; then
+  --pg "$PGPORT" --user "$PGUSER" --storage-mode local \
+  --operations "127.0.0.1:${P3_OPERATIONS_PORT}" > "$WORK/result_streams.out" 2>&1; then
   ok "stalled result clients"
 else bad "stalled result clients"; cat "$WORK/result_streams.out"; fi
 
@@ -1531,10 +1537,25 @@ reset_user_extensions() { # host port
       -c "DROP EXTENSION \"$extension\" CASCADE" >/dev/null 2>&1
   done
 }
+reset_user_routines() { # host port
+  psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
+    -F $'\t' \
+    -c "SELECT p.oid::regprocedure, p.prokind FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')" |
+  while IFS=$'\t' read -r routine kind; do
+    [[ -z "$routine" ]] && continue
+    case "$kind" in
+    a) drop='DROP AGGREGATE' ;;
+    p) drop='DROP PROCEDURE' ;;
+    *) drop='DROP FUNCTION' ;;
+    esac
+    psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -q \
+      -c "$drop $routine CASCADE" >/dev/null 2>&1
+  done
+}
 reset_user_relations() { # host port
   psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
     -F $'\t' \
-    -c "SELECT n.nspname, c.relname, c.relkind FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p', 'm')" |
+    -c "SELECT n.nspname, c.relname, c.relkind FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p', 'm', 'v', 'S')" |
   while IFS=$'\t' read -r schema relation relkind; do
     [[ -z "$relation" ]] && continue
     schema=${schema//\"/\"\"}
@@ -1542,6 +1563,8 @@ reset_user_relations() { # host port
     case "$relkind" in
     m) drop='DROP MATERIALIZED VIEW' ;;
     r | p) drop='DROP TABLE' ;;
+    v) drop='DROP VIEW' ;;
+    S) drop='DROP SEQUENCE' ;;
     *)
       printf 'FAIL: unexpected reset relation kind %q\n' "$relkind"
       return 1
@@ -1556,6 +1579,8 @@ reset_corpus_pair() {
   reset_user_extensions 127.0.0.1 "$P3_PORT"
   reset_user_relations "$PGHOST" "$PGPORT"
   reset_user_relations 127.0.0.1 "$P3_PORT"
+  reset_user_routines "$PGHOST" "$PGPORT"
+  reset_user_routines 127.0.0.1 "$P3_PORT"
 }
 
 if [[ "$RUN_CORPUS" == 1 ]]; then
@@ -1622,6 +1647,10 @@ restart_p3_fresh || exit 1
 echo "=== exact-error corpora (message wording must match) ==="
 for f in "$EXT"/differential_exact/*.sql; do
   n=$(basename "$f" .sql)
+  # Each fixture starts from an empty catalog on both servers, so objects a
+  # fixture leaves behind neither fill the fixed budgets nor show up in a
+  # later fixture's catalog queries.
+  reset_corpus_pair
   run_corpus "$PGHOST" "$PGPORT" "$WORK/$n.pg" "$f" verbose || exit 1
   run_corpus 127.0.0.1 "$P3_PORT" "$WORK/$n.p3" "$f" verbose || exit 1
   if diff -u "$WORK/$n.pg" "$WORK/$n.p3" > "$WORK/$n.diff"; then ok "exact errors: $n"

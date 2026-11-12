@@ -160,7 +160,7 @@ fn prepared_resolution_distinguishes_bind_from_an_executed_pipeline() {
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut conn = Conn::new(&config, &mut budget).unwrap();
         conn.id = 1;
-        conn.phase = Phase::Ready;
+        conn.enter_ready_for_tests(&engine);
         query(
             &mut conn,
             &mut engine,
@@ -323,8 +323,8 @@ fn immediate_utilities_publish_before_sync_with_postgresql_completion_tags() {
         let mut observer = Conn::new(&config, &mut budget).unwrap();
         conn.id = 1;
         observer.id = 2;
-        conn.phase = Phase::Ready;
-        observer.phase = Phase::Ready;
+        conn.enter_ready_for_tests(&engine);
+        observer.enter_ready_for_tests(&engine);
         for (sql, tag, observation, expected) in [
             (
                 "CREATE DATABASE utility_database",
@@ -371,7 +371,7 @@ fn immediate_utility_resumes_durable_commit_without_repeating_ddl() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut conn = Conn::new(&config, &mut budget).unwrap();
     conn.id = 1;
-    conn.phase = Phase::Ready;
+    conn.enter_ready_for_tests(&engine);
     query(
         &mut conn,
         &mut engine,
@@ -416,7 +416,11 @@ fn immediate_utility_resumes_durable_commit_without_repeating_ddl() {
             &mut conn.txn,
             &conn.guc,
             crate::sql::txn::CommitTarget::Ordinary,
-            None,
+            crate::sql::CursorCommitContext {
+                cursors: &mut conn.cursors,
+                plans: Some(&mut conn.sqlprep),
+                arena: &conn.arena,
+            },
             &conn.arena,
             &mut Responder::new(&mut conn.send),
         )
@@ -454,7 +458,7 @@ fn immediate_utility_resumes_durable_commit_without_repeating_ddl() {
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
     let mut recovered_conn = Conn::new(&config, &mut recovered_budget).unwrap();
     recovered_conn.id = 1;
-    recovered_conn.phase = Phase::Ready;
+    recovered_conn.enter_ready_for_tests(&recovered);
     assert_eq!(
         first_row(&query(
             &mut recovered_conn,
@@ -480,7 +484,7 @@ fn duplicate_named_bind_aborts_the_block_and_rollback_releases_the_portal() {
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut conn = Conn::new(&config, &mut budget).unwrap();
         conn.id = 1;
-        conn.phase = Phase::Ready;
+        conn.enter_ready_for_tests(&engine);
         query(&mut conn, &mut engine, "BEGIN");
         parse(&mut conn, &mut engine, "SELECT 7", &[]);
         message(
@@ -530,7 +534,7 @@ fn extended_parse_errors_abort_implicit_work_and_preserve_explicit_failure() {
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut conn = Conn::new(&config, &mut budget).unwrap();
         conn.id = 1;
-        conn.phase = Phase::Ready;
+        conn.enter_ready_for_tests(&engine);
         query(
             &mut conn,
             &mut engine,
@@ -586,7 +590,7 @@ fn binding_transaction_settings_does_not_take_a_data_snapshot() {
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut conn = Conn::new(&config, &mut budget).unwrap();
         conn.id = 1;
-        conn.phase = Phase::Ready;
+        conn.enter_ready_for_tests(&engine);
         query(&mut conn, &mut engine, "BEGIN");
         bind_command(
             &mut conn,
@@ -678,8 +682,8 @@ fn checked_function_planning_happens_at_bind_after_parameter_validation() {
         let mut observer = Conn::new(&config, &mut budget).unwrap();
         conn.id = 1;
         observer.id = 2;
-        conn.phase = Phase::Ready;
-        observer.phase = Phase::Ready;
+        conn.enter_ready_for_tests(&engine);
+        observer.enter_ready_for_tests(&engine);
         query(
             &mut conn,
             &mut engine,
@@ -811,7 +815,7 @@ fn bind_planner_waits_keep_unpublished_parameters_and_release_them_on_abort() {
             holder.id = 2;
             observer.id = 3;
             for connection in [&mut conn, &mut holder, &mut observer] {
-                connection.phase = Phase::Ready;
+                connection.enter_ready_for_tests(&engine);
             }
             query(
                 &mut conn,
@@ -1012,8 +1016,8 @@ fn generic_bind_inputs_are_shared_and_pinned_by_old_portals_after_statement_clos
         let mut observer = Conn::new(&config, &mut budget).unwrap();
         conn.id = 1;
         observer.id = 2;
-        conn.phase = Phase::Ready;
-        observer.phase = Phase::Ready;
+        conn.enter_ready_for_tests(&engine);
+        observer.enter_ready_for_tests(&engine);
         query(
             &mut conn,
             &mut engine,
@@ -1121,8 +1125,8 @@ fn custom_bind_parameters_prune_unreached_inputs_before_checking_function_bodies
         let mut observer = Conn::new(&config, &mut budget).unwrap();
         conn.id = 1;
         observer.id = 2;
-        conn.phase = Phase::Ready;
-        observer.phase = Phase::Ready;
+        conn.enter_ready_for_tests(&engine);
+        observer.enter_ready_for_tests(&engine);
         query(
             &mut conn,
             &mut engine,
@@ -1233,8 +1237,8 @@ fn concurrent_index_commands_publish_their_real_states_before_sync() {
         let mut observer = Conn::new(&config, &mut budget).unwrap();
         builder.id = 1;
         observer.id = 2;
-        builder.phase = Phase::Ready;
-        observer.phase = Phase::Ready;
+        builder.enter_ready_for_tests(&engine);
+        observer.enter_ready_for_tests(&engine);
         query(
             &mut builder,
             &mut engine,
@@ -1369,8 +1373,8 @@ fn concurrent_reindex_replaces_backing_indexes_and_publishes_before_sync() {
         let mut observer = Conn::new(&config, &mut budget).unwrap();
         builder.id = 1;
         observer.id = 2;
-        builder.phase = Phase::Ready;
-        observer.phase = Phase::Ready;
+        builder.enter_ready_for_tests(&engine);
+        observer.enter_ready_for_tests(&engine);
         query(
             &mut builder,
             &mut engine,
@@ -1504,7 +1508,7 @@ fn reindex_tablespace_moves_user_indexes_and_preserves_toast_placement() {
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = Conn::new(&config, &mut budget).unwrap();
         session.id = 1;
-        session.phase = Phase::Ready;
+        session.enter_ready_for_tests(&engine);
         query(
             &mut session,
             &mut engine,
@@ -1662,9 +1666,9 @@ fn concurrent_reindex_cancel_keeps_the_published_replacement_and_old_constraint(
         builder.id = 1;
         writer.id = 2;
         observer.id = 3;
-        builder.phase = Phase::Ready;
-        writer.phase = Phase::Ready;
-        observer.phase = Phase::Ready;
+        builder.enter_ready_for_tests(&engine);
+        writer.enter_ready_for_tests(&engine);
+        observer.enter_ready_for_tests(&engine);
         query(
             &mut builder,
             &mut engine,
@@ -1765,9 +1769,9 @@ fn concurrent_reindex_schema_finishes_each_table_before_waiting_on_the_next() {
     builder.id = 1;
     writer.id = 2;
     observer.id = 3;
-    builder.phase = Phase::Ready;
-    writer.phase = Phase::Ready;
-    observer.phase = Phase::Ready;
+    builder.enter_ready_for_tests(&engine);
+    writer.enter_ready_for_tests(&engine);
+    observer.enter_ready_for_tests(&engine);
     query(
         &mut builder,
         &mut engine,
@@ -1858,9 +1862,9 @@ fn concurrent_index_build_waits_for_earlier_writers_and_keeps_published_failures
     builder.id = 1;
     writer.id = 2;
     observer.id = 3;
-    builder.phase = Phase::Ready;
-    writer.phase = Phase::Ready;
-    observer.phase = Phase::Ready;
+    builder.enter_ready_for_tests(&engine);
+    writer.enter_ready_for_tests(&engine);
+    observer.enter_ready_for_tests(&engine);
     query(
         &mut builder,
         &mut engine,
@@ -2024,8 +2028,8 @@ fn concurrent_reindex_receipts_preserve_each_committed_prefix_after_cold_restart
         let mut observer = Conn::new(&config, &mut budget).unwrap();
         builder.id = 1;
         observer.id = 2;
-        builder.phase = Phase::Ready;
-        observer.phase = Phase::Ready;
+        builder.enter_ready_for_tests(&engine);
+        observer.enter_ready_for_tests(&engine);
         query(
             &mut builder,
             &mut engine,
@@ -2189,7 +2193,7 @@ fn concurrent_reindex_receipts_preserve_each_committed_prefix_after_cold_restart
         let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
         let mut verifier = Conn::new(&config, &mut recovered_budget).unwrap();
         verifier.id = 1;
-        verifier.phase = Phase::Ready;
+        verifier.enter_ready_for_tests(&recovered);
         assert_eq!(
             first_row(&query(
                 &mut verifier,
@@ -2459,7 +2463,7 @@ fn concurrent_reindex_receipts_preserve_each_committed_prefix_after_cold_restart
                 let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
                 let mut verifier = Conn::new(&config, &mut cold_budget).unwrap();
                 verifier.id = 1;
-                verifier.phase = Phase::Ready;
+                verifier.enter_ready_for_tests(&cold);
                 assert_eq!(
                     first_row(&query(&mut verifier, &mut cold, OWNERS)),
                     "t|t",
@@ -2512,8 +2516,8 @@ fn concurrent_reindex_preserves_unbuilt_predecessor_flags_until_retirement() {
     let mut observer = Conn::new(&config, &mut budget).unwrap();
     builder.id = 1;
     observer.id = 2;
-    builder.phase = Phase::Ready;
-    observer.phase = Phase::Ready;
+    builder.enter_ready_for_tests(&engine);
+    observer.enter_ready_for_tests(&engine);
     query(
         &mut builder,
         &mut engine,
@@ -2650,9 +2654,9 @@ fn concurrent_reindex_keeps_old_reader_lifetimes_until_their_locks_are_released(
         builder.id = 1;
         reader.id = 2;
         observer.id = 3;
-        builder.phase = Phase::Ready;
-        reader.phase = Phase::Ready;
-        observer.phase = Phase::Ready;
+        builder.enter_ready_for_tests(&engine);
+        reader.enter_ready_for_tests(&engine);
+        observer.enter_ready_for_tests(&engine);
         query(
             &mut builder,
             &mut engine,
@@ -2841,8 +2845,8 @@ fn concurrent_index_receipts_keep_exact_effects_cancel_and_cold_states() {
             let mut observer = Conn::new(&config, &mut budget).unwrap();
             builder.id = 1;
             observer.id = 2;
-            builder.phase = Phase::Ready;
-            observer.phase = Phase::Ready;
+            builder.enter_ready_for_tests(&engine);
+            observer.enter_ready_for_tests(&engine);
             query(
                 &mut builder,
                 &mut engine,
@@ -3054,7 +3058,7 @@ fn concurrent_index_receipts_keep_exact_effects_cancel_and_cold_states() {
             let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
             let mut recovered_conn = Conn::new(&config, &mut recovered_budget).unwrap();
             recovered_conn.id = 1;
-            recovered_conn.phase = Phase::Ready;
+            recovered_conn.enter_ready_for_tests(&recovered);
             assert_eq!(
                 first_row(&query(
                     &mut recovered_conn,
@@ -3119,8 +3123,8 @@ fn extended_write_type_descriptions_restore_the_owning_sessions_search_path() {
             let mut observer = Conn::new(&config, &mut budget).unwrap();
             writer.id = 1;
             observer.id = 2;
-            writer.phase = Phase::Ready;
-            observer.phase = Phase::Ready;
+            writer.enter_ready_for_tests(&engine);
+            observer.enter_ready_for_tests(&engine);
             query(
                 &mut writer,
                 &mut engine,
@@ -3231,7 +3235,7 @@ fn parse_fixes_parameter_types_and_reports_undeterminable_ones() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut conn = Conn::new(&config, &mut budget).unwrap();
     conn.id = 1;
-    conn.phase = Phase::Ready;
+    conn.enter_ready_for_tests(&engine);
     query(
         &mut conn,
         &mut engine,

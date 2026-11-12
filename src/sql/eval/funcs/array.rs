@@ -15,8 +15,8 @@ use crate::sql::types::{ArrElem, ColType, Datum};
 use crate::sql_err;
 
 use super::super::{
-    ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, cast_to, compare_datums, eval_full,
-    load_array, sqlstate, text_arg, text_view,
+    ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, cast_to, eval_full, load_array,
+    sqlstate, text_arg, text_view,
 };
 
 /// Compatible-array declarations promote PostgreSQL's catalog vectors to
@@ -608,7 +608,7 @@ pub(crate) fn dispatch<'a>(
                     } else if el.is_null() {
                         false
                     } else {
-                        compare_datums(&el, &target)?.is_eq()
+                        search_equal(&el, &target, hooks.catalog)?
                     };
                     if hit {
                         let i = first + offset;
@@ -668,7 +668,7 @@ pub(crate) fn dispatch<'a>(
                     } else if el.is_null() {
                         false
                     } else {
-                        compare_datums(el, &target)?.is_eq()
+                        search_equal(el, &target, hooks.catalog)?
                     })
                 };
                 let mut count = 0usize;
@@ -730,6 +730,8 @@ pub(crate) fn dispatch<'a>(
                         return Err(crate::sql::eval::function_argument_mismatch(name, &arr));
                     }
                 };
+                // An untyped literal that fails its element cast is positioned.
+                let untyped = matches!(args[elem_index], Expr::Str(_)) && raw.is_some();
                 let source_count = raw.map_or(0, array::len);
                 let items = array::alloc_items(arena, source_count + 1)?;
                 let mut n = 0usize;
@@ -743,7 +745,18 @@ pub(crate) fn dispatch<'a>(
                 let coerced = if elem.is_null() {
                     Datum::Null
                 } else {
-                    cast_to(elem, element.to_coltype(), arena)?
+                    let cast = cast_to(elem, element.to_coltype(), arena);
+                    durable_element(
+                        match (cast, args[elem_index]) {
+                            (Err(error), Expr::Str(literal)) if untyped => {
+                                return Err(crate::sql::error_position::at_subject(error, literal));
+                            }
+                            (cast, _) => cast?,
+                        },
+                        element,
+                        hooks.catalog,
+                        arena,
+                    )?
                 };
                 if name == "array_prepend" {
                     items[n] = coerced;
@@ -848,8 +861,14 @@ pub(crate) fn dispatch<'a>(
                         source.to_coltype(),
                     ));
                 }
+                // The arguments share one element type; a replacement entering
+                // a named-composite array takes the elements' durable form.
                 debug_assert_eq!(source, element);
-                let replacement = to;
+                let replacement = if to.is_null() {
+                    Datum::Null
+                } else {
+                    durable_element(to, element, hooks.catalog, arena)?
+                };
                 let to_coltype = element.to_coltype();
                 let items = array::alloc_items(arena, shape.element_count())?;
                 let mut n = 0usize;
@@ -859,7 +878,7 @@ pub(crate) fn dispatch<'a>(
                     } else if el.is_null() {
                         false
                     } else {
-                        compare_datums(&el, &target)?.is_eq()
+                        search_equal(&el, &target, hooks.catalog)?
                     };
                     if is_replace {
                         items[n] = if matches {
@@ -1115,7 +1134,9 @@ pub(crate) fn dispatch<'a>(
                 }
                 let (element, raw) = match compatible_array_input(values[0], arena)? {
                     Datum::Array { element, raw } => (element, raw),
-                    other => return Err(super::super::operand_type_mismatch(&other)),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
                 };
                 let shape = array::shape(raw).expect("array datum invariant");
                 let count = shape.dimension(0).unwrap_or(0);
@@ -1361,6 +1382,7 @@ pub(crate) fn dispatch<'a>(
                     &lower_bounds[..dimension_count],
                 )?;
                 let elem = ArrElem::from_datum(&value).unwrap_or(ArrElem::Int4);
+                let value = durable_element(value, elem, hooks.catalog, arena)?;
                 let filled = arena
                     .alloc_slice_with(shape.element_count(), |_| value)
                     .map_err(|_| arena_full())?;
@@ -1426,4 +1448,42 @@ fn sample_size_error(count: usize) -> SqlError {
         "sample size must be between 0 and {}",
         count
     )
+}
+
+/// Element equality for the array search and replace functions. Stored
+/// named-composite elements compare by their catalog fields; text compares
+/// bytewise, which agrees with equality under every deterministic collation.
+fn search_equal(
+    element: &Datum<'_>,
+    target: &Datum<'_>,
+    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+) -> Result<bool, SqlError> {
+    Ok(super::super::compare_datums_with_catalog(
+        crate::sql::ast::Collation::C,
+        catalog,
+        element,
+        target,
+    )?
+    .is_eq())
+}
+
+/// A value entering a named-composite array takes the elements' durable
+/// form; every other element is stored as it is.
+fn durable_element<'a>(
+    value: Datum<'a>,
+    element: ArrElem,
+    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Datum<'a>, SqlError> {
+    match (element, value) {
+        (ArrElem::Composite(Some(slot)), Datum::Composite { .. } | Datum::Record(_)) => catalog
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "named composite catalog access is unavailable"
+                )
+            })?
+            .composite_array_element(value, slot, arena),
+        _ => Ok(value),
+    }
 }

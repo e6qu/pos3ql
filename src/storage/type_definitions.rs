@@ -603,6 +603,13 @@ impl Storage {
         name: super::UserTypeName,
         transaction: u32,
     ) -> Result<(), SqlError> {
+        // A relation row type has no type-catalog image; its fields are read
+        // from the relation definition.
+        if name.relation_row_type_creation().is_some()
+            || name.information_schema_domain_binding().is_some()
+        {
+            return Ok(());
+        }
         let reference = TypeReference::from_bound_name(name)?;
         if let Some(previous) = queue[..*count]
             .iter()

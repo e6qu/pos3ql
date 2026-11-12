@@ -76,9 +76,8 @@ fn rule_definition_flags_preserve_formats_nulls_and_argument_effects() {
         );
         assert_eq!(error_sqlstates(&unsupported), ["0A000"]);
         assert!(
-            String::from_utf8_lossy(&unsupported).contains(
-                "pretty formatting of rewrite rule conditions or actions is not supported"
-            )
+            String::from_utf8_lossy(&unsupported)
+                .contains("pretty formatting of rewrite rule actions is not supported")
         );
         assert_eq!(data_rows(&session.success(&mut engine,
             "SELECT nextval('rule_argument_effects'); \

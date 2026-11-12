@@ -4,13 +4,13 @@
 //! bounds (ROWS/RANGE/GROUPS, with EXCLUDE), evaluates the window aggregates
 //! and value functions over that frame, and projects the final rows. The entry
 //! points `rewrite_grouped_windows`, `project_window_rows`, `window_select`,
-//! `dedup_window_rows`, and `cmp_key_rows` are called from the query pipeline.
+//! and `cmp_key_rows` are called from the query pipeline.
 
 use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::Responder;
 use crate::sql::ast::{
     BinaryOp, Collation, Expr, FrameBound, FrameUnits, FromClause, OrderBy, Select, SelectItem,
-    TableRef, WindowFrame,
+    TableRef, WindowFrame, WindowSpec,
 };
 use crate::sql::eval::{
     ColumnLookup, EvalHooks, SqlError, SubqueryValues, compare_datums, compare_datums_collated,
@@ -30,13 +30,18 @@ use super::{
     window_row,
 };
 
+/// The WHERE conjuncts the scan applies, and the correlated subqueries the
+/// rest of WHERE reads per row.
 fn window_scan_where<'a>(
     statement: &'a Select<'a>,
     correlated: &[&'a Expr<'a>],
     arena: &'a Arena,
-) -> Result<Option<&'a Expr<'a>>, SqlError> {
+) -> Result<(Option<&'a Expr<'a>>, &'a [&'a Expr<'a>]), SqlError> {
     let where_correlated = correlated_in_expression(statement.where_clause, correlated, arena)?;
-    correlated_scan_conjuncts(statement.where_clause, where_correlated, arena)
+    Ok((
+        correlated_scan_conjuncts(statement.where_clause, where_correlated, arena)?,
+        where_correlated,
+    ))
 }
 
 fn window_pax_columns<'a>(
@@ -129,7 +134,8 @@ pub(crate) fn rewrite_grouped_windows<'a>(
     if n_keys + n_aggs > MAX_PROJ {
         return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "too many columns"));
     }
-    let mut inner_items = [SelectItem::Wildcard; MAX_PROJ];
+    let mut inner_items =
+        [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_PROJ];
     let mut group_names: [&str; MAX_PROJ] = [""; MAX_PROJ];
     let agg_names = arena
         .alloc_slice_with(n_aggs, |_| "")
@@ -160,6 +166,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
             .map_err(|_| arena_full())?,
         distinct: false,
         distinct_on: &[],
+        windows: &[],
         from: statement.from,
         where_clause: statement.where_clause,
         group_by: statement.group_by,
@@ -187,7 +194,8 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         agg_names,
         scope,
     };
-    let mut outer_items = [SelectItem::Wildcard; MAX_PROJ];
+    let mut outer_items =
+        [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_PROJ];
     for (i, item) in statement.items.iter().enumerate() {
         outer_items[i] = match item {
             SelectItem::Expr { expression, alias } => SelectItem::Expr {
@@ -237,6 +245,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
             authorization_role: None,
             bound_table: None,
             view_access: None,
+            join_members: None,
         },
         joins: &[],
     };
@@ -246,6 +255,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
             .map_err(|_| arena_full())?,
         distinct: statement.distinct,
         distinct_on: &[],
+        windows: &[],
         from: Some(from),
         where_clause: None,
         group_by: &[],
@@ -775,7 +785,7 @@ fn compute_window<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<&'a [Datum<'a>], SqlError> {
     // Outer references, such as PL/pgSQL variables, read the caller's row.
-    let scope_columns = super::ScopeCols::new(scope);
+    let scope_columns = super::ScopeCols(scope);
     let outer_columns = super::aggregate_outer_columns(Some(scope), outer, storage, txid, arena);
     let aggregate_columns: &dyn crate::sql::exec::ColTypeResolver = match &outer_columns {
         Some(columns) => columns,
@@ -1594,6 +1604,166 @@ fn cmp_order<'a>(
     Ok(Ordering::Equal)
 }
 
+/// One window's row order: its PARTITION BY keys ascending with NULLs last,
+/// then its ORDER BY keys, an exactly repeated key kept once.
+fn window_sort_keys<'a>(
+    spec: &WindowSpec<'a>,
+    arena: &'a Arena,
+) -> Result<&'a [OrderBy<'a>], SqlError> {
+    let keys = arena
+        .alloc_slice_with(spec.partition_by.len() + spec.order_by.len(), |_| OrderBy {
+            expression: &Expr::Null,
+            descending: false,
+            nulls_first: false,
+        })
+        .map_err(|_| arena_full())?;
+    let mut n = 0usize;
+    let partition = spec.partition_by.iter().map(|&expression| OrderBy {
+        expression,
+        descending: false,
+        nulls_first: false,
+    });
+    for key in partition.chain(spec.order_by.iter().copied()) {
+        if !keys[..n].contains(&key) {
+            keys[n] = key;
+            n += 1;
+        }
+    }
+    Ok(&keys[..n])
+}
+
+fn window_spec<'a>(node: &'a Expr<'a>) -> Result<&'a WindowSpec<'a>, SqlError> {
+    match node {
+        Expr::Call {
+            over: Some(spec), ..
+        } => Ok(spec),
+        _ => Err(sql_err!(sqlstate::INTERNAL_ERROR, "not a window function")),
+    }
+}
+
+/// The windows in the order PostgreSQL evaluates them, as indices into
+/// `win_nodes`. Its planner numbers each distinct sort expression as the
+/// query's ORDER BY, DISTINCT and then each window (ORDER BY before PARTITION
+/// BY keys) first use it, and sorts the windows by their keys' numbers,
+/// highest first, a descending key before an ascending one and NULLs first
+/// before last, a longer key list before its prefix. Each window sorts its
+/// input stably by [`window_sort_keys`], so without a query ORDER BY rows
+/// leave in the last window's order, ties in the earlier windows' order.
+/// The `WINDOW` clause's definitions are numbered first, then inline
+/// specifications in select-list order.
+fn window_sort_chain<'a>(
+    statement: &'a Select<'a>,
+    win_nodes: &[&'a Expr<'a>],
+    arena: &'a Arena,
+) -> Result<&'a [usize], SqlError> {
+    let mut capacity = statement.order_by.len() + statement.items.len();
+    capacity += statement.distinct_on.len();
+    for &node in win_nodes {
+        let spec = window_spec(node)?;
+        capacity += spec.partition_by.len() + spec.order_by.len();
+    }
+    for spec in statement.windows {
+        capacity += spec.partition_by.len() + spec.order_by.len();
+    }
+    let numbered = arena
+        .alloc_slice_with(capacity, |_| &Expr::Null)
+        .map_err(|_| arena_full())?;
+    let mut count = 0usize;
+    let mut number = |expression: &'a Expr<'a>| -> usize {
+        match numbered[..count]
+            .iter()
+            .position(|&known| *known == *expression)
+        {
+            Some(index) => index,
+            None => {
+                numbered[count] = expression;
+                count += 1;
+                count - 1
+            }
+        }
+    };
+    let select_item = |expression: &'a Expr<'a>| -> &'a Expr<'a> {
+        let item = match *expression {
+            Expr::Int(ordinal) => usize::try_from(ordinal)
+                .ok()
+                .and_then(|ordinal| ordinal.checked_sub(1))
+                .and_then(|index| statement.items.get(index)),
+            Expr::Column {
+                qualifier: None,
+                name,
+            } => statement.items.iter().find(|item| {
+                matches!(item, SelectItem::Expr { alias: Some(alias), .. } if *alias == name)
+            }),
+            _ => None,
+        };
+        match item {
+            Some(SelectItem::Expr { expression, .. }) => expression,
+            _ => expression,
+        }
+    };
+    for order in statement.order_by {
+        number(select_item(order.expression));
+    }
+    if !statement.distinct_on.is_empty() {
+        for &expression in statement.distinct_on {
+            number(select_item(expression));
+        }
+    } else if statement.distinct {
+        for item in statement.items {
+            if let SelectItem::Expr { expression, .. } = item {
+                number(expression);
+            }
+        }
+    }
+    let specs = statement
+        .windows
+        .iter()
+        .copied()
+        .map(Ok)
+        .chain(win_nodes.iter().map(|&node| window_spec(node)));
+    for spec in specs {
+        let spec = spec?;
+        for order in spec.order_by {
+            number(order.expression);
+        }
+        for &expression in spec.partition_by {
+            number(expression);
+        }
+    }
+    let chain = arena
+        .alloc_slice_with(win_nodes.len(), |index| index)
+        .map_err(|_| arena_full())?;
+    let numbers = arena
+        .alloc_slice_with(win_nodes.len(), |_| &[] as &[(usize, bool, bool)])
+        .map_err(|_| arena_full())?;
+    for (index, &node) in win_nodes.iter().enumerate() {
+        let keys = window_sort_keys(window_spec(node)?, arena)?;
+        numbers[index] = arena
+            .alloc_slice_with(keys.len(), |k| {
+                let key = keys[k];
+                (number(key.expression), key.descending, key.nulls_first)
+            })
+            .map_err(|_| arena_full())?;
+    }
+    let precedes = |a: &[(usize, bool, bool)], b: &[(usize, bool, bool)]| {
+        for (x, y) in a.iter().zip(b) {
+            if x != y {
+                return (x.0, x.1, x.2) > (y.0, y.1, y.2);
+            }
+        }
+        a.len() > b.len()
+    };
+    // A handful of windows: an allocation-free stable insertion sort.
+    for i in 1..chain.len() {
+        let mut j = i;
+        while j > 0 && precedes(numbers[chain[j]], numbers[chain[j - 1]]) {
+            chain.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+    Ok(chain)
+}
+
 /// Materializes the post-WHERE source rows, computes each window function, and
 /// projects every row with the window values in scope. Returns the (unsorted)
 /// projected rows and their ORDER BY sort keys. Shared by the streaming
@@ -1618,8 +1788,8 @@ pub(crate) fn project_window_rows<'a>(
     // Enclosing query's row, when this window query is a correlated subquery's
     // body; its columns resolve after this query's own.
     outer: Option<&dyn ColumnLookup<'a>>,
-) -> Result<(&'a [&'a [Datum<'a>]], &'a [&'a [Datum<'a>]]), SqlError> {
-    let scan_where = window_scan_where(statement, correlated, arena)?;
+) -> Result<WindowRows<'a>, SqlError> {
+    let (scan_where, where_correlated) = window_scan_where(statement, correlated, arena)?;
     let pax_columns = window_pax_columns(statement, scope, from, win_nodes, arena)?;
     // Per-row correlated-subquery scratch, allocated once and reused across
     // both passes and the per-output-row merge below: per-row merges must not
@@ -1633,7 +1803,7 @@ pub(crate) fn project_window_rows<'a>(
     let mut total = 0usize;
     for t in 0..scope.n {
         offs[t] = total;
-        total += scope.defs.get(t).expect("resolved").n_columns;
+        total += scope.stored_width(t);
     }
 
     // Pass 1: count source rows.
@@ -1651,7 +1821,7 @@ pub(crate) fn project_window_rows<'a>(
         pax_columns,
         &mut |row| {
             if !row_passes_correlated_where(
-                correlated,
+                where_correlated,
                 statement.where_clause,
                 storage,
                 txid,
@@ -1688,7 +1858,7 @@ pub(crate) fn project_window_rows<'a>(
         pax_columns,
         &mut |row| {
             if !row_passes_correlated_where(
-                correlated,
+                where_correlated,
                 statement.where_clause,
                 storage,
                 txid,
@@ -1735,14 +1905,38 @@ pub(crate) fn project_window_rows<'a>(
     let win_ptrs: &[*const Expr] = arena
         .alloc_slice_with(win_nodes.len(), |i| win_nodes[i] as *const Expr)
         .map_err(|_| arena_full())?;
+    // Rows leave the windows in their evaluation order (see
+    // `window_sort_chain`); a query ORDER BY sorts them stably from there.
+    let row_order = arena
+        .alloc_slice_with(count, |index| index)
+        .map_err(|_| arena_full())?;
+    for &window in window_sort_chain(statement, win_nodes, arena)? {
+        let keys = window_sort_keys(window_spec(win_nodes[window])?, arena)?;
+        if keys.is_empty() {
+            continue;
+        }
+        crate::mem::arena::try_stable_sort_via(
+            arena,
+            row_order,
+            |&a, &b| {
+                cmp_order(
+                    keys, scope, rows, offs, a, b, arena, params, hooks, storage, txid,
+                )
+            },
+            |_| arena_full(),
+        )?;
+    }
 
     // Resolve ORDER BY (ordinals → select items).
     let n_order = statement.order_by.len();
     let order_exprs: &mut [Option<super::ResolvedSortKey<'a>>] = arena
         .alloc_slice_with(n_order, |_| None)
         .map_err(|_| arena_full())?;
+    let collations = arena
+        .alloc_slice_with(n_order, |_| Collation::None)
+        .map_err(|_| arena_full())?;
     for (k, ob) in statement.order_by.iter().enumerate() {
-        order_exprs[k] = Some(super::resolve_sort_key(
+        let key = super::resolve_sort_key(
             ob.expression,
             statement.items,
             scope,
@@ -1750,7 +1944,9 @@ pub(crate) fn project_window_rows<'a>(
             storage,
             txid,
             &order_exprs[..k],
-        )?);
+        )?;
+        collations[k] = scope.expression_collation(storage, arena, key.expression)?;
+        order_exprs[k] = Some(key);
     }
 
     // Project each row (with the window hook) and compute its sort keys.
@@ -1763,7 +1959,7 @@ pub(crate) fn project_window_rows<'a>(
     let wv: &mut [Datum] = arena
         .alloc_slice_with(win_nodes.len(), |_| Datum::Null)
         .map_err(|_| arena_full())?;
-    for i in 0..count {
+    for (out, &i) in row_order.iter().enumerate() {
         for (w, wval) in win_vals.iter().enumerate().take(win_nodes.len()) {
             wv[w] = wval[i];
         }
@@ -1812,7 +2008,7 @@ pub(crate) fn project_window_rows<'a>(
             &mut projected,
             outer,
         )?;
-        proj_rows[i] = &*arena
+        proj_rows[out] = &*arena
             .alloc_slice_copy(&projected[..np])
             .map_err(|_| arena_full())?;
         let keys: &mut [Datum] = arena
@@ -1832,15 +2028,110 @@ pub(crate) fn project_window_rows<'a>(
                 })?;
             keys[k] = value;
         }
-        sort_keys[i] = &*arena
+        sort_keys[out] = &*arena
             .alloc_slice_copy(&keys[..n_order])
             .map_err(|_| arena_full())?;
     }
-    Ok((proj_rows, sort_keys))
+    Ok(WindowRows {
+        rows: proj_rows,
+        sort_keys,
+        collations,
+    })
+}
+
+/// Window-projected output rows with each row's ORDER BY key values and the
+/// collation of each key.
+pub(crate) struct WindowRows<'a> {
+    pub(crate) rows: &'a [&'a [Datum<'a>]],
+    sort_keys: &'a [&'a [Datum<'a>]],
+    collations: &'a [Collation],
+}
+
+impl<'a> WindowRows<'a> {
+    /// SELECT DISTINCT: dedups on the projected values under SQL equality,
+    /// each survivor keeping its sort keys.
+    pub(crate) fn distinct(
+        self,
+        storage: &Storage,
+        txid: u32,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        let n = self.rows.len();
+        let index = arena.alloc_slice_with(n, |i| i).map_err(|_| arena_full())?;
+        let empty: &[u8] = &[];
+        let encoded = arena
+            .alloc_slice_with(n, |_| empty)
+            .map_err(|_| arena_full())?;
+        for (encoded, row) in encoded.iter_mut().zip(self.rows) {
+            *encoded = crate::sql::exec::encode_projected_pub(row, arena)?;
+        }
+        let width = self.rows.first().map_or(0, |row| row.len());
+        crate::util::try_sort_unstable_by(index, |&a, &b| {
+            crate::sql::exec::compare_projected_prefix(storage, txid, encoded[a], encoded[b], width)
+        })?;
+        let mut unique = 0usize;
+        for k in 0..n {
+            let same = k > 0
+                && crate::sql::exec::compare_projected_prefix(
+                    storage,
+                    txid,
+                    encoded[index[k]],
+                    encoded[index[unique - 1]],
+                    width,
+                )?
+                .is_eq();
+            if !same {
+                index[unique] = index[k];
+                unique += 1;
+            }
+        }
+        let rows = arena
+            .alloc_slice_with(unique, |k| self.rows[index[k]])
+            .map_err(|_| arena_full())?;
+        let sort_keys = arena
+            .alloc_slice_with(unique, |k| self.sort_keys[index[k]])
+            .map_err(|_| arena_full())?;
+        Ok(Self {
+            rows,
+            sort_keys,
+            collations: self.collations,
+        })
+    }
+
+    /// The row positions in ORDER BY order; ties keep their input order.
+    pub(crate) fn ordered(
+        &self,
+        storage: &Storage,
+        txid: u32,
+        order_by: &[OrderBy<'_>],
+        arena: &'a Arena,
+    ) -> Result<&'a [usize], SqlError> {
+        let order = arena
+            .alloc_slice_with(self.rows.len(), |i| i)
+            .map_err(|_| arena_full())?;
+        if !order_by.is_empty() {
+            crate::mem::arena::try_stable_sort_via(
+                arena,
+                order,
+                |&a, &b| {
+                    cmp_key_rows(
+                        storage,
+                        txid,
+                        self.collations,
+                        self.sort_keys[a],
+                        self.sort_keys[b],
+                        order_by,
+                    )
+                },
+                |_| arena_full(),
+            )?;
+        }
+        Ok(order)
+    }
 }
 
 /// Compares two encoded rows' first `n` columns under SQL equality and order,
-/// NULLs first — the same semantics `keys_equal` uses to partition rows.
+/// NULLs last — PostgreSQL's partition order.
 fn compare_encoded_keys(
     storage: &Storage,
     txid: u32,
@@ -1852,14 +2143,14 @@ fn compare_encoded_keys(
 ) -> Result<core::cmp::Ordering, SqlError> {
     use core::cmp::Ordering;
     for (k, &collation) in collations.iter().enumerate().take(n) {
-        let va = crate::sql::exec::decode_projected_pub(a, at + k);
-        let vb = crate::sql::exec::decode_projected_pub(b, at + k);
-        let c = match (va.is_null(), vb.is_null()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            (false, false) => compare_datums_collated(storage, txid, collation, &va, &vb)?,
-        };
+        let c = super::materialize::compare_ordered_key(
+            storage,
+            txid,
+            collation,
+            (false, false),
+            crate::sql::exec::ProjectedValue::column(a, at + k),
+            crate::sql::exec::ProjectedValue::column(b, at + k),
+        )?;
         if c != Ordering::Equal {
             return Ok(c);
         }
@@ -1880,9 +2171,14 @@ fn compare_encoded_order<'a>(
 ) -> Result<core::cmp::Ordering, SqlError> {
     use core::cmp::Ordering;
     for (k, o) in ord.iter().enumerate() {
-        let va = crate::sql::exec::decode_projected_pub(a, at + k);
-        let vb = crate::sql::exec::decode_projected_pub(b, at + k);
-        let c = order_by_key(storage, txid, collations[k], &va, &vb, o)?;
+        let c = super::materialize::compare_ordered_key(
+            storage,
+            txid,
+            collations[k],
+            (o.descending, o.nulls_first),
+            crate::sql::exec::ProjectedValue::column(a, at + k),
+            crate::sql::exec::ProjectedValue::column(b, at + k),
+        )?;
         if c != Ordering::Equal {
             return Ok(c);
         }
@@ -1902,7 +2198,7 @@ fn projected_width<'a>(
     let mut width = 0;
     for item in items {
         width += match item {
-            SelectItem::Wildcard => scope.star_columns(),
+            SelectItem::Wildcard(_) => scope.star_columns(),
             SelectItem::TableWildcard(qualifier) => scope.qualified_star_columns(qualifier)?,
             SelectItem::RecordStar(base) => {
                 record_star_width(base, Some(scope), storage, txid, arena)?
@@ -1952,7 +2248,7 @@ pub(crate) fn external_window_into<'a>(
     offset: u64,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<bool, SqlError>,
 ) -> Result<u64, SqlError> {
-    let scan_where = window_scan_where(statement, correlated, arena)?;
+    let (scan_where, where_correlated) = window_scan_where(statement, correlated, arena)?;
     let pax_columns = window_pax_columns(statement, scope, from, win_nodes, arena)?;
     // Per-row correlated-subquery scratch, allocated once and reused across
     // every scan pass below: per-row merges must not grow the statement arena.
@@ -1965,7 +2261,7 @@ pub(crate) fn external_window_into<'a>(
     let mut total = 0usize;
     for (t, offset) in offs.iter_mut().enumerate().take(scope.n) {
         *offset = total;
-        total += scope.defs.get(t).expect("resolved").n_columns;
+        total += scope.stored_width(t);
     }
     // Resolve ORDER BY (ordinals → select items).
     let n_order = statement.order_by.len();
@@ -2064,7 +2360,7 @@ pub(crate) fn external_window_into<'a>(
             pax_columns,
             &mut |row| {
                 if !row_passes_correlated_where(
-                    correlated,
+                    where_correlated,
                     statement.where_clause,
                     storage,
                     txid,
@@ -2103,7 +2399,7 @@ pub(crate) fn external_window_into<'a>(
                                 } else if index < n_keys + total {
                                     let flat = index - n_keys;
                                     for (t, offset) in offs.iter().enumerate().take(scope.n) {
-                                        let nc = scope.defs.get(t).expect("resolved").n_columns;
+                                        let nc = scope.stored_width(t);
                                         if flat < offset + nc {
                                             let vals = row.table_values(t).expect("bound");
                                             return if vals.is_empty() {
@@ -2146,30 +2442,39 @@ pub(crate) fn external_window_into<'a>(
             let mut pos_of: &mut [i64] = arena
                 .alloc_slice_with(16, |_| 0)
                 .map_err(|_| arena_full())?;
+            let mut rank_of: &mut [i64] = arena
+                .alloc_slice_with(16, |_| 0)
+                .map_err(|_| arena_full())?;
             let mut count = 0usize;
-            let mut finish_partition =
-                |rows: &[&'a [Datum<'a>]], pos_of: &[i64]| -> Result<(), SqlError> {
-                    let out = compute_window(
-                        storage, txid, node, rows, scope, offs, arena, params, hooks, outer,
-                    )?;
-                    for (r, &pos) in pos_of.iter().enumerate() {
-                        storage
-                            .with_block_store(|blocks| {
-                                win_sorter.push_projected_by(
-                                    blocks,
-                                    3,
-                                    |index| match index {
-                                        0 => Datum::Int8(pos),
-                                        1 => Datum::Int4(wi as i32),
-                                        _ => out[r],
-                                    },
-                                    &mut win_compare,
-                                )
-                            })
-                            .expect("spill-attached block store")?;
-                    }
-                    Ok(())
-                };
+            // Each row's rank in this window's sorted run; equal keys share
+            // one, so the output can follow the windows' chained order.
+            let mut rank = 0i64;
+            let mut finish_partition = |rows: &[&'a [Datum<'a>]],
+                                        pos_of: &[i64],
+                                        rank_of: &[i64]|
+             -> Result<(), SqlError> {
+                let out = compute_window(
+                    storage, txid, node, rows, scope, offs, arena, params, hooks, outer,
+                )?;
+                for (r, &pos) in pos_of.iter().enumerate() {
+                    storage
+                        .with_block_store(|blocks| {
+                            win_sorter.push_projected_by(
+                                blocks,
+                                4,
+                                |index| match index {
+                                    0 => Datum::Int8(pos),
+                                    1 => Datum::Int4(wi as i32),
+                                    2 => out[r],
+                                    _ => Datum::Int8(rank_of[r]),
+                                },
+                                &mut win_compare,
+                            )
+                        })
+                        .expect("spill-attached block store")?;
+                }
+                Ok(())
+            };
             loop {
                 let keep_scanning = {
                     let Some(context) = spec_reader.context() else {
@@ -2194,8 +2499,24 @@ pub(crate) fn external_window_into<'a>(
                         )?
                         .is_eq(),
                     };
+                    let new_rank = match previous {
+                        Some(prior) if !is_new => !compare_encoded_order(
+                            storage,
+                            txid,
+                            &order_collations[..spec.order_by.len()],
+                            prior,
+                            row,
+                            n_partition,
+                            spec.order_by,
+                        )?
+                        .is_eq(),
+                        _ => true,
+                    };
+                    if new_rank {
+                        rank += 1;
+                    }
                     if is_new && count > 0 {
-                        finish_partition(&rows[..count], &pos_of[..count])?;
+                        finish_partition(&rows[..count], &pos_of[..count], &rank_of[..count])?;
                         // SAFETY: every value allocated since `mark` was
                         // encoded into the window run; none escapes.
                         unsafe { arena.rewind_to(mark) };
@@ -2206,11 +2527,16 @@ pub(crate) fn external_window_into<'a>(
                         pos_of = arena
                             .alloc_slice_with(16, |_| 0)
                             .map_err(|_| arena_full())?;
+                        rank_of = arena
+                            .alloc_slice_with(16, |_| 0)
+                            .map_err(|_| arena_full())?;
                     }
                     if count == rows.len() {
                         rows = grow_slots(arena, rows, empty_row)?;
                         pos_of = grow_slots(arena, pos_of, 0)?;
+                        rank_of = grow_slots(arena, rank_of, 0)?;
                     }
+                    rank_of[count] = rank;
                     // Copy the encoded row into the arena so its decoded
                     // columns survive the reader's next advance.
                     let copied = arena.alloc_slice_copy(row).map_err(|_| arena_full())?;
@@ -2246,7 +2572,7 @@ pub(crate) fn external_window_into<'a>(
                     .expect("spill-attached block store")?;
             }
             if count > 0 {
-                finish_partition(&rows[..count], &pos_of[..count])?;
+                finish_partition(&rows[..count], &pos_of[..count], &rank_of[..count])?;
                 // SAFETY: the partition's decoded values were consumed into
                 // the window run before this rewind.
                 unsafe { arena.rewind_to(mark) };
@@ -2268,6 +2594,17 @@ pub(crate) fn external_window_into<'a>(
         statement_order_collations[index] =
             scope.expression_collation(storage, arena, key.expect("set").expression)?;
     }
+    // Without DISTINCT, ORDER BY ties keep the windows' chained order: each
+    // row carries its rank in every window's sorted run, the last-evaluated
+    // window's first (see `window_sort_chain`).
+    let chain = if statement.distinct {
+        &[][..]
+    } else {
+        window_sort_chain(statement, win_nodes, arena)?
+    };
+    let ranks: &mut [i64] = arena
+        .alloc_slice_with(win_nodes.len(), |_| 0)
+        .map_err(|_| arena_full())?;
     let mut out_sorter = storage.external_sorter()?;
     out_sorter.reset();
     let mut out_compare = |left: &[u8], right: &[u8]| -> Result<core::cmp::Ordering, SqlError> {
@@ -2280,13 +2617,23 @@ pub(crate) fn external_window_into<'a>(
             width,
             statement.order_by,
         )?;
-        if statement.distinct && by_order.is_eq() {
-            Ok(crate::sql::exec::compare_projected_prefix(
-                left, right, width,
-            ))
-        } else {
-            Ok(by_order)
+        if !by_order.is_eq() {
+            return Ok(by_order);
         }
+        if statement.distinct {
+            return crate::sql::exec::compare_projected_prefix(storage, txid, left, right, width);
+        }
+        for column in width + n_order..width + n_order + chain.len() {
+            let ordering = crate::sql::exec::compare_projected_values(
+                crate::sql::exec::ProjectedValue::column(left, column),
+                crate::sql::exec::ProjectedValue::column(right, column),
+                &mut |x, y| compare_datums(x, y),
+            )?;
+            if !ordering.is_eq() {
+                return Ok(ordering);
+            }
+        }
+        Ok(core::cmp::Ordering::Equal)
     };
     let mut win_reader = match win_run {
         Some(run) => {
@@ -2319,7 +2666,7 @@ pub(crate) fn external_window_into<'a>(
         pax_columns,
         &mut |row| {
             if !row_passes_correlated_where(
-                correlated,
+                where_correlated,
                 statement.where_clause,
                 storage,
                 txid,
@@ -2359,6 +2706,12 @@ pub(crate) fn external_window_into<'a>(
                 let value = crate::sql::exec::decode_projected_col_record(entry, 2, arena)?;
                 let owned = crate::sql::exec::encode_projected_pub(&[value], arena)?;
                 wv[index] = crate::sql::exec::decode_projected_col_record(owned, 0, arena)?;
+                ranks[index] = match crate::sql::exec::decode_projected_pub(entry, 3) {
+                    Datum::Int8(rank) => rank,
+                    _ => {
+                        return Err(sql_err!(sqlstate::INTERNAL_ERROR, "window rank is corrupt"));
+                    }
+                };
                 storage
                     .with_block_store(|blocks| reader.advance(blocks))
                     .expect("spill-attached block store")?;
@@ -2424,12 +2777,16 @@ pub(crate) fn external_window_into<'a>(
                 .with_block_store(|blocks| {
                     out_sorter.push_projected_by(
                         blocks,
-                        width + n_order,
+                        width + n_order + chain.len(),
                         |index| {
                             if index < width {
                                 projected[index]
-                            } else {
+                            } else if index < width + n_order {
                                 keys[index - width]
+                            } else {
+                                Datum::Int8(
+                                    ranks[chain[chain.len() - 1 - (index - width - n_order)]],
+                                )
                             }
                         },
                         &mut out_compare,
@@ -2466,10 +2823,13 @@ pub(crate) fn external_window_into<'a>(
                 boundary: _,
                 output: _,
             } = context;
-            let duplicate = statement.distinct
-                && previous.is_some_and(|prior| {
-                    crate::sql::exec::compare_projected_prefix(row, prior, width).is_eq()
-                });
+            let duplicate = match previous {
+                Some(prior) if statement.distinct => {
+                    crate::sql::exec::compare_projected_prefix(storage, txid, row, prior, width)?
+                        .is_eq()
+                }
+                _ => false,
+            };
             if duplicate {
                 true
             } else if skipped < offset {
@@ -2579,49 +2939,26 @@ pub(crate) fn window_select<'a>(
         responder.command_complete(tag.as_str())?;
         return sql_ok();
     }
-    let (proj_rows, sort_keys) = match project_window_rows(
+    let rows = match project_window_rows(
         // The top-level query has no enclosing row to resolve against.
         storage, txid, statement, from, scope, win_nodes, hooks, correlated, base, arena, params,
         None,
-    ) {
-        Ok(v) => v,
+    )
+    .and_then(|rows| {
+        if statement.distinct {
+            rows.distinct(storage, txid, arena)
+        } else {
+            Ok(rows)
+        }
+    }) {
+        Ok(rows) => rows,
         Err(e) => return sql_fail(e),
     };
-    // DISTINCT dedups on the projected row (encoded order-preserving), with
-    // each surviving row keeping its sort keys.
-    let (proj_rows, sort_keys) = if statement.distinct {
-        match dedup_window_rows(proj_rows, sort_keys, arena) {
-            Ok(pair) => pair,
-            Err(e) => return sql_fail(e),
-        }
-    } else {
-        (proj_rows, sort_keys)
+    let proj_rows = rows.rows;
+    let order = match rows.ordered(storage, txid, statement.order_by, arena) {
+        Ok(order) => order,
+        Err(e) => return sql_fail(e),
     };
-    let count = proj_rows.len();
-
-    // Sort output rows by the ORDER BY keys.
-    let order = match arena.alloc_slice_with(count, |i| i) {
-        Ok(o) => o,
-        Err(_) => return sql_fail(arena_full()),
-    };
-    if !statement.order_by.is_empty() {
-        for x in 1..count {
-            let mut y = x;
-            while y > 0 {
-                let c = cmp_key_rows(
-                    sort_keys[order[y - 1]],
-                    sort_keys[order[y]],
-                    statement.order_by,
-                );
-                if c == core::cmp::Ordering::Greater {
-                    order.swap(y - 1, y);
-                    y -= 1;
-                } else {
-                    break;
-                }
-            }
-        }
-    }
 
     // Emit under OFFSET/LIMIT.
     let mut emitted = 0u64;
@@ -2646,87 +2983,21 @@ pub(crate) fn window_select<'a>(
     sql_ok()
 }
 
-/// Dedups window-projected rows on the projected values (order-preserving
-/// encoding), keeping each survivor's sort keys. Used by SELECT DISTINCT
-/// with window functions.
-#[allow(clippy::type_complexity)]
-pub(crate) fn dedup_window_rows<'a>(
-    proj_rows: &'a [&'a [Datum<'a>]],
-    sort_keys: &'a [&'a [Datum<'a>]],
-    arena: &'a Arena,
-) -> Result<(&'a [&'a [Datum<'a>]], &'a [&'a [Datum<'a>]]), SqlError> {
-    let n = proj_rows.len();
-    let index = arena.alloc_slice_with(n, |i| i).map_err(|_| arena_full())?;
-    let empty: &[u8] = &[];
-    let encoded = arena
-        .alloc_slice_with(n, |_| empty)
-        .map_err(|_| arena_full())?;
-    for i in 0..n {
-        if proj_rows[i].iter().any(|d| matches!(d, Datum::Bpchar(_))) {
-            let key = arena
-                .alloc_slice_with(proj_rows[i].len(), |j| {
-                    crate::sql::eval::text_view(proj_rows[i][j])
-                })
-                .map_err(|_| arena_full())?;
-            encoded[i] = crate::sql::exec::encode_projected_pub(key, arena)?;
-        } else {
-            encoded[i] = crate::sql::exec::encode_projected_pub(proj_rows[i], arena)?;
-        }
-    }
-    index.sort_unstable_by(|&a, &b| encoded[a].cmp(encoded[b]));
-    let mut unique = 0usize;
-    for k in 0..n {
-        let same = k > 0 && encoded[index[k]] == encoded[index[k - 1]];
-        if !same {
-            index[unique] = index[k];
-            unique += 1;
-        }
-    }
-    let empty_row: &[Datum] = &[];
-    let out_rows = arena
-        .alloc_slice_with(unique, |_| empty_row)
-        .map_err(|_| arena_full())?;
-    let out_keys = arena
-        .alloc_slice_with(unique, |_| empty_row)
-        .map_err(|_| arena_full())?;
-    for k in 0..unique {
-        out_rows[k] = proj_rows[index[k]];
-        out_keys[k] = sort_keys[index[k]];
-    }
-    Ok((&*out_rows, &*out_keys))
-}
-
-/// Compares two precomputed sort-key tuples honoring ASC/DESC + NULLS order.
-pub(crate) fn cmp_key_rows(a: &[Datum], b: &[Datum], ord: &[OrderBy]) -> core::cmp::Ordering {
-    use core::cmp::Ordering;
+/// Compares two precomputed sort-key tuples honoring ASC/DESC + NULLS order,
+/// each key under its collation.
+pub(crate) fn cmp_key_rows(
+    storage: &Storage,
+    txid: u32,
+    collations: &[Collation],
+    a: &[Datum],
+    b: &[Datum],
+    ord: &[OrderBy],
+) -> Result<core::cmp::Ordering, SqlError> {
     for (k, o) in ord.iter().enumerate() {
-        let (va, vb) = (&a[k], &b[k]);
-        let base = match (va.is_null(), vb.is_null()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => {
-                if o.nulls_first {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                }
-            }
-            (false, true) => {
-                if o.nulls_first {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            }
-            (false, false) => compare_datums(va, vb).unwrap_or(Ordering::Equal),
-        };
-        let c = if o.descending && !va.is_null() && !vb.is_null() {
-            base.reverse()
-        } else {
-            base
-        };
-        if c != Ordering::Equal {
-            return c;
+        let ordering = order_by_key(storage, txid, collations[k], &a[k], &b[k], o)?;
+        if !ordering.is_eq() {
+            return Ok(ordering);
         }
     }
-    Ordering::Equal
+    Ok(core::cmp::Ordering::Equal)
 }

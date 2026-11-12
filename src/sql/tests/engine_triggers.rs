@@ -261,12 +261,13 @@ fn executor_trigger_errors_timeouts_and_rollbacks_undo_its_effects() {
     );
     holder.success(&mut engine, "SELECT pg_advisory_lock(7)", true);
     let sql = "INSERT INTO t(id, v) VALUES (1,'a'),(2,'b')";
+    let status = writer.execute_status(&mut engine, sql, true);
     let ExecutionStatus::Blocked {
         completed_statements,
         ..
-    } = writer.execute_status(&mut engine, sql, true)
+    } = status
     else {
-        panic!("the trigger did not wait");
+        panic!("the trigger did not wait: {status:?}");
     };
     writer.transaction.expire_suspended_statement_deadline();
     writer.send.clear();

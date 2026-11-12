@@ -787,6 +787,72 @@ fn statements_are_analysed_as_postgresql_analyses_them() {
     });
 }
 
+/// Under `#variable_conflict use_variable` the variable wins at every site that
+/// binds names to columns; cursor queries follow the body's rule too.
+#[test]
+fn procedural_use_variable_reads_the_variable_where_columns_bind() {
+    with_engine("procedural-use-variable", |engine, budget| {
+        let setup = "CREATE TABLE uv (a int, b int, c text); \
+             INSERT INTO uv VALUES (1, 10, 'x'), (2, 20, 'y'), (3, 30, 'x'); \
+             CREATE FUNCTION uv_reads() RETURNS SETOF text LANGUAGE plpgsql AS $$ \
+             #variable_conflict use_variable\nDECLARE a int := 2; c text := 'x'; BEGIN \
+             RETURN QUERY SELECT format('%s', sum(a)) FROM uv; \
+             RETURN QUERY SELECT format('%s|%s', a, count(*)) FROM uv GROUP BY a; \
+             RETURN QUERY SELECT DISTINCT ON (c) format('%s/%s', c, b) FROM uv ORDER BY c, b; \
+             RETURN QUERY SELECT format('%s', row_number() OVER (PARTITION BY c ORDER BY b)) FROM uv; \
+             RETURN QUERY SELECT format('%s', x) FROM (SELECT a + b AS x FROM uv) s ORDER BY 1 LIMIT 1; \
+             RETURN QUERY SELECT format('%s', a) FROM uv GROUP BY b HAVING count(*) > 0 ORDER BY b LIMIT 1; \
+             END $$; \
+             CREATE FUNCTION uv_writes() RETURNS int LANGUAGE plpgsql AS $$ \
+             #variable_conflict use_variable\nDECLARE b int := 5; BEGIN \
+             UPDATE uv SET b = b + 1 WHERE a = 1; \
+             DELETE FROM uv WHERE b = 5 AND a = 3; RETURN (SELECT uv.b FROM uv WHERE uv.a = 1); END $$; \
+             CREATE FUNCTION uv_cursor(rule text) RETURNS int LANGUAGE plpgsql AS $$ \
+             DECLARE a int := 2; cur refcursor; x int; BEGIN \
+             OPEN cur FOR SELECT sum(b) FROM uv WHERE a = 1; FETCH cur INTO x; RETURN x; END $$; \
+             CREATE FUNCTION uv_cursor_variable() RETURNS int LANGUAGE plpgsql AS $$ \
+             #variable_conflict use_variable\nDECLARE a int := 2; cur refcursor; x int; BEGIN \
+             OPEN cur FOR SELECT sum(a) FROM uv; FETCH cur INTO x; RETURN x; END $$; \
+             CREATE FUNCTION uv_cursor_column() RETURNS int LANGUAGE plpgsql AS $$ \
+             #variable_conflict use_column\nDECLARE a int := 2; cur refcursor; x int; BEGIN \
+             OPEN cur FOR SELECT sum(b) FROM uv WHERE a = 1; FETCH cur INTO x; RETURN x; END $$";
+        assert_eq!(
+            reports(&run_with(engine, budget, setup)),
+            Vec::<String>::new()
+        );
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "SELECT * FROM uv_reads()",
+                &[
+                    "data|6",
+                    "data|2|3",
+                    "data|x/10",
+                    "data|1",
+                    "data|2",
+                    "data|3",
+                    "data|12",
+                    "data|2",
+                    "SELECT 8",
+                ],
+            ),
+            ("SELECT uv_writes()", &["data|6", "SELECT 1"]),
+            ("SELECT count(*) FROM uv", &["data|2", "SELECT 1"]),
+            (
+                "SELECT uv_cursor('error')",
+                &[
+                    "ERROR 42702 column reference \"a\" is ambiguous detail: It could refer to either a PL/pgSQL variable or a table column.",
+                ],
+            ),
+            ("SELECT uv_cursor_variable()", &["data|4", "SELECT 1"]),
+            ("SELECT uv_cursor_column()", &["data|6", "SELECT 1"]),
+        ];
+        for (sql, expected) in cases {
+            let output = run_with(engine, budget, sql);
+            assert_eq!(transcript(&output), *expected, "{sql}");
+        }
+    });
+}
+
 /// `plpgsql.variable_conflict` and `#variable_conflict`: a name that is both a
 /// PL/pgSQL variable and a column is ambiguous by default, reported while the
 /// statement is analysed (no row needs to be read), at every query level.
@@ -828,12 +894,7 @@ fn procedural_variable_column_conflicts_follow_postgresql() {
                     "ERROR 42702 column reference \"b\" is ambiguous detail: It could refer to either a PL/pgSQL variable or a table column.",
                 ],
             ),
-            (
-                "SELECT vc_variable()",
-                &[
-                    "ERROR 0A000 #variable_conflict use_variable is not supported for \"b\", which is also a column",
-                ],
-            ),
+            ("SELECT vc_variable()", &["data|5", "SELECT 1"]),
             ("SELECT vc_free()", &["data|20", "SELECT 1"]),
             (
                 "SELECT m FROM vc_outer ORDER BY m",
@@ -980,6 +1041,23 @@ fn insert_target_counts_are_positioned() {
                 "INSERT INTO ic (a) SELECT 1, 2",
                 &["ERROR 42601 INSERT has more expressions than target columns @30"],
             ),
+            ("CREATE TABLE ix (a int[], b int)", &["CREATE TABLE"]),
+            (
+                "INSERT INTO ix (a[1], b) SELECT 1",
+                &["ERROR 42601 INSERT has more target columns than expressions @23"],
+            ),
+            (
+                "INSERT INTO ix (a[1], b) VALUES (1)",
+                &["ERROR 42601 INSERT has more target columns than expressions @23"],
+            ),
+            (
+                "INSERT INTO ix (a[1], b) VALUES ('x')",
+                &["ERROR 42601 INSERT has more target columns than expressions @23"],
+            ),
+            (
+                "INSERT INTO ix (a[1]) VALUES (1, 2)",
+                &["ERROR 42601 INSERT has more expressions than target columns @34"],
+            ),
             ("SELECT count(*) FROM ic", &["data|0", "SELECT 1"]),
         ];
         for (sql, expected) in cases {
@@ -1033,5 +1111,40 @@ fn record_fields_and_referential_actions_report_postgresql_context() {
                 ),
             ],
         );
+    });
+}
+
+/// A simple `CASE` compares its operand with each `WHEN` value at the `WHEN`
+/// keyword, and `PREPARE` positions analysis errors in its own text.
+#[test]
+fn case_comparisons_and_prepared_analysis_are_positioned() {
+    with_engine("case-prepare-positions", |engine, budget| {
+        let hint = "hint: No operator matches the given name and argument types. \
+                    You might need to add explicit type casts.";
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "SELECT CASE 1 WHEN 2 THEN 1 WHEN 'a'::text THEN 2 END",
+                &["ERROR 42883 operator does not exist: integer = text @29 "],
+            ),
+            (
+                "PREPARE w AS SELECT CASE $1 WHEN 1 THEN 'a' END",
+                &["ERROR 42883 operator does not exist: text = integer @29 "],
+            ),
+            (
+                "PREPARE w2 AS  SELECT (SELECT 1, 2)",
+                &["ERROR 42601 subquery must return only one column @23"],
+            ),
+        ];
+        for (sql, expected) in cases {
+            let output = run_with(engine, budget, sql);
+            let expected: Vec<String> = expected
+                .iter()
+                .map(|line| match line.strip_suffix(' ') {
+                    Some(line) => format!("{line} {hint}"),
+                    None => (*line).to_owned(),
+                })
+                .collect();
+            assert_eq!(transcript(&output), expected, "{sql}");
+        }
     });
 }

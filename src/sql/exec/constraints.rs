@@ -434,7 +434,10 @@ pub(crate) fn column_domain_target(
     if bound.polymorphic_type().is_some() {
         return Ok(None);
     }
-    let Some(identity) = bound.user_type else {
+    let Some(identity) = bound.user_type.filter(|identity| {
+        identity.relation_row_type_creation().is_none()
+            && identity.information_schema_domain_binding().is_none()
+    }) else {
         return Ok(None);
     };
     let reference = crate::storage::TypeReference::from_bound_name(identity)?;
@@ -460,6 +463,29 @@ pub(crate) fn check_domain_constraints(
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
     for (i, col) in def.columns().iter().enumerate() {
+        if let Some(domain) = col
+            .user_type
+            .and_then(crate::storage::UserTypeName::information_schema_domain_binding)
+        {
+            match (col.ctype, values.get(i).copied().unwrap_or(Datum::Null)) {
+                (ColType::Array(element), Datum::Array { raw, .. }) => {
+                    for item in crate::sql::array::elements(raw, element) {
+                        // The element's declared length applies as it does
+                        // to a scalar of the domain.
+                        let item = crate::sql::exec::apply_typmod(
+                            item,
+                            domain.base(),
+                            domain.base_type_mod(),
+                            arena,
+                        )?;
+                        domain.validate(&item)?;
+                    }
+                }
+                (ColType::Array(_), _) => {}
+                (_, value) => domain.validate(&value)?,
+            }
+            continue;
+        }
         let Some(slot) = column_domain_target(storage, col, txid)? else {
             continue;
         };
@@ -530,6 +556,90 @@ fn duplicate_key_error<'v>(
             name.as_str()
         ),
     }
+}
+
+/// Stashes PostgreSQL's DETAIL and constraint fields for a conflict between
+/// `values` and `other` under `exclusion`.
+fn stash_exclusion_conflict(
+    duplicate: DuplicateKey,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    exclusion: &crate::storage::ExclusionConstraint,
+    values: &[Datum],
+    other: &[Datum],
+) -> Result<(), SqlError> {
+    let names = || {
+        exclusion.columns[..exclusion.n_cols]
+            .iter()
+            .map(|column| def.columns()[*column as usize].name.as_str())
+    };
+    let mut existing_text = DetailText::new();
+    write_key_description(
+        &mut existing_text,
+        "key",
+        &mut names(),
+        &mut exclusion.columns[..exclusion.n_cols]
+            .iter()
+            .map(|column| other[*column as usize]),
+    );
+    let existing = match duplicate {
+        DuplicateKey::Write => "existing ",
+        DuplicateKey::IndexBuild => "",
+    };
+    let detail = key_detail(
+        &mut names(),
+        &mut exclusion.columns[..exclusion.n_cols]
+            .iter()
+            .map(|column| values[*column as usize]),
+        format_args!(" conflicts with {existing}{}.", existing_text.as_str()),
+    )?;
+    crate::sql::eval::stash_object_diagnostic(
+        Some(detail.as_str()),
+        crate::sql::eval::ErrorObjects::table_constraint(
+            def.schema.as_str(),
+            def.name.as_str(),
+            exclusion.name.as_str(),
+        ),
+    );
+    Ok(())
+}
+
+/// The 23P01 error for a conflict with exclusion constraint `name`.
+fn exclusion_violation(duplicate: DuplicateKey, name: SqlName) -> SqlError {
+    match duplicate {
+        DuplicateKey::Write => sql_err!(
+            sqlstate::EXCLUSION_VIOLATION,
+            "conflicting key value violates exclusion constraint \"{}\"",
+            name.as_str()
+        ),
+        DuplicateKey::IndexBuild => sql_err!(
+            sqlstate::EXCLUSION_VIOLATION,
+            "could not create exclusion constraint \"{}\"",
+            name.as_str()
+        ),
+    }
+}
+
+/// The index-build exclusion violation between rows `values` and `other`.
+pub(crate) fn index_build_exclusion_violation(
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    exclusion: &crate::storage::ExclusionConstraint,
+    values: &[Datum],
+    other: &[Datum],
+) -> SqlError {
+    match stash_exclusion_conflict(DuplicateKey::IndexBuild, def, exclusion, values, other) {
+        Ok(()) => exclusion_violation(DuplicateKey::IndexBuild, exclusion.name),
+        Err(error) => error,
+    }
+}
+
+/// The index-build unique violation for `values`' key `columns`.
+pub(crate) fn index_build_unique_violation(
+    name: SqlName,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    columns: &[u16],
+    values: &[Datum],
+) -> SqlError {
+    unique_violation(DuplicateKey::IndexBuild, name, def, columns, values)
 }
 
 /// Whether the row `rowid`'s committed key equals `values` under this index's
@@ -1741,6 +1851,7 @@ pub(crate) fn check_reindex_constraints(
             predicate,
             arena,
             Some(storage.validation_read()),
+            DuplicateKey::IndexBuild,
         )?;
     }
     check_unique_indexes(
@@ -2485,6 +2596,12 @@ fn check_or_defer_exclusions(
             expressions[crate::storage::MAX_CHECKS + index],
             arena,
             row.validation_read(),
+            // Existing rows meeting a new constraint are its index being built.
+            if matches!(row, ConstraintRow::Existing { .. }) {
+                DuplicateKey::IndexBuild
+            } else {
+                DuplicateKey::Write
+            },
         )?;
     }
     Ok(())
@@ -2503,6 +2620,7 @@ fn enforce_exclusion_constraint(
     predicate: Option<&Expr>,
     arena: &Arena,
     read: Option<ValidationRead>,
+    duplicate: DuplicateKey,
 ) -> Result<(), SqlError> {
     let decoder =
         crate::storage::RelationRowDecoder::new(def, &storage.table_def(table_index, txid))?;
@@ -2570,43 +2688,11 @@ fn enforce_exclusion_constraint(
                     return Ok(false);
                 }
             }
-            let names = || {
-                exclusion.columns[..exclusion.n_cols]
-                    .iter()
-                    .map(|column| def.columns()[*column as usize].name.as_str())
-            };
-            let mut existing_text = DetailText::new();
-            write_key_description(
-                &mut existing_text,
-                "key",
-                &mut names(),
-                &mut exclusion.columns[..exclusion.n_cols]
-                    .iter()
-                    .map(|column| other[*column as usize]),
-            );
-            let detail = key_detail(
-                &mut names(),
-                &mut exclusion.columns[..exclusion.n_cols]
-                    .iter()
-                    .map(|column| values[*column as usize]),
-                format_args!(" conflicts with existing {}.", existing_text.as_str()),
-            )?;
-            crate::sql::eval::stash_object_diagnostic(
-                Some(detail.as_str()),
-                crate::sql::eval::ErrorObjects::table_constraint(
-                    def.schema.as_str(),
-                    def.name.as_str(),
-                    exclusion.name.as_str(),
-                ),
-            );
+            stash_exclusion_conflict(duplicate, def, exclusion, values, other)?;
             Ok(true)
         })?;
         if conflicts {
-            return Err(sql_err!(
-                sqlstate::EXCLUSION_VIOLATION,
-                "conflicting key value violates exclusion constraint \"{}\"",
-                exclusion.name.as_str()
-            ));
+            return Err(exclusion_violation(duplicate, exclusion.name));
         }
         Ok(ControlFlow::Continue(()))
     };
@@ -3162,6 +3248,7 @@ pub(crate) fn validate_constraint_obligation(
                     predicate,
                     arena,
                     None,
+                    DuplicateKey::Write,
                 )?;
             }
             Ok(())
@@ -3691,7 +3778,6 @@ fn parent_has_key(
                     parent_definition.columns()[parent_column as usize].collation,
                     child,
                     parent,
-                    arena,
                 )
             };
             if !matches!(equal, Ok(true)) {
@@ -4617,7 +4703,6 @@ fn referencing_key_matches(
                 parent_column.collation,
                 &referencing,
                 referenced,
-                arena,
             )? {
                 return Ok(false);
             }
@@ -4640,22 +4725,8 @@ fn key_value_equal(
     collation: crate::sql::ast::Collation,
     referencing: &Datum,
     referenced: &Datum,
-    arena: &Arena,
 ) -> Result<bool, SqlError> {
-    let composite =
-        |value: &Datum| matches!(value, Datum::Composite { .. } | Datum::CompositeText { .. });
-    if composite(referencing) && composite(referenced) {
-        let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
-        let equal = crate::sql::eval::named_composite_comparison(
-            crate::sql::ast::BinaryOp::Eq,
-            *referenced,
-            *referencing,
-            Some(&catalog),
-            arena,
-        )?;
-        return Ok(matches!(equal, Some(Datum::Bool(true))));
-    }
-    Ok(compare_datums_collated(storage, txid, collation, referencing, referenced)?.is_eq())
+    Ok(compare_datums_collated(storage, txid, collation, referenced, referencing)?.is_eq())
 }
 
 /// A queued NO ACTION or RESTRICT check of a deleted or re-keyed parent row:

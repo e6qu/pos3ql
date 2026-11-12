@@ -27,7 +27,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 27;
+pub(crate) const RECORD_VERSION: u8 = 30;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -119,6 +119,14 @@ wal_record_kinds! {
 /// create-and-remove sequences that leave no live catalog row.
     KIND_CATALOG_RESERVATION = 157;
     KIND_SET_PARTITION_TRIGGER = 158;
+    KIND_SET_BUILTIN_ROUTINE = 159;
+/// Trigger alterations carry the trigger's `WHEN` condition, which a column or
+/// schema rename rewrites. Kind 57, without the condition, is rejected.
+    KIND_ALTER_TRIGGER_V2 = 160;
+/// Index alterations carry the complete key expressions and predicate, which
+/// column, table and schema renames rewrite. Kind 71, with only the mutable
+/// settings, is rejected.
+    KIND_ALTER_INDEX_DEFINITION_V2 = 161;
 // Publication records carry the typed ordinary-descendant selection added
 // after the original record layout. New kinds make older bytes fail recovery
 // loudly instead of being reinterpreted as a different catalog contract.
@@ -143,6 +151,8 @@ wal_record_kinds! {
 /// Routine result counts widened from one byte to PostgreSQL's tuple width.
     KIND_CREATE_ROUTINE_V2 = 142;
     KIND_CREATE_COMPOSITE_V2 = 143;
+/// View columns carry their names, types and defaults. Kinds 5 and 126,
+/// whose columns have no types, are rejected.
     KIND_CREATE_VIEW_V2 = 144;
     KIND_SET_VIEW_COLUMNS_V2 = 145;
 /// Policy role counts widened from one byte to the configured role catalog.
@@ -257,13 +267,14 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 19;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 18;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
 fn access_class_has_oid(class: u8) -> bool {
     class == crate::storage::AccessClass::Routine as u8
         || class == crate::storage::AccessClass::LargeObject as u8
+        || class == crate::storage::AccessClass::BuiltinRoutine as u8
 }
 
 fn table_needs_typed_journal<B: DefinitionBacking>(def: &TableDefinition<B>) -> bool {
@@ -406,10 +417,7 @@ pub(crate) enum WalViewColumns<'a> {
         columns: &'a crate::storage::ViewColumns,
         default_inputs: &'a crate::storage::StoredTypeInputs,
     },
-    Encoded {
-        bytes: &'a [u8],
-        wide_count: bool,
-    },
+    Encoded(&'a [u8]),
 }
 
 impl<'a> WalViewColumns<'a> {
@@ -427,20 +435,14 @@ impl<'a> WalViewColumns<'a> {
                         .enumerate()
                         .map(|(index, name)| {
                             1 + name.as_str().len()
-                                + encoded_view_default_len(
+                                + crate::storage::ViewColumnType::ENCODED_BYTES
+                                + encoded_view_column_default_len(
                                     columns.default_at(index).expect("view column exists"),
                                 )
                         })
                         .sum::<usize>()
             }
-            Self::Encoded {
-                bytes,
-                wide_count: true,
-            } => bytes.len(),
-            Self::Encoded {
-                bytes,
-                wide_count: false,
-            } => bytes.len() + 1,
+            Self::Encoded(bytes) => bytes.len(),
         }
     }
 
@@ -450,16 +452,7 @@ impl<'a> WalViewColumns<'a> {
                 columns,
                 default_inputs,
             } => append_view_columns(buffer, columns, default_inputs.bytes()),
-            Self::Encoded {
-                bytes,
-                wide_count: true,
-            } => buffer.append(bytes),
-            Self::Encoded {
-                bytes: _,
-                wide_count: false,
-            } => self
-                .decode()
-                .is_some_and(|(columns, inputs)| append_view_columns(buffer, &columns, inputs)),
+            Self::Encoded(bytes) => buffer.append(bytes),
         }
     }
 
@@ -469,7 +462,7 @@ impl<'a> WalViewColumns<'a> {
                 columns,
                 default_inputs,
             } => Some((*columns, default_inputs.bytes())),
-            Self::Encoded { bytes, wide_count } => decode_view_columns(bytes, wide_count),
+            Self::Encoded(bytes) => decode_view_columns(bytes),
         }
     }
 
@@ -533,7 +526,7 @@ impl WalStoredQueryDependencies<'_> {
                         .map(|dependency| {
                             1 + 1
                                 + dependency.identity.storage_key().len()
-                                + ColumnSet::ENCODED_BYTES
+                                + 2 * ColumnSet::ENCODED_BYTES
                                 + 1
                                 + dependency.schema.as_str().len()
                                 + 1
@@ -560,6 +553,7 @@ impl WalStoredQueryDependencies<'_> {
                             dependency.identity.storage_key().as_str(),
                         )
                         && append_column_set(buffer, dependency.referenced_columns)
+                        && append_column_set(buffer, dependency.written_columns)
                         && append_stored_dependency_name(buffer, dependency.schema.as_str())
                         && append_stored_dependency_name(buffer, dependency.name.as_str())
                         && append_stored_dependency_name(
@@ -675,6 +669,127 @@ pub(crate) enum WalExtendedStatisticsKey<'a> {
 
 impl WalExtendedStatisticsKey<'_> {
     pub(crate) const EMPTY: Self = Self::Column("");
+}
+
+/// A built-in routine's changeable `pg_proc` attributes: five attribute
+/// bytes, cost and rows as IEEE-754 bits, then the settings count and each
+/// setting's name and value, each with a one-byte length.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WalBuiltinRoutineImage<'a> {
+    Captured(&'a crate::storage::BuiltinRoutineAttributes),
+    Encoded(&'a [u8]),
+}
+
+const BUILTIN_ROUTINE_IMAGE_BYTES: usize = 5 + 8 + 8;
+
+impl WalBuiltinRoutineImage<'_> {
+    fn encoded_len(self) -> usize {
+        match self {
+            Self::Captured(image) => {
+                BUILTIN_ROUTINE_IMAGE_BYTES
+                    + 1
+                    + image
+                        .configs()
+                        .iter()
+                        .map(|config| 2 + config.name.as_str().len() + config.value.len())
+                        .sum::<usize>()
+            }
+            Self::Encoded(bytes) => bytes.len(),
+        }
+    }
+
+    fn append(self, buffer: &mut FixedBuf) -> bool {
+        match self {
+            Self::Captured(image) => {
+                let attributes = image.attributes;
+                buffer.append(&[
+                    u8::from(attributes.strict),
+                    attributes.volatility.code(),
+                    attributes.parallel.code(),
+                    u8::from(attributes.security_definer),
+                    u8::from(attributes.leakproof),
+                ]) && buffer.append(&image.cost().to_bits().to_le_bytes())
+                    && buffer.append(&image.rows().to_bits().to_le_bytes())
+                    && buffer.append(&[image.configs().len() as u8])
+                    && image.configs().iter().all(|config| {
+                        let name = config.name.as_str().as_bytes();
+                        let value = config.value.as_str().as_bytes();
+                        buffer.append(&[name.len() as u8])
+                            && buffer.append(name)
+                            && buffer.append(&[value.len() as u8])
+                            && buffer.append(value)
+                    })
+            }
+            Self::Encoded(bytes) => buffer.append(bytes),
+        }
+    }
+
+    /// Parses and validates the image for `routine`; `None` for any malformed
+    /// byte.
+    pub(crate) fn materialize(
+        self,
+        routine: crate::storage::BuiltinRoutineOid,
+    ) -> Option<crate::storage::BuiltinRoutineAttributes> {
+        let bytes = match self {
+            Self::Captured(image) => return Some(*image),
+            Self::Encoded(bytes) => bytes,
+        };
+        decode_builtin_routine_image(routine, bytes)
+    }
+}
+
+/// Decodes one built-in routine image; `None` for any malformed or trailing
+/// byte.
+pub(crate) fn decode_builtin_routine_image(
+    routine: crate::storage::BuiltinRoutineOid,
+    bytes: &[u8],
+) -> Option<crate::storage::BuiltinRoutineAttributes> {
+    let flag = |byte: u8| match byte {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    };
+    let fixed: &[u8; BUILTIN_ROUTINE_IMAGE_BYTES] =
+        bytes.get(..BUILTIN_ROUTINE_IMAGE_BYTES)?.try_into().ok()?;
+    let attributes = crate::storage::RoutineAttributes {
+        strict: flag(fixed[0])?,
+        volatility: crate::storage::RoutineVolatility::from_code(fixed[1])?,
+        parallel: crate::storage::RoutineParallel::from_code(fixed[2])?,
+        security_definer: flag(fixed[3])?,
+        leakproof: flag(fixed[4])?,
+        cost_bits: Some(u64::from_le_bytes(fixed[5..13].try_into().ok()?)),
+        rows_bits: Some(u64::from_le_bytes(fixed[13..21].try_into().ok()?)),
+    };
+    let mut rest = &bytes[BUILTIN_ROUTINE_IMAGE_BYTES..];
+    let (&count, tail) = rest.split_first()?;
+    rest = tail;
+    let count = usize::from(count);
+    if count > crate::storage::MAX_BUILTIN_ROUTINE_CONFIGS {
+        return None;
+    }
+    let mut configs =
+        [crate::storage::RoutineConfig::EMPTY; crate::storage::MAX_BUILTIN_ROUTINE_CONFIGS];
+    for config in &mut configs[..count] {
+        let mut field = || -> Option<&str> {
+            let (&length, tail) = rest.split_first()?;
+            let (text, tail) = tail.split_at_checked(usize::from(length))?;
+            rest = tail;
+            core::str::from_utf8(text).ok()
+        };
+        let name = crate::storage::SqlName::parse(field()?).ok()?;
+        let value = field()?;
+        if value.len() > crate::storage::ROUTINE_CONFIG_VALUE_MAX {
+            return None;
+        }
+        *config = crate::storage::RoutineConfig {
+            name,
+            value: crate::util::StackStr::from_str(value),
+        };
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    crate::storage::BuiltinRoutineAttributes::new(routine, attributes, &configs[..count]).ok()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1658,6 +1773,8 @@ pub(crate) enum WalOp<'a> {
         table: &'a str,
         new_name: &'a str,
         enabled: u8,
+        /// The complete condition after the change.
+        when: Option<&'a str>,
     },
     SetPolicy {
         identity: crate::storage::CatalogPosition,
@@ -1766,6 +1883,9 @@ pub(crate) enum WalOp<'a> {
         schema: &'a str,
         name: &'a str,
         definition: crate::storage::IndexMutableDefinition,
+        /// The complete key expressions and predicate after the change.
+        expressions: [Option<&'a str>; MAX_INDEX_COLS],
+        predicate: Option<&'a str>,
     },
     CreateTablespace {
         created_at: u64,
@@ -2234,6 +2354,13 @@ pub(crate) enum WalOp<'a> {
         parameter: &'a str,
         expected: Option<crate::storage::ParameterAclOid>,
         image: Option<crate::storage::ParameterAclImage<'a>>,
+    },
+    /// The complete committed attribute image of a built-in routine's row in
+    /// one database. Owner and privileges use the object owner and ACL kinds.
+    SetBuiltinRoutine {
+        database: i32,
+        routine: crate::storage::BuiltinRoutineOid,
+        image: WalBuiltinRoutineImage<'a>,
     },
     PreparedCatalogRow {
         relation: crate::storage::CatalogRelationIdentity,
@@ -3157,7 +3284,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::AlterReplicationSlot { .. } => KIND_ALTER_REPLICATION_SLOT,
         WalOp::CreateTrigger { .. } => KIND_CREATE_TRIGGER_V2,
         WalOp::DropTrigger { .. } => KIND_DROP_TRIGGER,
-        WalOp::AlterTrigger { .. } => KIND_ALTER_TRIGGER,
+        WalOp::AlterTrigger { .. } => KIND_ALTER_TRIGGER_V2,
         WalOp::SetPolicy { .. } => KIND_SET_POLICY_V2,
         WalOp::DropPolicy { .. } => KIND_DROP_POLICY,
         WalOp::Commit { .. } => KIND_COMMIT,
@@ -3170,7 +3297,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::AdvanceReplicationSlot { .. } => KIND_ADVANCE_REPLICATION_SLOT,
         WalOp::CreateIndex { .. } => KIND_CREATE_INDEX,
         WalOp::BrinMaintenance { .. } => KIND_BRIN_MAINTENANCE,
-        WalOp::AlterIndexDefinition { .. } => KIND_ALTER_INDEX_DEFINITION,
+        WalOp::AlterIndexDefinition { .. } => KIND_ALTER_INDEX_DEFINITION_V2,
         WalOp::CreateTablespace { .. } => KIND_CREATE_TABLESPACE,
         WalOp::AlterTablespace { .. } => KIND_ALTER_TABLESPACE,
         WalOp::DropTablespace { .. } => KIND_DROP_TABLESPACE,
@@ -3278,6 +3405,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::ReserveCatalogSequence(_) => KIND_CATALOG_RESERVATION,
         WalOp::SetPartitionTrigger { .. } => KIND_SET_PARTITION_TRIGGER,
         WalOp::SetParameterAcl { .. } => KIND_SET_PARAMETER_ACL,
+        WalOp::SetBuiltinRoutine { .. } => KIND_SET_BUILTIN_ROUTINE,
         WalOp::PreparedCatalogRow { .. } => KIND_PREPARED_CATALOG_ROW,
         WalOp::SetRelationIndexHint { .. } => KIND_SET_RELATION_INDEX_HINT,
     }
@@ -3721,6 +3849,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             table_schema,
             table,
             new_name,
+            when,
             ..
         } => {
             crate::storage::CatalogPosition::ENCODED_BYTES
@@ -3734,6 +3863,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + new_name.len()
                 + 1
+                + 2
+                + when.map_or(0, str::len)
         }
         WalOp::SetPolicy {
             schema,
@@ -3851,8 +3982,32 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 6
         }
         WalOp::BrinMaintenance { range_count, .. } => 8 + 4 + 8 + 1 + usize::from(*range_count) * 8,
-        WalOp::AlterIndexDefinition { schema, name, .. } => {
-            1 + schema.len() + 1 + name.len() + 2 + 1 + 1 + MAX_INDEX_COLS * 2 + 2 + 4 + 8 + 6
+        WalOp::AlterIndexDefinition {
+            schema,
+            name,
+            expressions,
+            predicate,
+            ..
+        } => {
+            1 + schema.len()
+                + 1
+                + name.len()
+                + 2
+                + 1
+                + 1
+                + MAX_INDEX_COLS * 2
+                + 2
+                + 4
+                + 8
+                + 6
+                + 4
+                + expressions
+                    .iter()
+                    .flatten()
+                    .map(|text| 2 + text.len())
+                    .sum::<usize>()
+                + 1
+                + predicate.map_or(0, |text| 2 + text.len())
         }
         WalOp::CreateTablespace { name, location, .. } => {
             8 + 1 + name.len() + 2 + location.len() + 24 + 2
@@ -4552,6 +4707,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             .saturating_add(row.key.len())
             .saturating_add(row.before.map_or(0, |image| image.bytes.len())),
         WalOp::SetRelationIndexHint { .. } => crate::storage::CatalogPosition::ENCODED_BYTES + 1,
+        WalOp::SetBuiltinRoutine { image, .. } => 4 + 4 + image.encoded_len(),
     }
 }
 
@@ -5743,10 +5899,33 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             schema,
             name,
             definition,
+            expressions,
+            predicate,
         } => {
+            let mask = expressions
+                .iter()
+                .enumerate()
+                .fold(0u32, |mask, (index, expression)| {
+                    mask | (u32::from(expression.is_some()) << index)
+                });
             name_bytes(buffer, schema)
                 && name_bytes(buffer, name)
                 && append_index_definition(buffer, *definition)
+                && buffer.append(&mask.to_le_bytes())
+                && expressions.iter().flatten().all(|text| {
+                    text.len() <= u16::MAX as usize
+                        && buffer.append(&(text.len() as u16).to_le_bytes())
+                        && buffer.append(text.as_bytes())
+                })
+                && match predicate {
+                    Some(text) => {
+                        text.len() <= u16::MAX as usize
+                            && buffer.append(&[1])
+                            && buffer.append(&(text.len() as u16).to_le_bytes())
+                            && buffer.append(text.as_bytes())
+                    }
+                    None => buffer.append(&[0]),
+                }
         }
         WalOp::CreateTablespace {
             created_at,
@@ -6779,6 +6958,15 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             position,
             has_index,
         } => buffer.append(&position.encode()) && buffer.append(&[u8::from(*has_index)]),
+        WalOp::SetBuiltinRoutine {
+            database,
+            routine,
+            image,
+        } => {
+            buffer.append(&database.to_le_bytes())
+                && buffer.append(&routine.get().to_le_bytes())
+                && image.append(buffer)
+        }
         WalOp::PreparedCatalogRow { relation, row } => {
             let Ok(key_length) = u32::try_from(row.key.len()) else {
                 return false;
@@ -6937,7 +7125,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             table,
             new_name,
             enabled,
+            when,
         } => {
+            let when_len = when.map_or(0usize, |value| value.len() + 1);
             buffer.append(&identity.encode())
                 && name_bytes(buffer, name)
                 && buffer.append(&[target.code()])
@@ -6945,6 +7135,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, table)
                 && name_bytes(buffer, new_name)
                 && buffer.append(&[*enabled])
+                && u16::try_from(when_len)
+                    .ok()
+                    .is_some_and(|length| buffer.append(&length.to_le_bytes()))
+                && when.is_none_or(|value| buffer.append(value.as_bytes()))
         }
         WalOp::SetPolicy {
             identity,
@@ -7035,7 +7229,10 @@ fn validate_stored_query_dependencies(payload: &[u8]) -> bool {
         if StoredDependencyIdentity::from_storage(class, key).is_none() {
             return false;
         }
-        if take_column_set(payload, &mut at).is_none() {
+        // Read columns, then written columns.
+        if take_column_set(payload, &mut at).is_none()
+            || take_column_set(payload, &mut at).is_none()
+        {
             return false;
         }
         for _ in 0..4 {
@@ -7077,6 +7274,7 @@ fn decode_stored_query_dependencies(payload: &[u8]) -> Option<(StoredQueryDepend
             stored_dependency_name(payload, &mut at)?,
         )?;
         let referenced_columns = take_column_set(payload, &mut at)?;
+        let written_columns = take_column_set(payload, &mut at)?;
         let schema = SqlName::parse(stored_dependency_name(payload, &mut at)?).ok()?;
         let name = SqlName::parse(stored_dependency_name(payload, &mut at)?).ok()?;
         let referenced_schema = SqlName::parse(stored_dependency_name(payload, &mut at)?).ok()?;
@@ -7090,6 +7288,7 @@ fn decode_stored_query_dependencies(payload: &[u8]) -> Option<(StoredQueryDepend
                 referenced_schema,
                 referenced_name,
                 referenced_columns,
+                written_columns,
             })
             .ok()?;
     }
@@ -8276,7 +8475,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             def.n_checks = n_checks;
-            for k in 0..n_checks {
+            for slot in &mut def.checks[..n_checks] {
                 let constraint_name = take_name(&mut at)?;
                 let validation =
                     crate::storage::ConstraintValidation::from_code(*payload.get(at)?)?;
@@ -8294,7 +8493,7 @@ fn decode_op_inner<'a>(
                 if check.expression.is_truncated() {
                     return None;
                 }
-                def.checks[k] = check;
+                *slot = check;
             }
             // FOREIGN KEY constraints.
             let n_fkeys = *payload.get(at)? as usize;
@@ -8303,7 +8502,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             def.n_fkeys = n_fkeys;
-            for f in 0..n_fkeys {
+            for slot in &mut def.fkeys[..n_fkeys] {
                 let fname = take_name(&mut at)?;
                 let nc = *payload.get(at)? as usize;
                 at += 1;
@@ -8348,7 +8547,7 @@ fn decode_op_inner<'a>(
                     *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
                     at += 2;
                 }
-                def.fkeys[f] = fk;
+                *slot = fk;
             }
             let n_exclusions = *payload.get(at)? as usize;
             at += 1;
@@ -8356,7 +8555,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             def.n_exclusions = n_exclusions;
-            for index in 0..n_exclusions {
+            for slot in &mut def.exclusions[..n_exclusions] {
                 let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
                 exclusion.name = SqlName::parse(take_name(&mut at)?).ok()?;
                 let meta = payload.get(at..at + 2)?;
@@ -8386,7 +8585,7 @@ fn decode_op_inner<'a>(
                     }
                     exclusion.predicate = Some(predicate);
                 }
-                def.exclusions[index] = exclusion;
+                *slot = exclusion;
             }
             def.schema = SqlName::parse(take_name(&mut at)?).ok()?;
             for f in 0..def.n_fkeys {
@@ -8676,7 +8875,8 @@ fn decode_op_inner<'a>(
                 content,
             })
         }),
-        KIND_CREATE_VIEW | KIND_CREATE_VIEW_V2 | KIND_CREATE_VIEW_BOUND => decode_large_op(|| {
+        KIND_CREATE_VIEW | KIND_SET_VIEW_COLUMNS => None,
+        KIND_CREATE_VIEW_V2 | KIND_CREATE_VIEW_BOUND => decode_large_op(|| {
             let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
@@ -8692,18 +8892,11 @@ fn decode_op_inner<'a>(
                 return_rule,
                 return_rule_created_at,
             )?;
-            let wide_columns = kind != KIND_CREATE_VIEW;
             let name = take_name(&mut at)?;
             let columns_start = at;
-            let column_count = if wide_columns {
-                let count = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
-                at += 2;
-                count
-            } else {
-                let count = *payload.get(at)? as usize;
-                at += 1;
-                count
-            };
+            let column_count =
+                u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+            at += 2;
             match *payload.get(at)? {
                 0 => false,
                 1 => true,
@@ -8715,13 +8908,11 @@ fn decode_op_inner<'a>(
             }
             for _ in 0..column_count {
                 take_name(&mut at)?;
-                decode_view_default(payload, &mut at)?;
+                take_view_column_type(payload, &mut at)?;
+                decode_view_column_default(payload, &mut at)?;
             }
             take_stored_type_inputs(payload, &mut at)?;
-            let columns = WalViewColumns::Encoded {
-                bytes: payload.get(columns_start..at)?,
-                wide_count: wide_columns,
-            };
+            let columns = WalViewColumns::Encoded(payload.get(columns_start..at)?);
             let sql_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
             at += 2;
             let raw = payload.get(at..at + sql_len)?;
@@ -8800,20 +8991,12 @@ fn decode_op_inner<'a>(
                 check_option,
             })
         }),
-        KIND_SET_VIEW_COLUMNS | KIND_SET_VIEW_COLUMNS_V2 => decode_large_op(|| {
-            let wide_columns = kind == KIND_SET_VIEW_COLUMNS_V2;
+        KIND_SET_VIEW_COLUMNS_V2 => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let columns_start = at;
-            let count = if wide_columns {
-                let count = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
-                at += 2;
-                count
-            } else {
-                let count = *payload.get(at)? as usize;
-                at += 1;
-                count
-            };
+            let count = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+            at += 2;
             match *payload.get(at)? {
                 0 => false,
                 1 => true,
@@ -8825,13 +9008,11 @@ fn decode_op_inner<'a>(
             }
             for _ in 0..count {
                 take_name(&mut at)?;
-                decode_view_default(payload, &mut at)?;
+                take_view_column_type(payload, &mut at)?;
+                decode_view_column_default(payload, &mut at)?;
             }
             take_stored_type_inputs(payload, &mut at)?;
-            let columns = WalViewColumns::Encoded {
-                bytes: payload.get(columns_start..at)?,
-                wide_count: wide_columns,
-            };
+            let columns = WalViewColumns::Encoded(payload.get(columns_start..at)?);
             (at == payload.len()).then_some(WalOp::SetViewColumns {
                 schema,
                 name,
@@ -9474,7 +9655,8 @@ fn decode_op_inner<'a>(
                 table,
             })
         }),
-        KIND_ALTER_TRIGGER => decode_large_op(|| {
+        KIND_ALTER_TRIGGER => None,
+        KIND_ALTER_TRIGGER_V2 => decode_large_op(|| {
             let identity = take_catalog_position(payload, &mut at)?;
             crate::storage::CatalogIdentity::parse(identity.created_at())?;
             let name = take_name(&mut at)?;
@@ -9486,6 +9668,16 @@ fn decode_op_inner<'a>(
             let enabled = *payload.get(at)?;
             crate::storage::TriggerEnabled::from_code(enabled)?;
             at += 1;
+            let when_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+            at += 2;
+            let when = if when_len == 0 {
+                None
+            } else {
+                let length = when_len - 1;
+                let value = core::str::from_utf8(payload.get(at..at + length)?).ok()?;
+                at += length;
+                Some(value)
+            };
             (at == payload.len()).then_some(WalOp::AlterTrigger {
                 identity,
                 name,
@@ -9494,6 +9686,7 @@ fn decode_op_inner<'a>(
                 table,
                 new_name,
                 enabled,
+                when,
             })
         }),
         KIND_SET_POLICY | KIND_SET_POLICY_V2 => decode_large_op(|| {
@@ -10057,14 +10250,47 @@ fn decode_op_inner<'a>(
                 range_count: count as u8,
             })
         }),
-        KIND_ALTER_INDEX_DEFINITION => decode_large_op(|| {
+        KIND_ALTER_INDEX_DEFINITION => None,
+        KIND_ALTER_INDEX_DEFINITION_V2 => decode_large_op(|| {
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             let definition = decode_index_definition(payload, &mut at)?;
+            let mask = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            let mut expressions = [None; MAX_INDEX_COLS];
+            for (index, expression) in expressions.iter_mut().enumerate() {
+                if mask & (1 << index) == 0 {
+                    continue;
+                }
+                let length = usize::from(u16::from_le_bytes(
+                    payload.get(at..at + 2)?.try_into().ok()?,
+                ));
+                at += 2;
+                *expression = Some(core::str::from_utf8(payload.get(at..at + length)?).ok()?);
+                at += length;
+            }
+            let predicate = match *payload.get(at)? {
+                0 => {
+                    at += 1;
+                    None
+                }
+                1 => {
+                    let length = usize::from(u16::from_le_bytes(
+                        payload.get(at + 1..at + 3)?.try_into().ok()?,
+                    ));
+                    at += 3;
+                    let text = core::str::from_utf8(payload.get(at..at + length)?).ok()?;
+                    at += length;
+                    Some(text)
+                }
+                _ => return None,
+            };
             (at == payload.len()).then_some(WalOp::AlterIndexDefinition {
                 schema,
                 name,
                 definition,
+                expressions,
+                predicate,
             })
         }),
         KIND_CREATE_TABLESPACE => decode_large_op(|| {
@@ -11943,7 +12169,7 @@ fn decode_op_inner<'a>(
         }),
         KIND_UPSERT_ROLE_MEMBERSHIP => decode_large_op(|| {
             let identity = take_catalog_position(payload, &mut at)?;
-            crate::storage::CatalogIdentity::parse(identity.created_at())?;
+            crate::storage::Storage::require_membership_identity(identity).ok()?;
             let mut take_role = || {
                 let oid = crate::storage::RoleOid::parse(i32::from_le_bytes(
                     payload.get(at..at + 4)?.try_into().ok()?,
@@ -11973,7 +12199,7 @@ fn decode_op_inner<'a>(
         }),
         KIND_DROP_ROLE_MEMBERSHIP => decode_large_op(|| {
             let identity = take_catalog_position(payload, &mut at)?;
-            crate::storage::CatalogIdentity::parse(identity.created_at())?;
+            crate::storage::Storage::require_membership_identity(identity).ok()?;
             (at == payload.len()).then_some(WalOp::DropRoleMembership { identity })
         }),
         KIND_SET_ROLE_SETTING => decode_large_op(|| {
@@ -12198,6 +12424,20 @@ fn decode_op_inner<'a>(
                 image,
             })
         }),
+        KIND_SET_BUILTIN_ROUTINE => decode_large_op(|| {
+            let database = i32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
+            crate::storage::DatabaseOid::parse(database)?;
+            let routine = crate::storage::BuiltinRoutineOid::parse(i32::from_le_bytes(
+                payload.get(4..8)?.try_into().ok()?,
+            ))?;
+            let image = WalBuiltinRoutineImage::Encoded(payload.get(8..)?);
+            image.materialize(routine)?;
+            Some(WalOp::SetBuiltinRoutine {
+                database,
+                routine,
+                image,
+            })
+        }),
         KIND_SET_RELATION_INDEX_HINT => decode_large_op(|| {
             let position = crate::storage::CatalogPosition::decode(payload.get(..10)?)?;
             if payload.len() != 11 {
@@ -12357,6 +12597,33 @@ fn encoded_view_default_len(default: crate::storage::ColumnDefault) -> usize {
     }
 }
 
+/// A view column default followed, when present, by its `pg_attrdef` stamp.
+fn encoded_view_column_default_len(default: crate::storage::ColumnDefault) -> usize {
+    encoded_view_default_len(default)
+        + if matches!(default, crate::storage::ColumnDefault::None) {
+            0
+        } else {
+            crate::storage::ConstraintIdentity::ENCODED_BYTES
+        }
+}
+
+fn decode_view_column_default(
+    payload: &[u8],
+    at: &mut usize,
+) -> Option<(
+    crate::storage::ColumnDefault,
+    Option<crate::storage::ConstraintIdentity>,
+)> {
+    let default = decode_view_default(payload, at)?;
+    if matches!(default, crate::storage::ColumnDefault::None) {
+        return Some((default, None));
+    }
+    let bytes = payload.get(*at..*at + crate::storage::ConstraintIdentity::ENCODED_BYTES)?;
+    *at += crate::storage::ConstraintIdentity::ENCODED_BYTES;
+    let identity = crate::storage::ConstraintIdentity::from_le_bytes(bytes.try_into().ok()?)?;
+    Some((default, Some(identity)))
+}
+
 fn append_view_columns(
     buffer: &mut FixedBuf,
     columns: &crate::storage::ViewColumns,
@@ -12365,30 +12632,31 @@ fn append_view_columns(
     buffer.append(&(columns.len() as u16).to_le_bytes())
         && buffer.append(&[u8::from(columns.has_aliases())])
         && columns.names().iter().enumerate().all(|(index, name)| {
+            let default = columns.default_at(index).expect("view column exists");
             name.as_str().len() <= u8::MAX as usize
                 && buffer.append(&[name.as_str().len() as u8])
                 && buffer.append(name.as_str().as_bytes())
-                && append_view_default(
-                    buffer,
-                    columns.default_at(index).expect("view column exists"),
-                )
+                && buffer.append(&columns.types()[index].to_le_bytes())
+                && append_view_default(buffer, default)
+                && (matches!(default, crate::storage::ColumnDefault::None)
+                    || columns
+                        .default_identity(index)
+                        .is_some_and(|identity| buffer.append(&identity.to_le_bytes())))
         })
         && u32::try_from(default_inputs.len()).is_ok()
         && buffer.append(&(default_inputs.len() as u32).to_le_bytes())
         && buffer.append(default_inputs)
 }
 
-fn decode_view_columns(
-    payload: &[u8],
-    wide_count: bool,
-) -> Option<(crate::storage::ViewColumns, &[u8])> {
-    let (count, mut at) = if wide_count {
-        let count = u16::from_le_bytes(payload.get(..2)?.try_into().ok()?) as usize;
-        (count, 2)
-    } else {
-        let count = *payload.first()? as usize;
-        (count, 1)
-    };
+fn take_view_column_type(payload: &[u8], at: &mut usize) -> Option<crate::storage::ViewColumnType> {
+    let bytes = payload.get(*at..*at + crate::storage::ViewColumnType::ENCODED_BYTES)?;
+    *at += crate::storage::ViewColumnType::ENCODED_BYTES;
+    crate::storage::ViewColumnType::from_le_bytes(bytes.try_into().ok()?)
+}
+
+fn decode_view_columns(payload: &[u8]) -> Option<(crate::storage::ViewColumns, &[u8])> {
+    let count = u16::from_le_bytes(payload.get(..2)?.try_into().ok()?) as usize;
+    let mut at = 2;
     if count > crate::storage::MAX_COLUMNS {
         return None;
     }
@@ -12399,21 +12667,25 @@ fn decode_view_columns(
     };
     at += 1;
     let mut names = [""; crate::storage::MAX_COLUMNS];
+    let mut types = [crate::storage::ViewColumnType::PLACEHOLDER; crate::storage::MAX_COLUMNS];
     let mut default_indexes = [0usize; crate::storage::MAX_VIEW_DEFAULTS];
     let mut defaults = [crate::storage::ColumnDefault::NONE; crate::storage::MAX_VIEW_DEFAULTS];
+    let mut identities = [None; crate::storage::MAX_VIEW_DEFAULTS];
     let mut default_count = 0usize;
     for (index, name) in names[..count].iter_mut().enumerate() {
         let len = *payload.get(at)? as usize;
         at += 1;
         *name = core::str::from_utf8(payload.get(at..at + len)?).ok()?;
         at += len;
-        let default = decode_view_default(payload, &mut at)?;
+        types[index] = take_view_column_type(payload, &mut at)?;
+        let (default, identity) = decode_view_column_default(payload, &mut at)?;
         if !matches!(default, crate::storage::ColumnDefault::None) {
             if default_count == defaults.len() {
                 return None;
             }
             default_indexes[default_count] = index;
             defaults[default_count] = default;
+            identities[default_count] = identity;
             default_count += 1;
         }
     }
@@ -12421,14 +12693,16 @@ fn decode_view_columns(
     if at != payload.len() {
         return None;
     }
-    let mut columns = crate::storage::ViewColumns::from_names(&names[..count])
+    let mut columns = crate::storage::ViewColumns::from_names(&names[..count], &types[..count])
         .ok()?
         .with_aliases(aliases);
     for index in 0..default_count {
         columns = columns
             .with_default(default_indexes[index], defaults[index])
-            .ok()?;
+            .ok()?
+            .with_default_identity(default_indexes[index], identities[index]?)?;
     }
+    crate::storage::validate_constraint_identities(columns.default_identities()).ok()?;
     Some((columns, inputs))
 }
 
@@ -13382,7 +13656,7 @@ mod tests {
                 _ => panic!("valid schema creation record rejected"),
             }
             assert!(decode_record(&record[..21]).is_none());
-            for created_at in [0_u64, 1_920_000, u64::MAX] {
+            for created_at in [0_u64, 10_000_000, u64::MAX] {
                 record[8..16].copy_from_slice(&created_at.to_le_bytes());
                 assert!(decode_record(&record[..20]).is_none());
             }
@@ -13875,6 +14149,36 @@ mod tests {
     }
 
     #[test]
+    fn trigger_alteration_carries_its_condition_and_rejects_the_retired_kind() {
+        let mut budget = Budget::new(1024);
+        let mut payload = FixedBuf::new(&mut budget, "trigger-alteration", 512).unwrap();
+        for when in [Some("(new.renamed > 0)"), None] {
+            payload.clear();
+            let operation = WalOp::AlterTrigger {
+                identity: crate::storage::CatalogPosition::new(3, 41).unwrap(),
+                name: "audit",
+                target: TriggerTargetKind::Table,
+                table_schema: "public",
+                table: "orders",
+                new_name: "audit",
+                enabled: b'O',
+                when,
+            };
+            assert!(append_payload(&mut payload, &operation));
+            assert_eq!(payload.len(), encoded_payload_len(&operation));
+            let encoded = payload.readable();
+            assert!(matches!(
+                decode_op(KIND_ALTER_TRIGGER_V2, encoded),
+                Some(WalOp::AlterTrigger { when: decoded, .. }) if decoded == when
+            ));
+            assert!(decode_op(KIND_ALTER_TRIGGER, encoded).is_none());
+            for truncated in 0..encoded.len() {
+                assert!(decode_op(KIND_ALTER_TRIGGER_V2, &encoded[..truncated]).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn logical_message_payload_round_trips_binary_content_strictly() {
         let mut budget = Budget::new(1024);
         let mut payload = FixedBuf::new(&mut budget, "logical-message", 256).unwrap();
@@ -13941,6 +14245,7 @@ mod tests {
                 referenced_schema: SqlName::parse("").unwrap(),
                 referenced_name: SqlName::parse("items").unwrap(),
                 referenced_columns: ColumnSet::from_low_word(0b101),
+                written_columns: ColumnSet::EMPTY,
             })
             .unwrap();
         dependencies
@@ -13954,6 +14259,7 @@ mod tests {
                 referenced_schema: SqlName::parse("").unwrap(),
                 referenced_name: SqlName::parse("original_function").unwrap(),
                 referenced_columns: crate::storage::ColumnSet::EMPTY,
+                written_columns: crate::storage::ColumnSet::EMPTY,
             })
             .unwrap();
         let mut budget = crate::mem::budget::Budget::new(1024);
@@ -13988,6 +14294,7 @@ mod tests {
                     referenced_schema: SqlName::parse("").unwrap(),
                     referenced_name: SqlName::parse("original_type").unwrap(),
                     referenced_columns: ColumnSet::EMPTY,
+                    written_columns: ColumnSet::EMPTY,
                 })
                 .unwrap();
             encoded.clear();
@@ -14031,6 +14338,7 @@ mod tests {
                 payload.clear();
                 assert!(payload.append(&[0xfc, 1, class as u8]));
                 assert!(append_stored_dependency_name(payload, key));
+                assert!(append_column_set(payload, ColumnSet::EMPTY));
                 assert!(append_column_set(payload, ColumnSet::EMPTY));
                 for name in ["public", "items", "", "items"] {
                     assert!(append_stored_dependency_name(payload, name));
@@ -14359,15 +14667,20 @@ mod tests {
         domain.checks[0].name = SqlName::parse("allowed").unwrap();
         domain.checks[0].expression =
             StackStr::from_str("pos3ql-enum-check-v1\nVALUE = /*p3c:0*/'old'");
-        let columns = crate::storage::ViewColumns::from_names(&["state"])
-            .unwrap()
-            .with_default(
-                0,
-                crate::storage::ColumnDefault::Expression(StackStr::from_str(
-                    "pos3ql-enum-check-v1\n/*p3c:0*/'old'",
-                )),
-            )
-            .unwrap();
+        let columns = crate::storage::ViewColumns::from_names(
+            &["state"],
+            &[crate::storage::ViewColumnType::INT4],
+        )
+        .unwrap()
+        .with_default(
+            0,
+            crate::storage::ColumnDefault::Expression(StackStr::from_str(
+                "pos3ql-enum-check-v1\n/*p3c:0*/'old'",
+            )),
+        )
+        .unwrap()
+        .with_default_identity(0, crate::storage::ConstraintIdentity::parse(31).unwrap())
+        .unwrap();
         let dependencies = crate::storage::StoredQueryDependencies::EMPTY;
         let statistics = crate::storage::ExtendedStatisticsData::EMPTY;
         let mut budget = Budget::new(32768);
@@ -14380,6 +14693,9 @@ mod tests {
         table.columns[0].default = crate::storage::ColumnDefault::Expression(StackStr::from_str(
             "pos3ql-enum-check-v1\n/*p3c:0*/'old'",
         ));
+        let attribute = usize::from(table.attribute_number(0) - 1);
+        table.attribute_identities[attribute].default =
+            crate::storage::ConstraintIdentity::parse(36);
         let operations = [
             (
                 KIND_CREATE_TYPED,
@@ -14666,11 +14982,69 @@ mod tests {
     }
 
     #[test]
+    fn builtin_routine_codec_keeps_database_routine_and_attributes() {
+        use crate::storage::{BuiltinRoutineAttributes, BuiltinRoutineOid, RoutineVolatility};
+        let lower = BuiltinRoutineOid::parse(870).unwrap();
+        let mut attributes = BuiltinRoutineAttributes::catalog(lower).attributes;
+        attributes.volatility = RoutineVolatility::Stable;
+        attributes.cost_bits = Some(5.0f64.to_bits());
+        let image = BuiltinRoutineAttributes::new(
+            lower,
+            attributes,
+            &[crate::storage::RoutineConfig {
+                name: crate::storage::SqlName::parse("search_path").unwrap(),
+                value: crate::util::StackStr::from_str("pg_catalog, \"$user\""),
+            }],
+        )
+        .unwrap();
+        let operation = WalOp::SetBuiltinRoutine {
+            database: 5,
+            routine: lower,
+            image: WalBuiltinRoutineImage::Captured(&image),
+        };
+        let mut bytes = [0; 256];
+        let payload = encode_catalog_operation(&operation, &mut bytes);
+        let Some(WalOp::SetBuiltinRoutine {
+            database,
+            routine,
+            image: decoded,
+        }) = decode_op(KIND_SET_BUILTIN_ROUTINE, payload)
+        else {
+            panic!("built-in routine row did not round trip");
+        };
+        assert_eq!((database, routine), (5, lower));
+        assert_eq!(decoded.materialize(lower), Some(image));
+        let mut invalid = [0; 256];
+        invalid[..payload.len()].copy_from_slice(payload);
+        // A truncated setting is corruption, not a shorter list.
+        assert!(decode_op(KIND_SET_BUILTIN_ROUTINE, &invalid[..payload.len() - 1]).is_none());
+        // Flags are bytes 0 or 1; any other value is corruption.
+        invalid[8] = 2;
+        assert!(decode_op(KIND_SET_BUILTIN_ROUTINE, &invalid[..payload.len()]).is_none());
+        invalid[8] = 0;
+        let Some(WalOp::SetBuiltinRoutine { image: changed, .. }) =
+            decode_op(KIND_SET_BUILTIN_ROUTINE, &invalid[..payload.len()])
+        else {
+            panic!("a changed strictness is a valid built-in routine row");
+        };
+        assert_eq!(
+            changed
+                .materialize(lower)
+                .map(|image| image.attributes.strict),
+            Some(false)
+        );
+        invalid[..payload.len()].copy_from_slice(payload);
+        invalid[4..8].copy_from_slice(&16_384i32.to_le_bytes());
+        assert!(decode_op(KIND_SET_BUILTIN_ROUTINE, &invalid[..payload.len()]).is_none());
+        assert!(decode_op(KIND_SET_BUILTIN_ROUTINE, &payload[..payload.len() - 1]).is_none());
+    }
+
+    #[test]
     fn parameter_acl_codec_is_typed_and_strict() {
         use crate::storage::{
             ParameterAclGrant, ParameterAclGrants, ParameterAclImage, ParameterAclOid,
         };
-        let oid = ParameterAclOid::parse(17001).unwrap();
+        let oid = ParameterAclOid::parse(20_001_001).unwrap();
         let grants = [ParameterAclGrant::parse(17002, 10, 3, 1).unwrap()];
         let operation = WalOp::SetParameterAcl {
             parameter: "event_triggers",
@@ -15158,7 +15532,7 @@ mod tests {
         let bytes = [
             core::mem::size_of_val(definition.columns()),
             core::mem::size_of_val(&definition.not_null_names[..definition.n_columns]),
-            core::mem::size_of_val(&definition.not_null_identities[..attributes]),
+            core::mem::size_of_val(&definition.attribute_identities[..attributes]),
             core::mem::size_of_val(&definition.inline_index_identities[..attributes]),
             core::mem::size_of_val(&definition.inline_constraint_identities[..attributes]),
             core::mem::size_of_val(definition.inline_key_names()),
@@ -15904,7 +16278,11 @@ mod tests {
     fn view_catalog_identity_rejects_missing_zero_and_reused_stamps() {
         let mut budget = Budget::new(4096);
         let mut payload = FixedBuf::new(&mut budget, "view identity codec", 2048).unwrap();
-        let columns = crate::storage::ViewColumns::from_names(&["value"]).unwrap();
+        let columns = crate::storage::ViewColumns::from_names(
+            &["value"],
+            &[crate::storage::ViewColumnType::INT4],
+        )
+        .unwrap();
         let dependencies = crate::storage::StoredQueryDependencies::EMPTY;
         let identity = crate::storage::ViewCatalogIdentity::new(2, 7, 3, 8).unwrap();
         crate::mem::guard::forbid_alloc(|| {
@@ -15933,6 +16311,8 @@ mod tests {
                 panic!("view identity did not decode");
             };
             assert_eq!(decoded, identity);
+            // Views journaled without column types are rejected.
+            assert!(decode_op(KIND_CREATE_VIEW, payload.readable()).is_none());
             for end in 0..crate::storage::ViewCatalogIdentity::ENCODED_BYTES {
                 assert!(decode_op(KIND_CREATE_VIEW_V2, &payload.readable()[..end]).is_none());
             }
@@ -15952,13 +16332,18 @@ mod tests {
         let mut payload = FixedBuf::new(&mut budget, "security payload", 4096).unwrap();
         let roles = [SqlName::parse("reader").unwrap()];
         let dependencies = crate::storage::StoredQueryDependencies::EMPTY;
-        let create_columns = crate::storage::ViewColumns::from_derived_names(&["value"])
-            .unwrap()
-            .with_default(
-                0,
-                crate::storage::ColumnDefault::Expression(StackStr::from_str("random()")),
-            )
-            .unwrap();
+        let create_columns = crate::storage::ViewColumns::from_derived_names(
+            &["value"],
+            &[crate::storage::ViewColumnType::INT4],
+        )
+        .unwrap()
+        .with_default(
+            0,
+            crate::storage::ColumnDefault::Expression(StackStr::from_str("random()")),
+        )
+        .unwrap()
+        .with_default_identity(0, crate::storage::ConstraintIdentity::parse(32).unwrap())
+        .unwrap();
         assert!(append_payload(
             &mut payload,
             &WalOp::SetPolicy {
@@ -16068,22 +16453,29 @@ mod tests {
             Some(crate::storage::ColumnDefault::Expression(source)) if source.as_str() == "random()"
         ));
         payload.clear();
-        let columns = crate::storage::ViewColumns::from_names(&["published_value", "live_value"])
-            .unwrap()
-            .with_default(
-                0,
-                crate::storage::ColumnDefault::Constant {
-                    value: OwnedDatum::Int4(22),
-                    expression: StackStr::from_str("22"),
-                },
+        let columns = crate::storage::ViewColumns::from_names(
+            &["published_value", "live_value"],
+            &[crate::storage::ViewColumnType::INT4; 2],
+        )
+        .unwrap()
+        .with_default(
+            0,
+            crate::storage::ColumnDefault::Constant {
+                value: OwnedDatum::Int4(22),
+                expression: StackStr::from_str("22"),
+            },
+        )
+        .and_then(|columns| {
+            columns.with_default(
+                1,
+                crate::storage::ColumnDefault::Expression(StackStr::from_str("random()")),
             )
-            .and_then(|columns| {
-                columns.with_default(
-                    1,
-                    crate::storage::ColumnDefault::Expression(StackStr::from_str("random()")),
-                )
-            })
-            .unwrap();
+        })
+        .unwrap()
+        .with_default_identity(0, crate::storage::ConstraintIdentity::parse(33).unwrap())
+        .unwrap()
+        .with_default_identity(1, crate::storage::ConstraintIdentity::parse(34).unwrap())
+        .unwrap();
         assert!(append_payload(
             &mut payload,
             &WalOp::SetViewColumns {
@@ -16528,6 +16920,7 @@ mod tests {
                     table: "orders",
                     new_name: "audit_row_disabled",
                     enabled: b'D',
+                    when: Some("NEW.total > OLD.total"),
                 },
             )
             .unwrap();
@@ -17324,6 +17717,12 @@ mod tests {
                 immediate: false,
                 ..crate::storage::IndexMutableDefinition::DEFAULT
             },
+            expressions: {
+                let mut expressions = [None; MAX_INDEX_COLS];
+                expressions[1] = Some("lower(renamed)");
+                expressions
+            },
+            predicate: None,
         };
         let mut budget = Budget::new(4096);
         let mut payload = FixedBuf::new(
@@ -17338,7 +17737,9 @@ mod tests {
             schema,
             name,
             definition,
-        }) = decode_op(KIND_ALTER_INDEX_DEFINITION, payload.readable())
+            expressions,
+            predicate,
+        }) = decode_op(KIND_ALTER_INDEX_DEFINITION_V2, payload.readable())
         else {
             panic!("clustered index definition WAL payload must decode");
         };
@@ -17346,10 +17747,13 @@ mod tests {
         assert_eq!(name, "clustered_rows");
         assert!(definition.clustered);
         assert!(!definition.immediate);
-        let immediate_at = payload.len() - 15;
+        assert_eq!(expressions[..3], [None, Some("lower(renamed)"), None]);
+        assert_eq!(predicate, None);
+        assert!(decode_op(KIND_ALTER_INDEX_DEFINITION, payload.readable()).is_none());
+        let immediate_at = payload.len() - 4 - (2 + "lower(renamed)".len()) - 1 - 15;
         payload.filled_mut()[immediate_at] = 2;
         crate::mem::guard::forbid_alloc(|| {
-            assert!(decode_op(KIND_ALTER_INDEX_DEFINITION, payload.readable()).is_none());
+            assert!(decode_op(KIND_ALTER_INDEX_DEFINITION_V2, payload.readable()).is_none());
         });
     }
 
@@ -17477,13 +17881,18 @@ mod tests {
                 &pool,
             )
             .unwrap();
-            let columns = crate::storage::ViewColumns::from_names(&["value"])
-                .unwrap()
-                .with_default(
-                    0,
-                    crate::storage::ColumnDefault::Expression(StackStr::from_str(source)),
-                )
-                .unwrap();
+            let columns = crate::storage::ViewColumns::from_names(
+                &["value"],
+                &[crate::storage::ViewColumnType::INT4],
+            )
+            .unwrap()
+            .with_default(
+                0,
+                crate::storage::ColumnDefault::Expression(StackStr::from_str(source)),
+            )
+            .unwrap()
+            .with_default_identity(0, crate::storage::ConstraintIdentity::parse(35).unwrap())
+            .unwrap();
             for create in [true, false] {
                 let columns_image = WalViewColumns::Captured {
                     columns: &columns,
@@ -17789,7 +18198,11 @@ mod tests {
     fn stored_query_payloads_reject_invalid_and_oversized_creation_paths() {
         let oversized = "a".repeat(crate::sql::guc::SEARCH_PATH_BYTES + 1);
         let oversized_utf8 = "é".repeat(crate::sql::guc::SEARCH_PATH_BYTES / 2 + 1);
-        let columns = crate::storage::ViewColumns::from_names(&["value"]).unwrap();
+        let columns = crate::storage::ViewColumns::from_names(
+            &["value"],
+            &[crate::storage::ViewColumnType::INT4],
+        )
+        .unwrap();
         let dependencies = crate::storage::StoredQueryDependencies::EMPTY;
         let identity = crate::storage::CatalogPosition::new(0, 1).unwrap();
         let mut budget = Budget::new(4096);

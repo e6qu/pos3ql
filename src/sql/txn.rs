@@ -823,6 +823,11 @@ pub(crate) enum DdlUndo {
     ParameterAclChanged {
         prior: crate::storage::ParameterAclUndo,
     },
+    /// `ALTER FUNCTION` changed a built-in routine's row in this database.
+    BuiltinRoutineChanged {
+        slot: u16,
+        prior: Option<crate::storage::PendingBuiltinRoutine>,
+    },
     /// A `COMMENT ON` set or removed an object's comment — undo by restoring
     /// the slot's prior uncommitted overlay. On commit, the overlay is
     /// promoted and journaled.
@@ -1908,6 +1913,19 @@ impl TxnState {
         }
     }
 
+    /// Moves a suspended statement's armed deadline into the past, so tests
+    /// expire statement_timeout without racing the host clock. Returns the
+    /// deadline it replaced.
+    #[cfg(test)]
+    pub(crate) fn expire_suspended_statement_deadline(&mut self) -> i64 {
+        let suspended = self
+            .suspended_statement
+            .as_mut()
+            .expect("a suspended statement");
+        assert_ne!(suspended.deadline, 0, "statement_timeout is armed");
+        core::mem::replace(&mut suspended.deadline, 1)
+    }
+
     pub(crate) fn enter_statement_timeout(&mut self, entry: super::StatementTimeoutEntry) {
         if self.staged_commit.is_some() {
             super::query::disarm_timeout();
@@ -1929,18 +1947,6 @@ impl TxnState {
             self.statement_timeout_consumed = false;
             super::query::arm_timeout(timeout_ms);
         }
-    }
-
-    /// Moves the waiting statement's deadline into the past, so its resumed
-    /// attempt fails with `57014` without the test depending on elapsed time.
-    #[cfg(test)]
-    pub(crate) fn expire_suspended_statement_deadline(&mut self) {
-        let suspended = self
-            .suspended_statement
-            .as_mut()
-            .expect("a waiting statement keeps its deadline");
-        assert_ne!(suspended.deadline, 0, "the statement has a timeout");
-        suspended.deadline = 1;
     }
 
     pub(crate) fn restore_statement_deadline(&self, deadline: i64) {
@@ -2088,6 +2094,23 @@ impl TxnState {
             parent_depth,
             _snapshot: snapshot,
         })
+    }
+
+    /// Joins the nested command already running instead of starting one:
+    /// the `WITH` queries of a PL/pgSQL statement and its write share one
+    /// command and snapshot, so neither sees the other's changes.
+    pub(crate) fn share_trigger_sql<'txn>(
+        &'txn mut self,
+        storage: &Storage,
+    ) -> TriggerSqlScope<'txn> {
+        let parent_command = self.command_id;
+        let parent_depth = self.trigger_depth;
+        TriggerSqlScope {
+            transaction: self,
+            parent_command,
+            parent_depth,
+            _snapshot: storage.same_statement_snapshot(),
+        }
     }
 
     pub(crate) fn trigger_depth(&self) -> u16 {
@@ -3681,6 +3704,20 @@ impl TxnState {
         if let Err(error) = self.record_ddl(storage, DdlUndo::Dropped(undo)) {
             storage.finish_table_drop(undo, crate::storage::CatalogDdlDecision::Rollback);
             return Err(error);
+        }
+        // Every path that drops a foreign table, including a cascade from its
+        // partitioned parent or schema, drops its `pg_foreign_table` binding.
+        if let Ok(table) = u16::try_from(undo.slot())
+            && let Some((binding, _)) = storage.foreign_table(table, self.txid)
+        {
+            let class = crate::storage::foreign::ForeignObjectClass::Table;
+            storage.foreign_catalog_drop(class, binding, self.txid);
+            if let Err(error) =
+                self.record_ddl(storage, DdlUndo::ForeignTableDropped(binding as u32))
+            {
+                storage.foreign_catalog_rollback_drop(class, binding, self.txid);
+                return Err(error);
+            }
         }
         Ok(())
     }

@@ -33,6 +33,7 @@ pub(super) const fn empty_subquery_list<'a>() -> SubqueryList<'a> {
         probe: None,
         saw_null: false,
         witness: Datum::Null,
+        column_types: &[],
         collations: &[],
     }
 }
@@ -51,7 +52,7 @@ impl SubqueryListProbe for ExternalSubqueryList {
     fn probe<'a>(
         &self,
         value: Datum<'a>,
-        collations: &[Collation],
+        columns: crate::sql::eval::QuantifiedColumns<'_>,
         catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
         arena: &'a Arena,
     ) -> Result<(bool, bool), SqlError> {
@@ -70,7 +71,8 @@ impl SubqueryListProbe for ExternalSubqueryList {
                     BinaryOp::Eq,
                     value,
                     member,
-                    collations,
+                    columns.row_constructor,
+                    columns.collations,
                     catalog,
                     arena,
                 )? {
@@ -97,7 +99,7 @@ impl SubqueryListProbe for ExternalSubqueryList {
         value: Datum<'a>,
         operator: BinaryOp,
         all: bool,
-        collations: &[Collation],
+        columns: crate::sql::eval::QuantifiedColumns<'_>,
         catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
@@ -112,7 +114,13 @@ impl SubqueryListProbe for ExternalSubqueryList {
             let left = crate::sql::eval::coerce_unknown(value, &member)?;
             let right = crate::sql::eval::coerce_unknown(member, &left)?;
             let result = crate::sql::eval::quantified_comparison(
-                operator, left, right, collations, catalog, arena,
+                operator,
+                left,
+                right,
+                columns.row_constructor,
+                columns.collations,
+                catalog,
+                arena,
             )?;
             match result {
                 Datum::Bool(true) if !all => {
@@ -184,7 +192,7 @@ fn spooled_column_witness<'a>(
         return catalog_type_witness(storage, txid, columns[0].type_oid);
     }
     match select.items.first() {
-        Some(SelectItem::Wildcard) => {
+        Some(SelectItem::Wildcard(_)) => {
             let scope = scope.ok_or_else(|| {
                 sql_err!(
                     sqlstate::SYNTAX_ERROR,
@@ -230,19 +238,12 @@ fn composite_slot_witness<'a>(
     slot: crate::storage::TypeCreation,
     arena: &'a Arena,
 ) -> Result<(Datum<'a>, &'a [Collation]), SqlError> {
-    let target = crate::storage::TypeDefinitionTarget::by_creation(
-        storage,
-        crate::storage::NamedTypeKind::Composite,
-        slot,
-    )?;
-    let definition = storage
-        .read_composite_definition(target, txid)?
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "composite type no longer exists"
-            )
-        })?;
+    let definition = storage.row_type_definition(slot, txid)?.ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "composite type no longer exists"
+        )
+    })?;
     let mut fields = [RecordField {
         name: "",
         type_oid: 0,
@@ -313,27 +314,24 @@ fn scope_record_witness<'a>(
         Expr::Column {
             qualifier: None,
             name,
-        } if scope.table_index(name).is_ok() => Some(*name),
+        } if scope.source(name).is_ok() => Some(*name),
         _ => None,
     };
     if let Some(table_name) = table_name {
         if scope.func_scalar_column(table_name).is_some() {
             return Ok(None);
         }
-        let table = scope.table_index(table_name)?;
-        let definition = scope
-            .defs
-            .get(table)
-            .expect("whole-row table has a definition");
+        let source = scope.source(table_name)?;
+        let columns = scope.source_columns(source);
         let mut fields = [RecordField {
             name: "",
             type_oid: 0,
             value: Datum::Null,
         }; MAX_PROJ];
         let mut collations = [Collation::None; MAX_PROJ];
-        for (index, column) in definition.columns().iter().enumerate() {
+        for (index, column) in columns.iter().enumerate() {
             fields[index] = RecordField {
-                name: scope.defs.column_name(table, index),
+                name: scope.defs.column_name(source.table, source.first + index),
                 type_oid: storage
                     .routine_type_oid(column.ctype, column.user_type, txid)
                     .ok_or_else(|| {
@@ -347,10 +345,10 @@ fn scope_record_witness<'a>(
             collations[index] = column.collation;
         }
         let fields = arena
-            .alloc_slice_copy(&fields[..definition.n_columns])
+            .alloc_slice_copy(&fields[..columns.len()])
             .map_err(|_| arena_full())?;
         let collations = arena
-            .alloc_slice_copy(&collations[..definition.n_columns])
+            .alloc_slice_copy(&collations[..columns.len()])
             .map_err(|_| arena_full())?;
         return Ok(Some((Datum::Record(&*fields), &*collations)));
     }
@@ -370,10 +368,12 @@ fn external_list_subquery<'a>(
     depth: u32,
     row_arity: usize,
     row_witness: Option<Datum<'a>>,
+    column_types: &'a [i32],
     collations: &'a [Collation],
     outer: Option<&dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<SubqueryList<'a>, SqlError> {
+    let select = super::pullup::pull_up_subqueries(select, storage, txid, arena, outer)?;
     if depth == 0 {
         return Err(sql_err!(
             sqlstate::STATEMENT_TOO_COMPLEX,
@@ -503,8 +503,54 @@ fn external_list_subquery<'a>(
         probe,
         saw_null: false,
         witness,
+        column_types,
         collations,
     })
+}
+
+/// The declared types of the columns an `IN` or quantified subquery compares
+/// against, one per row field, independent of the rows it yields.
+fn list_column_types<'a>(
+    select: &'a Select<'a>,
+    row_witness: Option<Datum<'a>>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<&'a [i32], SqlError> {
+    if let Some(row_witness) = row_witness {
+        let Datum::Record(fields) = row_witness else {
+            unreachable!("row subquery witness is a record")
+        };
+        let types = arena
+            .alloc_slice_with(fields.len(), |index| fields[index].type_oid)
+            .map_err(|_| arena_full())?;
+        return Ok(&*types);
+    }
+    // Only the type survives; the inference's scratch allocations do not.
+    let mark = arena.mark();
+    let expression = Expr::Subquery(select);
+    let type_oid = subquery_expression_type(
+        &expression,
+        storage,
+        txid,
+        arena,
+        outer.unwrap_or(&crate::sql::eval::NoColumns),
+    );
+    // SAFETY: nothing allocated after `mark` is referenced past this point;
+    // the inferred type is a plain OID.
+    unsafe {
+        arena.rewind_to(mark);
+    }
+    let type_oid = type_oid?.ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "subquery column has no declared type"
+        )
+    })?;
+    Ok(&*arena
+        .alloc_slice_copy(&[type_oid])
+        .map_err(|_| arena_full())?)
 }
 
 /// Evaluates a scalar subquery through the row callback seam. Only the first
@@ -521,6 +567,7 @@ fn streaming_scalar_subquery<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(Datum<'a>, Datum<'a>), SqlError> {
+    let select = super::pullup::pull_up_subqueries(select, storage, txid, arena, outer)?;
     if depth == 0 {
         return Err(sql_err!(
             sqlstate::STATEMENT_TOO_COMPLEX,
@@ -615,6 +662,7 @@ fn streaming_array_subquery<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(Datum<'a>, Datum<'a>), SqlError> {
+    let select = super::pullup::pull_up_subqueries(select, storage, txid, arena, outer)?;
     if depth == 0 {
         return Err(sql_err!(
             sqlstate::STATEMENT_TOO_COMPLEX,
@@ -682,7 +730,7 @@ fn streaming_array_subquery<'a>(
 
 /// Walks an expression tree collecting subquery nodes, in discovery order and
 /// deduplicated by node identity so each subquery keeps one stable position.
-fn collect_subqueries<'a>(
+pub(super) fn collect_subqueries<'a>(
     expression: &'a Expr<'a>,
     out: &mut ArenaList<'a, &'a Expr<'a>>,
 ) -> Result<(), SqlError> {
@@ -736,7 +784,7 @@ pub(super) fn check_subquery_literals<'a>(
     Ok(())
 }
 
-fn check_select_literals<'a>(
+pub(super) fn check_select_literals<'a>(
     select: &'a Select<'a>,
     outer: Option<&QueryScope<'a>>,
     storage: &Storage,
@@ -776,7 +824,7 @@ fn check_select_literals<'a>(
     };
     // A FROM clause that does not resolve is reported by the query's own
     // analysis when it runs, in PostgreSQL's order.
-    let outer_columns = outer.map(super::ScopeSchema::new);
+    let outer_columns = outer.map(super::ScopeSchema);
     let Ok(scope) = crate::sql::error_position::preserving_pending(|| {
         QueryScope::resolve_schema(
             storage,
@@ -1027,7 +1075,7 @@ impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
         index: usize,
         catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
     ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
-        let schema = self.scope.map(ScopeSchema::new);
+        let schema = self.scope.map(ScopeSchema);
         let empty = crate::sql::eval::NoColumns;
         let inner: &dyn ColumnLookup<'_> = match &schema {
             Some(schema) => schema,
@@ -1041,7 +1089,7 @@ impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
     }
 
     fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
-        let schema = self.scope.map(ScopeSchema::new);
+        let schema = self.scope.map(ScopeSchema);
         let empty = crate::sql::eval::NoColumns;
         let inner: &dyn ColumnLookup<'_> = match &schema {
             Some(schema) => schema,
@@ -1054,12 +1102,26 @@ impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
         .column_type_oid(qualifier, name)
     }
 
+    fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
+        let schema = self.scope.map(ScopeSchema);
+        let empty = crate::sql::eval::NoColumns;
+        let inner: &dyn ColumnLookup<'_> = match &schema {
+            Some(schema) => schema,
+            None => &empty,
+        };
+        Chained {
+            inner,
+            outer: self.outer,
+        }
+        .row_variable(name)
+    }
+
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ColType, SqlError> {
-        let schema = self.scope.map(ScopeSchema::new);
+        let schema = self.scope.map(ScopeSchema);
         let empty = crate::sql::eval::NoColumns;
         let inner: &dyn ColumnLookup<'_> = match &schema {
             Some(schema) => schema,
@@ -1079,10 +1141,7 @@ impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
 
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         self.scope
-            .and_then(|scope| {
-                scope.qualified_star_columns(table).ok()?;
-                Some(scope.func_scalar_type(table).unwrap_or(ColType::Record))
-            })
+            .and_then(|scope| scope.whole_row_type(table))
             .or_else(|| self.outer.and_then(|outer| outer.whole_row_type(table)))
     }
 
@@ -1124,7 +1183,7 @@ impl<'a> ColumnLookup<'a> for SubqueryCollationLookup<'_, 'a, '_, 'a> {
     fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> Collation {
         if let Some(scope) = self.scope {
             let collation =
-                crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols::new(scope))
+                crate::sql::exec::record_field_metadata(base, field, &super::ScopeCols(scope))
                     .map_or(Collation::None, |meta| meta.collation);
             if collation != Collation::None {
                 return collation;
@@ -1227,7 +1286,7 @@ fn subquery_collations<'a>(
                 .0;
                 count += 1;
             }
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard(_) => {
                 let scope = scope.as_ref().ok_or_else(|| {
                     sql_err!(
                         sqlstate::SYNTAX_ERROR,
@@ -1334,8 +1393,8 @@ fn row_subquery_witness<'a>(
         let SelectItem::Expr { expression, alias } = item else {
             unreachable!("non-expression projections were described above")
         };
-        let value =
-            subquery_witness_with_outer(storage, txid, expression, scope.as_ref(), outer, arena)?;
+        let (type_oid, value) =
+            subquery_item_type(storage, txid, expression, scope.as_ref(), outer, arena)?;
         let generated = stack_format!(12, "f{}", index + 1);
         fields[index] = RecordField {
             name: match alias {
@@ -1344,7 +1403,7 @@ fn row_subquery_witness<'a>(
                     .alloc_str(generated.as_str())
                     .map_err(|_| arena_full())?,
             },
-            type_oid: value.type_oid(),
+            type_oid,
             value,
         };
     }
@@ -1439,6 +1498,7 @@ pub fn prepare_subqueries<'a>(
         depth,
         outer,
         sequences,
+        SubqueryTiming::WhereReached,
     )
 }
 
@@ -1455,147 +1515,268 @@ fn eval_subquery_nodes<'a>(
     depth: u32,
     outer: Option<&dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    timing: SubqueryTiming,
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+    let defers = |node: &Expr<'_>| match timing {
+        SubqueryTiming::Now | SubqueryTiming::Retained => false,
+        SubqueryTiming::WhereReached => subquery_has_effects(node, storage, txid),
+        SubqueryTiming::FirstRead => {
+            matches!(
+                node,
+                Expr::Subquery(_)
+                    | Expr::RowSubquery { .. }
+                    | Expr::ArraySubquery(_)
+                    | Expr::Exists(_)
+            ) || subquery_has_effects(node, storage, txid)
+        }
+    };
     let n_list_nodes = nodes
         .iter()
         .filter(|node| {
             matches!(
                 node,
                 Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. }
-            )
+            ) && !defers(node)
         })
         .count();
+    let n_deferred = nodes.iter().filter(|node| defers(node)).count();
     let scalars: &mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)] = arena
-        .alloc_slice_with(nodes.len() - n_list_nodes, |_| {
+        .alloc_slice_with(nodes.len() - n_list_nodes - n_deferred, |_| {
             (core::ptr::null(), Datum::Null, Datum::Null)
         })
         .map_err(|_| arena_full())?;
     let lists: &mut [SubqueryList<'a>] = arena
         .alloc_slice_with(n_list_nodes, |_| empty_subquery_list())
         .map_err(|_| arena_full())?;
+    let deferred = if n_deferred == 0 {
+        &mut []
+    } else {
+        let executor: &'a dyn super::super::eval::SubqueryExecution = arena
+            .alloc(ProceduralSubqueries { storage, txid })
+            .map_err(|_| arena_full())?;
+        let mut entries = nodes.iter().filter(|node| defers(node));
+        let mut failed = false;
+        let deferred = arena
+            .alloc_slice_with(n_deferred, |_| {
+                let node = entries.next().copied();
+                let cache = match arena.alloc(super::super::eval::DeferredSubqueryCache::default())
+                {
+                    Ok(cache) => {
+                        let cache: &core::cell::Cell<_> = core::cell::Cell::from_mut(cache);
+                        Some(cache)
+                    }
+                    Err(_) => {
+                        failed = true;
+                        None
+                    }
+                };
+                super::super::eval::DeferredSubquery {
+                    node: node.map_or(core::ptr::null(), |node| (node as *const Expr).cast()),
+                    executor,
+                    owner: arena,
+                    cache,
+                }
+            })
+            .map_err(|_| arena_full())?;
+        if failed {
+            return Err(arena_full());
+        }
+        deferred
+    };
     let (mut n_scalars, mut n_lists) = (0, 0);
     for node in nodes {
-        match node {
-            Expr::RowSubquery { select, arity } => {
-                let (values, _, witness) = run_row_subquery(
-                    select,
-                    storage,
-                    txid,
-                    arena,
-                    params,
-                    depth,
-                    outer,
-                    *arity as usize,
-                    sequences,
-                )?;
-                if values.len() > 1 {
-                    return Err(sql_err!(
-                        crate::sql::eval::sqlstate::CARDINALITY_VIOLATION,
-                        "more than one row returned by a subquery used as an expression"
-                    ));
-                }
-                scalars[n_scalars] = (
-                    *node as *const _,
-                    values.first().copied().unwrap_or(Datum::Null),
-                    witness,
-                );
-                n_scalars += 1;
-            }
-            Expr::Subquery(select) => {
-                if storage.spill_attached() {
-                    let (value, witness) = streaming_scalar_subquery(
-                        select, storage, txid, arena, params, depth, outer, sequences,
-                    )?;
-                    scalars[n_scalars] = (*node as *const _, value, witness);
-                    n_scalars += 1;
-                    continue;
-                }
-                let (values, _, witness) = run_subquery(
-                    select, storage, txid, arena, params, depth, outer, 1, sequences,
-                )?;
-                if values.len() > 1 {
-                    return Err(sql_err!(
-                        crate::sql::eval::sqlstate::CARDINALITY_VIOLATION,
-                        "more than one row returned by a subquery used as an expression"
-                    ));
-                }
-                let v = values.first().copied().unwrap_or(Datum::Null);
-                scalars[n_scalars] = (*node as *const _, v, witness);
-                n_scalars += 1;
-            }
-            Expr::Exists(select) => {
-                let found = subquery_exists(
-                    select, storage, txid, arena, params, depth, outer, sequences,
-                )?;
-                scalars[n_scalars] = (*node as *const _, Datum::Bool(found), Datum::Bool(false));
-                n_scalars += 1;
-            }
-            Expr::ArraySubquery(select) => {
-                if storage.spill_attached() {
-                    let (v, witness) = streaming_array_subquery(
-                        select, storage, txid, arena, params, depth, outer, sequences,
-                    )?;
-                    scalars[n_scalars] = (*node as *const _, v, witness);
-                    n_scalars += 1;
-                    continue;
-                }
-                let plan = array_subquery_plan(select, storage, txid, arena, outer)?;
-                let (values, _, _) = run_subquery(
-                    select, storage, txid, arena, params, depth, outer, 1, sequences,
-                )?;
-                let v = build_array_scalar(values, plan, storage, txid, arena)?;
-                scalars[n_scalars] = (*node as *const _, v, v);
-                n_scalars += 1;
-            }
-            Expr::InSubquery {
-                operand, select, ..
-            }
-            | Expr::QuantifiedSubquery {
-                operand, select, ..
-            } => {
-                let original_select = *select;
-                let (select, arity) = row_projected(operand, original_select, arena)?;
-                let collations = subquery_collations(original_select, storage, txid, arena, outer)?;
-                let row_witness = (arity > 1)
-                    .then(|| row_subquery_witness(original_select, storage, txid, arena, outer))
-                    .transpose()?;
-                if storage.spill_attached() {
-                    lists[n_lists] = external_list_subquery(
-                        node,
+        if defers(node) {
+            continue;
+        }
+        let mut evaluate = || -> Result<(), SqlError> {
+            match node {
+                Expr::RowSubquery { select, arity } => {
+                    let (values, _, witness) = run_row_subquery(
                         select,
                         storage,
                         txid,
                         arena,
                         params,
                         depth,
-                        arity,
-                        row_witness,
-                        collations,
                         outer,
+                        *arity as usize,
                         sequences,
                     )?;
-                    n_lists += 1;
-                    continue;
+                    if values.len() > 1 {
+                        return Err(sql_err!(
+                            crate::sql::eval::sqlstate::CARDINALITY_VIOLATION,
+                            "more than one row returned by a subquery used as an expression"
+                        ));
+                    }
+                    scalars[n_scalars] = (
+                        *node as *const _,
+                        values.first().copied().unwrap_or(Datum::Null),
+                        witness,
+                    );
+                    n_scalars += 1;
                 }
-                let (values, saw_null, witness) = run_subquery(
-                    select, storage, txid, arena, params, depth, outer, arity, sequences,
-                )?;
-                lists[n_lists] = SubqueryList {
-                    node: (*node as *const Expr).cast(),
-                    values,
-                    probe: None,
-                    saw_null,
-                    witness: row_witness.unwrap_or(witness),
-                    collations,
-                };
-                n_lists += 1;
+                Expr::Subquery(select) => {
+                    if storage.spill_attached() {
+                        let (value, witness) = streaming_scalar_subquery(
+                            select, storage, txid, arena, params, depth, outer, sequences,
+                        )?;
+                        scalars[n_scalars] = (*node as *const _, value, witness);
+                        n_scalars += 1;
+                        return Ok(());
+                    }
+                    let (values, _, witness) = run_subquery(
+                        select, storage, txid, arena, params, depth, outer, 1, sequences,
+                    )?;
+                    if values.len() > 1 {
+                        return Err(sql_err!(
+                            crate::sql::eval::sqlstate::CARDINALITY_VIOLATION,
+                            "more than one row returned by a subquery used as an expression"
+                        ));
+                    }
+                    let v = values.first().copied().unwrap_or(Datum::Null);
+                    scalars[n_scalars] = (*node as *const _, v, witness);
+                    n_scalars += 1;
+                }
+                Expr::Exists(select) => {
+                    let found = subquery_exists(
+                        select, storage, txid, arena, params, depth, outer, sequences,
+                    )?;
+                    scalars[n_scalars] =
+                        (*node as *const _, Datum::Bool(found), Datum::Bool(false));
+                    n_scalars += 1;
+                }
+                Expr::ArraySubquery(select) => {
+                    if storage.spill_attached() {
+                        let (v, witness) = streaming_array_subquery(
+                            select, storage, txid, arena, params, depth, outer, sequences,
+                        )?;
+                        scalars[n_scalars] = (*node as *const _, v, witness);
+                        n_scalars += 1;
+                        return Ok(());
+                    }
+                    let plan = array_subquery_plan(select, storage, txid, arena, outer)?;
+                    let (values, _, _) = run_subquery(
+                        select, storage, txid, arena, params, depth, outer, 1, sequences,
+                    )?;
+                    let v = build_array_scalar(values, plan, storage, txid, arena)?;
+                    scalars[n_scalars] = (*node as *const _, v, v);
+                    n_scalars += 1;
+                }
+                Expr::InSubquery {
+                    operand, select, ..
+                }
+                | Expr::QuantifiedSubquery {
+                    operand, select, ..
+                } => {
+                    let original_select = *select;
+                    let (select, arity) = row_projected(operand, original_select, arena)?;
+                    let collations =
+                        subquery_collations(original_select, storage, txid, arena, outer)?;
+                    let row_witness = (arity > 1)
+                        .then(|| row_subquery_witness(original_select, storage, txid, arena, outer))
+                        .transpose()?;
+                    let column_types = list_column_types(
+                        original_select,
+                        row_witness,
+                        storage,
+                        txid,
+                        arena,
+                        outer,
+                    )?;
+                    if storage.spill_attached() && !matches!(timing, SubqueryTiming::Retained) {
+                        lists[n_lists] = external_list_subquery(
+                            node,
+                            select,
+                            storage,
+                            txid,
+                            arena,
+                            params,
+                            depth,
+                            arity,
+                            row_witness,
+                            column_types,
+                            collations,
+                            outer,
+                            sequences,
+                        )?;
+                        n_lists += 1;
+                        return Ok(());
+                    }
+                    let (values, saw_null, witness) = run_subquery(
+                        select, storage, txid, arena, params, depth, outer, arity, sequences,
+                    )?;
+                    lists[n_lists] = SubqueryList {
+                        node: (*node as *const Expr).cast(),
+                        values,
+                        probe: None,
+                        saw_null,
+                        witness: row_witness.unwrap_or(witness),
+                        column_types,
+                        collations,
+                    };
+                    n_lists += 1;
+                }
+                _ => unreachable!("collector only stores subquery nodes"),
             }
-            _ => unreachable!("collector only stores subquery nodes"),
-        }
+            Ok(())
+        };
+        evaluate().map_err(|error| subquery_shape_position(error, node))?;
     }
     debug_assert_eq!(n_scalars, scalars.len());
     debug_assert_eq!(n_lists, lists.len());
-    Ok(SubqueryValues { scalars, lists })
+    Ok(SubqueryValues {
+        scalars,
+        lists,
+        deferred,
+    })
+}
+
+/// PostgreSQL reports a subquery's column count at the subquery.
+pub(super) fn subquery_shape_position(error: SqlError, node: &Expr<'_>) -> SqlError {
+    if matches!(
+        error.message.as_str(),
+        "subquery must return only one column"
+            | "subquery has too many columns"
+            | "subquery has too few columns"
+    ) {
+        crate::sql::error_position::at_node(error, node)
+    } else {
+        error
+    }
+}
+
+/// When prepared subqueries run.
+#[derive(Clone, Copy)]
+enum SubqueryTiming {
+    /// Before the expressions that contain them.
+    Now,
+    /// Now, gathering a list in memory so its result can be saved for
+    /// later rows instead of spooled.
+    Retained,
+    /// One with effects runs where evaluation reaches it.
+    WhereReached,
+    /// As `WhereReached`, and every scalar subquery also runs when an
+    /// expression first reads it, as PostgreSQL's initPlans do: an
+    /// expression no row reaches never runs its subquery.
+    FirstRead,
+}
+
+/// Whether running a scalar subquery early would reorder its effects: it
+/// calls a volatile function, or its statement reads data-modifying `WITH`
+/// queries, which run when first read. `IN` and quantified subqueries are
+/// prepared before their expressions.
+fn subquery_has_effects(node: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
+    let (Expr::Subquery(select)
+    | Expr::RowSubquery { select, .. }
+    | Expr::Exists(select)
+    | Expr::ArraySubquery(select)
+    | Expr::InSubquery { select, .. }
+    | Expr::QuantifiedSubquery { select, .. }) = node
+    else {
+        return false;
+    };
+    super::statement_reads_write_queries()
+        || super::cte::select_contains_volatile(select, storage, txid)
 }
 
 /// Runs a subquery only to determine whether it yields any row (EXISTS).
@@ -1611,6 +1792,7 @@ fn subquery_exists<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<bool, SqlError> {
+    let select = super::pullup::pull_up_subqueries(select, storage, txid, arena, outer)?;
     if depth == 0 {
         return Err(sql_err!(
             sqlstate::STATEMENT_TOO_COMPLEX,
@@ -1619,13 +1801,15 @@ fn subquery_exists<'a>(
     }
     if let Some(tree) = select.set_body {
         let (vals, _, _) = run_set_subquery(
-            tree, select, storage, txid, arena, params, outer, 1, sequences,
+            tree, select, storage, txid, arena, params, 1, outer, sequences,
         )?;
         return Ok(!vals.is_empty());
     }
-    if !select.group_by.is_empty() || select.having.is_some() || select.distinct {
+    if needs_row_source(select, storage, txid, arena)? {
         // Grouped/DISTINCT EXISTS: the row-source executor already handles
-        // grouping, HAVING, and DISTINCT — existence is whether it emits.
+        // grouping, HAVING, and DISTINCT — existence is whether it emits. It
+        // also evaluates a nested subquery that reads this query's rows once
+        // per row.
         let mut found = false;
         select_into_rows(
             storage,
@@ -1773,6 +1957,42 @@ fn subquery_exists<'a>(
     Ok(found)
 }
 
+/// Whether a subquery needs the general row-source executor rather than the
+/// single-scan paths here: grouping, `DISTINCT`, or a nested subquery that
+/// must run per row or per group of this one (the single-scan paths run
+/// nested subqueries once, against the enclosing row only).
+fn needs_row_source<'a>(
+    select: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    if !select.group_by.is_empty()
+        || select.having.is_some()
+        || select.distinct
+        || super::aggregate_levels::select_owns_nested_aggregates(select)
+    {
+        return Ok(true);
+    }
+    let items = select.items.iter().filter_map(|item| match item {
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+            Some(*expression)
+        }
+        _ => None,
+    });
+    for expression in items
+        .chain(select.where_clause)
+        .chain(select.order_by.iter().map(|order| order.expression))
+        .chain(select.limit)
+        .chain(select.offset)
+    {
+        if expression_has_correlated_subquery(expression, storage, txid, arena)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// A chain of query scopes from innermost outward, used to decide whether a
 /// subquery references a column belonging to an enclosing query.
 struct ScopeChain<'s, 'd> {
@@ -1791,34 +2011,6 @@ impl ScopeChain<'_, '_> {
         }
         self.parent
             .is_some_and(|parent| parent.resolves(qualifier, name))
-    }
-}
-
-fn set_tree_has_outer_ref<'a>(
-    tree: &'a SetTree<'a>,
-    chain: &ScopeChain<'_, 'a>,
-    storage: &'a Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<bool, SqlError> {
-    match tree {
-        SetTree::Select(select) => {
-            let scope = select
-                .from
-                .as_ref()
-                .map(|from| correlation_schema(storage, txid, from, arena))
-                .transpose()?
-                .flatten();
-            let child = ScopeChain {
-                scope: scope.as_ref(),
-                parent: Some(chain),
-            };
-            select_has_outer_ref(select, &child, storage, txid, arena)
-        }
-        SetTree::Op { left, right, .. } => {
-            Ok(set_tree_has_outer_ref(left, chain, storage, txid, arena)?
-                || set_tree_has_outer_ref(right, chain, storage, txid, arena)?)
-        }
     }
 }
 
@@ -1887,10 +2079,46 @@ fn correlation_schema<'a>(
     from: &'a crate::sql::ast::FromClause<'a>,
     arena: &'a Arena,
 ) -> Result<Option<QueryScope<'a>>, SqlError> {
+    // A function source can name an outer column only through its
+    // arguments; one whose arguments read no column resolves on its own.
+    fn reads_columns(expression: &Expr<'_>) -> bool {
+        if matches!(
+            expression,
+            Expr::Column { .. }
+                | Expr::WholeRow(_)
+                | Expr::SchemaColumn { .. }
+                | Expr::Subquery(_)
+                | Expr::RowSubquery { .. }
+                | Expr::InSubquery { .. }
+                | Expr::QuantifiedSubquery { .. }
+                | Expr::Exists(_)
+                | Expr::ArraySubquery(_)
+        ) {
+            return true;
+        }
+        let mut found = false;
+        let _ = walk_children(expression, &mut |child| {
+            found |= reads_columns(child);
+            Ok(())
+        });
+        found
+    }
+    let function_reads_columns = |table: &crate::sql::ast::TableRef<'_>| {
+        table
+            .func_args
+            .is_some_and(|arguments| arguments.iter().any(|argument| reads_columns(argument)))
+            || table.rows_from.is_some_and(|functions| {
+                functions.iter().any(|function| {
+                    function.func_args.is_some_and(|arguments| {
+                        arguments.iter().any(|argument| reads_columns(argument))
+                    })
+                })
+            })
+    };
     // A derived table may read the levels around its query, though not the
     // tables beside it; its columns then exist only per outer row.
     let references_outer = |table: &'a crate::sql::ast::TableRef<'a>| {
-        if table.lateral || table.is_function_source() {
+        if table.lateral || (table.is_function_source() && function_reads_columns(table)) {
             return Ok(true);
         }
         match table.subquery {
@@ -1901,12 +2129,22 @@ fn correlation_schema<'a>(
     if references_outer(&from.base)? {
         return Ok(None);
     }
-    for join in from.joins {
-        if references_outer(&join.table)? {
-            return Ok(None);
+    // A derived table that reads an enclosing query does not resolve on its
+    // own either; the query's own analysis reports a name nothing answers.
+    match crate::sql::error_position::preserving_pending(|| {
+        QueryScope::resolve_schema(storage, from, txid, arena, None)
+    }) {
+        Ok(scope) => Ok(Some(scope)),
+        Err(error)
+            if matches!(
+                error.sqlstate.as_str(),
+                sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+            ) =>
+        {
+            Ok(None)
         }
+        Err(error) => Err(error),
     }
-    QueryScope::resolve_schema(storage, from, txid, arena, None).map(Some)
 }
 
 /// Whether any column in this select (WHERE or projection) fails to resolve
@@ -1918,9 +2156,25 @@ fn select_has_outer_ref<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
-    // Each branch of a set operation is a query level of its own.
     if let Some(tree) = select.set_body {
-        return set_tree_has_outer_ref(tree, chain, storage, txid, arena);
+        // Each branch of a set operation has its own FROM scope.
+        let mut leaves = ArenaList::new(arena);
+        super::setops::collect_set_leaves(tree, &mut leaves)?;
+        for leaf in leaves.as_slice() {
+            let scope = leaf
+                .from
+                .as_ref()
+                .map(|from| correlation_schema(storage, txid, from, arena))
+                .transpose()?
+                .flatten();
+            let child = ScopeChain {
+                scope: scope.as_ref(),
+                parent: Some(chain),
+            };
+            if select_has_outer_ref(leaf, &child, storage, txid, arena)? {
+                return Ok(true);
+            }
+        }
     }
     if let Some(from) = select.from.as_ref() {
         if table_ref_has_outer_ref(&from.base, chain, storage, txid, arena)? {
@@ -2034,6 +2288,8 @@ fn expr_has_outer_ref<'a>(
 ) -> Result<bool, SqlError> {
     match expression {
         Expr::Column { qualifier, name } => Ok(!chain.resolves(*qualifier, name)),
+        // Reads the enclosing query's current group.
+        Expr::OuterAggregate { .. } => Ok(true),
         Expr::SchemaColumn {
             schema,
             table,
@@ -2129,11 +2385,83 @@ pub(super) fn prepare_outer_subqueries<'a>(
         SUBQUERY_DEPTH,
         None,
         sequences,
+        SubqueryTiming::FirstRead,
     )?;
     Ok(OuterSubs {
         base,
         correlated: corr.as_slice(),
     })
+}
+
+/// Uncorrelated scalar subqueries `nodes` that run when an expression first
+/// reads them, as PostgreSQL's initPlans do. Nothing runs here. Their state
+/// and results live in `arena`'s persistent tail and retained bytes, which a
+/// reader's per-row rewinds and resumed attempts do not reclaim.
+pub(super) fn first_read_subqueries<'a>(
+    nodes: &[&'a Expr<'a>],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+    debug_assert!(nodes.iter().all(|node| matches!(
+        node,
+        Expr::Subquery(_) | Expr::RowSubquery { .. } | Expr::ArraySubquery(_) | Expr::Exists(_)
+    )));
+    // SAFETY: the engine's storage outlives every statement and reader that
+    // keeps these subqueries, and each run detaches its result before any
+    // borrow of storage escapes.
+    let storage: &'a Storage = unsafe { &*(storage as *const Storage) };
+    let executor: &'a dyn super::super::eval::SubqueryExecution = &arena
+        .alloc_persistent_slice_with(1, |_| {
+            StatementSubqueries(ProceduralSubqueries { storage, txid })
+        })
+        .map_err(|_| arena_full())?[0];
+    let caches = arena
+        .alloc_persistent_slice_with(nodes.len(), |_| {
+            super::super::eval::DeferredSubqueryCache::default()
+        })
+        .map_err(|_| arena_full())?;
+    let caches = core::cell::Cell::from_mut(caches).as_slice_of_cells();
+    let deferred = arena
+        .alloc_persistent_slice_with(nodes.len(), |index| super::super::eval::DeferredSubquery {
+            node: (nodes[index] as *const Expr).cast(),
+            executor,
+            owner: arena,
+            cache: Some(&caches[index]),
+        })
+        .map_err(|_| arena_full())?;
+    Ok(SubqueryValues {
+        scalars: &[],
+        lists: &[],
+        deferred,
+    })
+}
+
+/// Runs a top-level statement's uncorrelated subqueries: they read no row
+/// of the statement, so the row an expression is evaluated over is not
+/// passed on.
+#[derive(Clone, Copy)]
+struct StatementSubqueries<'s>(ProceduralSubqueries<'s>);
+
+impl super::super::eval::SubqueryExecution for StatementSubqueries<'_> {
+    fn evaluate<'a>(
+        &self,
+        expression: &Expr<'a>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        _outer: &dyn ColumnLookup<'a>,
+        sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+        retained: bool,
+    ) -> Result<super::super::eval::SubqueryResult<'a>, SqlError> {
+        self.0.evaluate(
+            expression,
+            arena,
+            params,
+            &crate::sql::eval::NoColumns,
+            sequences,
+            retained,
+        )
+    }
 }
 
 /// The exact scratch sizes `merge_correlated` fills for `base` + `correlated`
@@ -2197,7 +2525,7 @@ pub(super) fn alloc_merge_scratch<'a>(
 )]
 pub(super) fn merge_correlated<'a, 'b>(
     correlated: &[&'a Expr<'a>],
-    base: &SubqueryValues<'_, 'a>,
+    base: &SubqueryValues<'b, 'a>,
     row: &dyn ColumnLookup<'a>,
     enclosing: Option<&dyn ColumnLookup<'a>>,
     storage: &'a Storage,
@@ -2208,13 +2536,6 @@ pub(super) fn merge_correlated<'a, 'b>(
     lists: &'b mut [SubqueryList<'a>],
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<SubqueryValues<'b, 'a>, SqlError> {
-    // A correlated subquery reads the current row and every level around
-    // its query, such as a routine's variables.
-    let chained = super::Chained {
-        inner: row,
-        outer: enclosing,
-    };
-    let outer: &dyn ColumnLookup<'a> = &chained;
     let mut ns = 0;
     for (p, v, w) in base.scalars {
         // Node addresses are identity keys; every base value was built from
@@ -2227,7 +2548,17 @@ pub(super) fn merge_correlated<'a, 'b>(
         lists[nl] = *list;
         nl += 1;
     }
+    // A correlated subquery sees the current row first, then every query
+    // enclosing the one that produced it.
+    let chained = Chained {
+        inner: row,
+        outer: enclosing,
+    };
+    let outer: &dyn ColumnLookup<'a> = &chained;
     for node in correlated {
+        if subquery_has_effects(node, storage, txid) {
+            continue;
+        }
         match node {
             Expr::RowSubquery { select, arity } => {
                 let (values, _, witness) = run_row_subquery(
@@ -2355,6 +2686,14 @@ pub(super) fn merge_correlated<'a, 'b>(
                         row_subquery_witness(original_select, storage, txid, arena, Some(outer))
                     })
                     .transpose()?;
+                let column_types = list_column_types(
+                    original_select,
+                    row_witness,
+                    storage,
+                    txid,
+                    arena,
+                    Some(outer),
+                )?;
                 if storage.spill_attached() {
                     lists[nl] = external_list_subquery(
                         node,
@@ -2366,6 +2705,7 @@ pub(super) fn merge_correlated<'a, 'b>(
                         SUBQUERY_DEPTH,
                         arity,
                         row_witness,
+                        column_types,
                         collations,
                         Some(outer),
                         sequences,
@@ -2390,6 +2730,7 @@ pub(super) fn merge_correlated<'a, 'b>(
                     probe: None,
                     saw_null,
                     witness: row_witness.unwrap_or(witness),
+                    column_types,
                     collations,
                 };
                 nl += 1;
@@ -2397,9 +2738,39 @@ pub(super) fn merge_correlated<'a, 'b>(
             _ => unreachable!("correlated list holds only subquery nodes"),
         }
     }
+    let effects = correlated
+        .iter()
+        .filter(|node| subquery_has_effects(node, storage, txid))
+        .count();
+    let deferred: &'b [super::super::eval::DeferredSubquery<'b>] = if effects == 0 {
+        base.deferred
+    } else {
+        let executor: &'a dyn super::super::eval::SubqueryExecution = arena
+            .alloc(ProceduralSubqueries { storage, txid })
+            .map_err(|_| arena_full())?;
+        let mut correlated_effects = correlated
+            .iter()
+            .filter(|node| subquery_has_effects(node, storage, txid));
+        // Each outer row runs its correlated subqueries afresh.
+        &*arena
+            .alloc_slice_with(base.deferred.len() + effects, |index| {
+                base.deferred.get(index).copied().unwrap_or_else(|| {
+                    super::super::eval::DeferredSubquery {
+                        node: correlated_effects
+                            .next()
+                            .map_or(core::ptr::null(), |node| (*node as *const Expr).cast()),
+                        executor,
+                        owner: arena,
+                        cache: None,
+                    }
+                })
+            })
+            .map_err(|_| arena_full())?
+    };
     Ok(SubqueryValues {
         scalars: &scalars[..ns],
         lists: &lists[..nl],
+        deferred,
     })
 }
 
@@ -2411,7 +2782,7 @@ pub(super) fn correlated_where_passes<'a>(
     correlated: &[&'a Expr<'a>],
     base: &SubqueryValues<'a, 'a>,
     predicate: Option<&'a Expr<'a>>,
-    row: &dyn ColumnLookup<'a>,
+    row: &impl ColumnLookup<'a>,
     enclosing: Option<&dyn ColumnLookup<'a>>,
     storage: &'a Storage,
     txid: u32,
@@ -2441,7 +2812,7 @@ pub(super) fn correlated_where_passes<'a>(
         subs: Some(&values),
         ..*hooks
     };
-    let row = super::Chained {
+    let row = Chained {
         inner: row,
         outer: enclosing,
     };
@@ -2454,7 +2825,7 @@ pub(super) fn correlated_where_passes<'a>(
 /// (no spurious error), matching that these accept an unknown literal as-is.
 pub(crate) fn type_witness(ct: ColType) -> Result<Datum<'static>, SqlError> {
     Ok(match ct {
-        ColType::Void | ColType::Internal => Datum::Null,
+        ColType::Void | ColType::Internal | ColType::Pseudo(_) => Datum::Null,
         ColType::PgDdlCommand => Datum::PgDdlCommand,
         ColType::AnyArray => Datum::Null,
         // An empty record: enough for coerce_unknown to leave values alone.
@@ -2605,6 +2976,20 @@ fn subquery_witness_with_outer(
     outer: Option<&dyn ColumnLookup<'_>>,
     arena: &Arena,
 ) -> Result<Datum<'static>, SqlError> {
+    subquery_item_type(storage, txid, item, scope, outer, arena).map(|(_, witness)| witness)
+}
+
+/// A subquery item's declared type and its value witness. The type survives
+/// where the witness cannot carry it: a pseudo-type such as `cstring` has
+/// none.
+fn subquery_item_type(
+    storage: &Storage,
+    txid: u32,
+    item: &Expr,
+    scope: Option<&QueryScope>,
+    outer: Option<&dyn ColumnLookup<'_>>,
+    arena: &Arena,
+) -> Result<(i32, Datum<'static>), SqlError> {
     let inferred = crate::sql::exec::infer_type_res(
         item,
         &SubqueryColumns {
@@ -2621,9 +3006,9 @@ fn subquery_witness_with_outer(
         },
     )?;
     if inferred.0 == crate::sql::types::oid::UNKNOWN {
-        return type_witness(ColType::Text);
+        return Ok((ColType::Text.oid(), type_witness(ColType::Text)?));
     }
-    catalog_type_witness(storage, txid, inferred.0)
+    Ok((inferred.0, catalog_type_witness(storage, txid, inferred.0)?))
 }
 
 /// Query and procedural subqueries resolve inner columns before outer values,
@@ -2632,6 +3017,32 @@ pub(super) struct SubqueryColumns<'scope, 'definition, 'outer, 'row, 'catalog> {
     pub(super) scope: Option<&'scope QueryScope<'definition>>,
     pub(super) outer: Option<&'outer dyn ColumnLookup<'row>>,
     pub(super) catalog: crate::sql::exec::CatalogCols<'catalog>,
+}
+
+impl<'scope, 'definition, 'outer, 'row, 'catalog>
+    SubqueryColumns<'scope, 'definition, 'outer, 'row, 'catalog>
+{
+    /// Static types of `scope`'s columns, then of the enclosing queries'.
+    pub(super) fn of_scope(
+        scope: &'scope QueryScope<'definition>,
+        outer: Option<&'outer dyn ColumnLookup<'row>>,
+        storage: &'catalog Storage,
+        txid: u32,
+        arena: &'catalog Arena,
+    ) -> Self {
+        Self {
+            scope: Some(scope),
+            outer,
+            catalog: crate::sql::exec::CatalogCols {
+                definition: None,
+                alias: None,
+                output_aliases: &[],
+                storage,
+                txid,
+                arena,
+            },
+        }
+    }
 }
 
 impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
@@ -2660,7 +3071,7 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
             return match self.scope {
                 Some(scope) => CatalogScopeCols {
                     scope,
-                    outer_scope: None,
+                    outer: None,
                     storage: self.catalog.storage,
                     txid: self.catalog.txid,
                     arena: self.catalog.arena,
@@ -2755,7 +3166,7 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
 
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         let inner = match self.scope {
-            Some(scope) => ScopeCols::new(scope).resolve(qualifier, name),
+            Some(scope) => ScopeCols(scope).resolve(qualifier, name),
             None => self.catalog.resolve(qualifier, name),
         };
         match inner {
@@ -2813,7 +3224,7 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
         {
             return CatalogScopeCols {
                 scope,
-                outer_scope: None,
+                outer: None,
                 storage: self.catalog.storage,
                 txid: self.catalog.txid,
                 arena: self.catalog.arena,
@@ -2880,7 +3291,7 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
     }
 
     fn subquery_type(&self, expression: &Expr<'_>) -> Result<Option<(i32, i16)>, SqlError> {
-        let schema = self.scope.map(ScopeSchema::new);
+        let schema = self.scope.map(ScopeSchema);
         let empty = crate::sql::eval::NoColumns;
         let inner: &dyn ColumnLookup<'_> = match &schema {
             Some(schema) => schema,
@@ -2904,10 +3315,16 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
         self.scope?.func_scalar_type(name)
     }
 
+    fn whole_row_composite_type(&self, name: &str) -> Option<ColType> {
+        self.scope?
+            .whole_row_type(name)
+            .filter(|ctype| matches!(ctype, ColType::Composite(_)))
+    }
+
     fn table_columns(&self, name: &str) -> Option<&[crate::storage::ColumnMeta]> {
         let scope = self.scope?;
-        let table = scope.table_index(name).ok()?;
-        Some(scope.defs.get(table)?.columns())
+        let source = scope.source(name).ok()?;
+        Some(scope.source_columns(source))
     }
 
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
@@ -2980,8 +3397,38 @@ pub(crate) fn subquery_expression_type(
         }
         _ => return Ok(None),
     };
+    if select.set_body.is_some() && !array {
+        // Each branch may read the enclosing row, as a correlated subquery does.
+        let mut type_oid = None;
+        let mut columns = 0usize;
+        super::visit_projection_types(
+            select,
+            storage,
+            txid,
+            arena,
+            Some(outer),
+            &mut |source, _| {
+                if columns == 0 {
+                    type_oid = Some(source);
+                }
+                columns += 1;
+                Ok(())
+            },
+        )?;
+        if columns != 1 {
+            return Err(subquery_shape_position(
+                sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "subquery must return only one column"
+                ),
+                expression,
+            ));
+        }
+        return Ok(type_oid);
+    }
     if select.set_body.is_some() {
-        return super::subquery_result_type(expression, None, storage, txid, arena)
+        let types = super::scope::OuterColumnTypes(outer);
+        return super::subquery_result_type(expression, Some(&types), storage, txid, arena)
             .map(|result| result.map(|result| result.type_oid));
     }
     let scope = select
@@ -3005,7 +3452,7 @@ pub(crate) fn subquery_expression_type(
         [SelectItem::Expr { expression, .. }] => {
             crate::sql::exec::infer_routine_argument_oid(expression, &columns)?
         }
-        [SelectItem::Wildcard]
+        [SelectItem::Wildcard(_)]
             if scope
                 .as_ref()
                 .is_some_and(|scope| scope.star_columns() == 1) =>
@@ -3278,6 +3725,7 @@ fn run_row_subquery<'a>(
     row_arity: usize,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
+    let select = super::pullup::pull_up_subqueries(select, storage, txid, arena, outer)?;
     if depth == 0 {
         return Err(sql_err!(
             sqlstate::STATEMENT_TOO_COMPLEX,
@@ -3286,7 +3734,7 @@ fn run_row_subquery<'a>(
     }
     if let Some(tree) = select.set_body {
         let (values, saw_null, witness) = run_set_subquery(
-            tree, select, storage, txid, arena, params, outer, row_arity, sequences,
+            tree, select, storage, txid, arena, params, row_arity, outer, sequences,
         )?;
         if values.len() > 1 {
             return Err(sql_err!(
@@ -3317,6 +3765,7 @@ fn run_subquery<'a>(
     row_arity: usize,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
+    let select = super::pullup::pull_up_subqueries(select, storage, txid, arena, outer)?;
     if depth == 0 {
         return Err(sql_err!(
             sqlstate::STATEMENT_TOO_COMPLEX,
@@ -3325,7 +3774,7 @@ fn run_subquery<'a>(
     }
     if let Some(tree) = select.set_body {
         return run_set_subquery(
-            tree, select, storage, txid, arena, params, outer, row_arity, sequences,
+            tree, select, storage, txid, arena, params, row_arity, outer, sequences,
         );
     }
     if row_arity > 1 {
@@ -3342,14 +3791,14 @@ fn run_subquery<'a>(
     // `SELECT *` is accepted when the source has exactly one column (resolved
     // below); until then a placeholder stands in (a wildcard carries no
     // subqueries or aggregates of its own).
-    let wildcard = matches!(&select.items[0], SelectItem::Wildcard);
+    let wildcard = matches!(&select.items[0], SelectItem::Wildcard(_));
     let table_star = match &select.items[0] {
         SelectItem::TableWildcard(q) => Some(*q),
         _ => None,
     };
     let item: &Expr = match &select.items[0] {
         SelectItem::Expr { expression, .. } => expression,
-        SelectItem::Wildcard | SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => {
+        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => {
             &Expr::Null
         }
     };
@@ -3364,12 +3813,7 @@ fn run_subquery<'a>(
     // rows, so its body belongs to the row-source executor too (which handles
     // SRF expansion) — just like a grouped or windowed subquery.
     let has_srf = super::srf::has_project_set(select.items, storage, txid);
-    if !select.group_by.is_empty()
-        || select.having.is_some()
-        || select.distinct
-        || has_window
-        || has_srf
-    {
+    if has_window || has_srf || needs_row_source(select, storage, txid, arena)? {
         // Grouped/DISTINCT/windowed/SRF subquery: the row-source executor
         // already handles grouping, HAVING, DISTINCT, windows, and SRF
         // expansion; collect its single output column.
@@ -3394,8 +3838,10 @@ fn run_subquery<'a>(
                 // reader. Re-encode the scalar into the statement arena
                 // before retaining it in the subquery result.
                 let encoded = crate::sql::exec::encode_projected_pub(vals, arena)?;
-                out.push(crate::sql::exec::decode_projected_pub(encoded, 0))
-                    .map_err(|_| arena_full())?;
+                out.push(crate::sql::exec::decode_projected_col_record(
+                    encoded, 0, arena,
+                )?)
+                .map_err(|_| arena_full())?;
                 any_null |= vals[0].is_null();
                 Ok(())
             },
@@ -3623,16 +4069,22 @@ fn run_subquery<'a>(
             sequences: hooks.sequences,
             merge_action: hooks.merge_action,
         };
-        let schema = ScopeSchema::new(&scope);
+        let schema = ScopeSchema(&scope);
         let base = Chained {
             inner: &schema,
             outer,
         };
         let v = eval_full(item, arena, params, &base, &agg_hooks)?;
-        let out = arena.alloc_slice_copy(&[v]).map_err(|_| arena_full())?;
+        // OFFSET and LIMIT apply to the aggregate's one row.
+        let offset = crate::sql::exec::eval_offset_pub(select.offset, arena, params, &hooks)?;
+        let limit = crate::sql::exec::eval_limit_pub(select.limit, arena, params, &hooks)?;
+        let rows = usize::from(offset == 0 && limit > 0);
+        let out = arena
+            .alloc_slice_copy(&[v][..rows])
+            .map_err(|_| arena_full())?;
         return Ok((
             &*out,
-            v.is_null(),
+            rows == 1 && v.is_null(),
             spooled_column_witness(select, storage, txid, Some(&scope), arena, item, outer)?,
         ));
     }
@@ -3694,24 +4146,37 @@ fn run_subquery<'a>(
     let vals = vals.as_slice();
     let keys = keys.as_slice();
 
-    // Stable insertion sort of row indices by the ORDER BY keys.
+    // Stable sort of row indices by the ORDER BY keys.
     let order = arena
         .alloc_slice_with(count, |i| i)
         .map_err(|_| arena_full())?;
     if n_keys > 0 {
-        for x in 1..count {
-            let mut y = x;
-            while y > 0 {
-                let a = &keys[order[y - 1] * n_keys..order[y - 1] * n_keys + n_keys];
-                let b = &keys[order[y] * n_keys..order[y] * n_keys + n_keys];
-                if cmp_key_rows(a, b, select.order_by) == core::cmp::Ordering::Greater {
-                    order.swap(y - 1, y);
-                    y -= 1;
-                } else {
-                    break;
-                }
-            }
+        let collations = arena
+            .alloc_slice_with(n_keys, |_| crate::sql::ast::Collation::None)
+            .map_err(|_| arena_full())?;
+        for (collation, o) in collations.iter_mut().zip(select.order_by) {
+            // A positional `ORDER BY 1` sorts by the single output column.
+            let expression = match o.expression {
+                Expr::Int(_) => item,
+                e => e,
+            };
+            *collation = scope.expression_collation(storage, arena, expression)?;
         }
+        crate::mem::arena::try_stable_sort_via(
+            arena,
+            order,
+            |&a, &b| {
+                cmp_key_rows(
+                    storage,
+                    txid,
+                    collations,
+                    &keys[a * n_keys..a * n_keys + n_keys],
+                    &keys[b * n_keys..b * n_keys + n_keys],
+                    select.order_by,
+                )
+            },
+            |_| arena_full(),
+        )?;
     }
 
     // Apply OFFSET/LIMIT over the ordered rows.
@@ -3753,8 +4218,8 @@ fn run_set_subquery<'a>(
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
-    outer: Option<&dyn ColumnLookup<'a>>,
     row_arity: usize,
+    outer: Option<&dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
     let bound_catalog = super::storage_catalog(storage, arena, txid);
@@ -3766,10 +4231,35 @@ fn run_set_subquery<'a>(
         ..crate::sql::eval::NO_HOOKS
     };
 
-    // Each branch reads the levels around the subquery.
     let (rows, target, n_cols) = super::setops::materialize_set_body_tied(
         storage, txid, tree, arena, params, sequences, outer,
     )?;
+    // The trailing ORDER BY sorts the combined rows before LIMIT and OFFSET.
+    let rows = if outer_select.order_by.is_empty() {
+        rows
+    } else {
+        let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
+        super::setops::describe_set_body(
+            storage,
+            tree,
+            txid,
+            &mut columns,
+            arena,
+            None,
+            crate::sql::exec::DescriptionTarget::Sql,
+            outer,
+        )?;
+        let sorted = arena.alloc_slice_copy(rows).map_err(|_| arena_full())?;
+        super::setops::sort_set_rows(
+            storage,
+            txid,
+            arena,
+            sorted,
+            outer_select.order_by,
+            &columns[..n_cols],
+        )?;
+        &*sorted
+    };
     if n_cols != row_arity {
         return Err(sql_err!(
             sqlstate::SYNTAX_ERROR,
@@ -3949,6 +4439,44 @@ pub fn subquery_hooks<'a>(
     subquery_hooks_with_outer(exprs, storage, txid, arena, params, None, sequences)
 }
 
+/// [`subquery_hooks`] for a data change's WHERE: only the subqueries that
+/// read no column of the target row run once; a correlated one runs for each
+/// row through the evaluator's subquery executor.
+pub(crate) fn uncorrelated_subquery_hooks<'a>(
+    exprs: &[Option<&'a Expr<'a>>],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    outer: Option<&dyn ColumnLookup<'a>>,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+    // SAFETY: as in `subquery_hooks_with_outer`; values are detached below.
+    let storage_for_eval: &'a Storage = unsafe { &*(storage as *const Storage) };
+    let mut nodes = ArenaList::new(arena);
+    for expression in exprs.iter().flatten() {
+        collect_subqueries(expression, &mut nodes)?;
+    }
+    let mut uncorrelated = ArenaList::new(arena);
+    for &node in nodes.as_slice() {
+        if !subquery_node_correlated(node, storage_for_eval, txid, arena)? {
+            uncorrelated.push(node).map_err(|_| arena_full())?;
+        }
+    }
+    let borrowed = eval_subquery_nodes(
+        uncorrelated.as_slice(),
+        storage_for_eval,
+        txid,
+        arena,
+        params,
+        SUBQUERY_DEPTH,
+        outer,
+        sequences,
+        SubqueryTiming::WhereReached,
+    )?;
+    detach_subquery_values(borrowed, arena)
+}
+
 pub(crate) fn subquery_hooks_outer<'a>(
     exprs: &[Option<&'a Expr<'a>>],
     storage: &Storage,
@@ -3989,47 +4517,8 @@ pub(crate) fn subquery_hooks_with_outer<'a>(
     detach_subquery_values(borrowed, arena)
 }
 
-/// Evaluates the subqueries of a data-modifying statement's `WHERE` (and
-/// other row-independent expressions) that do not read the written row. A
-/// correlated subquery runs per row through [`ProceduralSubqueries`], as
-/// PostgreSQL runs a correlated `SubPlan` for every candidate row.
-pub(crate) fn uncorrelated_subquery_hooks<'a>(
-    exprs: &[Option<&'a Expr<'a>>],
-    storage: &Storage,
-    txid: u32,
-    arena: &'a Arena,
-    params: &[Datum<'a>],
-    outer: Option<&dyn ColumnLookup<'a>>,
-    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-) -> Result<SubqueryValues<'a, 'a>, SqlError> {
-    // SAFETY: as in `subquery_hooks_with_outer`; every value is detached
-    // before this function returns.
-    let storage_for_eval: &'a Storage = unsafe { &*(storage as *const Storage) };
-    let mut nodes = ArenaList::new(arena);
-    for expression in exprs.iter().flatten() {
-        collect_subqueries(expression, &mut nodes)?;
-    }
-    let mut uncorrelated = ArenaList::new(arena);
-    for &node in nodes.as_slice() {
-        if !subquery_node_correlated(node, storage_for_eval, txid, arena)? {
-            uncorrelated.push(node).map_err(|_| arena_full())?;
-        }
-    }
-    let borrowed = eval_subquery_nodes(
-        uncorrelated.as_slice(),
-        storage_for_eval,
-        txid,
-        arena,
-        params,
-        SUBQUERY_DEPTH,
-        outer,
-        sequences,
-    )?;
-    detach_subquery_values(borrowed, arena)
-}
-
-fn detach_subquery_values<'a>(
-    borrowed: SubqueryValues<'_, '_>,
+pub(super) fn detach_subquery_values<'a>(
+    borrowed: SubqueryValues<'a, '_>,
     arena: &'a Arena,
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
     let scalars = arena
@@ -4063,15 +4552,20 @@ fn detach_subquery_values<'a>(
             probe: list.probe,
             saw_null: list.saw_null,
             witness: detach_subquery_datum(list.witness, arena)?,
+            column_types: &*arena
+                .alloc_slice_copy(list.column_types)
+                .map_err(|_| arena_full())?,
             collations: &*collations,
         };
     }
     Ok(SubqueryValues {
         scalars: &*scalars,
         lists: &*lists,
+        deferred: borrowed.deferred,
     })
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct ProceduralSubqueries<'s> {
     pub storage: &'s Storage,
     pub txid: u32,
@@ -4085,6 +4579,7 @@ impl super::super::eval::SubqueryExecution for ProceduralSubqueries<'_> {
         params: &[Datum<'a>],
         outer: &dyn ColumnLookup<'a>,
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+        retained: bool,
     ) -> Result<super::super::eval::SubqueryResult<'a>, SqlError> {
         // SAFETY: storage remains immutable and live for this call; the
         // result is detached before the borrow can escape.
@@ -4098,6 +4593,11 @@ impl super::super::eval::SubqueryExecution for ProceduralSubqueries<'_> {
             SUBQUERY_DEPTH,
             Some(outer),
             sequences,
+            if retained {
+                SubqueryTiming::Retained
+            } else {
+                SubqueryTiming::Now
+            },
         )?;
         let values = detach_subquery_values(borrowed, arena)?;
         match (values.scalars, values.lists) {

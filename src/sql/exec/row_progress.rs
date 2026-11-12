@@ -9,11 +9,12 @@
 //! the unfinished row. The call therefore sees the earlier rows' changes, as
 //! in PostgreSQL, and every row, trigger and `RETURNING` row happens once.
 //!
-//! A statement made of several steps (the sub-statements of a data-modifying
-//! `WITH` and its main statement; a rule's original statement and actions)
-//! also keeps its finished steps: the next attempt skips them, using their
-//! saved output rows and row counts, and runs the unfinished step at its
-//! row, or from the step's start when no row was unfinished.
+//! A statement made of several steps (a rule's original statement and
+//! actions) also keeps its finished steps: the next attempt skips them, using
+//! their saved output rows and row counts, and runs the unfinished step at its
+//! row, or from the step's start when no row was unfinished. A data-modifying
+//! `WITH` query runs when its rows are first read, as one step whose returned
+//! rows are kept with its changed rows.
 //!
 //! A top-level write also keeps its rows across storage and lock waits: its
 //! transaction holds the progress in a [`RetainedWrite`] while the statement
@@ -186,6 +187,8 @@ pub(crate) struct RowProgress {
     step_levels: usize,
     /// The level a data-modifying `WITH` claimed in this attempt.
     implicit_level: usize,
+    /// Where the statement's output began in its first attempt.
+    output: Option<crate::pg::overflow::OutputMark>,
     /// A multi-step statement of this attempt nested deeper than the step
     /// levels and runs its steps without progress.
     steps_exhausted: bool,
@@ -218,6 +221,7 @@ impl RowProgress {
             started: false,
             unrestartable: false,
             implicit_level: 0,
+            output: None,
             steps_exhausted: false,
             retained: false,
             attempt_effects: 0,
@@ -253,6 +257,15 @@ impl RowProgress {
         let mut progress = Self::new(storage)?;
         progress.retained = true;
         Ok(progress)
+    }
+
+    /// Where the statement's output began: `mark` in the first attempt, and
+    /// that first mark in every later one.
+    pub(crate) fn statement_output(
+        &mut self,
+        mark: crate::pg::overflow::OutputMark,
+    ) -> crate::pg::overflow::OutputMark {
+        *self.output.get_or_insert(mark)
     }
 
     /// Records the journal and lock positions of the attempt about to run;
@@ -956,63 +969,6 @@ impl RowProgress {
             (None, None) => Ok(None),
         }
     }
-}
-
-/// Starts the main statement of a `WITH` whose `steps` sub-statements
-/// modify data, as the step after them.
-pub(crate) fn begin_main_step<'p>(
-    progress: &'p mut RowProgress,
-    steps: usize,
-    txn: &mut TxnState,
-    responder: &Responder<'_>,
-) -> Result<Option<&'p mut RowProgress>, SqlError> {
-    if steps != 0 && !progress.begin_step(steps, false, txn, responder)? {
-        return Err(changed_steps());
-    }
-    Ok(Some(progress))
-}
-
-/// After the main statement of a `WITH`: a stop for a routine call keeps
-/// the sub-statements' output rows for the next attempt.
-pub(crate) fn settle_main_step<'a, T>(
-    progress: Option<&mut RowProgress>,
-    outcome: Result<Result<(), SqlError>, T>,
-    materialized: &[(&str, &'a crate::sql::ast::MaterializedCte<'a>)],
-    arena: &'a Arena,
-    pool: &std::sync::Arc<LeasePool>,
-) -> Result<Result<(), SqlError>, T> {
-    if let Ok(Err(error)) = &outcome
-        && !materialized.is_empty()
-        && let Some(progress) = progress
-        && progress.stops_for(error)
-    {
-        let kept = cte_step_records(materialized, arena)
-            .and_then(|records| progress.keep_steps(records, &[], arena, pool));
-        if let Err(error) = kept {
-            return Ok(Err(error));
-        }
-    }
-    outcome
-}
-
-/// The finished data-modifying `WITH` sub-statements, as steps.
-pub(crate) fn cte_step_records<'a>(
-    materialized: &[(&str, &'a crate::sql::ast::MaterializedCte<'a>)],
-    arena: &'a Arena,
-) -> Result<&'a [StepRecord<'a>], SqlError> {
-    let records = arena
-        .alloc_slice_with(materialized.len(), |_| StepRecord {
-            rows: &[],
-            affected: 0,
-        })
-        .map_err(|_| crate::sql::query::arena_full_pub())?;
-    for (record, (_, cte)) in records.iter_mut().zip(materialized) {
-        let crate::sql::ast::MaterializedCteSource::Inline(rows) = cte.source else {
-            return Err(changed_steps());
-        };
-        record.rows = rows;
-    }
-    Ok(records)
 }
 
 fn step_records_full(error: crate::mem::lease_pool::LeaseError) -> SqlError {

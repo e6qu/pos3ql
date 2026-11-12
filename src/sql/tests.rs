@@ -7,36 +7,63 @@
 use super::*;
 use crate::mem::mutex::Mutex;
 
+mod aggregate_levels;
 mod array_element_comparisons;
+mod assignment_and_name_diagnostics;
+mod bound_definition_renames;
 mod builtin_aggregate_resolution;
 mod builtin_argument_binding;
+mod builtin_routine_changes;
+mod builtin_routine_comments;
 mod canonical_sequences;
+mod cast_and_operator_class_descriptions;
 mod catalog_identity_lookup;
+mod catalog_join_probes;
 mod client_catalog;
 mod compatibility_diagnostics;
+mod composite_parameter_fields;
 mod constraint_index_identity;
 mod cursor_execution;
+mod deparsed_expressions;
+mod dependency_rows;
+mod drop_dependency_reports;
 mod error_report_fields;
+mod evaluation_timing;
 mod foreign_key_lookups;
 mod foreign_parent_admission;
 mod function_progress;
 mod geometric_casts;
 mod geometry_assignments;
+mod index_expression_mutability;
 mod index_parent_ownership;
+mod indirect_execute_privileges;
+mod information_schema_domains;
+mod initplans;
+mod joined_dml_returning;
 mod key_preparation;
 mod nested_planner_inputs;
 pub(super) mod object_reads;
 mod oid_alias_comparisons;
 mod owner_role_inheritance;
+mod partition_ancestry;
+mod partition_index_propagation;
+mod plpgsql_data_modifying_with;
+mod plpgsql_row_variables;
 mod polymorphic_resolution;
+mod predefined_roles;
 mod prepared_object_capacity;
 mod prepared_parameter_types;
 mod procedural_expression_calls;
 mod procedural_progress;
 mod procedural_subtransactions;
 mod procedure_progress;
+mod pseudo_type_identities;
 mod query_execution;
+mod query_scope_chain;
+mod record_comparisons;
+mod relation_row_types;
 mod result_streams;
+mod rewritten_expression_recovery;
 mod routine_calls;
 mod routine_identity_diagnostics;
 mod routine_selection;
@@ -46,14 +73,19 @@ mod row_lock_conflicts;
 mod runtime_input_validity;
 mod runtime_plan_invalidation;
 mod sequence_inheritance;
+mod shared_dependencies;
+mod shared_dependency_databases;
 mod shared_row_capacity;
 mod shared_row_work;
 mod shared_statistics;
+mod special_datetime_inputs;
 mod sql_function_results;
 mod stored_relation_sources;
 mod table_metadata_capacity;
 mod table_publication;
 mod transaction_publication;
+mod type_catalog_rows;
+mod type_dependent_routines;
 mod type_input_binding;
 mod type_input_positions;
 mod virtual_search_path;
@@ -534,11 +566,11 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
                     &mut editor.transaction,
                     &editor.guc,
                     crate::sql::txn::CommitTarget::Ordinary,
-                    Some(CursorCommitContext {
+                    CursorCommitContext {
                         cursors: &mut editor.cursors,
-                        plans: &mut editor.pool,
+                        plans: Some(&mut editor.pool),
                         arena: &editor.arena,
-                    }),
+                    },
                     &editor.arena,
                     &mut Responder::new(&mut editor.send),
                 )
@@ -1505,6 +1537,122 @@ fn constraint_public_identifiers_survive_journal_and_checkpoint_recovery() {
             std::fs::remove_dir_all(&config.data_dir).unwrap();
             crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         }
+    }
+}
+
+#[test]
+fn undetermined_prepare_parameters_fail_like_postgresql() {
+    let config = test_config("undetermined-prepare-parameters");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    // A parameter that first reaches an argument of pseudo-type "any" or an
+    // IS NULL test while untyped stays undetermined (PostgreSQL 18.6).
+    for (sql, parameter) in [
+        ("PREPARE a1 AS SELECT pg_typeof($1)", 1),
+        ("PREPARE a4 AS SELECT count($1)", 1),
+        ("PREPARE a7 AS SELECT format('%s', $1)", 1),
+        ("PREPARE a8 AS SELECT num_nulls($1)", 1),
+        ("PREPARE a9 AS SELECT $1 IS NULL", 1),
+        ("PREPARE a10 AS SELECT pg_typeof($1), $1 + 1", 1),
+        ("PREPARE a11 AS SELECT $2 IS NULL, $1::int", 2),
+    ] {
+        let output = session.execute(&mut engine, sql, false);
+        assert_eq!(error_sqlstates(&output), ["42P18"], "{sql}");
+        assert!(
+            String::from_utf8_lossy(&output).contains(&format!(
+                "could not determine data type of parameter ${parameter}"
+            )),
+            "{sql}"
+        );
+    }
+    session.success(
+        &mut engine,
+        "PREPARE a2 AS SELECT $1; PREPARE a3 AS SELECT $1 || 'x'; \
+         PREPARE a5 AS SELECT coalesce($1, $2); PREPARE a12 AS SELECT pg_typeof($1::int)",
+        false,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT name, parameter_types::text FROM pg_prepared_statements ORDER BY name",
+            false,
+        )),
+        ["a12|{integer}", "a2|{text}", "a3|{text}", "a5|{text,text}"]
+    );
+}
+
+#[test]
+fn attribute_default_oids_follow_default_lifetimes_through_journal_and_checkpoint_recovery() {
+    // PostgreSQL stores a new pg_attrdef row (and OID) whenever a default or
+    // generation expression is set; renames and unrelated changes keep it.
+    const SETUP: &str = "CREATE TABLE ad_t(a int DEFAULT 1, b int GENERATED ALWAYS AS (a * 2) STORED, c text DEFAULT 'x');
+         CREATE TABLE ad_src(a int);
+         CREATE VIEW ad_v AS SELECT a FROM ad_src;
+         ALTER VIEW ad_v ALTER a SET DEFAULT 5;
+         CREATE TABLE ad_saved(identity oid, relid oid, num int2);
+         INSERT INTO ad_saved SELECT oid, adrelid, adnum FROM pg_attrdef;
+         SELECT count(DISTINCT identity) = 4 FROM ad_saved;
+         SELECT count(*) = 0 FROM ad_saved s WHERE s.identity IN (SELECT oid FROM pg_constraint UNION ALL SELECT oid FROM pg_trigger UNION ALL SELECT oid FROM pg_class);
+         SELECT pg_describe_object(2604, identity, 0) = 'default value for column a of view ad_v' FROM ad_saved WHERE relid = 'ad_v'::regclass;
+         SELECT pg_describe_object(2604, identity, 0) = 'default value for column b of table ad_t' FROM ad_saved WHERE relid = 'ad_t'::regclass AND num = 2;
+         ALTER TABLE ad_t RENAME COLUMN c TO cc;
+         ALTER TABLE ad_t ALTER cc SET DEFAULT 'y';
+         ALTER TABLE ad_t ALTER b SET EXPRESSION AS (a * 3);
+         SELECT count(*) = 2 FROM ad_saved s JOIN pg_attrdef d ON d.oid = s.identity AND d.adrelid = s.relid AND d.adnum = s.num;
+         SELECT count(*) = 2 FROM pg_attrdef d WHERE d.adrelid = 'ad_t'::regclass AND d.oid NOT IN (SELECT identity FROM ad_saved)";
+    const QUERIES: &str = "SELECT count(*) = 2 FROM ad_saved s JOIN pg_attrdef d ON d.oid = s.identity AND d.adrelid = s.relid AND d.adnum = s.num;
+         SELECT count(DISTINCT oid) = 4 FROM pg_attrdef";
+    const AFTER: &str = "ALTER VIEW ad_v ALTER a SET DEFAULT 6;
+         ALTER TABLE ad_t ALTER a TYPE bigint;
+         SELECT count(*) = 0 FROM ad_saved s JOIN pg_attrdef d ON d.oid = s.identity;
+         SELECT count(DISTINCT oid) = 4 FROM pg_attrdef";
+    for checkpoint in [false, true] {
+        let name = format!("attribute-default-oids-{checkpoint}");
+        let mut config = test_config(&name);
+        config.max_ddl_per_transaction = 32;
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.object_store_bucket = format!("{name}-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let run = |engine: &mut Engine,
+                   session: &mut ConfiguredTransactionSession,
+                   statements: &str,
+                   expected: usize| {
+            let mut observations = 0;
+            for statement in statements
+                .split(';')
+                .map(str::trim)
+                .filter(|statement| !statement.is_empty())
+            {
+                let rows = data_rows(&session.success(engine, statement, false));
+                assert!(rows.iter().all(|row| row == "t"), "{statement}: {rows:?}");
+                observations += rows.len();
+            }
+            assert_eq!(observations, expected);
+        };
+        {
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            run(&mut engine, &mut session, SETUP, 6);
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
+            engine.commit_wal().unwrap();
+        }
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        {
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            run(&mut engine, &mut session, QUERIES, 2);
+            run(&mut engine, &mut session, AFTER, 2);
+        }
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
 }
 
@@ -4717,7 +4865,7 @@ fn metadata_sequence_comment_reuse_keeps_replacement() {
         let output = session.success(
             &mut engine,
             include_str!(
-                "../../tests/external/differential_exact/06_metadata_comment_lifetimes.sql"
+                "../../tests/external/differential_exact/104_metadata_comment_lifetimes.sql"
             ),
             true,
         );
@@ -7311,23 +7459,18 @@ fn catalog_constraint_identity_ranges_reject_overflow_and_keep_triggers_disjoint
                 < first.oid() as u64
         );
         for trigger in ForeignKeyTrigger::ALL {
-            assert!(last.oid() < first.foreign_key_trigger_oid(trigger));
+            for identity in [first, last] {
+                assert_eq!(
+                    crate::storage::OidBand::of(identity.foreign_key_trigger_oid(trigger)),
+                    Some(crate::storage::OidBand::ForeignKeyTrigger)
+                );
+                assert_eq!(
+                    crate::storage::OidBand::of(identity.attribute_default_oid()),
+                    Some(crate::storage::OidBand::AttributeDefault)
+                );
+            }
             assert!(first.foreign_key_trigger_oid(trigger) < last.foreign_key_trigger_oid(trigger));
-            assert!(
-                last.foreign_key_trigger_oid(trigger) < crate::storage::FIRST_PARTITION_TRIGGER_OID
-            );
-            assert!(
-                crate::storage::TRIGGER_OID_BASE as u64
-                    + crate::storage::MAX_TRIGGER_OID_GENERATION
-                    < first.foreign_key_trigger_oid(trigger) as u64
-            );
         }
-        assert!(
-            crate::storage::FIRST_PARTITION_TRIGGER_OID as u64
-                + crate::storage::MAX_CATALOG_CREATION
-                + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET as u64
-                <= i32::MAX as u64
-        );
     });
 }
 
@@ -7949,13 +8092,7 @@ fn postgresql_18_refcursor_type_catalog_and_native_plpgsql_cursors() {
          BEGIN; SELECT returned_cursor_probe(); \
          SELECT name, statement, is_holdable, is_binary, is_scrollable \
            FROM pg_cursors WHERE name = 'returned'; \
-         FETCH NEXT FROM returned; CLOSE returned; COMMIT; \
-         BEGIN; \
-         DECLARE visible SCROLL CURSOR FOR SELECT 1; \
-         SELECT name, statement, is_holdable, is_binary, is_scrollable, creation_time IS NOT NULL \
-           FROM pg_cursors; \
-         SELECT count(*) FROM pg_cursor(); \
-         CLOSE visible; COMMIT",
+         FETCH NEXT FROM returned; CLOSE returned; COMMIT",
     );
     assert_eq!(
         data_rows(&output),
@@ -7971,11 +8108,21 @@ fn postgresql_18_refcursor_type_catalog_and_native_plpgsql_cursors() {
             "returned",
             "returned|SELECT 11::integer AS value|f|f|f",
             "11",
-            "visible|DECLARE visible SCROLL CURSOR FOR SELECT 1|f|f|t|t",
-            "1",
         ],
         "{}",
         String::from_utf8_lossy(&output),
+    );
+    // A declared cursor shows the client's whole query string.
+    const DECLARED: &str = "BEGIN; DECLARE visible SCROLL CURSOR FOR SELECT 1; \
+         SELECT name, statement, is_holdable, is_binary, is_scrollable, creation_time IS NOT NULL \
+           FROM pg_cursors; \
+         SELECT count(*) FROM pg_cursor(); CLOSE visible; COMMIT";
+    let declared = run_with(&mut engine, &mut budget, DECLARED);
+    assert_eq!(
+        data_rows(&declared),
+        [format!("visible|{DECLARED}|f|f|t|t"), "1".to_string()],
+        "{}",
+        String::from_utf8_lossy(&declared),
     );
     assert_eq!(copy_data_rows(&output), ["saved\t{left,right}"]);
     for query in [
@@ -15992,7 +16139,8 @@ fn cast_operator_dependencies_enforce_restrict_and_transactional_cascade() {
         &mut budget,
         "DROP OPERATOR public.%%(integer, integer)",
     );
-    assert!(String::from_utf8_lossy(&restricted).contains("2BP01"));
+    let restricted = String::from_utf8_lossy(&restricted);
+    assert!(restricted.contains("2BP01"), "{restricted}");
     let dropped = run_with(
         &mut engine,
         &mut budget,
@@ -16473,7 +16621,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         "DROP TABLE moved_extensions.typed_values CASCADE",
     );
     assert!(
-        String::from_utf8_lossy(&rejected).contains("extension \"typed_ext\" requires it"),
+        String::from_utf8_lossy(&rejected).contains("because extension typed_ext requires it"),
         "{}",
         String::from_utf8_lossy(&rejected)
     );
@@ -16515,7 +16663,8 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
             &mut replay_budget,
             "SELECT count(*) FROM pg_extension; \
              SELECT count(*) FROM pg_class WHERE relname='typed_values'; \
-             SELECT count(*) FROM pg_depend WHERE deptype IN ('e','x','n')",
+             SELECT count(*) FROM pg_depend \
+             WHERE classid = 'pg_extension'::regclass OR refclassid = 'pg_extension'::regclass",
         )),
         ["0", "0", "0"]
     );
@@ -16690,7 +16839,7 @@ fn extension_lifecycle_rejects_invalid_states_and_obeys_dependency_classes() {
     );
     let member_drop = run_with(&mut engine, &mut budget, "DROP TABLE member_table");
     assert!(
-        String::from_utf8_lossy(&member_drop).contains("extension \"empty_ext\" requires it"),
+        String::from_utf8_lossy(&member_drop).contains("because extension empty_ext requires it"),
         "{}",
         String::from_utf8_lossy(&member_drop)
     );
@@ -16800,7 +16949,7 @@ fn extension_lifecycle_rejects_invalid_states_and_obeys_dependency_classes() {
     ] {
         let rejected = run_with(&mut engine, &mut budget, command);
         assert!(
-            String::from_utf8_lossy(&rejected).contains("extension \"empty_ext\" requires it"),
+            String::from_utf8_lossy(&rejected).contains("because extension empty_ext requires it"),
             "{command}: {}",
             String::from_utf8_lossy(&rejected)
         );
@@ -18198,7 +18347,14 @@ fn copy_line(
     engine.copy_row_line(
         setup,
         line,
-        super::CopyRowContext::new(txn, guc, arena, &mut responder, inserted),
+        super::CopyRowContext::new(
+            txn,
+            guc,
+            &mut super::cursor::CursorPool::for_tests(),
+            arena,
+            &mut responder,
+            inserted,
+        ),
     )
 }
 
@@ -18221,7 +18377,14 @@ fn copy_binary_row(
     engine.copy_row_binary(
         setup,
         row,
-        super::CopyRowContext::new(txn, guc, arena, &mut responder, inserted),
+        super::CopyRowContext::new(
+            txn,
+            guc,
+            &mut super::cursor::CursorPool::for_tests(),
+            arena,
+            &mut responder,
+            inserted,
+        ),
     )
 }
 
@@ -18234,11 +18397,16 @@ fn finish_copy(
     inserted: &mut crate::sql::exec::CopyTransitionRows,
 ) -> Result<(), SqlError> {
     let mut send = crate::mem::FixedBuf::new(budget, "copy finish response", 1 << 16).unwrap();
+    let arena = Arena::new(budget, "copy finish arena", 1 << 12).unwrap();
     let result = engine.copy_finish(
         setup,
         txn,
         guc,
-        None,
+        CursorCommitContext {
+            cursors: &mut super::cursor::CursorPool::for_tests(),
+            plans: None,
+            arena: &arena,
+        },
         &mut Responder::new(&mut send),
         inserted,
         CopyFinishMode::ImplicitTransaction,
@@ -19878,7 +20046,7 @@ fn configured_role_authorization_capacity_survives_object_cold_recovery() {
          GRANT SELECT ON scaled_role_data TO scaled_role_001; \
          SELECT count(*) FROM pg_roles WHERE rolname LIKE 'scaled_role_%'; \
          SELECT count(*) FROM pg_group WHERE groname LIKE 'scaled_role_%'; \
-         SELECT count(*) FROM pg_auth_members; \
+         SELECT count(*) FROM pg_auth_members WHERE roleid >= 16384; \
          SELECT count(*) FROM pg_db_role_setting WHERE setrole <> 0; \
          SELECT count(*) FROM information_schema.enabled_roles \
           WHERE role_name LIKE 'scaled_role_%'; \
@@ -19944,7 +20112,7 @@ fn configured_role_authorization_capacity_survives_object_cold_recovery() {
         &mut recovered,
         &mut recovered_budget,
         "SELECT count(*) FROM pg_roles WHERE rolname LIKE 'scaled_role_%'; \
-         SELECT count(*) FROM pg_auth_members; \
+         SELECT count(*) FROM pg_auth_members WHERE roleid >= 16384; \
          SELECT count(*) FROM pg_db_role_setting WHERE setrole <> 0; \
          SELECT has_table_privilege('scaled_role_095', 'scaled_role_data', 'SELECT'); \
          SET SESSION AUTHORIZATION scaled_role_095; \
@@ -20417,7 +20585,8 @@ fn role_catalog_replays_from_wal() {
          SELECT parent.rolname, child.rolname, membership.admin_option
            FROM pg_auth_members membership
            JOIN pg_roles parent ON parent.oid = membership.roleid
-           JOIN pg_roles child ON child.oid = membership.member;
+           JOIN pg_roles child ON child.oid = membership.member
+          WHERE membership.roleid >= 16384;
          SELECT parent.rolname, child.rolname, membership.admin_option,
                 membership.inherit_option, membership.set_option, grantor.rolname
            FROM pg_auth_members membership
@@ -22606,6 +22775,94 @@ fn view_output_columns_are_typed_catalog_identity_and_durable() {
 }
 
 #[test]
+fn view_column_types_are_recorded_at_creation_and_recovered() {
+    let mut config = test_config("view-column-types");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("view-column-types-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let attributes = "SELECT attname || ':' || format_type(atttypid, atttypmod) || ':' ||
+           attcollation::regcollation::text
+         FROM pg_attribute WHERE attrelid = 'typed_view'::regclass AND attnum > 0
+         ORDER BY attnum;
+         SELECT * FROM typed_view;";
+    let expected = [
+        "total:integer:-",
+        "label:character varying(3):\"default\"",
+        "sorted:text:\"C\"",
+        "kind:typed_mood:-",
+        "6|ab|q|ok",
+    ];
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        &format!(
+            "CREATE FUNCTION typed_add(int, int) RETURNS int LANGUAGE sql AS 'SELECT coalesce($1, 0) + $2';
+             CREATE AGGREGATE typed_sum(int) (SFUNC = typed_add, STYPE = int);
+             CREATE TYPE typed_mood AS ENUM ('sad', 'ok');
+             CREATE TABLE typed_source (label varchar(3), note text, kind typed_mood);
+             INSERT INTO typed_source VALUES ('ab', 'q', 'ok');
+             CREATE VIEW typed_view AS
+               SELECT (SELECT typed_sum(x) FROM generate_series(1, 3) x) AS total,
+                      label, note COLLATE \"C\" AS sorted, kind
+                 FROM typed_source;
+             {attributes}"
+        ),
+    );
+    assert_eq!(
+        data_rows(&created),
+        expected,
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    drop(engine);
+
+    // The journal alone restores the recorded types.
+    let mut replay_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    let replayed_rows = run_with(&mut replayed, &mut replay_budget, attributes);
+    assert_eq!(
+        data_rows(&replayed_rows),
+        expected,
+        "{}",
+        String::from_utf8_lossy(&replayed_rows)
+    );
+    let refused = run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "CREATE OR REPLACE VIEW typed_view AS
+           SELECT 1 AS total, label::varchar(4) AS label, note COLLATE \"C\" AS sorted, kind
+             FROM typed_source;",
+    );
+    assert!(
+        String::from_utf8_lossy(&refused).contains(
+            "cannot change data type of view column \"label\" from character varying(3) to character varying(4)"
+        ),
+        "{}",
+        String::from_utf8_lossy(&refused)
+    );
+    assert!(replayed.checkpoint().unwrap());
+    drop(replayed);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    // The checkpoint manifest restores them after the local disk is lost.
+    let mut recovered_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let recovered_rows = run_with(&mut recovered, &mut recovered_budget, attributes);
+    assert_eq!(
+        data_rows(&recovered_rows),
+        expected,
+        "{}",
+        String::from_utf8_lossy(&recovered_rows)
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn view_defaults_are_typed_catalog_state_and_survive_object_recovery() {
     let mut config = test_config("view-defaults");
     config.object_store_on = true;
@@ -23857,15 +24114,16 @@ fn role_membership_controls_set_role_and_catalog_rows() {
                 membership.inherit_option, membership.set_option
            FROM pg_auth_members membership
            JOIN pg_roles parent ON parent.oid = membership.roleid
-           JOIN pg_roles child ON child.oid = membership.member;
+           JOIN pg_roles child ON child.oid = membership.member
+          WHERE membership.roleid >= 16384;
          SET ROLE child;
          SET ROLE parent;
          SELECT current_user, session_user;
          RESET ROLE;
          REVOKE ADMIN OPTION FOR parent FROM child;
-         SELECT admin_option, inherit_option, set_option FROM pg_auth_members;
+         SELECT admin_option, inherit_option, set_option FROM pg_auth_members WHERE roleid >= 16384;
          REVOKE parent FROM child;
-         SELECT count(*) FROM pg_auth_members;",
+         SELECT count(*) FROM pg_auth_members WHERE roleid >= 16384;",
     );
     assert_eq!(
         data_rows(&output),
@@ -24607,7 +24865,7 @@ fn dropping_a_role_removes_memberships_transactionally() {
             &mut engine,
             &mut budget,
             "DROP ROLE dropped_member; DROP ROLE dropped_parent; \
-             SELECT count(*) FROM pg_auth_members; \
+             SELECT count(*) FROM pg_auth_members WHERE roleid >= 16384; \
              SELECT count(*) FROM pg_roles \
               WHERE rolname IN ('dropped_parent', 'dropped_member')",
         )),
@@ -24638,7 +24896,7 @@ fn dropped_role_memberships_do_not_reappear_after_wal_replay() {
         data_rows(&run_with(
             &mut restarted,
             &mut restarted_budget,
-            "SELECT count(*) FROM pg_auth_members; \
+            "SELECT count(*) FROM pg_auth_members WHERE roleid >= 16384; \
              SELECT count(*) FROM pg_roles \
              WHERE rolname IN ('replay_parent', 'replay_member'); \
              SELECT shobj_description(oid, 'pg_authid') FROM pg_roles \
@@ -24662,6 +24920,7 @@ fn create_role_membership_clauses_match_grant_role_state() {
            FROM pg_auth_members membership
            JOIN pg_roles parent ON parent.oid = membership.roleid
            JOIN pg_roles child ON child.oid = membership.member
+          WHERE membership.roleid >= 16384
           ORDER BY parent.rolname, child.rolname;",
     );
     assert_eq!(
@@ -28371,6 +28630,20 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
         )
         .unwrap();
     assert_eq!(inferred[..2], [domain_oid, enum_oid]);
+    // Parameters inside a data-modifying statement's own expressions take
+    // the type their target-scope operands give them, through an alias too.
+    let inferred = engine
+        .infer_param_types(
+            "UPDATE protocol_types AS t SET count = t.count + $1 \
+             WHERE t.count + $2 > 0 RETURNING t.count * $3",
+            &arena,
+            &transaction,
+            3,
+            &[],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(inferred[..3], [crate::sql::types::oid::INT4; 3]);
     let inferred = engine
         .infer_param_types(
             "SELECT p.state, count(*) FROM protocol_types p \
@@ -32202,7 +32475,9 @@ fn owned_copy_to_sources_preserve_saved_leaf_rows_pending_changes_and_cold_recov
             "COPY export_low TO STDOUT (FORMAT csv, HEADER true); COPY export_other TO STDOUT (FORMAT csv)",
             true
         )),
-        ["id,note", "3,moved", "30,\"far, saved\"", "31,added"]
+        // COPY reads a table in the order SELECT scans it: pending rows,
+        // then saved ones.
+        ["id,note", "3,moved", "31,added", "30,\"far, saved\""]
     );
     assert_eq!(
         copy_data_rows(&session.success(
@@ -32210,7 +32485,7 @@ fn owned_copy_to_sources_preserve_saved_leaf_rows_pending_changes_and_cold_recov
             "COPY export_low (note, id) TO STDOUT; COPY export_other (note, id) TO STDOUT",
             true
         )),
-        ["moved\t3", "far, saved\t30", "added\t31"]
+        ["moved\t3", "added\t31", "far, saved\t30"]
     );
     let binary = session.success(
         &mut engine,
@@ -38338,10 +38613,11 @@ fn collatable_builtin_types_expose_the_default_collation() {
             "SELECT typname, typcollation FROM pg_type \
              WHERE typname IN ('text', 'varchar', 'bpchar', 'name', 'int4') ORDER BY typname",
         )),
+        // PostgreSQL 18 gives `name` the "C" collation (950).
         [
             "bpchar|100",
             "int4|0",
-            "name|100",
+            "name|950",
             "text|100",
             "varchar|100"
         ],
@@ -42819,7 +43095,16 @@ fn configured_dependency_plans_cross_old_catalog_ceiling_and_recover_cold() {
     let depth_restricted = String::from_utf8_lossy(&depth_restricted);
     assert!(depth_restricted.contains("2BP01"), "{depth_restricted}");
     assert!(!depth_restricted.contains("54000"), "{depth_restricted}");
-    assert!(depth_restricted.contains("dp_d_128"), "{depth_restricted}");
+    // PostgreSQL lists the first 100 dependents and counts the rest.
+    assert!(
+        depth_restricted.contains("function dp_d_99() depends on function dp_d_98()"),
+        "{depth_restricted}"
+    );
+    assert!(
+        depth_restricted.contains("and 29 other objects (see server log for list)"),
+        "{depth_restricted}"
+    );
+    assert!(!depth_restricted.contains("dp_d_100"), "{depth_restricted}");
     let depth_cascade = run_with_ddl_capacity(
         &mut engine,
         &mut budget,
@@ -42893,9 +43178,15 @@ fn configured_dependency_plans_cross_old_catalog_ceiling_and_recover_cold() {
     let restricted = String::from_utf8_lossy(&restricted);
     assert!(restricted.contains("2BP01"), "{restricted}");
     assert!(!restricted.contains("54000"), "{restricted}");
-    assert!(restricted.contains("dp_v_128"), "{restricted}");
-    assert!(restricted.contains("dp_dep"), "{restricted}");
-    assert!(restricted.contains("dp_rule"), "{restricted}");
+    // PostgreSQL lists the first 100 of the 131 dependents and counts the rest.
+    assert!(
+        restricted.contains("view dp_v_99 depends on table dp_root"),
+        "{restricted}"
+    );
+    assert!(
+        restricted.contains("and 31 other objects (see server log for list)"),
+        "{restricted}"
+    );
 
     let rolled_back = run_with_fixed_memory_and_ddl_capacity(
         &mut engine,
@@ -46360,7 +46651,9 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
         String::from_utf8_lossy(&branches)
     );
 
-    let unsupported = run_with(
+    // An AFTER trigger's NEW is a record local to the invocation, as in
+    // PostgreSQL: assigning it does not change the stored row.
+    run_with(
         &mut engine,
         &mut budget,
         "CREATE FUNCTION after_mutation() RETURNS trigger LANGUAGE plpgsql AS
@@ -46369,18 +46662,14 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
            FOR EACH ROW EXECUTE FUNCTION after_mutation();
          INSERT INTO trigger_body_target (id, value) VALUES (2, 3);",
     );
-    assert!(
-        String::from_utf8_lossy(&unsupported).contains("0A000"),
-        "{}",
-        String::from_utf8_lossy(&unsupported)
-    );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT count(*) FROM trigger_body_target WHERE id = 2"
+            "SELECT value FROM trigger_body_target WHERE id = 2"
         )),
-        ["0"]
+        // The BEFORE trigger's increment, not the AFTER trigger's assignment.
+        ["4"]
     );
 
     // As in PostgreSQL, RETURNING without INTO is accepted when the function
@@ -50679,7 +50968,7 @@ fn generated_expression_evolution_rewrites_rows_and_survives_cold_recovery() {
             "ALTER TABLE generated_expression_evolution \
              ALTER COLUMN b DROP EXPRESSION IF EXISTS"
         ))
-        .contains("not a stored generated column, skipping")
+        .contains("not a generated column, skipping")
     );
     cold.commit_wal().unwrap();
     assert!(cold.checkpoint().unwrap());
@@ -51565,14 +51854,22 @@ fn merge_assignment_states_and_inheritance_selection_are_typed() {
         ["1|10"]
     );
 
-    for invalid in [
-        "MERGE INTO merge_assignment_target AS target USING merge_assignment_source AS source \
-           ON target.id = source.id WHEN MATCHED THEN UPDATE SET value = 1, value = 2",
-        "MERGE INTO merge_assignment_target AS target USING merge_assignment_source AS source \
-           ON target.id = source.id WHEN NOT MATCHED THEN INSERT (id, id) VALUES (1, 2)",
+    // PostgreSQL's rewriter and checkInsertTargets report these.
+    for (invalid, sqlstate) in [
+        (
+            "MERGE INTO merge_assignment_target AS target USING merge_assignment_source AS source \
+               ON target.id = source.id WHEN MATCHED THEN UPDATE SET value = 1, value = 2",
+            "42601",
+        ),
+        (
+            "MERGE INTO merge_assignment_target AS target USING merge_assignment_source AS source \
+               ON target.id = source.id WHEN NOT MATCHED THEN INSERT (id, id) VALUES (1, 2)",
+            "42701",
+        ),
     ] {
         assert!(
-            String::from_utf8_lossy(&run_with(&mut engine, &mut budget, invalid)).contains("42601"),
+            String::from_utf8_lossy(&run_with(&mut engine, &mut budget, invalid))
+                .contains(sqlstate),
             "{invalid}"
         );
     }
@@ -54488,8 +54785,8 @@ fn hash_join_matches_nested_loop() {
     assert_eq!(r, ["d"], "LEFT JOIN + WHERE mc2.w IS NULL: {r:?}");
 
     // reltuples is deliberately a planner estimate. A stale underestimate
-    // must exhaust the selected fixed-capacity hash table loudly rather than
-    // changing execution plans at runtime.
+    // sizes the selected hash table, which grows to hold the actual build
+    // rows without changing the plan; PostgreSQL 18.6 returns every match.
     run_with(&mut e, &mut b, "CREATE TABLE stale_build (k int, v text)");
     run_with(&mut e, &mut b, "CREATE TABLE stale_probe (k int, v text)");
     run_with(&mut e, &mut b, "INSERT INTO stale_build VALUES (1, 'one')");
@@ -54504,16 +54801,12 @@ fn hash_join_matches_nested_loop() {
         &mut b,
         "INSERT INTO stale_probe VALUES (1, 'a'), (2, 'b'), (3, 'c')",
     );
-    let result = run_with(
+    let result = data_rows(&run_with(
         &mut e,
         &mut b,
         "SELECT p.v, b.v FROM stale_probe p JOIN stale_build b ON p.k = b.k ORDER BY 1",
-    );
-    assert!(
-        String::from_utf8_lossy(&result).contains("54000"),
-        "stale reltuples must fail loudly: {}",
-        String::from_utf8_lossy(&result)
-    );
+    ));
+    assert_eq!(result, ["a|one", "b|two", "c|three"]);
 }
 
 #[test]
@@ -55309,7 +55602,8 @@ fn comment_roundtrip_and_removal() {
         &mut e,
         &mut b,
         "SELECT description FROM pg_description \
-         WHERE description LIKE 'the %' OR description IN ('col a', 'view col') \
+         WHERE description LIKE 'the %' AND description NOT LIKE 'the average %' \
+           AND description NOT LIKE 'the smallest %' OR description IN ('col a', 'view col') \
          ORDER BY description",
     );
     assert_eq!(
@@ -58071,8 +58365,10 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
         "DROP TYPE durable_types.coordinate_renamed",
     );
     assert!(
-        String::from_utf8_lossy(&bytes)
-            .contains("column point of composite type place depends on type coordinate_renamed"),
+        String::from_utf8_lossy(&bytes).contains(
+            "column point of composite type place depends on type \
+                 durable_types.coordinate_renamed"
+        ),
         "{}",
         String::from_utf8_lossy(&bytes)
     );
@@ -60764,6 +61060,18 @@ fn enums_order_and_enforce() {
     );
     // DROP RESTRICT fails while a column depends on the enum.
     assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "DROP TYPE mood")).contains("2BP01"));
+    // A column default's cast names the type and its labels as text, so
+    // label and type renames are refused until that table is gone.
+    for refused in [
+        "ALTER TYPE mood RENAME VALUE 'sad' TO 'blue'",
+        "ALTER TYPE mood RENAME TO feeling",
+    ] {
+        assert!(
+            String::from_utf8_lossy(&run_with(&mut e, &mut b, refused)).contains("0A000"),
+            "{refused}"
+        );
+    }
+    run_with(&mut e, &mut b, "DROP TABLE enum_defaults");
     // Renames rewrite inline scalar/array labels while preserving sort order,
     // then move the type identity (including its generated array type).
     run_with(
@@ -62533,21 +62841,15 @@ fn lateral_joins() {
         data_rows(&bytes),
         ["1|1|10", "1|2|20", "2|1|10", "2|2|20", "2|3|30"]
     );
-    // The right side of a RIGHT JOIN cannot read the left items; a body
-    // that reads none runs once.
-    let bytes = run_with(
-        &mut e,
-        &mut b,
-        "SELECT t.id, s.one FROM lt t RIGHT JOIN LATERAL (SELECT 1 AS one) s ON true ORDER BY 1",
-    );
-    assert_eq!(data_rows(&bytes), ["1|1", "2|1", "3|1"]);
-    assert!(
-        String::from_utf8_lossy(&run_with(
+    // A LATERAL item on the right of a RIGHT join that reads nothing of
+    // the join's left side runs once for the join, as in PostgreSQL.
+    assert_eq!(
+        data_rows(&run_with(
             &mut e,
             &mut b,
-            "SELECT * FROM lt t RIGHT JOIN LATERAL (SELECT t.id) s ON true"
-        ))
-        .contains("42P10")
+            "SELECT t.id, s.k FROM lt t RIGHT JOIN LATERAL (SELECT 1 AS k) s ON true ORDER BY 1"
+        )),
+        ["1|1", "2|1", "3|1"]
     );
 }
 
@@ -70690,7 +70992,7 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
             "SELECT indexdef FROM pg_indexes WHERE tablename = 'copied_cover'",
         )),
         [
-            "CREATE UNIQUE INDEX copied_cover_key_idx ON public.copied_cover USING btree (key) INCLUDE (payload, note)"
+            "CREATE UNIQUE INDEX copied_cover_key_payload_note_idx ON public.copied_cover USING btree (key) INCLUDE (payload, note)"
         ]
     );
     run_with(
@@ -75046,7 +75348,7 @@ fn typed_table_membership_controls_composite_attribute_and_drop_lifecycle() {
         "ALTER TABLE typed_lifecycle_rows ADD COLUMN forbidden integer",
     );
     assert!(
-        String::from_utf8_lossy(&output).contains("0A000"),
+        String::from_utf8_lossy(&output).contains("cannot add column to typed table"),
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -76227,10 +76529,6 @@ fn drop_database_force_marks_every_live_backend_for_administrative_termination()
     assert!(engine.reserve_database_connection(database, false));
     assert!(engine.reserve_database_connection(database, false));
 
-    let output = run_with(&mut engine, &mut budget, "DROP DATABASE force_target");
-    assert!(String::from_utf8_lossy(&output).contains("55006"));
-    assert!(engine.database_login("force_target").is_some());
-
     let output = run_with(
         &mut engine,
         &mut budget,
@@ -76246,6 +76544,121 @@ fn drop_database_force_marks_every_live_backend_for_administrative_termination()
     engine.release_database_connection(database.slot);
     engine.release_database_connection(database.slot);
     assert!(!engine.database_connection_must_terminate(database.slot as usize));
+}
+
+/// Like PostgreSQL's `CountOtherDBBackends`, a database statement that needs
+/// a database to itself waits up to five seconds for other sessions to leave:
+/// the connection parks on a timer and the statement re-checks on resume.
+#[test]
+fn database_statements_wait_for_other_sessions_before_reporting_in_use() {
+    let config = test_config("database-session-wait");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for sql in [
+        "CREATE DATABASE left_target",
+        "CREATE DATABASE busy_target",
+        "CREATE DATABASE busy_template",
+        "CREATE DATABASE busy_tablespace",
+        "CREATE TABLESPACE wait_space LOCATION '/object/wait-space'",
+    ] {
+        session.success(&mut engine, sql, false);
+    }
+    let resume = |session: &mut ConfiguredTransactionSession,
+                  engine: &mut Engine,
+                  sql: &str,
+                  completed_statements: usize| {
+        session.send.clear();
+        session.arena.recycle_front();
+        engine
+            .execute_simple_from(
+                sql,
+                completed_statements,
+                &session.arena,
+                &mut session.transaction,
+                &mut session.pool,
+                &mut session.cursors,
+                &session.guc,
+                &mut Responder::new(&mut session.send),
+                session.connection_id,
+                false,
+            )
+            .unwrap()
+    };
+
+    // The other session leaves while the statement waits.
+    let left = engine.database_login("left_target").unwrap();
+    assert!(engine.reserve_database_connection(left, false));
+    let sql = "DROP DATABASE left_target";
+    let ExecutionStatus::Blocked {
+        completed_statements,
+        ..
+    } = session.execute_status(&mut engine, sql, false)
+    else {
+        panic!("DROP DATABASE did not wait for the other session");
+    };
+    assert!(session.guc.seq_session().sleep_until().is_some());
+    assert!(session.send.readable().is_empty());
+    engine.release_database_connection(left.slot);
+    assert_eq!(
+        resume(&mut session, &mut engine, sql, completed_statements),
+        ExecutionStatus::Complete
+    );
+    assert!(error_sqlstates(session.send.readable()).is_empty());
+    assert!(engine.database_login("left_target").is_none());
+
+    // Sessions that stay past the window make each statement report 55006.
+    let busy = engine.database_login("busy_target").unwrap();
+    let template = engine.database_login("busy_template").unwrap();
+    let tablespace = engine.database_login("busy_tablespace").unwrap();
+    for database in [busy, template, tablespace] {
+        assert!(engine.reserve_database_connection(database, false));
+    }
+    for (sql, message) in [
+        (
+            "DROP DATABASE busy_target",
+            "database \"busy_target\" is being accessed by other users",
+        ),
+        (
+            "CREATE DATABASE from_busy TEMPLATE busy_template",
+            "source database \"busy_template\" is being accessed by other users",
+        ),
+        (
+            "ALTER DATABASE busy_tablespace SET TABLESPACE wait_space",
+            "database \"busy_tablespace\" is being accessed by other users",
+        ),
+    ] {
+        let ExecutionStatus::Blocked {
+            completed_statements,
+            ..
+        } = session.execute_status(&mut engine, sql, false)
+        else {
+            panic!("{sql} did not wait for the other session");
+        };
+        let started = session.guc.seq_session().database_wait_since().unwrap();
+        session
+            .guc
+            .seq_session()
+            .set_database_wait_since(Some(started - 5_000_000));
+        assert_eq!(
+            resume(&mut session, &mut engine, sql, completed_statements),
+            ExecutionStatus::Complete,
+            "{sql}"
+        );
+        let output = String::from_utf8_lossy(session.send.readable()).into_owned();
+        assert!(
+            output.contains("55006") && output.contains(message),
+            "{sql}: {output}"
+        );
+        crate::sql::sequence::finish_statement(session.guc.seq_session());
+    }
+    assert!(engine.database_login("busy_target").is_some());
+    assert!(engine.database_login("from_busy").is_none());
+    for database in [busy, template, tablespace] {
+        engine.release_database_connection(database.slot);
+    }
+    drop((session, engine));
+    std::fs::remove_dir_all(config.data_dir).unwrap();
 }
 
 #[test]
@@ -76535,7 +76948,16 @@ fn publication_row_filters_reject_nonimmutable_functions_at_ddl_time() {
          CREATE PUBLICATION publication_filter_volatile_pub \
            FOR TABLE publication_filter_volatile WHERE (random() > 0)",
     );
-    assert!(String::from_utf8_lossy(&output).contains("42P17"));
+    assert_eq!(error_sqlstates(&output), ["0A000"]);
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("invalid publication WHERE expression"),
+        "{text}"
+    );
+    assert!(
+        text.contains("User-defined or built-in mutable functions are not allowed."),
+        "{text}"
+    );
 }
 
 #[test]
@@ -79920,8 +80342,8 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
         )),
         [
             "lifecycle_default_idx|i|f|NULL",
-            "lifecycle_high_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
-            "lifecycle_low_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_high_id_value_payload_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_low_id_value_payload_idx|i|t|{fillfactor=80,deduplicate_items=off}",
             "lifecycle_value_idx|I|f|{fillfactor=80,deduplicate_items=off}",
             "2",
         ]
@@ -79992,7 +80414,7 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
              FROM pg_index WHERE indexrelid = 'lifecycle_value_idx'::regclass",
         )),
         [
-            "CREATE INDEX lifecycle_value_idx ON ONLY public.lifecycle_root USING btree (id, value COLLATE \"C\" DESC NULLS LAST) INCLUDE (payload) WITH (fillfactor='80', deduplicate_items=off) WHERE id >= 0",
+            "CREATE INDEX lifecycle_value_idx ON ONLY public.lifecycle_root USING btree (id, value COLLATE \"C\" DESC NULLS LAST) INCLUDE (payload) WITH (fillfactor='80', deduplicate_items=off) WHERE (id >= 0)",
             "t|t|t|0 950|1978 3126|0 1",
         ]
     );
@@ -80065,8 +80487,8 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
             &mut replayed,
             &mut replay_budget,
             "SELECT relname, relkind, relispartition, reloptions FROM pg_class \
-             WHERE relname IN ('lifecycle_value_idx', 'lifecycle_low_id_idx', \
-                               'lifecycle_high_id_idx', 'lifecycle_expression_idx') \
+             WHERE relname IN ('lifecycle_value_idx', 'lifecycle_low_id_value_payload_idx', \
+                               'lifecycle_high_id_value_payload_idx', 'lifecycle_expression_idx') \
              ORDER BY relname; \
              SELECT attstattarget FROM pg_attribute \
              WHERE attrelid = 'lifecycle_expression_idx'::regclass AND attnum = 1; \
@@ -80079,8 +80501,8 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
         )),
         [
             "lifecycle_expression_idx|i|f|{fillfactor=70,deduplicate_items=on}",
-            "lifecycle_high_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
-            "lifecycle_low_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_high_id_value_payload_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_low_id_value_payload_idx|i|t|{fillfactor=80,deduplicate_items=off}",
             "lifecycle_value_idx|I|f|{fillfactor=80,deduplicate_items=off}",
             "77",
             "lifecycle_space_renamed|{random_page_cost=2,seq_page_cost=1.5,effective_io_concurrency=8}",
@@ -80109,7 +80531,7 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
             &mut replayed,
             &mut replay_budget,
             "SELECT count(*) FROM pg_indexes WHERE indexname IN \
-             ('lifecycle_value_idx', 'lifecycle_low_id_idx', 'lifecycle_high_id_idx')",
+             ('lifecycle_value_idx', 'lifecycle_low_id_value_payload_idx', 'lifecycle_high_id_value_payload_idx')",
         )),
         ["0"]
     );
@@ -86869,6 +87291,25 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
          ORDER BY grp",
         &[
             "0|2857", "1|2858", "2|2857", "3|2857", "4|2857", "5|2857", "6|2857",
+        ],
+    );
+    // Without ORDER BY, rows leave in the last-evaluated window's order with
+    // ties in the earlier windows' order, as PostgreSQL 18.6 returns them.
+    partitioned(
+        &mut engine,
+        &mut budget,
+        "SELECT id, row_number() OVER (ORDER BY id DESC)
+         FROM external_window_rows WHERE grp = 1 AND id <= 50 LIMIT 3",
+        &["50|1", "43|2", "36|3"],
+    );
+    partitioned(
+        &mut engine,
+        &mut budget,
+        "SELECT grp, id, rank() OVER (ORDER BY id DESC), count(*) OVER (PARTITION BY grp)
+         FROM external_window_rows WHERE id <= 9",
+        &[
+            "2|9|1|2", "1|8|2|2", "0|7|3|1", "6|6|4|1", "5|5|5|1", "4|4|6|1", "3|3|7|1", "2|2|8|2",
+            "1|1|9|2",
         ],
     );
     let traffic = engine.storage.block_io_stats().saturating_sub(before);
@@ -96549,6 +96990,7 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                     &setup,
                     &mut reader.transaction,
                     &reader.guc,
+                    &mut reader.cursors,
                     &arena,
                     &mut Responder::new(&mut send),
                 )
@@ -96562,6 +97004,7 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                 let context = CopyRowContext::new(
                     &mut reader.transaction,
                     &reader.guc,
+                    &mut reader.cursors,
                     &arena,
                     &mut responder,
                     &mut transition,
@@ -96604,11 +97047,11 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                         &setup,
                         &mut reader.transaction,
                         &reader.guc,
-                        Some(CursorCommitContext {
+                        CursorCommitContext {
                             cursors: &mut reader.cursors,
-                            plans: &mut reader.pool,
+                            plans: Some(&mut reader.pool),
                             arena: &reader.arena,
-                        }),
+                        },
                         &mut Responder::new(&mut send),
                         &transition,
                         CopyFinishMode::ImplicitTransaction,
@@ -100924,4 +101367,100 @@ fn foreign_key_trigger_modes_survive_journal_and_checkpoint_recovery() {
     assert_eq!(data_rows(&recovered), rows);
     drop(restarted);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn pseudo_type_columns_fail_like_postgresql() {
+    let config = test_config("pseudo-type-columns");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    // PostgreSQL 18.6 reports each pseudo-type by its formatted name.
+    for (sql, message) in [
+        (
+            "CREATE TABLE p(c cstring)",
+            "column \"c\" has pseudo-type cstring",
+        ),
+        (
+            "CREATE TABLE p(c cstring[])",
+            "column \"c\" has pseudo-type cstring",
+        ),
+        (
+            "CREATE TABLE p(c pg_catalog.cstring)",
+            "column \"c\" has pseudo-type cstring",
+        ),
+        (
+            "CREATE TABLE p(c anyelement)",
+            "column \"c\" has pseudo-type anyelement",
+        ),
+        (
+            "CREATE TABLE p(c \"any\")",
+            "column \"c\" has pseudo-type \"any\"",
+        ),
+        (
+            "CREATE TABLE p(c trigger)",
+            "column \"c\" has pseudo-type trigger",
+        ),
+        (
+            "CREATE TABLE p(c unknown)",
+            "column \"c\" has pseudo-type unknown",
+        ),
+        (
+            "CREATE TABLE p(c fdw_handler)",
+            "column \"c\" has pseudo-type fdw_handler",
+        ),
+        (
+            "CREATE TABLE p(c record[])",
+            "column \"c\" has pseudo-type record[]",
+        ),
+        (
+            "CREATE TYPE p AS (f event_trigger)",
+            "column \"f\" has pseudo-type event_trigger",
+        ),
+        (
+            "CREATE TABLE p(c int); ALTER TABLE p ADD COLUMN d anycompatible",
+            "column \"d\" has pseudo-type anycompatible",
+        ),
+    ] {
+        let output = session.execute(&mut engine, sql, false);
+        assert_eq!(error_sqlstates(&output), ["42P16"], "{sql}");
+        assert!(String::from_utf8_lossy(&output).contains(message), "{sql}");
+        session.execute(&mut engine, "DROP TABLE IF EXISTS p", false);
+    }
+    let output = session.execute(&mut engine, "CREATE TABLE p(c anyelement[])", false);
+    assert_eq!(error_sqlstates(&output), ["42704"]);
+}
+
+#[test]
+fn spilled_grouping_keys_read_enclosing_aggregates() {
+    for external in [false, true] {
+        let mut config = test_config(if external {
+            "outer-aggregate-key-external"
+        } else {
+            "outer-aggregate-key-inline"
+        });
+        config.object_store_on = external;
+        config.object_store_sim = external;
+        config.object_store_bucket =
+            format!("outer-aggregate-key-{}-{external}", std::process::id());
+        let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        assert_eq!(engine.storage.spill_attached(), external);
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE oak_t (id int); CREATE TABLE oak_u (x int); \
+             INSERT INTO oak_t VALUES (1),(2),(3); INSERT INTO oak_u VALUES (5),(6)",
+        );
+        assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+        // The inner query groups by the outer query's aggregate.
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT (SELECT count(*) FROM oak_u GROUP BY max(oak_t.id)) FROM oak_t",
+            )),
+            ["2"]
+        );
+    }
 }

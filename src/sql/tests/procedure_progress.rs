@@ -167,7 +167,7 @@ fn procedures_resume_waits_after_transaction_control() {
                  CREATE PROCEDURE wait_outer() LANGUAGE plpgsql AS $$ \
                  DECLARE n int := 10; BEGIN \
                  INSERT INTO wait_log VALUES ('outer-before', nextval('wait_numbers')); \
-                 COMMIT; UPDATE wait_rows SET v = v + 1 WHERE id = 1; \
+                 COMMIT; UPDATE wait_rows SET v = wait_rows.v + 1 WHERE id = 1; \
                  INSERT INTO wait_log VALUES ('outer-updated', nextval('wait_numbers')); \
                  ROLLBACK; CALL wait_inner(n); \
                  INSERT INTO wait_log VALUES ('outer-after-' || n, nextval('wait_numbers')); \
@@ -238,6 +238,87 @@ fn procedures_resume_waits_after_transaction_control() {
                     "wait_inner:1",
                     "wait_outer:1",
                 ],
+                "{label}"
+            );
+            drop((holder, writer, engine));
+            std::fs::remove_dir_all(config.data_dir).unwrap();
+        }
+    }
+}
+
+/// A cursor `FOR` loop resumes across lock waits in its body and in its own
+/// row-locking fetch: each row is handled once, sequence values follow PostgreSQL 18.6, and
+/// the portal is closed when the loop ends. From `CALL` and `DO`, in both
+/// transaction modes.
+#[test]
+fn cursor_loops_resume_lock_waits_in_body_and_fetch() {
+    for (label, sql, tag) in [
+        ("call", "CALL loop_proc()", "CALL"),
+        ("do", "DO $$BEGIN CALL loop_proc(); END$$", "DO"),
+    ] {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let mut config = test_config(&format!("cursor-loop-wait-{label}-{mode:?}"));
+            config.transaction_mode = mode;
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut writer =
+                ConfiguredTransactionSession::with_arena_bytes(&config, &mut budget, 4 << 20);
+            let mut holder =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            writer.success(
+                &mut engine,
+                "CREATE SEQUENCE loop_numbers; CREATE TABLE loop_log(id int, n bigint); \
+                 CREATE TABLE loop_rows(id int PRIMARY KEY, v int); \
+                 INSERT INTO loop_rows VALUES (1, 0), (2, 0), (3, 0); \
+                 CREATE PROCEDURE loop_proc() LANGUAGE plpgsql AS $$ \
+                 DECLARE c CURSOR FOR SELECT id FROM loop_rows ORDER BY id FOR UPDATE; \
+                 BEGIN FOR r IN c LOOP \
+                 INSERT INTO loop_log VALUES (r.id, nextval('loop_numbers')); \
+                 IF r.id = 1 THEN PERFORM pg_advisory_xact_lock(711); END IF; \
+                 END LOOP; \
+                 INSERT INTO loop_log VALUES ((SELECT count(*) FROM pg_cursors), 0); END$$",
+                true,
+            );
+            holder.success(
+                &mut engine,
+                "BEGIN; SELECT pg_advisory_lock(711); \
+                 UPDATE loop_rows SET v = 1 WHERE id = 2",
+                true,
+            );
+            let mut status = writer.execute_status(&mut engine, sql, true);
+            assert_eq!(
+                blocked_wait(&status, &writer),
+                StatementWait::Lock,
+                "{label}"
+            );
+            holder.success(&mut engine, "SELECT pg_advisory_unlock(711)", true);
+            // The loop's next fetch waits for row 2's lock.
+            status = resume_procedure_wait(&mut engine, &mut writer, sql, status);
+            assert_eq!(
+                blocked_wait(&status, &writer),
+                StatementWait::Lock,
+                "{label}"
+            );
+            holder.success(&mut engine, "COMMIT", true);
+            status = resume_procedure_wait(&mut engine, &mut writer, sql, status);
+            assert_eq!(status, ExecutionStatus::Complete, "{label}");
+            assert!(
+                error_sqlstates(writer.send.readable()).is_empty(),
+                "{label}: {}",
+                String::from_utf8_lossy(writer.send.readable())
+            );
+            assert_eq!(command_tags(writer.send.readable()), [tag], "{label}");
+            assert_eq!(
+                data_rows(&writer.success(
+                    &mut engine,
+                    "SELECT id || ':' || n FROM loop_log ORDER BY n, id; \
+                     SELECT count(*) FROM pg_cursors",
+                    true
+                )),
+                ["0:0", "1:1", "2:2", "3:3", "0"],
                 "{label}"
             );
             drop((holder, writer, engine));

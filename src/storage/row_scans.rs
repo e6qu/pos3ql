@@ -242,6 +242,7 @@ impl<'source_arena> CapturedRowScan<'source_arena> {
         Ok(self.generation)
     }
 
+    #[cfg(test)]
     pub(crate) fn retain<'source>(
         &'source self,
         rowid: u64,

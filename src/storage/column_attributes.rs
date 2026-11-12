@@ -409,7 +409,7 @@ mod ownership_tests {
             assert_eq!(saved.columns.len(), 1);
             assert_eq!(saved.not_null_names.len(), 1);
             assert_eq!(saved.attributes.slots.len(), 2);
-            assert_eq!(saved.not_null_identities.len(), 2);
+            assert_eq!(saved.attribute_identities.len(), 2);
             assert_eq!(saved.inline_index_identities.len(), 2);
             assert_eq!(saved.inline_constraint_identities.len(), 2);
             assert_eq!(saved.inline_key_names.len(), 1);
@@ -426,7 +426,7 @@ mod ownership_tests {
                     saved.columns.as_ptr()
                 ));
                 assert_eq!(borrowed.columns.len(), 1);
-                assert_eq!(borrowed.not_null_identities.len(), 2);
+                assert_eq!(borrowed.attribute_identities.len(), 2);
                 assert_eq!(borrowed.inline_constraint_identities.len(), 2);
                 assert_eq!(borrowed.inline_key_names.len(), 1);
                 assert_eq!(borrowed.attribute_number(0), 2);

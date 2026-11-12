@@ -1402,7 +1402,7 @@ impl Storage {
         &self,
         owners: &mut super::type_contracts::CatalogDependencyOwners<'_, super::ViewRuleCatalog>,
         target: CatalogEditTarget,
-        definition: super::ViewDefinition,
+        mut definition: super::ViewDefinition,
         transaction: u32,
     ) -> Result<ViewAlterUndo, SqlError> {
         self.validate_view_default_inputs(
@@ -1423,6 +1423,10 @@ impl Storage {
                 current.name.as_str(),
             ));
         }
+        self.reserve_view_default_identities(
+            &mut definition.columns,
+            Some(current.columns_for(transaction)),
+        )?;
         let version = self.catalog_sequence.next()?;
         let mut rule_definition = rule.definition_for(transaction);
         rule_definition.source = definition.query.sql;
@@ -1558,10 +1562,11 @@ impl Storage {
     pub(crate) fn stage_view_columns(
         &self,
         target: CatalogEditTarget,
-        columns: super::ViewColumns,
+        mut columns: super::ViewColumns,
         transaction: u32,
         default_inputs: super::StoredTypeInputs,
     ) -> Result<ViewAlterUndo, SqlError> {
+        self.reserve_view_default_identities(&mut columns, None)?;
         {
             let catalog = self
                 .type_catalog

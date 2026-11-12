@@ -168,6 +168,29 @@ pub fn object_keys_error(name: &str, kind: Kind) -> SqlError {
     )
 }
 
+/// PostgreSQL's error for calling `*_each` on a non-object: the `json`
+/// variants cannot deconstruct an array or a scalar; the `jsonb` variants
+/// name themselves.
+pub fn each_error(name: &str, jsonb: bool, kind: Kind) -> SqlError {
+    if jsonb {
+        return sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "cannot call {} on a non-object",
+            name
+        );
+    }
+    match kind {
+        Kind::Array => sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "cannot deconstruct an array as an object"
+        ),
+        Kind::Scalar | Kind::Object => sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "cannot deconstruct a scalar"
+        ),
+    }
+}
+
 /// PostgreSQL's error for calling `*_array_elements` on a non-array. The `json`
 /// variants phrase it as `cannot call <fn> on a scalar / a non-array`; the
 /// `jsonb` variants as `cannot extract elements from a scalar / an object`.
@@ -197,6 +220,134 @@ pub fn array_elements_error(name: &str, jsonb: bool, kind: Kind) -> SqlError {
     }
 }
 
+/// The top-level members or elements of one JSON container, stepped in
+/// source order one at a time. `start` validates the whole document first,
+/// rewinding its scratch after each item, so a malformed tail fails before the
+/// first item is returned, as PostgreSQL parses the whole value first. Each
+/// item's decoded key uses the caller's arena; values stay verbatim slices of
+/// the input.
+#[derive(Clone, Copy)]
+pub struct SourceItems<'a> {
+    text: &'a str,
+    at: usize,
+    object: bool,
+    done: bool,
+}
+
+/// One container item: a decoded object key (`None` for array elements) and
+/// the item's verbatim source text.
+pub type SourceItem<'a> = (Option<&'a str>, &'a str);
+
+impl<'a> SourceItems<'a> {
+    /// Positions after the opening bracket of an object (`object`) or array.
+    /// `scratch` holds per-item parse trees only while validating.
+    pub fn start(text: &'a str, object: bool, scratch: &Arena) -> Result<Self, SqlError> {
+        let mut p = P {
+            b: text.as_bytes(),
+            at: 0,
+            arena: scratch,
+            preserve_object_order: true,
+        };
+        p.ws();
+        let open = if object { b'{' } else { b'[' };
+        if p.b.get(p.at) != Some(&open) {
+            return Err(if object {
+                sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "cannot call json_object_keys on a non-object"
+                )
+            } else {
+                sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "cannot extract elements from a non-array"
+                )
+            });
+        }
+        let items = Self {
+            text,
+            at: p.at + 1,
+            object,
+            done: false,
+        };
+        let mut check = items;
+        loop {
+            let mark = scratch.mark();
+            let item = check.step(scratch);
+            // SAFETY: validation keeps no reference to the item's scratch.
+            unsafe { scratch.rewind_to(mark) };
+            if item?.is_none() {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
+    /// The next item, or `None` after the closing bracket.
+    pub fn next(&mut self, arena: &'a Arena) -> Result<Option<SourceItem<'a>>, SqlError> {
+        self.step(arena)
+    }
+
+    fn step<'s>(&mut self, arena: &'s Arena) -> Result<Option<SourceItem<'s>>, SqlError>
+    where
+        'a: 's,
+    {
+        if self.done {
+            return Ok(None);
+        }
+        let text: &'s str = self.text;
+        let mut p = P {
+            b: text.as_bytes(),
+            at: self.at,
+            arena,
+            preserve_object_order: true,
+        };
+        let close = if self.object { b'}' } else { b']' };
+        p.ws();
+        if p.b.get(p.at) == Some(&close) {
+            p.at += 1;
+            p.ws();
+            if p.at != p.b.len() {
+                return Err(bad());
+            }
+            self.done = true;
+            return Ok(None);
+        }
+        let key = if self.object {
+            if p.b.get(p.at) != Some(&b'"') {
+                return Err(bad());
+            }
+            let key = decode_string(p.string()?, arena)?;
+            p.ws();
+            if p.b.get(p.at) != Some(&b':') {
+                return Err(bad());
+            }
+            p.at += 1;
+            Some(key)
+        } else {
+            None
+        };
+        p.ws();
+        let start = p.at;
+        p.value(0)?;
+        let value = core::str::from_utf8(&p.b[start..p.at]).map_err(|_| bad())?;
+        p.ws();
+        match p.b.get(p.at) {
+            Some(b',') => {
+                p.at += 1;
+                // A comma must be followed by another item.
+                p.ws();
+                if p.b.get(p.at) == Some(&close) {
+                    return Err(bad());
+                }
+            }
+            Some(byte) if *byte == close => {}
+            _ => return Err(bad()),
+        }
+        self.at = p.at;
+        Ok(Some((key, value)))
+    }
+}
+
 /// Top-level members of a JSON object in source order, keys decoded and each
 /// value kept as its verbatim source text. Unlike [`parse`], this preserves the
 /// input's key order, duplicate keys, and interior whitespace — the behavior of
@@ -205,54 +356,12 @@ pub fn object_members_source<'a>(
     input: &'a str,
     arena: &'a Arena,
 ) -> Result<&'a [(&'a str, &'a str)], SqlError> {
-    let mut p = P {
-        b: input.as_bytes(),
-        at: 0,
-        arena,
-        preserve_object_order: true,
-    };
-    p.ws();
-    if p.b.get(p.at) != Some(&b'{') {
-        return Err(sql_err!(
-            sqlstate::INVALID_PARAMETER_VALUE,
-            "cannot call json_object_keys on a non-object"
-        ));
-    }
-    p.at += 1;
+    let mut items = SourceItems::start(input, true, arena)?;
     let mut members = ArenaList::new(arena);
-    p.ws();
-    if p.b.get(p.at) == Some(&b'}') {
-        return Ok(&[]);
-    }
-    loop {
-        p.ws();
-        if p.b.get(p.at) != Some(&b'"') {
-            return Err(bad());
-        }
-        let key = decode_string(p.string()?, arena)?;
-        p.ws();
-        if p.b.get(p.at) != Some(&b':') {
-            return Err(bad());
-        }
-        p.at += 1;
-        p.ws();
-        let start = p.at;
-        p.value(0)?;
-        let value = core::str::from_utf8(&p.b[start..p.at]).map_err(|_| bad())?;
-        members.push((key, value)).map_err(|_| full())?;
-        p.ws();
-        match p.b.get(p.at) {
-            Some(b',') => p.at += 1,
-            Some(b'}') => {
-                p.at += 1;
-                break;
-            }
-            _ => return Err(bad()),
-        }
-    }
-    p.ws();
-    if p.at != p.b.len() {
-        return Err(bad());
+    while let Some((key, value)) = items.next(arena)? {
+        members
+            .push((key.expect("object member key"), value))
+            .map_err(|_| full())?;
     }
     Ok(members.as_slice())
 }
@@ -264,44 +373,10 @@ pub fn array_elements_source<'a>(
     input: &'a str,
     arena: &'a Arena,
 ) -> Result<&'a [&'a str], SqlError> {
-    let mut p = P {
-        b: input.as_bytes(),
-        at: 0,
-        arena,
-        preserve_object_order: true,
-    };
-    p.ws();
-    if p.b.get(p.at) != Some(&b'[') {
-        return Err(sql_err!(
-            sqlstate::INVALID_PARAMETER_VALUE,
-            "cannot extract elements from a non-array"
-        ));
-    }
-    p.at += 1;
+    let mut source = SourceItems::start(input, false, arena)?;
     let mut items = ArenaList::new(arena);
-    p.ws();
-    if p.b.get(p.at) == Some(&b']') {
-        return Ok(&[]);
-    }
-    loop {
-        p.ws();
-        let start = p.at;
-        p.value(0)?;
-        let element = core::str::from_utf8(&p.b[start..p.at]).map_err(|_| bad())?;
+    while let Some((_, element)) = source.next(arena)? {
         items.push(element).map_err(|_| full())?;
-        p.ws();
-        match p.b.get(p.at) {
-            Some(b',') => p.at += 1,
-            Some(b']') => {
-                p.at += 1;
-                break;
-            }
-            _ => return Err(bad()),
-        }
-    }
-    p.ws();
-    if p.at != p.b.len() {
-        return Err(bad());
     }
     Ok(items.as_slice())
 }
@@ -1397,6 +1472,22 @@ pub fn write_datum_json_styled(
             crate::sql::datetime::format_timestamp_json(*t, true).as_str(),
             out,
         ),
+        Datum::Array {
+            element: crate::sql::types::ArrElem::Record,
+            raw,
+        } => {
+            out.write_char('[')?;
+            for (i, payload) in crate::sql::array::element_payloads(raw).enumerate() {
+                if i > 0 {
+                    out.write_str(comma)?;
+                }
+                match crate::sql::array::record_element(payload) {
+                    Some(value) => write_projected_json(value, colon, comma, out)?,
+                    None => out.write_str("null")?,
+                }
+            }
+            out.write_char(']')
+        }
         Datum::Array { element, raw } => {
             out.write_char('[')?;
             for (i, elem) in crate::sql::array::elements(raw, *element).enumerate() {
@@ -1422,4 +1513,27 @@ pub fn write_datum_json_styled(
         // Everything else renders as a quoted string of its text form.
         other => write_json_display_string(other, out),
     }
+}
+
+/// Writes an encoded value as [`write_datum_json_styled`] does, rendering a
+/// record from its encoded fields (its decoded form is only text).
+fn write_projected_json(
+    value: crate::sql::exec::ProjectedValue<'_>,
+    colon: &str,
+    comma: &str,
+    out: &mut dyn core::fmt::Write,
+) -> core::fmt::Result {
+    let Some(fields) = value.record_fields() else {
+        return write_datum_json_styled(&value.datum(), colon, comma, out);
+    };
+    out.write_char('{')?;
+    for (i, (name, _, field)) in fields.enumerate() {
+        if i > 0 {
+            out.write_str(comma)?;
+        }
+        write_json_raw_string(name, out)?;
+        out.write_str(colon)?;
+        write_projected_json(field, colon, comma, out)?;
+    }
+    out.write_char('}')
 }

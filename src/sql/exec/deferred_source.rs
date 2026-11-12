@@ -64,6 +64,30 @@ fn volatile_user_call(
     Ok(found)
 }
 
+/// Whether `expression` calls a user routine that returns a set: such an
+/// output item multiplies the source's rows, so its calls cannot run later.
+fn set_returning_user_call(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> Result<bool, SqlError> {
+    if let Expr::Call {
+        kind: crate::sql::ast::CallKind::Routine,
+        name,
+        ..
+    } = expression
+        && storage.has_set_returning_routine_named(name.rsplit('.').next().unwrap_or(name), txid)
+    {
+        return Ok(true);
+    }
+    let mut found = false;
+    crate::sql::query::walk_children(expression, &mut |child| {
+        found |= set_returning_user_call(child, storage, txid)?;
+        Ok(())
+    })?;
+    Ok(found)
+}
+
 fn alloc<'a>(arena: &'a Arena, expression: Expr<'a>) -> Result<&'a Expr<'a>, SqlError> {
     arena
         .alloc(expression)
@@ -234,7 +258,7 @@ fn skeleton<'a>(
             operand,
             whens,
             otherwise,
-            synthetic,
+            origin,
         } => {
             // The operand and the first condition always run.
             let operand = match operand {
@@ -267,7 +291,7 @@ fn skeleton<'a>(
                 operand,
                 whens: branches.as_slice(),
                 otherwise,
-                synthetic,
+                origin,
             }
         }
         _ => return Ok(None),
@@ -320,6 +344,13 @@ fn split_leaf<'a>(
             .any(|item| !matches!(item, SelectItem::Expr { .. }))
     {
         return Ok(None);
+    }
+    for item in select.items {
+        if let SelectItem::Expr { expression, .. } = item
+            && set_returning_user_call(expression, storage, txid)?
+        {
+            return Ok(None);
+        }
     }
     // A set-returning call expands the output list into several rows, so
     // the list cannot be computed again one inserted row at a time.
@@ -458,6 +489,9 @@ pub(super) fn defer_source_calls<'a>(
     }
     if deferred.is_empty() {
         return Ok(None);
+    }
+    for leaf in sources.as_slice() {
+        crate::sql::query::require_source_routine_execute(leaf, storage, txid, arena, outer)?;
     }
     // Every leaf has the written items, its leaf number, then each leaf's
     // hidden columns: its own values and NULL in the other leaves' slots.
@@ -730,7 +764,7 @@ impl<'a> DeferredSource<'a> {
                 operand,
                 whens,
                 otherwise,
-                synthetic,
+                origin,
             } => {
                 let mut branches = ArenaList::new(arena);
                 for (condition, result) in whens {
@@ -749,7 +783,7 @@ impl<'a> DeferredSource<'a> {
                     otherwise: otherwise
                         .map(|otherwise| self.bind(otherwise, offset, values, arena))
                         .transpose()?,
-                    synthetic,
+                    origin,
                 }
             }
             _ => return Ok(expression),

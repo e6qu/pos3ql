@@ -1254,6 +1254,22 @@ impl Engine {
                 txid: txn.txid,
                 arena,
             };
+            let mut argument_oids = [0; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            if candidate.arguments.len() <= argument_oids.len() {
+                for (target, argument) in argument_oids.iter_mut().zip(candidate.arguments) {
+                    *target = argument.type_oid;
+                }
+                super::exec::check_inlined_polymorphic_result(
+                    &self.storage,
+                    txn.txid,
+                    &routine,
+                    &argument_oids[..candidate.arguments.len()],
+                    body,
+                    &statements[0],
+                    inline::simple_expression(statements).is_some(),
+                    arena,
+                )?;
+            }
             let accepted = inline::accepted(
                 &routine,
                 statements,
@@ -1329,19 +1345,53 @@ impl Engine {
                 Ok(value) => value,
                 Err(_) => return Ok(Err(super::eval::arena_full())),
             };
-            return with_inline_parameters(values, known, || {
-                for statement in statements {
-                    let result = type_input_plans::with_owner(prepared.owner, || {
-                        self.prepare_planner_inputs_under(
-                            statement, None, arena, txn, sqlprep, cursors, guc, responder, ancestry,
-                        )
-                    })?;
-                    if result.is_err() {
-                        return Ok(result);
+            // PostgreSQL runs an IMMUTABLE function called with constants at
+            // plan time, and folds the inlined body of any other call with
+            // constants; either names the function in its error context.
+            let constant_arguments = known.iter().all(|known| *known);
+            let frame = crate::sql::error_context::SqlFunctionFrame {
+                name: routine.name.as_str(),
+                body,
+                statement: core::cell::Cell::new(1),
+                inlining: if !constant_arguments {
+                    crate::sql::error_context::SqlFunctionInlining::Inlined
+                } else if routine.attributes.volatility
+                    == crate::storage::RoutineVolatility::Immutable
+                {
+                    crate::sql::error_context::SqlFunctionInlining::Executed
+                } else {
+                    crate::sql::error_context::SqlFunctionInlining::Folded
+                },
+            };
+            let known = &*known;
+            // The frame records the context of a SQL error; a full send buffer
+            // passes through unchanged.
+            let outcome =
+                crate::sql::error_context::within(&frame, || {
+                    match with_inline_parameters(values, known, || {
+                        for statement in statements {
+                            let result = type_input_plans::with_owner(prepared.owner, || {
+                                self.prepare_planner_inputs_under(
+                                    statement, None, arena, txn, sqlprep, cursors, guc, responder,
+                                    ancestry,
+                                )
+                            })?;
+                            if result.is_err() {
+                                return Ok(result);
+                            }
+                        }
+                        Ok(Ok(()))
+                    }) {
+                        Ok(Ok(())) => Ok(Ok(())),
+                        Ok(Err(error)) => Err(error),
+                        Err(full) => Ok(Err(full)),
                     }
-                }
-                Ok(Ok(()))
-            });
+                });
+            return match outcome {
+                Ok(Ok(())) => Ok(Ok(())),
+                Ok(Err(full)) => Err(full),
+                Err(error) => Ok(Err(error)),
+            };
         }
         Ok(Ok(()))
     }

@@ -482,6 +482,13 @@ impl super::Storage {
         name: super::UserTypeName,
         transaction: u32,
     ) -> Result<Option<usize>, SqlError> {
+        // Relation row types and information_schema domains have no slot in
+        // the user type catalog.
+        if name.relation_row_type_creation().is_some()
+            || name.information_schema_domain_binding().is_some()
+        {
+            return Ok(None);
+        }
         let reference = super::TypeReference::from_bound_name(name)?;
         let catalog = self
             .type_catalog
@@ -536,6 +543,13 @@ impl super::Storage {
             let Some(parent) = parent else {
                 return Ok(false);
             };
+            // A relation row type or information_schema domain is not in the
+            // user type catalog, so no domain is reached through it.
+            if parent.relation_row_type_creation().is_some()
+                || parent.information_schema_domain_binding().is_some()
+            {
+                return Ok(false);
+            }
             let parent = catalog
                 .resolve_source_reference(
                     super::TypeReference::from_bound_name(parent)?,

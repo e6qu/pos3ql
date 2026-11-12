@@ -36,11 +36,15 @@ jobs:
           # Coverage and crash-torture builds use incompatible instrumentation.
           # Keep them in distinct jobs: serializing either pair can exceed the
           # hard 15-minute bound even though each workload fits on its own.
-          - { name: lib-a, shards: "lib:0-of-4", needs_pg18: false }
-          - { name: lib-b, shards: "lib:1-of-4", needs_pg18: false }
-          - { name: lib-c, shards: "lib:2-of-4", needs_pg18: false }
-          - { name: lib-d, shards: "lib:3-of-4", needs_pg18: false }
-          - { name: protocol-durability, shards: "run:proto,dur", needs_pg18_client: true }
+          - { name: lib-a, shards: "lib:0-of-6", needs_pg18: false }
+          - { name: lib-b, shards: "lib:1-of-6", needs_pg18: false }
+          - { name: lib-c, shards: "lib:2-of-6", needs_pg18: false }
+          - { name: lib-d, shards: "lib:3-of-6", needs_pg18: false }
+          - { name: lib-e, shards: "lib:4-of-6", needs_pg18: false }
+          - { name: lib-f, shards: "lib:5-of-6", needs_pg18: false }
+          # Each external group repeats the instrumented and release builds.
+          - { name: protocol, shards: "run:proto", needs_pg18_client: true }
+          - { name: durability, shards: "run:dur", needs_pg18_client: true }
           - { name: spill-overlay, shards: "runtest:overlay", needs_pg18: false }
           - { name: ingest, shards: "runtest:ingest", needs_pg18: false }
           - { name: tls-correctness, shards: "runtest:tls", needs_pg18: false }
@@ -51,7 +55,7 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Install native debugger for library and protocol failure diagnostics
-        if: startsWith(matrix.shards, 'lib:') || matrix.name == 'protocol-durability'
+        if: startsWith(matrix.shards, 'lib:') || matrix.name == 'protocol' || matrix.name == 'durability'
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends gdb
@@ -225,7 +229,9 @@ jobs:
           - { name: d, corpus_shard: "3-of-6", auxiliary: none }
           - { name: e, corpus_shard: "4-of-6", auxiliary: none }
           - { name: f, corpus_shard: "5-of-6", auxiliary: none }
-          - { name: exact, corpus_shard: "none", auxiliary: exact }
+          - { name: exact-a, corpus_shard: "none", auxiliary: exact, exact_shard: "0", exact_shards: "3" }
+          - { name: exact-b, corpus_shard: "none", auxiliary: exact, exact_shard: "1", exact_shards: "3" }
+          - { name: exact-c, corpus_shard: "none", auxiliary: exact, exact_shard: "2", exact_shards: "3" }
           - { name: copy, corpus_shard: "none", auxiliary: copy }
           - { name: types, corpus_shard: "none", auxiliary: types }
           - { name: grouping, corpus_shard: "none", auxiliary: grouping }
@@ -285,6 +291,8 @@ jobs:
           POS3QL_DIFF_AUXILIARY: ${{ matrix.auxiliary }}
           POS3QL_SLT_QUERY_SHARD: ${{ matrix.slt_query_shard || '0' }}
           POS3QL_SLT_QUERY_SHARDS: ${{ matrix.slt_query_shards || '1' }}
+          POS3QL_EXACT_SHARD: ${{ matrix.exact_shard || '0' }}
+          POS3QL_EXACT_SHARDS: ${{ matrix.exact_shards || '1' }}
           COVERAGE_SHARD: runtest:spilldiff
         run: sh tools/coverage.sh
 
@@ -310,7 +318,9 @@ jobs:
           - { name: corpus-d, corpus_shard: "3-of-6", auxiliary: none }
           - { name: corpus-e, corpus_shard: "4-of-6", auxiliary: none }
           - { name: corpus-f, corpus_shard: "5-of-6", auxiliary: none }
-          - { name: auxiliary-exact, corpus_shard: "none", auxiliary: exact }
+          - { name: auxiliary-exact-a, corpus_shard: "none", auxiliary: exact, exact_shard: "0", exact_shards: "3" }
+          - { name: auxiliary-exact-b, corpus_shard: "none", auxiliary: exact, exact_shard: "1", exact_shards: "3" }
+          - { name: auxiliary-exact-c, corpus_shard: "none", auxiliary: exact, exact_shard: "2", exact_shards: "3" }
           - { name: auxiliary-copy, corpus_shard: "none", auxiliary: copy }
           - { name: auxiliary-types, corpus_shard: "none", auxiliary: types }
           - { name: auxiliary-grouping, corpus_shard: "none", auxiliary: grouping, grouping_timeout: "300" }
@@ -381,6 +391,8 @@ jobs:
           POS3QL_POSTGRES_REGRESS_SHARDS: "4"
           POS3QL_SLT_QUERY_SHARD: ${{ matrix.slt_query_shard || '0' }}
           POS3QL_SLT_QUERY_SHARDS: ${{ matrix.slt_query_shards || '1' }}
+          POS3QL_EXACT_SHARD: ${{ matrix.exact_shard || '0' }}
+          POS3QL_EXACT_SHARDS: ${{ matrix.exact_shards || '1' }}
           COVERAGE_SHARDS: "run:diff"
         run: |
           COVERAGE_SHARD="$COVERAGE_SHARDS" \

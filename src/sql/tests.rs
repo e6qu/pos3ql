@@ -76395,10 +76395,6 @@ fn drop_database_force_marks_every_live_backend_for_administrative_termination()
     assert!(engine.reserve_database_connection(database, false));
     assert!(engine.reserve_database_connection(database, false));
 
-    let output = run_with(&mut engine, &mut budget, "DROP DATABASE force_target");
-    assert!(String::from_utf8_lossy(&output).contains("55006"));
-    assert!(engine.database_login("force_target").is_some());
-
     let output = run_with(
         &mut engine,
         &mut budget,
@@ -76414,6 +76410,121 @@ fn drop_database_force_marks_every_live_backend_for_administrative_termination()
     engine.release_database_connection(database.slot);
     engine.release_database_connection(database.slot);
     assert!(!engine.database_connection_must_terminate(database.slot as usize));
+}
+
+/// Like PostgreSQL's `CountOtherDBBackends`, a database statement that needs
+/// a database to itself waits up to five seconds for other sessions to leave:
+/// the connection parks on a timer and the statement re-checks on resume.
+#[test]
+fn database_statements_wait_for_other_sessions_before_reporting_in_use() {
+    let config = test_config("database-session-wait");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for sql in [
+        "CREATE DATABASE left_target",
+        "CREATE DATABASE busy_target",
+        "CREATE DATABASE busy_template",
+        "CREATE DATABASE busy_tablespace",
+        "CREATE TABLESPACE wait_space LOCATION '/object/wait-space'",
+    ] {
+        session.success(&mut engine, sql, false);
+    }
+    let resume = |session: &mut ConfiguredTransactionSession,
+                  engine: &mut Engine,
+                  sql: &str,
+                  completed_statements: usize| {
+        session.send.clear();
+        session.arena.recycle_front();
+        engine
+            .execute_simple_from(
+                sql,
+                completed_statements,
+                &session.arena,
+                &mut session.transaction,
+                &mut session.pool,
+                &mut session.cursors,
+                &session.guc,
+                &mut Responder::new(&mut session.send),
+                session.connection_id,
+                false,
+            )
+            .unwrap()
+    };
+
+    // The other session leaves while the statement waits.
+    let left = engine.database_login("left_target").unwrap();
+    assert!(engine.reserve_database_connection(left, false));
+    let sql = "DROP DATABASE left_target";
+    let ExecutionStatus::Blocked {
+        completed_statements,
+        ..
+    } = session.execute_status(&mut engine, sql, false)
+    else {
+        panic!("DROP DATABASE did not wait for the other session");
+    };
+    assert!(session.guc.seq_session().sleep_until().is_some());
+    assert!(session.send.readable().is_empty());
+    engine.release_database_connection(left.slot);
+    assert_eq!(
+        resume(&mut session, &mut engine, sql, completed_statements),
+        ExecutionStatus::Complete
+    );
+    assert!(error_sqlstates(session.send.readable()).is_empty());
+    assert!(engine.database_login("left_target").is_none());
+
+    // Sessions that stay past the window make each statement report 55006.
+    let busy = engine.database_login("busy_target").unwrap();
+    let template = engine.database_login("busy_template").unwrap();
+    let tablespace = engine.database_login("busy_tablespace").unwrap();
+    for database in [busy, template, tablespace] {
+        assert!(engine.reserve_database_connection(database, false));
+    }
+    for (sql, message) in [
+        (
+            "DROP DATABASE busy_target",
+            "database \"busy_target\" is being accessed by other users",
+        ),
+        (
+            "CREATE DATABASE from_busy TEMPLATE busy_template",
+            "source database \"busy_template\" is being accessed by other users",
+        ),
+        (
+            "ALTER DATABASE busy_tablespace SET TABLESPACE wait_space",
+            "database \"busy_tablespace\" is being accessed by other users",
+        ),
+    ] {
+        let ExecutionStatus::Blocked {
+            completed_statements,
+            ..
+        } = session.execute_status(&mut engine, sql, false)
+        else {
+            panic!("{sql} did not wait for the other session");
+        };
+        let started = session.guc.seq_session().database_wait_since().unwrap();
+        session
+            .guc
+            .seq_session()
+            .set_database_wait_since(Some(started - 5_000_000));
+        assert_eq!(
+            resume(&mut session, &mut engine, sql, completed_statements),
+            ExecutionStatus::Complete,
+            "{sql}"
+        );
+        let output = String::from_utf8_lossy(session.send.readable()).into_owned();
+        assert!(
+            output.contains("55006") && output.contains(message),
+            "{sql}: {output}"
+        );
+        crate::sql::sequence::finish_statement(session.guc.seq_session());
+    }
+    assert!(engine.database_login("busy_target").is_some());
+    assert!(engine.database_login("from_busy").is_none());
+    for database in [busy, template, tablespace] {
+        engine.release_database_connection(database.slot);
+    }
+    drop((session, engine));
+    std::fs::remove_dir_all(config.data_dir).unwrap();
 }
 
 #[test]

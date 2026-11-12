@@ -29742,7 +29742,7 @@ fn execute_bound_plpgsql_utility<'a>(
                         txn,
                         name,
                         *options,
-                        connections,
+                        super::exec::OtherDatabaseSessions::new(connections, guc.seq_session()),
                         responder,
                     )
                 }
@@ -29755,7 +29755,10 @@ fn execute_bound_plpgsql_utility<'a>(
                         super::exec::AlterDatabaseCommand {
                             name,
                             action: *action,
-                            active_connections: connections,
+                            other_sessions: super::exec::OtherDatabaseSessions::new(
+                                connections,
+                                guc.seq_session(),
+                            ),
                             guc,
                         },
                         responder,
@@ -29775,7 +29778,10 @@ fn execute_bound_plpgsql_utility<'a>(
                             name,
                             if_exists: *if_exists,
                             force: *force,
-                            active_connections: connections,
+                            other_sessions: super::exec::OtherDatabaseSessions::new(
+                                connections,
+                                guc.seq_session(),
+                            ),
                         },
                         responder,
                     )
@@ -65198,13 +65204,35 @@ fn database_encoding(value: &str) -> Result<crate::storage::DatabaseEncoding, Sq
     }
 }
 
+/// The other sessions connected to a database that a statement needs for
+/// itself. Every check goes through PostgreSQL's five-second wait for them to
+/// leave.
+#[derive(Clone, Copy)]
+pub struct OtherDatabaseSessions<'a> {
+    count: u16,
+    session: &'a crate::sql::guc::SeqSession,
+}
+
+impl<'a> OtherDatabaseSessions<'a> {
+    pub(crate) fn new(count: u16, session: &'a crate::sql::guc::SeqSession) -> Self {
+        Self { count, session }
+    }
+
+    /// Whether the database is still in use once the wait window closes. An
+    /// error is the internal wait that parks the statement until it re-checks.
+    fn still_in_use(self) -> Result<bool, SqlError> {
+        crate::sql::sequence::wait_for_database_sessions(self.session, self.count != 0)?;
+        Ok(self.count != 0)
+    }
+}
+
 pub fn create_database(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
     name: &str,
     options: crate::sql::ast::CreateDatabaseOptions<'_>,
-    template_connections: u16,
+    template_sessions: OtherDatabaseSessions<'_>,
     responder: &mut Responder,
 ) -> Outcome {
     let Some(current) = storage.current_role_slot(txn.txid) else {
@@ -65250,12 +65278,16 @@ pub fn create_database(
             template_name
         ));
     }
-    if template_connections != 0 {
-        return sql_fail(sql_err!(
-            sqlstate::OBJECT_IN_USE,
-            "source database \"{}\" is being accessed by other users",
-            template_name
-        ));
+    match template_sessions.still_in_use() {
+        Err(wait) => return sql_fail(wait),
+        Ok(true) => {
+            return sql_fail(sql_err!(
+                sqlstate::OBJECT_IN_USE,
+                "source database \"{}\" is being accessed by other users",
+                template_name
+            ));
+        }
+        Ok(false) => {}
     }
     let owner = match options.owner {
         Some(owner) => {
@@ -65429,7 +65461,7 @@ pub fn create_database(
 pub struct AlterDatabaseCommand<'a> {
     pub name: &'a str,
     pub action: crate::sql::ast::AlterDatabaseAction<'a>,
-    pub active_connections: u16,
+    pub other_sessions: OtherDatabaseSessions<'a>,
     pub guc: &'a crate::sql::guc::GucState,
 }
 
@@ -65443,7 +65475,7 @@ pub fn alter_database(
     let AlterDatabaseCommand {
         name,
         action,
-        active_connections,
+        other_sessions,
         guc,
     } = command;
     let Some(slot) = storage.database_slot(name, txn.txid) else {
@@ -65520,12 +65552,16 @@ pub fn alter_database(
             owner = new_owner;
         }
         crate::sql::ast::AlterDatabaseAction::SetTablespace(name) => {
-            if active_connections != 0 {
-                return sql_fail(sql_err!(
-                    sqlstate::OBJECT_IN_USE,
-                    "database \"{}\" is being accessed by other users",
-                    definition.name.as_str()
-                ));
+            match other_sessions.still_in_use() {
+                Err(wait) => return sql_fail(wait),
+                Ok(true) => {
+                    return sql_fail(sql_err!(
+                        sqlstate::OBJECT_IN_USE,
+                        "database \"{}\" is being accessed by other users",
+                        definition.name.as_str()
+                    ));
+                }
+                Ok(false) => {}
             }
             definition.tablespace = match storage.tablespace_id(name, txn.txid) {
                 Some(0) => 0,
@@ -65679,7 +65715,7 @@ pub struct DropDatabaseCommand<'a> {
     pub name: &'a str,
     pub if_exists: bool,
     pub force: bool,
-    pub active_connections: u16,
+    pub other_sessions: OtherDatabaseSessions<'a>,
 }
 
 pub fn drop_database(
@@ -65693,7 +65729,7 @@ pub fn drop_database(
         name,
         if_exists,
         force,
-        active_connections,
+        other_sessions,
     } = command;
     let Some(slot) = storage.database_slot(name, txn.txid) else {
         if if_exists {
@@ -65724,12 +65760,18 @@ pub fn drop_database(
     if let Err(error) = storage.require_owner(object, txn.txid, "database") {
         return sql_fail(error);
     }
-    if active_connections != 0 && !force {
-        return sql_fail(sql_err!(
-            sqlstate::OBJECT_IN_USE,
-            "database \"{}\" is being accessed by other users",
-            name
-        ));
+    if !force {
+        match other_sessions.still_in_use() {
+            Err(wait) => return sql_fail(wait),
+            Ok(true) => {
+                return sql_fail(sql_err!(
+                    sqlstate::OBJECT_IN_USE,
+                    "database \"{}\" is being accessed by other users",
+                    name
+                ));
+            }
+            Ok(false) => {}
+        }
     }
     storage.drop_database(slot, txn.txid);
     let lsn = storage.bump_lsn();

@@ -119,10 +119,11 @@ is owned.
   general executor cannot run a routine body inside expression evaluation.
 - **Catalog history:** a transaction that changes a catalog relation
   synthesizes that whole relation twice (its committed and its private image)
-  in the statement arena to capture the changed rows, so `CREATE FUNCTION`
-  needs room for every `pg_proc` row, built-in ones included (more than
-  1 MiB). Capturing only the rows the transaction's changes name would bound
-  it by the change.
+  in the statement arena to capture the changed rows. `pg_proc` history
+  includes only the built-in routines that have a per-database entry, so
+  `CREATE FUNCTION` is bounded by the stored and altered routines, not the
+  3,000-row built-in catalog. Capturing only the rows the transaction's
+  changes name would bound every relation by the change.
 - **Write phases:** a write keeps its changed rows across storage and lock
   waits and continues at the unfinished row, at top level and in `CALL` and
   `DO` bodies (see the

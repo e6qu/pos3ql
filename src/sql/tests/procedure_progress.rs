@@ -516,11 +516,14 @@ fn procedure_wait_failures_release_saved_frames() {
             true,
         );
         if timeout {
-            writer.success(&mut engine, "SET statement_timeout = '50ms'", true);
+            writer.success(&mut engine, "SET statement_timeout = '1s'", true);
         }
         holder.success(&mut engine, "SELECT pg_advisory_lock(711)", true);
         let sql = "CALL failed_wait()";
         for attempt in 0..2 {
+            // The timeout outlasts the body's first steps on a loaded debug
+            // runner so the call reaches the lock; the deadline is then waited out.
+            let started = Instant::now();
             let status = writer.execute_status(&mut engine, sql, true);
             let ExecutionStatus::Blocked {
                 completed_statements,
@@ -532,7 +535,7 @@ fn procedure_wait_failures_release_saved_frames() {
             };
             assert!(writer.transaction.pending_procedure.is_some(), "{label}");
             if timeout {
-                std::thread::sleep(Duration::from_millis(80));
+                std::thread::sleep(Duration::from_millis(1_050).saturating_sub(started.elapsed()));
             }
             output_mark.truncate_unsent(&mut writer.send);
             writer.arena.recycle_front();

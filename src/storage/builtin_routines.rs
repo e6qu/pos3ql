@@ -203,6 +203,14 @@ impl Storage {
             .len()
     }
 
+    /// The configured number of per-database built-in routine entries.
+    pub(crate) fn builtin_routine_capacity(&self) -> usize {
+        self.builtin_routines
+            .lock()
+            .expect("built-in routine catalog lock poisoned")
+            .capacity()
+    }
+
     pub(super) fn builtin_routine_slot_in(
         &self,
         database: DatabaseOid,

@@ -521,6 +521,9 @@ pub struct SeqSession {
     /// call that the current statement is parked on. The statement's effect
     /// journal replays the sleeps that already finished.
     sleep_until: Cell<Option<i64>>,
+    /// When the current statement first found its database still used by
+    /// other sessions (microseconds since the Unix epoch).
+    database_wait_since: Cell<Option<i64>>,
 }
 
 const INLINE_SEQUENCE_SLOTS: usize = 64;
@@ -572,6 +575,7 @@ impl SeqSession {
             overflow_currvals: None,
             overflow_caches: None,
             sleep_until: Cell::new(None),
+            database_wait_since: Cell::new(None),
         }
     }
 
@@ -582,6 +586,14 @@ impl SeqSession {
 
     pub(super) fn set_sleep_until(&self, deadline: Option<i64>) {
         self.sleep_until.set(deadline);
+    }
+
+    pub(super) fn database_wait_since(&self) -> Option<i64> {
+        self.database_wait_since.get()
+    }
+
+    pub(super) fn set_database_wait_since(&self, started: Option<i64>) {
+        self.database_wait_since.set(started);
     }
 
     pub(crate) const fn extra_budget_bytes(sequence_capacity: usize) -> usize {

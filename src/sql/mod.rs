@@ -22148,7 +22148,7 @@ impl Engine {
                     txn,
                     name,
                     *options,
-                    connections,
+                    exec::OtherDatabaseSessions::new(connections, guc.seq_session()),
                     responder,
                 )
             }
@@ -22161,7 +22161,10 @@ impl Engine {
                     exec::AlterDatabaseCommand {
                         name,
                         action: *action,
-                        active_connections: connections,
+                        other_sessions: exec::OtherDatabaseSessions::new(
+                            connections,
+                            guc.seq_session(),
+                        ),
                         guc,
                     },
                     responder,
@@ -22181,7 +22184,10 @@ impl Engine {
                         name,
                         if_exists: *if_exists,
                         force: *force,
-                        active_connections: connections,
+                        other_sessions: exec::OtherDatabaseSessions::new(
+                            connections,
+                            guc.seq_session(),
+                        ),
                     },
                     responder,
                 )

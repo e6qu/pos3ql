@@ -335,6 +335,29 @@ fn same_set_row(
     })
 }
 
+/// Advances past the reader's staged current row and its duplicates and
+/// returns how many there were. The staged row counts without comparing it to
+/// itself: like PostgreSQL's sorted grouping, only distinct input rows are
+/// compared, so a record field without an ordering is reached only when an
+/// earlier field ties between two rows.
+fn skip_set_duplicates(
+    storage: &Storage,
+    txid: u32,
+    reader: &mut crate::sql::external::ExternalRunReader,
+    staged: usize,
+) -> Result<u64, SqlError> {
+    let mut count = 0u64;
+    loop {
+        count += 1;
+        storage
+            .with_block_store(|blocks| reader.advance(blocks))
+            .expect("spill-attached block store")?;
+        if !same_set_row(storage, txid, reader.row(), reader.output(staged))? {
+            return Ok(count);
+        }
+    }
+}
+
 fn resolve_set_order(
     order_by: &[OrderBy],
     columns: &[ColDesc],
@@ -608,19 +631,8 @@ fn external_set_tree<'a>(
         }
         while left_reader.row().is_some() {
             let left_length = left_reader.stage_current().expect("current left row");
-            let mut left_count = 0u64;
-            while same_set_row(
-                context.storage,
-                context.txid,
-                left_reader.row(),
-                left_reader.output(left_length),
-            )? {
-                left_count += 1;
-                context
-                    .storage
-                    .with_block_store(|blocks| left_reader.advance(blocks))
-                    .expect("spill-attached block store")?;
-            }
+            let left_count =
+                skip_set_duplicates(context.storage, context.txid, &mut left_reader, left_length)?;
             let left_row = left_reader.output(left_length);
             while right_reader
                 .row()
@@ -643,17 +655,12 @@ fn external_set_tree<'a>(
                         })
                         .expect("spill-attached block store")?;
                 }
-                while same_set_row(
+                skip_set_duplicates(
                     context.storage,
                     context.txid,
-                    right_reader.row(),
-                    right_reader.output(right_length),
-                )? {
-                    context
-                        .storage
-                        .with_block_store(|blocks| right_reader.advance(blocks))
-                        .expect("spill-attached block store")?;
-                }
+                    &mut right_reader,
+                    right_length,
+                )?;
             }
             let mut right_count = 0u64;
             while same_set_row(context.storage, context.txid, right_reader.row(), left_row)? {
@@ -693,17 +700,12 @@ fn external_set_tree<'a>(
                         )
                     })
                     .expect("spill-attached block store")?;
-                while same_set_row(
+                skip_set_duplicates(
                     context.storage,
                     context.txid,
-                    right_reader.row(),
-                    right_reader.output(right_length),
-                )? {
-                    context
-                        .storage
-                        .with_block_store(|blocks| right_reader.advance(blocks))
-                        .expect("spill-attached block store")?;
-                }
+                    &mut right_reader,
+                    right_length,
+                )?;
             }
         }
     } else if *operator == SetOp::Union && !*all {
@@ -725,17 +727,7 @@ fn external_set_tree<'a>(
                         )
                     })
                     .expect("spill-attached block store")?;
-                while same_set_row(
-                    context.storage,
-                    context.txid,
-                    reader.row(),
-                    reader.output(right_length),
-                )? {
-                    context
-                        .storage
-                        .with_block_store(|blocks| reader.advance(blocks))
-                        .expect("spill-attached block store")?;
-                }
+                skip_set_duplicates(context.storage, context.txid, &mut reader, right_length)?;
             }
         }
     }

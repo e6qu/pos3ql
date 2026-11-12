@@ -5116,6 +5116,7 @@ fn consume_external_lateral_run<'a>(
     run: crate::sql::external::ExternalRun,
     arena: &'a Arena,
     recycle_rows: bool,
+    retain_match: Option<&core::cell::Cell<bool>>,
     visit: &mut impl FnMut(usize, &'a [u8]) -> Result<bool, SqlError>,
 ) -> Result<bool, SqlError> {
     let mut reader = storage.external_run_reader()?;
@@ -5129,9 +5130,12 @@ fn consume_external_lateral_run<'a>(
         let owned = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
         let keep_scanning = visit(index, owned)?;
         index += 1;
-        if let Some(mark) = mark {
+        if let Some(mark) = mark
+            && !retain_match.is_some_and(core::cell::Cell::get)
+        {
             // SAFETY: the candidate and every evaluator result derived from it
-            // were consumed synchronously by `visit`.
+            // were consumed synchronously by `visit`. A retained match (a
+            // joined DML source row) keeps its copy for the statement.
             unsafe { arena.rewind_to(mark) };
         }
         if !keep_scanning {
@@ -5484,7 +5488,25 @@ fn join_key_types_compatible(a: ColType, b: ColType) -> bool {
     fn is_integer(t: ColType) -> bool {
         matches!(t, ColType::Int2 | ColType::Int4 | ColType::Int8)
     }
-    a == b || (is_integer(a) && is_integer(b))
+    // `oid` and the reg* aliases are binary coercible and hash their OID.
+    fn is_oid(t: ColType) -> bool {
+        matches!(
+            t,
+            ColType::Oid
+                | ColType::Regtype
+                | ColType::Regproc
+                | ColType::Regprocedure
+                | ColType::Regoper
+                | ColType::Regoperator
+                | ColType::Regclass
+                | ColType::Regnamespace
+                | ColType::Regrole
+                | ColType::Regconfig
+                | ColType::Regdictionary
+                | ColType::Regcollation
+        )
+    }
+    a == b || (is_integer(a) && is_integer(b)) || (is_oid(a) && is_oid(b))
 }
 
 /// Extracts every equi-join key for a two-table hash join: each
@@ -7371,6 +7393,7 @@ fn scan_source_mode<'a>(
                             run,
                             arena,
                             recycle_rows,
+                            retain_match,
                             &mut |index, bytes| {
                                 visit_candidate!(index, BoundRow::Encoded(bytes), None)
                             },

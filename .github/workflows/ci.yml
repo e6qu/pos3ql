@@ -92,11 +92,13 @@ jobs:
 
   reactor-ownership:
     needs: native-build
-    name: native build and test (${{ matrix.platform }})
+    name: native build and test (${{ matrix.platform }}, ${{ matrix.suite }})
     strategy:
       fail-fast: false
       matrix:
         platform: [Linux arm64, macOS arm64]
+        # Each suite has its own 15-minute budget on the slower native runners.
+        suite: [contracts, boundaries]
         include:
           - platform: Linux arm64
             runner: ubuntu-24.04-arm
@@ -133,6 +135,7 @@ jobs:
           PY
 
       - name: Function, procedural rollback and HTTP fixture contracts
+        if: matrix.suite == 'contracts'
         shell: bash
         run: |
           native_test_binary=$(python3 tools/native-test-artifact.py verify \
@@ -145,6 +148,7 @@ jobs:
             --test-threads=1
 
       - name: Native SQL, catalog and socket boundaries
+        if: matrix.suite == 'boundaries'
         shell: bash
         run: |
           native_test_binary=$(python3 tools/native-test-artifact.py verify \
@@ -402,7 +406,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [0-of-8, 1-of-8, 2-of-8, 3-of-8, 4-of-8, 5-of-8, 6-of-8, 7-of-8]
+        partition: [0-of-12, 1-of-12, 2-of-12, 3-of-12, 4-of-12, 5-of-12, 6-of-12, 7-of-12, 8-of-12, 9-of-12, 10-of-12, 11-of-12]
     steps:
       - uses: actions/checkout@v5
 

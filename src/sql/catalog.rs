@@ -10103,7 +10103,7 @@ pub(crate) fn synthesize_current<'a>(
         (false, "pg_partitioned_table") => pg_partitioned_table(storage, txid, arena),
         (false, "pg_settings") => pg_settings(arena),
         (false, "pg_prepared_xacts") => pg_prepared_xacts(storage, txid, arena),
-        (false, "pg_proc") => pg_proc(storage, txid, arena),
+        (false, "pg_proc") => pg_proc(storage, txid, purpose, arena),
         (false, "pg_aggregate") => pg_aggregate(storage, txid, arena),
         (false, "pg_operator") => pg_operator(storage, txid, arena),
         (false, "pg_opclass") => pg_opclass(storage, txid, arena),
@@ -17476,52 +17476,43 @@ pub(crate) fn table_constraint_identity_by_oid(
     txid: u32,
     oid: i32,
 ) -> Option<(usize, StackStr<128>)> {
+    // Constraint OIDs are unique, so each kind is matched by its own OID:
+    // one pass over the indexes and one over the tables, not a name lookup
+    // per constraint (which revisits every table's indexes).
+    let mut index_constraint = None;
+    visit_indexes(storage, txid, None, |index| {
+        if index_constraint.is_none()
+            && index
+                .constraint_identity
+                .is_some_and(|identity| identity.oid() == oid)
+        {
+            index_constraint = Some((index.table_slot, StackStr::from_str(index.name.as_str())));
+        }
+    });
+    if index_constraint.is_some() {
+        return index_constraint;
+    }
     for table_slot in 0..storage.table_count() {
         if !storage.table_slot_visible_to(table_slot, txid) {
             continue;
         }
         let table = storage.table_def(table_slot, txid);
-        let candidate = |name: &str| {
-            (table_constraint_oid(storage, txid, table_slot, name) == Some(oid))
-                .then(|| (table_slot, StackStr::from_str(name)))
-        };
-        if let Some(found) = table
-            .partition
-            .detached_bound
-            .and_then(|constraint| candidate(constraint.name.as_str()))
+        let found = |name: &str| Some((table_slot, StackStr::from_str(name)));
+        if let Some(constraint) = table.partition.detached_bound
+            && constraint.oid() == oid
         {
-            return Some(found);
+            return found(constraint.name.as_str());
         }
-        for check in table.checks() {
-            if let Some(found) = candidate(check.name.as_str()) {
-                return Some(found);
-            }
+        if let Some(check) = table.checks().iter().find(|check| check.oid() == oid) {
+            return found(check.name.as_str());
         }
-        for foreign_key in table.fkeys() {
-            if let Some(found) = candidate(foreign_key.name.as_str()) {
-                return Some(found);
-            }
+        if let Some(foreign_key) = table.fkeys().iter().find(|key| key.oid() == oid) {
+            return found(foreign_key.name.as_str());
         }
-        for column in table.columns() {
-            if column.not_null.is_required() {
-                let name = not_null_constraint_name(&table, column);
-                if let Some(found) = candidate(name.as_str()) {
-                    return Some(found);
-                }
+        for (position, column) in table.columns().iter().enumerate() {
+            if column.not_null.is_required() && table.not_null_constraint_oid(position) == oid {
+                return found(not_null_constraint_name(&table, column).as_str());
             }
-        }
-        let mut index_name = None;
-        visit_indexes(storage, txid, None, |index| {
-            if index.table_slot == table_slot
-                && index
-                    .constraint_identity
-                    .is_some_and(|identity| identity.oid() == oid)
-            {
-                index_name = Some(StackStr::from_str(index.name.as_str()));
-            }
-        });
-        if let Some(name) = index_name {
-            return Some((table_slot, name));
         }
     }
     None
@@ -27547,10 +27538,21 @@ fn builtin_proconfig<'a>(
     })
 }
 
-fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_proc<'a>(
+    storage: &Storage,
+    txid: u32,
+    purpose: Materialization,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_proc", false);
-    let row_capacity = callable_signatures::CALLABLES
-        .len()
+    let builtin_capacity = match purpose {
+        Materialization::Query => callable_signatures::CALLABLES.len(),
+        // Entries can be added concurrently; the fixed capacity bounds them.
+        Materialization::History => storage
+            .builtin_routine_capacity()
+            .min(callable_signatures::CALLABLES.len()),
+    };
+    let row_capacity = builtin_capacity
         .checked_add(storage.routine_count())
         .ok_or_else(|| catalog_capacity_exceeded("pg_proc"))?;
     let rows = arena
@@ -27558,9 +27560,21 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         .map_err(|_| arena_full())?;
     let mut count = 0;
     for signature in callable_signatures::CALLABLES {
-        // A retained stored definition is the executable owner of its OID.
-        if storage.routine_slot_by_oid(signature.oid, txid).is_some() {
+        // Stored routines take OIDs from their own band, never a built-in's.
+        // A built-in's row changes only through its per-database entry, so
+        // history captures just the built-ins that have one.
+        if matches!(purpose, Materialization::History)
+            && storage
+                .builtin_routine_slot(
+                    crate::storage::BuiltinRoutineOid::parse(signature.oid)
+                        .expect("callable signatures name built-in routines"),
+                )
+                .is_none()
+        {
             continue;
+        }
+        if count == rows.len() {
+            return Err(catalog_capacity_exceeded("pg_proc"));
         }
         rows[count] = builtin_proc_row(signature, storage, txid, arena)?;
         count += 1;

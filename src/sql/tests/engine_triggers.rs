@@ -273,19 +273,23 @@ fn executor_trigger_errors_timeouts_and_rollbacks_undo_its_effects() {
     assert!(error_sqlstates(&output).is_empty());
     writer.success(
         &mut engine,
-        "SET application_name = 'wait'; SET statement_timeout = '50ms'",
+        "SET application_name = 'wait'; SET statement_timeout = '2s'",
         true,
     );
     holder.success(&mut engine, "SELECT pg_advisory_lock(7)", true);
     let sql = "INSERT INTO t(id, v) VALUES (1,'a'),(2,'b')";
+    // The timeout must outlast the first row's body on a loaded debug runner
+    // so the statement reaches the lock; the deadline is then waited out.
+    let started = std::time::Instant::now();
+    let status = writer.execute_status(&mut engine, sql, true);
     let ExecutionStatus::Blocked {
         completed_statements,
         ..
-    } = writer.execute_status(&mut engine, sql, true)
+    } = status
     else {
-        panic!("the trigger did not wait");
+        panic!("the trigger did not wait: {status:?}");
     };
-    std::thread::sleep(std::time::Duration::from_millis(80));
+    std::thread::sleep(std::time::Duration::from_millis(2_050).saturating_sub(started.elapsed()));
     writer.send.clear();
     writer.arena.recycle_front();
     let status = crate::mem::guard::forbid_alloc(|| {

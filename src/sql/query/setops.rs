@@ -36,12 +36,14 @@ struct ExternalSetContext<'scope, 'a> {
 /// type; the operators combine those multisets; then the trailing ORDER BY /
 /// LIMIT / OFFSET apply to the whole result. Grouped/DISTINCT/aggregate leaves
 /// are rejected loudly (they flow through `select_into_rows`).
+#[allow(clippy::too_many_arguments)]
 pub fn set_query<'a>(
     storage: &'a Storage,
     txid: u32,
     q: &'a SetQuery<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    dml_mats: &[(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)],
     sequences: Option<&dyn SequenceAccess>,
     responder: &mut Responder,
 ) -> Outcome {
@@ -64,7 +66,9 @@ pub fn set_query<'a>(
         ));
     }
     // WITH CTEs and view references expand across the whole tree first.
-    let body = match expand_set_tree_exec(q.with, q.body, storage, txid, arena, params, sequences) {
+    let body = match expand_set_tree_exec(
+        q.with, q.body, storage, txid, arena, params, dml_mats, sequences,
+    ) {
         Ok(b) => b,
         Err(e) => return sql_fail(e),
     };
@@ -215,7 +219,14 @@ pub(crate) fn set_query_into_rows<'a>(
         ));
     }
     let body = expand_set_tree_exec(
-        query.with, query.body, storage, txid, arena, params, sequences,
+        query.with,
+        query.body,
+        storage,
+        txid,
+        arena,
+        params,
+        &[],
+        sequences,
     )?;
     if storage.spill_attached() {
         return external_set_body_into(

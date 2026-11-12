@@ -106,13 +106,16 @@ is owned.
   or a nested-loop or hash join of up to eight such items and `VALUES` lists,
   with an `ORDER BY` or `DISTINCT ON` sorted in `plan_build_bytes` in local mode or a
   `GROUP BY`, `HAVING`, aggregates and plain `DISTINCT` computed there, or a
-  `UNION ALL` of such queries, including paged portals, forward `FETCH` from `NO SCROLL` cursors and
+  `UNION ALL` of such queries, with inlined CTEs, views and simple FROM
+  subqueries merged in, including paged portals, forward `FETCH` from `NO SCROLL` cursors and
   `COPY ... TO STDOUT` of such a query or one table. Remaining:
   - More retained shapes, by the
     [retained plan tree design](docs/architecture.md#retained-plan-tree):
     index-probed joins, RIGHT and FULL joins, grouping sets,
     subqueries other than the simple FROM subqueries merged into their query
-    (scalar, `IN`/`EXISTS`, grouped or bounded derived tables, CTE scans),
+    (scalar, `IN`/`EXISTS`, grouped or bounded derived tables, scans of CTEs
+    that run once, and derived tables whose FROM names collide with the outer
+    query's, such as a `NOT MATERIALIZED` CTE read twice),
     set operations other than `UNION ALL` (and `UNION ALL` under
     `ORDER BY`, in a declared cursor, or with volatile or routine-calling
     expressions), sorts in object-store mode (external runs

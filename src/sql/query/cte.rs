@@ -86,17 +86,16 @@ pub(crate) fn expand_stored_query_exec<'a>(
         storage,
         txid,
         arena,
-        params,
+        ExecutionSubst::materializing(params, sequences),
         &[],
         &[],
         &[],
         &[],
-        sequences,
         0,
         Some(path),
         Some(dependencies),
         None,
-        |name| select_references(select, name),
+        |name| body_references(select, name),
         |context| subst_select_body(select, context, arena),
     )
 }
@@ -258,10 +257,11 @@ fn with_schema_context<'a, 's, R>(
     mut visit: Option<&mut dyn FnMut(ScopedCte<'a>) -> Result<(), SqlError>>,
     build: impl for<'c> FnOnce(Subst<'c, 'a, 's, 'a>) -> Result<R, SqlError>,
 ) -> Result<R, SqlError> {
-    // Resolve CTEs left-to-right so a CTE can reference earlier ones.
+    // Resolve CTEs in dependency order so each reads only resolved ones.
     let mut resolved = ArenaList::new(arena);
     let mut materialized = ArenaList::new(arena);
-    for (index, cte) in with.iter().enumerate() {
+    for &index in cte_order(with, arena)? {
+        let cte = &with[index];
         if with[..index].iter().any(|prior| prior.name == cte.name) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_ALIAS,
@@ -337,6 +337,7 @@ fn with_schema_context<'a, 's, R>(
             }
         } else {
             let query = subst_select(cte.query, context, arena)?;
+            check_inlined_columns(cte, query, storage, txid, arena)?;
             if let Some(visit) = &mut visit {
                 visit(ScopedCte::Select(query))?;
             }
@@ -481,19 +482,65 @@ pub fn expand_ctes_exec<'a>(
         storage,
         txid,
         arena,
-        params,
+        ExecutionSubst::materializing(params, sequences),
         dml_mats,
         &[],
         &[],
         &[],
-        sequences,
         0,
         None,
         None,
         None,
-        |name| select_references(sel, name),
+        |name| body_references(sel, name),
         |context| subst_select_body(sel, context, arena),
     )
+}
+
+/// [`expand_ctes_exec`] for a result stream, which must not run a query
+/// before its first row is read: `None` when some CTE, at any depth or in a
+/// view body, must run once (`MATERIALIZED`, referenced twice, volatile,
+/// recursive or data-modifying). Every other CTE inlines as PostgreSQL's
+/// planner inlines it, and views expand, locked and with their owners'
+/// privileges, as the general executor expands them.
+pub(crate) fn expand_stream_ctes<'a>(
+    sel: &'a Select<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<&'a Select<'a>>, SqlError> {
+    if !select_contains_with(sel) && !storage.has_any_view() {
+        return Ok(Some(sel));
+    }
+    if sel.with.iter().any(|cte| cte.dml.is_some()) {
+        return Ok(None);
+    }
+    analyze_unreferenced_ctes(sel, storage, txid, arena)?;
+    let refused = core::cell::Cell::new(false);
+    let expanded = with_exec_context(
+        sel.with,
+        storage,
+        txid,
+        arena,
+        ExecutionSubst {
+            params: &[],
+            sequences: None,
+            refused: Some(&refused),
+        },
+        &[],
+        &[],
+        &[],
+        &[],
+        0,
+        None,
+        None,
+        None,
+        |name| body_references(sel, name),
+        |context| subst_select_body(sel, context, arena),
+    );
+    if refused.get() {
+        return Ok(None);
+    }
+    expanded.map(Some)
 }
 
 /// PostgreSQL analyses every query in a WITH clause, including one no part
@@ -634,6 +681,49 @@ fn materialized_input_context<'a, 's>(
         recursive_state: None,
         execution: None,
     }
+}
+
+/// The order a WITH list's queries are analysed in: written order, or under
+/// `RECURSIVE` (where any query may read any other) each query after the
+/// ones it reads, as PostgreSQL's `TopologicalSort` orders them. A cycle
+/// through two or more queries is PostgreSQL's 0A000.
+fn cte_order<'a>(with: &[Cte<'_>], arena: &'a Arena) -> Result<&'a [usize], SqlError> {
+    for (index, cte) in with.iter().enumerate() {
+        if with[..index].iter().any(|prior| prior.name == cte.name) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_ALIAS,
+                "WITH query name \"{}\" specified more than once",
+                cte.name
+            ));
+        }
+    }
+    let order = arena
+        .alloc_slice_with(with.len(), |index| index)
+        .map_err(|_| arena_full())?;
+    if !with.iter().any(|cte| cte.recursive) {
+        return Ok(order);
+    }
+    let depends = |reader: usize, read: usize| {
+        reader != read && cte_references(&with[reader], with[read].name) > 0
+    };
+    // order[..done] is sorted; pick the first remaining query whose
+    // dependencies are all sorted.
+    for done in 0..with.len() {
+        let ready = (done..with.len()).find(|&candidate| {
+            (done..with.len()).all(|other| !depends(order[candidate], order[other]))
+        });
+        let Some(ready) = ready else {
+            return Err(crate::sql::error_position::at_reference(
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "mutual recursion between WITH items is not implemented"
+                ),
+                with[order[done]].name,
+            ));
+        };
+        order[done..=ready].rotate_right(1);
+    }
+    Ok(order)
 }
 
 fn materialized_not_shadowed<'a, 'scope>(
@@ -849,12 +939,11 @@ pub(crate) fn expand_stored_rule_expression_exec<'a>(
         storage,
         txid,
         arena,
-        params,
+        ExecutionSubst::materializing(params, sequences),
         &[],
         &[],
         &[],
         &[],
-        sequences,
         0,
         Some(path),
         Some(dependencies),
@@ -1609,12 +1698,11 @@ fn expand_stored_statement_with_transition<'a>(
         storage,
         txid,
         arena,
-        params,
+        ExecutionSubst::materializing(params, sequences),
         &[],
         &[],
         &[],
         &[],
-        sequences,
         0,
         Some(path),
         Some(dependencies),
@@ -1710,12 +1798,11 @@ fn expand_dml_ctes_with_relations<'a>(
         storage,
         txid,
         arena,
-        params,
+        ExecutionSubst::materializing(params, sequences),
         dml_mats,
         relations,
         &[],
         &[],
-        sequences,
         0,
         None,
         None,
@@ -2533,12 +2620,11 @@ fn with_exec_context<'a, 's, 'e, R>(
     storage: &'s Storage,
     txid: u32,
     arena: &'a Arena,
-    params: &'e [Datum<'a>],
+    execution: ExecutionSubst<'e, 'a>,
     dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
     relations: &[(&'a str, &'a MaterializedCte<'a>)],
     inherited_ctes: &CteBindings<'a>,
     inherited_materialized: &[(&'a str, &'a MaterializedCte<'a>)],
-    sequences: Option<&'e dyn SequenceAccess>,
     depth: u32,
     path: Option<crate::storage::PathContext>,
     dependencies: Option<crate::storage::StoredQueryDependencyView<'s>>,
@@ -2564,7 +2650,8 @@ fn with_exec_context<'a, 's, 'e, R>(
             .push((name, relation))
             .map_err(|_| arena_full())?;
     }
-    for (cte_index, cte) in with.iter().enumerate() {
+    for &cte_index in cte_order(with, arena)? {
+        let cte = &with[cte_index];
         if with[..cte_index].iter().any(|prior| prior.name == cte.name) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_ALIAS,
@@ -2595,7 +2682,7 @@ fn with_exec_context<'a, 's, 'e, R>(
             qualifier: None,
             rule_transition: None,
             recursive_state: None,
-            execution: Some(ExecutionSubst { params, sequences }),
+            execution: Some(execution),
         };
         let self_references = select_references(cte.query, cte.name);
         if (cte.search.is_some() || cte.cycle.is_some())
@@ -2607,7 +2694,18 @@ fn with_exec_context<'a, 's, 'e, R>(
                 cte.name
             ));
         }
+        // Under RECURSIVE an earlier CTE may read a later one too.
+        let references = root_references(cte.name)
+            + with
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index > cte_index || cte.recursive && *index < cte_index)
+                .map(|(_, other)| cte_references(other, cte.name))
+                .sum::<usize>();
         if cte.dml.is_some() {
+            if execution.refuses_evaluate_once() {
+                return Err(execution.refuse());
+            }
             let materialized_cte = dml_mats
                 .iter()
                 .find(|(name, _)| *name == cte.name)
@@ -2623,18 +2721,28 @@ fn with_exec_context<'a, 's, 'e, R>(
                 .push((cte.name, materialized_cte))
                 .map_err(|_| arena_full())?;
         } else if cte.recursive && self_references > 0 {
-            let recursive =
-                materialize_recursive(cte, context, storage, txid, arena, params, sequences)?;
+            // PostgreSQL never plans a CTE nothing references, so an
+            // unreferenced recursive query does not run.
+            if references == 0 {
+                continue;
+            }
+            if execution.refuses_evaluate_once() {
+                return Err(execution.refuse());
+            }
+            let recursive = materialize_recursive(
+                cte,
+                context,
+                storage,
+                txid,
+                arena,
+                execution.params,
+                execution.sequences,
+            )?;
             materialized
                 .push((cte.name, recursive))
                 .map_err(|_| arena_full())?;
         } else {
             let query = subst_select(cte.query, context, arena)?;
-            let references = root_references(cte.name)
-                + with[cte_index + 1..]
-                    .iter()
-                    .map(|later| cte_references(later, cte.name))
-                    .sum::<usize>();
             let volatile = select_contains_volatile(query, storage, txid);
             let requires_evaluate_once = match cte.materialization {
                 CteMaterialization::Default => references > 1 || volatile,
@@ -2642,6 +2750,9 @@ fn with_exec_context<'a, 's, 'e, R>(
                 CteMaterialization::NotMaterialized => volatile,
             };
             if references > 0 && requires_evaluate_once {
+                if execution.refuses_evaluate_once() {
+                    return Err(execution.refuse());
+                }
                 let relation = materialize_query_cte(
                     cte.name,
                     cte.columns,
@@ -2649,13 +2760,14 @@ fn with_exec_context<'a, 's, 'e, R>(
                     storage,
                     txid,
                     arena,
-                    params,
-                    sequences,
+                    execution.params,
+                    execution.sequences,
                 )?;
                 materialized
                     .push((cte.name, relation))
                     .map_err(|_| arena_full())?;
             } else {
+                check_inlined_columns(cte, query, storage, txid, arena)?;
                 resolved
                     .push((cte.name, query, cte.columns))
                     .map_err(|_| arena_full())?;
@@ -2685,9 +2797,57 @@ fn with_exec_context<'a, 's, 'e, R>(
         qualifier: None,
         rule_transition: None,
         recursive_state: None,
-        execution: Some(ExecutionSubst { params, sequences }),
+        execution: Some(execution),
     };
     build(context)
+}
+
+/// PostgreSQL analyses a CTE's column list against its query wherever it
+/// is read: an inlined CTE reports a list longer than its output as the WITH
+/// query's, at its name.
+fn check_inlined_columns<'a>(
+    cte: &Cte<'a>,
+    query: &'a Select<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    if cte.columns.is_empty() {
+        return Ok(());
+    }
+    let mark = arena.mark();
+    let described = arena
+        .alloc(SetTree::Select(query))
+        .map_err(|_| arena_full())
+        .and_then(|tree| {
+            let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
+            describe_set_body(
+                storage,
+                tree,
+                txid,
+                &mut described,
+                arena,
+                None,
+                crate::sql::exec::DescriptionTarget::Sql,
+                None,
+            )
+        });
+    // SAFETY: only the column count leaves the description.
+    unsafe { arena.rewind_to(mark) };
+    let available = described?;
+    if cte.columns.len() > available {
+        return Err(crate::sql::error_position::at_reference(
+            sql_err!(
+                sqlstate::INVALID_COLUMN_REFERENCE,
+                "WITH query \"{}\" has {} columns available but {} columns specified",
+                cte.name,
+                available,
+                cte.columns.len()
+            ),
+            cte.name,
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2842,6 +3002,7 @@ pub(crate) fn expand_set_tree<'a>(
 
 /// Like [`expand_set_tree`], but for execution: recursive CTEs materialize to
 /// their fixpoint (see [`expand_ctes_exec`]).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn expand_set_tree_exec<'a>(
     with: &'a [Cte<'a>],
     tree: &'a SetTree<'a>,
@@ -2849,13 +3010,14 @@ pub(super) fn expand_set_tree_exec<'a>(
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
     sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a SetTree<'a>, SqlError> {
     if with.is_empty() && !set_tree_contains_with(tree) && !storage.has_any_view() {
         return Ok(tree);
     }
     let wrapper = wrap_set_tree_with(with, tree, arena)?;
-    let expanded = expand_ctes_exec(wrapper, storage, txid, arena, params, &[], sequences)?;
+    let expanded = expand_ctes_exec(wrapper, storage, txid, arena, params, dml_mats, sequences)?;
     Ok(expanded.set_body.expect("wrapper keeps its set body"))
 }
 
@@ -2968,6 +3130,36 @@ struct Subst<'c, 'a, 's, 'e> {
 struct ExecutionSubst<'e, 'a> {
     params: &'e [Datum<'a>],
     sequences: Option<&'e dyn SequenceAccess>,
+    /// Set when the caller can only use a query whose CTEs all inline (a
+    /// result stream): a CTE that must run once sets it and stops the
+    /// expansion instead of materializing.
+    refused: Option<&'e core::cell::Cell<bool>>,
+}
+
+impl<'e, 'a> ExecutionSubst<'e, 'a> {
+    fn materializing(params: &'e [Datum<'a>], sequences: Option<&'e dyn SequenceAccess>) -> Self {
+        Self {
+            params,
+            sequences,
+            refused: None,
+        }
+    }
+
+    fn refuses_evaluate_once(self) -> bool {
+        self.refused.is_some()
+    }
+
+    /// Marks the expansion refused; the error only unwinds it, and the
+    /// caller reads the mark.
+    fn refuse(self) -> SqlError {
+        if let Some(refused) = self.refused {
+            refused.set(true);
+        }
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "a common table expression that runs once cannot be inlined"
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3043,6 +3235,18 @@ fn select_references(s: &Select, name: &str) -> usize {
         .map(|cte| cte_references(cte, name))
         .sum::<usize>();
     count
+}
+
+/// References to `name` from `select` outside its own `WITH` list, which
+/// counts each CTE's references separately: PostgreSQL's reference count of
+/// a CTE is the main query's references plus those of the other CTEs.
+fn body_references(select: &Select, name: &str) -> usize {
+    select_references(select, name)
+        - select
+            .with
+            .iter()
+            .map(|cte| cte_references(cte, name))
+            .sum::<usize>()
 }
 
 fn cte_references(cte: &Cte<'_>, name: &str) -> usize {
@@ -5137,23 +5341,23 @@ fn subst_select<'a>(
             context.storage,
             context.txid,
             arena,
-            execution.params,
+            execution,
             &[],
             &[],
             context.ctes,
             context.materialized,
-            execution.sequences,
             context.depth,
             context.path,
             context.dependencies,
             context.authorization_role,
-            |name| select_references(select, name),
+            |name| body_references(select, name),
             |inner| subst_select_body(select, inner, arena),
         );
     }
 
     let mut resolved = ArenaList::new(arena);
-    for (index, cte) in select.with.iter().enumerate() {
+    for &index in cte_order(select.with, arena)? {
+        let cte = &select.with[index];
         if select.with[..index]
             .iter()
             .any(|prior| prior.name == cte.name)
@@ -5183,7 +5387,11 @@ fn subst_select<'a>(
         let child = Subst {
             ctes: scoped.as_slice(),
             materialized: materialized_not_shadowed(
-                &select.with[..index + usize::from(cte.recursive)],
+                if cte.recursive {
+                    select.with
+                } else {
+                    &select.with[..index]
+                },
                 context.materialized,
                 arena,
             )?,
@@ -5940,17 +6148,16 @@ fn subst_tableref<'a>(
                 context.storage,
                 context.txid,
                 arena,
-                execution.params,
+                execution,
                 &[],
                 &[],
                 &[],
                 &[],
-                execution.sequences,
                 context.depth + 1,
                 Some(view_path),
                 Some(dependencies.view()),
                 authorization_role,
-                |name| select_references(vsel, name),
+                |name| body_references(vsel, name),
                 |inner| subst_select_body(vsel, inner, arena),
             )?
         } else {

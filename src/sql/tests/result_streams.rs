@@ -113,6 +113,10 @@ enum ColdRequest {
     /// A simple Query over a derived table, which is merged into its query
     /// and streams as the table scan it became.
     Derived,
+    /// A CTE read once, inlined into its query, then merged the same way.
+    Cte,
+    /// A view, expanded under its owner's privileges and merged.
+    View,
 }
 
 #[test]
@@ -151,6 +155,16 @@ fn merged_derived_tables_stream_like_their_table() {
 }
 
 #[test]
+fn inlined_ctes_stream_like_their_table() {
+    cold_result_stream("result-stream-cold-cte", ColdRequest::Cte);
+}
+
+#[test]
+fn views_stream_like_their_table() {
+    cold_result_stream("result-stream-cold-view", ColdRequest::View);
+}
+
+#[test]
 fn distinct_paged_portals_yield_on_cold_reads_and_read_each_object_once() {
     cold_result_stream("result-stream-cold-distinct", ColdRequest::Distinct);
 }
@@ -181,6 +195,11 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
     session.success(
         &mut engine,
         "CREATE TABLE cold_orders(id integer, code text)",
+        false,
+    );
+    session.success(
+        &mut engine,
+        "CREATE VIEW cold_view AS SELECT id AS ident, code FROM cold_orders WHERE id > 0",
         false,
     );
     let mut insert = String::from("INSERT INTO cold_orders VALUES ");
@@ -238,6 +257,11 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
             ColdRequest::Derived => {
                 query("SELECT id, code FROM (SELECT id, code FROM cold_orders) s")
             }
+            ColdRequest::Cte => query(
+                "WITH c AS NOT MATERIALIZED (SELECT id, code FROM cold_orders) \
+                 SELECT id, code FROM c",
+            ),
+            ColdRequest::View => query("SELECT ident, code FROM cold_view"),
             ColdRequest::Union => paged_request(
                 "SELECT id, code FROM cold_orders WHERE id <= 160 UNION ALL \
                  SELECT id, code FROM cold_orders WHERE id > 160",
@@ -371,7 +395,7 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
             assert_eq!(kinds.iter().filter(|kind| **kind == b's').count(), 3);
             assert_eq!(response[kinds.len() - 2].1, b"SELECT 170\0");
         }
-        ColdRequest::Select | ColdRequest::Derived => {
+        ColdRequest::Select | ColdRequest::Derived | ColdRequest::Cte | ColdRequest::View => {
             assert_eq!(kinds.iter().filter(|kind| **kind == b'T').count(), 1);
             assert_eq!(response[kinds.len() - 2].1, b"SELECT 320\0");
         }

@@ -299,7 +299,7 @@ impl CursorQuery {
                 crate::sql::query::stream_query(statement, storage, txid, &self.arena)
             }
             (CursorStatement::Select(statement), crate::sql::query::RetainedUse::Cursor) => {
-                Ok(statement)
+                Ok(Some(statement))
             }
             (CursorStatement::SetQuery(query), crate::sql::query::RetainedUse::Stream) => {
                 crate::sql::query::set_query_select(query, &self.arena).and_then(|select| {
@@ -311,7 +311,13 @@ impl CursorQuery {
             }
         };
         let statement = match statement {
-            Ok(statement) => statement,
+            Ok(Some(statement)) => statement,
+            // A CTE that runs once: the cursor saves its rows instead.
+            Ok(None) => {
+                // SAFETY: nothing borrows the rejected query's bytes.
+                unsafe { self.arena.rewind_to(mark) };
+                return Ok(false);
+            }
             Err(error) => {
                 // SAFETY: nothing borrows the rejected query's bytes.
                 unsafe { self.arena.rewind_to(mark) };

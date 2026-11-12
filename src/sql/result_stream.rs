@@ -134,8 +134,14 @@ impl Engine {
             Stmt::Select(select) => (
                 query::stream_query(select, &self.storage, txid, &self.work).and_then(|stream| {
                     appended = select.set_body.is_some();
-                    let select = stream;
-                    query::RetainedSelect::stream_source(&self.storage, txid, select, &self.work)
+                    stream.map_or(Ok(None), |select| {
+                        query::RetainedSelect::stream_source(
+                            &self.storage,
+                            txid,
+                            select,
+                            &self.work,
+                        )
+                    })
                 }),
                 source_len,
             ),
@@ -144,12 +150,14 @@ impl Engine {
                     .and_then(|select| query::stream_query(select, &self.storage, txid, &self.work))
                     .and_then(|select| {
                         appended = true;
-                        query::RetainedSelect::stream_source(
-                            &self.storage,
-                            txid,
-                            select,
-                            &self.work,
-                        )
+                        select.map_or(Ok(None), |select| {
+                            query::RetainedSelect::stream_source(
+                                &self.storage,
+                                txid,
+                                select,
+                                &self.work,
+                            )
+                        })
                     }),
                 source_len,
             ),
@@ -160,7 +168,11 @@ impl Engine {
                     .and_then(|text| {
                         let select = crate::sql::parser::parse_query(text, &self.work)?;
                         appended = select.set_body.is_some();
-                        let select = query::stream_query(select, &self.storage, txid, &self.work)?;
+                        let Some(select) =
+                            query::stream_query(select, &self.storage, txid, &self.work)?
+                        else {
+                            return Ok((None, text.len()));
+                        };
                         query::RetainedSelect::stream_source(
                             &self.storage,
                             txid,

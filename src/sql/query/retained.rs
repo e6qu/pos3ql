@@ -1634,20 +1634,29 @@ fn branch_admitted<'a>(
 /// is not an explicit `UNION ALL` without ORDER BY, WITH or row locks.
 fn appended_select<'a>(
     query: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<&'a Select<'a>>, SqlError> {
-    if query.set_body.is_none()
-        || !query.with.is_empty()
+    let Some(body) = query.set_body else {
+        return Ok(None);
+    };
+    if !query.with.is_empty()
         || !query.order_by.is_empty()
         || query.with_ties
         || !query.locking.is_empty()
     {
         return Ok(None);
     }
+    let mut leaves = crate::mem::arena::ArenaList::new(arena);
+    if !union_all_leaves(body, &mut leaves)? {
+        return Ok(None);
+    }
     let inner = arena
         .alloc(Select {
             limit: None,
             offset: None,
+            set_body: Some(pull_up_appended(body, storage, txid, arena)?),
             ..*query
         })
         .map_err(|_| arena_full())?;
@@ -1699,22 +1708,60 @@ fn appended_select<'a>(
     Ok(Some(&*wrapper))
 }
 
-/// The query a stream reads for `select`: the appending form of a
-/// `UNION ALL`, else `select` with its simple FROM subqueries pulled up, as
-/// the general executor runs it.
+/// The query a stream reads for `select`, or `None` when it cannot stream:
+/// its CTEs inlined and views expanded (a CTE that must run once keeps it
+/// out), then the appending form of a `UNION ALL`, else the query with its
+/// simple FROM subqueries pulled up, as the general executor runs it.
 pub(crate) fn stream_query<'a>(
     select: &'a Select<'a>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
-) -> Result<&'a Select<'a>, SqlError> {
-    match appended_select(select, arena)? {
-        Some(appended) => Ok(appended),
+) -> Result<Option<&'a Select<'a>>, SqlError> {
+    let Some(select) = super::cte::expand_stream_ctes(select, storage, txid, arena)? else {
+        return Ok(None);
+    };
+    match appended_select(select, storage, txid, arena)? {
+        Some(appended) => Ok(Some(appended)),
         None if select.from.is_some() => {
-            super::pullup::pull_up_subqueries(select, storage, txid, arena, None)
+            super::pullup::pull_up_subqueries(select, storage, txid, arena, None).map(Some)
         }
-        None => Ok(select),
+        None => Ok(Some(select)),
     }
+}
+
+/// `tree` with each query of an explicit `UNION ALL` pulled up, as the
+/// general executor pulls up each query it runs.
+fn pull_up_appended<'a>(
+    tree: &'a crate::sql::ast::SetTree<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a crate::sql::ast::SetTree<'a>, SqlError> {
+    use crate::sql::ast::SetTree;
+    let rebuilt = match tree {
+        SetTree::Select(select) if select.from.is_some() => SetTree::Select(
+            super::pullup::pull_up_subqueries(select, storage, txid, arena, None)?,
+        ),
+        SetTree::Select(_) => return Ok(tree),
+        SetTree::Op {
+            syntax,
+            operator,
+            all,
+            left,
+            right,
+        } => SetTree::Op {
+            syntax: *syntax,
+            operator: *operator,
+            all: *all,
+            left: pull_up_appended(left, storage, txid, arena)?,
+            right: pull_up_appended(right, storage, txid, arena)?,
+        },
+    };
+    arena
+        .alloc(rebuilt)
+        .map(|tree| &*tree)
+        .map_err(|_| arena_full())
 }
 
 /// The Select form of a top-level set query, as subqueries carry one.

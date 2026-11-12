@@ -108,7 +108,8 @@ source (`GROUP BY`, `HAVING`, aggregates and plain `DISTINCT`, below), or
 `DISTINCT ON` the stream sorts (local mode), or a `UNION ALL` of such
 queries without its own `ORDER BY` (below);
 without grouping sets, other set operations, subqueries (a simple subquery in
-FROM is merged into its query first, below), CTEs, row locking or row security, whose read position (one
+FROM is merged into its query first, below), CTEs that run once, row locking
+or row security, whose read position (one
 record per resident row of each table plus the query text) fits
 `result_stream_bytes`. A retained join uses inner, cross and `LEFT` joins
 whose `ON`/`USING` conditions are scalar, non-volatile and call no
@@ -247,6 +248,21 @@ conjuncts without aggregates, volatile calls or subqueries into `WHERE`, so
 they filter rows before aggregation. This happens in the general executor and
 in stream admission alike, so a merged derived table streams like the query it
 became (`src/sql/query/pullup.rs`).
+
+**CTEs and views in streams.** Stream admission expands a query's `WITH`
+list and views as the general executor does, then merges the result as
+above. A CTE is inlined, as PostgreSQL's planner inlines it, when nothing
+forces it to run once: it is not recursive or data-modifying, not
+`MATERIALIZED`, calls nothing volatile, and is read once (or is `NOT
+MATERIALIZED`). A CTE nothing reads never runs. When any CTE, at any depth
+or inside a view, must run once, the statement spools for `shape`: the
+general executor runs that CTE to its end before the first row. A view
+expands under its owner's privileges and is locked as the general executor
+locks it; it merges only when the caller holds `SELECT` on the whole view,
+and otherwise (column privileges only, `security_barrier`) spools. So
+`WITH recent AS (SELECT * FROM orders WHERE id > 100) SELECT * FROM recent`
+streams as the scan of `orders` it becomes, while the same query with `AS
+MATERIALIZED` spools (`src/sql/query/cte.rs`, `expand_stream_ctes`).
 
 Every other shape runs in the general executor, which materializes in the
 statement arena and cannot pause after its first byte. New node kinds are the

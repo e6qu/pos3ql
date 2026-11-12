@@ -1173,6 +1173,7 @@ pub(crate) fn dispatch<'a>(
                 | "pg_blocking_pids"
                 | "pg_cancel_backend"
                 | "pg_terminate_backend"
+                | "pg_log_backend_memory_contexts"
                 | "pg_listening_channels"
                 | "pg_notification_queue_usage"
                 | "pg_advisory_lock"
@@ -1441,6 +1442,27 @@ pub(crate) fn dispatch<'a>(
                     )
                 })?;
                 Ok(Datum::Bool(catalog.signal_backend(pid, terminate)?))
+            }
+            "pg_log_backend_memory_contexts" => {
+                arity(1)?;
+                let pid = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Int2(value) => i32::from(value),
+                    Datum::Int4(value) => value,
+                    Datum::Int8(value) => i32::try_from(value).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range")
+                    })?,
+                    Datum::Null => return Ok(Datum::Null),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
+                };
+                let catalog = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "backend signaling is unavailable"
+                    )
+                })?;
+                Ok(Datum::Bool(catalog.log_backend_memory_contexts(pid)?))
             }
             "pg_listening_channels" => {
                 arity(0)?;

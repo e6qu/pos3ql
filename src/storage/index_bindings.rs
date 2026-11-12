@@ -96,6 +96,12 @@ impl IndexDef {
             .map_or(self.schema, |pending| pending.schema)
     }
 
+    pub(super) fn table_for(&self, transaction: u32) -> SqlName {
+        self.pending_table
+            .filter(|pending| pending.transaction == transaction)
+            .map_or(self.table, |pending| pending.table)
+    }
+
     pub(super) fn namespace_blocker(
         &self,
         schema: SqlName,

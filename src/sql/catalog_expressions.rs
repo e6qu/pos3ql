@@ -155,7 +155,7 @@ pub(super) fn current<'a>(
     Ok(SynthTable { rows, ..table })
 }
 
-fn reference_start(
+pub(crate) fn reference_start(
     source: &str,
     site: parser::ColumnSource<'_>,
     arena: &Arena,
@@ -247,8 +247,19 @@ pub(crate) fn bind<'a>(
             column: 0,
         })
         .map_err(|_| arena_full())?;
+    let mut count = 0;
     if let Some(table) = table {
-        for (target, column) in sites.iter_mut().zip(columns) {
+        for column in columns {
+            // A bare relation name that is no column is the whole row; it has
+            // no column ordinal to bind.
+            if column.qualifier_parts == 0
+                && table.column_index(column.name).is_none()
+                && column.name == table.name.as_str()
+            {
+                continue;
+            }
+            let target = &mut sites[count];
+            count += 1;
             let number = table.column_index(column.name).ok_or_else(|| {
                 sql_err!(
                     sqlstate::UNDEFINED_COLUMN,
@@ -263,7 +274,7 @@ pub(crate) fn bind<'a>(
             };
         }
     }
-    encode(source, kind, sites, output)
+    encode(source, kind, &mut sites[..count], output)
 }
 
 fn bind_policy<'a>(

@@ -10,6 +10,7 @@ use crate::mem::mutex::Mutex;
 mod aggregate_levels;
 mod array_element_comparisons;
 mod assignment_and_name_diagnostics;
+mod bound_definition_renames;
 mod builtin_aggregate_resolution;
 mod builtin_argument_binding;
 mod builtin_routine_changes;
@@ -33,6 +34,7 @@ mod foreign_parent_admission;
 mod function_progress;
 mod geometric_casts;
 mod geometry_assignments;
+mod index_expression_mutability;
 mod index_parent_ownership;
 mod indirect_execute_privileges;
 mod information_schema_domains;
@@ -44,6 +46,7 @@ pub(super) mod object_reads;
 mod oid_alias_comparisons;
 mod owner_role_inheritance;
 mod partition_ancestry;
+mod partition_index_propagation;
 mod plpgsql_data_modifying_with;
 mod plpgsql_row_variables;
 mod polymorphic_resolution;
@@ -60,6 +63,7 @@ mod query_scope_chain;
 mod record_comparisons;
 mod relation_row_types;
 mod result_streams;
+mod rewritten_expression_recovery;
 mod routine_calls;
 mod routine_identity_diagnostics;
 mod routine_selection;
@@ -61056,6 +61060,18 @@ fn enums_order_and_enforce() {
     );
     // DROP RESTRICT fails while a column depends on the enum.
     assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "DROP TYPE mood")).contains("2BP01"));
+    // A column default's cast names the type and its labels as text, so
+    // label and type renames are refused until that table is gone.
+    for refused in [
+        "ALTER TYPE mood RENAME VALUE 'sad' TO 'blue'",
+        "ALTER TYPE mood RENAME TO feeling",
+    ] {
+        assert!(
+            String::from_utf8_lossy(&run_with(&mut e, &mut b, refused)).contains("0A000"),
+            "{refused}"
+        );
+    }
+    run_with(&mut e, &mut b, "DROP TABLE enum_defaults");
     // Renames rewrite inline scalar/array labels while preserving sort order,
     // then move the type identity (including its generated array type).
     run_with(
@@ -70968,7 +70984,7 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
             "SELECT indexdef FROM pg_indexes WHERE tablename = 'copied_cover'",
         )),
         [
-            "CREATE UNIQUE INDEX copied_cover_key_idx ON public.copied_cover USING btree (key) INCLUDE (payload, note)"
+            "CREATE UNIQUE INDEX copied_cover_key_payload_note_idx ON public.copied_cover USING btree (key) INCLUDE (payload, note)"
         ]
     );
     run_with(
@@ -80318,8 +80334,8 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
         )),
         [
             "lifecycle_default_idx|i|f|NULL",
-            "lifecycle_high_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
-            "lifecycle_low_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_high_id_value_payload_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_low_id_value_payload_idx|i|t|{fillfactor=80,deduplicate_items=off}",
             "lifecycle_value_idx|I|f|{fillfactor=80,deduplicate_items=off}",
             "2",
         ]
@@ -80463,8 +80479,8 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
             &mut replayed,
             &mut replay_budget,
             "SELECT relname, relkind, relispartition, reloptions FROM pg_class \
-             WHERE relname IN ('lifecycle_value_idx', 'lifecycle_low_id_idx', \
-                               'lifecycle_high_id_idx', 'lifecycle_expression_idx') \
+             WHERE relname IN ('lifecycle_value_idx', 'lifecycle_low_id_value_payload_idx', \
+                               'lifecycle_high_id_value_payload_idx', 'lifecycle_expression_idx') \
              ORDER BY relname; \
              SELECT attstattarget FROM pg_attribute \
              WHERE attrelid = 'lifecycle_expression_idx'::regclass AND attnum = 1; \
@@ -80477,8 +80493,8 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
         )),
         [
             "lifecycle_expression_idx|i|f|{fillfactor=70,deduplicate_items=on}",
-            "lifecycle_high_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
-            "lifecycle_low_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_high_id_value_payload_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_low_id_value_payload_idx|i|t|{fillfactor=80,deduplicate_items=off}",
             "lifecycle_value_idx|I|f|{fillfactor=80,deduplicate_items=off}",
             "77",
             "lifecycle_space_renamed|{random_page_cost=2,seq_page_cost=1.5,effective_io_concurrency=8}",
@@ -80507,7 +80523,7 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
             &mut replayed,
             &mut replay_budget,
             "SELECT count(*) FROM pg_indexes WHERE indexname IN \
-             ('lifecycle_value_idx', 'lifecycle_low_id_idx', 'lifecycle_high_id_idx')",
+             ('lifecycle_value_idx', 'lifecycle_low_id_value_payload_idx', 'lifecycle_high_id_value_payload_idx')",
         )),
         ["0"]
     );

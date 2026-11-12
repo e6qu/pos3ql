@@ -159,6 +159,51 @@ pub(crate) fn capture_before<'a>(
             }
         }
     }
+    // A `DROP TYPE ... CASCADE` drops every column of the type, as
+    // PostgreSQL's dependency walk does.
+    for root in before.original_drops {
+        let (schema, name) = match *root {
+            ObjectRef::Domain(slot) => {
+                let domain = storage.domain_for(slot, txid);
+                (domain.schema, domain.name)
+            }
+            ObjectRef::Enum(slot) => {
+                let enumeration = storage.enum_for(slot, txid);
+                (enumeration.schema, enumeration.name)
+            }
+            ObjectRef::Composite(slot) => {
+                let composite = storage.composite_for(slot, txid);
+                (composite.schema, composite.name)
+            }
+            _ => continue,
+        };
+        for table_slot in 0..storage.table_count() {
+            if !storage.table_slot_visible_to(table_slot, txid) {
+                continue;
+            }
+            let table = storage.table_def(table_slot, txid);
+            for (column_index, column) in table.columns().iter().enumerate() {
+                if !column
+                    .user_type
+                    .is_some_and(|user_type| user_type.schema == schema && user_type.name == name)
+                {
+                    continue;
+                }
+                dependent_drops
+                    .push((
+                        EventObjectRef::DetachedColumn {
+                            table_oid: crate::sql::catalog::user_table_oid(storage, table_slot),
+                            schema: table.schema,
+                            table: table.name,
+                            column: column.name,
+                            attnum: table.attribute_number(column_index),
+                        },
+                        true,
+                    ))
+                    .map_err(|_| graph_full())?;
+            }
+        }
+    }
     before.dependent_drops = dependent_drops.as_slice();
     Ok(before)
 }
@@ -265,6 +310,99 @@ struct ActiveRows {
 std::thread_local! {
     static DDL_COMMANDS: Cell<Option<ActiveRows>> = const { Cell::new(None) };
     static DROPPED_OBJECTS: Cell<Option<ActiveRows>> = const { Cell::new(None) };
+    static DROP_ORDER: core::cell::RefCell<DropOrder> = const {
+        core::cell::RefCell::new(DropOrder {
+            objects: [(0, 0, 0); MAX_DROP_ORDER],
+            len: 0,
+            overflowed: false,
+        })
+    };
+}
+
+/// The most objects one statement's dependency walks may order for
+/// `pg_event_trigger_dropped_objects`.
+const MAX_DROP_ORDER: usize = 1024;
+
+/// The objects this statement's `DROP` dependency walks reached, in
+/// PostgreSQL's report order. PostgreSQL's `EventTriggerSQLDropAddObject`
+/// pushes each deleted object onto the head of its list, so the dropped
+/// objects come back in exactly this order.
+struct DropOrder {
+    objects: [(i32, i32, i32); MAX_DROP_ORDER],
+    len: usize,
+    overflowed: bool,
+}
+
+/// Starts a statement with no recorded dependency walk.
+pub(crate) fn clear_drop_order() {
+    DROP_ORDER.with(|order| {
+        let mut order = order.borrow_mut();
+        order.len = 0;
+        order.overflowed = false;
+    });
+}
+
+/// Appends one dependency walk's objects, in report order.
+pub(crate) fn record_drop_order(objects: impl Iterator<Item = (i32, i32, i32)>) {
+    DROP_ORDER.with(|order| {
+        let mut order = order.borrow_mut();
+        for object in objects {
+            if order.objects[..order.len].contains(&object) {
+                continue;
+            }
+            if order.len == MAX_DROP_ORDER {
+                order.overflowed = true;
+                return;
+            }
+            let at = order.len;
+            order.objects[at] = object;
+            order.len += 1;
+        }
+    });
+}
+
+/// Orders dropped objects as the statement's dependency walks reached them;
+/// an object no walk reached keeps its place after those that were.
+fn order_drops<'a>(
+    storage: &Storage,
+    txid: u32,
+    drops: &'a [DroppedObject],
+    arena: &'a Arena,
+) -> Result<&'a [DroppedObject], SqlError> {
+    let (len, overflowed) = DROP_ORDER.with(|order| {
+        let order = order.borrow();
+        (order.len, order.overflowed)
+    });
+    if len == 0 || drops.is_empty() {
+        return Ok(drops);
+    }
+    if overflowed {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "dropped objects exceed the {} ordered by one statement",
+            MAX_DROP_ORDER
+        ));
+    }
+    let mut keys = ArenaList::new(arena);
+    for (index, drop) in drops.iter().enumerate() {
+        let object = drop.object(storage, txid)?;
+        let address = (object.class_id, object.object_id, object.sub_id);
+        let position = DROP_ORDER.with(|order| {
+            let order = order.borrow();
+            order.objects[..order.len]
+                .iter()
+                .position(|candidate| *candidate == address)
+                .unwrap_or(usize::MAX)
+        });
+        keys.push((position, index)).map_err(|_| graph_full())?;
+    }
+    let keys = keys.into_mut_slice().map_err(|_| graph_full())?;
+    keys.sort_unstable();
+    let mut ordered = ArenaList::new(arena);
+    for (_, index) in keys.iter() {
+        ordered.push(drops[*index]).map_err(|_| graph_full())?;
+    }
+    Ok(ordered.as_slice())
 }
 
 pub(crate) struct DdlCommandScope(Option<ActiveRows>);
@@ -4692,7 +4830,7 @@ pub(crate) fn collect<'a>(
     debug_assert_eq!(drop_count, drops.len());
     Ok(EventGraphs {
         commands: commands.as_slice(),
-        drops: drops.as_slice(),
+        drops: order_drops(storage, txid, drops.as_slice(), arena)?,
     })
 }
 

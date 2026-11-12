@@ -3627,6 +3627,39 @@ pub fn describe_set_query<'a>(
     )
 }
 
+/// Describes a stored set query with its names bound to captured identities.
+pub(crate) fn describe_stored_set_query<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    q: &'a SetQuery<'a>,
+    (path, dependencies): (
+        crate::storage::PathContext,
+        crate::storage::StoredQueryDependencyView<'_>,
+    ),
+    columns: &mut [ColDesc<'a>],
+    arena: &'a Arena,
+) -> Result<usize, SqlError> {
+    let body = expand_set_tree(
+        q.with,
+        q.body,
+        storage,
+        txid,
+        Some(path),
+        Some(dependencies),
+        arena,
+    )?;
+    describe_set_body(
+        storage,
+        body,
+        txid,
+        columns,
+        arena,
+        None,
+        crate::sql::exec::DescriptionTarget::Sql,
+        None,
+    )
+}
+
 /// Expands WITH CTEs and view references across a whole set-operation tree
 /// (schema-only: a self-referencing recursive CTE binds its non-recursive
 /// term's shape, as in [`expand_ctes`]).

@@ -37,9 +37,29 @@ pub(crate) struct Context<'s> {
     pub parameters: &'s [crate::storage::RoutineParameterDef],
     /// The FROM items of a view, by exposed name. Column references are
     /// qualified when there is more than one, as PostgreSQL prints them.
-    pub joined: &'s [(&'s str, &'s TableDef)],
+    pub joined: &'s [Joined<'s>],
     /// `PRETTYFLAG_PAREN`: parentheses only where precedence requires them.
     pub pretty: bool,
+}
+
+/// A FROM item: the name stored references qualify columns with, the name
+/// printed for it (a renamed table's current name unless it has an alias)
+/// and its definition.
+#[derive(Clone, Copy)]
+pub(crate) struct Joined<'s> {
+    pub name: &'s str,
+    pub printed: &'s str,
+    pub table: &'s TableDef,
+}
+
+impl<'s> Joined<'s> {
+    pub(crate) fn new(name: &'s str, table: &'s TableDef) -> Self {
+        Self {
+            name,
+            printed: name,
+            table,
+        }
+    }
 }
 
 /// The node a pretty-printed child expression appears under.
@@ -64,6 +84,17 @@ pub(crate) fn deparse<'a>(
     let Ok(expression) = crate::sql::parser::parse_expr(source, arena) else {
         return Ok(None);
     };
+    deparse_expression(context, expression, destination, arena)
+}
+
+/// Deparses a parsed expression, such as one whose names were bound to the
+/// catalog identities they captured at CREATE.
+pub(crate) fn deparse_expression<'a>(
+    context: &Context<'_>,
+    expression: &Expr<'_>,
+    destination: Destination,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
     let mut output = Output {
         arena,
         text: ArenaString::new(arena),
@@ -154,9 +185,10 @@ impl Context<'_> {
     /// The one joined FROM item a column reference names.
     fn joined_source(&self, qualifier: Option<&str>, name: &str) -> Option<(&str, &TableDef)> {
         let mut found = None;
-        for (exposed, table) in self.joined {
-            if qualifier.is_some_and(|qualifier| qualifier != *exposed)
-                || !table
+        for joined in self.joined {
+            if qualifier.is_some_and(|qualifier| qualifier != joined.name)
+                || !joined
+                    .table
                     .columns()
                     .iter()
                     .any(|column| column.name.as_str() == name)
@@ -166,9 +198,113 @@ impl Context<'_> {
             if found.is_some() {
                 return None;
             }
-            found = Some((*exposed, *table));
+            found = Some((joined.printed, joined.table));
         }
         found
+    }
+
+    /// The relation a whole-row reference names, with the name it is exposed
+    /// under: `t.*`, or a bare `t` that is neither a column nor a parameter.
+    fn whole_row(&self, expression: &Expr<'_>) -> Option<(&str, &TableDef)> {
+        let (name, bare) = match expression {
+            Expr::WholeRow(name) => (*name, false),
+            Expr::Column {
+                qualifier: None,
+                name,
+            } if !self
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name.as_str() == *name) =>
+            {
+                (*name, true)
+            }
+            _ => return None,
+        };
+        if self.joined.is_empty() {
+            let table = self.table?;
+            return (name == table.name.as_str() && !(bare && table.column_index(name).is_some()))
+                .then_some((table.name.as_str(), table));
+        }
+        if bare
+            && self
+                .joined
+                .iter()
+                .any(|joined| joined.table.column_index(name).is_some())
+        {
+            return None;
+        }
+        self.joined
+            .iter()
+            .find(|joined| joined.name == name)
+            .map(|joined| (joined.printed, joined.table))
+    }
+
+    fn row_type(&self, table: &TableDef) -> Option<i32> {
+        self.storage
+            .find_visible(table.schema.as_str(), table.name.as_str(), self.txid)
+            .map(|slot| super::table_row_type_oid(self.storage, slot, false))
+    }
+
+    /// `(t).column`, which PostgreSQL resolves to the column itself.
+    fn row_field<'e>(&self, expression: &Expr<'e>) -> Option<&'e str> {
+        match expression {
+            Expr::Field { base, field } if *field != "*" && self.whole_row(base).is_some() => {
+                Some(field)
+            }
+            _ => None,
+        }
+    }
+
+    /// A user-defined function selected for a positional call.
+    fn selected_routine(
+        &self,
+        expression: &Expr<'_>,
+    ) -> Result<Option<(usize, crate::storage::RoutineDef)>, SqlError> {
+        let Expr::Call {
+            kind: CallKind::Routine,
+            name,
+            args,
+            argument_names,
+            bound_oid,
+            variadic: false,
+            star: false,
+            distinct: false,
+            order_by: [],
+            over: None,
+            filter: None,
+            ..
+        } = expression
+        else {
+            return Ok(None);
+        };
+        if args.len() > crate::storage::MAX_ROUTINE_ARGUMENTS
+            || argument_names.iter().any(Option::is_some)
+        {
+            return Ok(None);
+        }
+        // A bound call keeps the routine its stored body selected at CREATE.
+        if let Some(slot) =
+            bound_oid.and_then(|oid| self.storage.routine_slot_by_oid(oid, self.txid))
+        {
+            let routine = self.storage.routine_for(slot, self.txid);
+            return Ok((routine.argument_count == args.len()).then_some((slot, routine)));
+        }
+        let mut argument_oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        for (target, argument) in argument_oids.iter_mut().zip(*args) {
+            *target = self.type_of(argument)?.unwrap_or(oid::UNKNOWN);
+        }
+        let crate::storage::RoutineCallSelection::Stored(slot) = self.storage.select_routine_call(
+            name,
+            &[],
+            &argument_oids[..args.len()],
+            false,
+            self.txid,
+            crate::storage::RoutineCallKind::Function,
+        ) else {
+            return Ok(None);
+        };
+        let routine = self.storage.routine_for(slot, self.txid);
+        Ok((routine.argument_count == args.len()).then_some((slot, routine)))
     }
 
     fn named_type(&self, type_name: &str) -> Option<i32> {
@@ -194,7 +330,19 @@ impl Context<'_> {
             | Expr::Like { .. }
             | Expr::Match { .. } => Some(oid::BOOL),
             Expr::Str(_) | Expr::Null => None,
+            _ if self.whole_row(expression).is_some() => self
+                .whole_row(expression)
+                .and_then(|(_, table)| self.row_type(table)),
             Expr::Column { qualifier, name } => self.column_type(*qualifier, name)?,
+            Expr::Field { .. } => match self.row_field(expression) {
+                Some(field) => self.column_type(None, field)?,
+                None => None,
+            },
+            Expr::Call {
+                kind: CallKind::SqlSyntax,
+                name,
+                ..
+            } if name.eq_ignore_ascii_case("row") => Some(oid::RECORD),
             Expr::Cast { type_name, .. } => self.named_type(type_name),
             Expr::Unary {
                 operator: UnaryOp::Not,
@@ -246,9 +394,13 @@ impl Context<'_> {
                 star: true,
                 ..
             } => Some(oid::INT8),
-            Expr::Call { .. } => self
-                .selected_builtin(expression)?
-                .map(|routine| routine.result_oid),
+            Expr::Call { .. } => match self.selected_builtin(expression)? {
+                Some(routine) => Some(routine.result_oid),
+                None => self.selected_routine(expression)?.and_then(|(_, routine)| {
+                    self.storage
+                        .routine_function_result_oid(&routine, self.txid)
+                }),
+            },
             _ => None,
         })
     }
@@ -333,7 +485,9 @@ impl Context<'_> {
         if type_oid == oid::BPCHAR {
             return output.push("bpchar");
         }
-        if let Some(ctype) = ColType::from_oid(type_oid) {
+        if let Some(ctype) = ColType::from_oid(type_oid)
+            && crate::storage::NamedTypeKind::from_oid(type_oid).is_none()
+        {
             return output.push(ctype.name());
         }
         match super::user_type_name_fixed(self.storage, self.txid, type_oid)? {
@@ -462,6 +616,8 @@ impl Context<'_> {
                     Err(_) => return output.unsupported(),
                 }
             }
+            // `enum_out(enum_in(label))` is the label itself.
+            Some(ColType::Enum(_)) => text,
             Some(ctype) if !ctype.is_collatable() || ctype == ColType::Name => {
                 match crate::sql::eval::cast_to(
                     crate::sql::types::Datum::Text(text),
@@ -529,6 +685,64 @@ impl Context<'_> {
             Expr::Float(_) => output.unsupported(),
             Expr::NumericLit(text) => self.constant(text, oid::NUMERIC, output),
             Expr::Bool(value) => output.push(if *value { "true" } else { "false" }),
+            // `get_variable` prints a whole-row variable as `t.*`.
+            _ if self.whole_row(expression).is_some() => {
+                let exposed = self
+                    .whole_row(expression)
+                    .map_or("", |(exposed, _)| exposed);
+                let mut identifier = crate::util::StackStr::<260>::new();
+                write_identifier(&mut identifier, exposed);
+                let _ = identifier.write_str(".*");
+                output.push(identifier.as_str())
+            }
+            Expr::Field { .. } if self.row_field(expression).is_some() => {
+                let field = self.row_field(expression).unwrap_or_default();
+                self.bare(
+                    &Expr::Column {
+                        qualifier: None,
+                        name: field,
+                    },
+                    output,
+                )
+            }
+            Expr::Call {
+                kind: CallKind::SqlSyntax,
+                name,
+                args,
+                ..
+            } if name.eq_ignore_ascii_case("row") => {
+                // The parser expands `ROW(t.*)` into the relation's columns.
+                output.push("ROW(")?;
+                let mut first = true;
+                for argument in *args {
+                    let expansion = match argument {
+                        Expr::WholeRow(_) => self.whole_row(argument),
+                        Expr::Field { base, field: "*" } => self.whole_row(base),
+                        _ => None,
+                    };
+                    let columns = match expansion {
+                        Some((_, table)) => table.columns(),
+                        None => &[],
+                    };
+                    for column in columns {
+                        if !first {
+                            output.push(", ")?;
+                        }
+                        first = false;
+                        let mut identifier = crate::util::StackStr::<260>::new();
+                        write_identifier(&mut identifier, column.name.as_str());
+                        output.push(identifier.as_str())?;
+                    }
+                    if expansion.is_none() {
+                        if !first {
+                            output.push(", ")?;
+                        }
+                        first = false;
+                        self.write(argument, None, output)?;
+                    }
+                }
+                output.push(")")
+            }
             Expr::Column { qualifier, name } => {
                 if self.column_type(*qualifier, name)?.is_none() {
                     return output.unsupported();
@@ -791,6 +1005,48 @@ impl Context<'_> {
                 over: None,
                 ..
             } => output.push("count(*)"),
+            Expr::Call { args, .. } if self.selected_builtin(expression)?.is_none() => {
+                let Some((slot, routine)) = self.selected_routine(expression)? else {
+                    return output.unsupported();
+                };
+                let mut identifier = crate::util::StackStr::<260>::new();
+                // `generate_function_name` qualifies a function the bare
+                // name would not select.
+                let argument_oids = |index: usize| {
+                    let argument = routine.arguments[index];
+                    self.storage
+                        .routine_type_oid(argument.ctype, argument.user_type, self.txid)
+                };
+                let mut parameter_oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                for (index, target) in parameter_oids.iter_mut().enumerate().take(args.len()) {
+                    let Some(found) = argument_oids(index) else {
+                        return output.unsupported();
+                    };
+                    *target = found;
+                }
+                if self.storage.select_routine_call(
+                    routine.name.as_str(),
+                    &[],
+                    &parameter_oids[..args.len()],
+                    false,
+                    self.txid,
+                    crate::storage::RoutineCallKind::Function,
+                ) != crate::storage::RoutineCallSelection::Stored(slot)
+                {
+                    write_identifier(&mut identifier, routine.schema.as_str());
+                    let _ = identifier.write_char('.');
+                }
+                write_identifier(&mut identifier, routine.name.as_str());
+                output.push(identifier.as_str())?;
+                output.push("(")?;
+                for (index, argument) in args.iter().enumerate() {
+                    if index != 0 {
+                        output.push(", ")?;
+                    }
+                    self.write(argument, Some(parameter_oids[index]), output)?;
+                }
+                output.push(")")
+            }
             Expr::Call { name, args, .. } => {
                 let Some(routine) = self.selected_builtin(expression)? else {
                     return output.unsupported();
@@ -1028,6 +1284,8 @@ fn simple(expression: &Expr<'_>, parent: Parent, first: bool) -> bool {
     };
     match expression {
         Expr::Column { .. }
+        | Expr::WholeRow(_)
+        | Expr::Field { .. }
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::NumericLit(_)
@@ -1102,6 +1360,23 @@ fn sql_value_function(name: &str) -> Option<(&'static str, i32)> {
     })
 }
 
+/// `looks_like_function`: a call written in function syntax, which an index
+/// definition prints without surrounding parentheses.
+pub(crate) fn looks_like_function(expression: &Expr<'_>) -> bool {
+    match expression {
+        Expr::Call {
+            kind: CallKind::Routine,
+            ..
+        } => true,
+        Expr::Call {
+            kind: CallKind::SqlSyntax,
+            name,
+            ..
+        } => is_conditional(name) || sql_value_function(name).is_some(),
+        _ => false,
+    }
+}
+
 fn is_conditional(name: &str) -> bool {
     matches!(name, "coalesce" | "nullif" | "greatest" | "least")
 }
@@ -1147,19 +1422,19 @@ fn plain_table<'r>(
 
 /// `pg_get_viewdef(view)` for a view over one table: PostgreSQL's indented
 /// layout, one target per line, with analyzed expressions. Other query shapes
-/// are reported as unsupported.
+/// are reported as unsupported. A stored view's relations, routines and types
+/// are bound to the identities they captured at CREATE and printed under
+/// their current names.
 pub(crate) fn view_definition<'a>(
     storage: &Storage,
     txid: u32,
-    query: &str,
+    select: &'a crate::sql::ast::Select<'a>,
+    dependencies: Option<crate::storage::StoredQueryDependencyView<'_>>,
     column_names: &[&str],
     layout: ViewLayout,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     let pretty = layout.pretty;
-    let Ok(select) = crate::sql::parser::parse_query(query, arena) else {
-        return Ok(None);
-    };
     let Some(from) = select.from else {
         return Ok(None);
     };
@@ -1189,25 +1464,54 @@ pub(crate) fn view_definition<'a>(
     if !wildcard && select.items.len() != column_names.len() {
         return Ok(None);
     }
+    // Binding substitutes captured names only; a subquery would expand the
+    // views it reads, which this layout cannot print.
+    let bind = |expression: &'a Expr<'a>| -> Result<Option<&'a Expr<'a>>, SqlError> {
+        let Some(dependencies) = dependencies else {
+            return Ok(Some(expression));
+        };
+        if expression.contains_subquery() {
+            return Ok(None);
+        }
+        crate::sql::query::bind_stored_expression(expression, storage, txid, dependencies, arena)
+            .map(Some)
+    };
     let sources = core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
     let mut reads: [Option<crate::storage::TableDefinitionRead<'_>>; MAX_JOINED] =
         core::array::from_fn(|_| None);
     for (read, source) in reads.iter_mut().zip(sources.clone()) {
-        let Some(crate::storage::ResolvedRelation::Table(slot)) =
-            storage.resolve_relation(source.schema, source.table, txid)
-        else {
+        let captured = dependencies
+            .and_then(|dependencies| {
+                dependencies.entries().iter().find(|dependency| {
+                    matches!(
+                        dependency.class,
+                        crate::storage::DependencyClass::Table
+                            | crate::storage::DependencyClass::View
+                    ) && dependency.referenced_schema.as_str() == source.schema.unwrap_or("")
+                        && dependency.referenced_name.as_str() == source.table
+                })
+            })
+            .map(|dependency| storage.resolve_stored_query_relation(dependency, txid))
+            .transpose()?;
+        let resolved = match captured {
+            Some(resolved) => Some(resolved),
+            None => storage.resolve_relation(source.schema, source.table, txid),
+        };
+        let Some(crate::storage::ResolvedRelation::Table(slot)) = resolved else {
             return Ok(None);
         };
         *read = Some(storage.table_def(slot, txid));
     }
     let table = reads[0].as_deref().expect("resolved base relation");
-    let mut joined: [(&str, &TableDef); MAX_JOINED] = [("", table); MAX_JOINED];
+    let mut joined = [Joined::new("", table); MAX_JOINED];
     let count = from.joins.len() + 1;
     for ((target, read), source) in joined.iter_mut().zip(&reads).zip(sources) {
-        *target = (
-            source.alias.unwrap_or(source.table),
-            read.as_deref().expect("resolved source"),
-        );
+        let read = read.as_deref().expect("resolved source");
+        *target = Joined {
+            name: source.alias.unwrap_or(source.table),
+            printed: source.alias.unwrap_or(read.name.as_str()),
+            table: read,
+        };
     }
     let context = Context {
         storage,
@@ -1244,7 +1548,10 @@ pub(crate) fn view_definition<'a>(
             let crate::sql::ast::SelectItem::Expr { expression, .. } = &select.items[index] else {
                 return Ok(None);
             };
-            *expression
+            let Some(expression) = bind(expression)? else {
+                return Ok(None);
+            };
+            expression
         };
         if let Expr::Case {
             operand: None,
@@ -1258,8 +1565,26 @@ pub(crate) fn view_definition<'a>(
         } else {
             let natural = context.type_of(expression)?;
             context.write(expression, natural, &mut target)?;
+            // `get_variable` casts a top-level whole-row variable to its row
+            // type so that it is not read back as a `*` expansion.
+            if context.whole_row(expression).is_some() {
+                match natural {
+                    Some(row_type) => {
+                        match super::user_type_name_fixed(context.storage, context.txid, row_type)?
+                        {
+                            Some(name) => {
+                                target.push("::")?;
+                                target.push(name.as_str())?;
+                            }
+                            None => target.unsupported()?,
+                        }
+                    }
+                    None => target.unsupported()?,
+                }
+            }
         }
-        let bare_column = matches!(expression, Expr::Column { name: column, .. } if column == name);
+        let bare_column = context.whole_row(expression).is_none()
+            && matches!(expression, Expr::Column { name: column, .. } if column == name);
         if !bare_column {
             target.push(" AS ")?;
             let mut identifier = crate::util::StackStr::<130>::new();
@@ -1311,7 +1636,11 @@ pub(crate) fn view_definition<'a>(
         relation
     };
     output.push(relation(table, &from.base).as_str())?;
-    for (join, (_, joined_table)) in from.joins.iter().zip(&joined[1..]) {
+    for (join, joined_table) in from
+        .joins
+        .iter()
+        .zip(joined[1..].iter().map(|joined| joined.table))
+    {
         output.push(match join.kind {
             crate::sql::ast::JoinKind::Left => "\n     LEFT JOIN ",
             crate::sql::ast::JoinKind::Right => "\n     RIGHT JOIN ",
@@ -1320,16 +1649,18 @@ pub(crate) fn view_definition<'a>(
         })?;
         output.push(relation(joined_table, &join.table).as_str())?;
         output.push(if pretty { " ON " } else { " ON (" })?;
-        context.write(
-            join.on.expect("checked join condition"),
-            Some(oid::BOOL),
-            &mut output,
-        )?;
+        let Some(condition) = bind(join.on.expect("checked join condition"))? else {
+            return Ok(None);
+        };
+        context.write(condition, Some(oid::BOOL), &mut output)?;
         if !pretty {
             output.push("))")?;
         }
     }
     if let Some(condition) = select.where_clause {
+        let Some(condition) = bind(condition)? else {
+            return Ok(None);
+        };
         output.push("\n  WHERE ")?;
         context.write(condition, Some(oid::BOOL), &mut output)?;
     }
@@ -1339,6 +1670,9 @@ pub(crate) fn view_definition<'a>(
             if index != 0 {
                 output.push(", ")?;
             }
+            let Some(expression) = bind(expression)? else {
+                return Ok(None);
+            };
             let natural = context.type_of(expression)?;
             context.write(expression, natural, &mut output)?;
         }
@@ -1349,8 +1683,11 @@ pub(crate) fn view_definition<'a>(
             if index != 0 {
                 output.push(", ")?;
             }
-            let natural = context.type_of(order.expression)?;
-            context.write(order.expression, natural, &mut output)?;
+            let Some(expression) = bind(order.expression)? else {
+                return Ok(None);
+            };
+            let natural = context.type_of(expression)?;
+            context.write(expression, natural, &mut output)?;
             if order.descending {
                 output.push(" DESC")?;
             }
@@ -1365,6 +1702,9 @@ pub(crate) fn view_definition<'a>(
     }
     for (keyword, value) in [(" OFFSET ", select.offset), (" LIMIT ", select.limit)] {
         if let Some(value) = value {
+            let Some(value) = bind(value)? else {
+                return Ok(None);
+            };
             output.push("\n")?;
             output.push(keyword)?;
             let natural = context.type_of(value)?;

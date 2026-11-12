@@ -2876,6 +2876,29 @@ impl<'a> Parser<'a> {
                     index_expression_source(expression, self.text[start..self.peek_at].trim());
                 self.expect_op(")")?;
                 StatisticsKey::Expression(StatisticsExpression { expression, source })
+            } else if matches!(self.peeked, Tok::Ident(_) | Tok::QuotedIdent(_)) && {
+                // PostgreSQL's `stats_param` also takes a bare function call.
+                let mut lexer = self.lexer.clone();
+                matches!(
+                    lexer
+                        .next_token()
+                        .map_err(|error| ParseError::lexical(error, self.text))?,
+                    Tok::Op("(") | Tok::Op(".")
+                )
+            } {
+                let start = self.peek_at;
+                let expression = self.prefix()?;
+                if !matches!(
+                    expression,
+                    Expr::Call {
+                        kind: crate::sql::ast::CallKind::Routine,
+                        ..
+                    }
+                ) {
+                    return Err(self.syntax_error_here());
+                }
+                let source = self.text[start..self.peek_at].trim();
+                StatisticsKey::Expression(StatisticsExpression { expression, source })
             } else {
                 StatisticsKey::Column(self.col_ident("column name")?)
             };
@@ -4317,8 +4340,14 @@ impl<'a> Parser<'a> {
                 return Err(self.syntax_error_here());
             }
         }
-        let language =
-            language.ok_or_else(|| self.invalid_function_definition("no language specified"))?;
+        // PostgreSQL's CreateFunction: a SQL-standard body implies LANGUAGE SQL.
+        let language = match (language, body) {
+            (Some(language), _) => language,
+            (None, Some(body)) if !matches!(body, crate::sql::ast::RoutineBody::String(_)) => {
+                crate::sql::ast::RoutineLanguage::Sql
+            }
+            (None, _) => return Err(self.invalid_function_definition("no language specified")),
+        };
         if body.is_some_and(|body| {
             !matches!(body, crate::sql::ast::RoutineBody::String(_))
                 && language != crate::sql::ast::RoutineLanguage::Sql

@@ -57,9 +57,11 @@ mod query_relation_sources;
 pub(crate) use query_relation_sources::RelationReference;
 mod routine_lifecycles;
 mod schema_names;
+mod stored_text_names;
 pub(crate) use matview_lifecycles::MatviewDdlUndo;
 pub(crate) use matview_lifecycles::MatviewQueryUndo;
 pub(crate) use schema_names::{SchemaIdentity, SchemaNameUndo};
+pub(crate) use stored_text_names::StoredTextName;
 mod routine_resolution;
 pub(crate) use crate::sql::eval::RoutineCallSelection;
 pub(crate) use routine_resolution::builtin_compatible_element_oid;
@@ -5826,32 +5828,111 @@ pub(crate) struct RuleDefinition {
 }
 
 impl RuleDefinition {
+    /// The condition is an expression and each action a statement, so every
+    /// fragment is parsed on its own and the source is rebuilt around it.
     fn rename_schema(
         &mut self,
         old: SqlName,
         new: SqlName,
         arena: &crate::mem::arena::Arena,
     ) -> Result<(), SqlError> {
-        let mut spans = [RuleTextSpan::EMPTY; MAX_RULE_ACTIONS + 1];
-        if let Some(condition) = self.condition {
-            spans[0] = condition;
-        }
-        spans[1..1 + usize::from(self.action_count)]
-            .copy_from_slice(&self.actions[..usize::from(self.action_count)]);
-        rename_schema_qualified_sql(
-            &mut self.source,
-            &mut spans[..1 + usize::from(self.action_count)],
-            old,
-            new,
+        self.rewrite_fragments(|fragment, kind| {
+            rename_schema_qualified_sql(fragment, &mut [], old, new, kind, arena)
+        })
+        .map(|_| ())
+    }
+
+    /// Renames `NEW.from`/`OLD.from` in the condition and actions. A bare use
+    /// of the name may be the target's column, which text cannot follow.
+    pub(crate) fn rename_target_column(
+        &mut self,
+        from: SqlName,
+        to: SqlName,
+        arena: &crate::mem::arena::Arena,
+    ) -> Result<RowReferenceRename, SqlError> {
+        let mut unqualified = false;
+        let changed = self.rewrite_fragments(|fragment, _| {
+            let outcome = rename_row_reference_columns(fragment, from, to, arena)?;
+            unqualified |= outcome.unqualified;
+            Ok(outcome.changed)
+        })?;
+        Ok(RowReferenceRename {
+            changed,
+            unqualified,
+        })
+    }
+
+    /// Rewrites each fragment in place; text between fragments is kept.
+    fn rewrite_fragments(
+        &mut self,
+        mut rewrite: impl FnMut(
+            &mut StackStr<RULE_SQL_MAX>,
+            crate::sql::parser::StoredSqlKind,
+        ) -> Result<bool, SqlError>,
+    ) -> Result<bool, SqlError> {
+        use core::fmt::Write as _;
+        let mut fragments = [(
+            RuleTextSpan::EMPTY,
             crate::sql::parser::StoredSqlKind::Statements,
-            arena,
-        )?;
+        ); MAX_RULE_ACTIONS + 1];
+        let mut count = 0;
+        if let Some(condition) = self.condition {
+            fragments[0] = (condition, crate::sql::parser::StoredSqlKind::Expression);
+            count = 1;
+        }
+        for span in &self.actions[..usize::from(self.action_count)] {
+            fragments[count] = (*span, crate::sql::parser::StoredSqlKind::Statements);
+            count += 1;
+        }
+        let mut order = [0usize; MAX_RULE_ACTIONS + 1];
+        for (index, slot) in order.iter_mut().enumerate().take(count) {
+            *slot = index;
+        }
+        order[..count].sort_unstable_by_key(|index| fragments[*index].0.start);
+        let mut source = StackStr::<RULE_SQL_MAX>::new();
+        let mut rewritten = [RuleTextSpan::EMPTY; MAX_RULE_ACTIONS + 1];
+        let mut copied = 0;
+        let mut changed = false;
+        for &index in &order[..count] {
+            let (span, kind) = fragments[index];
+            let start = usize::from(span.start);
+            if start < copied {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "rewrite rule fragments overlap"
+                ));
+            }
+            let _ = source.write_str(&self.source.as_str()[copied..start]);
+            let mut fragment = StackStr::<RULE_SQL_MAX>::from_str(self.text(span));
+            changed |= rewrite(&mut fragment, kind)?;
+            let begin = source.as_str().len();
+            let _ = source.write_str(fragment.as_str());
+            rewritten[index] = RuleTextSpan {
+                start: begin as u16,
+                len: (source.as_str().len() - begin) as u16,
+            };
+            copied = start + usize::from(span.len);
+        }
+        let _ = source.write_str(&self.source.as_str()[copied..]);
+        if source.is_truncated() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "rewrite rule definition exceeds {} bytes",
+                RULE_SQL_MAX
+            ));
+        }
+        if !changed {
+            return Ok(false);
+        }
+        self.source = source;
+        let mut next = 0;
         if self.condition.is_some() {
-            self.condition = Some(spans[0]);
+            self.condition = Some(rewritten[0]);
+            next = 1;
         }
         self.actions[..usize::from(self.action_count)]
-            .copy_from_slice(&spans[1..1 + usize::from(self.action_count)]);
-        Ok(())
+            .copy_from_slice(&rewritten[next..next + usize::from(self.action_count)]);
+        Ok(true)
     }
 
     fn view_return(slot: usize, query: &StoredQueryDefinition) -> Self {
@@ -5928,6 +6009,12 @@ pub(crate) enum RuleMetadataChange<'arena> {
     Rename(SqlName),
     SetEnabled(RuleEnabled),
     Schema {
+        old: SqlName,
+        new: SqlName,
+        arena: &'arena crate::mem::arena::Arena,
+    },
+    /// A column of the rule's table was renamed.
+    TargetColumn {
         old: SqlName,
         new: SqlName,
         arena: &'arena crate::mem::arena::Arena,
@@ -10840,6 +10927,10 @@ impl TriggerDef {
         self.definition_to(txid).name
     }
 
+    pub(crate) fn pending_definition(&self) -> Option<PendingTriggerDefinition> {
+        self.pending_definition
+    }
+
     pub(crate) fn enabled_to(&self, txid: u32) -> TriggerEnabled {
         self.definition_to(txid).enabled
     }
@@ -12453,6 +12544,56 @@ impl IndexMutableDefinition {
         clustered: false,
         replica_identity: false,
     };
+}
+
+/// Key expressions and predicate as stored by an index.
+pub(crate) type IndexExpressionImage = (
+    [Option<StackStr<INDEX_EXPRESSION_MAX>>; MAX_INDEX_COLS],
+    Option<StackStr<INDEX_PREDICATE_MAX>>,
+);
+
+/// Admits journaled key expressions and predicate; over-long text is corrupt.
+pub(crate) fn index_expression_image(
+    expressions: [Option<&str>; MAX_INDEX_COLS],
+    predicate: Option<&str>,
+) -> Result<IndexExpressionImage, SqlError> {
+    let corrupt = || {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "journal index expression exceeds its stored limit"
+        )
+    };
+    let mut image = [None; MAX_INDEX_COLS];
+    for (target, source) in image.iter_mut().zip(expressions) {
+        *target = source
+            .map(|text| {
+                let stored = StackStr::from_str(text);
+                (!stored.is_truncated())
+                    .then_some(stored)
+                    .ok_or_else(corrupt)
+            })
+            .transpose()?;
+    }
+    let predicate = predicate
+        .map(|text| {
+            let stored = StackStr::from_str(text);
+            (!stored.is_truncated())
+                .then_some(stored)
+                .ok_or_else(corrupt)
+        })
+        .transpose()?;
+    Ok((image, predicate))
+}
+
+/// The journal form of an index's key expressions and predicate.
+pub(crate) fn index_expression_text(
+    image: &IndexExpressionImage,
+) -> ([Option<&str>; MAX_INDEX_COLS], Option<&str>) {
+    let mut expressions = [None; MAX_INDEX_COLS];
+    for (target, source) in expressions.iter_mut().zip(&image.0) {
+        *target = source.as_ref().map(|text| text.as_str());
+    }
+    (expressions, image.1.as_ref().map(|text| text.as_str()))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -17610,6 +17751,88 @@ pub(crate) fn rename_schema_path(
     Ok(())
 }
 
+/// How a stored trigger condition or rule fragment names a column of its
+/// target relation after `rename_row_reference_columns`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RowReferenceRename {
+    pub(crate) changed: bool,
+    /// The renamed name also appears outside a `NEW.`/`OLD.` reference, where
+    /// a text rewrite cannot tell the target's column from another relation's.
+    pub(crate) unqualified: bool,
+}
+
+/// Renames `NEW.from` and `OLD.from` in stored SQL text. Trigger `WHEN`
+/// conditions can name the target's columns only this way.
+pub(crate) fn rename_row_reference_columns<const N: usize>(
+    source: &mut StackStr<N>,
+    from: SqlName,
+    to: SqlName,
+    arena: &crate::mem::arena::Arena,
+) -> Result<RowReferenceRename, SqlError> {
+    use crate::sql::lexer::{Lexer, Tok};
+    use core::fmt::Write as _;
+    let text = *source;
+    let text = text.as_str();
+    let mark = arena.mark();
+    let result = (|| {
+        let mut output = StackStr::<N>::new();
+        let mut lexer = Lexer::new(text, arena);
+        let mut previous = [Tok::Eof; 2];
+        let mut copied = 0;
+        let mut outcome = RowReferenceRename {
+            changed: false,
+            unqualified: false,
+        };
+        let row = |token: Tok<'_>| match token {
+            Tok::Ident(name) | Tok::QuotedIdent(name) => matches!(name, "new" | "old"),
+            _ => false,
+        };
+        loop {
+            let token = lexer.next_token().map_err(|error| {
+                sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "invalid stored expression at byte {}: {}",
+                    error.at,
+                    error.message
+                )
+            })?;
+            if token == Tok::Eof {
+                break;
+            }
+            let matches = match token {
+                Tok::Ident(name) | Tok::QuotedIdent(name) => name == from.as_str(),
+                _ => false,
+            };
+            if matches {
+                if previous[0] == Tok::Op(".") && row(previous[1]) {
+                    let _ = output.write_str(&text[copied..lexer.token_start()]);
+                    crate::sql::catalog::write_identifier(&mut output, to.as_str());
+                    copied = lexer.token_end();
+                    outcome.changed = true;
+                } else if previous[0] != Tok::Op(".") {
+                    outcome.unqualified = true;
+                }
+            }
+            previous = [token, previous[0]];
+        }
+        let _ = output.write_str(&text[copied..]);
+        if output.is_truncated() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "rewritten stored expression exceeds {} bytes",
+                N
+            ));
+        }
+        Ok((output, outcome))
+    })();
+    // SAFETY: lexing contributes only tokens borrowed from the copied text,
+    // which outlives this call; nothing retains arena references.
+    unsafe { arena.rewind_to(mark) };
+    let (output, outcome) = result?;
+    *source = output;
+    Ok(outcome)
+}
+
 pub(crate) fn rename_schema_qualified_sql<const N: usize>(
     source: &mut StackStr<N>,
     spans: &mut [RuleTextSpan],
@@ -19304,6 +19527,35 @@ impl Storage {
         inspect(self.backend_state().activities.as_slice())
     }
 
+    /// PostgreSQL's `pg_log_backend_memory_contexts`. A pos3ql session draws
+    /// only from pools reserved at startup and has no memory contexts of its
+    /// own (`pg_backend_memory_contexts` is empty), so the log holds the
+    /// header and an empty grand total.
+    pub(crate) fn log_backend_memory_contexts(&self, pid: i32) -> Result<bool, SqlError> {
+        if !self
+            .backend_state()
+            .activities
+            .iter()
+            .any(|activity| activity.pid == pid)
+        {
+            crate::sql::eval::raise_eval_message(
+                crate::sql::eval::EvalMessageLevel::Warning,
+                sqlstate::WARNING,
+                format_args!("PID {pid} is not a PostgreSQL server process"),
+            )?;
+            return Ok(false);
+        }
+        crate::logging::info_args(
+            "backend_memory_contexts",
+            format_args!("logging memory contexts of PID {pid}"),
+        );
+        crate::logging::info(
+            "backend_memory_contexts",
+            "Grand total: 0 bytes in 0 blocks; 0 free (0 chunks); 0 used",
+        );
+        Ok(true)
+    }
+
     pub(crate) fn request_backend_signal(
         &self,
         pid: i32,
@@ -19898,9 +20150,9 @@ impl Storage {
                         self.tables.iter().enumerate().find_map(|(slot, table)| {
                             (table.database() == index.database
                                 && table.visible_to(txid)
-                                && self.table_def(slot, txid).schema == index.schema
-                                && self.table_def(slot, txid).name == index.table)
-                                .then_some(slot)
+                                && self.table_def(slot, txid).schema == index.schema_for(txid)
+                                && self.table_def(slot, txid).name == index.table_for(txid))
+                            .then_some(slot)
                         })
                     })
                     .is_some_and(|table| {
@@ -26933,7 +27185,7 @@ impl Storage {
             AccessClass::Index => self.index_catalog().iter().position(|index| {
                 index.database == current_database()
                     && index.visible_to(txid)
-                    && index.schema.as_str() == schema
+                    && index.schema_for(txid).as_str() == schema
                     && index.name_for(txid).as_str() == name
             }),
             AccessClass::Routine => RoutineIter {
@@ -27019,7 +27271,7 @@ impl Storage {
             }
             AccessClass::Index => {
                 let definition = &self.index(slot);
-                (definition.schema, definition.name_for(txid))
+                (definition.schema_for(txid), definition.name_for(txid))
             }
             AccessClass::Routine => {
                 let definition = self.routine(slot);
@@ -32576,6 +32828,65 @@ impl Storage {
             }
         }
 
+        {
+            let triggers = self
+                .trigger_catalog
+                .lock()
+                .expect("trigger catalog lock poisoned");
+            for trigger in triggers.definitions.iter().filter(|trigger| {
+                trigger.database == current_database()
+                    && trigger.ddl_state != CatalogDdlState::Absent
+            }) {
+                for mut when in [
+                    trigger.when,
+                    trigger
+                        .pending_definition
+                        .and_then(|pending| pending.definition.when),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    rename_schema_qualified_sql(
+                        &mut when,
+                        &mut [],
+                        prior,
+                        name,
+                        crate::sql::parser::StoredSqlKind::Expression,
+                        arena,
+                    )?;
+                }
+            }
+        }
+        {
+            let statistics = self
+                .extended_statistics_catalog
+                .lock()
+                .expect("extended-statistics catalog lock poisoned");
+            for definition in statistics.definitions.iter().filter(|definition| {
+                definition.database == current_database()
+                    && definition.ddl_state != CatalogDdlState::Absent
+            }) {
+                for key in definition.keys.iter().chain(
+                    definition
+                        .pending_keys
+                        .iter()
+                        .flat_map(|pending| &pending.keys),
+                ) {
+                    if let ExtendedStatisticsKey::Expression(source) = key {
+                        let mut source = *source;
+                        rename_schema_qualified_sql(
+                            &mut source,
+                            &mut [],
+                            prior,
+                            name,
+                            crate::sql::parser::StoredSqlKind::Expression,
+                            arena,
+                        )?;
+                    }
+                }
+            }
+        }
+
         let input_renames = self.prepare_schema_input_renames(prior, name, arena)?;
         let revision = self.reserve_table_definition_revision()?;
         schemas[slot].name = name;
@@ -32897,6 +33208,47 @@ impl Storage {
                 rename_schema_name(&mut definition.mutable.schema, prior, name);
                 if let Some(pending) = &mut definition.pending_definition {
                     rename_schema_name(&mut pending.definition.schema, prior, name);
+                }
+                let pending_keys = definition
+                    .pending_keys
+                    .iter_mut()
+                    .flat_map(|pending| &mut pending.keys);
+                for key in definition.keys.iter_mut().chain(pending_keys) {
+                    if let ExtendedStatisticsKey::Expression(source) = key {
+                        rename_schema_qualified_sql(
+                            source,
+                            &mut [],
+                            prior,
+                            name,
+                            crate::sql::parser::StoredSqlKind::Expression,
+                            arena,
+                        )?;
+                    }
+                }
+            }
+        }
+        {
+            let mut triggers = self
+                .trigger_catalog
+                .lock()
+                .expect("trigger catalog lock poisoned");
+            for trigger in triggers.definitions.iter_mut().filter(|trigger| {
+                trigger.database == current_database()
+                    && trigger.ddl_state != CatalogDdlState::Absent
+            }) {
+                let pending = trigger
+                    .pending_definition
+                    .as_mut()
+                    .and_then(|pending| pending.definition.when.as_mut());
+                for when in trigger.when.as_mut().into_iter().chain(pending) {
+                    rename_schema_qualified_sql(
+                        when,
+                        &mut [],
+                        prior,
+                        name,
+                        crate::sql::parser::StoredSqlKind::Expression,
+                        arena,
+                    )?;
                 }
             }
         }
@@ -48535,6 +48887,14 @@ impl Storage {
             .len()
     }
 
+    pub(crate) fn trigger_when_to(
+        &self,
+        slot: usize,
+        txid: u32,
+    ) -> Option<StackStr<TRIGGER_WHEN_MAX>> {
+        self.trigger(slot).definition_to(txid).when
+    }
+
     pub(crate) fn trigger_to(&self, slot: usize, txid: u32) -> TriggerDef {
         self.trigger(slot).effective_to(txid)
     }
@@ -48762,6 +49122,39 @@ impl Storage {
         if old_name != name {
             self.stage_trigger_comment_rename(old_name, name, comment_subid, txid);
         }
+        Ok(TriggerAlter::Changed { prior })
+    }
+
+    /// Stages a rewritten `WHEN` condition (a renamed column or schema it
+    /// names), keeping every other part of the trigger.
+    pub(crate) fn alter_trigger_when(
+        &mut self,
+        slot: usize,
+        when: Option<StackStr<TRIGGER_WHEN_MAX>>,
+        txid: u32,
+    ) -> Result<TriggerAlter, SqlError> {
+        let mut catalog = self
+            .trigger_catalog
+            .lock()
+            .expect("trigger catalog lock poisoned");
+        let trigger = catalog.definitions[slot];
+        let blocker = trigger
+            .pending_definition
+            .map(|pending| pending.txid)
+            .or_else(|| trigger.ddl_state.pending_txid())
+            .filter(|owner| *owner != txid);
+        if let Some(blocker) = blocker {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, blocker, trigger.name_to(txid).as_str()));
+        }
+        let mut definition = trigger.definition_to(txid);
+        if definition.when == when {
+            return Ok(TriggerAlter::Unchanged);
+        }
+        definition.when = when;
+        let prior = trigger.pending_definition;
+        catalog.definitions[slot].pending_definition =
+            Some(PendingTriggerDefinition { txid, definition });
         Ok(TriggerAlter::Changed { prior })
     }
 
@@ -50702,6 +51095,32 @@ impl Storage {
         Ok(prior)
     }
 
+    /// Stages rewritten key expressions and predicate (a renamed column,
+    /// table or schema they name), keeping the index's other settings.
+    pub(crate) fn alter_index_expressions(
+        &self,
+        slot: usize,
+        expressions: [Option<StackStr<INDEX_EXPRESSION_MAX>>; MAX_INDEX_COLS],
+        predicate: Option<StackStr<INDEX_PREDICATE_MAX>>,
+        txid: u32,
+    ) -> Result<Option<PendingIndexDefinition>, SqlError> {
+        let mut catalog = self.index_catalog();
+        let index = catalog[slot];
+        if let Some(owner) = index.pending_owner_other_than(txid) {
+            drop(catalog);
+            return Err(self.catalog_ddl_wait_error(txid, owner, index.name.as_str()));
+        }
+        let prior = index.pending_definition;
+        catalog[slot].pending_definition = Some(PendingIndexDefinition {
+            txid,
+            revision: self.catalog_sequence.next()?,
+            definition: index.mutable_for(txid),
+            expressions,
+            predicate,
+        });
+        Ok(prior)
+    }
+
     pub(crate) fn commit_index_definition(&mut self, slot: usize) -> Result<(), SqlError> {
         self.install_index_definition(slot, 0, None)
     }
@@ -51246,6 +51665,91 @@ impl Storage {
                 }
                 index
             })
+    }
+
+    /// Recovery check of the current database's partitioned indexes, in the
+    /// committed catalog: an attached index's parent index lives on its
+    /// table's direct partitioned parent, and a valid partitioned index has
+    /// exactly one attached index on every partition that can hold one.
+    /// Earlier releases could commit partitions created or attached without
+    /// their copy, which left unique indexes unenforced there; such a state
+    /// is refused rather than served.
+    pub(crate) fn validate_restored_partition_indexes(&self) -> Result<(), SqlError> {
+        let invalid = |message: core::fmt::Arguments<'_>| {
+            sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "restored partitioned index {}",
+                message
+            )
+        };
+        for slot in 0..self.index_count() {
+            let Some(index) = self.index_visible_to(slot, 0) else {
+                continue;
+            };
+            let Some(table) = self.index_table_slot_to(slot, 0) else {
+                continue;
+            };
+            let definition = index.mutable_for(0);
+            if let Some(parent) = definition.parent {
+                let parent = usize::from(parent);
+                let attached_under = self
+                    .table_def(table, 0)
+                    .partition
+                    .attachment
+                    .map(|attachment| usize::from(attachment.parent));
+                let parent_index = self.index_visible_to(parent, 0);
+                if !parent_index.is_some_and(|parent| parent.mutable_for(0).kind.is_partitioned())
+                    || attached_under.is_none()
+                    || self.index_table_slot_to(parent, 0) != attached_under
+                {
+                    return Err(invalid(format_args!(
+                        "attachment of \"{}\" does not follow its table's partition parent",
+                        index.name.as_str()
+                    )));
+                }
+            }
+            if definition.kind != (IndexKind::Partitioned { valid: true }) {
+                continue;
+            }
+            for partition in 0..self.table_count() {
+                if !self.table_slot_visible_to(partition, 0) {
+                    continue;
+                }
+                let partition_def = self.table_def(partition, 0);
+                if partition_def.kind == TableKind::Foreign
+                    || !partition_def
+                        .partition
+                        .attachment
+                        .is_some_and(|attachment| usize::from(attachment.parent) == table)
+                {
+                    continue;
+                }
+                let copies = (0..self.index_count())
+                    .filter(|child| {
+                        self.index_table_slot_to(*child, 0) == Some(partition)
+                            && self.index_visible_to(*child, 0).is_some_and(|child| {
+                                child.mutable_for(0).parent == Some(slot as u16)
+                            })
+                    })
+                    .count();
+                if copies != 1 {
+                    return Err(invalid(format_args!(
+                        "\"{}\" has {} attached indexes on partition \"{}\"; exactly one is required",
+                        index.name.as_str(),
+                        copies,
+                        partition_def.name.as_str()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Recreates the committed state an earlier release could write: a
+    /// partition index no longer attached to its partitioned parent index.
+    #[cfg(test)]
+    pub(crate) fn detach_committed_index_parent_for_test(&self, slot: usize) {
+        self.index_catalog()[slot].mutable.parent = None;
     }
 
     pub(crate) fn index_visible_to(&self, slot: usize, txid: u32) -> Option<IndexDef> {
@@ -55694,10 +56198,12 @@ impl Storage {
             self.validate_rule_edit(&catalog, selected_target, txid)?;
             catalog.rules[slot]
         };
-        let mut schema_dependencies = if let RuleMetadataChange::Schema { arena, .. } = change {
-            Some(self.snapshot_rule_dependencies(slot, txid, arena)?)
-        } else {
-            None
+        let mut schema_dependencies = match change {
+            RuleMetadataChange::Schema { arena, .. }
+            | RuleMetadataChange::TargetColumn { arena, .. } => {
+                Some(self.snapshot_rule_dependencies(slot, txid, arena)?)
+            }
+            RuleMetadataChange::Rename(_) | RuleMetadataChange::SetEnabled(_) => None,
         };
         let target = self.query_rule_target(selected.definition_for(txid).target, txid)?;
         let mut owners = self.catalog_dependency_owners(
@@ -55735,17 +56241,36 @@ impl Storage {
                 rename_schema_path(&mut definition.creation_path, old, new)?;
                 definition.rename_schema(old, new, arena)?;
             }
+            RuleMetadataChange::TargetColumn {
+                old: from,
+                new: to,
+                arena,
+            } => {
+                if definition
+                    .rename_target_column(from, to, arena)?
+                    .unqualified
+                {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cannot rename column \"{}\" because rule \"{}\" names it without NEW or OLD",
+                        from.as_str(),
+                        definition.name.as_str()
+                    ));
+                }
+            }
         }
-        if let RuleMetadataChange::Schema {
-            old: from,
-            new: to,
-            arena,
-        } = change
+        if let RuleMetadataChange::Schema { arena, .. }
+        | RuleMetadataChange::TargetColumn { arena, .. } = change
         {
             let dependencies = schema_dependencies
                 .as_mut()
                 .expect("schema image captured before catalog locks");
-            dependencies.rename_schema(from, to);
+            if let RuleMetadataChange::Schema {
+                old: from, new: to, ..
+            } = change
+            {
+                dependencies.rename_schema(from, to);
+            }
             let inputs = self.relocate_stored_type_inputs(
                 dependencies.type_inputs(),
                 |section| {

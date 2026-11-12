@@ -4909,6 +4909,7 @@ impl Engine {
             storage.rebind_user_type_declarations()?;
             storage.rebind_routine_types()?;
             storage.rebind_all_stored_query_dependencies(0)?;
+            storage.validate_restored_partition_indexes()?;
         }
         for (_, metadata) in prepared_transactions.entries() {
             storage.select_database_for_recovery(metadata.database)?;
@@ -21438,6 +21439,7 @@ impl Engine {
         let _ = eval::take_diagnostic();
         if reset_workspace {
             eval::clear_eval_messages();
+            event_trigger::clear_drop_order();
         }
         exec::reset_record_shapes();
         for (_, composite) in self.storage.composites_with_slots_visible_to(txn.txid) {
@@ -22236,6 +22238,7 @@ impl Engine {
                     identity: routine,
                     actions,
                     guc: Some(guc),
+                    arena,
                 },
                 responder,
             ),
@@ -22245,6 +22248,7 @@ impl Engine {
                 txn,
                 aggregate,
                 *action,
+                arena,
                 responder,
             ),
             Stmt::DropFunction {
@@ -23029,6 +23033,7 @@ impl Engine {
                 txn,
                 exec::DropIndexCommand {
                     names,
+                    arena,
                     if_exists: *if_exists,
                     build: *build,
                     cascade: *cascade,
@@ -29613,6 +29618,7 @@ fn apply_wal_op(
             table,
             new_name,
             enabled,
+            when,
         } => {
             let target = match (
                 target,
@@ -29650,6 +29656,12 @@ fn apply_wal_op(
                     slot,
                     crate::storage::SqlName::parse(new_name)?,
                     enabled,
+                    0,
+                )?;
+                storage.alter_trigger_when(
+                    slot,
+                    when.map(crate::storage::trigger_when_stackstr)
+                        .transpose()?,
                     0,
                 )?;
                 storage.commit_trigger_alter(slot, 0);
@@ -31025,6 +31037,8 @@ fn apply_wal_op(
             schema,
             name,
             definition,
+            expressions,
+            predicate,
         } => {
             let slot = storage.index_slot(schema, name, 0).ok_or_else(|| {
                 sql_err!(
@@ -31033,7 +31047,10 @@ fn apply_wal_op(
                     name
                 )
             })?;
+            let (expressions, predicate) =
+                crate::storage::index_expression_image(expressions, predicate)?;
             storage.alter_index_definition(slot, definition, 0)?;
+            storage.alter_index_expressions(slot, expressions, predicate, 0)?;
             storage.commit_index_definition(slot)?;
         }
         WalOp::CreateTablespace {
@@ -31574,7 +31591,8 @@ fn apply_wal_op(
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
-                        "WAL ownership target \"{}\" does not exist",
+                        "WAL ownership target \"{}\".\"{}\" does not exist",
+                        schema,
                         name
                     )
                 })?;

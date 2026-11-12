@@ -4001,6 +4001,21 @@ fn record_routine_call(
     }
     let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
     for (slot, argument) in argument_oids.iter_mut().zip(args.iter().copied()) {
+        // Without the FROM scope a whole-row reference has no row type yet;
+        // the caller retries with the scope instead of selecting `record`.
+        if let Expr::WholeRow(table) = argument
+            && resolver.scope.is_none()
+            && !ColTypeResolver::is_whole_row(resolver, table)
+        {
+            if unresolved.is_none() {
+                *unresolved = Some(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "missing FROM-clause entry for table \"{}\"",
+                    table
+                ));
+            }
+            return Ok(());
+        }
         match crate::sql::exec::infer_routine_argument_oid(argument, resolver) {
             Ok(oid) => *slot = oid,
             Err(error)

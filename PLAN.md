@@ -453,23 +453,66 @@ statement runs. Column defaults, CHECK constraints, routine parameter defaults
 conditions are printed in PostgreSQL's analyzed form (`'x'::text`,
 `((k >= 1) AND (k <= 5))`), but only for literals, columns, parameters,
 operators, `IN`, `LIKE`, `IS NULL`, `IS [NOT] DISTINCT FROM`, `IS [NOT]
-TRUE/FALSE`, `CASE`, casts, SQL value functions and built-in function calls;
-other expressions (subqueries, user-defined function calls, `$n` parameters,
-array constructors outside a quantified comparison, and whole-row
-references) are still printed as stored. A whole-row reference in an index
-expression or `CHECK` (`CREATE INDEX ON t (f(t.*))`) fails with `0A000`
-until column dependencies record whole-row users, and a view passing `t.*`
-to a function taking the table's row type fails with `42883` because view
-dependency recording still types the reference as `record` (the bare `t`
-spelling works). `pg_get_viewdef` uses PostgreSQL's
+TRUE/FALSE`, `CASE`, casts, SQL value functions, positional calls of
+built-in and user-defined functions, `ROW(...)` and whole-row references;
+other expressions (subqueries, named-argument calls, `$n` parameters and
+array constructors outside a quantified comparison) are still printed as
+stored. Column defaults, CHECK and exclusion predicates, index keys and
+predicates, statistics expressions, trigger `WHEN` conditions, domain
+constraints keep routine and type names as SQL text, so renaming or moving a
+routine or type one of them names, or renaming an enum value it casts to,
+fails with `0A000` (PostgreSQL stores them bound by OID and follows the
+rename); views, rules, policies and SQL-standard routine bodies are bound and
+follow it. Those expressions also resolve unqualified names under the
+session's search path when they run, so `CHECK (f(v) > 0)` created with
+`search_path = s` fails with `42883` once the path lacks `s`. Binding them
+means storing, with each expression, the dependency list captured under the
+creator's path (as `stored_query_dependencies` does for views and policies),
+binding it with `bind_stored_expression` wherever it is evaluated or printed,
+journaling and checkpointing that list with its owner, and then dropping the
+rename refusals. Renaming an enum value that a cast literal in a SQL-standard routine
+body spells (`RETURN 'a'::e`) leaves the body spelling the old label, so the
+call fails with `22P02`. An index key whose value is a row
+(`CREATE INDEX ON t ((t))`) fails with `0A000`, since row values have no stored
+key encoding. A rule action that names its table's renamed column without
+`NEW.` or `OLD.` fails the rename with `0A000`. After a table, routine or type rename,
+`pg_get_viewdef` of a view it cannot deparse (see below) still prints the old
+names from the stored query text. A
+partition's `UNIQUE` or `PRIMARY KEY` constraint cannot be attached to
+its parent's plain unique index, so attaching such a partition builds a
+separate copy where PostgreSQL reuses the constraint's index; constraint
+indexes need a durable link to a parent index first. A partitioned table's
+multi-column `UNIQUE` constraint has its index but no `pg_constraint` row, and
+a child's inherited `NOT NULL` constraint is named after the child
+(`c_k_not_null`) where PostgreSQL keeps the parent's name. `CHECK ... NO
+INHERIT` fails with `42601`; an exclusion constraint over a B-tree index fails
+with `42601`, and `box` has no default GiST operator class. `ALTER TABLE ...
+CLUSTER ON` and `REPLICA IDENTITY USING INDEX` reject an index that backs a
+`PRIMARY KEY` or `UNIQUE` constraint (`42704`), since those indexes have no
+separate index slot to mark. A view's `reloptions` list `security_barrier`
+before `check_option` and omit `security_invoker=false`, where PostgreSQL keeps
+the options as written; keeping them needs the written order in the view's
+journal records and checkpoint image. `pg_operator` lists 27 `=` operators
+where PostgreSQL lists 63, so a foreign key's `conpfeqop`, `conppeqop` and
+`conffeqop` are NULL where PostgreSQL lists each key column's equality
+operator (`{96}`); they need the complete built-in operator rows first. `pg_get_viewdef` uses PostgreSQL's
 layout, including its wrap column, only for a view
 over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
 comma or `USING` joins, subqueries or set operations; other views return their
 query text. In a `BEGIN ATOMIC` body only a `SELECT` of expressions
-without `FROM` is deparsed (`SELECT (x + 1);`); other statements are printed
-one per line as written, where PostgreSQL prints its analyzed form (`INSERT
+without `FROM` is deparsed (`SELECT (x + 1);`, under the current names of
+the routines and types it named); other statements are printed one per line
+as written, keeping names that were since renamed, where PostgreSQL prints its analyzed form (`INSERT
 INTO t (a, b) VALUES (f.x, 'q'::text);`); rule actions (`DO INSERT ...`) are printed as written, and their pretty
-form fails with `0A000`; policy expressions are not deparsed. Errors in a client's query report
+form fails with `0A000`; policy expressions are not deparsed. Notices carry
+no position (`''::tsquery` points at the literal in PostgreSQL). Built-in
+calls with constant arguments are not folded once while planning: `SELECT
+timestamptypmodin('{7}') FROM generate_series(1, 3)` warns three times where
+PostgreSQL warns once, and a later constant error (`SELECT
+timestamptypmodin('{7}'), 1/0`) is reported without the warning PostgreSQL's
+folding raised first. Folding needs each statement to keep its folded values
+for every later evaluation, including after a pause, before it can replace
+the per-row evaluation. Errors in a client's query report
 PostgreSQL's cursor position (the `P` field that psql shows as `LINE 1:` and a
 caret) for syntax errors and for unknown relations, columns, types, functions
 and operators, failed constant input and non-boolean conditions, except a
@@ -559,13 +602,17 @@ classes and families, extensions, policies, triggers, rules, indexes and
 the `pg_depend` walk that `DROP TABLE`, `VIEW`, `MATERIALIZED VIEW`,
 `SEQUENCE`, `FUNCTION`, `TYPE`, `DOMAIN`, `SCHEMA`, `OPERATOR`, `COLLATION`,
 `SERVER`, `FOREIGN DATA WRAPPER` and text search objects share, and
-`pg_event_trigger_dropped_objects` is built by each statement rather than from
-that walk, so a cascade lists its objects in the order the statement drops
-them (`DROP TABLE t CASCADE` lists a view over a materialized view of `t`
-before the materialized view) where PostgreSQL follows the walk; the walk's
-objects would have to be described before they are dropped, into a fixed
-per-statement buffer. `pg_rewrite` lists no rules of built-in views (PostgreSQL has 145
-`_RETURN` rules, at OID `reltype + 1`, and `pg_settings_u`/`pg_settings_n`),
+`pg_event_trigger_dropped_objects` describes each statement's own objects
+and orders them by the walk only for the statements on it. A TOAST table
+shares its table's creation stamp, so it is listed just after the table's
+array type rather than after its `NOT NULL` constraints, and `ALTER TABLE ...
+DROP COLUMN ... CASCADE` lists the column after its dependents instead of
+first. `pg_rewrite` lists no rules of built-in views (PostgreSQL has 145
+`_RETURN` rules, at OID `reltype + 1`, and `pg_settings_u`/`pg_settings_n`)
+and has no `ev_qual` or `ev_action` column (selecting one fails with `42703`);
+they would carry the rule's condition and actions as `pos3ql-catalog-expression-v1`
+nodes, derived from the retained rule body so that the nine-field
+`pg_rewrite` image keeps its shape,
 and `ALTER VIEW` and `ALTER MATERIALIZED VIEW` accept only their own actions,
 so `ALTER VIEW v DISABLE RULE r` fails with `42601` where PostgreSQL reports
 `42809` `ALTER action DISABLE RULE cannot be performed on relation "v"`. A partition key that is an

@@ -1424,7 +1424,15 @@ pub(super) fn attach_constraints(
                 expression,
                 text,
                 validation,
+                no_inherit,
             } => {
+                if *no_inherit && def.partition.is_partitioned() {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_TABLE_DEFINITION,
+                        "cannot add NO INHERIT constraint to partitioned table \"{}\"",
+                        def.name.as_str()
+                    ));
+                }
                 let single_column = expression_variables(expression, def)?.single_column();
                 if text.len() > crate::storage::CHECK_SQL_MAX {
                     return Err(sql_err!(
@@ -1457,6 +1465,7 @@ pub(super) fn attach_constraints(
                     name: constraint_name,
                     expression: crate::util::StackStr::new(),
                     validation: storage_validation(*validation),
+                    no_inherit: *no_inherit,
                 };
                 let stored = stored_relation_expression(text, def, arena)?;
                 let _ = core::fmt::Write::write_str(&mut c.expression, stored);

@@ -1951,6 +1951,8 @@ pub struct CheckConstraint {
     pub name: SqlName,
     pub expression: StackStr<CHECK_SQL_MAX>,
     pub validation: ConstraintValidation,
+    /// `NO INHERIT`: the table's children neither receive nor need it.
+    pub no_inherit: bool,
 }
 
 impl CheckConstraint {
@@ -1959,6 +1961,7 @@ impl CheckConstraint {
         name: SqlName::EMPTY,
         expression: StackStr::new(),
         validation: ConstraintValidation::EnforcedValidated,
+        no_inherit: false,
     };
 }
 

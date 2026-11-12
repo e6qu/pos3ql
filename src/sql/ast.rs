@@ -4052,6 +4052,8 @@ pub enum TableConstraint<'a> {
         /// enforcement time.
         text: &'a str,
         validation: ConstraintValidation,
+        /// `NO INHERIT`: the constraint stays local to its table.
+        no_inherit: bool,
     },
     ForeignKey {
         name: Option<&'a str>,

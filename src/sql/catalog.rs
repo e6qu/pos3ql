@@ -14455,7 +14455,11 @@ fn check_inheritance_count(
             .table_def(usize::from(attachment.parent), txid)
             .checks()
             .iter()
-            .any(|parent| parent.name == child.name && parent.expression == child.expression)
+            .any(|parent| {
+                !parent.no_inherit
+                    && parent.name == child.name
+                    && parent.expression == child.expression
+            })
     }));
     partition_count
         + definition
@@ -14468,7 +14472,9 @@ fn check_inheritance_count(
                     .checks()
                     .iter()
                     .any(|parent| {
-                        parent.name == child.name && parent.expression == child.expression
+                        !parent.no_inherit
+                            && parent.name == child.name
+                            && parent.expression == child.expression
                     })
             })
             .count()
@@ -14611,6 +14617,9 @@ pub fn constraint_def_text<'a>(
                 None => {
                     let _ = write!(rendered, "CHECK (({}))", check.expression.as_str());
                 }
+            }
+            if check.no_inherit {
+                let _ = rendered.write_str(" NO INHERIT");
             }
             append_constraint_attributes(
                 &mut rendered,
@@ -19808,7 +19817,7 @@ fn pg_constraint_values<'a>(
                     text(" ", arena)?,
                     Datum::Bool(!inherited),
                     Datum::Int4(inheritance_count as i32),
-                    Datum::Bool(false),
+                    Datum::Bool(check.no_inherit),
                     Datum::Null,
                     Datum::Null,
                     Datum::Null,

@@ -539,32 +539,28 @@ impl<'a> DerivedTableOuter<'_, '_, '_, 'a> {
         }
     }
 
-    /// The qualifier that names `qualifier.name`'s earlier FROM item in
-    /// `siblings` itself, when one in reach answers it. `siblings` may
-    /// already hold this item and later ones, so an unqualified name is
-    /// resolved among the preceding items and then qualified by its item.
+    /// The qualifier, as written, when an earlier FROM item in reach
+    /// answers `qualifier.name`; [`Self::left_items`] then resolves it.
     fn sibling_qualifier<'q>(
-        &'q self,
+        &self,
         qualifier: Option<&'q str>,
         name: &str,
     ) -> Option<Option<&'q str>> {
         if self.visible_from >= self.preceding {
             return None;
         }
-        match self
+        let reached = match self
             .siblings
             .find_column_in(0..self.preceding, qualifier, name)
         {
-            Ok(ResolvedColumn::Table(table, _)) if self.reachable(table) => {
-                Some(qualifier.or(Some(self.siblings.names[table])))
-            }
-            Ok(ResolvedColumn::Merged(_))
-                if self.visible_from == 0 && self.preceding == self.siblings.n =>
-            {
-                Some(qualifier)
-            }
-            _ => None,
-        }
+            Ok(ResolvedColumn::Table(table, _)) => self.reachable(table),
+            Ok(ResolvedColumn::Merged(merged)) => self.siblings.merged[merged]
+                .parts
+                .iter()
+                .all(|&(table, _)| self.reachable(table)),
+            Err(_) => false,
+        };
+        reached.then_some(qualifier)
     }
 
     fn sibling_table(&self, table: &str) -> bool {
@@ -714,10 +710,20 @@ fn target_hint(error: SqlError, table: &str, qualifier: Option<&str>, name: &str
     )
 }
 
+/// The FROM items before a derived table, as its body reads them.
+fn left_items<'s, 'd>(
+    outer: &DerivedTableOuter<'s, 'd, '_, '_>,
+) -> super::materialize::ScopePrefix<'s, 'd> {
+    super::materialize::ScopePrefix {
+        scope: outer.siblings,
+        visible: outer.preceding,
+    }
+}
+
 impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
-            return super::ScopeSchema(self.siblings).lookup(qualifier, name);
+            return left_items(self).lookup(qualifier, name);
         }
         self.answer(qualifier, name, self.target().lookup(qualifier, name))
     }
@@ -732,7 +738,7 @@ impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
 
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
         if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
-            return super::ScopeSchema(self.siblings).column_type_mod(qualifier, name);
+            return left_items(self).column_type_mod(qualifier, name);
         }
         self.target().column_type_mod(qualifier, name)
     }
@@ -743,7 +749,7 @@ impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
         name: &str,
     ) -> Result<ColType, SqlError> {
         if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
-            return super::ScopeSchema(self.siblings).resolve_column_type(qualifier, name);
+            return left_items(self).resolve_column_type(qualifier, name);
         }
         let enclosing = match self.enclosing {
             Some(enclosing) if !enclosing.is_empty_scope() => {
@@ -771,7 +777,7 @@ impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
 
     fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
         if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
-            return super::ScopeSchema(self.siblings).column_identity(qualifier, name);
+            return left_items(self).column_identity(qualifier, name);
         }
         self.target().column_identity(qualifier, name)
     }
@@ -796,7 +802,7 @@ impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
         arena: &'a Arena,
     ) -> Result<Option<&'a [crate::sql::types::RecordField<'a>]>, SqlError> {
         if self.sibling_table(table) {
-            return super::ScopeSchema(self.siblings).whole_row_fields(table, arena);
+            return left_items(self).whole_row_fields(table, arena);
         }
         self.target().whole_row_fields(table, arena)
     }
@@ -808,8 +814,7 @@ impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
         catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
     ) -> Option<(StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
         if self.sibling_table(table) {
-            return super::ScopeSchema(self.siblings)
-                .whole_row_field_metadata(table, index, catalog);
+            return left_items(self).whole_row_field_metadata(table, index, catalog);
         }
         self.target()
             .whole_row_field_metadata(table, index, catalog)
@@ -821,41 +826,41 @@ impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
         arena: &'a Arena,
     ) -> Result<&'a [crate::sql::types::RecordField<'a>], SqlError> {
         if self.sibling_table(table) {
-            return super::ScopeSchema(self.siblings).whole_row_expansion_fields(table, arena);
+            return left_items(self).whole_row_expansion_fields(table, arena);
         }
         self.target().whole_row_expansion_fields(table, arena)
     }
 
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
         if self.sibling_table(table) {
-            return super::ScopeSchema(self.siblings).whole_row_present(table);
+            return left_items(self).whole_row_present(table);
         }
         self.target().whole_row_present(table)
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
-            return super::ScopeSchema(self.siblings).col_type(qualifier, name);
+            return left_items(self).col_type(qualifier, name);
         }
         self.target().col_type(qualifier, name)
     }
 
     fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
         if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
-            return super::ScopeSchema(self.siblings).column_type_oid(qualifier, name);
+            return left_items(self).column_type_oid(qualifier, name);
         }
         self.target().column_type_oid(qualifier, name)
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
         if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
-            return super::ScopeSchema(self.siblings).collation(qualifier, name);
+            return left_items(self).collation(qualifier, name);
         }
         self.target().collation(qualifier, name)
     }
 
     fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> crate::sql::ast::Collation {
-        let own = super::ScopeSchema(self.siblings).record_field_collation(base, field);
+        let own = left_items(self).record_field_collation(base, field);
         if own != crate::sql::ast::Collation::None && self.visible_from < self.preceding {
             return own;
         }
@@ -864,21 +869,21 @@ impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
 
     fn column_user_type(&self, qualifier: Option<&str>, name: &str) -> Option<UserTypeName> {
         if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
-            return super::ScopeSchema(self.siblings).column_user_type(qualifier, name);
+            return left_items(self).column_user_type(qualifier, name);
         }
         self.target().column_user_type(qualifier, name)
     }
 
     fn whole_row_is_scalar(&self, table: &str) -> bool {
         if self.sibling_table(table) {
-            return super::ScopeSchema(self.siblings).whole_row_is_scalar(table);
+            return left_items(self).whole_row_is_scalar(table);
         }
         self.target().whole_row_is_scalar(table)
     }
 
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         if self.sibling_table(table) {
-            return super::ScopeSchema(self.siblings).whole_row_type(table);
+            return left_items(self).whole_row_type(table);
         }
         self.target().whole_row_type(table)
     }
@@ -2651,10 +2656,18 @@ impl<'d> QueryScope<'d> {
             },
             outer,
         };
+        // Beside a data change's target, which its arguments find but may not
+        // read, they resolve as a LATERAL item's body does.
+        let beside_target = DerivedTableOuter::after(self, true, outer);
+        let arguments: &dyn ColumnLookup<'_> = if self.lateral_from > 0 {
+            &beside_target
+        } else {
+            &columns
+        };
         let def_reference = if self.n == 0 && outer.is_none() {
             table_func_def(tref, storage, txid, arena, params)?
         } else {
-            table_func_def_outer(tref, storage, txid, arena, params, &columns)?
+            table_func_def_outer(tref, storage, txid, arena, params, &arguments)?
         };
         if self.right_of_outer_join {
             self.reject_outer_join_lateral_arguments(tref)?;

@@ -1215,6 +1215,27 @@ pub(crate) fn dispatch<'a>(
                 if args.len() < 3 || star {
                     return Err(arity_err("jsonb subscripting assignment", args.len()));
                 }
+                // Only arrays, jsonb and the subscripted geometric types take
+                // an element assignment; PostgreSQL rejects any other declared
+                // type while analysing it.
+                let declared = crate::sql::types::ColType::from_oid(
+                    crate::sql::eval::expression_type_identity(args[0], row, hooks)?
+                        .routine_argument_oid(),
+                );
+                if let Some(declared) = declared
+                    && !matches!(
+                        declared,
+                        crate::sql::types::ColType::Array(_)
+                            | crate::sql::types::ColType::Jsonb
+                            | crate::sql::types::ColType::Geometry(_)
+                    )
+                {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "cannot subscript type {} because it does not support subscripting",
+                        declared.name()
+                    ));
+                }
                 let base = eval_full(args[0], arena, params, row, hooks)?;
                 let array_target = match base {
                     Datum::Array { .. } => true,

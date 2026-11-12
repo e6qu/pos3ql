@@ -1288,6 +1288,165 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
     }
 }
 
+/// [`ScopeSchema`] over the first `visible` FROM items of a scope: what a
+/// `LATERAL` item's body reads of the items to its left, never its own or a
+/// later item's columns.
+#[derive(Clone, Copy)]
+pub(crate) struct ScopePrefix<'s, 'd> {
+    pub(crate) scope: &'s QueryScope<'d>,
+    pub(crate) visible: usize,
+}
+
+impl ScopePrefix<'_, '_> {
+    fn whole(&self) -> bool {
+        self.visible >= self.scope.n
+    }
+
+    fn entry(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<super::scope::ResolvedColumn, SqlError> {
+        self.scope.find_column_among(self.visible, qualifier, name)
+    }
+
+    fn names_visible_item(&self, table: &str) -> bool {
+        self.scope
+            .source(table)
+            .is_ok_and(|source| source.table < self.visible)
+    }
+}
+
+impl<'a> ColumnLookup<'a> for ScopePrefix<'_, '_> {
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        if self.whole() {
+            return ColumnLookup::<'a>::column_type_mod(&ScopeSchema(self.scope), qualifier, name);
+        }
+        match self.entry(qualifier, name) {
+            Ok(super::scope::ResolvedColumn::Table(table, column)) => self
+                .scope
+                .defs
+                .get(table)
+                .and_then(|definition| definition.columns.get(column))
+                .map_or(-1, |column| column.type_mod),
+            _ => -1,
+        }
+    }
+
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn super::super::eval::CatalogAccess>,
+    ) -> Option<(crate::util::StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        if !self.whole() && !self.names_visible_item(table) {
+            return None;
+        }
+        ColumnLookup::<'a>::whole_row_field_metadata(
+            &ScopeSchema(self.scope),
+            table,
+            index,
+            catalog,
+        )
+    }
+
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        if self.whole() {
+            return ColumnLookup::<'a>::resolve_column_type(
+                &ScopeSchema(self.scope),
+                qualifier,
+                name,
+            );
+        }
+        match self.entry(qualifier, name) {
+            Ok(column) => Ok(self.scope.output_type(column)),
+            Err(error)
+                if qualifier.is_none()
+                    && error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    && self.names_visible_item(name) =>
+            {
+                self.scope.whole_row_type(name).ok_or(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.visible.min(self.scope.n) == 0
+    }
+
+    fn lookup(&self, _qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" does not exist",
+            name
+        ))
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        if self.whole() {
+            return ColumnLookup::<'a>::col_type(&ScopeSchema(self.scope), qualifier, name);
+        }
+        match self.entry(qualifier, name) {
+            Ok(entry) => Some(self.scope.output_type(entry)),
+            Err(error)
+                if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    && qualifier.is_none()
+                    && self.names_visible_item(name) =>
+            {
+                self.scope.whole_row_type(name)
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> Collation {
+        self.entry(qualifier, name)
+            .ok()
+            .map(|entry| self.scope.output_collation(entry))
+            .unwrap_or(Collation::None)
+    }
+
+    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> Collation {
+        ScopeSchema(self.scope).record_field_collation(base, field)
+    }
+
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
+        match self.entry(qualifier, name).ok()? {
+            super::scope::ResolvedColumn::Table(table, column) => {
+                self.scope.defs.get(table)?.columns.get(column)?.user_type
+            }
+            super::scope::ResolvedColumn::Merged(_) => None,
+        }
+    }
+
+    fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
+        match self.entry(qualifier, name).ok()? {
+            super::scope::ResolvedColumn::Table(t, c) => Some((t as u32, c as u32)),
+            super::scope::ResolvedColumn::Merged(m) => Some((u32::MAX, m as u32)),
+        }
+    }
+
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        (self.whole() || self.names_visible_item(table))
+            && self.scope.func_scalar_type(table).is_some()
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        (self.whole() || self.names_visible_item(table))
+            .then(|| self.scope.whole_row_type(table))
+            .flatten()
+    }
+}
+
 /// `postponed` marks output deferred until after sorting. Encoded rows append
 /// raw source columns and source-presence flags starting at `raw_at`.
 pub(crate) struct PostponedProjection {

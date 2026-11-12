@@ -3893,8 +3893,10 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
                     Expr::Cast { type_mod, .. } => *type_mod,
                     _ => -1,
                 };
+                // A single array's element column takes the table alias, as a
+                // scalar function's column does; several stay `unnest`.
                 default_cols[index] = table_function_column(
-                    SqlName::parse("unnest")?,
+                    SqlName::parse(if args.len() == 1 { name } else { "unnest" })?,
                     ctype,
                     user_type,
                     type_mod,

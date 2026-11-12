@@ -19481,7 +19481,12 @@ enum ParsedPlpgsqlLocalType<'a> {
 #[derive(Clone, Copy)]
 enum PlpgsqlRecordShape {
     Dynamic,
-    Table(u16),
+    /// A table's row type: the table's slot, and the row type whose fields
+    /// a NULL row's field references are typed by.
+    Table {
+        slot: u16,
+        row_type: crate::storage::TypeCreation,
+    },
 }
 
 /// Ordering follows lexical nesting, independently of handler-buffer slots.
@@ -19511,6 +19516,17 @@ struct TriggerLocalDecl {
     record_shape: Option<PlpgsqlRecordShape>,
     constant: bool,
     not_null: bool,
+}
+
+impl TriggerLocalDecl {
+    /// The type the variable is declared with: a table's row variable has
+    /// the table's row type.
+    fn declared_type(&self) -> ColType {
+        match self.record_shape {
+            Some(PlpgsqlRecordShape::Table { row_type, .. }) => ColType::Composite(Some(row_type)),
+            _ => self.ctype,
+        }
+    }
 }
 
 /// Per-firing context stays distinct from lexical local bindings, including
@@ -26030,11 +26046,13 @@ fn resolve_plpgsql_rowtype(
                 "table catalog exceeds PL/pgSQL rowtype capacity"
             )
         })?;
+        let row_type = storage
+            .relation_row_type_creation(crate::storage::RowTypeRelation::Table(usize::from(slot)));
         return Ok((
             ColType::Record,
             None,
             -1,
-            Some(PlpgsqlRecordShape::Table(slot)),
+            Some(PlpgsqlRecordShape::Table { slot, row_type }),
         ));
     }
     let result = resolve_routine_type(storage, txid, written)?;
@@ -27264,10 +27282,10 @@ fn plpgsql_row_variable(
         .rposition(|local| local.name.as_str() == name)?;
     let local = locals[index];
     match values[index] {
-        // A table row variable's fields come from its table, which the
-        // value scope reads.
         Datum::Null => match (local.record_shape, local.ctype) {
-            (Some(PlpgsqlRecordShape::Table(_)), _) => None,
+            (Some(PlpgsqlRecordShape::Table { row_type, .. }), _) => {
+                Some(RowVariable::Declared(row_type))
+            }
             (_, ColType::Composite(Some(creation))) => Some(RowVariable::Declared(creation)),
             (_, ColType::Record) => Some(RowVariable::Unassigned),
             _ => None,
@@ -27631,7 +27649,7 @@ where
             })
         };
         let type_oid = match (local.record_shape, local.ctype) {
-            (Some(PlpgsqlRecordShape::Table(slot)), _) => catalog()?
+            (Some(PlpgsqlRecordShape::Table { slot, .. }), _) => catalog()?
                 .table_row_type_oid(usize::from(slot))
                 .ok_or_else(|| {
                     sql_err!(
@@ -27692,7 +27710,7 @@ where
                 Datum::Null
                     if matches!(
                         self.locals[index].record_shape,
-                        Some(PlpgsqlRecordShape::Table(_))
+                        Some(PlpgsqlRecordShape::Table { .. })
                     ) || matches!(self.locals[index].ctype, ColType::Composite(_)) =>
                 {
                     return Ok(Datum::Null);
@@ -27743,6 +27761,12 @@ where
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         if self.names_trigger_record(qualifier) {
             return self.transition.col_type(qualifier, name);
+        }
+        // A table's row variable has the table's row type.
+        if qualifier.is_none()
+            && let Some(index) = self.local_index(name)
+        {
+            return Some(self.locals[index].declared_type());
         }
         self.named(qualifier, name)
             .map(|variable| variable.ctype)
@@ -32322,7 +32346,7 @@ fn coerce_plpgsql_local<'a>(
     sequences: &dyn crate::sql::eval::SequenceAccess,
 ) -> Result<Datum<'a>, SqlError> {
     let value = match local.record_shape {
-        Some(PlpgsqlRecordShape::Table(slot)) => {
+        Some(PlpgsqlRecordShape::Table { slot, .. }) => {
             let definition = storage.table_def(usize::from(slot), txid);
             let mut target_oids = [0; MAX_COLUMNS];
             for (oid, column) in target_oids.iter_mut().zip(definition.columns()) {
@@ -32943,7 +32967,7 @@ fn assign_trigger_record_field<'a>(
     };
     let current: &[RecordField<'a>] = match (values[record], local.record_shape, local.ctype) {
         (Datum::Record(fields) | Datum::Composite { fields, .. }, _, _) => fields,
-        (Datum::Null, Some(PlpgsqlRecordShape::Table(slot)), _) => {
+        (Datum::Null, Some(PlpgsqlRecordShape::Table { slot, .. }), _) => {
             let definition = storage.table_def(usize::from(slot), txid);
             declared(
                 &mut definition

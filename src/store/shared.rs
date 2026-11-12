@@ -63,6 +63,14 @@ impl<Store: BlockStore + ?Sized> BlockStore for SharedBlockStore<'_, Store> {
         self.lock().read_capacity_generation()
     }
 
+    fn owner_awaits_read(&self, owner: super::ReadOwner) -> bool {
+        self.lock().owner_awaits_read(owner)
+    }
+
+    fn exchange_fetch_history(&mut self, history: &mut super::FetchHistory) {
+        self.lock().exchange_fetch_history(history);
+    }
+
     fn enable_async_gets(&mut self) {
         self.lock().enable_async_gets();
     }

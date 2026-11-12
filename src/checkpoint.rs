@@ -2712,6 +2712,20 @@ impl Checkpointer {
             .cancel_read_owner(owner);
     }
 
+    pub(crate) fn exchange_fetch_history(&mut self, history: &mut crate::store::FetchHistory) {
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .exchange_fetch_history(history);
+    }
+
+    pub(crate) fn owner_awaits_read(&self, owner: crate::store::ReadOwner) -> bool {
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .owner_awaits_read(owner)
+    }
+
     pub(crate) fn read_capacity_generation(&self) -> u64 {
         self.blocks
             .lock()

@@ -229,9 +229,8 @@ is owned.
     that reread.
   - In object-store mode a join or grouping runs in the general executor
     first and streams only once its output overflows, so a cold input larger
-    than the block caches can evict its own blocks between restarts and
-    never finish; reading such an input synchronously would block every
-    other session. Opening such a stream before it runs needs the
+    than the block caches restarts on each cold read until the synchronous
+    fallback reads it. Opening such a stream before it runs needs the
     retained readers to report the general executor's analysis errors
     (literal checks in join conditions, aggregates owned by an outer query,
     user functions named like aggregates, aggregates over `record`) and to

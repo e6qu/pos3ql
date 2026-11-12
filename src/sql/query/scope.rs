@@ -2234,7 +2234,7 @@ impl<'d> QueryScope<'d> {
             .map_err(|error| crate::sql::error_position::column_reference(error, qualifier, name))
     }
 
-    fn find_column_unpositioned(
+    pub(super) fn find_column_unpositioned(
         &self,
         qualifier: Option<&str>,
         name: &str,

@@ -48,6 +48,15 @@ COPY_TABLE = "COPY result_stream_rows TO STDOUT"
 QUERIES = (
     (f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g", ROWS, ALL_PROTOCOLS, BOTH),
     ("SELECT id, payload FROM result_stream_rows", TABLE_ROWS, ALL_PROTOCOLS, BOTH),
+    # An uncorrelated IN list runs when the first row reads it and stays
+    # with the reader for the rest of the statement.
+    (
+        "SELECT id, payload FROM result_stream_rows "
+        "WHERE id % 3 IN (SELECT g FROM generate_series(0, 2) g)",
+        TABLE_ROWS,
+        ALL_PROTOCOLS,
+        BOTH,
+    ),
     # Nested-loop joins resume row by row, paged portals included.
     (
         f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g, (VALUES (1)) v",
@@ -68,6 +77,14 @@ QUERIES = (
     # spools, and a paged portal would buffer more than portal_result_bytes.
     (
         "SELECT id, payload FROM result_stream_rows ORDER BY -id DESC",
+        TABLE_ROWS,
+        LOCAL_PAGED,
+        LOCAL,
+    ),
+    # A sorted stream keeps its uncorrelated subqueries too.
+    (
+        "SELECT id, payload FROM result_stream_rows "
+        "WHERE id > (SELECT min(g) - 1 FROM generate_series(1, 3) g) ORDER BY -id DESC",
         TABLE_ROWS,
         LOCAL_PAGED,
         LOCAL,

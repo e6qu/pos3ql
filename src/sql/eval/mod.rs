@@ -544,6 +544,14 @@ fn same_resolved_column<'a>(row: &impl ColumnLookup<'a>, a: &Expr, b: &Expr) -> 
 pub trait ColumnLookup<'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError>;
 
+    /// Whether this scope certainly has no column `qualifier.name`, so a
+    /// lookup would fail as an undefined column or table. An enclosing scope
+    /// then answers without this one positioning an error it discards.
+    /// `false` when the scope cannot tell cheaply.
+    fn lacks_column(&self, _qualifier: Option<&str>, _name: &str) -> bool {
+        false
+    }
+
     /// The `plpgsql.variable_conflict` rule of the PL/pgSQL variable this
     /// scope or an enclosing one names `qualifier.name`, or None when no
     /// variable answers to it. A scope that puts a relation's columns in front
@@ -2777,6 +2785,11 @@ pub trait SubqueryListProbe: 'static {
         catalog: Option<&dyn CatalogAccess>,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError>;
+
+    /// Copies this probe into `arena`'s persistent tail, for a list kept
+    /// for the rest of the statement.
+    fn persist(&self, arena: &Arena)
+    -> Result<core::ptr::NonNull<dyn SubqueryListProbe>, SqlError>;
 }
 
 /// One pre-evaluated `IN (subquery)` result.
@@ -2809,10 +2822,11 @@ pub struct SubqueryValues<'h, 'a> {
     pub(crate) bindings: &'h [crate::sql::query::SubqueryBinding<'a>],
 }
 
-/// Uncorrelated scalar subqueries that run when an expression first reads
-/// them, as PostgreSQL's initPlans do, so an expression no row reaches never
-/// runs its subquery. Each keeps its value for the rest of the statement in
-/// the arena's persistent tail, which per-row recycling does not reclaim.
+/// Uncorrelated subqueries that run when an expression first reads them, as
+/// PostgreSQL's initPlans (and hashed `IN` subplans) do, so an expression no
+/// row reaches never runs its subquery. Each keeps its value for the rest of
+/// the statement in the arena's persistent tail, which per-row recycling does
+/// not reclaim.
 #[derive(Clone, Copy)]
 pub struct InitPlans<'a> {
     pub(crate) plans: &'a [InitPlan<'a>],
@@ -2825,22 +2839,276 @@ pub struct InitPlans<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct InitPlan<'a> {
     pub(crate) node: *const Expr<'a>,
-    /// Once run, the address and length of the value and type witness,
-    /// encoded as one projected row in the persistent tail. A raw extent
-    /// keeps hooks covariant; the handle rejects a reset arena.
-    pub(crate) result: crate::mem::arena::ArenaHandle<Option<(*const u8, usize)>>,
+    /// Once run, the value kept in the persistent tail. Raw extents keep
+    /// hooks covariant; the handle rejects a reset arena.
+    pub(crate) result: crate::mem::arena::ArenaHandle<Option<InitPlanValue>>,
+}
+
+/// A run initPlan's value in its arena's persistent tail.
+#[derive(Clone, Copy)]
+pub(crate) enum InitPlanValue {
+    /// A scalar, `EXISTS`, `ARRAY` or row subquery: the value and type
+    /// witness encoded as one projected row.
+    Scalar { encoded: *const u8, len: usize },
+    /// An `IN`, `ANY` or `ALL` list.
+    List {
+        /// Probes the members: encoded rows, or an external run.
+        probe: core::ptr::NonNull<dyn SubqueryListProbe>,
+        /// The result column's type witness, encoded as one projected row.
+        witness: *const u8,
+        witness_len: usize,
+        saw_null: bool,
+        collations: *const Collation,
+        collations_len: usize,
+    },
+}
+
+/// What one initPlan run produced, in the evaluation's arena.
+pub(crate) enum InitPlanOutput<'a> {
+    /// The value and type witness encoded as one projected row.
+    Scalar(&'a [u8]),
+    List(SubqueryList<'a>),
 }
 
 pub(crate) trait InitPlanRunner {
-    /// Runs one uncorrelated scalar subquery and returns its value and type
-    /// witness encoded as one projected row in `arena`.
+    /// Runs one uncorrelated subquery.
     fn run<'a>(
         &self,
         node: &Expr<'a>,
         arena: &'a Arena,
         params: &[Datum<'a>],
         sequences: Option<&dyn SequenceAccess>,
-    ) -> Result<&'a [u8], SqlError>;
+    ) -> Result<InitPlanOutput<'a>, SqlError>;
+}
+
+/// The members of a kept `IN`/`ANY`/`ALL` list, encoded back to back as
+/// one-column projected rows in an arena's persistent tail.
+#[derive(Clone, Copy)]
+struct EncodedSubqueryList {
+    members: *const u8,
+    len: usize,
+}
+
+impl EncodedSubqueryList {
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: the extent lives in the persistent tail of the arena owning
+        // this probe, which outlives every evaluation reading it.
+        unsafe { core::slice::from_raw_parts(self.members, self.len) }
+    }
+
+    fn rows<'s>(&'s self) -> impl FnMut() -> Result<Option<&'s [u8]>, SqlError> + 's {
+        let bytes = self.bytes();
+        let mut at = 0;
+        move || {
+            if at == bytes.len() {
+                return Ok(None);
+            }
+            let len = super::exec::projected_prefix_len(&bytes[at..], 1);
+            let row = &bytes[at..at + len];
+            at += len;
+            Ok(Some(row))
+        }
+    }
+}
+
+impl SubqueryListProbe for EncodedSubqueryList {
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn probe<'a>(
+        &self,
+        value: Datum<'a>,
+        collations: &[Collation],
+        catalog: Option<&dyn CatalogAccess>,
+        arena: &'a Arena,
+    ) -> Result<(bool, bool), SqlError> {
+        probe_member_rows(self.rows(), value, collations, catalog, arena)
+    }
+
+    fn quantify<'a>(
+        &self,
+        value: Datum<'a>,
+        operator: BinaryOp,
+        all: bool,
+        collations: &[Collation],
+        catalog: Option<&dyn CatalogAccess>,
+        arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError> {
+        quantify_member_rows(
+            self.rows(),
+            value,
+            operator,
+            all,
+            collations,
+            catalog,
+            arena,
+        )
+    }
+
+    fn persist(
+        &self,
+        _arena: &Arena,
+    ) -> Result<core::ptr::NonNull<dyn SubqueryListProbe>, SqlError> {
+        Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a kept subquery list was kept again"
+        ))
+    }
+}
+
+/// `value = ANY (members)` over one-column projected member rows: whether a
+/// member matched, and whether any comparison was unknown.
+pub(crate) fn probe_member_rows<'a, 'r>(
+    mut next: impl FnMut() -> Result<Option<&'r [u8]>, SqlError>,
+    value: Datum<'a>,
+    collations: &[Collation],
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &'a Arena,
+) -> Result<(bool, bool), SqlError> {
+    let mut saw_unknown = false;
+    while let Some(row) = next()? {
+        crate::sql::query::check_timeout()?;
+        let mark = arena.mark();
+        // SAFETY: the row outlives this iteration, and every value decoded
+        // from it is dead before the arena rewinds below.
+        let row: &'a [u8] = unsafe { core::slice::from_raw_parts(row.as_ptr(), row.len()) };
+        let member = super::exec::decode_projected_col_record(row, 0, arena)?;
+        let matched = if member.is_null() {
+            saw_unknown = true;
+            false
+        } else {
+            let left = coerce_unknown(value, &member)?;
+            let right = coerce_unknown(member, &left)?;
+            match quantified_comparison(BinaryOp::Eq, left, right, collations, catalog, arena)? {
+                Datum::Bool(matched) => matched,
+                Datum::Null => {
+                    saw_unknown = true;
+                    false
+                }
+                _ => unreachable!("equality returns boolean or NULL"),
+            }
+        };
+        // SAFETY: the decoded member is consumed by the comparison above;
+        // `value` was allocated below the mark by the caller.
+        unsafe { arena.rewind_to(mark) };
+        if matched {
+            return Ok((true, saw_unknown));
+        }
+    }
+    Ok((false, saw_unknown))
+}
+
+/// `value operator ANY|ALL (members)` over one-column projected member rows.
+pub(crate) fn quantify_member_rows<'a, 'r>(
+    mut next: impl FnMut() -> Result<Option<&'r [u8]>, SqlError>,
+    value: Datum<'a>,
+    operator: BinaryOp,
+    all: bool,
+    collations: &[Collation],
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let mut saw_unknown = false;
+    while let Some(row) = next()? {
+        crate::sql::query::check_timeout()?;
+        let mark = arena.mark();
+        // SAFETY: as in `probe_member_rows`.
+        let row: &'a [u8] = unsafe { core::slice::from_raw_parts(row.as_ptr(), row.len()) };
+        let member = super::exec::decode_projected_col_record(row, 0, arena)?;
+        let left = coerce_unknown(value, &member)?;
+        let right = coerce_unknown(member, &left)?;
+        let result = quantified_comparison(operator, left, right, collations, catalog, arena)?;
+        let decided = match result {
+            Datum::Bool(true) if !all => Some(true),
+            Datum::Bool(false) if all => Some(false),
+            Datum::Null => {
+                saw_unknown = true;
+                None
+            }
+            Datum::Bool(_) => None,
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "op ANY/ALL (array) requires operator to yield boolean"
+                ));
+            }
+        };
+        // SAFETY: decoded values are dead after the comparison.
+        unsafe { arena.rewind_to(mark) };
+        if let Some(decided) = decided {
+            return Ok(Datum::Bool(decided));
+        }
+    }
+    Ok(if saw_unknown {
+        Datum::Null
+    } else {
+        Datum::Bool(all)
+    })
+}
+
+/// Keeps a run list in `keep`'s persistent tail.
+fn keep_subquery_list(list: &SubqueryList<'_>, keep: &Arena) -> Result<InitPlanValue, SqlError> {
+    let full = || {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "an uncorrelated subquery's value exceeds the statement's memory"
+        )
+    };
+    let probe = match list.probe {
+        // SAFETY: see the lifetime invariant on `SubqueryList::probe`.
+        Some(probe) => {
+            debug_assert!(
+                list.values.is_empty(),
+                "a probed list keeps no inline members"
+            );
+            unsafe { probe.as_ref() }.persist(keep)?
+        }
+        None => {
+            let mut len = 0usize;
+            for member in list.values {
+                len = len
+                    .checked_add(super::exec::projected_row_len(core::slice::from_ref(
+                        member,
+                    ))?)
+                    .ok_or_else(full)?;
+            }
+            let members = keep
+                .alloc_persistent_slice_with(len, |_| 0u8)
+                .map_err(|_| full())?;
+            let mut at = 0;
+            for member in list.values {
+                at += super::exec::encode_projected_into(
+                    core::slice::from_ref(member),
+                    &mut members[at..],
+                )?;
+            }
+            let probe: &mut [EncodedSubqueryList] = keep
+                .alloc_persistent_slice_with(1, |_| EncodedSubqueryList {
+                    members: members.as_ptr(),
+                    len,
+                })
+                .map_err(|_| full())?;
+            let probe: &mut dyn SubqueryListProbe = &mut probe[0];
+            core::ptr::NonNull::from(probe)
+        }
+    };
+    let witness = core::slice::from_ref(&list.witness);
+    let witness_bytes = keep
+        .alloc_persistent_slice_with(super::exec::projected_row_len(witness)?, |_| 0u8)
+        .map_err(|_| full())?;
+    super::exec::encode_projected_into(witness, witness_bytes)?;
+    let collations = keep
+        .alloc_persistent_slice_with(list.collations.len(), |index| list.collations[index])
+        .map_err(|_| full())?;
+    Ok(InitPlanValue::List {
+        probe,
+        witness: witness_bytes.as_ptr(),
+        witness_len: witness_bytes.len(),
+        saw_null: list.saw_null,
+        collations: collations.as_ptr(),
+        collations_len: collations.len(),
+    })
 }
 
 pub enum SubqueryResult<'a> {
@@ -3439,6 +3707,43 @@ fn validate_enum_operator_types<'a>(
     Ok(())
 }
 
+/// A column, literal or parameter carries no explicit collation, so two of
+/// them cannot conflict before they are read; their implicit collation
+/// matters only to values that compare by collation, as PostgreSQL's
+/// comparison functions consult it only then.
+fn collation_deferrable(operand: &Expr<'_>) -> bool {
+    matches!(
+        operand,
+        Expr::Column { .. }
+            | Expr::Param(_)
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::NumericLit(_)
+            | Expr::Str(_)
+            | Expr::Bool(_)
+            | Expr::Null
+    )
+}
+
+/// The collation of a comparison of two [`collation_deferrable`] operands,
+/// resolved once their values are known.
+fn deferred_comparison_collation<'a>(
+    left: &Expr<'a>,
+    right: &Expr<'a>,
+    left_value: Datum<'_>,
+    right_value: Datum<'_>,
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<super::ast::Collation, SqlError> {
+    if left_value.is_null()
+        || right_value.is_null()
+        || left_value.ignores_collation() && right_value.ignores_collation()
+    {
+        return Ok(super::ast::Collation::None);
+    }
+    resolve_comparison_collation(left, right, row, hooks.catalog)
+}
+
 fn eval_binary_expression<'a>(
     expression: BinaryExpression<'_, 'a>,
     arena: &'a Arena,
@@ -3446,8 +3751,11 @@ fn eval_binary_expression<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
-    let comparison_collation = if operators::Comparison::from_binary(expression.operator).is_some()
-    {
+    let comparison = operators::Comparison::from_binary(expression.operator).is_some();
+    let deferred = comparison
+        && collation_deferrable(expression.left)
+        && collation_deferrable(expression.right);
+    let mut comparison_collation = if comparison && !deferred {
         Some(resolve_comparison_collation(
             expression.left,
             expression.right,
@@ -3467,6 +3775,16 @@ fn eval_binary_expression<'a>(
         hooks,
         arena,
     )?;
+    if deferred {
+        comparison_collation = Some(deferred_comparison_collation(
+            expression.left,
+            expression.right,
+            left,
+            right,
+            row,
+            hooks,
+        )?);
+    }
     Ok(eval_binary_values(
         expression,
         left,
@@ -3740,6 +4058,24 @@ pub(crate) fn routine_input_handoff(
     expression: &Expr<'_>,
     catalog: Option<&dyn CatalogAccess>,
 ) -> bool {
+    input_handoff(expression, catalog, false)
+}
+
+/// [`routine_input_handoff`] for a statement whose subqueries a retained
+/// reader keeps: they call no user-defined function and run apart from the
+/// row, so only their operands count.
+pub(crate) fn routine_input_handoff_kept_subqueries(
+    expression: &Expr<'_>,
+    catalog: Option<&dyn CatalogAccess>,
+) -> bool {
+    input_handoff(expression, catalog, true)
+}
+
+fn input_handoff(
+    expression: &Expr<'_>,
+    catalog: Option<&dyn CatalogAccess>,
+    kept_subqueries: bool,
+) -> bool {
     match expression {
         Expr::Call {
             kind,
@@ -3776,6 +4112,21 @@ pub(crate) fn routine_input_handoff(
         }
         // Casts, operators and subqueries can invoke stored code even without
         // a Call node. Keep their journal until their executable target is bound.
+        Expr::QuantifiedSubquery { operator, .. }
+            if kept_subqueries
+                && operator.operator_name().is_some_and(|name| {
+                    catalog.is_some_and(|catalog| catalog.has_operator_candidate(name))
+                }) =>
+        {
+            return true;
+        }
+        Expr::Subquery(_)
+        | Expr::RowSubquery { .. }
+        | Expr::ArraySubquery(_)
+        | Expr::Exists(_)
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. }
+            if kept_subqueries => {}
         Expr::Cast {
             binding: CastBinding::Resolve,
             ..
@@ -3798,7 +4149,7 @@ pub(crate) fn routine_input_handoff(
     }
     let mut handoff = false;
     super::query::walk_children(expression, &mut |child| {
-        handoff |= routine_input_handoff(child, catalog);
+        handoff |= input_handoff(child, catalog, kept_subqueries);
         Ok(())
     })
     .expect("input handoff inspection does not evaluate expressions");
@@ -4332,41 +4683,55 @@ fn eval_full_inner<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
-    if matches!(
-        expression,
-        Expr::Subquery(_) | Expr::RowSubquery { .. } | Expr::ArraySubquery(_) | Expr::Exists(_)
-    ) && let Some(subs) = hooks.subs
+    if let Some(subs) = hooks.subs
         && let Some(plans) = subs.initplans
+        && matches!(
+            expression,
+            Expr::Subquery(_)
+                | Expr::RowSubquery { .. }
+                | Expr::ArraySubquery(_)
+                | Expr::Exists(_)
+                | Expr::InSubquery { .. }
+                | Expr::QuantifiedSubquery { .. }
+        )
         && !subs
             .scalars
             .iter()
             .any(|(node, _, _)| core::ptr::eq(*node, expression))
+        && !subs
+            .lists
+            .iter()
+            .any(|list| core::ptr::eq(list.node, (expression as *const Expr).cast()))
         && let Some(plan) = plans
             .plans
             .iter()
             .find(|plan| core::ptr::eq(plan.node, expression))
     {
-        let encoded: &'a [u8] = match plans.arena.retained(plan.result) {
-            // SAFETY: the handle matched the owning arena's current identity,
-            // so the persistent-tail extent it records is still allocated, and
-            // that arena outlives this evaluation's.
-            Some(Some((start, len))) => unsafe { core::slice::from_raw_parts(start, len) },
+        let kept = match plans.arena.retained(plan.result) {
+            Some(Some(kept)) => kept,
             Some(None) => {
-                let encoded = plans
+                let kept = match plans
                     .runner
-                    .run(expression, arena, params, hooks.sequences)?;
-                let kept = plans
-                    .arena
-                    .alloc_persistent_slice_with(encoded.len(), |index| encoded[index])
-                    .map_err(|_| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "an uncorrelated subquery's value exceeds the statement's memory"
-                        )
-                    })?;
-                plans
-                    .arena
-                    .replace_retained(plan.result, Some((kept.as_ptr(), kept.len())));
+                    .run(expression, arena, params, hooks.sequences)?
+                {
+                    InitPlanOutput::Scalar(encoded) => {
+                        let kept = plans
+                            .arena
+                            .alloc_persistent_slice_with(encoded.len(), |index| encoded[index])
+                            .map_err(|_| {
+                                sql_err!(
+                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                    "an uncorrelated subquery's value exceeds the statement's memory"
+                                )
+                            })?;
+                        InitPlanValue::Scalar {
+                            encoded: kept.as_ptr(),
+                            len: kept.len(),
+                        }
+                    }
+                    InitPlanOutput::List(list) => keep_subquery_list(&list, plans.arena)?,
+                };
+                plans.arena.replace_retained(plan.result, Some(kept));
                 kept
             }
             None => {
@@ -4376,23 +4741,68 @@ fn eval_full_inner<'a>(
                 ));
             }
         };
-        let scalars = [(
-            expression as *const Expr,
-            super::exec::decode_projected_col_record(encoded, 0, arena)?,
-            super::exec::decode_projected_col_record(encoded, 1, arena)?,
-        )];
+        // SAFETY (both arms): the handle matched the owning arena's current
+        // identity, so the persistent-tail extents it records are still
+        // allocated, and that arena outlives this evaluation's.
+        let mut scalars = [(expression as *const Expr, Datum::Null, Datum::Null)];
+        let values = match kept {
+            InitPlanValue::Scalar { encoded, len } => {
+                let encoded: &'a [u8] = unsafe { core::slice::from_raw_parts(encoded, len) };
+                scalars[0].1 = super::exec::decode_projected_col_record(encoded, 0, arena)?;
+                scalars[0].2 = super::exec::decode_projected_col_record(encoded, 1, arena)?;
+                SubqueryValues {
+                    scalars: &scalars,
+                    lists: subs.lists,
+                    initplans: subs.initplans,
+                    bindings: subs.bindings,
+                }
+            }
+            InitPlanValue::List {
+                probe,
+                witness,
+                witness_len,
+                saw_null,
+                collations,
+                collations_len,
+            } => {
+                let witness: &'a [u8] =
+                    unsafe { core::slice::from_raw_parts(witness, witness_len) };
+                let collations: &'a [Collation] =
+                    unsafe { core::slice::from_raw_parts(collations, collations_len) };
+                let lists = arena
+                    .alloc_slice_with(subs.lists.len() + 1, |index| match index {
+                        0 => SubqueryList {
+                            node: (expression as *const Expr).cast(),
+                            values: &[],
+                            probe: Some(probe),
+                            saw_null,
+                            witness: Datum::Null,
+                            collations,
+                        },
+                        index => subs.lists[index - 1],
+                    })
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "subquery lists exceed the statement's memory"
+                        )
+                    })?;
+                lists[0].witness = super::exec::decode_projected_col_record(witness, 0, arena)?;
+                SubqueryValues {
+                    scalars: subs.scalars,
+                    lists,
+                    initplans: subs.initplans,
+                    bindings: subs.bindings,
+                }
+            }
+        };
         return eval_full_inner(
             expression,
             arena,
             params,
             row,
             &EvalHooks {
-                subs: Some(&SubqueryValues {
-                    scalars: &scalars,
-                    lists: subs.lists,
-                    initplans: subs.initplans,
-                    bindings: subs.bindings,
-                }),
+                subs: Some(&values),
                 ..*hooks
             },
         );
@@ -7473,7 +7883,9 @@ pub(crate) fn builtin_operator_function<'a>(
                 "bound operator function argument contract changed"
             ));
         };
-        let comparison_collation = if operators::Comparison::from_binary(operator).is_some() {
+        let comparison = operators::Comparison::from_binary(operator).is_some();
+        let deferred = comparison && collation_deferrable(left) && collation_deferrable(right);
+        let mut comparison_collation = if comparison && !deferred {
             Some(resolve_comparison_collation(
                 left,
                 right,
@@ -7545,6 +7957,11 @@ pub(crate) fn builtin_operator_function<'a>(
         }
         if strict && values.iter().any(|value| value.is_null()) {
             return Ok(Datum::Null);
+        }
+        if deferred {
+            comparison_collation = Some(deferred_comparison_collation(
+                left, right, values[0], values[1], row, hooks,
+            )?);
         }
         Ok(eval_binary_values(
             BinaryExpression {

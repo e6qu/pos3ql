@@ -86,7 +86,7 @@ is owned.
   synchronously, as do PL/pgSQL cursor reads (`OPEN`, `FETCH` and cursor
   `FOR` loops), whose lock waits already park. A top-level `SELECT` that the retained reader cannot hold
   (`DISTINCT` over routine output, grouping sets, groupings whose keys or aggregate inputs call
-  routines, subqueries, sorts in object-store mode or over non-volatile
+  routines, correlated subqueries, sorts in object-store mode or over non-volatile
   routine output, joins it would probe through an index) restarts once for
   each first call of a SQL-language routine, so its work grows with the square
   of those calls; single-table, `VALUES` and `generate_series` sources,
@@ -115,18 +115,24 @@ is owned.
     index-probed joins, `RIGHT` and `FULL` joins of more than two items or
     over generator calls, grouping sets,
     subqueries other than the simple FROM subqueries merged into their query
-    and uncorrelated scalar, `EXISTS`, `ARRAY` and row subqueries of unsorted,
-    ungrouped streams (correlated ones, `IN`/`ANY`/`ALL` lists, subqueries
-    under a sort or grouping, grouped or bounded derived tables, and scans of
-    CTEs that run once). A correlated scalar subquery that is not grouped,
-    windowed or a set operation binds its output type and aggregate calls
-    once per statement, but still resolves its FROM scope and evaluates its
-    operators unbound for each outer row; correlated `EXISTS`, `ARRAY`, row,
-    `IN`, `ANY` and `ALL` subqueries and the other scalar ones are analysed
-    again for each outer row. Over 2000 outer rows and a 50-row inner table
-    in a debug build, `sum((SELECT max(v) ... WHERE v <= o.id))` takes 2.6 s
-    (27 s unbound) and the matching `EXISTS` 2.4 s, where PostgreSQL takes
-    about 4 ms. Rewinding a retained child tree per outer row removes that,
+    and uncorrelated scalar, `EXISTS`, `ARRAY`, row and `IN`/`ANY`/`ALL`
+    subqueries of streams, sorted and grouped ones included (correlated ones,
+    grouped or bounded derived tables, and scans of CTEs that run once). A
+    correlated scalar subquery that is not grouped, windowed or a set
+    operation binds its output type and aggregate calls once per statement,
+    but still resolves its FROM scope and evaluates its operators unbound for
+    each outer row; correlated `EXISTS`, `ARRAY`, row, `IN`, `ANY` and `ALL`
+    subqueries and the other scalar ones are analysed again for each outer
+    row. Over 2000 outer rows and a 50-row inner table in a debug build on a
+    loaded 8-core workstation, `sum((SELECT max(v) ... WHERE v <= o.id))`
+    takes 1.4 s, the matching `EXISTS` 1.1 s and `IN` 1.3 s (3.5 s, 3.0 s and
+    3.5 s before comparisons of non-collatable values skipped collation
+    resolution and scans stopped rebuilding each row's column types), where
+    PostgreSQL takes about 1 to 9 ms. In the `EXISTS` profile the inner scan's
+    visibility passes (counting, then collecting visible rows before sorting
+    them into insertion order) take a third, the comparison a third, and the
+    per-row scope and subquery preparation under a tenth. Rewinding a
+    retained child tree per outer row removes the analysis,
     set operations other than `UNION ALL` (and `UNION ALL` under
     `ORDER BY`, in a declared cursor, or with volatile or routine-calling
     expressions), sorts in object-store mode (external runs
@@ -334,10 +340,12 @@ with `0A000`. `UPDATE` and `DELETE` run their
 subqueries once per statement, so a subquery correlated with the target table
 fails as a missing FROM-clause entry, and an aggregate of the target table in
 one is not rejected as PostgreSQL's `aggregate functions are not allowed in
-UPDATE`. An uncorrelated `IN`, `ANY` or `ALL` subquery runs before
-the query's first row, where PostgreSQL runs it at its first use: `SELECT id
-FROM t WHERE id IN (SELECT 1/x FROM z) AND false` fails with `22012` here and
-returns no rows in PostgreSQL. A SQL function whose earlier
+UPDATE`. Their subqueries, and those of `INSERT ... SELECT`, run before
+the first row is written, where PostgreSQL runs an uncorrelated one at its
+first use: `UPDATE t SET v = (SELECT 1/x FROM z) WHERE id > 5` fails with
+`22012` here and updates no rows in PostgreSQL. Running them later needs row
+visibility by command within a transaction, so a subquery run after the
+statement's first write still reads the rows as they were before it. A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final

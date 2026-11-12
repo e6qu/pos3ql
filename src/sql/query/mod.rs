@@ -7519,6 +7519,41 @@ fn check_literal_operands<'a>(
     )
 }
 
+/// [`check_literal_operands`] for operands compared with an uncorrelated
+/// subquery, whose type is its column's declared type: a scalar subquery
+/// compared with an unknown-type literal, and `IN`, `ANY` and `ALL` lists.
+/// Correlated subqueries cannot be typed here and are checked when they run.
+fn check_subquery_operands<'a>(
+    expression: &'a Expr<'a>,
+    scope: &QueryScope<'a>,
+    arena: &'a Arena,
+    storage: &'a Storage,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let subquery_type = |other: &'a Expr<'a>| match other {
+        Expr::Subquery(_) => {
+            subquery::subquery_expression_type(other, storage, txid, arena, &super::eval::NoColumns)
+                .ok()
+                .flatten()
+        }
+        _ => None,
+    };
+    check_literal_operands_typed(
+        expression,
+        &|other| subquery_type(other).and_then(ColType::from_oid),
+        arena,
+    )?;
+    subquery::check_list_operands(
+        expression,
+        &|other| {
+            subquery_type(other).or_else(|| infer_scope_type(other, scope).ok().map(|(oid, _)| oid))
+        },
+        storage,
+        txid,
+        arena,
+    )
+}
+
 /// [`check_literal_operands`] with `infer` naming each operand's type.
 pub(crate) fn check_literal_operands_typed<'a>(
     expression: &'a Expr<'a>,
@@ -9445,7 +9480,7 @@ fn validate_projection_source(
 fn check_select_types<'a>(
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
-    storage: &Storage,
+    storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
@@ -9486,10 +9521,12 @@ fn check_select_types<'a>(
         validate_projection_source(item, scope)?;
         if let SelectItem::Expr { expression, .. } = item {
             check(expression)?;
+            check_subquery_operands(expression, scope, arena, storage, txid)?;
         }
     }
     if let Some(w) = statement.where_clause {
         check(w)?;
+        check_subquery_operands(w, scope, arena, storage, txid)?;
         check_condition_type("WHERE", w, columns, storage, txid, arena)?;
     }
     for g in statement.group_by {
@@ -9497,7 +9534,15 @@ fn check_select_types<'a>(
     }
     if let Some(h) = statement.having {
         check(h)?;
+        check_subquery_operands(h, scope, arena, storage, txid)?;
         check_condition_type("HAVING", h, columns, storage, txid, arena)?;
+    }
+    for on in statement
+        .from
+        .iter()
+        .flat_map(|from| from.joins.iter().filter_map(|join| join.on))
+    {
+        check_subquery_operands(on, scope, arena, storage, txid)?;
     }
     for ob in statement.order_by {
         check(resolve_order_target(
@@ -10015,8 +10060,6 @@ pub(crate) fn select_query_resumable<'a>(
         storage,
         txid,
         arena,
-        params,
-        seq,
     ) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
@@ -11578,8 +11621,6 @@ fn select_into_rows_mode<'a>(
             storage,
             txid,
             arena,
-            params,
-            seq,
         )?;
         let hooks = EvalHooks {
             group: None,
@@ -11797,8 +11838,6 @@ fn select_into_rows_mode<'a>(
         storage,
         txid,
         arena,
-        params,
-        seq,
     )?;
     let correlated = outer_subs.correlated;
     let where_correlated = correlated_in_expression(statement.where_clause, correlated, arena)?;

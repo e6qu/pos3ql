@@ -53307,6 +53307,7 @@ impl Storage {
     /// row, so it scans under one lock and copies only matching names.
     pub(crate) fn has_operator_named_on_path(&self, name: &str, txid: u32) -> bool {
         const BATCH: usize = 16;
+        let database = current_database();
         let mut next = 0;
         loop {
             let mut schemas = [None; BATCH];
@@ -53318,7 +53319,7 @@ impl Storage {
                     .lock()
                     .expect("operator catalog lock poisoned");
                 for (slot, operator) in catalog.operators.iter().enumerate().skip(next) {
-                    if !(operator.database == current_database() && operator.visible_to(txid)) {
+                    if !(operator.database == database && operator.visible_to(txid)) {
                         continue;
                     }
                     let definition = operator.definition_for(txid);

@@ -1,5 +1,6 @@
 //! Resolved expression effects govern projection reuse and security barriers.
 
+use crate::mem::arena::Arena;
 use crate::sql::ast::{BinaryOp, CastBinding, Expr, UnaryOp};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::exec::{ColTypeResolver, infer_routine_argument_oid};
@@ -228,12 +229,15 @@ fn sql_value_expression(name: &str) -> bool {
 
 /// A non-leakproof function matters at a barrier only when its arguments can
 /// expose a row column. A volatile constant call can still move independently.
+/// `arena` is scratch for the correlation check of each subquery: nothing
+/// allocated there outlives the call.
 pub(super) fn expression_properties(
     expression: &Expr<'_>,
     columns: &dyn ColTypeResolver,
     storage: &Storage,
     txid: u32,
     stage: AnalysisStage,
+    arena: &Arena,
 ) -> Result<ExpressionProperties, SqlError> {
     let mut result = ExpressionProperties {
         volatile: false,
@@ -241,7 +245,7 @@ pub(super) fn expression_properties(
         columns: false,
     };
     super::walk_children(expression, &mut |child| {
-        let child = expression_properties(child, columns, storage, txid, stage)?;
+        let child = expression_properties(child, columns, storage, txid, stage, arena)?;
         result.volatile |= child.volatile;
         result.leaks_columns |= child.leaks_columns;
         result.columns |= child.columns;
@@ -702,12 +706,40 @@ pub(super) fn expression_properties(
             },
             _ => ProcedureProperties::UNKNOWN,
         }),
+        // At run time an uncorrelated subquery calling no volatile or
+        // user-defined function returns one result for the statement, as a
+        // stable function does; it is not known to be leakproof. A view
+        // pushes no qualifier containing a subquery, as PostgreSQL's
+        // `qual_is_pushdown_safe` does not.
         Expr::Subquery(_)
         | Expr::RowSubquery { .. }
         | Expr::InSubquery { .. }
         | Expr::QuantifiedSubquery { .. }
         | Expr::Exists(_)
-        | Expr::ArraySubquery(_) => Some(ProcedureProperties::UNKNOWN),
+        | Expr::ArraySubquery(_)
+            if stage == AnalysisStage::ViewPushdown =>
+        {
+            Some(ProcedureProperties::UNKNOWN)
+        }
+        Expr::Subquery(_)
+        | Expr::RowSubquery { .. }
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. }
+        | Expr::Exists(_)
+        | Expr::ArraySubquery(_) => {
+            let mark = arena.mark();
+            let stable = super::subquery::stable_uncorrelated(expression, storage, txid, arena);
+            // SAFETY: the check returns a flag; nothing it allocated escapes.
+            unsafe { arena.rewind_to(mark) };
+            Some(if stable {
+                ProcedureProperties {
+                    volatile: false,
+                    leakproof: false,
+                }
+            } else {
+                ProcedureProperties::UNKNOWN
+            })
+        }
         _ => None,
     };
     if let Some(procedure) = procedure {

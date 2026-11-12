@@ -2253,13 +2253,26 @@ fn row_compare<'a>(
             "unequal number of entries in row expressions"
         ));
     }
+    // An unknown-type literal field takes the type of the field it is
+    // compared with, as PostgreSQL resolves each column's operator.
+    let resolved = |x: &RecordField<'a>, y: &RecordField<'a>| -> Result<_, SqlError> {
+        let unknown = |field: &RecordField<'_>| field.type_oid == crate::sql::types::oid::UNKNOWN;
+        Ok(match (unknown(x), unknown(y)) {
+            (true, false) => (coerce_unknown(x.value, &y.value)?, y.value),
+            (false, true) => (x.value, coerce_unknown(y.value, &x.value)?),
+            _ => (x.value, y.value),
+        })
+    };
     match operator {
         Eq | NotEq => {
             let mut saw_null = false;
             for (x, y) in a.iter().zip(b) {
                 if x.value.is_null() || y.value.is_null() {
                     saw_null = true;
-                } else if !compare_datums(&x.value, &y.value)?.is_eq() {
+                    continue;
+                }
+                let (x, y) = resolved(x, y)?;
+                if !compare_datums(&x, &y)?.is_eq() {
                     return Ok(Datum::Bool(operator == NotEq));
                 }
             }
@@ -2274,7 +2287,8 @@ fn row_compare<'a>(
                 if x.value.is_null() || y.value.is_null() {
                     return Ok(Datum::Null);
                 }
-                let ordering = compare_datums(&x.value, &y.value)?;
+                let (x, y) = resolved(x, y)?;
+                let ordering = compare_datums(&x, &y)?;
                 if !ordering.is_eq() {
                     return Ok(Datum::Bool(match operator {
                         Lt | LtEq => ordering.is_lt(),

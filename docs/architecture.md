@@ -295,18 +295,27 @@ streams as the scan of `orders` it becomes, while the same query with `AS
 MATERIALIZED` spools (`src/sql/query/cte.rs`, `expand_stream_ctes`).
 
 **Built: uncorrelated subqueries.** A stream, or a top-level `SELECT` run in
-place, keeps scalar, `EXISTS`, `ARRAY` and row subqueries that read no column
-of its query and call no volatile or user-defined function. Each runs when an
-expression first reads it, as PostgreSQL's initPlans do (in the general
-executor too), and keeps its value for the rest of the statement in the
-reader's allocation (`result_stream_bytes`) or the statement arena's
-persistent tail, so `SELECT (SELECT 1/x FROM z) FROM empty_table` returns no
-rows. A `WHERE` conjunct that reads no column of its query runs once before
+place, keeps scalar, `EXISTS`, `ARRAY`, row and `IN`/`ANY`/`ALL` subqueries
+that read no column of its query and call no volatile or user-defined
+function (one over a set-returning function whose arguments read no column,
+such as `FROM generate_series(1, 3)`, reads none). Each runs when an expression first reads it, as PostgreSQL's
+initPlans and hashed subplans do (in the general executor too), and keeps its
+value for the rest of the statement in the reader's allocation
+(`result_stream_bytes`) or the statement arena's persistent tail, so `SELECT
+(SELECT 1/x FROM z) FROM empty_table` and `SELECT id FROM t WHERE id > 5 AND
+id IN (SELECT 1/x FROM z)` return no rows. A list keeps its members as encoded
+rows there, or in object-store mode as the external run it was written to,
+with its column type, collations and whether a member was NULL. The operand's
+type is checked against the list's declared column type while the query is
+analysed, so `'zz' IN (SELECT int_column ...)` fails even when no row reaches
+it. A `WHERE` conjunct that reads no column of its query runs once before
 the scan, as PostgreSQL's one-time filter: `SELECT id, payload FROM orders
 WHERE id > (SELECT max(id) - 1000 FROM orders)` streams, and a false one
-returns no rows without reading any. A wait inside a subquery runs it again. Correlated subqueries, `IN` and `ANY`/`ALL`
-lists, subqueries in a sorted or grouped stream, in a `UNION ALL` query or
-in a declared cursor still spool or save their rows. In the general executor
+returns no rows without reading any. A wait inside a subquery runs it again. A sorted or grouped stream keeps
+them too: they count as stable, as PostgreSQL's initPlans are, so a sort
+evaluates them before it orders the rows. Correlated subqueries, and
+subqueries in a `UNION ALL` query or in a declared cursor, still spool or
+save their rows. In the general executor
 a correlated subquery reads the enclosing row from its derived tables, set
 operation branches, `LIMIT`, `OFFSET` and `JOIN ... ON` conditions, as
 PostgreSQL's outer references do; a correlated subquery in a join condition
@@ -429,7 +438,7 @@ being built and are released when it is delivered.
 | Sort (built: local mode, also for `DISTINCT ON`) | Sort keys, saved output and input columns of every row | `plan_build_bytes`; object-store mode: the external sorter's runs on the block grid (not built) |
 | Set operations (built: `UNION ALL` in streams) | `UNION ALL`: each query's own plan and the current query; others: sorted runs of both inputs with counts | Stream allocation; others: external runs |
 | Scalar, `EXISTS`, `ARRAY` and row subquery (built: uncorrelated, unsorted and ungrouped, run when first read) | Each value; correlated: a per-outer-row child tree, rewound per row | Stream allocation |
-| `IN`/`ANY`/`ALL` subquery | A cached sorted run when uncorrelated, or a per-outer-row child tree | External run |
+| `IN`/`ANY`/`ALL` subquery (built: uncorrelated, run when first read, kept as encoded rows or an external run) | A cached sorted run when uncorrelated, or a per-outer-row child tree | External run |
 | Derived table, CTE read once | Child tree in place | Its nodes |
 
 **Choosing a stream before execution.** Eligibility is decided from the

@@ -445,6 +445,17 @@ fn retained_expression_with(
         {
             true
         }
+        Expr::InSubquery { operand, .. } if statement.is_some() => {
+            retained_expression_with(operand, catalog, statement, leaves)
+        }
+        Expr::QuantifiedSubquery {
+            operand, operator, ..
+        } if statement.is_some() => {
+            operator
+                .operator_name()
+                .is_none_or(|name| !catalog.has_operator_candidate(name))
+                && retained_expression_with(operand, catalog, statement, leaves)
+        }
         _ => false,
     }
 }
@@ -452,8 +463,8 @@ fn retained_expression_with(
 /// The subqueries in a retained statement's expressions, which its reader
 /// runs once before its first row, as the general executor runs them before
 /// its scan, and keeps in its own allocation. `None` when one cannot be
-/// kept that way: it reads a column of the statement (correlated), returns
-/// a list (`IN`, `ANY`/`ALL`), or calls a volatile or user-defined function.
+/// kept that way: it reads a column of the statement (correlated) or calls a
+/// volatile or user-defined function.
 fn statement_sublinks<'a>(
     statement: &'a Select<'a>,
     storage: &'a Storage,
@@ -493,26 +504,8 @@ fn statement_sublinks<'a>(
         super::subquery::collect_subqueries(expression, &mut nodes)?;
     }
     for &node in nodes.as_slice() {
-        let select = match node {
-            Expr::Subquery(select)
-            | Expr::Exists(select)
-            | Expr::ArraySubquery(select)
-            | Expr::RowSubquery { select, .. } => *select,
-            _ => return Ok(None),
-        };
-        if super::cte::select_contains_function(select, &|name, arguments| {
-            crate::sql::ast::is_volatile_function(name)
-                || storage.has_callable_candidate(name, arguments, txid)
-        }) {
+        if !super::subquery::stable_uncorrelated(node, storage, txid, arena) {
             return Ok(None);
-        }
-        // Correlation is read from the subquery's FROM items as written; one
-        // it cannot resolve that way (a view, which the general executor
-        // expands as it runs the subquery) is not kept, and the statement
-        // runs there, reporting any real error itself.
-        match super::subquery::subquery_node_correlated(node, storage, txid, arena) {
-            Ok(false) => {}
-            Ok(true) | Err(_) => return Ok(None),
         }
     }
     Ok(Some(nodes.as_slice()))
@@ -1711,6 +1704,7 @@ fn branch_admitted<'a>(
                 storage,
                 txid,
                 super::predicate_safety::AnalysisStage::RuntimeProjection,
+                arena,
             )?
             .volatile
         {
@@ -2105,6 +2099,7 @@ fn cursor_revisit(
             storage,
             txid,
             super::predicate_safety::AnalysisStage::RuntimeProjection,
+            columns.arena,
         )
         .map(|properties| properties.volatile)
     };
@@ -3570,6 +3565,7 @@ impl<'a> RetainedSelect<'a> {
                 storage,
                 txid,
                 super::predicate_safety::AnalysisStage::RuntimeProjection,
+                arena,
             )
             .map(|properties| properties.volatile)
         };

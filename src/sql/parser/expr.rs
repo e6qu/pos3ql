@@ -620,7 +620,31 @@ impl<'a> Parser<'a> {
                 })?;
                 continue;
             }
-            let right = self.expression(operator.precedence() + 1)?;
+            let mut right = self.expression(operator.precedence() + 1)?;
+            // `ROW(a, b) < (SELECT x, y ...)` compares the row with the
+            // subquery's one row, as PostgreSQL's row-comparison sublink.
+            if matches!(
+                operator,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+            ) && let Expr::Subquery(select) = right
+                && let Expr::Call {
+                    kind: crate::sql::ast::CallKind::SqlSyntax,
+                    name,
+                    args,
+                    ..
+                } = left
+                && name.eq_ignore_ascii_case("row")
+                && args.len() > 1
+            {
+                let arity = u8::try_from(args.len())
+                    .map_err(|_| self.err_here("row comparison is too wide"))?;
+                right = self.arena_expr(Expr::RowSubquery { select, arity })?;
+            }
             left = self.arena_expr(Expr::Binary {
                 source_position,
                 operator,

@@ -4921,6 +4921,31 @@ impl<'a> Datum<'a> {
         matches!(self, Datum::Null)
     }
 
+    /// Whether comparing this value never consults a collation: a NULL or
+    /// a value of a non-collatable scalar type.
+    pub(crate) fn ignores_collation(&self) -> bool {
+        matches!(
+            self,
+            Datum::Null
+                | Datum::Bool(_)
+                | Datum::Int2(_)
+                | Datum::Int4(_)
+                | Datum::Int8(_)
+                | Datum::Oid(_)
+                | Datum::Float4(_)
+                | Datum::Float8(_)
+                | Datum::Numeric(_)
+                | Datum::Money(_)
+                | Datum::Date(_)
+                | Datum::Timestamp(_)
+                | Datum::Timestamptz(_)
+                | Datum::Time(_)
+                | Datum::Timetz(..)
+                | Datum::Interval(_)
+                | Datum::Uuid(_)
+        )
+    }
+
     pub fn type_oid(&self) -> i32 {
         match self {
             Datum::Record(_) => oid::RECORD,

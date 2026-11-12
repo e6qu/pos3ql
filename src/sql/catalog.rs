@@ -98,7 +98,7 @@ pub(crate) struct SynthTable<'a> {
 
 /// Base for synthetic publication-membership identifiers. Publication objects
 /// themselves derive identifiers from their durable creation stamps.
-const FIRST_USER_OID: i32 = 16384;
+pub(crate) const FIRST_USER_OID: i32 = 16384;
 const PG_CATALOG_NS_OID: i32 = 11;
 const PG_TOAST_NS_OID: i32 = 99;
 // PostgreSQL 18.6 initdb image; capture: actions/runs/40192510296.

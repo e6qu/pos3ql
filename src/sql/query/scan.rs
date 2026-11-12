@@ -4099,6 +4099,9 @@ fn compare_ordered_index_keys(
 struct RowDecodeBuffers<'values> {
     values: &'values mut [Datum<'values>],
     offsets: &'values [usize],
+    /// Each stored table's column types at its buffer's offset, read once
+    /// per scan instead of once per decoded row.
+    schemas: &'values [ColType],
 }
 
 /// One assembled source row: per table, decoded values (empty slice =
@@ -4204,6 +4207,16 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
 
     fn is_empty_scope(&self) -> bool {
         self.scope.n == 0
+    }
+
+    fn lacks_column(&self, qualifier: Option<&str>, name: &str) -> bool {
+        matches!(
+            self.scope.find_column_unpositioned(qualifier, name),
+            Err(error) if matches!(
+                error.sqlstate.as_str(),
+                sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
+            )
+        )
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
@@ -4539,7 +4552,17 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
         }
     }
 
+    fn lacks_column(&self, q: Option<&str>, name: &str) -> bool {
+        self.inner.lacks_column(q, name) && self.outer.is_none_or(|o| o.lacks_column(q, name))
+    }
+
     fn lookup(&self, q: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        if let Some(outer) = self.outer
+            && self.inner.lacks_column(q, name)
+            && !q.is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some())
+        {
+            return outer.lookup(q, name);
+        }
         match self.inner.lookup(q, name) {
             Ok(v) => {
                 if crate::sql::eval::column_precedes_variable(self.outer, q, name)? {
@@ -6196,9 +6219,9 @@ fn scan_source_mode<'a>(
                             *slot = crate::sql::exec::decode_projected_col_record(bytes, c, arena)?;
                         }
                     } else {
-                        let mut schema = [ColType::Bool; MAX_COLUMNS];
-                        def.schema(&mut schema);
-                        rowenc::decode(bytes, &schema[..def.n_columns], buffer)?;
+                        let start = buffers.offsets[position];
+                        let schema = &buffers.schemas[start..start + def.n_columns];
+                        rowenc::decode(bytes, schema, buffer)?;
                         refresh_catalog_object_names(storage, txid, buffer, arena)?;
                     }
                 }
@@ -7883,9 +7906,20 @@ fn scan_source_mode<'a>(
     let values = arena
         .alloc_slice_with(buffer_offsets[scope.n], |_| Datum::Null)
         .map_err(|_| arena_full())?;
+    let schemas = arena
+        .alloc_slice_with(buffer_offsets[scope.n], |_| ColType::Bool)
+        .map_err(|_| arena_full())?;
+    for (position, &table) in order.iter().enumerate() {
+        let columns = scope.defs.get(table).expect("resolved").columns();
+        let start = buffer_offsets[position];
+        for (index, column) in columns.iter().enumerate() {
+            schemas[start + index] = column.ctype;
+        }
+    }
     let decode_buffers = &mut RowDecodeBuffers {
         values,
         offsets: buffer_offsets,
+        schemas,
     };
     // A row-security predicate is a security barrier ahead of every user ON
     // and WHERE expression. The nested plan owns that ordering explicitly;

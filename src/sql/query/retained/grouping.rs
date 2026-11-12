@@ -76,6 +76,7 @@ fn before_input_end(
             storage,
             columns.txid,
             super::predicate_safety::AnalysisStage::RuntimeProjection,
+            columns.arena,
         )?
         .volatile)
 }

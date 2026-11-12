@@ -135,6 +135,18 @@ pub(super) fn admit_grouping<'a>(
             return Ok(None);
         }
     }
+    // A user routine that could answer an aggregate's name, such as a
+    // `sum(integer)` function, is resolved by the general executor.
+    if aggregates
+        .as_slice()
+        .iter()
+        .any(|&(_, aggregate)| match aggregate {
+            Expr::Call { name, args, .. } => storage.has_callable_candidate(name, args.len(), txid),
+            _ => false,
+        })
+    {
+        return Ok(None);
+    }
     let plain =
         aggregates.is_empty() && statement.group_by.is_empty() && statement.having.is_none();
     // DISTINCT ON keeps each first row of a retained sort.

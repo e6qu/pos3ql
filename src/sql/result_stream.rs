@@ -22,11 +22,8 @@ pub(crate) enum StreamChoice {
     /// A `SELECT` reopens as a stream if its output first overflows.
     Promote,
     /// The statement opens its stream before it runs. A `UNION ALL`
-    /// statement always does: the general executor's attempt would materialize every query
-    /// before its first row could overflow. In object-store mode a join,
-    /// grouping or sort does too: its attempt would read a whole input
-    /// before its first row, and again after each storage wait, so a cold
-    /// input larger than the block cache would never finish.
+    /// statement does: the general executor's attempt would materialize
+    /// every query before its first row could overflow.
     Open,
     /// A FETCH streams its cursor's rows from the start: they are evaluated
     /// as the client reads them and never saved in `cursor_bytes`.
@@ -193,17 +190,14 @@ impl Engine {
         };
         // The probe resolved names in scratch memory only.
         unsafe { self.work.rewind_to(mark) };
-        let opens = match source {
-            Ok(Some(query::StreamSource::Appended(_))) => set_query,
-            Ok(Some(query::StreamSource::Table { builds, .. })) => {
-                builds && self.storage.spill_attached()
-            }
-            Ok(Some(query::StreamSource::Join(_))) => self.storage.spill_attached(),
-            _ => false,
-        };
+        // Only a `UNION ALL` opens before it runs. A grouping, sort or join
+        // runs in the general executor first and promotes when its output
+        // overflows: retained readers do not yet reproduce every analysis
+        // check and wait of that executor.
+        let opens = matches!(source, Ok(Some(query::StreamSource::Appended(_)))) && set_query;
         let positions = match source {
             // Conservative: every resident entry and every saved generation.
-            Ok(Some(query::StreamSource::Table { table, .. })) => {
+            Ok(Some(query::StreamSource::Table(table))) => {
                 crate::storage::RowCursor::position_bytes(
                     self.storage.resident_row_entries(table),
                     self.max_spill_generations_per_table,

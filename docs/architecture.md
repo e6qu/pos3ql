@@ -257,11 +257,9 @@ sends nothing before its first page, so its reads yield throughout.
 A paged portal whose statement can stream opens its stream before the
 statement runs: its attempt would stop at its first row anyway, so a sort,
 grouping or hash table is built once, in the stream, and its input reads
-resume instead of restarting the statement on each cold read. In
-object-store mode a join or grouping (including plain `DISTINCT`) opens its
-stream before running under every protocol, for the same reason: its first
-row reads a whole input. Such a stream opens however small its result, so
-it counts in `pos3ql_result_streams_total`.
+resume instead of restarting the statement on each cold read. Under the
+other protocols a join or grouping runs in the general executor first and
+streams only once its output overflows.
 
 A statement that does not stream restarts from its start after each cold
 read, finding the objects its earlier attempts read only in the block

@@ -227,6 +227,14 @@ is owned.
     their history in `cursor_bytes`. A scrollable cursor moving back rereads
     its input from the first row; retained position checkpoints would bound
     that reread.
+  - In object-store mode a join or grouping runs in the general executor
+    first and streams only once its output overflows, so a cold input larger
+    than the block caches restarts on each cold read until the synchronous
+    fallback reads it. Opening such a stream before it runs needs the
+    retained readers to report the general executor's analysis errors
+    (literal checks in join conditions, aggregates owned by an outer query,
+    user functions named like aggregates, aggregates over `record`) and to
+    resume their concurrent cold reads without stalling.
   - Saving a held cursor at commit reads storage synchronously: the fourteen
     callers of the commit path (statement, protocol, procedure and
     replication commits) do not yet accept a wait before the commit is

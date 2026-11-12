@@ -82,9 +82,7 @@ pub(crate) enum LockedRow {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StreamSource {
     /// One ordinary table: its retained read position grows with its rows.
-    /// `builds` when the stream reads the whole table (a grouping or sort)
-    /// before its first row.
-    Table { table: usize, builds: bool },
+    Table(usize),
     /// A builtin set-returning function: only its next value is retained.
     Generated,
     /// A join: the read positions of its physical tables; literal and
@@ -2613,7 +2611,6 @@ impl<'a> RetainedSelect<'a> {
         else {
             return Ok(None);
         };
-        let builds = aggregates.is_some() || sort::sorts(statement);
         if aggregates.is_none() {
             for expression in statement
                 .items
@@ -2664,7 +2661,7 @@ impl<'a> RetainedSelect<'a> {
         if storage.row_security_applies(table, role, txid) {
             return Ok(None);
         }
-        Ok(Some(StreamSource::Table { table, builds }))
+        Ok(Some(StreamSource::Table(table)))
     }
 
     /// [`Self::stream_source`] of a `UNION ALL` read as one appended
@@ -2699,7 +2696,7 @@ impl<'a> RetainedSelect<'a> {
                 return Ok(None);
             }
             let leaf_tables = match Self::stream_source(storage, txid, leaf, arena)? {
-                Some(StreamSource::Table { table, .. }) => {
+                Some(StreamSource::Table(table)) => {
                     [Some(table), None, None, None, None, None, None, None]
                 }
                 Some(StreamSource::Generated) => [None; MAX_RETAINED_SOURCES],

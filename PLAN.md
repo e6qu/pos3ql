@@ -214,11 +214,20 @@ is owned.
     and output type, and evaluates its operators without binding them first
     (about 1 ms per outer row for a 50-row inner scan in a debug build).
     Binding the subquery once per statement and rewinding a retained child
-    tree per row removes that. A branch built these on per-statement
-    initPlans (correlated bindings, nested initPlans, `IN` lists in sorted
-    streams, `UPDATE`/`DELETE` subqueries read as of the statement, held
-    aggregate values); they must be rebuilt on the deferred subqueries that
-    run where evaluation first reaches them,
+    tree per row removes that. These subquery behaviours were built on
+    per-statement initPlans and must be rebuilt on the deferred subqueries
+    that run where evaluation first reaches them: uncorrelated `IN`/`ANY`/
+    `ALL` lists that run at their first read (`WHERE id IN (SELECT 1/x
+    FROM z) AND false` returns no rows in PostgreSQL), also inside sorted
+    streams; `UPDATE`/`DELETE`/`INSERT ... SELECT` subqueries read as of
+    the statement and only when a row reaches them; a nested uncorrelated
+    subquery that runs once per statement and shares its slot across outer
+    rows (`(SELECT x + (SELECT nextval('s')) ...)` per row); correlated
+    scalar subqueries bound once per statement; aggregates of a scalar
+    subquery (`sum((SELECT v FROM u LIMIT 1))`, which fails with `42725`) and
+    held running aggregate values that do not keep each row's scratch; and
+    a correlated `LIMIT` in an `ARRAY(...)` subquery (`ARRAY(SELECT w ...
+    LIMIT t.id)`),
     set operations other than `UNION ALL` (and `UNION ALL` under
     `ORDER BY`, in a declared cursor, or with volatile or routine-calling
     expressions), sorts in object-store mode (external runs

@@ -3413,13 +3413,42 @@ impl TriggerCursorRead<'_, '_> {
         } else {
             CursorRowSink::Discard
         };
+        // An ordered cursor saves and sorts every row its filter passes
+        // before its first row, as the session's FETCH does.
+        while self.cursors.sort_pending(self.at) {
+            let sorted = self.with_row_scratch(source_snapshot, |read| {
+                if !read.prepare_source_row()? {
+                    read.cursors
+                        .finish_sorting(read.at, read.storage, read.txid)?;
+                    return Ok(true);
+                }
+                if read.evaluate_row(true, CursorRowSink::FilterOnly)? {
+                    read.cursors.save_pending_input(read.at)?;
+                }
+                read.cursors.execution_parts(read.at).0.finish_row(false);
+                Ok(false)
+            })?;
+            if sorted {
+                break;
+            }
+        }
+        let sorted = self.cursors.sorted_source(self.at);
         loop {
             let produced = self.with_row_scratch(source_snapshot, |read| {
-                if !read.prepare_source_row()? {
+                let ready = if sorted {
+                    read.cursors.prepare_sorted_row(read.at)?
+                } else {
+                    read.prepare_source_row()?
+                };
+                if !ready {
                     return Ok(None);
                 }
-                let emitted = read.evaluate_row(true, output)?;
+                // A sorted row passed its filter before the sort.
+                let emitted = read.evaluate_row(!sorted, output)?;
                 read.cursors.execution_parts(read.at).0.finish_row(emitted);
+                if sorted {
+                    read.cursors.finish_sorted_row(read.at);
+                }
                 Ok(Some(emitted))
             })?;
             match produced {

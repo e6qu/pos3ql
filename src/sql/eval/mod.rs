@@ -4533,7 +4533,7 @@ fn eval_binary_expression<'a>(
             expression.right,
             row,
             hooks.catalog,
-        )?)
+        ))
     } else {
         None
     };
@@ -4547,6 +4547,18 @@ fn eval_binary_expression<'a>(
         hooks,
         arena,
     )?;
+    // PostgreSQL's strict comparison functions are not called with a NULL
+    // input, so an indeterminate collation is reported only for two values.
+    let comparison_collation = match comparison_collation {
+        Some(Err(error))
+            if error.sqlstate == sqlstate::INDETERMINATE_COLLATION
+                && (left.is_null() || right.is_null()) =>
+        {
+            Some(crate::sql::ast::Collation::None)
+        }
+        Some(resolved) => Some(resolved?),
+        None => None,
+    };
     if expression.left.is_row_constructor()
         && expression.right.is_row_constructor()
         && comparison_collation.is_some()

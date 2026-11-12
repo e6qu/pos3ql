@@ -4075,10 +4075,16 @@ fn run_subquery<'a>(
             outer,
         };
         let v = eval_full(item, arena, params, &base, &agg_hooks)?;
-        let out = arena.alloc_slice_copy(&[v]).map_err(|_| arena_full())?;
+        // OFFSET and LIMIT apply to the aggregate's one row.
+        let offset = crate::sql::exec::eval_offset_pub(select.offset, arena, params, &hooks)?;
+        let limit = crate::sql::exec::eval_limit_pub(select.limit, arena, params, &hooks)?;
+        let rows = usize::from(offset == 0 && limit > 0);
+        let out = arena
+            .alloc_slice_copy(&[v][..rows])
+            .map_err(|_| arena_full())?;
         return Ok((
             &*out,
-            v.is_null(),
+            rows == 1 && v.is_null(),
             spooled_column_witness(select, storage, txid, Some(&scope), arena, item, outer)?,
         ));
     }

@@ -65865,7 +65865,34 @@ pub fn create_index(
             match catalog_column_type(storage, txn.txid, type_oid) {
                 // Expression keys are stored in the row encoding, which keeps
                 // row values only as columns of a named composite type.
-                Some((ColType::Record | ColType::Composite(_), _)) => {
+                Some((ColType::Record, _) | (ColType::Composite(_), None)) => {
+                    // A whole row of an unknown relation is the analysis
+                    // error PostgreSQL reports first.
+                    fn unknown_whole_row(
+                        expression: &Expr<'_>,
+                        table: &str,
+                    ) -> Result<(), SqlError> {
+                        if let Expr::WholeRow(name) = expression
+                            && *name != table
+                        {
+                            return Err(sql_err!(
+                                sqlstate::UNDEFINED_TABLE,
+                                "missing FROM-clause entry for table \"{}\"",
+                                name
+                            ));
+                        }
+                        super::query::walk_children(expression, &mut |child| {
+                            unknown_whole_row(child, table)
+                        })
+                    }
+                    if let Err(error) =
+                        unknown_whole_row(index_column.expression, tdef.name.as_str())
+                    {
+                        return sql_fail(crate::sql::error_position::at_expression(
+                            error,
+                            index_column.expression,
+                        ));
+                    }
                     return sql_fail(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
                         "index expressions of a row type are not supported"

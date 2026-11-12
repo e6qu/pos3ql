@@ -1494,6 +1494,7 @@ fn agg_undefined(name: &str, arg_oid: i32) -> SqlError {
 /// name), or a CASE whose ELSE yields a name. `None` for anything unnamed.
 fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
     match expression {
+        Expr::OuterAggregate { call, .. } => name_of(call),
         Expr::Column { name, .. }
         | Expr::RoutineParam { name, .. }
         | Expr::SchemaColumn { name, .. } => Some(name),
@@ -5287,6 +5288,9 @@ fn infer_type_unpositioned(
     expression: &Expr,
     columns: &dyn ColTypeResolver,
 ) -> Result<(i32, i16), SqlError> {
+    if let Expr::OuterAggregate { call, .. } = expression {
+        return infer_type_unpositioned(call, columns);
+    }
     let of = |t: ColType| (t.oid(), t.typlen());
     let selected = selected_call(expression, columns)?;
     if let Expr::Call {
@@ -5394,6 +5398,7 @@ fn infer_type_unpositioned(
         ),
         Expr::RecursiveState { ctype, .. } => of(*ctype),
         Expr::Null | Expr::Str(_) => (oid::UNKNOWN, -2),
+        Expr::OuterAggregate { .. } => unreachable!("outer aggregates take their call's type"),
         Expr::Param(index) => bound_parameter_type_oid(*index)
             .map(|oid| (oid, coltype_of_oid(oid).map_or(-1, ColType::typlen)))
             .or_else(|| routine_parameter_type(*index))

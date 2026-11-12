@@ -744,6 +744,7 @@ fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
         | Expr::BoundLiteral { .. }
         | Expr::BitLit(_)
         | Expr::Param(_)
+        | Expr::OuterAggregate { .. }
         | Expr::DefaultMarker => {}
         Expr::Array(items) => {
             for e in *items {

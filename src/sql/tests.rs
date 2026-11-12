@@ -7,6 +7,7 @@
 use super::*;
 use crate::mem::mutex::Mutex;
 
+mod aggregate_levels;
 mod array_element_comparisons;
 mod assignment_and_name_diagnostics;
 mod builtin_aggregate_resolution;
@@ -34,6 +35,7 @@ mod geometry_assignments;
 mod index_parent_ownership;
 mod indirect_execute_privileges;
 mod information_schema_domains;
+mod initplans;
 mod joined_dml_returning;
 mod key_preparation;
 mod nested_planner_inputs;

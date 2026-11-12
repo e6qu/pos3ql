@@ -30,13 +30,18 @@ use super::{
     window_row,
 };
 
+/// The WHERE conjuncts the scan applies, and the correlated subqueries the
+/// rest of WHERE reads per row.
 fn window_scan_where<'a>(
     statement: &'a Select<'a>,
     correlated: &[&'a Expr<'a>],
     arena: &'a Arena,
-) -> Result<Option<&'a Expr<'a>>, SqlError> {
+) -> Result<(Option<&'a Expr<'a>>, &'a [&'a Expr<'a>]), SqlError> {
     let where_correlated = correlated_in_expression(statement.where_clause, correlated, arena)?;
-    correlated_scan_conjuncts(statement.where_clause, where_correlated, arena)
+    Ok((
+        correlated_scan_conjuncts(statement.where_clause, where_correlated, arena)?,
+        where_correlated,
+    ))
 }
 
 fn window_pax_columns<'a>(
@@ -1784,7 +1789,7 @@ pub(crate) fn project_window_rows<'a>(
     // body; its columns resolve after this query's own.
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<WindowRows<'a>, SqlError> {
-    let scan_where = window_scan_where(statement, correlated, arena)?;
+    let (scan_where, where_correlated) = window_scan_where(statement, correlated, arena)?;
     let pax_columns = window_pax_columns(statement, scope, from, win_nodes, arena)?;
     // Per-row correlated-subquery scratch, allocated once and reused across
     // both passes and the per-output-row merge below: per-row merges must not
@@ -1816,7 +1821,7 @@ pub(crate) fn project_window_rows<'a>(
         pax_columns,
         &mut |row| {
             if !row_passes_correlated_where(
-                correlated,
+                where_correlated,
                 statement.where_clause,
                 storage,
                 txid,
@@ -1853,7 +1858,7 @@ pub(crate) fn project_window_rows<'a>(
         pax_columns,
         &mut |row| {
             if !row_passes_correlated_where(
-                correlated,
+                where_correlated,
                 statement.where_clause,
                 storage,
                 txid,
@@ -2243,7 +2248,7 @@ pub(crate) fn external_window_into<'a>(
     offset: u64,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<bool, SqlError>,
 ) -> Result<u64, SqlError> {
-    let scan_where = window_scan_where(statement, correlated, arena)?;
+    let (scan_where, where_correlated) = window_scan_where(statement, correlated, arena)?;
     let pax_columns = window_pax_columns(statement, scope, from, win_nodes, arena)?;
     // Per-row correlated-subquery scratch, allocated once and reused across
     // every scan pass below: per-row merges must not grow the statement arena.
@@ -2355,7 +2360,7 @@ pub(crate) fn external_window_into<'a>(
             pax_columns,
             &mut |row| {
                 if !row_passes_correlated_where(
-                    correlated,
+                    where_correlated,
                     statement.where_clause,
                     storage,
                     txid,
@@ -2661,7 +2666,7 @@ pub(crate) fn external_window_into<'a>(
         pax_columns,
         &mut |row| {
             if !row_passes_correlated_where(
-                correlated,
+                where_correlated,
                 statement.where_clause,
                 storage,
                 txid,

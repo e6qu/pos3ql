@@ -195,9 +195,15 @@ is owned.
     index-probed joins, `RIGHT` and `FULL` joins of more than two items or
     over generator calls, grouping sets,
     subqueries other than the simple FROM subqueries merged into their query
-    (scalar, `IN`/`EXISTS`, grouped or bounded derived tables, scans of CTEs
-    that run once, and derived tables whose FROM names collide with the outer
-    query's, such as a `NOT MATERIALIZED` CTE read twice),
+    and uncorrelated scalar, `EXISTS`, `ARRAY` and row subqueries of unsorted,
+    ungrouped streams (correlated ones, `IN`/`ANY`/`ALL` lists, subqueries
+    under a sort or grouping, grouped or bounded derived tables, and scans of
+    CTEs that run once). A correlated subquery is analysed again for each
+    outer row: the general executor resolves its FROM scope, aggregate calls
+    and output type, and evaluates its operators without binding them first
+    (about 1 ms per outer row for a 50-row inner scan in a debug build).
+    Binding the subquery once per statement and rewinding a retained child
+    tree per row removes that,
     set operations other than `UNION ALL` (and `UNION ALL` under
     `ORDER BY`, in a declared cursor, or with volatile or routine-calling
     expressions), sorts in object-store mode (external runs
@@ -403,7 +409,21 @@ do). Parameter inference walks a statement in its own order rather than
 PostgreSQL's left-to-right analysis, so a parameter typed by one use and passed
 untyped to an `"any"` argument by another can be accepted where PostgreSQL
 reports `42P18`, and a user-defined polymorphic argument left untyped becomes
-`text` where PostgreSQL reports `42804`. A SQL function whose earlier
+`text` where PostgreSQL reports `42804`. 
+An aggregate in a subquery that reads only an outer query's columns
+belongs to that query, as in PostgreSQL, except through a subquery in `FROM`
+or a set operation, whose outer references fail as missing FROM-clause
+entries; a `UNION` subquery reading an outer column fails the same way, and a
+correlated `LIMIT` or `JOIN ... ON` inside a subquery cannot read an outer
+column. A subquery reading an aggregate of a query that also has window
+functions fails with `0A000`. An aggregate whose argument is a scalar subquery
+(`SELECT sum((SELECT v FROM u LIMIT 1)) FROM t`) fails with `42725`
+(`function sum is not unique`), and `CREATE VIEW` over a query with a
+correlated scalar subquery fails with `XX000` (`column dependency has no
+owning relation dependency`). An uncorrelated `IN`, `ANY` or `ALL` subquery
+runs before the query's first row, where PostgreSQL runs it at its first use:
+`SELECT id FROM t WHERE id IN (SELECT 1/x FROM z) AND false` fails with
+`22012` here and returns no rows in PostgreSQL. A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final

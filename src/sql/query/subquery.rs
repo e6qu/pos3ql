@@ -730,7 +730,7 @@ fn streaming_array_subquery<'a>(
 
 /// Walks an expression tree collecting subquery nodes, in discovery order and
 /// deduplicated by node identity so each subquery keeps one stable position.
-fn collect_subqueries<'a>(
+pub(super) fn collect_subqueries<'a>(
     expression: &'a Expr<'a>,
     out: &mut ArenaList<'a, &'a Expr<'a>>,
 ) -> Result<(), SqlError> {
@@ -1517,8 +1517,18 @@ fn eval_subquery_nodes<'a>(
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     timing: SubqueryTiming,
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
-    let defers = |node: &Expr<'_>| {
-        matches!(timing, SubqueryTiming::WhereReached) && subquery_has_effects(node, storage, txid)
+    let defers = |node: &Expr<'_>| match timing {
+        SubqueryTiming::Now | SubqueryTiming::Retained => false,
+        SubqueryTiming::WhereReached => subquery_has_effects(node, storage, txid),
+        SubqueryTiming::FirstRead => {
+            matches!(
+                node,
+                Expr::Subquery(_)
+                    | Expr::RowSubquery { .. }
+                    | Expr::ArraySubquery(_)
+                    | Expr::Exists(_)
+            ) || subquery_has_effects(node, storage, txid)
+        }
     };
     let n_list_nodes = nodes
         .iter()
@@ -1745,6 +1755,10 @@ enum SubqueryTiming {
     Retained,
     /// One with effects runs where evaluation reaches it.
     WhereReached,
+    /// As `WhereReached`, and every scalar subquery also runs when an
+    /// expression first reads it, as PostgreSQL's initPlans do: an
+    /// expression no row reaches never runs its subquery.
+    FirstRead,
 }
 
 /// Whether running a scalar subquery early would reorder its effects: it
@@ -1787,15 +1801,11 @@ fn subquery_exists<'a>(
     }
     if let Some(tree) = select.set_body {
         let (vals, _, _) = run_set_subquery(
-            tree, select, storage, txid, arena, params, 1, sequences, outer,
+            tree, select, storage, txid, arena, params, 1, outer, sequences,
         )?;
         return Ok(!vals.is_empty());
     }
-    if !select.group_by.is_empty()
-        || select.having.is_some()
-        || select.distinct
-        || has_correlated_nested_subquery(select, storage, txid, arena)?
-    {
+    if needs_row_source(select, storage, txid, arena)? {
         // Grouped/DISTINCT EXISTS: the row-source executor already handles
         // grouping, HAVING, and DISTINCT — existence is whether it emits. It
         // also evaluates a nested subquery that reads this query's rows once
@@ -1947,6 +1957,42 @@ fn subquery_exists<'a>(
     Ok(found)
 }
 
+/// Whether a subquery needs the general row-source executor rather than the
+/// single-scan paths here: grouping, `DISTINCT`, or a nested subquery that
+/// must run per row or per group of this one (the single-scan paths run
+/// nested subqueries once, against the enclosing row only).
+fn needs_row_source<'a>(
+    select: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    if !select.group_by.is_empty()
+        || select.having.is_some()
+        || select.distinct
+        || super::aggregate_levels::select_owns_nested_aggregates(select)
+    {
+        return Ok(true);
+    }
+    let items = select.items.iter().filter_map(|item| match item {
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+            Some(*expression)
+        }
+        _ => None,
+    });
+    for expression in items
+        .chain(select.where_clause)
+        .chain(select.order_by.iter().map(|order| order.expression))
+        .chain(select.limit)
+        .chain(select.offset)
+    {
+        if expression_has_correlated_subquery(expression, storage, txid, arena)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// A chain of query scopes from innermost outward, used to decide whether a
 /// subquery references a column belonging to an enclosing query.
 struct ScopeChain<'s, 'd> {
@@ -2006,35 +2052,6 @@ fn select_correlated<'a>(
         parent: None,
     };
     select_has_outer_ref(select, &chain, storage, txid, arena)
-}
-
-/// Whether a subquery nested in `select`'s clauses reads a column from
-/// outside itself: such a value depends on `select`'s current row (or an
-/// enclosing one), so it cannot be computed once before `select` scans.
-fn has_correlated_nested_subquery<'a>(
-    select: &'a Select<'a>,
-    storage: &'a Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<bool, SqlError> {
-    let items = select.items.iter().filter_map(|item| match item {
-        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-            Some(*expression)
-        }
-        SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => None,
-    });
-    let clauses = select
-        .where_clause
-        .into_iter()
-        .chain(select.order_by.iter().map(|order| order.expression))
-        .chain(select.limit)
-        .chain(select.offset);
-    for expression in items.chain(clauses) {
-        if expression_has_correlated_subquery(expression, storage, txid, arena)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 pub(crate) fn expression_has_correlated_subquery<'a>(
@@ -2271,6 +2288,8 @@ fn expr_has_outer_ref<'a>(
 ) -> Result<bool, SqlError> {
     match expression {
         Expr::Column { qualifier, name } => Ok(!chain.resolves(*qualifier, name)),
+        // Reads the enclosing query's current group.
+        Expr::OuterAggregate { .. } => Ok(true),
         Expr::SchemaColumn {
             schema,
             table,
@@ -2366,12 +2385,42 @@ pub(super) fn prepare_outer_subqueries<'a>(
         SUBQUERY_DEPTH,
         None,
         sequences,
-        SubqueryTiming::WhereReached,
+        SubqueryTiming::FirstRead,
     )?;
     Ok(OuterSubs {
         base,
         correlated: corr.as_slice(),
     })
+}
+
+/// Uncorrelated scalar subqueries `nodes` that run when an expression first
+/// reads them and keep their values in `arena`'s retained bytes, as
+/// PostgreSQL's initPlans do. Nothing runs here.
+pub(super) fn first_read_subqueries<'a>(
+    nodes: &[&'a Expr<'a>],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+    debug_assert!(nodes.iter().all(|node| matches!(
+        node,
+        Expr::Subquery(_) | Expr::RowSubquery { .. } | Expr::ArraySubquery(_) | Expr::Exists(_)
+    )));
+    // SAFETY: the engine's storage outlives every statement and reader that
+    // keeps these subqueries, and each run detaches its result before any
+    // borrow of storage escapes.
+    let storage: &'a Storage = unsafe { &*(storage as *const Storage) };
+    eval_subquery_nodes(
+        nodes,
+        storage,
+        txid,
+        arena,
+        &[],
+        SUBQUERY_DEPTH,
+        None,
+        None,
+        SubqueryTiming::FirstRead,
+    )
 }
 
 /// The exact scratch sizes `merge_correlated` fills for `base` + `correlated`
@@ -3644,7 +3693,7 @@ fn run_row_subquery<'a>(
     }
     if let Some(tree) = select.set_body {
         let (values, saw_null, witness) = run_set_subquery(
-            tree, select, storage, txid, arena, params, row_arity, sequences, outer,
+            tree, select, storage, txid, arena, params, row_arity, outer, sequences,
         )?;
         if values.len() > 1 {
             return Err(sql_err!(
@@ -3684,7 +3733,7 @@ fn run_subquery<'a>(
     }
     if let Some(tree) = select.set_body {
         return run_set_subquery(
-            tree, select, storage, txid, arena, params, row_arity, sequences, outer,
+            tree, select, storage, txid, arena, params, row_arity, outer, sequences,
         );
     }
     if row_arity > 1 {
@@ -3723,13 +3772,7 @@ fn run_subquery<'a>(
     // rows, so its body belongs to the row-source executor too (which handles
     // SRF expansion) — just like a grouped or windowed subquery.
     let has_srf = super::srf::has_project_set(select.items, storage, txid);
-    if !select.group_by.is_empty()
-        || select.having.is_some()
-        || select.distinct
-        || has_window
-        || has_srf
-        || has_correlated_nested_subquery(select, storage, txid, arena)?
-    {
+    if has_window || has_srf || needs_row_source(select, storage, txid, arena)? {
         // Grouped/DISTINCT/windowed/SRF subquery: the row-source executor
         // already handles grouping, HAVING, DISTINCT, windows, and SRF
         // expansion; collect its single output column.
@@ -4129,8 +4172,8 @@ fn run_set_subquery<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     row_arity: usize,
-    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     outer: Option<&dyn ColumnLookup<'a>>,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
     let bound_catalog = super::storage_catalog(storage, arena, txid);
     let bound_queries = super::ProceduralSubqueries { storage, txid };
@@ -4144,6 +4187,32 @@ fn run_set_subquery<'a>(
     let (rows, target, n_cols) = super::setops::materialize_set_body_tied(
         storage, txid, tree, arena, params, sequences, outer,
     )?;
+    // The trailing ORDER BY sorts the combined rows before LIMIT and OFFSET.
+    let rows = if outer_select.order_by.is_empty() {
+        rows
+    } else {
+        let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
+        super::setops::describe_set_body(
+            storage,
+            tree,
+            txid,
+            &mut columns,
+            arena,
+            None,
+            crate::sql::exec::DescriptionTarget::Sql,
+            outer,
+        )?;
+        let sorted = arena.alloc_slice_copy(rows).map_err(|_| arena_full())?;
+        super::setops::sort_set_rows(
+            storage,
+            txid,
+            arena,
+            sorted,
+            outer_select.order_by,
+            &columns[..n_cols],
+        )?;
+        &*sorted
+    };
     if n_cols != row_arity {
         return Err(sql_err!(
             sqlstate::SYNTAX_ERROR,
@@ -4401,7 +4470,7 @@ pub(crate) fn subquery_hooks_with_outer<'a>(
     detach_subquery_values(borrowed, arena)
 }
 
-fn detach_subquery_values<'a>(
+pub(super) fn detach_subquery_values<'a>(
     borrowed: SubqueryValues<'a, '_>,
     arena: &'a Arena,
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {

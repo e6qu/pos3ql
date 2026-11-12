@@ -5946,6 +5946,14 @@ pub enum Expr<'a> {
         source: ParameterSource,
     },
     Param(u32),
+    /// An aggregate call inside a subquery whose arguments read only columns
+    /// of the query `levels_up` levels out, which therefore computes it per
+    /// group (PostgreSQL's `agglevelsup`). Here it reads that query's value
+    /// for the current group; `call` is the node the owning query folds.
+    OuterAggregate {
+        call: &'a Expr<'a>,
+        levels_up: u32,
+    },
     Unary {
         source_position: SourcePosition,
         operator: UnaryOp,
@@ -6391,6 +6399,7 @@ impl<'a> Expr<'a> {
             | Expr::RecursiveState { .. }
             | Expr::RoutineParam { .. }
             | Expr::Param(_)
+            | Expr::OuterAggregate { .. }
             | Expr::Subquery(_)
             | Expr::RowSubquery { .. }
             | Expr::InSubquery { .. }
@@ -6485,7 +6494,7 @@ impl<'a> Expr<'a> {
     /// evaluated per inserted row rather than folded once.
     pub fn contains_call(&self) -> bool {
         match self {
-            Expr::Call { .. } => true,
+            Expr::Call { .. } | Expr::OuterAggregate { .. } => true,
             Expr::Null
             | Expr::Bool(_)
             | Expr::Int(_)
@@ -6590,6 +6599,7 @@ impl<'a> Expr<'a> {
             | Expr::SchemaColumn { .. }
             | Expr::RecursiveState { .. }
             | Expr::Param(_)
+            | Expr::OuterAggregate { .. }
             | Expr::DefaultMarker => false,
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
@@ -6711,6 +6721,7 @@ impl<'a> Expr<'a> {
                 }
                 args.iter().find_map(|a| a.find_function(matches))
             }
+            Expr::OuterAggregate { call, .. } => call.find_function(matches),
             Expr::Null
             | Expr::Bool(_)
             | Expr::Int(_)
@@ -6810,6 +6821,7 @@ impl<'a> Expr<'a> {
             | Expr::SchemaColumn { .. }
             | Expr::RecursiveState { .. }
             | Expr::Param(_)
+            | Expr::OuterAggregate { .. }
             | Expr::DefaultMarker
             | Expr::Subquery(_)
             | Expr::RowSubquery { .. }
@@ -6910,6 +6922,7 @@ impl<'a> Expr<'a> {
             | Expr::SchemaColumn { .. }
             | Expr::RecursiveState { .. }
             | Expr::Param(_)
+            | Expr::OuterAggregate { .. }
             | Expr::RoutineParam { .. }
             | Expr::DefaultMarker
             | Expr::Subquery(_)

@@ -888,6 +888,12 @@ pub trait ColumnLookup<'a> {
         None
     }
 
+    /// The current group's value of an aggregate that this scope's query, or
+    /// an enclosing one, computes for a nested subquery (`Expr::OuterAggregate`).
+    fn outer_aggregate(&self, _call: *const Expr<'_>) -> Option<Datum<'a>> {
+        None
+    }
+
     /// Declared size/precision, or the registered shape of a record column.
     fn column_type_mod(&self, _qualifier: Option<&str>, _name: &str) -> i32 {
         -1
@@ -1737,6 +1743,10 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
 /// A reference to a lookup is itself a lookup, so `&dyn ColumnLookup` can be
 /// passed to the generic `eval`/`where_passes` helpers.
 impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
+    fn outer_aggregate(&self, call: *const Expr<'_>) -> Option<Datum<'a>> {
+        (**self).outer_aggregate(call)
+    }
+
     fn procedural_variable(
         &self,
         qualifier: Option<&str>,
@@ -3471,9 +3481,11 @@ pub struct SubqueryValues<'h, 'a> {
     /// all-NULL, matching PostgreSQL (which type-checks `x IN (...)` regardless
     /// of contents).
     pub lists: &'h [SubqueryList<'a>],
-    /// Subqueries with effects, run where evaluation reaches them as
-    /// PostgreSQL runs a subplan, so their calls, sequence values and
-    /// data-modifying `WITH` reads keep PostgreSQL's order.
+    /// Subqueries run where evaluation reaches them, as PostgreSQL runs a
+    /// subplan or an initPlan: those with effects, so their calls, sequence
+    /// values and data-modifying `WITH` reads keep PostgreSQL's order, and a
+    /// query's uncorrelated scalar subqueries, so an expression no row
+    /// reaches never runs its subquery.
     pub deferred: &'h [DeferredSubquery<'h>],
 }
 
@@ -4015,6 +4027,7 @@ fn fold_check<'a>(
         | Expr::SchemaColumn { .. }
         | Expr::RecursiveState { .. }
         | Expr::Param(_)
+        | Expr::OuterAggregate { .. }
         | Expr::DefaultMarker => Ok(None),
         // Boolean connectives short-circuit like PostgreSQL's folding: a FALSE
         // (AND) / TRUE (OR) operand settles the result and drops the sibling,
@@ -5157,7 +5170,20 @@ fn eval_binary_values<'a>(
         row,
         hooks,
     )?;
-    if comparison_collation.is_some() {
+    // A number or boolean is never an enum's value, so neither operand's
+    // declared type can be an enum or a domain over one.
+    let not_enum = |value: &Datum<'_>| {
+        matches!(
+            value,
+            Datum::Bool(_)
+                | Datum::Int2(_)
+                | Datum::Int4(_)
+                | Datum::Int8(_)
+                | Datum::Float4(_)
+                | Datum::Float8(_)
+        )
+    };
+    if comparison_collation.is_some() && !(not_enum(&l) && not_enum(&r)) {
         validate_enum_operator_types(operator, left, right, row, hooks, arena)?;
     }
     if nulls == OperatorNulls::ReturnNull {
@@ -6289,6 +6315,19 @@ fn eval_full_inner<'a>(
         Expr::RecursiveState {
             qualifier, index, ..
         } => row.recursive_state(qualifier, index as usize),
+        Expr::OuterAggregate { call, .. } => {
+            let value = row.outer_aggregate(call).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "outer-level aggregate is evaluated outside its query's groups"
+                )
+            })?;
+            materialize_enum_values(
+                materialize_acl_value(value, hooks, arena)?,
+                hooks.catalog,
+                arena,
+            )
+        }
         Expr::Param(n) => params.get(n as usize - 1).copied().ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_PARAMETER,

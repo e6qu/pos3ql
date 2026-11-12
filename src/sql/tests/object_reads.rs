@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 pub(crate) struct HttpObjectServer {
     stop: Arc<AtomicBool>,
     pub(super) requests: Arc<AtomicUsize>,
+    /// Every distinct key an object GET read.
+    pub(super) fetched: Arc<crate::mem::mutex::Mutex<std::collections::HashSet<String>>>,
     pub(super) uploads: Arc<AtomicUsize>,
     pub(super) hold_response: Arc<AtomicBool>,
     hold_upload_response: Arc<AtomicBool>,
@@ -52,11 +54,15 @@ impl HttpObjectServer {
         fixture_config.object_store_prefix.clear();
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(AtomicUsize::new(0));
+        let fetched = Arc::new(crate::mem::mutex::Mutex::new(
+            std::collections::HashSet::new(),
+        ));
         let uploads = Arc::new(AtomicUsize::new(0));
         let hold_response = Arc::new(AtomicBool::new(false));
         let hold_upload_response = Arc::new(AtomicBool::new(false));
         let server_stop = Arc::clone(&stop);
         let server_requests = Arc::clone(&requests);
+        let server_fetched = Arc::clone(&fetched);
         let server_uploads = Arc::clone(&uploads);
         let server_hold_response = Arc::clone(&hold_response);
         let server_hold_upload_response = Arc::clone(&hold_upload_response);
@@ -224,6 +230,7 @@ impl HttpObjectServer {
                         };
                         let data = backing.body_bytes();
                         server_requests.fetch_add(1, Ordering::Relaxed);
+                        server_fetched.lock().unwrap().insert(key.to_owned());
                         while server_hold_response.load(Ordering::Acquire)
                             && !server_stop.load(Ordering::Acquire)
                         {
@@ -260,6 +267,7 @@ impl HttpObjectServer {
         Self {
             stop,
             requests,
+            fetched,
             uploads,
             hold_response,
             hold_upload_response,
@@ -552,14 +560,21 @@ pub(super) fn reply(stream: &mut TcpStream, request: &str, body: &[u8]) {
 }
 
 pub(super) fn replace_uncached_blocks(engine: &mut Engine, config: &Config) {
+    replace_blocks(engine, config, 0);
+}
+
+/// Replaces the engine's block stack with one reading `config`'s object
+/// endpoint through a RAM cache of `cache_bytes` and no disk tier.
+pub(super) fn replace_blocks(engine: &mut Engine, config: &Config, cache_bytes: usize) {
     use crate::store::{OwnedObjectStore, StackPlan};
     let blocks = engine.ckpt.as_ref().unwrap().block_stack();
-    let mut budget = Budget::new(OwnedObjectStore::budget_bytes(config));
+    let plan = StackPlan::resolve(cache_bytes, 0);
+    let mut budget = Budget::new(OwnedObjectStore::budget_bytes(config) + plan.ram_budget_bytes());
     let provider = OwnedObjectStore::new(config, &mut budget, "blocks/").unwrap();
     *blocks.lock().unwrap() = crate::store::build_tiers(
         &mut budget,
         provider,
-        StackPlan::resolve(0, 0),
+        plan,
         std::path::Path::new(&config.data_dir),
     )
     .unwrap();

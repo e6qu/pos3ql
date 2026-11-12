@@ -787,6 +787,7 @@ impl<'a> JoinState<'a> {
         buffers: &mut RowCursorBuffers,
         work: &Arena,
         params: &[Datum<'_>],
+        subqueries: Option<&crate::sql::eval::SubqueryValues<'_, '_>>,
     ) -> Result<bool, SqlError> {
         loop {
             check_timeout()?;
@@ -953,7 +954,7 @@ impl<'a> JoinState<'a> {
                 }
             }
             if !self.levels[depth].checked {
-                let passes = self.row_passes(scope, storage, txid, work, params)?;
+                let passes = self.row_passes(scope, storage, txid, work, params, subqueries)?;
                 let level = &mut self.levels[depth];
                 if !passes {
                     let pending = level.scan.pending.take().expect("checked join row");
@@ -1131,6 +1132,7 @@ impl<'a> JoinState<'a> {
         txid: u32,
         work: &Arena,
         params: &[Datum<'_>],
+        subqueries: Option<&crate::sql::eval::SubqueryValues<'_, '_>>,
     ) -> Result<bool, SqlError> {
         let level = &self.levels[self.depth];
         if level.on.is_none() && level.pushdown.is_empty() && level.hash.is_none() {
@@ -1163,6 +1165,7 @@ impl<'a> JoinState<'a> {
             let catalog = storage_catalog(storage, work, txid);
             let hooks = EvalHooks {
                 catalog: Some(&catalog),
+                subs: subqueries,
                 ..crate::sql::eval::NO_HOOKS
             };
             if let Some(on) = level.on {

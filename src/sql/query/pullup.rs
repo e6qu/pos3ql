@@ -64,7 +64,10 @@ pub(super) fn pull_up_subqueries<'a>(
     arena: &'a Arena,
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<&'a Select<'a>, SqlError> {
-    let mut current = select;
+    // Aggregates are placed before any merge, as PostgreSQL's parse analysis
+    // assigns their levels before planning.
+    let mut current =
+        super::aggregate_levels::assign_aggregate_levels(select, storage, txid, arena)?;
     let mut next = 0usize;
     // A grouped query names a subquery's columns in its ungrouped-column
     // errors, which merging the subquery would rename; there a subquery that
@@ -655,22 +658,12 @@ fn pull_up_one<'a>(
         .map_err(|_| Stop::Keep)?;
     let inner = inner_scope.as_ref();
     let alias = outer_scope.names[position];
-    // Every exposed name stays unique after the merge.
-    for index in 0..inner.map_or(0, |scope| scope.n) {
-        let inner_scope = inner.expect("counted");
-        let name = inner_scope.names[index];
-        if name.is_empty()
-            || inner_scope.names[..index].contains(&name)
-            || (0..outer_scope.n).any(|other| other != position && outer_scope.names[other] == name)
-        {
-            return Err(Stop::Keep);
-        }
-    }
     for index in 0..outer_scope.n {
         if outer_scope.names[..index].contains(&outer_scope.names[index]) {
             return Err(Stop::Keep);
         }
     }
+    let renamed = merged_names(&outer_scope, position, inner, body_from, arena)?;
     let scoped_columns = inner.map(|scope| CatalogScopeCols {
         scope,
         outer: None,
@@ -710,6 +703,7 @@ fn pull_up_one<'a>(
         arena,
         top: Top::Inner {
             inner,
+            renamed,
             outer: &outer_scope,
             position,
             lateral: table.lateral,
@@ -754,7 +748,7 @@ fn pull_up_one<'a>(
                 let inner_scope = inner.ok_or(Stop::Keep)?;
                 for column in 0..inner_scope.star_columns() {
                     *projected.get_mut(filled).ok_or(Stop::Keep)? =
-                        inner_column(inner_scope, inner_scope.star_entry(column), arena)?;
+                        inner_column(inner_scope, renamed, inner_scope.star_entry(column), arena)?;
                     filled += 1;
                 }
             }
@@ -768,7 +762,7 @@ fn pull_up_one<'a>(
                         .qualified_star_entry(name, column)
                         .map_err(|_| Stop::Keep)?;
                     *projected.get_mut(filled).ok_or(Stop::Keep)? =
-                        inner_column(inner_scope, entry, arena)?;
+                        inner_column(inner_scope, renamed, entry, arena)?;
                     filled += 1;
                 }
             }
@@ -926,10 +920,8 @@ fn pull_up_one<'a>(
                 let mut of = crate::mem::arena::ArenaList::new(arena);
                 for name in clause.of {
                     if *name == alias {
-                        let inner_scope = inner.ok_or(Stop::Keep)?;
-                        for index in 0..inner_scope.n {
-                            of.push(inner_scope.names[index])
-                                .map_err(|_| Stop::full())?;
+                        for name in renamed {
+                            of.push(*name).map_err(|_| Stop::full())?;
                         }
                     } else {
                         of.push(*name).map_err(|_| Stop::full())?;
@@ -1065,15 +1057,85 @@ fn nulled_with_columns(expression: &Expr<'_>) -> bool {
     strict(expression, &mut columns) && columns
 }
 
+/// The name each of the subquery's FROM items has after the merge. An item
+/// whose name an outer item (or an earlier merge) already exposes, such as
+/// the second read of a `NOT MATERIALIZED` CTE or a self-join through two
+/// derived tables, gets a name no SQL text can spell: longer than the 63
+/// bytes PostgreSQL keeps of an identifier, so it cannot capture a
+/// reference. PostgreSQL itself tells such items apart by range-table index.
+fn merged_names<'a>(
+    outer: &QueryScope<'a>,
+    position: usize,
+    inner: Option<&QueryScope<'a>>,
+    body_from: Option<&FromClause<'a>>,
+    arena: &'a Arena,
+) -> Step<&'a [&'a str]> {
+    let Some(inner) = inner else {
+        return Ok(&[]);
+    };
+    let names = arena
+        .alloc_slice_copy(&inner.names[..inner.n])
+        .map_err(|_| Stop::full())?;
+    let taken = |names: &[&str], index: usize, name: &str| {
+        names[..index].contains(&name)
+            || (0..outer.n).any(|other| other != position && outer.names[other] == name)
+    };
+    for index in 0..inner.n {
+        let name = names[index];
+        if name.is_empty() || inner.names[..index].contains(&name) {
+            return Err(Stop::Keep);
+        }
+        if !taken(names, index, name) {
+            continue;
+        }
+        // Only a plain relation's name is free to change: a function's or
+        // a VALUES list's name also names its columns.
+        let from = body_from.ok_or(Stop::Keep)?;
+        if inner.n != 1 + from.joins.len() {
+            return Err(Stop::Keep);
+        }
+        let item = item(from, index);
+        if item.subquery.is_some()
+            || item.func_args.is_some()
+            || item.rows_from.is_some()
+            || item.cte.is_some()
+            || inner.derived[index].is_some()
+            || inner.slots[index] == usize::MAX
+        {
+            return Err(Stop::Keep);
+        }
+        let mut ordinal = 1usize;
+        let fresh = loop {
+            let mut fresh = crate::mem::arena::ArenaString::new(arena);
+            core::fmt::Write::write_fmt(
+                &mut fresh,
+                format_args!(
+                    "{name} (merged FROM item {ordinal:0>width$})",
+                    width = crate::sql::lexer::MAX_IDENTIFIER_BYTES
+                ),
+            )
+            .map_err(|_| Stop::full())?;
+            let fresh = fresh.as_str();
+            if !taken(names, index, fresh) && !inner.names[..inner.n].contains(&fresh) {
+                break fresh;
+            }
+            ordinal += 1;
+        };
+        names[index] = fresh;
+    }
+    Ok(names)
+}
+
 fn inner_column<'a>(
     scope: &QueryScope<'a>,
+    renamed: &[&'a str],
     entry: ResolvedColumn,
     arena: &'a Arena,
 ) -> Step<&'a Expr<'a>> {
     match entry {
         ResolvedColumn::Table(table, column) => Ok(&*arena
             .alloc(Expr::Column {
-                qualifier: Some(scope.names[table]),
+                qualifier: Some(renamed[table]),
                 name: scope.defs.column_name(table, column),
             })
             .map_err(|_| Stop::full())?),
@@ -1144,6 +1206,8 @@ enum Top<'r, 'a> {
     /// bind to an outer item after the merge.
     Inner {
         inner: Option<&'r QueryScope<'a>>,
+        /// Each inner item's name after the merge.
+        renamed: &'a [&'a str],
         outer: &'r QueryScope<'a>,
         position: usize,
         lateral: bool,
@@ -1268,6 +1332,7 @@ impl<'a> Rewrite<'_, 'a> {
             }
             Top::Inner {
                 inner,
+                renamed,
                 outer,
                 position,
                 lateral,
@@ -1276,10 +1341,15 @@ impl<'a> Rewrite<'_, 'a> {
                     if let Some(inner) = inner
                         && names_relation(Some(inner), qualifier)
                     {
-                        inner
+                        let entry = inner
                             .find_column(Some(qualifier), name)
                             .map_err(|_| Stop::Keep)?;
-                        return Ok(None);
+                        return match entry {
+                            ResolvedColumn::Table(table, _) if renamed[table] != qualifier => {
+                                Ok(Some(inner_column(inner, renamed, entry, self.arena)?))
+                            }
+                            _ => Ok(None),
+                        };
                     }
                     if let Ok(table) = outer.entry_index(qualifier) {
                         return if lateral && table < position {
@@ -1304,7 +1374,9 @@ impl<'a> Rewrite<'_, 'a> {
                     )),
                 };
                 match resolved {
-                    Ok((inner, entry)) => Ok(Some(inner_column(inner, entry, self.arena)?)),
+                    Ok((inner, entry)) => {
+                        Ok(Some(inner_column(inner, renamed, entry, self.arena)?))
+                    }
                     Err(error) if error.sqlstate == sqlstate::UNDEFINED_COLUMN => {
                         match outer.find_column(None, name) {
                             Ok(ResolvedColumn::Table(table, column))
@@ -1384,6 +1456,31 @@ impl<'a> Rewrite<'_, 'a> {
                     Ok(None)
                 } else {
                     self.column(*qualifier, name)
+                }
+            }
+            // The call reads the columns of the query that owns it; one owned
+            // outside the query being rewritten keeps its references.
+            Expr::OuterAggregate { call, levels_up } => {
+                let mut owner = level;
+                for _ in 1..*levels_up {
+                    owner = owner.and_then(|level| level.parent);
+                }
+                let Some(owner) = owner else {
+                    return Ok(None);
+                };
+                let mapped = self.expression(call, owner.parent)?;
+                if core::ptr::eq(mapped, *call) {
+                    Ok(None)
+                } else {
+                    Ok(Some(
+                        &*self
+                            .arena
+                            .alloc(Expr::OuterAggregate {
+                                call: mapped,
+                                levels_up: *levels_up,
+                            })
+                            .map_err(|_| Stop::full())?,
+                    ))
                 }
             }
             Expr::WholeRow(name) => {
@@ -1668,12 +1765,12 @@ impl<'a> Rewrite<'_, 'a> {
     /// The subquery's own FROM items, with their conditions and lateral
     /// references qualified.
     fn qualified_from(&self, from: &'a FromClause<'a>) -> Step<FromClause<'a>> {
-        let base = self.inner_table(&from.base)?;
+        let base = self.inner_table(&from.base, 0)?;
         let mut joins = crate::mem::arena::ArenaList::new(self.arena);
-        for join in from.joins {
+        for (index, join) in from.joins.iter().enumerate() {
             joins
                 .push(Join {
-                    table: self.inner_table(&join.table)?,
+                    table: self.inner_table(&join.table, index + 1)?,
                     on: join
                         .on
                         .map(|condition| self.expression(condition, None))
@@ -1691,10 +1788,20 @@ impl<'a> Rewrite<'_, 'a> {
         })
     }
 
-    fn inner_table(&self, table: &TableRef<'a>) -> Step<TableRef<'a>> {
+    /// FROM item `index` of the subquery, under its merged name.
+    fn inner_table(&self, table: &TableRef<'a>, index: usize) -> Step<TableRef<'a>> {
         let mut table = *table;
         if table.lateral || table.rows_from.is_some() {
             return Err(Stop::Keep);
+        }
+        if let Top::Inner {
+            inner: Some(inner),
+            renamed,
+            ..
+        } = self.top
+            && renamed[index] != inner.names[index]
+        {
+            table.alias = Some(renamed[index]);
         }
         if let Some(arguments) = table.func_args {
             table.func_args = Some(self.expressions(arguments, None)?);

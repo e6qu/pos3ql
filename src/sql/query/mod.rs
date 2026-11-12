@@ -94,6 +94,7 @@ pub(crate) use type_inputs::capture_procedural_statement_type_inputs;
 pub(crate) use type_inputs::{
     capture_contextual_type_inputs, visit_planner_calls, visit_planner_expression,
 };
+mod aggregate_levels;
 pub(super) mod predicate_safety;
 pub(crate) use cte::expand_enclosed_ctes_exec;
 pub(crate) use cte::expand_from_schema;
@@ -4975,12 +4976,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn has_operator_candidate(&self, name: &str) -> bool {
-        self.storage
-            .operators_visible_to(self.txid)
-            .any(|(_, operator)| {
-                operator.name.as_str() == name
-                    && self.storage.schema_is_on_path(operator.schema, self.txid)
-            })
+        self.storage.has_operator_named_on_path(name, self.txid)
     }
 
     fn statistics_definition<'a>(
@@ -9971,8 +9967,38 @@ pub(super) fn collect_aggs<'a>(
             .map_err(|_| arena_full())?;
         return Ok(()); // aggregate arguments evaluate per input row
     }
+    if is_sublink(expression) {
+        push_owned_outer_aggregates(expression, out)?;
+    }
     walk_children(expression, &mut |child| {
         collect_aggs(child, out, storage, txid, columns)
+    })
+}
+
+fn is_sublink(expression: &Expr<'_>) -> bool {
+    matches!(
+        expression,
+        Expr::Subquery(_)
+            | Expr::Exists(_)
+            | Expr::ArraySubquery(_)
+            | Expr::RowSubquery { .. }
+            | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
+    )
+}
+
+/// Adds the aggregates that `expression`'s nested queries read from this
+/// query (see `aggregate_levels`), once each.
+fn push_owned_outer_aggregates<'a>(
+    expression: &'a Expr<'a>,
+    out: &mut ArenaList<'a, (*const Expr<'a>, &'a Expr<'a>)>,
+) -> Result<(), SqlError> {
+    aggregate_levels::visit_owned_outer_aggregates(expression, &mut |call| {
+        if !out.as_slice().iter().any(|(p, _)| core::ptr::eq(*p, call)) {
+            out.push((call as *const _, call))
+                .map_err(|_| arena_full())?;
+        }
+        Ok(())
     })
 }
 
@@ -10101,6 +10127,16 @@ fn collect_grouped_aggs<'a>(
         out.push((e as *const _, e)).map_err(|_| arena_full())?;
         return Ok(());
     }
+    if is_sublink(e) {
+        // The window layer evaluates subqueries above the grouped derived
+        // table, where an aggregate this query owns has no group to read.
+        aggregate_levels::visit_owned_outer_aggregates(e, &mut |_| {
+            Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a subquery reading an aggregate of a query with window functions is not supported"
+            ))
+        })?;
+    }
     walk_children(e, &mut |child| {
         collect_grouped_aggs(child, out, storage, txid, columns)
     })
@@ -10168,6 +10204,7 @@ fn rewrite_grouped_expr<'a>(
         | Expr::BoundLiteral { .. }
         | Expr::BitLit(_)
         | Expr::Param(_)
+        | Expr::OuterAggregate { .. }
         | Expr::DefaultMarker
         // Subqueries evaluate through their own hooks, not the group.
         | Expr::Subquery(_)
@@ -10541,6 +10578,12 @@ pub(super) fn expr_has_aggregate(
         return Ok(true);
     }
     let mut found = false;
+    if is_sublink(expression) {
+        aggregate_levels::visit_owned_outer_aggregates(expression, &mut |_| {
+            found = true;
+            Ok(())
+        })?;
+    }
     subquery::walk_children(expression, &mut |child| {
         if expr_has_aggregate(child, storage, txid, columns)? {
             found = true;
@@ -12327,6 +12370,28 @@ fn expression_needs_aggregate_resolution(
     storage: &Storage,
     txid: u32,
 ) -> bool {
+    if call_may_be_aggregate(expression, storage, txid) {
+        return true;
+    }
+    let mut found = false;
+    if is_sublink(expression) {
+        aggregate_levels::visit_owned_outer_aggregates(expression, &mut |_| {
+            found = true;
+            Ok(())
+        })
+        .expect("owned-aggregate visitor cannot fail");
+    }
+    walk_children(expression, &mut |child| {
+        found |= expression_needs_aggregate_resolution(child, storage, txid);
+        Ok(())
+    })
+    .expect("aggregate candidate visitor cannot fail");
+    found
+}
+
+/// Whether a call without `OVER` could select an aggregate, judged by its
+/// spelling and the catalog's names alone, before its argument types are known.
+pub(super) fn call_may_be_aggregate(expression: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
     if let Expr::Call {
         name,
         args,
@@ -12351,13 +12416,7 @@ fn expression_needs_aggregate_resolution(
     {
         return true;
     }
-    let mut found = false;
-    walk_children(expression, &mut |child| {
-        found |= expression_needs_aggregate_resolution(child, storage, txid);
-        Ok(())
-    })
-    .expect("aggregate candidate visitor cannot fail");
-    found
+    false
 }
 
 #[allow(clippy::too_many_arguments)]

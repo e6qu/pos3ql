@@ -220,8 +220,9 @@ stream sorts itself (local mode), or a **retained grouping** of such a
 source (`GROUP BY`, `HAVING`, aggregates and plain `DISTINCT`, below), or
 `DISTINCT ON` the stream sorts (local mode), or a `UNION ALL` of such
 queries without its own `ORDER BY` (below);
-without grouping sets, other set operations, subqueries (a simple subquery in
-FROM is merged into its query first, below), CTEs that run once, row locking
+without grouping sets, other set operations, subqueries other than
+uncorrelated scalar ones (a simple subquery in FROM is merged into its query
+first, below), CTEs that run once, row locking
 or row security, whose read position (one
 record per resident row of each table plus the query text) fits
 `result_stream_bytes`. A retained join uses inner, cross and `LEFT` joins,
@@ -256,7 +257,21 @@ sends nothing before its first page, so its reads yield throughout.
 A paged portal whose statement can stream opens its stream before the
 statement runs: its attempt would stop at its first row anyway, so a sort,
 grouping or hash table is built once, in the stream, and its input reads
-resume instead of restarting the statement on each cold read.
+resume instead of restarting the statement on each cold read. In
+object-store mode a join or grouping (including plain `DISTINCT`) opens its
+stream before running under every protocol, for the same reason: its first
+row reads a whole input. Such a stream opens however small its result, so
+it counts in `pos3ql_result_streams_total`.
+
+A statement that does not stream restarts from its start after each cold
+read, finding the objects its earlier attempts read only in the block
+caches. Once it has restarted more times than the caches and the object
+read slots hold blocks (`block_cache_bytes`, `disk_cache_bytes` and
+`object_store_get_slots`), its next attempt reads storage synchronously,
+blocking the worker, instead of restarting again: its input may have
+outgrown the caches, so each attempt could evict blocks the next one needs
+and it would never finish. A result stream resumes from its read position
+and never restarts this way.
 
 A forward `FETCH n` or `FETCH ALL` (simple Query or unpaged `Execute`) from
 a cursor that reads as it fetches and saves no history opens such a stream
@@ -347,6 +362,16 @@ driver itself, so a routine call there hands off on its row; a filter under a
 sort or grouping runs as that node reads its input
 (`src/sql/query/retained/tree.rs`).
 
+**Aggregate levels.** Before a query is planned, each aggregate call is
+given to the query PostgreSQL assigns it: the innermost one whose columns its
+arguments read. `SELECT (SELECT max(t.id) FROM u) FROM t` aggregates `t` and
+returns one row. Analysis rewrites such a call inside a subquery as an outer
+aggregate; the owning query folds it with its own aggregates and evaluates
+that subquery once per group, whose row supplies the value. The same pass
+reports PostgreSQL's placement errors (an aggregate in `WHERE`, `JOIN ... ON`,
+`GROUP BY`, `FILTER`, `LIMIT`, a function in `FROM`, or nested in another of
+its level) before any row is read (`src/sql/query/aggregate_levels.rs`).
+
 **Subqueries in FROM.** Before a query is planned, each simple subquery in its
 FROM clause is merged into it, as PostgreSQL's `pull_up_subqueries` does: the
 subquery's FROM items join the outer query in its place, its `WHERE` joins the
@@ -356,7 +381,11 @@ t) s WHERE x <> 0` filters before it divides, and an output column nothing
 reads is never computed. A subquery is merged only when that is exact: no
 grouping, aggregates, window functions, `DISTINCT`, `ORDER BY`, `LIMIT`,
 locking, set-returning or volatile output, security-barrier view, or name the
-merge could rebind. Under an outer join that can null its rows it merges only
+merge could rebind. A table among its FROM items whose name another item of
+the query already has (a `NOT MATERIALIZED` CTE read twice, a self-join
+through two derived tables) takes a name no SQL text can spell, longer than
+the 63 bytes kept of an identifier, as PostgreSQL tells such items apart by
+position. Under an outer join that can null its rows it merges only
 without a `WHERE` (which would otherwise run per joined pair) and when each
 output it substitutes is null whenever its columns are (PostgreSQL substitutes
 those without a placeholder). A view merges when the caller holds `SELECT` on all of it.
@@ -383,6 +412,20 @@ and otherwise (column privileges only, `security_barrier`) spools. So
 `WITH recent AS (SELECT * FROM orders WHERE id > 100) SELECT * FROM recent`
 streams as the scan of `orders` it becomes, while the same query with `AS
 MATERIALIZED` spools (`src/sql/query/cte.rs`, `expand_stream_ctes`).
+
+**Built: uncorrelated subqueries.** A stream, or a top-level `SELECT` run in
+place, keeps scalar, `EXISTS`, `ARRAY` and row subqueries that read no column
+of its query and call no volatile or user-defined function. Each runs when an
+expression first reads it, as PostgreSQL's initPlans do (in the general
+executor too), and keeps its value for the rest of the statement in the
+reader's allocation (`result_stream_bytes`) or the statement arena's
+persistent tail, so `SELECT (SELECT 1/x FROM z) FROM empty_table` returns no
+rows. A `WHERE` conjunct that reads no column of its query runs once before
+the scan, as PostgreSQL's one-time filter: `SELECT id, payload FROM orders
+WHERE id > (SELECT max(id) - 1000 FROM orders)` streams, and a false one
+returns no rows without reading any. A wait inside a subquery runs it again. Correlated subqueries, `IN` and `ANY`/`ALL`
+lists, subqueries in a sorted or grouped stream, in a `UNION ALL` query or
+in a declared cursor still spool or save their rows.
 
 Every other shape runs in the general executor, which materializes in the
 statement arena and cannot pause after its first byte. New node kinds are the
@@ -497,7 +540,8 @@ being built and are released when it is delivered.
 | `DISTINCT` (built: plain, as a grouping by the output list) | Each distinct output row | `plan_build_bytes` |
 | Sort (built: local mode, also for `DISTINCT ON`) | Sort keys, saved output and input columns of every row | `plan_build_bytes`; object-store mode: the external sorter's runs on the block grid (not built) |
 | Set operations (built: `UNION ALL` in streams) | `UNION ALL`: each query's own plan and the current query; others: sorted runs of both inputs with counts | Stream allocation; others: external runs |
-| Scalar, `IN`/`EXISTS` subquery | Per-outer-row child tree, rewound per row, or a cached sorted run when uncorrelated | Node record or external run |
+| Scalar, `EXISTS`, `ARRAY` and row subquery (built: uncorrelated, unsorted and ungrouped, run when first read) | Each value; correlated: a per-outer-row child tree, rewound per row | Stream allocation |
+| `IN`/`ANY`/`ALL` subquery | A cached sorted run when uncorrelated, or a per-outer-row child tree | External run |
 | Derived table, CTE read once | Child tree in place | Its nodes |
 
 **Choosing a stream before execution.** Eligibility is decided from the

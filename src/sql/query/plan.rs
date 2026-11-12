@@ -1082,6 +1082,7 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         | BitLit(_)
         | BoundLiteral { .. }
         | Param(_)
+        | OuterAggregate { .. }
         | RoutineParam { .. }
         | DefaultMarker
         | Column { .. }

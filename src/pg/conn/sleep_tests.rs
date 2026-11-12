@@ -47,7 +47,7 @@ fn connection(fixture: &mut Fixture, id: i32) -> (Conn, TcpStream) {
     let mut conn = Conn::new(&fixture.config, &mut fixture.budget).unwrap();
     conn.open(server, id).unwrap();
     conn.auth_database = fixture.engine.database_login("postgres");
-    conn.phase = Phase::Ready;
+    conn.enter_ready_for_tests(&fixture.engine);
     (conn, client)
 }
 

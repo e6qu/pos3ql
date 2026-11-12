@@ -107,7 +107,7 @@ fn connection(fixture: &mut Fixture, id: i32) -> (Conn, TcpStream) {
     let mut conn = Conn::new(&fixture.config, &mut fixture.budget).unwrap();
     conn.open(server, id).unwrap();
     conn.auth_database = fixture.engine.database_login("postgres");
-    conn.phase = Phase::Ready;
+    conn.enter_ready_for_tests(&fixture.engine);
     (conn, client)
 }
 
@@ -1896,7 +1896,7 @@ fn tls_result_streams_resume_while_the_client_reads_ciphertext() {
     let mut conn = Conn::new(&fixture.config, &mut fixture.budget).unwrap();
     conn.open(server, 3).unwrap();
     conn.auth_database = fixture.engine.database_login("postgres");
-    conn.phase = Phase::Ready;
+    conn.enter_ready_for_tests(&fixture.engine);
     let mut client = tls_client(&mut conn, &mut socket);
     let mut input = query("SELECT id, payload FROM big");
     input.extend_from_slice(&query("SELECT 2"));

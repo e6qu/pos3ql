@@ -6937,8 +6937,8 @@ mod tests {
             let mut other = Conn::new(&config, &mut budget).unwrap();
             conn.id = 1;
             other.id = 2;
-            conn.phase = Phase::Ready;
-            other.phase = Phase::Ready;
+            conn.enter_ready_for_tests(&engine);
+            other.enter_ready_for_tests(&engine);
             conn.guc
                 .set_config("statement_timeout", Some("1s"), false)
                 .unwrap();
@@ -7179,8 +7179,8 @@ mod tests {
             let mut other = Conn::new(&config, &mut budget).unwrap();
             conn.id = 1;
             other.id = 2;
-            conn.phase = Phase::Ready;
-            other.phase = Phase::Ready;
+            conn.enter_ready_for_tests(&engine);
+            other.enter_ready_for_tests(&engine);
             conn.guc
                 .set_config("application_name", Some("copy-owner"), false)
                 .unwrap();
@@ -7336,9 +7336,9 @@ mod tests {
             writer.id = 1;
             holder.id = 2;
             observer.id = 3;
-            writer.phase = Phase::Ready;
-            holder.phase = Phase::Ready;
-            observer.phase = Phase::Ready;
+            writer.enter_ready_for_tests(&engine);
+            holder.enter_ready_for_tests(&engine);
+            observer.enter_ready_for_tests(&engine);
             request(
                 &mut writer,
                 &mut engine,
@@ -7540,9 +7540,9 @@ mod tests {
                 writer.id = 1;
                 holder.id = 2;
                 observer.id = 3;
-                writer.phase = Phase::Ready;
-                holder.phase = Phase::Ready;
-                observer.phase = Phase::Ready;
+                writer.enter_ready_for_tests(&engine);
+                holder.enter_ready_for_tests(&engine);
+                observer.enter_ready_for_tests(&engine);
                 request(
                     &mut writer,
                     &mut engine,
@@ -7787,7 +7787,7 @@ mod tests {
             let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
             let mut engine = Engine::new(&config, &mut budget).unwrap();
             let mut conn = Conn::new(&config, &mut budget).unwrap();
-            conn.phase = Phase::Ready;
+            conn.enter_ready_for_tests(&engine);
             query(
                 &mut conn,
                 &mut engine,
@@ -7975,7 +7975,7 @@ mod tests {
         let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut conn = Conn::new(&config, &mut budget).unwrap();
-        conn.phase = Phase::Ready;
+        conn.enter_ready_for_tests(&engine);
         query(
             &mut conn,
             &mut engine,
@@ -8097,7 +8097,7 @@ mod tests {
             let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
             let mut engine = Engine::new(&config, &mut budget).unwrap();
             let mut conn = Conn::new(&config, &mut budget).unwrap();
-            conn.phase = Phase::Ready;
+            conn.enter_ready_for_tests(&engine);
             message(&mut conn, &mut engine, wire::FMSG_QUERY, b"BEGIN\0");
             let name = if reset == 3 { "" } else { "saved" };
             parse(&mut conn, &mut engine, name, "SELECT 1 AS original_value");
@@ -8218,7 +8218,7 @@ mod tests {
                 let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 let mut conn = Conn::new(&config, &mut budget).unwrap();
-                conn.phase = Phase::Ready;
+                conn.enter_ready_for_tests(&engine);
                 // Initial publication populates the simulator's remote fixtures.
                 assert!(conn.recv.append(&frontend(
                     wire::FMSG_QUERY,
@@ -8323,7 +8323,7 @@ mod tests {
                 let mut engine = Engine::new(&config, &mut budget).unwrap();
                 engine.enable_async_durability();
                 let mut conn = Conn::new(&config, &mut budget).unwrap();
-                conn.phase = Phase::Ready;
+                conn.enter_ready_for_tests(&engine);
                 assert!(matches!(
                     message(&mut conn, &mut engine, wire::FMSG_QUERY, RESULTS),
                     Step::Continue | Step::Parked
@@ -8417,7 +8417,7 @@ mod tests {
                 let (server, _) = listener.accept().unwrap();
                 server.set_nonblocking(true).unwrap();
                 connection.open(server, id).unwrap();
-                connection.phase = Phase::Ready;
+                connection.enter_ready_for_tests(&engine);
                 engine
                     .register_backend(
                         id,
@@ -8626,7 +8626,7 @@ mod tests {
                 let (server, _) = listener.accept().unwrap();
                 server.set_nonblocking(true).unwrap();
                 connection.open(server, id).unwrap();
-                connection.phase = Phase::Ready;
+                connection.enter_ready_for_tests(&engine);
                 engine
                     .register_backend(
                         id,
@@ -8889,7 +8889,7 @@ mod tests {
             let (server, _) = listener.accept().unwrap();
             server.set_nonblocking(true).unwrap();
             conn.open(server, 72).unwrap();
-            conn.phase = Phase::Ready;
+            conn.enter_ready_for_tests(&engine);
             let role = engine.role_login("postgres").unwrap().identity;
             engine
                 .register_backend(
@@ -9057,7 +9057,7 @@ mod tests {
         let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut conn = Conn::new(&config, &mut budget).unwrap();
-        conn.phase = Phase::Ready;
+        conn.enter_ready_for_tests(&engine);
         query(
             &mut conn,
             &mut engine,
@@ -9229,7 +9229,7 @@ mod tests {
         let mut budget = crate::sql::test_engine_budget(&config, 1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut conn = Conn::new(&config, &mut budget).unwrap();
-        conn.phase = Phase::Ready;
+        conn.enter_ready_for_tests(&engine);
         // Expected fields were captured from PostgreSQL 18.6.
         let cases: [(u8, &str, &str, &str, Option<&str>); 7] = [
             (
@@ -9337,7 +9337,7 @@ mod tests {
         let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
-        connection.phase = Phase::Ready;
+        connection.enter_ready_for_tests(&engine);
 
         let query = format!("SELECT ${MAX_BIND_PARAMS}::integer");
         let mut parse = Vec::new();
@@ -9546,7 +9546,7 @@ mod tests {
         let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
-        connection.phase = Phase::Ready;
+        connection.enter_ready_for_tests(&engine);
 
         let mut query = vec![wire::FMSG_QUERY];
         query.extend_from_slice(&13i32.to_be_bytes());
@@ -9635,9 +9635,9 @@ mod tests {
             let mut engine = Engine::new(&config, &mut budget).unwrap();
             let mut reader = Conn::new(&config, &mut budget).unwrap();
             let mut writer = Conn::new(&config, &mut budget).unwrap();
-            reader.phase = Phase::Ready;
+            reader.enter_ready_for_tests(&engine);
             reader.id = 1;
-            writer.phase = Phase::Ready;
+            writer.enter_ready_for_tests(&engine);
             writer.id = 2;
             reader
                 .recv
@@ -9767,7 +9767,7 @@ mod tests {
         let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut conn = Conn::new(&config, &mut budget).unwrap();
-        conn.phase = Phase::Ready;
+        conn.enter_ready_for_tests(&engine);
         message(&mut conn, &mut engine, wire::FMSG_QUERY,
             b"CREATE FUNCTION bind_first_state(anyelement,anyelement) RETURNS anyelement LANGUAGE sql AS 'SELECT coalesce($1,$2)'; CREATE AGGREGATE bind_first(anyelement)(SFUNC=bind_first_state,STYPE=anyelement)\0");
         for (name, oid, input) in [
@@ -9856,7 +9856,7 @@ mod tests {
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
         assert_eq!(budget.remaining(), 0);
-        connection.phase = Phase::Ready;
+        connection.enter_ready_for_tests(&engine);
 
         let mut parse = Vec::new();
         parse.extend_from_slice(b"char\0SELECT $1\0");
@@ -9938,7 +9938,7 @@ mod tests {
         let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
-        connection.phase = Phase::Ready;
+        connection.enter_ready_for_tests(&engine);
 
         let mut parse = Vec::new();
         parse.extend_from_slice(b"aclitem\0SELECT makeaclitem(10,10,'SELECT',false)\0");
@@ -10021,7 +10021,7 @@ mod tests {
         let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
-        connection.phase = Phase::Ready;
+        connection.enter_ready_for_tests(&engine);
 
         let mut parse = Vec::new();
         parse.extend_from_slice(b"refcursor_binary\0SELECT $1::refcursor, $2::refcursor[]\0");
@@ -10146,7 +10146,7 @@ mod tests {
         let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
-        connection.phase = Phase::Ready;
+        connection.enter_ready_for_tests(&engine);
 
         let mut parse = Vec::new();
         parse.extend_from_slice(b"array_subscripts\0SELECT array_remove($1::int[], 10)\0");
@@ -10250,7 +10250,7 @@ mod tests {
         let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
-        connection.phase = Phase::Ready;
+        connection.enter_ready_for_tests(&engine);
 
         connection.recv.append(&frontend(
             wire::FMSG_QUERY,
@@ -10352,7 +10352,7 @@ mod tests {
         let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
-        connection.phase = Phase::Ready;
+        connection.enter_ready_for_tests(&engine);
 
         let mut parse = Vec::new();
         parse.extend_from_slice(
@@ -10446,7 +10446,7 @@ mod tests {
             let mut budget = crate::sql::test_engine_budget(&config, 1 << 30);
             let mut engine = Engine::new(&config, &mut budget).unwrap();
             let mut administrator = Conn::new(&config, &mut budget).unwrap();
-            administrator.phase = Phase::Ready;
+            administrator.enter_ready_for_tests(&engine);
             assert!(administrator.recv.append(&frontend(
                 wire::FMSG_QUERY,
                 b"CREATE TABLE login_commit_audit(username text); \
@@ -11855,7 +11855,7 @@ mod tests {
                     let (socket, _) = listener.accept().unwrap();
                     socket.set_nonblocking(true).unwrap();
                     connection.open(socket, id).unwrap();
-                    connection.phase = Phase::Ready;
+                    connection.enter_ready_for_tests(&engine);
                     engine
                         .register_backend(
                             id,

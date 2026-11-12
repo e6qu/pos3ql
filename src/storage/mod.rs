@@ -47610,6 +47610,15 @@ impl Storage {
         }
     }
 
+    /// The unqualified name of the relation a trigger is defined on. Read it
+    /// without holding the trigger catalog lock.
+    fn trigger_target_name(&self, target: TriggerTarget, txid: u32) -> SqlName {
+        match target {
+            TriggerTarget::Table(slot) => self.table_def(usize::from(slot), txid).name,
+            TriggerTarget::View(slot) => self.view(usize::from(slot)).name_for(txid),
+        }
+    }
+
     pub(crate) fn create_trigger(
         &mut self,
         spec: TriggerSpec,
@@ -47652,10 +47661,12 @@ impl Storage {
             .iter()
             .any(|trigger| same_identity(trigger) && trigger.visible_to(txid))
         {
+            drop(catalog);
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
-                "trigger \"{}\" for relation already exists",
-                spec.name.as_str()
+                "trigger \"{}\" for relation \"{}\" already exists",
+                spec.name.as_str(),
+                self.trigger_target_name(spec.target, txid).as_str()
             ));
         }
         let Some(slot) = catalog
@@ -47772,10 +47783,12 @@ impl Storage {
                     && candidate.name_to(txid) == name
             })
         {
+            drop(catalog);
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
-                "trigger \"{}\" for relation already exists",
-                name.as_str()
+                "trigger \"{}\" for relation \"{}\" already exists",
+                name.as_str(),
+                self.trigger_target_name(trigger.target, txid).as_str()
             ));
         }
         let trigger = &mut catalog.definitions[slot];
@@ -54504,6 +54517,7 @@ impl Storage {
     ) -> Result<RulePublication, SqlError> {
         validate_stored_search_path(&definition.creation_path)?;
         let target = self.query_rule_target(definition.target, txid)?;
+        let (_, relation) = self.rule_target_names(definition.target, txid);
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
             type_contracts::CatalogPublicationInput::QueryDefinition(dependencies),
@@ -54520,8 +54534,9 @@ impl Storage {
             if !or_replace {
                 return Err(sql_err!(
                     sqlstate::DUPLICATE_OBJECT,
-                    "rule \"{}\" for relation already exists",
-                    definition.name.as_str()
+                    "rule \"{}\" for relation \"{}\" already exists",
+                    definition.name.as_str(),
+                    relation.as_str()
                 ));
             }
             let prior = catalog.rules[slot].pending;
@@ -54642,6 +54657,8 @@ impl Storage {
             None
         };
         let target = self.query_rule_target(selected.definition_for(txid).target, txid)?;
+        // Read before the catalog lock below; the relation's name lives there.
+        let (_, relation) = self.rule_target_names(selected.definition_for(txid).target, txid);
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
             type_contracts::CatalogPublicationInput::RuleMetadataEdit,
@@ -54726,7 +54743,9 @@ impl Storage {
         {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
-                "rule already exists for relation"
+                "rule \"{}\" for relation \"{}\" already exists",
+                definition.name.as_str(),
+                relation.as_str()
             ));
         }
         if matches!(change, RuleMetadataChange::Rename(_)) {

@@ -8027,7 +8027,9 @@ pub(crate) fn analyse_rule_action<'a>(
     }
 }
 
-fn analyse_sublinks<'a>(
+/// [`analyse_select`] for every subquery of `expression`, with `row` as the
+/// outer query's columns.
+pub(crate) fn analyse_sublinks<'a>(
     expression: &'a Expr<'a>,
     storage: &'a Storage,
     txid: u32,

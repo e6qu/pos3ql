@@ -297,8 +297,9 @@ set, and omits an explicit `security_invoker=false`. A `CHECK` constraint
 marked `NO INHERIT` fails with `0A000`, and exclusion constraints support only
 GiST over range columns (`EXCLUDE USING btree (a WITH =)` fails with `0A000`).
 `pg_constraint` omits the system catalogs' own not-null constraints.
-`CREATE RULE` accepts a condition containing a subquery only in PostgreSQL:
-pos3ql rejects it with `0A000` (`cannot use subquery in rule condition`). A
+`CREATE OR REPLACE RULE "_RETURN"` replaces a view's query only when every
+column keeps its type modifier; PostgreSQL also accepts an unmodified type
+(`numeric` for a `numeric(5,2)` column). A
 missing column error never carries PostgreSQL's spelling-suggestion hint
 (`Perhaps you meant to reference the column "t.v".`). A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1

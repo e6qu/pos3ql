@@ -515,7 +515,9 @@ are the reference.
 
 `CREATE OR REPLACE VIEW` keeps the view's identifier, row type, `_RETURN` rule,
 owner, permissions and comments. Renaming a source column keeps the view's
-output names.
+output names. `CREATE OR REPLACE RULE "_RETURN" AS ON SELECT TO v DO INSTEAD
+SELECT ...` replaces the query of view `v` when it returns the same column
+names and types, and also keeps the view's options.
 
 A materialized view created `WITH NO DATA` fails ordinary reads with `55000`,
 including `LIMIT 0`. REFRESH requires MAINTAIN, runs as the owner and holds an
@@ -523,8 +525,10 @@ exclusive lock until the transaction ends. Rollback restores both rows and
 populated status.
 
 Rewrite rules take the target table's exclusive lock, so a rule that redirects
-an insert conflicts with ordinary reads of that table. `_RETURN` cannot be
-renamed. `pg_get_ruledef` supports both formatting modes for unconditional
+an insert conflicts with ordinary reads of that table. A rule condition may
+use subqueries over other tables and the event's `OLD` and `NEW` rows
+(`WHERE EXISTS (SELECT 1 FROM allowed WHERE allowed.id = new.id)`). `_RETURN`
+cannot be renamed. `pg_get_ruledef` supports both formatting modes for unconditional
 `DO NOTHING` rules; other rules return their saved SQL, and pretty formatting
 of a condition or action returns `0A000`. A missing rule returns NULL.
 

@@ -29,6 +29,7 @@ pub(super) enum CompletionReply {
 
 /// The next event belongs to this statement's trigger depth. Its completion
 /// marker is installed by the firing, before recursive trigger SQL can run.
+#[derive(Clone, Copy)]
 pub(super) struct QueuedFiring {
     pub(super) index: usize,
     pub(super) trigger_slot: u16,
@@ -182,6 +183,7 @@ enum AfterPhase {
     clippy::large_enum_variant,
     reason = "selected trigger definitions stay inline without heap allocation"
 )]
+#[derive(Clone, Copy)]
 enum AfterFiring {
     Row(QueuedFiring),
     Statement {
@@ -490,6 +492,16 @@ impl WriteCompletionState {
                 Ok(Some((firing, wait))) => {
                     self.firing = Some(firing);
                     return sql_fail(wait);
+                }
+                // A wait before the firing could keep its own progress runs
+                // the same event again on resume; the cursor has moved past it.
+                Err(error) if control_flow::is_execution_wait(&error) => {
+                    match SavedAfterFiring::capture(selected, &context.storage().execution_control)
+                    {
+                        Ok(saved) => self.selected = Some(saved),
+                        Err(capture) => return sql_fail(capture),
+                    }
+                    return sql_fail(error);
                 }
                 Err(error) => return sql_fail(error),
             }

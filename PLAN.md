@@ -115,9 +115,9 @@ is owned.
   write whose scan ran a volatile built-in reads its rows synchronously.
   Reads after a write's last row (statement-level and `AFTER` triggers,
   foreign key checks queued as constraint events, transition tables, the
-  next step's selection) read synchronously: the write completion advances
-  its event cursor before an event runs, so yielding there first needs the
-  completion to run the waiting event again instead of skipping it.
+  next step's selection) read synchronously. The write completion already
+  runs an event that waited again instead of skipping it; those reads still
+  need to leave the statement's effect protection so they can wait.
   `INSTEAD OF` view rows, DDL, COPY, replication apply and deferred
   triggers read synchronously. A routine call inside the rows
   keeps the changed rows (row progress), also for views and rules written

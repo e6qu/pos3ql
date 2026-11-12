@@ -728,6 +728,12 @@ fn select_output_width(
             }
         }
     }
+    // The query's own WITH list names some of its FROM items.
+    let select = if select.with.is_empty() {
+        select
+    } else {
+        super::expand_ctes(select, storage, txid, arena)?
+    };
     // A routine's variables are the levels around a stored body's query.
     let outer = context.transition.map(super::scope::ResolverColumns);
     let scope = select

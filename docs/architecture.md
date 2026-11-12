@@ -327,10 +327,23 @@ save their rows. In the general executor
 a correlated subquery reads the enclosing row from its derived tables, set
 operation branches, `LIMIT`, `OFFSET` and `JOIN ... ON` conditions, as
 PostgreSQL's outer references do; a correlated subquery in a join condition
-runs for each pair of rows it compares. A correlated scalar subquery binds
-its result type and aggregate calls once per statement, before any outer
-row, and copies the bound aggregate states for each outer row
-(`bind_correlated_subqueries` in `src/sql/query/subquery.rs`).
+runs for each pair of rows it compares. A correlated scalar, `ARRAY`,
+single-column `IN`/`ANY`/`ALL` or `EXISTS` subquery binds whether the
+row-source executor runs it, its result type, collations and aggregate calls
+once per statement, before any outer row, and copies the bound aggregate
+states for each outer row (`bind_correlated_subqueries` in
+`src/sql/query/subquery.rs`). An uncorrelated subquery nested in a
+correlated one, at any depth, takes a slot the outermost statement reserves
+before its scan (`InitPlans::nested`), so it runs once for the statement as
+PostgreSQL's initPlan does: `SELECT (SELECT x + (SELECT nextval('s')) FROM z
+WHERE x <= t.id) FROM t` reads one sequence value, and 100000 outer rows do
+not each keep a copy of its value. A grouped query whose aggregates keep only
+running values (`count`, `sum`, `avg`, `min`, `max`, the boolean, bitwise and
+statistical aggregates, without `DISTINCT` or `ORDER BY`) copies a
+variable-width running value such as a text maximum or numeric sum into a
+reused slot after each row (`HeldValues` in `src/sql/query/aggregate.rs`), so
+the scan reclaims the row's scratch; a derived table kept in local mode
+stores only its encoded rows.
 
 Every other shape runs in the general executor, which materializes in the
 statement arena and cannot pause after its first byte. New node kinds are the

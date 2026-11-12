@@ -570,6 +570,13 @@ pub trait ColumnLookup<'a> {
         None
     }
 
+    /// The enclosing statement's slots for uncorrelated subqueries nested in
+    /// its correlated ones ([`InitPlans::nested`]), when this row belongs to
+    /// a query run for an outer row; `Some(&[])` when it has none.
+    fn statement_initplans(&self) -> Option<&'a [InitPlan<'a>]> {
+        None
+    }
+
     /// Declared size/precision, or the registered shape of a record column.
     fn column_type_mod(&self, _qualifier: Option<&str>, _name: &str) -> i32 {
         -1
@@ -2831,17 +2838,120 @@ pub struct SubqueryValues<'h, 'a> {
 pub struct InitPlans<'a> {
     pub(crate) plans: &'a [InitPlan<'a>],
     pub(crate) runner: &'a dyn InitPlanRunner,
-    /// The arena whose persistent tail keeps the results: the statement's,
-    /// or a retained reader's own, which outlives each row's work arena.
-    pub(crate) arena: &'a Arena,
+    /// The statement's slots for the uncorrelated subqueries nested in its
+    /// correlated ones. A correlated subquery run for each outer row reuses
+    /// these, so each runs once for the statement, as PostgreSQL's initPlans
+    /// do, and its value takes one slot however many rows read it.
+    pub(crate) nested: &'a [InitPlan<'a>],
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct InitPlan<'a> {
+pub struct InitPlan<'a> {
     pub(crate) node: *const Expr<'a>,
-    /// Once run, the value kept in the persistent tail. Raw extents keep
+    /// Once run, the value kept in `keep`'s persistent tail. Raw extents keep
     /// hooks covariant; the handle rejects a reset arena.
     pub(crate) result: crate::mem::arena::ArenaHandle<Option<InitPlanValue>>,
+    /// The arena whose persistent tail keeps the result: the statement's, or
+    /// a retained reader's own, which outlives each row's work arena.
+    pub(crate) keep: &'a Arena,
+}
+
+/// An outer row lookup that also carries the statement's nested initPlan
+/// slots (see [`InitPlans::nested`]) into a correlated subquery run for it.
+pub(crate) struct InitPlanScope<'r, 'a> {
+    pub(crate) row: &'r dyn ColumnLookup<'a>,
+    pub(crate) nested: &'a [InitPlan<'a>],
+}
+
+impl<'a> ColumnLookup<'a> for InitPlanScope<'_, 'a> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        self.row.lookup(qualifier, name)
+    }
+    fn lacks_column(&self, qualifier: Option<&str>, name: &str) -> bool {
+        self.row.lacks_column(qualifier, name)
+    }
+    fn procedural_variable(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::sql::guc::VariableConflict> {
+        self.row.procedural_variable(qualifier, name)
+    }
+    fn outer_aggregate(&self, call: *const Expr<'_>) -> Option<Datum<'a>> {
+        self.row.outer_aggregate(call)
+    }
+    fn statement_initplans(&self) -> Option<&'a [InitPlan<'a>]> {
+        Some(self.nested)
+    }
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        self.row.column_type_mod(qualifier, name)
+    }
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.row.resolve_column_type(qualifier, name)
+    }
+    fn is_empty_scope(&self) -> bool {
+        self.row.is_empty_scope()
+    }
+    fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'a>, SqlError> {
+        self.row.recursive_state(qualifier, index)
+    }
+    fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
+        self.row.column_identity(qualifier, name)
+    }
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a [super::types::RecordField<'a>]>, SqlError> {
+        self.row.whole_row_fields(table, arena)
+    }
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn CatalogAccess>,
+    ) -> Option<(StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        self.row.whole_row_field_metadata(table, index, catalog)
+    }
+    fn whole_row_expansion_fields(
+        &self,
+        table: &str,
+        arena: &'a Arena,
+    ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
+        self.row.whole_row_expansion_fields(table, arena)
+    }
+    fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        self.row.whole_row_present(table)
+    }
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        self.row.col_type(qualifier, name)
+    }
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        self.row.column_type_oid(qualifier, name)
+    }
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        self.row.collation(qualifier, name)
+    }
+    fn record_field_collation(&self, base: &Expr<'a>, field: &str) -> crate::sql::ast::Collation {
+        self.row.record_field_collation(base, field)
+    }
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
+        self.row.column_user_type(qualifier, name)
+    }
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.row.whole_row_is_scalar(table)
+    }
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.row.whole_row_type(table)
+    }
 }
 
 /// A run initPlan's value in its arena's persistent tail.
@@ -4707,7 +4817,7 @@ fn eval_full_inner<'a>(
             .iter()
             .find(|plan| core::ptr::eq(plan.node, expression))
     {
-        let kept = match plans.arena.retained(plan.result) {
+        let kept = match plan.keep.retained(plan.result) {
             Some(Some(kept)) => kept,
             Some(None) => {
                 let kept = match plans
@@ -4715,8 +4825,8 @@ fn eval_full_inner<'a>(
                     .run(expression, arena, params, hooks.sequences)?
                 {
                     InitPlanOutput::Scalar(encoded) => {
-                        let kept = plans
-                            .arena
+                        let kept = plan
+                            .keep
                             .alloc_persistent_slice_with(encoded.len(), |index| encoded[index])
                             .map_err(|_| {
                                 sql_err!(
@@ -4729,9 +4839,9 @@ fn eval_full_inner<'a>(
                             len: kept.len(),
                         }
                     }
-                    InitPlanOutput::List(list) => keep_subquery_list(&list, plans.arena)?,
+                    InitPlanOutput::List(list) => keep_subquery_list(&list, plan.keep)?,
                 };
-                plans.arena.replace_retained(plan.result, Some(kept));
+                plan.keep.replace_retained(plan.result, Some(kept));
                 kept
             }
             None => {
@@ -4828,7 +4938,18 @@ fn eval_full_inner<'a>(
                     .any(|list| core::ptr::eq(list.node, (expression as *const Expr).cast()))
         })
     {
-        let result = executor.evaluate(expression, arena, params, row, hooks.sequences)?;
+        let scope;
+        let outer: &dyn ColumnLookup<'a> = match hooks.subs.and_then(|subs| subs.initplans) {
+            Some(plans) => {
+                scope = InitPlanScope {
+                    row,
+                    nested: plans.nested,
+                };
+                &scope
+            }
+            None => row,
+        };
+        let result = executor.evaluate(expression, arena, params, outer, hooks.sequences)?;
         let mut scalars = [(expression as *const Expr, Datum::Null, Datum::Null)];
         let mut lists = [SubqueryList {
             node: core::ptr::null(),

@@ -3697,6 +3697,7 @@ impl<'a> RetainedSelect<'a> {
             // initPlans do, and keeps its value in the reader's allocation.
             let initplans = super::subquery::UncorrelatedSubqueries::plans(
                 self.sublinks,
+                None,
                 storage,
                 txid,
                 None,

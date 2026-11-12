@@ -4433,6 +4433,12 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
             .or_else(|| self.outer?.outer_aggregate(call))
     }
 
+    fn statement_initplans(&self) -> Option<&'a [crate::sql::eval::InitPlan<'a>]> {
+        self.inner
+            .statement_initplans()
+            .or_else(|| self.outer?.statement_initplans())
+    }
+
     fn procedural_variable(
         &self,
         qualifier: Option<&str>,

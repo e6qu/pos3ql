@@ -342,3 +342,95 @@ fn dml_subqueries_run_when_first_read_as_of_the_statement() {
         &["1|6", "3|8"],
     );
 }
+
+/// An uncorrelated subquery nested in a correlated one runs once for the
+/// statement, as PostgreSQL's initPlan does, rather than once per outer row:
+/// the value is kept in one slot, so 100000 outer rows fit the statement
+/// arena. Expected values were read from PostgreSQL 18.6 (`initdb --locale=C`).
+#[test]
+fn nested_uncorrelated_subqueries_run_once_per_statement() {
+    let (mut e, mut b) = test_engine();
+    let mut t = TxnState::new(&mut b, 256).unwrap();
+    for sql in [
+        "CREATE TABLE nu_big (id int)",
+        "CREATE TABLE nu_z (x int)",
+        "CREATE SEQUENCE nu_s",
+        "INSERT INTO nu_big SELECT g FROM generate_series(1, 100) g",
+        "INSERT INTO nu_z VALUES (1)",
+    ] {
+        run_txn(&mut e, &mut b, &mut t, sql);
+    }
+    let from = "nu_big, generate_series(1, 1000) g";
+    for (sql, expected) in [
+        (
+            format!(
+                "SELECT sum((SELECT x + (SELECT max(x) FROM nu_z) FROM nu_z WHERE x <= nu_big.id)) FROM {from}"
+            ),
+            vec!["200000"],
+        ),
+        (
+            format!("SELECT sum((SELECT nu_big.id + (SELECT max(x) FROM nu_z))) FROM {from}"),
+            vec!["5150000"],
+        ),
+        (
+            format!(
+                "SELECT count(*) FROM {from} WHERE EXISTS (SELECT 1 FROM nu_z WHERE x <= nu_big.id AND x IN (SELECT x FROM nu_z))"
+            ),
+            vec!["100000"],
+        ),
+        (
+            format!(
+                "SELECT max((SELECT x + (SELECT (SELECT max(x) FROM nu_z) FROM nu_z WHERE x < g) FROM nu_z WHERE x <= nu_big.id)) FROM {from}"
+            ),
+            vec!["2"],
+        ),
+        (
+            "SELECT id, (SELECT x + (SELECT nextval('nu_s')) FROM nu_z WHERE x <= nu_big.id) FROM nu_big WHERE id <= 3 ORDER BY id".to_owned(),
+            vec!["1|2", "2|2", "3|2"],
+        ),
+    ] {
+        assert_eq!(rows(&mut e, &mut b, &mut t, &sql), expected, "{sql}");
+    }
+}
+
+/// Aggregates whose running values are text or numeric, and derived tables
+/// kept in local mode, reclaim each input row's evaluation scratch: 20000
+/// rows of 1 KiB scratch each fit the 2 MiB statement arena. Expected values
+/// were read from PostgreSQL 18.6 (`initdb --locale=C`).
+#[test]
+fn held_aggregate_values_and_derived_tables_reclaim_row_scratch() {
+    let (mut e, mut b) = test_engine();
+    let mut t = TxnState::new(&mut b, 256).unwrap();
+    let rows_of = "generate_series(1, 20000) g";
+    for (sql, expected) in [
+        (
+            format!(
+                "SELECT length(max(repeat('x', 1000) || g)), right(max(repeat('x', 1000) || g), 4), min(g::text) FROM {rows_of}"
+            ),
+            vec!["1004|9999|1"],
+        ),
+        (
+            format!(
+                "SELECT sum(length(repeat('x', 1000))::numeric + g / 3.0), avg(length(repeat('y', 1000) || g)) FROM {rows_of}"
+            ),
+            vec!["86670000.00000000000000000000|1004.4447000000000000"],
+        ),
+        (
+            format!(
+                "SELECT g % 2, right(max(repeat('z', 1000) || g), 5), variance(length(repeat('v', 1000) || g)) FROM {rows_of} GROUP BY 1 ORDER BY 1"
+            ),
+            vec![
+                "0|z9998|0.36880087008700870087",
+                "1|z9999|0.36995674567456745675",
+            ],
+        ),
+        (
+            format!(
+                "SELECT count(*), max(v) FROM (SELECT length(repeat('x', 1000) || g) AS v FROM {rows_of} LIMIT 30000) d"
+            ),
+            vec!["20000|1005"],
+        ),
+    ] {
+        assert_eq!(rows(&mut e, &mut b, &mut t, &sql), expected, "{sql}");
+    }
+}

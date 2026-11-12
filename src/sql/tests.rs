@@ -62508,17 +62508,28 @@ fn correlated_scalar_subquery_analyses_once_per_statement() {
             b,
             "SELECT sum((SELECT max(v) FROM inner_rows WHERE inner_rows.v <= outer_rows.id)), \
              count((SELECT 1 WHERE outer_rows.id > 0)), \
-             sum(cardinality(ARRAY(SELECT v FROM inner_rows WHERE v <= outer_rows.id))) \
+             sum(cardinality(ARRAY(SELECT v FROM inner_rows WHERE v <= outer_rows.id))), \
+             sum(CASE WHEN EXISTS (SELECT 1 FROM inner_rows WHERE v = outer_rows.id) THEN 1 END), \
+             sum(CASE WHEN outer_rows.id IN (SELECT v FROM inner_rows WHERE v <= outer_rows.id) \
+                 THEN 1 END), \
+             sum((SELECT count(*) FROM inner_rows WHERE v <= outer_rows.id GROUP BY true)), \
+             sum((SELECT row_number() OVER () FROM inner_rows WHERE v = outer_rows.id)) \
              FROM outer_rows",
         );
         let expected = (1..=rows).map(|id| id.min(50)).sum::<i32>();
-        assert_eq!(data_rows(&bytes), [format!("{expected}|{rows}|{expected}")]);
+        let present = rows.min(50);
+        assert_eq!(
+            data_rows(&bytes),
+            [format!(
+                "{expected}|{rows}|{expected}|{present}|{present}|{expected}|{present}"
+            )]
+        );
         crate::sql::query::subquery_analyses() - before
     };
     // Binding happens once per statement, not once per outer row.
     let few = analyses(&mut e, &mut b, 3);
     let many = analyses(&mut e, &mut b, 200);
-    assert_eq!(few, 3);
+    assert_eq!(few, 7);
     assert_eq!(many, few);
 }
 

@@ -622,6 +622,23 @@ pub(super) fn groups_for_mask<'a>(
                 .get(i)
                 .is_none_or(|state| state.recycling_safe_for(node, aggregate_columns))
         });
+        // Otherwise, states whose running values `hold` copies out after each
+        // row let the scan reclaim that row's allocations too.
+        let hold_values = !recycling_safe
+            && !partial_execution
+            && agg_nodes.iter().enumerate().all(|(i, (_, node))| {
+                states
+                    .get(i)
+                    .is_none_or(|state| state.holds_values_only(node))
+            });
+        let held: &mut [super::aggregate::HeldValues] = arena
+            .alloc_slice_with(if hold_values { n_groups * n_aggs } else { 0 }, |_| {
+                super::aggregate::HeldValues::default()
+            })
+            .map_err(|_| arena_full())?;
+        for (state, held) in states.iter().zip(held.iter_mut()) {
+            state.hold(held, arena, arena)?;
+        }
         let mut visit = |row: &JoinRow<'_, 'a, '_>| {
             if !row_passes_correlated_where(
                 where_correlated,
@@ -679,6 +696,10 @@ pub(super) fn groups_for_mask<'a>(
                 let index = g * n_aggs + i;
                 if partial_execution && states[index].supports_partial() {
                     partial_states[index].update(node, arena, params, row, row_hooks)?;
+                } else if hold_values {
+                    states[index].restore_held(&held[index], arena)?;
+                    states[index].update(node, arena, params, row, row_hooks)?;
+                    states[index].hold(&mut held[index], arena, arena)?;
                 } else {
                     states[index].update(node, arena, params, row, row_hooks)?;
                 }
@@ -711,11 +732,14 @@ pub(super) fn groups_for_mask<'a>(
             }
             Ok(true)
         };
-        if recycling_safe {
+        if recycling_safe || hold_values {
             scan_source_recycling_with_pax_columns(
                 storage, scope, from, txid, scan_where, arena, params, hooks, outer, pax_demand,
                 &mut visit,
             )?;
+            for (state, held) in states.iter_mut().zip(held.iter()) {
+                state.restore_held(held, arena)?;
+            }
         } else {
             scan_source_with_pax_columns(
                 storage, scope, from, txid, scan_where, arena, params, hooks, outer, pax_demand,

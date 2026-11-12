@@ -118,12 +118,13 @@ is owned.
     and uncorrelated scalar, `EXISTS`, `ARRAY`, row and `IN`/`ANY`/`ALL`
     subqueries of streams, sorted and grouped ones included (correlated ones,
     grouped or bounded derived tables, and scans of CTEs that run once). A
-    correlated scalar subquery that is not grouped, windowed or a set
-    operation binds its output type and aggregate calls once per statement,
-    but still resolves its FROM scope and evaluates its operators unbound for
-    each outer row; correlated `EXISTS`, `ARRAY`, row, `IN`, `ANY` and `ALL`
-    subqueries and the other scalar ones are analysed again for each outer
-    row. Over 2000 outer rows and a 50-row inner table in a debug build on a
+    correlated scalar, `ARRAY`, single-column `IN`/`ANY`/`ALL` or `EXISTS`
+    subquery that is not a set operation binds its executor choice, output
+    type, collations and aggregate calls once per statement, but still
+    resolves its FROM scope and evaluates its operators unbound for each outer
+    row; correlated row subqueries, row-valued `IN`, set operations and
+    subqueries rewritten for each row are analysed again for each outer row.
+    Over 2000 outer rows and a 50-row inner table in a debug build on a
     loaded 8-core workstation, `sum((SELECT max(v) ... WHERE v <= o.id))`
     takes 1.2 s, the matching `EXISTS` 1.0 s and `IN` 1.1 s (1.4 s, 1.1 s and 1.3 s
     before single-pass visibility collection; 3.5 s, 3.0 s and
@@ -134,13 +135,12 @@ is owned.
     scope and subquery preparation under a tenth; a scan now collects up to
     64 visible rows in one visibility pass before sorting them into
     insertion order, and counts a larger table's rows first. A grouped query
-    reclaims each input row's subquery values once a plain-data aggregate
-    (`count`, `sum`/`avg` of integers, floats or intervals, fixed-width
-    `min`/`max`, `bool_and`, float statistics) folds them; other aggregates,
-    and a derived table materialized in local mode, keep every row's
-    evaluation scratch until the statement ends, so a correlated subquery
-    over about 60000 such rows exhausts a 32 MiB `sql_arena_bytes` with
-    `54000`. Rewinding a
+    reclaims each input row's subquery values and scratch once its
+    aggregates fold them, keeping a running text, numeric or other
+    variable-width value in one reused slot; `DISTINCT`, ordered, collecting
+    (`array_agg`, `string_agg`, JSON), range and user-defined aggregates
+    still keep every row's evaluation scratch until the statement ends.
+    Rewinding a
     retained child tree per outer row removes the analysis,
     set operations other than `UNION ALL` (and `UNION ALL` under
     `ORDER BY`, in a declared cursor, or with volatile or routine-calling

@@ -513,6 +513,75 @@ impl FixedState {
     }
 }
 
+/// The running values of an aggregate whose state [`AggState::holds_values_only`]:
+/// its best value and numeric sums, each encoded as a one-column projected
+/// row in a slot that is reused while the value fits and doubles otherwise.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct HeldValues([HeldValue; 3]);
+
+#[derive(Clone, Copy)]
+struct HeldValue {
+    bytes: *mut u8,
+    /// Encoded length, or `None` for no value.
+    len: Option<usize>,
+    capacity: usize,
+}
+
+impl Default for HeldValue {
+    fn default() -> Self {
+        Self {
+            bytes: core::ptr::null_mut(),
+            len: None,
+            capacity: 0,
+        }
+    }
+}
+
+impl HeldValue {
+    fn store(
+        &mut self,
+        value: Option<Datum<'_>>,
+        scratch: &Arena,
+        keep: &Arena,
+    ) -> Result<(), SqlError> {
+        let Some(value) = value else {
+            self.len = None;
+            return Ok(());
+        };
+        // Encode in scratch first: the value may have been decoded from
+        // this slot's own bytes.
+        let encoded = crate::sql::exec::encode_projected_pub(&[value], scratch)?;
+        if encoded.len() > self.capacity {
+            let capacity = encoded.len().max(self.capacity.saturating_mul(2));
+            let slot = keep
+                .alloc_persistent_slice_with(capacity, |_| 0u8)
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "an aggregate's running value exceeds the statement's memory"
+                    )
+                })?;
+            self.bytes = slot.as_mut_ptr();
+            self.capacity = capacity;
+        }
+        // SAFETY: the slot has `capacity` bytes in `keep`'s persistent tail,
+        // which outlives the scan; `encoded` is a distinct scratch extent.
+        unsafe { core::ptr::copy_nonoverlapping(encoded.as_ptr(), self.bytes, encoded.len()) };
+        self.len = Some(encoded.len());
+        Ok(())
+    }
+
+    fn load<'a>(&self, arena: &'a Arena) -> Result<Option<Datum<'a>>, SqlError> {
+        let Some(len) = self.len else {
+            return Ok(None);
+        };
+        // SAFETY: `store` wrote `len` encoded bytes to this persistent slot,
+        // and its arena outlives every evaluation that reads the value.
+        let encoded: &'a [u8] = unsafe { core::slice::from_raw_parts(self.bytes, len) };
+        crate::sql::exec::decode_projected_col_record(encoded, 0, arena).map(Some)
+    }
+}
+
 /// A by-value datum: one tag byte and up to 16 payload bytes.
 const FIXED_VALUE_BYTES: usize = 17;
 
@@ -1088,6 +1157,77 @@ impl<'a> AggState<'a> {
         // reclaims after each row — every other aggregate buffers or folds
         // arena-backed values the same way.
         self.custom.is_none() && matches!(self.kind, AggKind::Count) && !self.distinct
+    }
+
+    /// Whether this state's running values are plain data plus at most the
+    /// values [`HeldValues`] keeps: no buffer that grows with each row. A
+    /// recycling scan may then reclaim each input row's allocations once
+    /// [`Self::hold`] has copied those values out.
+    pub(crate) fn holds_values_only(&self, node: &Expr<'_>) -> bool {
+        let Expr::Call { order_by, .. } = node else {
+            return false;
+        };
+        self.custom.is_none()
+            && !self.distinct
+            && !self.ordered
+            && order_by.is_empty()
+            && (matches!(
+                self.kind,
+                AggKind::Count
+                    | AggKind::Sum
+                    | AggKind::Avg
+                    | AggKind::Min
+                    | AggKind::Max
+                    | AggKind::BoolAnd
+                    | AggKind::BoolOr
+                    | AggKind::BitAnd
+                    | AggKind::BitOr
+                    | AggKind::BitXor
+                    | AggKind::VarPop
+                    | AggKind::VarSamp
+                    | AggKind::StddevPop
+                    | AggKind::StddevSamp
+            ) || self.kind.is_two_arg_stat())
+    }
+
+    /// Copies this state's arena-backed running values into `held`, whose
+    /// slots in `keep`'s persistent tail are reused while a value fits.
+    pub(crate) fn hold(
+        &self,
+        held: &mut HeldValues,
+        scratch: &Arena,
+        keep: &Arena,
+    ) -> Result<(), SqlError> {
+        let values = [
+            self.best,
+            self.sum_numeric.map(Datum::Numeric),
+            self.sum_sq_numeric.map(Datum::Numeric),
+        ];
+        for (slot, value) in held.0.iter_mut().zip(values) {
+            slot.store(value, scratch, keep)?;
+        }
+        Ok(())
+    }
+
+    /// Reads the running values [`Self::hold`] kept back into this state,
+    /// decoded in `arena`.
+    pub(crate) fn restore_held(
+        &mut self,
+        held: &HeldValues,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        let numeric = |value: Option<Datum<'a>>| match value {
+            None => Ok(None),
+            Some(Datum::Numeric(value)) => Ok(Some(value)),
+            Some(_) => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a held numeric aggregate value changed type"
+            )),
+        };
+        self.best = held.0[0].load(arena)?;
+        self.sum_numeric = numeric(held.0[1].load(arena)?)?;
+        self.sum_sq_numeric = numeric(held.0[2].load(arena)?)?;
+        Ok(())
     }
 
     /// Whether a recycling scan may reclaim each input row's allocations

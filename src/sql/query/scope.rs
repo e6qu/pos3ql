@@ -20,8 +20,8 @@ use crate::storage::{
 use crate::util::StackStr;
 
 use super::{
-    Chained, arena_full, collect_aggs, collect_windows, common_using_type, select_into_rows,
-    table_func_def, table_func_def_outer, table_func_rows_outer,
+    Chained, arena_full, collect_aggs, collect_windows, common_using_type, table_func_def,
+    table_func_def_outer, table_func_rows_outer,
 };
 
 fn catalog_scan(
@@ -1061,13 +1061,11 @@ impl<'d> QueryScope<'d> {
                 .expect("spill-attached block store")?;
             rows = &[];
         } else {
-            // Local-only mode has no authoritative external tier: retain the
-            // existing arena representation and fail loudly at its bound.
-            const EMPTY: &[u8] = &[];
-            let mut store: *mut &[u8] = core::ptr::null_mut();
-            let mut len = 0usize;
-            let mut cap = 0usize;
-            select_into_rows(
+            // Local-only mode has no authoritative external tier: keep the
+            // encoded rows in the arena's persistent tail, which the scan's
+            // per-row rewinds leave in place, and fail loudly at its bound.
+            let mut kept = crate::mem::arena::ArenaList::new_persistent(arena);
+            super::select_into_rows_recycling(
                 storage,
                 txid,
                 sub,
@@ -1076,29 +1074,16 @@ impl<'d> QueryScope<'d> {
                 outer,
                 sequences,
                 &mut |values| {
-                    let encoded = crate::sql::exec::encode_projected_pub(values, arena)?;
-                    if len == cap {
-                        let new_cap = if cap == 0 { 8 } else { cap * 2 };
-                        let fresh: &mut [&[u8]] = arena
-                            .alloc_slice_with(new_cap, |_| EMPTY)
-                            .map_err(|_| arena_full())?;
-                        if len > 0 {
-                            let old = unsafe { core::slice::from_raw_parts(store, len) };
-                            fresh[..len].copy_from_slice(old);
-                        }
-                        store = fresh.as_mut_ptr();
-                        cap = new_cap;
-                    }
-                    unsafe { store.add(len).write(encoded) };
-                    len += 1;
-                    Ok(())
+                    let len = crate::sql::exec::projected_row_len(values)?;
+                    let encoded = arena
+                        .alloc_persistent_slice_with(len, |_| 0u8)
+                        .map_err(|_| arena_full())?;
+                    crate::sql::exec::encode_projected_into(values, encoded)?;
+                    let encoded: &'a [u8] = encoded;
+                    kept.push(encoded).map_err(|_| arena_full())
                 },
             )?;
-            rows = if len == 0 {
-                &[]
-            } else {
-                unsafe { core::slice::from_raw_parts(store, len) }
-            };
+            rows = kept.as_slice();
             external_run = None;
         }
         self.names[self.n] = exposed;

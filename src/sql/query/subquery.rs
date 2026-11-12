@@ -10,8 +10,8 @@
 use crate::mem::arena::{Arena, ArenaList};
 use crate::sql::ast::{BinaryOp, Collation, Expr, Select, SelectItem, SetTree};
 use crate::sql::eval::{
-    ColumnLookup, EvalHooks, InitPlan, InitPlanOutput, InitPlanRunner, InitPlans, SqlError,
-    SubqueryList, SubqueryListProbe, SubqueryValues, eval_full, sqlstate,
+    ColumnLookup, EvalHooks, InitPlan, InitPlanOutput, InitPlanRunner, InitPlanScope, InitPlans,
+    SqlError, SubqueryList, SubqueryListProbe, SubqueryValues, eval_full, sqlstate,
 };
 use crate::sql::types::{ColType, Datum, RecordField};
 use crate::sql_err;
@@ -1442,6 +1442,61 @@ pub fn prepare_subqueries<'a>(
     )
 }
 
+/// [`prepare_subqueries`] for a query run for an outer row. The subqueries
+/// the enclosing statement keeps slots for ([`InitPlans::nested`]) run when
+/// an expression first reads them, once for the statement; the others run
+/// now.
+#[allow(clippy::too_many_arguments)]
+fn prepare_row_subqueries<'a>(
+    exprs: &[Option<&'a Expr<'a>>],
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    depth: u32,
+    outer: Option<&dyn ColumnLookup<'a>>,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+    let Some(nested) = outer.and_then(|outer| outer.statement_initplans()) else {
+        return prepare_subqueries(exprs, storage, txid, arena, params, depth, outer, sequences);
+    };
+    let mut nodes = ArenaList::new(arena);
+    for expression in exprs.iter().flatten() {
+        collect_subqueries(expression, &mut nodes)?;
+    }
+    let mut now = ArenaList::new(arena);
+    let mut kept = ArenaList::new(arena);
+    for &node in nodes.as_slice() {
+        match nested.iter().find(|plan| core::ptr::eq(plan.node, node)) {
+            Some(plan) => kept.push(*plan).map_err(|_| arena_full())?,
+            None => now.push(node).map_err(|_| arena_full())?,
+        }
+    }
+    let mut values = eval_subquery_nodes(
+        now.as_slice(),
+        storage,
+        txid,
+        arena,
+        params,
+        depth,
+        outer,
+        sequences,
+    )?;
+    let runner: &'a UncorrelatedSubqueries = arena
+        .alloc(UncorrelatedSubqueries {
+            storage,
+            txid,
+            command: None,
+        })
+        .map_err(|_| arena_full())?;
+    values.initplans = Some(InitPlans {
+        plans: kept.as_slice(),
+        runner,
+        nested,
+    });
+    Ok(values)
+}
+
 /// Evaluates a set of already-collected subquery nodes (scalar, IN, or
 /// EXISTS) into arena-backed [`SubqueryValues`] keyed by node identity.
 /// EXISTS results are stored as boolean scalars.
@@ -1525,7 +1580,7 @@ pub(super) fn eval_subquery_nodes<'a>(
             }
             Expr::Exists(select) => {
                 let found = subquery_exists(
-                    select, storage, txid, arena, params, depth, outer, sequences,
+                    select, storage, txid, arena, params, depth, outer, sequences, None,
                 )?;
                 scalars[n_scalars] = (*node as *const _, Datum::Bool(found), Datum::Bool(false));
                 n_scalars += 1;
@@ -1615,8 +1670,12 @@ fn subquery_exists<'a>(
     depth: u32,
     outer: Option<&dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    binding: Option<&SubqueryBinding<'a>>,
 ) -> Result<bool, SqlError> {
     let select = super::pullup::pull_up_subqueries(select, storage, txid, arena, outer)?;
+    // A binding describes the query as written; one rewritten for this row
+    // is analysed again.
+    let binding = binding.filter(|binding| core::ptr::eq(binding.select, select));
     if depth == 0 {
         return Err(sql_err!(
             sqlstate::STATEMENT_TOO_COMPLEX,
@@ -1629,7 +1688,14 @@ fn subquery_exists<'a>(
         )?;
         return Ok(!vals.is_empty());
     }
-    if needs_row_source(select, storage, txid, arena)? {
+    let row_source = match binding {
+        Some(binding) => binding.row_source,
+        None => {
+            count_subquery_analysis();
+            needs_row_source(select, storage, txid, arena)?
+        }
+    };
+    if row_source {
         // Grouped/DISTINCT EXISTS: the row-source executor already handles
         // grouping, HAVING, and DISTINCT — existence is whether it emits.
         let mut found = false;
@@ -1661,7 +1727,7 @@ fn subquery_exists<'a>(
     if let Some(from) = &select.from {
         collect_table_sample_expressions(from, &mut item_exprs[1..]);
     }
-    let inner_subs = prepare_subqueries(
+    let inner_subs = prepare_row_subqueries(
         item_exprs,
         storage,
         txid,
@@ -2291,6 +2357,7 @@ pub(super) fn prepare_outer_subqueries<'a>(
     }
     let mut plans = ArenaList::new(arena);
     let mut corr = ArenaList::new(arena);
+    let mut join_corr = ArenaList::new(arena);
     for (index, &node) in nodes.as_slice().iter().enumerate() {
         if subquery_node_correlated(node, storage, txid, arena)? {
             // A join condition's correlated subquery runs for each pair of
@@ -2298,18 +2365,31 @@ pub(super) fn prepare_outer_subqueries<'a>(
             // the others run once for each row the query produces.
             if index < output_nodes {
                 corr.push(node).map_err(|_| arena_full())?;
+            } else {
+                join_corr.push(node).map_err(|_| arena_full())?;
             }
         } else {
             plans.push(node).map_err(|_| arena_full())?;
         }
     }
+    let nested = match row_types.statement_initplans() {
+        Some(nested) => Some(nested),
+        None if corr.is_empty() && join_corr.is_empty() => None,
+        None => Some(nested_initplans(
+            corr.as_slice().iter().chain(join_corr.as_slice()),
+            storage,
+            txid,
+            arena,
+        )?),
+    };
     let mut base = SubqueryValues {
         scalars: &[],
         lists: &[],
         initplans: None,
         bindings: &[],
     };
-    base.initplans = UncorrelatedSubqueries::plans(plans.as_slice(), storage, txid, None, arena)?;
+    base.initplans =
+        UncorrelatedSubqueries::plans(plans.as_slice(), nested, storage, txid, None, arena)?;
     base.bindings = bind_correlated_subqueries(corr.as_slice(), storage, txid, arena, row_types)?;
     Ok(OuterSubs {
         base,
@@ -2329,25 +2409,30 @@ pub(super) struct UncorrelatedSubqueries {
 }
 
 impl UncorrelatedSubqueries {
-    /// Lazy plans for `nodes`, with their results kept in `arena`.
+    /// Lazy plans for `nodes`, with their results kept in `arena` unless the
+    /// enclosing statement keeps a slot for one in `nested`, its slots for the
+    /// uncorrelated subqueries nested in its correlated ones. `nested` is
+    /// passed on to this query's correlated subqueries; `None` when the query
+    /// has none and runs for no outer row.
     pub(super) fn plans<'a>(
         nodes: &[&'a Expr<'a>],
+        nested: Option<&'a [InitPlan<'a>]>,
         storage: &Storage,
         txid: u32,
         command: Option<u32>,
         arena: &'a Arena,
     ) -> Result<Option<InitPlans<'a>>, SqlError> {
-        if nodes.is_empty() {
+        if nodes.is_empty() && nested.is_none() {
             return Ok(None);
         }
+        let nested = nested.unwrap_or(&[]);
         let mut plans = ArenaList::new(arena);
         for &node in nodes {
-            plans
-                .push(InitPlan {
-                    node,
-                    result: arena.retain(None).map_err(|_| arena_full())?,
-                })
-                .map_err(|_| arena_full())?;
+            let plan = match nested.iter().find(|plan| core::ptr::eq(plan.node, node)) {
+                Some(plan) => *plan,
+                None => new_initplan(node, arena)?,
+            };
+            plans.push(plan).map_err(|_| arena_full())?;
         }
         let runner: &'a Self = arena
             .alloc(Self {
@@ -2359,9 +2444,152 @@ impl UncorrelatedSubqueries {
         Ok(Some(InitPlans {
             plans: plans.as_slice(),
             runner,
-            arena,
+            nested,
         }))
     }
+}
+
+/// An empty slot for `node`'s value, kept in `arena`'s persistent tail.
+fn new_initplan<'a>(node: &'a Expr<'a>, arena: &'a Arena) -> Result<InitPlan<'a>, SqlError> {
+    Ok(InitPlan {
+        node,
+        result: arena.retain(None).map_err(|_| arena_full())?,
+        keep: arena,
+    })
+}
+
+/// Slots for the uncorrelated subqueries nested, at any depth, in the
+/// `correlated` subqueries of a query that no outer row runs. Each one
+/// reads only its own FROM items, so its value holds for the statement:
+/// PostgreSQL runs it once as an initPlan however many times the subquery
+/// around it runs, and here every run of that subquery finds the one slot.
+fn nested_initplans<'a>(
+    correlated: impl IntoIterator<Item = &'a &'a Expr<'a>>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [InitPlan<'a>], SqlError> {
+    let mut found = ArenaList::new(arena);
+    for &node in correlated {
+        if let Some(select) = sublink_select(node) {
+            collect_nested_uncorrelated(select, &mut found, storage, txid, arena)?;
+        }
+    }
+    let mut plans = ArenaList::new(arena);
+    for &node in found.as_slice() {
+        plans
+            .push(new_initplan(node, arena)?)
+            .map_err(|_| arena_full())?;
+    }
+    Ok(plans.as_slice())
+}
+
+fn sublink_select<'a>(node: &'a Expr<'a>) -> Option<&'a Select<'a>> {
+    match node {
+        Expr::Subquery(select)
+        | Expr::Exists(select)
+        | Expr::ArraySubquery(select)
+        | Expr::RowSubquery { select, .. }
+        | Expr::InSubquery { select, .. }
+        | Expr::QuantifiedSubquery { select, .. } => Some(select),
+        _ => None,
+    }
+}
+
+/// Adds to `found` the uncorrelated subqueries `select` runs, descending
+/// through its correlated subqueries, derived tables, `WITH` bodies and
+/// set-operation branches, which all run again for each outer row.
+fn collect_nested_uncorrelated<'a>(
+    select: &'a Select<'a>,
+    found: &mut ArenaList<'a, &'a Expr<'a>>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    fn from_item<'a>(
+        table: &'a crate::sql::ast::TableRef<'a>,
+        nodes: &mut ArenaList<'a, &'a Expr<'a>>,
+        selects: &mut ArenaList<'a, &'a Select<'a>>,
+    ) -> Result<(), SqlError> {
+        if let Some(sample) = table.sample {
+            collect_subqueries(sample.percentage, nodes)?;
+            if let Some(repeatable) = sample.repeatable {
+                collect_subqueries(repeatable, nodes)?;
+            }
+        }
+        for argument in table.func_args.unwrap_or(&[]) {
+            collect_subqueries(argument, nodes)?;
+        }
+        for function in table.rows_from.unwrap_or(&[]) {
+            from_item(function, nodes, selects)?;
+        }
+        if let Some(select) = table.subquery {
+            selects.push(select).map_err(|_| arena_full())?;
+        }
+        Ok(())
+    }
+    let mut nodes = ArenaList::new(arena);
+    let mut selects = ArenaList::new(arena);
+    if let Some(from) = select.from.as_ref() {
+        from_item(&from.base, &mut nodes, &mut selects)?;
+        for join in from.joins {
+            from_item(&join.table, &mut nodes, &mut selects)?;
+            if let Some(on) = join.on {
+                collect_subqueries(on, &mut nodes)?;
+            }
+        }
+    }
+    let items = select.items.iter().filter_map(|item| match item {
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+            Some(*expression)
+        }
+        _ => None,
+    });
+    for expression in items
+        .chain(select.where_clause)
+        .chain(select.having)
+        .chain(select.group_by.iter().copied())
+        .chain(select.distinct_on.iter().copied())
+        .chain(select.order_by.iter().map(|order| order.expression))
+        .chain(select.limit)
+        .chain(select.offset)
+    {
+        collect_subqueries(expression, &mut nodes)?;
+    }
+    for cte in select.with {
+        selects.push(cte.query).map_err(|_| arena_full())?;
+    }
+    let mut branches = ArenaList::new(arena);
+    if let Some(tree) = select.set_body {
+        branches.push(tree).map_err(|_| arena_full())?;
+    }
+    while let Some(tree) = branches.as_slice().last().copied() {
+        branches.truncate(branches.len() - 1);
+        match tree {
+            SetTree::Select(select) => selects.push(select).map_err(|_| arena_full())?,
+            SetTree::Op { left, right, .. } => {
+                branches.push(left).map_err(|_| arena_full())?;
+                branches.push(right).map_err(|_| arena_full())?;
+            }
+        }
+    }
+    for &node in nodes.as_slice() {
+        if subquery_node_correlated(node, storage, txid, arena)? {
+            if let Some(select) = sublink_select(node) {
+                selects.push(select).map_err(|_| arena_full())?;
+            }
+        } else if !found
+            .as_slice()
+            .iter()
+            .any(|&seen| core::ptr::eq(seen, node))
+        {
+            found.push(node).map_err(|_| arena_full())?;
+        }
+    }
+    for &select in selects.as_slice() {
+        collect_nested_uncorrelated(select, found, storage, txid, arena)?;
+    }
+    Ok(())
 }
 
 impl InitPlanRunner for UncorrelatedSubqueries {
@@ -2480,7 +2708,17 @@ pub(super) fn merge_correlated<'a, 'b>(
         inner: row,
         outer: enclosing,
     };
-    let outer: &dyn ColumnLookup<'a> = &chained;
+    let scope;
+    let outer: &dyn ColumnLookup<'a> = match base.initplans {
+        Some(plans) => {
+            scope = InitPlanScope {
+                row: &chained,
+                nested: plans.nested,
+            };
+            &scope
+        }
+        None => &chained,
+    };
     let mut ns = 0;
     for (p, v, w) in base.scalars {
         // Node addresses are identity keys; every base value was built from
@@ -2521,10 +2759,7 @@ pub(super) fn merge_correlated<'a, 'b>(
                 ns += 1;
             }
             Expr::Subquery(select) => {
-                let binding = base
-                    .bindings
-                    .iter()
-                    .find(|binding| core::ptr::eq(binding.select, *select));
+                let binding = SubqueryBinding::of(base.bindings, select);
                 if storage.spill_attached() {
                     let (value, witness) = streaming_scalar_subquery(
                         select,
@@ -2576,6 +2811,7 @@ pub(super) fn merge_correlated<'a, 'b>(
                     SUBQUERY_DEPTH,
                     Some(outer),
                     sequences,
+                    SubqueryBinding::of(base.bindings, select),
                 )?;
                 scalars[ns] = (*node as *const _, Datum::Bool(found), Datum::Bool(false));
                 ns += 1;
@@ -2597,10 +2833,7 @@ pub(super) fn merge_correlated<'a, 'b>(
                     continue;
                 }
                 let plan = array_subquery_plan(select, storage, txid, arena, Some(outer))?;
-                let binding = base
-                    .bindings
-                    .iter()
-                    .find(|binding| core::ptr::eq(binding.select, *select));
+                let binding = SubqueryBinding::of(base.bindings, select);
                 let (values, _, _) = run_subquery(
                     select,
                     storage,
@@ -2625,8 +2858,14 @@ pub(super) fn merge_correlated<'a, 'b>(
             } => {
                 let original_select = *select;
                 let (select, arity) = row_projected(operand, original_select, arena)?;
-                let collations =
-                    subquery_collations(original_select, storage, txid, arena, Some(outer))?;
+                let binding = SubqueryBinding::of(base.bindings, original_select);
+                let collations = match binding {
+                    Some(binding) => binding.collations,
+                    None => {
+                        count_subquery_analysis();
+                        subquery_collations(original_select, storage, txid, arena, Some(outer))?
+                    }
+                };
                 let row_witness = (arity > 1)
                     .then(|| {
                         row_subquery_witness(original_select, storage, txid, arena, Some(outer))
@@ -2660,7 +2899,7 @@ pub(super) fn merge_correlated<'a, 'b>(
                     Some(outer),
                     arity,
                     sequences,
-                    None,
+                    binding,
                 )?;
                 lists[nl] = SubqueryList {
                     node: (*node as *const Expr).cast(),
@@ -3515,16 +3754,31 @@ fn run_row_subquery<'a>(
     )
 }
 
-/// A correlated scalar or `ARRAY` subquery analysed once per statement, before
-/// any outer row is read: its result type witness and, for an aggregate query
-/// over FROM items, its aggregate calls with their initialized states. Each
-/// outer row copies those states instead of resolving the calls and types
-/// again.
+/// A correlated scalar, `ARRAY`, `IN`/`ANY`/`ALL` or `EXISTS` subquery
+/// analysed once per statement, before any outer row is read: whether the
+/// row-source executor runs it, its result type witness and collations and,
+/// for an aggregate query over FROM items, its aggregate calls with their
+/// initialized states. Each outer row reuses these instead of resolving the
+/// calls and types again.
 #[derive(Clone, Copy)]
 pub(crate) struct SubqueryBinding<'a> {
     select: *const Select<'a>,
+    /// Grouped, `DISTINCT`, windowed or set-returning: the row-source
+    /// executor runs it.
+    row_source: bool,
     witness: Datum<'a>,
+    /// An `IN`/`ANY`/`ALL` list's comparison collations.
+    collations: &'a [Collation],
     aggregates: Option<BoundAggregates<'a>>,
+}
+
+impl<'a> SubqueryBinding<'a> {
+    /// The binding of `select` among `bindings`.
+    fn of<'b>(bindings: &'b [Self], select: &Select<'a>) -> Option<&'b Self> {
+        bindings
+            .iter()
+            .find(|binding| core::ptr::eq(binding.select, select))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3589,11 +3843,21 @@ pub(super) fn bind_correlated_subqueries<'a>(
 ) -> Result<&'a [SubqueryBinding<'a>], SqlError> {
     let mut bindings = ArenaList::new(arena);
     for node in nodes {
-        let (Expr::Subquery(select) | Expr::ArraySubquery(select)) = node else {
-            continue;
-        };
         let mark = arena.mark();
-        match bind_scalar_subquery(select, storage, txid, arena, outer) {
+        let bound = match node {
+            Expr::Subquery(select) | Expr::ArraySubquery(select) => {
+                bind_scalar_subquery(select, storage, txid, arena, outer)
+            }
+            Expr::InSubquery {
+                operand, select, ..
+            }
+            | Expr::QuantifiedSubquery {
+                operand, select, ..
+            } => bind_list_subquery(operand, select, storage, txid, arena, outer),
+            Expr::Exists(select) => bind_exists_subquery(select, storage, txid, arena, outer),
+            _ => Ok(None),
+        };
+        match bound {
             Ok(Some(binding)) => bindings.push(binding).map_err(|_| arena_full())?,
             Ok(None) | Err(_) => {
                 // SAFETY: nothing allocated by the failed analysis escapes.
@@ -3602,6 +3866,54 @@ pub(super) fn bind_correlated_subqueries<'a>(
         }
     }
     Ok(bindings.as_slice())
+}
+
+/// Binds an `IN`/`ANY`/`ALL` subquery compared with a single value.
+fn bind_list_subquery<'a>(
+    operand: &'a Expr<'a>,
+    select: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    outer: &dyn ColumnLookup<'a>,
+) -> Result<Option<SubqueryBinding<'a>>, SqlError> {
+    let (projected, arity) = row_projected(operand, select, arena)?;
+    if arity != 1 || !core::ptr::eq(projected, select) {
+        return Ok(None);
+    }
+    let Some(binding) = bind_scalar_subquery(select, storage, txid, arena, outer)? else {
+        return Ok(None);
+    };
+    Ok(Some(SubqueryBinding {
+        collations: subquery_collations(select, storage, txid, arena, Some(outer))?,
+        ..binding
+    }))
+}
+
+/// Binds an `EXISTS` subquery: which executor runs it.
+fn bind_exists_subquery<'a>(
+    select: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    outer: &dyn ColumnLookup<'a>,
+) -> Result<Option<SubqueryBinding<'a>>, SqlError> {
+    if select.set_body.is_some()
+        || !core::ptr::eq(
+            super::pullup::pull_up_subqueries(select, storage, txid, arena, Some(outer))?,
+            select,
+        )
+    {
+        return Ok(None);
+    }
+    count_subquery_analysis();
+    Ok(Some(SubqueryBinding {
+        select,
+        row_source: needs_row_source(select, storage, txid, arena)?,
+        witness: Datum::Null,
+        collations: &[],
+        aggregates: None,
+    }))
 }
 
 fn bind_scalar_subquery<'a>(
@@ -3620,7 +3932,11 @@ fn bind_scalar_subquery<'a>(
             super::pullup::pull_up_subqueries(select, storage, txid, arena, Some(outer))?,
             select,
         )
-        || super::expr_has_window(item)
+    {
+        return Ok(None);
+    }
+    count_subquery_analysis();
+    if super::expr_has_window(item)
         || select
             .order_by
             .iter()
@@ -3628,14 +3944,37 @@ fn bind_scalar_subquery<'a>(
         || super::srf::has_project_set(select.items, storage, txid)
         || needs_row_source(select, storage, txid, arena)?
     {
-        return Ok(None);
+        // A scope that fails to resolve leaves the subquery unbound, to be
+        // analysed for each row as the executor that runs it does.
+        let own_scope = select
+            .from
+            .as_ref()
+            .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, Some(outer)))
+            .transpose()?;
+        let witness = spooled_column_witness(
+            select,
+            storage,
+            txid,
+            own_scope.as_ref(),
+            arena,
+            item,
+            Some(outer),
+        )?;
+        return Ok(Some(SubqueryBinding {
+            select,
+            row_source: true,
+            witness,
+            collations: &[],
+            aggregates: None,
+        }));
     }
-    count_subquery_analysis();
     let Some(from) = &select.from else {
         let witness = subquery_witness_with_outer(storage, txid, item, None, Some(outer), arena)?;
         return Ok(Some(SubqueryBinding {
             select,
+            row_source: false,
             witness,
+            collations: &[],
             aggregates: None,
         }));
     };
@@ -3669,7 +4008,9 @@ fn bind_scalar_subquery<'a>(
     };
     Ok(Some(SubqueryBinding {
         select,
+        row_source: false,
         witness,
+        collations: &[],
         aggregates,
     }))
 }
@@ -3741,8 +4082,15 @@ fn run_subquery<'a>(
     // A set-returning function in the subquery's select list expands to many
     // rows, so its body belongs to the row-source executor too (which handles
     // SRF expansion) — just like a grouped or windowed subquery.
-    let has_srf = super::srf::has_project_set(select.items, storage, txid);
-    if has_window || has_srf || needs_row_source(select, storage, txid, arena)? {
+    let row_source = match binding {
+        Some(binding) => binding.row_source,
+        None => {
+            has_window
+                || super::srf::has_project_set(select.items, storage, txid)
+                || needs_row_source(select, storage, txid, arena)?
+        }
+    };
+    if row_source {
         // Grouped/DISTINCT/windowed/SRF subquery: the row-source executor
         // already handles grouping, HAVING, DISTINCT, windows, and SRF
         // expansion; collect its single output column.
@@ -3773,19 +4121,21 @@ fn run_subquery<'a>(
                 Ok(())
             },
         )?;
-        let own_scope = select
-            .from
-            .as_ref()
-            .and_then(|f| QueryScope::resolve_schema(storage, f, txid, arena, outer).ok());
-        let witness = spooled_column_witness(
-            select,
-            storage,
-            txid,
-            own_scope.as_ref(),
-            arena,
-            item,
-            outer,
-        )?;
+        let witness = bound_witness(binding, || {
+            let own_scope = select
+                .from
+                .as_ref()
+                .and_then(|f| QueryScope::resolve_schema(storage, f, txid, arena, outer).ok());
+            spooled_column_witness(
+                select,
+                storage,
+                txid,
+                own_scope.as_ref(),
+                arena,
+                item,
+                outer,
+            )
+        })?;
         return Ok((out.as_slice(), any_null, witness));
     }
 
@@ -3808,7 +4158,7 @@ fn run_subquery<'a>(
     if let Some(from) = &select.from {
         collect_table_sample_expressions(from, &mut inner_expressions[4 + keys..]);
     }
-    let inner_subs = prepare_subqueries(
+    let inner_subs = prepare_row_subqueries(
         inner_expressions,
         storage,
         txid,
@@ -4554,15 +4904,35 @@ pub(super) fn lazy_subqueries<'a>(
         collect_subqueries(expression, &mut nodes)?;
     }
     let mut plans = ArenaList::new(arena);
+    let mut correlated = ArenaList::new(arena);
     for &node in nodes.as_slice() {
-        if !subquery_node_correlated(node, storage, txid, arena)? {
+        if subquery_node_correlated(node, storage, txid, arena)? {
+            correlated.push(node).map_err(|_| arena_full())?;
+        } else {
             plans.push(node).map_err(|_| arena_full())?;
         }
     }
+    let nested = if correlated.is_empty() {
+        None
+    } else {
+        Some(nested_initplans(
+            correlated.as_slice(),
+            storage,
+            txid,
+            arena,
+        )?)
+    };
     Ok(SubqueryValues {
         scalars: &[],
         lists: &[],
-        initplans: UncorrelatedSubqueries::plans(plans.as_slice(), storage, txid, command, arena)?,
+        initplans: UncorrelatedSubqueries::plans(
+            plans.as_slice(),
+            nested,
+            storage,
+            txid,
+            command,
+            arena,
+        )?,
         bindings: &[],
     })
 }

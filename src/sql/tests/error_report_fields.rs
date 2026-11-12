@@ -1041,6 +1041,23 @@ fn insert_target_counts_are_positioned() {
                 "INSERT INTO ic (a) SELECT 1, 2",
                 &["ERROR 42601 INSERT has more expressions than target columns @30"],
             ),
+            ("CREATE TABLE ix (a int[], b int)", &["CREATE TABLE"]),
+            (
+                "INSERT INTO ix (a[1], b) SELECT 1",
+                &["ERROR 42601 INSERT has more target columns than expressions @23"],
+            ),
+            (
+                "INSERT INTO ix (a[1], b) VALUES (1)",
+                &["ERROR 42601 INSERT has more target columns than expressions @23"],
+            ),
+            (
+                "INSERT INTO ix (a[1], b) VALUES ('x')",
+                &["ERROR 42601 INSERT has more target columns than expressions @23"],
+            ),
+            (
+                "INSERT INTO ix (a[1]) VALUES (1, 2)",
+                &["ERROR 42601 INSERT has more expressions than target columns @34"],
+            ),
             ("SELECT count(*) FROM ic", &["data|0", "SELECT 1"]),
         ];
         for (sql, expected) in cases {

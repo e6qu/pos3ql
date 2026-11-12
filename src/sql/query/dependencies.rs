@@ -946,6 +946,11 @@ fn collect_statement(
                     if let SelectItem::Expr { expression, .. }
                     | SelectItem::RecordStar(expression) = item
                     {
+                        // In a rule action, OLD and NEW name the rule's rows.
+                        if context.transition.is_some() {
+                            collect_expr!(expression, Some(&scope), no_excluded)?;
+                            continue;
+                        }
                         collect_returning_expression(
                             expression,
                             update.returning,
@@ -1009,6 +1014,11 @@ fn collect_statement(
                     if let SelectItem::Expr { expression, .. }
                     | SelectItem::RecordStar(expression) = item
                     {
+                        // In a rule action, OLD and NEW name the rule's rows.
+                        if context.transition.is_some() {
+                            collect_expr!(expression, Some(&scope), no_excluded)?;
+                            continue;
+                        }
                         collect_returning_expression(
                             expression,
                             delete.returning,

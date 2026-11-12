@@ -13625,17 +13625,17 @@ fn rewrite_rules_expand_defaults_returning_and_on_conflict_contracts() {
         (
             "CREATE RULE missing_column AS ON INSERT TO rule_defaults \
              WHERE NEW.absent = 1 DO NOTHING",
-            "column \"absent\" does not exist",
+            "column new.absent does not exist",
         ),
         (
             "CREATE RULE invalid_old AS ON INSERT TO rule_defaults \
              DO ALSO INSERT INTO rule_default_log VALUES (OLD.id, NEW.label)",
-            "cannot reference OLD",
+            "ON INSERT rule cannot use OLD",
         ),
         (
             "CREATE RULE invalid_new AS ON DELETE TO rule_defaults \
              DO ALSO INSERT INTO rule_default_log VALUES (NEW.id, OLD.label)",
-            "cannot reference NEW",
+            "ON DELETE rule cannot use NEW",
         ),
         (
             "CREATE RULE conditional_notify AS ON INSERT TO rule_defaults \
@@ -13649,7 +13649,7 @@ fn rewrite_rules_expand_defaults_returning_and_on_conflict_contracts() {
             "{sql}: {}",
             String::from_utf8_lossy(&rejected)
         );
-        if expected.starts_with("cannot reference") {
+        if expected.contains("rule cannot use") {
             assert_eq!(error_sqlstates(&rejected), ["42P17"], "{sql}");
         }
     }

@@ -296,13 +296,11 @@ IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 set, and omits an explicit `security_invoker=false`. A `CHECK` constraint
 marked `NO INHERIT` fails with `0A000`, and exclusion constraints support only
 GiST over range columns (`EXCLUDE USING btree (a WITH =)` fails with `0A000`).
-`pg_constraint` omits the system catalogs' own not-null constraints. A rewrite rule's multi-row `INSERT ... VALUES` action
-resolves each column's type across its rows as a `VALUES` list does, so
-`VALUES ('1'::text, 3), (2, DEFAULT)` into a `text` column fails with `VALUES
-types text and integer cannot be matched` where PostgreSQL converts each value
-to the target column's type; and a rule action's `RETURNING` list that reads
-`NEW` or `OLD` fails with `missing FROM-clause entry` when the triggering
-statement asks for rows. A derived table computes output
+`pg_constraint` omits the system catalogs' own not-null constraints.
+`CREATE RULE` accepts a condition containing a subquery only in PostgreSQL:
+pos3ql rejects it with `0A000` (`cannot use subquery in rule condition`). A
+missing column error never carries PostgreSQL's spelling-suggestion hint
+(`Perhaps you meant to reference the column "t.v".`). A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1
 FROM (SELECT 10 / t.x) s)` fails with division by zero on a zero `x` where
 PostgreSQL, which drops unread subquery outputs, returns the row. A
@@ -324,9 +322,10 @@ protocol-level `Parse` message checks only syntax and parameter types, so
 analysis errors (`SELECT current_date + $1`, `SELECT 1 WHERE 'x'`) arrive at
 `Bind` or `Execute` where PostgreSQL reports them at `Parse`, and
 `pg_prepared_statements` lists only SQL `PREPARE` statements, not protocol
-ones. `PREPARE` checks a `SELECT` without `FROM` and the types of every
-query, but constant inputs of a query with `FROM` (`SELECT 'a'::int FROM t`)
-are converted when it runs. `pg_sleep` and its
+ones. `PREPARE` and `CREATE RULE` check a `SELECT` without `FROM` and the
+types of every query, but constant inputs of a query with `FROM` (`SELECT
+'a'::int FROM t`) or of a rule action (`DO ALSO UPDATE t SET a = 'k'`) are
+converted when it runs. `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,

@@ -766,6 +766,17 @@ pub(crate) fn with_copied_source<R>(written: &str, copy: &str, run: impl FnOnce(
 }
 
 /// Runs `run` positioning relation and column lookups in the installed
+/// statement text, for a utility statement that analyses queries written
+/// inside it (`CREATE RULE`).
+pub(crate) fn with_analysis<R>(run: impl FnOnce() -> R) -> R {
+    let _scope = SourceScope(
+        SOURCE.with(Cell::get),
+        ANALYZED.with(|flag| flag.replace(true)),
+    );
+    run()
+}
+
+/// Runs `run` positioning relation and column lookups in the installed
 /// statement text, for queries parsed from `text`, a slice of it written
 /// inside a utility statement (a `CREATE FUNCTION ... BEGIN ATOMIC` body):
 /// their parsed offsets count from the slice's start.

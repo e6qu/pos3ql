@@ -1531,10 +1531,12 @@ pub(crate) fn rule_transition_source<'a>(
 }
 
 /// The target relation of a rule's `INSERT ... VALUES` action: its column
-/// names in order and their declared type identities.
+/// names in order, their declared type identities and the names that
+/// resolve those types under any search path.
 pub(crate) struct RuleInsertTarget<'a> {
     pub names: &'a [&'a str],
     pub type_oids: &'a [i32],
+    pub type_names: &'a [&'a str],
 }
 
 /// Attaches the original statement's transition-row source to one rebound
@@ -1614,10 +1616,46 @@ pub(crate) fn attach_rule_source<'a>(
         .map_err(|_| arena_full())
 }
 
+/// PostgreSQL's analysis of a rule's `INSERT ... VALUES` action: each item
+/// is assigned to its target column with OLD and NEW typed by the rule's
+/// transition `source`, before the action becomes a query over that source.
+pub(crate) fn check_rule_insert_values<'a>(
+    statement: &'a Stmt<'a>,
+    source: &'a TableRef<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let Stmt::Insert(insert) = statement else {
+        return Ok(());
+    };
+    if insert.select.is_some() || insert.rows.is_empty() {
+        return Ok(());
+    }
+    let from = arena
+        .alloc(FromClause {
+            base: *source,
+            joins: &[],
+        })
+        .map_err(|_| arena_full())?;
+    let scope = super::QueryScope::resolve_schema(storage, from, txid, arena, None)?;
+    super::validate_dml_assignment_casts(
+        statement,
+        storage,
+        txid,
+        arena,
+        Some(&super::ScopeSchema(&scope)),
+    )
+}
+
 /// A rule's `INSERT ... VALUES` action as `INSERT ... SELECT` over its
 /// source rows. Several rows join the source as `LATERAL (VALUES ...)`, so
 /// every `VALUES` row is inserted for one source row before the next, as
-/// PostgreSQL's plan does. A column written as `DEFAULT` in every row leaves
+/// PostgreSQL's plan does. PostgreSQL converts each item of such a list to
+/// its target column's type rather than resolving one type across the rows;
+/// the caller has checked each item's assignment to its column, so each item
+/// is converted to the column's type here (without its modifier, which the
+/// assignment applies). A column written as `DEFAULT` in every row leaves
 /// the target list; one written as `DEFAULT` in some rows keeps a typed null
 /// placeholder, and the executor takes the default for the positions the
 /// trailing row-number column selects from `values_defaults`.
@@ -1729,23 +1767,23 @@ fn rule_insert_values<'a>(
     let row_number = tagged || kept.is_empty();
     let values_width = kept.len() + usize::from(row_number);
     let mut placeholder_types = [0i32; crate::storage::MAX_COLUMNS];
+    let mut target_types = [""; crate::storage::MAX_COLUMNS];
     for (slot, position) in kept.iter().enumerate() {
-        if rows.iter().any(|row| is_default(row[*position])) {
-            let name = named[*position];
-            let index = target
-                .names
-                .iter()
-                .position(|column| *column == name)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" of relation \"{}\" does not exist",
-                        name,
-                        insert.table.name
-                    )
-                })?;
-            placeholder_types[slot] = target.type_oids[index];
-        }
+        let name = named[*position];
+        let index = target
+            .names
+            .iter()
+            .position(|column| *column == name)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" of relation \"{}\" does not exist",
+                    name,
+                    insert.table.name
+                )
+            })?;
+        placeholder_types[slot] = target.type_oids[index];
+        target_types[slot] = target.type_names[index];
     }
     let mut leaves: ArenaList<'a, &'a SetTree<'a>> = ArenaList::new(arena);
     for (number, row) in rows.iter().enumerate() {
@@ -1764,7 +1802,15 @@ fn rule_insert_values<'a>(
                     })
                     .map_err(|_| arena_full())?
             } else {
-                row[*position]
+                &*arena
+                    .alloc(Expr::Cast {
+                        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                        operand: row[*position],
+                        type_name: target_types[slot],
+                        type_mod: -1,
+                        binding: crate::sql::ast::CastBinding::Resolve,
+                    })
+                    .map_err(|_| arena_full())?
             };
             items[slot] = SelectItem::Expr {
                 expression,
@@ -5785,7 +5831,7 @@ fn subst_select_items<'a>(
             if (old && !transition.old_available) || (!old && !transition.new_available) {
                 return Err(sql_err!(
                     sqlstate::INVALID_OBJECT_DEFINITION,
-                    "ON {} rule cannot reference {}",
+                    "ON {} rule cannot use {}",
                     if old { "INSERT" } else { "DELETE" },
                     if old { "OLD" } else { "NEW" }
                 ));
@@ -5936,8 +5982,17 @@ fn subst_insert<'a>(
         rows,
         select,
         on_conflict,
+        // A rule's OLD and NEW cannot be referenced from an INSERT action's
+        // RETURNING list, where `old` and `new` name the inserted row's images.
         returning: Returning {
-            items: subst_select_items(statement.returning.items, context, arena)?,
+            items: subst_select_items(
+                statement.returning.items,
+                Subst {
+                    rule_transition: None,
+                    ..context
+                },
+                arena,
+            )?,
             ..statement.returning
         },
         overriding: statement.overriding,
@@ -7315,7 +7370,7 @@ fn subst_expr<'a>(
                 if (old && !transition.old_available) || (!old && !transition.new_available) {
                     return Err(sql_err!(
                         sqlstate::INVALID_OBJECT_DEFINITION,
-                        "ON {} rule cannot reference {}",
+                        "ON {} rule cannot use {}",
                         if old { "INSERT" } else { "DELETE" },
                         if old { "OLD" } else { "NEW" }
                     ));

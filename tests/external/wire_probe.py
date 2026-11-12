@@ -5697,7 +5697,7 @@ def test_collation_and_conversion_extended_wire_metadata():
     )
     catalog = simple_query(
         s,
-        "SELECT collprovider || '|' || collencoding::text FROM pg_collation "
+        "SELECT collprovider::text || '|' || collencoding::text FROM pg_collation "
         "WHERE collname = 'wire_byte_order'",
     )
     check(

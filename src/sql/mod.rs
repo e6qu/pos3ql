@@ -25724,7 +25724,12 @@ impl Engine {
                     };
                     match prepared {
                         Ok(true) => retained_cursor_plan_scroll(cursors, at, storage, txid, work),
+                        // A query that does not stream, or a hash table that
+                        // does not fit, runs whole at the first read instead.
                         Ok(false) => {
+                            describe_cursor_rows(cursors, at, storage, txid, work).map(|_| ())
+                        }
+                        Err(error) if error.is_plan_build_exhausted() => {
                             describe_cursor_rows(cursors, at, storage, txid, work).map(|_| ())
                         }
                         Err(error) => Err(error),

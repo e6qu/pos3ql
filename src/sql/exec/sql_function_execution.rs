@@ -1297,6 +1297,18 @@ fn check_polymorphic_result<'a>(
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     let _ = argument_oids;
+    // Other results are checked at CREATE and by the called-routine check;
+    // a polymorphic one only resolves with a call's argument types.
+    let polymorphic = routine
+        .function_result_contract()
+        .is_some_and(|result| result.polymorphic_type().is_some())
+        || routine
+            .arguments()
+            .iter()
+            .any(|argument| argument.polymorphic_type().is_some());
+    if !polymorphic {
+        return Ok(());
+    }
     // A polymorphic call runs an instance whose result is already resolved.
     let scalar = routine.kind.function_result().is_some_and(|result| {
         !matches!(

@@ -4187,6 +4187,22 @@ fn builtin_polymorphic_consistent(actual: [i32; 2], declared: [i32; 2]) -> bool 
             | oid::ANYENUM
             | oid::ANYCOMPATIBLE
             | oid::ANYCOMPATIBLENONARRAY => actual,
+            // A range binds the element family to its subtype.
+            oid::ANYRANGE | oid::ANYMULTIRANGE => {
+                let subtype = |kind: super::types::RangeKind| match kind {
+                    super::types::RangeKind::Int4 => oid::INT4,
+                    super::types::RangeKind::Int8 => oid::INT8,
+                    super::types::RangeKind::Num => oid::NUMERIC,
+                    super::types::RangeKind::Date => oid::DATE,
+                    super::types::RangeKind::Ts => oid::TIMESTAMP,
+                    super::types::RangeKind::Tstz => oid::TIMESTAMPTZ,
+                };
+                match (declared, ColType::from_oid(actual)) {
+                    (oid::ANYRANGE, Some(ColType::Range(kind)))
+                    | (oid::ANYMULTIRANGE, Some(ColType::Multirange(kind))) => subtype(kind),
+                    _ => return false,
+                }
+            }
             _ => continue,
         };
         let family = if matches!(

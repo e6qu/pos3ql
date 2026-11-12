@@ -2069,9 +2069,6 @@ fn rule_insert_values<'a>(
         .as_slice()
         .iter()
         .any(|mask| *mask != crate::storage::ColumnSet::EMPTY);
-    // A VALUES row needs a column even when every target takes its default.
-    let row_number = tagged || kept.is_empty();
-    let values_width = kept.len() + usize::from(row_number);
     let mut placeholder_types = [0i32; crate::storage::MAX_COLUMNS];
     for (slot, position) in kept.iter().enumerate() {
         if rows.iter().any(|row| is_default(row[*position])) {
@@ -2091,38 +2088,23 @@ fn rule_insert_values<'a>(
             placeholder_types[slot] = target.type_oids[index];
         }
     }
+    // The joined VALUES list numbers the rows; each target picks its row's
+    // expression with a CASE in the output list, so volatile calls run as
+    // each row is inserted, as PostgreSQL evaluates a VALUES row.
     let mut leaves: ArenaList<'a, &'a SetTree<'a>> = ArenaList::new(arena);
-    for (number, row) in rows.iter().enumerate() {
+    for number in 0..rows.len() {
         let items = arena
-            .alloc_slice_with(values_width, |_| SelectItem::Expr {
+            .alloc_slice_with(1, |_| SelectItem::Expr {
                 expression: &Expr::Null,
                 alias: None,
             })
             .map_err(|_| arena_full())?;
-        for (slot, position) in kept.iter().enumerate() {
-            let expression = if is_default(row[*position]) {
-                &*arena
-                    .alloc(Expr::BoundDefault {
-                        expression: &Expr::Null,
-                        type_oid: placeholder_types[slot],
-                    })
-                    .map_err(|_| arena_full())?
-            } else {
-                row[*position]
-            };
-            items[slot] = SelectItem::Expr {
-                expression,
-                alias: None,
-            };
-        }
-        if row_number {
-            items[kept.len()] = SelectItem::Expr {
-                expression: arena
-                    .alloc(Expr::Int(number as i64))
-                    .map_err(|_| arena_full())?,
-                alias: None,
-            };
-        }
+        items[0] = SelectItem::Expr {
+            expression: arena
+                .alloc(Expr::Int(number as i64))
+                .map_err(|_| arena_full())?,
+            alias: None,
+        };
         let select = arena
             .alloc(rule_select(items, None, None))
             .map_err(|_| arena_full())?;
@@ -2154,14 +2136,15 @@ fn rule_insert_values<'a>(
             ..rule_select(&[], None, None)
         })
         .map_err(|_| arena_full())?;
-    let value_names = arena
-        .alloc_slice_with(values_width, |_| "")
+    let value_names: &'a [&'a str] = arena
+        .alloc_slice_copy(&["column1"])
         .map_err(|_| arena_full())?;
-    for (index, name) in value_names.iter_mut().enumerate() {
-        *name = arena
-            .alloc_str(crate::stack_format!(16, "column{}", index + 1).as_str())
-            .map_err(|_| arena_full())?;
-    }
+    let row_column = &*arena
+        .alloc(Expr::Column {
+            qualifier: Some(VALUES_ALIAS),
+            name: value_names[0],
+        })
+        .map_err(|_| arena_full())?;
     let output_width = kept.len() + usize::from(tagged);
     let items = arena
         .alloc_slice_with(output_width, |_| SelectItem::Expr {
@@ -2169,14 +2152,41 @@ fn rule_insert_values<'a>(
             alias: None,
         })
         .map_err(|_| arena_full())?;
-    for (index, item) in items.iter_mut().enumerate() {
-        *item = SelectItem::Expr {
+    for (slot, position) in kept.iter().enumerate() {
+        let whens = arena
+            .alloc_slice_with(rows.len(), |_| (&Expr::Null, &Expr::Null))
+            .map_err(|_| arena_full())?;
+        for (index, row) in rows.iter().enumerate() {
+            let expression = if is_default(row[*position]) {
+                &*arena
+                    .alloc(Expr::BoundDefault {
+                        expression: &Expr::Null,
+                        type_oid: placeholder_types[slot],
+                    })
+                    .map_err(|_| arena_full())?
+            } else {
+                row[*position]
+            };
+            let number = &*arena
+                .alloc(Expr::Int(index as i64))
+                .map_err(|_| arena_full())?;
+            whens[index] = (number, expression);
+        }
+        items[slot] = SelectItem::Expr {
             expression: arena
-                .alloc(Expr::Column {
-                    qualifier: Some(VALUES_ALIAS),
-                    name: value_names[index],
+                .alloc(Expr::Case {
+                    operand: Some(row_column),
+                    whens,
+                    otherwise: None,
+                    origin: crate::sql::ast::CaseOrigin::Written,
                 })
                 .map_err(|_| arena_full())?,
+            alias: None,
+        };
+    }
+    if tagged {
+        items[kept.len()] = SelectItem::Expr {
+            expression: row_column,
             alias: None,
         };
     }
@@ -2190,7 +2200,7 @@ fn rule_insert_values<'a>(
         func_variadic: false,
         func_source_position: crate::sql::ast::SourcePosition::UNKNOWN,
         rows_from: None,
-        col_alias: Some(&*value_names),
+        col_alias: Some(value_names),
         inheritance: crate::sql::ast::RelationInheritance::Descendants,
         sample: None,
         cte: None,

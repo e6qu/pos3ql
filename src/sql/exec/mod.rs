@@ -66881,32 +66881,6 @@ fn require_unique_index_partition_keys<Definition0: crate::storage::DefinitionBa
     Ok(())
 }
 
-/// The visible direct partitions of `table`, in catalog slot order.
-fn direct_partition_slots<'a>(
-    storage: &Storage,
-    table: usize,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<&'a [usize], SqlError> {
-    let partitions = arena
-        .alloc_slice_with(storage.table_count(), |_| usize::MAX)
-        .map_err(|_| arena_full())?;
-    let mut count = 0;
-    for candidate in 0..storage.table_count() {
-        if storage.table_slot_visible_to(candidate, txid)
-            && storage
-                .table_def(candidate, txid)
-                .partition
-                .attachment
-                .is_some_and(|attachment| usize::from(attachment.parent) == table)
-        {
-            partitions[count] = candidate;
-            count += 1;
-        }
-    }
-    Ok(&partitions[..count])
-}
-
 /// The partitioned indexes of `table` in OID order, PostgreSQL's
 /// `RelationGetIndexList` order for cloning them onto a partition.
 fn partitioned_index_slots<'a>(
@@ -66949,8 +66923,18 @@ fn ensure_partition_index_children(
     matching: PartitionIndexMatch,
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    for &partition in direct_partition_slots(storage, table, txn.txid, arena)? {
-        ensure_partition_index(storage, wal, txn, parent_index, partition, matching, arena)?;
+    // Partitions are found slot by slot: a slot list sized for every table
+    // would not fit a small statement arena.
+    for partition in 0..storage.table_count() {
+        let attached = storage.table_slot_visible_to(partition, txn.txid)
+            && storage
+                .table_def(partition, txn.txid)
+                .partition
+                .attachment
+                .is_some_and(|attachment| usize::from(attachment.parent) == table);
+        if attached {
+            ensure_partition_index(storage, wal, txn, parent_index, partition, matching, arena)?;
+        }
     }
     refresh_partitioned_index_validity(storage, wal, txn, parent_index)
 }
@@ -67014,12 +66998,16 @@ fn ensure_partition_index_in(
         }
         return Ok(());
     }
-    ddl::require_convertible_index(
+    let mark = arena.mark();
+    let convertible = ddl::require_convertible_index(
         &parent_def,
         &parent,
         parent.name_for(txn.txid).as_str(),
         arena,
-    )?;
+    );
+    // SAFETY: the check returns no arena-backed value.
+    unsafe { arena.rewind_to(mark) };
+    convertible?;
     let mut columns = parent.columns;
     for (column, expression) in columns
         .iter_mut()
@@ -67093,6 +67081,7 @@ fn ensure_partition_index_in(
             &copy.expressions[..copy.n_cols],
         )?;
     }
+    let mark = arena.mark();
     let name = copied_index_name(
         storage,
         &table,
@@ -67101,7 +67090,10 @@ fn ensure_partition_index_in(
         &copy.include_columns[..copy.n_include_cols],
         txn.txid,
         arena,
-    )?;
+    );
+    // SAFETY: the name is an owned `SqlName`; its parsing scratch ends here.
+    unsafe { arena.rewind_to(mark) };
+    let name = name?;
     let slot = storage.create_index(IndexDef { name, ..copy }, txn.txid)?;
     finish_index_creation(storage, wal, txn, slot, partition, arena)?;
     if table.partition.is_partitioned() {

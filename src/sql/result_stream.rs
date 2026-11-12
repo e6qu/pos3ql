@@ -587,6 +587,9 @@ impl Engine {
         conn_id: i32,
         lock_timeout_expired: bool,
     ) -> Result<StreamStep, WireFull> {
+        // A stream resumes at its read position and never restarts, so the
+        // downloads before this wait are progress, not repeated work.
+        self.statement_progressed();
         let Some(mut state) = stream.state.filter(|state| !state.suspended) else {
             return self.fail_result_stream(
                 Some(stream),

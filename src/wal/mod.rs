@@ -257,7 +257,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 17;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 18;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -1103,7 +1103,9 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
             + fk.parent.as_str().len()
             + 1
             + fk.n_parent_cols * 2
-            + 4;
+            + 4
+            + 1
+            + fk.n_delete_set_cols * 2;
     }
     // exclusion constraints
     n += 1;
@@ -1253,6 +1255,10 @@ fn append_table_payload<B: DefinitionBacking>(
             fk.timing.code(),
             fk.validation.code(),
         ]);
+        ok &= buffer.append(&[fk.n_delete_set_cols as u8]);
+        for &c in fk.delete_set_cols() {
+            ok &= buffer.append(&c.to_le_bytes());
+        }
     }
     ok &= buffer.append(&[def.n_exclusions as u8]);
     for exclusion in def.exclusions() {
@@ -8325,6 +8331,16 @@ fn decode_op_inner<'a>(
                 fk.on_update = FkAction::from_code(acts[1])?;
                 fk.timing = crate::storage::ConstraintTiming::from_code(acts[2])?;
                 fk.validation = crate::storage::ConstraintValidation::from_code(acts[3])?;
+                let n_set = *payload.get(at)? as usize;
+                at += 1;
+                if n_set > nc {
+                    return None;
+                }
+                fk.n_delete_set_cols = n_set;
+                for c in fk.delete_set_cols.iter_mut().take(n_set) {
+                    *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
+                    at += 2;
+                }
                 def.fkeys[f] = fk;
             }
             let n_exclusions = *payload.get(at)? as usize;

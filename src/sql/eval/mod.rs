@@ -3576,10 +3576,63 @@ fn eval_binary_values<'a>(
             first_argument: l,
         });
     }
+    if comparison.is_some()
+        && let Some(value) = named_composite_comparison(operator, l, r, hooks.catalog, arena)?
+    {
+        return Ok(OperatorEvaluation {
+            value,
+            first_argument: l,
+        });
+    }
     Ok(OperatorEvaluation {
         value: binary(operator, l, r, left_unknown, right_unknown, arena)?,
         first_argument: l,
     })
+}
+
+/// A comparison of two named composite values (not `ROW(...)` constructors):
+/// PostgreSQL's `record_eq`/`record_cmp` over their fields, stored values
+/// read through the catalog. `None` when an operand is not one.
+pub(crate) fn named_composite_comparison<'a>(
+    operator: BinaryOp,
+    left: Datum<'a>,
+    right: Datum<'a>,
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &'a Arena,
+) -> Result<Option<Datum<'a>>, SqlError> {
+    let slot = |value: &Datum<'_>| match value {
+        Datum::Composite { slot, .. } | Datum::CompositeText { slot, .. } => Some(*slot),
+        _ => None,
+    };
+    let (Some(left_slot), Some(right_slot)) = (slot(&left), slot(&right)) else {
+        return Ok(None);
+    };
+    let fields = |value: Datum<'a>| -> Result<&'a [super::types::RecordField<'a>], SqlError> {
+        let value = match value {
+            Datum::CompositeText {
+                slot,
+                physical_fields,
+                text,
+            } => catalog
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "named composite catalog access is unavailable"
+                    )
+                })?
+                .materialize_composite(slot, physical_fields, text, arena)?,
+            value => value,
+        };
+        match value {
+            Datum::Composite { fields, .. } => Ok(fields),
+            _ => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a named composite did not materialize its fields"
+            )),
+        }
+    };
+    let (left, right) = (fields(left)?, fields(right)?);
+    operators::compare_records(operator, left, right, left_slot != right_slot).map(Some)
 }
 
 fn materialize_acl_value<'a>(

@@ -8860,17 +8860,36 @@ impl<'a> Parser<'a> {
         };
         let mut on_delete = FkAction::NoAction;
         let mut on_update = FkAction::NoAction;
-        while self.eat_ident("on")? {
+        let mut delete_set_columns: &'a [&'a str] = &[];
+        while self.peeked == Tok::Ident("on") {
+            let on_at = self.peek_at;
+            self.advance()?;
             let is_delete = if self.eat_ident("delete")? {
                 true
             } else {
                 self.expect_ident("update")?;
                 false
             };
-            let action = self.fk_action()?;
+            let (action, set_columns) = self.fk_action()?;
             if is_delete {
                 on_delete = action;
+                delete_set_columns = set_columns;
             } else {
+                if !set_columns.is_empty() {
+                    return Err(ParseError {
+                        at: on_at,
+                        message: crate::util::StackStr::from_str(if action == FkAction::SetNull {
+                            "a column list with SET NULL is only supported for ON DELETE actions"
+                        } else {
+                            "a column list with SET DEFAULT is only supported for ON DELETE actions"
+                        }),
+                        sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                        cursor: Some(on_at),
+                        hint: None,
+                        near: None,
+                        detail: None,
+                    });
+                }
                 on_update = action;
             }
         }
@@ -8881,6 +8900,7 @@ impl<'a> Parser<'a> {
             parent,
             parent_cols,
             on_delete,
+            delete_set_columns,
             on_update,
             timing,
             validation,
@@ -8978,21 +8998,29 @@ impl<'a> Parser<'a> {
         Ok(timing)
     }
 
-    fn fk_action(&mut self) -> Result<FkAction, ParseError> {
+    /// A referential action, with the column list `SET NULL` and `SET
+    /// DEFAULT` may name.
+    fn fk_action(&mut self) -> Result<(FkAction, &'a [&'a str]), ParseError> {
         if self.eat_ident("no")? {
             self.expect_ident("action")?;
-            Ok(FkAction::NoAction)
+            Ok((FkAction::NoAction, &[]))
         } else if self.eat_ident("restrict")? {
-            Ok(FkAction::Restrict)
+            Ok((FkAction::Restrict, &[]))
         } else if self.eat_ident("cascade")? {
-            Ok(FkAction::Cascade)
+            Ok((FkAction::Cascade, &[]))
         } else if self.eat_ident("set")? {
-            if self.eat_ident("null")? {
-                Ok(FkAction::SetNull)
+            let action = if self.eat_ident("null")? {
+                FkAction::SetNull
             } else {
                 self.expect_ident("default")?;
-                Ok(FkAction::SetDefault)
-            }
+                FkAction::SetDefault
+            };
+            let columns = if self.peeked == Tok::Op("(") {
+                self.column_name_list()?
+            } else {
+                &[]
+            };
+            Ok((action, columns))
         } else {
             Err(self.syntax_error_here())
         }

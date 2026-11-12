@@ -102,7 +102,7 @@ pub(crate) fn begin_dynamic_query(text: &str) {
 pub(crate) enum QueryMode {
     /// `SQL statement "..."`.
     Statement,
-    /// `SQL expression "..."`.
+    /// `PL/pgSQL expression "..."`.
     Expression,
     /// `PL/pgSQL assignment "..."`.
     Assignment,
@@ -149,7 +149,7 @@ impl Frame for QueryFrame<'_> {
         }
         let what = match self.mode {
             QueryMode::Statement => "SQL statement",
-            QueryMode::Expression => "SQL expression",
+            QueryMode::Expression => "PL/pgSQL expression",
             QueryMode::Assignment => "PL/pgSQL assignment",
         };
         write!(out, "{what} \"{}\"", self.text)

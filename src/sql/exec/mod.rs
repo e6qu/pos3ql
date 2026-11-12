@@ -3813,6 +3813,8 @@ fn build_inherited_table_def(
     for index in 0..definition.n_fkeys {
         definition.fkeys[index].columns =
             remap_columns(&definition, &own, definition.fkeys[index].columns())?;
+        definition.fkeys[index].delete_set_cols =
+            remap_columns(&definition, &own, definition.fkeys[index].delete_set_cols())?;
     }
     for index in 0..definition.n_fkeys {
         let key = definition.fkeys[index];
@@ -25202,7 +25204,9 @@ fn in_simple_expression<T>(
     let frame = crate::sql::error_context::QueryFrame::new(text, mode, true);
     crate::sql::error_context::with_frame(&frame, || {
         crate::sql::error_position::with_internal_source(text, run).map_err(|error| {
-            if error.sqlstate.internal_control().is_none() {
+            if crate::sql::error_position::is_record_field_failure(&error) {
+                frame.planned();
+            } else if error.sqlstate.internal_control().is_none() {
                 let mark = arena.mark();
                 let folded = crate::sql::error_position::preserving_pending(|| {
                     constant_fold_error(expression, arena)
@@ -34020,32 +34024,55 @@ pub(crate) enum TriggerQueueBoundary {
     Constraints(Option<crate::sql::txn::ConstraintIdentity>),
 }
 
-/// Runs one queued event: a foreign key check, or a row trigger body.
+/// Runs one queued event: a foreign key check or action, a row trigger
+/// body, or an AFTER STATEMENT trigger. `own` holds the transition rows of
+/// the statement's own target when the event belongs to it.
 fn execute_queued_firing<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     firing: write_completion::QueuedFiring,
-    transition_rows: Option<TransitionRows<'a>>,
+    own: Option<TransitionRows<'a>>,
 ) -> Result<(), SqlError> {
-    match firing.trigger_slot {
-        Some(trigger_slot) => execute_deferred_trigger_event(
+    let Some(trigger_slot) = firing.trigger_slot else {
+        return constraints::fire_queued_foreign_key_event(context, firing.index);
+    };
+    let trigger = context.storage().trigger(usize::from(trigger_slot));
+    let rows = write_completion::queued_transition_rows(context, &trigger, firing, own)?;
+    if !firing.statement {
+        return execute_deferred_trigger_event(
             context,
             firing.index,
             trigger_slot,
             firing.table,
-            transition_rows,
-        ),
-        None => {
-            let arena = context.arena;
-            let (storage, txn, _, seq_session) = context.dml_parts_with_sequence();
-            constraints::fire_queued_foreign_key_event(
-                storage,
-                txn,
-                firing.index,
-                arena,
-                seq_session,
-            )
-        }
+            rows,
+        );
     }
+    // Its WHEN condition passed when it was queued.
+    context.txn.fire_trigger_event(firing.index)?;
+    let definition = (*context
+        .storage()
+        .table_def(usize::from(firing.table), context.txn.txid))
+    .clone();
+    let relation = crate::storage::RelationDefinition::from_definition(&definition);
+    let target = crate::storage::TriggerTarget::Table(firing.table);
+    let mut context = context.for_trigger();
+    let mut statement_firing = prepare_trigger_firing(
+        &context,
+        &trigger,
+        TriggerRelationIdentity {
+            target,
+            schema: relation.schema,
+            name: relation.name,
+        },
+        relation,
+        firing.event,
+        false,
+        None,
+        None,
+        rows,
+    )?;
+    super::query::protect_replayable_effect();
+    statement_firing.execute(&mut context)?;
+    Ok(())
 }
 
 fn execute_deferred_trigger_event<'a>(
@@ -34113,6 +34140,34 @@ fn fire_statement_row_trigger_events<'a>(
     Ok(())
 }
 
+/// Runs the AFTER events the statement at `depth` running as `command` still
+/// has queued: those of its data-modifying `WITH` sub-statements when the
+/// main statement fired no events of its own (a `SELECT`, or a write
+/// rewritten into other statements).
+pub(crate) fn fire_statement_after_events(
+    (storage, seq_session): (&mut Storage, &crate::sql::guc::SeqSession),
+    txn: &mut TxnState,
+    (depth, command): (u16, u32),
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Result<(), SqlError> {
+    let mut context = TriggerExecContext {
+        host: PlpgsqlExecHost::Atomic {
+            storage,
+            seq_session,
+        },
+        txn,
+        arena,
+        params: crate::sql::eval::NO_PARAMS,
+        responder,
+    };
+    let mut cursor = write_completion::AfterRowCursor::new(depth, command);
+    while let Some(firing) = cursor.next(&mut context)? {
+        execute_queued_firing(&mut context, firing, None)?;
+    }
+    Ok(())
+}
+
 /// Fires deferred constraint triggers at their typed boundary. Row images were
 /// captured at the event, so later updates cannot change OLD or NEW.
 pub(crate) fn fire_constraint_triggers(
@@ -34124,30 +34179,72 @@ pub(crate) fn fire_constraint_triggers(
     boundary: TriggerQueueBoundary,
 ) -> Result<(), SqlError> {
     txn.queue_all_pending_row_events()?;
+    let mut context = TriggerExecContext {
+        host: PlpgsqlExecHost::Atomic {
+            storage,
+            seq_session,
+        },
+        txn,
+        arena,
+        params: crate::sql::eval::NO_PARAMS,
+        responder,
+    };
     let mut next = 0u64;
-    while next < txn.trigger_events_end() {
+    while next < context.txn.trigger_events_end() {
         let index = next;
-        let (event, following, fired) = txn.trigger_event(index)?;
+        let (event, following, fired) = context.txn.trigger_event(index)?;
         next = following;
         if fired {
             continue;
         }
         let (trigger_slot, table) = match event.kind {
-            crate::sql::txn::DeferredTriggerKind::AfterRow { .. } => {
-                if matches!(boundary, TriggerQueueBoundary::Constraints(_)) {
+            crate::sql::txn::DeferredTriggerKind::Transition { .. } => continue,
+            crate::sql::txn::DeferredTriggerKind::AfterRow {
+                trigger_slot,
+                effective_table,
+                ..
+            }
+            | crate::sql::txn::DeferredTriggerKind::AfterStatement {
+                trigger_slot,
+                effective_table,
+                ..
+            } => match boundary {
+                TriggerQueueBoundary::Constraints(_) => continue,
+                // A referential action this boundary ran queued them.
+                TriggerQueueBoundary::Statement => {
+                    execute_queued_firing(
+                        &mut context,
+                        write_completion::QueuedFiring {
+                            index,
+                            trigger_slot: Some(trigger_slot),
+                            table: effective_table,
+                            event: event.event,
+                            statement: matches!(
+                                event.kind,
+                                crate::sql::txn::DeferredTriggerKind::AfterStatement { .. }
+                            ),
+                        },
+                        None,
+                    )?;
                     continue;
                 }
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "AFTER ROW event escaped its statement boundary"
-                ));
-            }
+                TriggerQueueBoundary::Transaction => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "AFTER trigger event escaped its statement boundary"
+                    ));
+                }
+            },
             crate::sql::txn::DeferredTriggerKind::ForeignKey {
                 identity, check, ..
             } => {
-                let Some(mode) = constraints::foreign_key_event_mode(storage, txn, identity, check)
-                else {
-                    txn.fire_trigger_event(index)?;
+                let Some(mode) = constraints::foreign_key_event_mode(
+                    context.storage(),
+                    context.txn,
+                    identity,
+                    check,
+                ) else {
+                    context.txn.fire_trigger_event(index)?;
                     continue;
                 };
                 let fires = match boundary {
@@ -34158,18 +34255,12 @@ pub(crate) fn fire_constraint_triggers(
                     TriggerQueueBoundary::Constraints(selected) => {
                         selected.is_none_or(|selected| {
                             selected == identity
-                                || selected == txn.current_constraint_identity(identity)
+                                || selected == context.txn.current_constraint_identity(identity)
                         })
                     }
                 };
                 if fires {
-                    constraints::fire_queued_foreign_key_event(
-                        storage,
-                        txn,
-                        index,
-                        arena,
-                        seq_session,
-                    )?;
+                    constraints::fire_queued_foreign_key_event(&mut context, index)?;
                 }
                 continue;
             }
@@ -34178,14 +34269,15 @@ pub(crate) fn fire_constraint_triggers(
                 effective_table,
                 ..
             } => {
-                let Some(timing) = constraints::constraint_timing(storage, identity, txn.txid)
+                let Some(timing) =
+                    constraints::constraint_timing(context.storage(), identity, context.txn.txid)
                 else {
-                    txn.fire_trigger_event(index)?;
+                    context.txn.fire_trigger_event(index)?;
                     continue;
                 };
                 let fires = match boundary {
                     TriggerQueueBoundary::Statement => {
-                        txn.constraint_mode(identity, timing)
+                        context.txn.constraint_mode(identity, timing)
                             == crate::sql::ast::ConstraintMode::Immediate
                     }
                     TriggerQueueBoundary::Transaction => true,
@@ -34202,22 +34294,7 @@ pub(crate) fn fire_constraint_triggers(
                 (slot, effective_table)
             }
         };
-        execute_deferred_trigger_event(
-            &mut TriggerExecContext {
-                host: PlpgsqlExecHost::Atomic {
-                    storage,
-                    seq_session,
-                },
-                txn,
-                arena,
-                params: crate::sql::eval::NO_PARAMS,
-                responder,
-            },
-            index,
-            trigger_slot,
-            table,
-            None,
-        )?;
+        execute_deferred_trigger_event(&mut context, index, trigger_slot, table, None)?;
     }
     Ok(())
 }
@@ -34539,6 +34616,9 @@ fn fire_after_triggers_with_rows<'a, Definition0: crate::storage::DefinitionBack
     )
 }
 
+/// Fires `table`'s statement triggers for `event`. BEFORE STATEMENT triggers
+/// fire once per table and operation in a statement, its referential
+/// actions and data-modifying `WITH` sub-statements included.
 fn fire_statement_triggers<'a, Definition0: crate::storage::DefinitionBacking>(
     context: TriggerExecContext<'_, 'a, '_>,
     table: usize,
@@ -34547,6 +34627,12 @@ fn fire_statement_triggers<'a, Definition0: crate::storage::DefinitionBacking>(
     before: bool,
     updated_columns: ColumnSet,
 ) -> Result<(), SqlError> {
+    if before
+        && (!write_completion::has_statement_triggers(&context, table.into(), event, true)
+            || !context.txn.claim_before_statement(table as u16, event)?)
+    {
+        return Ok(());
+    }
     fire_statement_triggers_with_rows(
         context,
         table.into(),
@@ -76146,7 +76232,10 @@ fn drop_column_constraints(
             remember(foreign_key.name)?;
             continue;
         }
-        for child_column in &mut foreign_key.columns[..foreign_key.n_cols] {
+        for child_column in foreign_key.columns[..foreign_key.n_cols]
+            .iter_mut()
+            .chain(&mut foreign_key.delete_set_cols[..foreign_key.n_delete_set_cols])
+        {
             if usize::from(*child_column) > column {
                 *child_column -= 1;
             }
@@ -76992,6 +77081,7 @@ fn same_foreign_key_body(
         && left.parent == right.parent
         && left.parent_cols() == right.parent_cols()
         && left.on_delete == right.on_delete
+        && left.delete_set_cols() == right.delete_set_cols()
         && left.on_update == right.on_update
 }
 

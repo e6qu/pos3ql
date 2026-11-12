@@ -1960,6 +1960,11 @@ pub struct ForeignKey {
     pub parent_cols: [u16; MAX_INDEX_COLS],
     pub n_parent_cols: usize,
     pub on_delete: FkAction,
+    /// The referencing columns `ON DELETE SET NULL (...)` or `SET DEFAULT
+    /// (...)` changes, in written order (PostgreSQL's `confdelsetcols`);
+    /// none means every key column.
+    pub delete_set_cols: [u16; MAX_INDEX_COLS],
+    pub n_delete_set_cols: usize,
     pub on_update: FkAction,
     pub timing: ConstraintTiming,
     pub validation: ConstraintValidation,
@@ -1976,6 +1981,8 @@ impl ForeignKey {
         parent_cols: [0u16; MAX_INDEX_COLS],
         n_parent_cols: 0,
         on_delete: FkAction::NoAction,
+        delete_set_cols: [0u16; MAX_INDEX_COLS],
+        n_delete_set_cols: 0,
         on_update: FkAction::NoAction,
         timing: ConstraintTiming::NotDeferrable,
         validation: ConstraintValidation::EnforcedValidated,
@@ -1983,6 +1990,10 @@ impl ForeignKey {
 
     pub fn columns(&self) -> &[u16] {
         &self.columns[..self.n_cols]
+    }
+
+    pub fn delete_set_cols(&self) -> &[u16] {
+        &self.delete_set_cols[..self.n_delete_set_cols]
     }
 
     pub fn parent_cols(&self) -> &[u16] {
@@ -14735,6 +14746,25 @@ pub(crate) fn information_schema_on_path() -> bool {
 
 pub(crate) fn replace_execution_path(path: PathContext) -> PathContext {
     EXECUTION_PATH.with(|current| current.replace(path))
+}
+
+std::thread_local! {
+    static NO_FORCE_ROW_SECURITY: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Restores the caller's row security forcing when dropped.
+pub(crate) struct NoForceRowSecurityScope(bool);
+
+impl Drop for NoForceRowSecurityScope {
+    fn drop(&mut self) {
+        NO_FORCE_ROW_SECURITY.with(|current| current.set(self.0));
+    }
+}
+
+/// Exempts a table's owner from `FORCE ROW LEVEL SECURITY` while the scope
+/// lives, as PostgreSQL's referential queries run (`SECURITY_NOFORCE_RLS`).
+pub(crate) fn enter_no_force_row_security() -> NoForceRowSecurityScope {
+    NoForceRowSecurityScope(NO_FORCE_ROW_SECURITY.with(|current| current.replace(true)))
 }
 
 fn execution_visibility() -> VisibilityContext {
@@ -47131,7 +47161,8 @@ impl Storage {
         if attributes.superuser || attributes.bypass_row_level_security {
             return false;
         }
-        state.forced || self.object_owner(self.table_access_object(table, txid), txid) != role
+        (state.forced && !NO_FORCE_ROW_SECURITY.with(core::cell::Cell::get))
+            || self.object_owner(self.table_access_object(table, txid), txid) != role
     }
 
     pub(crate) fn policy_slot_on(&self, table: usize, name: &str, txid: u32) -> Option<usize> {

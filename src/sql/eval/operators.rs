@@ -2287,6 +2287,71 @@ fn row_compare<'a>(
     }
 }
 
+/// PostgreSQL's `record_eq` and `record_cmp` for two named composite values,
+/// as `ta_value = tb_value` and foreign keys between composite types compare
+/// them: fields compare in order, two NULL fields are equal and a NULL field
+/// sorts after any value. Values of different types (`check_types`) must
+/// agree in arity and in each field's type, checked as the walk reaches it.
+pub(crate) fn compare_records<'a>(
+    operator: BinaryOp,
+    left: &[RecordField<'a>],
+    right: &[RecordField<'a>],
+    check_types: bool,
+) -> Result<Datum<'a>, SqlError> {
+    use BinaryOp::*;
+    let type_name = |oid: i32| {
+        crate::sql::types::ColType::from_oid(oid).map_or_else(
+            || crate::stack_format!(64, "{}", oid),
+            |ctype| crate::util::StackStr::from_str(ctype.name()),
+        )
+    };
+    let mut ordering = core::cmp::Ordering::Equal;
+    for index in 0.. {
+        let (x, y) = match (left.get(index), right.get(index)) {
+            (None, None) => break,
+            (Some(x), Some(y)) => (x, y),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "cannot compare record types with different numbers of columns"
+                ));
+            }
+        };
+        if check_types && x.type_oid != y.type_oid {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "cannot compare dissimilar column types {} and {} at record column {}",
+                type_name(x.type_oid).as_str(),
+                type_name(y.type_oid).as_str(),
+                index + 1
+            ));
+        }
+        ordering = match (x.value.is_null(), y.value.is_null()) {
+            (true, true) => core::cmp::Ordering::Equal,
+            (true, false) => core::cmp::Ordering::Greater,
+            (false, true) => core::cmp::Ordering::Less,
+            (false, false) => compare_datums(&x.value, &y.value)?,
+        };
+        if !ordering.is_eq() {
+            break;
+        }
+    }
+    Ok(Datum::Bool(match operator {
+        Eq => ordering.is_eq(),
+        NotEq => !ordering.is_eq(),
+        Lt => ordering.is_lt(),
+        LtEq => ordering.is_le(),
+        Gt => ordering.is_gt(),
+        GtEq => ordering.is_ge(),
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "record comparison of a non-comparison operator"
+            ));
+        }
+    }))
+}
+
 /// SQL equality as the membership tests (`IN`, `NOT IN`) need it: three-valued,
 /// returning `None` for unknown. Rows go through [`row_compare`], so a NULL
 /// *inside* a row makes the membership unknown; `compare_datums` alone gives

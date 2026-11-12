@@ -16909,6 +16909,7 @@ fn inherited_foreign_key_parent_oid(
                 && parent.parent == child.parent
                 && parent.parent_cols() == child.parent_cols()
                 && parent.on_delete == child.on_delete
+                && parent.delete_set_cols() == child.delete_set_cols()
                 && parent.on_update == child.on_update
         })
         .map_or(0, |constraint| constraint.oid())
@@ -17000,8 +17001,14 @@ pub fn constraint_def_text<'a>(
             write_identifier(&mut s, child.columns()[c as usize].name.as_str());
         }
         let _ = s.write_str(") REFERENCES ");
-        write_identifier(&mut s, parent.schema.as_str());
-        let _ = s.write_char('.');
+        // PostgreSQL's `generate_relation_name`: qualified only when the
+        // name alone would not find the referenced table.
+        if !matches!(storage.resolve_relation(None, parent.name.as_str(), txid),
+            Some(crate::storage::ResolvedRelation::Table(slot)) if slot == pslot)
+        {
+            write_identifier(&mut s, parent.schema.as_str());
+            let _ = s.write_char('.');
+        }
         write_identifier(&mut s, parent.name.as_str());
         let _ = s.write_char('(');
         for (k, &c) in fk.parent_cols[..fk.n_parent_cols].iter().enumerate() {
@@ -17012,6 +17019,16 @@ pub fn constraint_def_text<'a>(
         }
         let _ = s.write_str(")");
         let _ = s.write_str(fk_action_suffix(fk.on_delete, "DELETE"));
+        if !fk.delete_set_cols().is_empty() {
+            let _ = s.write_str(" (");
+            for (k, &c) in fk.delete_set_cols().iter().enumerate() {
+                if k > 0 {
+                    let _ = s.write_str(", ");
+                }
+                write_identifier(&mut s, child.columns()[c as usize].name.as_str());
+            }
+            let _ = s.write_char(')');
+        }
         let _ = s.write_str(fk_action_suffix(fk.on_update, "UPDATE"));
         append_constraint_attributes(&mut s, fk.timing, fk.validation);
         return Ok(Some(alloc_rendered(
@@ -22002,7 +22019,15 @@ fn pg_constraint_values<'a>(
                 foreign_key_operator_array(storage, txid, info, &fk, 0, arena)?,
                 foreign_key_operator_array(storage, txid, info, &fk, 1, arena)?,
                 foreign_key_operator_array(storage, txid, info, &fk, 2, arena)?,
-                Datum::Null,
+                if fk.delete_set_cols().is_empty() {
+                    Datum::Null
+                } else {
+                    attnum_array(
+                        fk.delete_set_cols(),
+                        &storage.table_def(info.child_slot, txid),
+                        arena,
+                    )?
+                },
                 Datum::Null,
                 Datum::Null,
             ],

@@ -4067,6 +4067,9 @@ pub enum TableConstraint<'a> {
         /// Referenced columns; empty means "the parent's primary key".
         parent_cols: &'a [&'a str],
         on_delete: FkAction,
+        /// The referencing columns `ON DELETE SET NULL (...)` or `SET
+        /// DEFAULT (...)` changes; empty means all of them.
+        delete_set_columns: &'a [&'a str],
         on_update: FkAction,
         timing: ConstraintTiming,
         validation: ConstraintValidation,

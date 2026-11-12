@@ -8821,8 +8821,11 @@ impl Engine {
             mark.constraint_completions,
             mark.constraint_modes,
             mark.constraint_renames,
-            mark.trigger_events,
-            mark.pending_row_events,
+            (
+                mark.trigger_events,
+                mark.pending_row_events,
+                mark.statement_tables,
+            ),
         );
         txn.rewind_notifications(
             mark.notifications,
@@ -17242,7 +17245,7 @@ impl Engine {
     }
 
     /// After the main statement of a `WITH` whose sub-statements modify data:
-    /// the sub-statements' foreign key checks it did not fire itself.
+    /// the sub-statements' AFTER events it did not fire itself.
     /// A failing check replaces the main statement's unsent command tag, as
     /// PostgreSQL fires them before completing the statement.
     fn fire_with_foreign_key_events<T>(
@@ -17256,13 +17259,12 @@ impl Engine {
     ) -> Result<Result<(), SqlError>, T> {
         match outcome {
             Ok(Ok(())) if !materialized.is_empty() => {
-                let checked = exec::constraints::fire_statement_foreign_key_events(
-                    storage,
+                let checked = exec::fire_statement_after_events(
+                    (storage, seq_session),
                     txn,
-                    depth,
-                    command,
+                    (depth, command),
                     arena,
-                    seq_session,
+                    responder,
                 );
                 if checked.is_err() && responder.completion_tag().is_some() {
                     let _ = responder.take_command_completion_tag(arena, false);

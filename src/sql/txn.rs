@@ -50,6 +50,7 @@ pub struct Savepoint {
     pub constraint_rename_mark: usize,
     pub trigger_event_mark: crate::sql::trigger_events::TriggerEventMark,
     pub pending_row_event_mark: u64,
+    pub statement_table_mark: u64,
     /// The `failed` flag at savepoint time, restored on ROLLBACK TO.
     pub failed: bool,
 }
@@ -75,6 +76,7 @@ pub(crate) struct StatementMark {
     pub constraint_renames: usize,
     pub trigger_events: crate::sql::trigger_events::TriggerEventMark,
     pub pending_row_events: u64,
+    pub statement_tables: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -520,6 +522,13 @@ pub struct TxnState {
     /// end scans only the events queued since. A command not listed scans
     /// from the start.
     command_event_starts: [(u32, u64); COMMAND_EVENT_STARTS],
+    after_event_owner: Option<AfterEventOwner>,
+    statement_tables: [StatementTableEvents; STATEMENT_TABLE_EVENTS],
+    statement_table_count: usize,
+    statement_table_serial: u64,
+    /// The last queued transition row, so a statement that queued none
+    /// does not look for them.
+    last_transition_row: Option<u64>,
     large_object_descriptors: FixedVec<LargeObjectDescriptor>,
 }
 
@@ -965,6 +974,67 @@ pub(crate) enum DeferredTriggerKind {
         command: u32,
         rowid: u64,
     },
+    /// An AFTER STATEMENT trigger, queued after the rows of the statement
+    /// that changed `effective_table`.
+    AfterStatement {
+        trigger_slot: u16,
+        effective_table: u16,
+        trigger_depth: u16,
+        command: u32,
+    },
+    /// One transition row of a change whose AFTER events another statement
+    /// fires (a referential action or a data-modifying `WITH` sub-statement):
+    /// its OLD and NEW images in the projected encoding. It is queued fired.
+    Transition {
+        effective_table: u16,
+        trigger_depth: u16,
+        command: u32,
+    },
+}
+
+/// The statement that fires the AFTER events of the writes running at
+/// `depth`. PostgreSQL runs a referential action's query without firing
+/// triggers of its own: its AFTER events join the queue of the statement
+/// whose event runs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AfterEventOwner {
+    pub(crate) depth: u16,
+    pub(crate) owner_depth: u16,
+    pub(crate) owner_command: u32,
+    /// The writes read the latest committed rows, as PostgreSQL's
+    /// referential queries do under repeatable read.
+    pub(crate) latest_snapshot: bool,
+}
+
+/// PostgreSQL's per-statement `AfterTriggersTableData`: whether a table
+/// operation's BEFORE STATEMENT triggers fired, and its queued AFTER
+/// STATEMENT events, which a later change of the same table and operation
+/// in the statement replaces.
+#[derive(Clone, Copy)]
+struct StatementTableEvents {
+    serial: u64,
+    depth: u16,
+    command: u32,
+    table: u16,
+    event: u8,
+    before_fired: bool,
+    after: Option<(u64, u64)>,
+}
+
+/// Table operations whose statement trigger state the running statements
+/// keep, across all trigger nesting levels.
+pub(crate) const STATEMENT_TABLE_EVENTS: usize = 128;
+
+impl StatementTableEvents {
+    const EMPTY: Self = Self {
+        serial: 0,
+        depth: 0,
+        command: 0,
+        table: 0,
+        event: 0,
+        before_fired: false,
+        after: None,
+    };
 }
 
 pub const DEFERRED_TRIGGER_BYTES: usize = 256 * 1024;
@@ -1453,6 +1523,11 @@ impl TxnState {
             )?,
             pending_row_events: PendingRowEvents::new(budget)?,
             command_event_starts: [(0, 0); COMMAND_EVENT_STARTS],
+            after_event_owner: None,
+            statement_tables: [StatementTableEvents::EMPTY; STATEMENT_TABLE_EVENTS],
+            statement_table_count: 0,
+            statement_table_serial: 0,
+            last_transition_row: None,
             large_object_descriptors,
         })
     }
@@ -1986,7 +2061,15 @@ impl TxnState {
             ));
         }
         let command = self.next_command_identity()?;
-        let snapshot = self.statement_snapshot(storage.statement_snapshot_lsn(self.txid)?);
+        let latest = storage.statement_snapshot_lsn(self.txid)?;
+        let snapshot = if self
+            .after_event_owner
+            .is_some_and(|owner| owner.latest_snapshot && owner.depth == self.trigger_depth + 1)
+        {
+            latest
+        } else {
+            self.statement_snapshot(latest)
+        };
         if matches!(
             self.isolation,
             TransactionIsolation::RepeatableRead | TransactionIsolation::Serializable
@@ -2708,8 +2791,11 @@ impl TxnState {
         completion_mark: usize,
         mode_mark: usize,
         rename_mark: usize,
-        trigger_events: crate::sql::trigger_events::TriggerEventMark,
-        pending_row_events: u64,
+        (trigger_events, pending_row_events, statement_tables): (
+            crate::sql::trigger_events::TriggerEventMark,
+            u64,
+            u64,
+        ),
     ) {
         while self.deferred_constraints.len() > obligation_mark {
             self.deferred_constraints.pop();
@@ -2729,6 +2815,17 @@ impl TxnState {
         for (_, start) in &mut self.command_event_starts {
             *start = (*start).min(end);
         }
+        // State a rolled-back part of a statement created goes with it.
+        let mut kept = 0;
+        for index in 0..self.statement_table_count {
+            let entry = self.statement_tables[index];
+            if entry.serial > statement_tables {
+                continue;
+            }
+            self.statement_tables[kept] = entry;
+            kept += 1;
+        }
+        self.statement_table_count = kept;
     }
 
     pub(crate) fn queue_constraint_trigger(
@@ -2744,8 +2841,8 @@ impl TxnState {
             DeferredTriggerKind::Constraint {
                 identity,
                 effective_table,
-                trigger_depth: self.trigger_depth,
-                command: self.command_id,
+                trigger_depth: self.after_event_owner().0,
+                command: self.after_event_owner().1,
             },
             event,
             updated_columns,
@@ -2767,8 +2864,8 @@ impl TxnState {
             DeferredTriggerKind::AfterRow {
                 trigger_slot,
                 effective_table,
-                trigger_depth: self.trigger_depth,
-                command: self.command_id,
+                trigger_depth: self.after_event_owner().0,
+                command: self.after_event_owner().1,
             },
             event,
             updated_columns,
@@ -2817,12 +2914,13 @@ impl TxnState {
         rowid: u64,
         old: Option<&[u8]>,
     ) -> Result<(), SqlError> {
+        let (trigger_depth, command) = self.after_event_owner();
         let kind = DeferredTriggerKind::ForeignKey {
             identity,
             check,
             effective_table,
-            trigger_depth: self.trigger_depth,
-            command: self.command_id,
+            trigger_depth,
+            command,
             rowid,
         };
         self.pending_row_events
@@ -2879,6 +2977,203 @@ impl TxnState {
             self.pending_row_events.remove(0);
         }
         Ok(())
+    }
+
+    /// The statement (trigger depth, command) that fires the AFTER events of
+    /// the write running now.
+    pub(crate) fn after_event_owner(&self) -> (u16, u32) {
+        match self.after_event_owner {
+            Some(owner) if owner.depth == self.trigger_depth => {
+                (owner.owner_depth, owner.owner_command)
+            }
+            _ => (self.trigger_depth, self.command_id),
+        }
+    }
+
+    /// Whether the write running now leaves its AFTER events to an enclosing
+    /// statement.
+    pub(crate) fn defers_after_events(&self) -> bool {
+        self.after_event_owner
+            .is_some_and(|owner| owner.depth == self.trigger_depth)
+    }
+
+    /// Installs the owner of the AFTER events of writes at `owner.depth`,
+    /// returning the one it replaces.
+    pub(crate) fn replace_after_event_owner(
+        &mut self,
+        owner: Option<AfterEventOwner>,
+    ) -> Option<AfterEventOwner> {
+        core::mem::replace(&mut self.after_event_owner, owner)
+    }
+
+    /// The statement trigger state of `table` and `event` in the statement
+    /// owning the running write's AFTER events, created when missing. Entries
+    /// of statements that ended (deeper ones, or another command at the same
+    /// depth) are dropped first.
+    fn statement_table_events(
+        &mut self,
+        table: u16,
+        event: u8,
+    ) -> Result<&mut StatementTableEvents, SqlError> {
+        let (depth, command) = self.after_event_owner();
+        let mut kept = 0;
+        for index in 0..self.statement_table_count {
+            let entry = self.statement_tables[index];
+            if entry.depth >= depth && entry.command != command {
+                continue;
+            }
+            self.statement_tables[kept] = entry;
+            kept += 1;
+        }
+        self.statement_table_count = kept;
+        if let Some(index) = self.statement_tables[..kept].iter().position(|entry| {
+            entry.depth == depth
+                && entry.command == command
+                && entry.table == table
+                && entry.event == event
+        }) {
+            return Ok(&mut self.statement_tables[index]);
+        }
+        if kept == STATEMENT_TABLE_EVENTS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "statement triggers of more than {} table operations are pending",
+                STATEMENT_TABLE_EVENTS
+            ));
+        }
+        self.statement_table_serial += 1;
+        self.statement_tables[kept] = StatementTableEvents {
+            serial: self.statement_table_serial,
+            depth,
+            command,
+            table,
+            event,
+            before_fired: false,
+            after: None,
+        };
+        self.statement_table_count += 1;
+        Ok(&mut self.statement_tables[kept])
+    }
+
+    /// Whether `table`'s BEFORE STATEMENT triggers for `event` fire now: once
+    /// per table and operation in a statement, its referential actions and
+    /// its data-modifying `WITH` sub-statements included.
+    pub(crate) fn claim_before_statement(
+        &mut self,
+        table: u16,
+        event: u8,
+    ) -> Result<bool, SqlError> {
+        let entry = self.statement_table_events(table, event)?;
+        Ok(!core::mem::replace(&mut entry.before_fired, true))
+    }
+
+    /// Starts queuing `table`'s AFTER STATEMENT triggers for `event` in the
+    /// statement owning the running write's AFTER events: those an earlier
+    /// change of the same table and operation queued and that have not
+    /// fired are dropped (PostgreSQL's `cancel_prior_stmt_triggers`). Returns
+    /// where the new ones start.
+    pub(crate) fn begin_after_statement_triggers(
+        &mut self,
+        table: u16,
+        event: u8,
+    ) -> Result<u64, SqlError> {
+        let (trigger_depth, command) = self.after_event_owner();
+        if let Some((start, end)) = self.statement_table_events(table, event)?.after {
+            let mut id = start;
+            while id < end && id < self.trigger_events.end() {
+                let (queued, next, fired) = self.trigger_events.event(id)?;
+                if !fired
+                    && queued.event == event
+                    && matches!(
+                        queued.kind,
+                        DeferredTriggerKind::AfterStatement {
+                            effective_table,
+                            trigger_depth: depth,
+                            command: queued_by,
+                            ..
+                        } if effective_table == table
+                            && depth == trigger_depth
+                            && queued_by == command
+                    )
+                {
+                    self.trigger_events.fire(id)?;
+                }
+                id = next;
+            }
+        }
+        Ok(self.trigger_events.end())
+    }
+
+    /// Queues one AFTER STATEMENT trigger of `table` for `event`.
+    pub(crate) fn queue_after_statement_trigger(
+        &mut self,
+        trigger_slot: u16,
+        table: u16,
+        event: u8,
+        updated_columns: ColumnSet,
+    ) -> Result<(), SqlError> {
+        let (trigger_depth, command) = self.after_event_owner();
+        self.queue_trigger_event(
+            DeferredTriggerKind::AfterStatement {
+                trigger_slot,
+                effective_table: table,
+                trigger_depth,
+                command,
+            },
+            event,
+            updated_columns,
+            None,
+            None,
+        )
+    }
+
+    /// Records the AFTER STATEMENT triggers queued since `start` as those a
+    /// later change of `table` for `event` replaces.
+    pub(crate) fn finish_after_statement_triggers(
+        &mut self,
+        table: u16,
+        event: u8,
+        start: u64,
+    ) -> Result<(), SqlError> {
+        let end = self.trigger_events.end();
+        self.statement_table_events(table, event)?.after = (end > start).then_some((start, end));
+        Ok(())
+    }
+
+    /// Queues one transition row of `table` for the statement owning the
+    /// running write's AFTER events.
+    pub(crate) fn queue_transition_row(
+        &mut self,
+        table: u16,
+        event: u8,
+        old: Option<&[u8]>,
+        new: Option<&[u8]>,
+    ) -> Result<(), SqlError> {
+        let (trigger_depth, command) = self.after_event_owner();
+        let id = self.trigger_events.push(
+            &DeferredTriggerEvent {
+                kind: DeferredTriggerKind::Transition {
+                    effective_table: table,
+                    trigger_depth,
+                    command,
+                },
+                event,
+                updated_columns: ColumnSet::EMPTY,
+                old: None,
+                new: None,
+            },
+            old,
+            new,
+        )?;
+        self.last_transition_row = Some(id);
+        self.trigger_events.fire(id)
+    }
+
+    /// Whether a transition row (see [`Self::queue_transition_row`]) may be
+    /// queued at or after event `start`.
+    pub(crate) fn has_queued_transition_rows(&self, start: u64) -> bool {
+        self.last_transition_row
+            .is_some_and(|last| last >= start && last < self.trigger_events.end())
     }
 
     pub(crate) fn attach_trigger_event_spill(
@@ -3018,6 +3313,7 @@ impl TxnState {
             constraint_rename_mark: self.constraint_renames.len(),
             trigger_event_mark: self.trigger_events.mark(),
             pending_row_event_mark: self.pending_row_events.serial,
+            statement_table_mark: self.statement_table_serial,
             failed: self.failed,
         };
         self.savepoints.push(sp).map_err(|_| {
@@ -3048,6 +3344,7 @@ impl TxnState {
             constraint_renames: self.constraint_renames.len(),
             trigger_events: self.trigger_events.mark(),
             pending_row_events: self.pending_row_events.serial,
+            statement_tables: self.statement_table_serial,
         }
     }
 
@@ -3120,8 +3417,11 @@ impl TxnState {
             boundary.constraint_completion_mark,
             boundary.constraint_mode_mark,
             boundary.constraint_rename_mark,
-            boundary.trigger_event_mark,
-            boundary.pending_row_event_mark,
+            (
+                boundary.trigger_event_mark,
+                boundary.pending_row_event_mark,
+                boundary.statement_table_mark,
+            ),
         );
         self.rewind_notifications(
             boundary.notify_mark,
@@ -3690,6 +3990,9 @@ impl TxnState {
         self.trigger_events.clear();
         self.pending_row_events.clear();
         self.command_event_starts = [(0, 0); COMMAND_EVENT_STARTS];
+        self.after_event_owner = None;
+        self.statement_table_count = 0;
+        self.last_transition_row = None;
         for descriptor in self.large_object_descriptors.iter_mut() {
             descriptor.active = false;
         }
@@ -3699,6 +4002,66 @@ impl TxnState {
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn referential_writes_share_their_owner_statement_trigger_state() {
+        let mut budget = Budget::new(TxnState::budget_bytes(8) + 4096);
+        let mut txn = TxnState::new(&mut budget, 8).unwrap();
+        txn.test_set_command_id(5);
+        let delete = crate::sql::ast::TriggerEvents::DELETE;
+        // The outer statement fires its BEFORE STATEMENT trigger once.
+        assert!(txn.claim_before_statement(3, delete).unwrap());
+        assert!(!txn.claim_before_statement(3, delete).unwrap());
+        let start = txn.begin_after_statement_triggers(3, delete).unwrap();
+        txn.queue_after_statement_trigger(1, 3, delete, ColumnSet::EMPTY)
+            .unwrap();
+        txn.finish_after_statement_triggers(3, delete, start)
+            .unwrap();
+        // A referential action's write one level down belongs to it.
+        let owner = AfterEventOwner {
+            depth: 1,
+            owner_depth: 0,
+            owner_command: 5,
+            latest_snapshot: true,
+        };
+        assert_eq!(txn.replace_after_event_owner(Some(owner)), None);
+        txn.trigger_depth = 1;
+        txn.command_id = 6;
+        assert!(txn.defers_after_events());
+        assert_eq!(txn.after_event_owner(), (0, 5));
+        assert!(!txn.claim_before_statement(3, delete).unwrap());
+        assert!(txn.claim_before_statement(4, delete).unwrap());
+        // Its change of the same table replaces the queued trigger.
+        let start = txn.begin_after_statement_triggers(3, delete).unwrap();
+        assert!(txn.trigger_events.is_fired(0).unwrap());
+        txn.queue_after_statement_trigger(1, 3, delete, ColumnSet::EMPTY)
+            .unwrap();
+        txn.finish_after_statement_triggers(3, delete, start)
+            .unwrap();
+        txn.queue_transition_row(3, delete, Some(b"row"), None)
+            .unwrap();
+        assert!(txn.has_queued_transition_rows(start));
+        assert!(!txn.has_queued_transition_rows(txn.trigger_events_end()));
+        let (queued, next, fired) = txn.trigger_event(start).unwrap();
+        assert!(!fired);
+        assert!(matches!(
+            queued.kind,
+            DeferredTriggerKind::AfterStatement {
+                trigger_slot: 1,
+                effective_table: 3,
+                trigger_depth: 0,
+                command: 5,
+            }
+        ));
+        assert!(txn.trigger_event(next).unwrap().2);
+        txn.replace_after_event_owner(None);
+        txn.trigger_depth = 0;
+        txn.command_id = 5;
+        // The next statement at the same depth starts afresh.
+        txn.command_id = 7;
+        assert!(txn.claim_before_statement(3, delete).unwrap());
+        assert_eq!(txn.statement_table_count, 1);
+    }
 
     #[test]
     fn statement_retry_restores_large_object_positions_and_descriptor_lifetimes() {

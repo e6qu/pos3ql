@@ -115,19 +115,33 @@ in the scan, would select different rows, so such a write reads its rows
 synchronously and a lock wait runs it again from its first start. A wait inside a routine body run for a row keeps the body's progress
 and continues it.
 
-**AFTER events queue in one spilling log.** Every queued `AFTER ROW`
-trigger, constraint trigger and foreign key check is a record in the
-transaction's event log, fired at its statement's end (or at `SET
-CONSTRAINTS` and commit when deferred) as PostgreSQL's after-trigger queue
-does. A written row's foreign key checks, its own references and the NO
-ACTION and RESTRICT checks of keys it removes, wait beside the row until its
-`AFTER` triggers are queued and take their places among them by the name of
-PostgreSQL's `RI_ConstraintTrigger_c_<oid>`/`_a_<oid>` triggers. A referencing
-check reads the row's current version, so a row deleted before the check is
-not checked; a referenced check carries the old key, and NO ACTION passes
-when another row provides that key again. Checks see every change of their
-transaction, and those of a data-modifying `WITH` sub-statement wait for the
-end of the whole statement, so `WITH d AS (DELETE FROM p ...) INSERT INTO p
+**AFTER events queue in one spilling log.** Every queued `AFTER ROW` and
+`AFTER STATEMENT` trigger, constraint trigger, foreign key check and
+referential action is a record in the transaction's event log, fired at its
+statement's end (or at `SET CONSTRAINTS` and commit when deferred) as
+PostgreSQL's after-trigger queue does. A written row's foreign key events,
+its own references and the actions and checks of keys it removes, wait
+beside the row until its `AFTER` triggers are queued and take their places
+among them by the name of PostgreSQL's
+`RI_ConstraintTrigger_c_<oid>`/`_a_<oid>` triggers. A statement's `AFTER
+STATEMENT` triggers follow its row events. A referencing check reads the
+row's current version, so a row deleted before the check is not checked; a
+referenced check carries the old key, and NO ACTION passes when another row
+provides that key again. Checks see every change of their transaction.
+
+A `CASCADE`, `SET NULL` or `SET DEFAULT` action runs PostgreSQL's
+`ri_triggers.c` query (`DELETE FROM ONLY child WHERE $1 OPERATOR(pg_catalog.=)
+"col"`, `UPDATE ONLY child SET ...`) through the nested write path as the
+child's owner, so rules rewrite it and the child's `BEFORE` triggers fire.
+Its writes record the statement that ran the event as the owner of their
+`AFTER` events (`AfterEventOwner`): their row events, `AFTER STATEMENT`
+triggers and transition rows join the end of that statement's queue instead
+of firing at the action's end. Per statement, table and operation, the
+transaction keeps whether `BEFORE STATEMENT` triggers fired and which `AFTER
+STATEMENT` events are queued, so each fires once, after the last change, with
+the transition rows of all of them (PostgreSQL's `AfterTriggersTableData`).
+A data-modifying `WITH` sub-statement leaves its `AFTER` events to the main
+statement the same way, so `WITH d AS (DELETE FROM p ...) INSERT INTO p
 SELECT ...` passes as in PostgreSQL. The log is cut into 64 KiB pages:
 `deferred_trigger_bytes` of them stay in memory per connection and older
 pages move to the `trigger_event_spill_bytes` file shared by all
@@ -138,9 +152,10 @@ after it.
 
 **Work after a write's last row resumes too.** A top-level `INSERT`,
 `UPDATE`, `DELETE` or `MERGE` keeps its finished `AFTER` work across a
-wait: queued `AFTER ROW` events, then the transaction's immediate
+wait: its queued events in order, with the transaction's immediate
 constraint checks (deferrable unique and exclusion constraints in
-`IMMEDIATE` mode), then `AFTER STATEMENT` triggers. An event
+`IMMEDIATE` mode) before its first `AFTER STATEMENT` trigger and again after
+any events queued later. An event
 stays selected until it completes. A wait inside a PL/pgSQL trigger body
 keeps the body and continues at its waiting statement; a wait before the
 body starts runs the same event again, replaying its sequence values from
@@ -148,8 +163,9 @@ the event's start. Each event's reads yield until its own first effect
 (a write, sequence call or routine call in its body), after which the rest
 of that event reads synchronously; the next event yields again. A write in
 a `CALL` or `DO` body keeps its `AFTER` work the same way in the body's
-frame. The steps of a multi-step write (rule actions, data-modifying `WITH`)
-run their `AFTER` work inline and synchronously.
+frame. The steps of a multi-step write (rule actions) run their `AFTER` work
+inline and synchronously; a data-modifying `WITH` sub-statement's `AFTER`
+work runs with the main statement's.
 Cancellation, a statement or lock timeout, an error and
 the end of the transaction release the kept progress.
 
@@ -356,9 +372,9 @@ releases the saved body.
 
 Write completion follows PostgreSQL's
 [write executor](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/executor/nodeModifyTable.c):
-drain row events, run AFTER statement triggers in order (MERGE runs them in
-DELETE, UPDATE, INSERT order; `INSERT ... ON CONFLICT DO UPDATE` runs UPDATE
-before INSERT), then return one completion. Direct table writes without rewrite
+queue AFTER statement triggers after the row events (MERGE queues them in
+DELETE, UPDATE, INSERT order; `INSERT ... ON CONFLICT DO UPDATE` queues UPDATE
+before INSERT), drain the queue, then return one completion. Direct table writes without rewrite
 rules hand that completion to a retained owner, so a waiting AFTER trigger
 resumes without redoing the insert, update or delete, and earlier `RETURNING`
 rows are kept. Nested INSERT, UPDATE and DELETE inside a trigger hand their

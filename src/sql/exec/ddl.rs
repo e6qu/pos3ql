@@ -578,6 +578,22 @@ pub(super) fn resolve_cols<Definition0: crate::storage::DefinitionBacking>(
     Ok((out, names.len()))
 }
 
+/// [`resolve_cols`] for the column lists of a foreign key, with
+/// PostgreSQL's `transformColumnNameList` error.
+fn resolve_foreign_key_cols<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
+    names: &[&str],
+) -> Result<([u16; MAX_INDEX_COLS], usize), SqlError> {
+    if let Some(missing) = names.iter().find(|name| def.column_index(name).is_none()) {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" referenced in foreign key constraint does not exist",
+            missing
+        ));
+    }
+    resolve_cols(def, names)
+}
+
 /// Validates that every column reference in a CHECK predicate names a real
 /// column of the table being defined, and that the predicate uses no subquery
 /// (which PostgreSQL forbids in CHECK). Each referenced column's index is OR'd
@@ -919,6 +935,7 @@ pub(super) fn attach_constraints(
                 parent,
                 parent_cols,
                 on_delete,
+                delete_set_columns,
                 on_update,
                 timing,
                 validation,
@@ -941,7 +958,7 @@ pub(super) fn attach_constraints(
                     columns,
                     parent,
                     parent_cols,
-                    *on_delete,
+                    (*on_delete, delete_set_columns),
                     *on_update,
                     *timing,
                     *validation,
@@ -1190,7 +1207,7 @@ fn attach_fkey(
     child_cols: &[&str],
     parent: &QualName,
     parent_cols: &[&str],
-    on_delete: FkAction,
+    (on_delete, delete_set_names): (FkAction, &[&str]),
     on_update: FkAction,
     timing: AstConstraintTiming,
     validation: AstConstraintValidation,
@@ -1205,7 +1222,7 @@ fn attach_fkey(
             crate::storage::MAX_FKEYS
         ));
     }
-    let (child_idxs, n_child) = resolve_cols(def, child_cols)?;
+    let (child_idxs, n_child) = resolve_foreign_key_cols(def, child_cols)?;
 
     // The parent may be this very table (self-reference), not yet in
     // storage: PostgreSQL resolves the reference with the new table already
@@ -1279,6 +1296,24 @@ fn attach_fkey(
             }
         ));
     }
+    // `ON DELETE SET NULL (...)` names key columns, each once
+    // (`validateFkOnDeleteSetColumns`).
+    let (named_set_cols, n_named_set) = resolve_foreign_key_cols(def, delete_set_names)?;
+    let mut delete_set_cols = [0u16; MAX_INDEX_COLS];
+    let mut n_delete_set = 0;
+    for (&column, name) in named_set_cols[..n_named_set].iter().zip(delete_set_names) {
+        if !child_idxs[..n_child].contains(&column) {
+            return Err(sql_err!(
+                sqlstate::INVALID_COLUMN_REFERENCE,
+                "column \"{}\" referenced in ON DELETE SET action must be part of foreign key",
+                name
+            ));
+        }
+        if !delete_set_cols[..n_delete_set].contains(&column) {
+            delete_set_cols[n_delete_set] = column;
+            n_delete_set += 1;
+        }
+    }
     // Referenced columns default to the parent's primary key.
     let mut pcol_names: [&str; MAX_INDEX_COLS] = [""; MAX_INDEX_COLS];
     let n_parent;
@@ -1305,7 +1340,7 @@ fn attach_fkey(
             "number of referencing and referenced columns for foreign key disagree"
         ));
     }
-    let (parent_idxs, _) = resolve_cols(&parent_def, &pcol_names[..n_parent])?;
+    let (parent_idxs, _) = resolve_foreign_key_cols(&parent_def, &pcol_names[..n_parent])?;
     if !self_ref {
         let parent_slot = resolved.expect("non-self foreign key resolved above");
         storage.require_schema_usage(parent_def.schema.as_str(), txid)?;
@@ -1381,6 +1416,8 @@ fn attach_fkey(
     fk.parent_cols[..n_parent].copy_from_slice(&parent_idxs[..n_parent]);
     fk.n_parent_cols = n_parent;
     fk.on_delete = fk_action_of(on_delete);
+    fk.delete_set_cols = delete_set_cols;
+    fk.n_delete_set_cols = n_delete_set;
     fk.on_update = fk_action_of(on_update);
     fk.timing = storage_timing(timing);
     fk.validation = storage_validation(validation);
@@ -1461,13 +1498,6 @@ fn check_foreign_key_column_types(
     (referencing_name, referencing): (&str, &crate::storage::ColumnMeta),
     (referenced_name, referenced): (&str, &crate::storage::ColumnMeta),
 ) -> Result<(), SqlError> {
-    if super::foreign_key_equality::dissimilar_composites(referencing.ctype, referenced.ctype) {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "foreign key constraint \"{}\" between different composite types is not supported",
-            constraint
-        ));
-    }
     if super::foreign_key_equality::key_equality(referencing.ctype, referenced.ctype).is_none() {
         let type_oid = |column: &crate::storage::ColumnMeta| {
             storage

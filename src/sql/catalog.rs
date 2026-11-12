@@ -15423,7 +15423,10 @@ pub fn trigger_def_text<'a>(
         let deparsed = match render_target {
             crate::storage::TriggerTarget::Table(table) => {
                 let definition = storage.table_def(usize::from(table), txid);
-                let joined = [("new", &*definition), ("old", &*definition)];
+                let joined = [
+                    deparse::Joined::new("new", &definition),
+                    deparse::Joined::new("old", &definition),
+                ];
                 deparse::deparse(
                     &deparse::Context {
                         storage,
@@ -15996,14 +15999,13 @@ pub(crate) fn view_def_text_pretty<'a>(
                 .alloc_str(column.name.as_str())
                 .map_err(|_| arena_full())?;
         }
-        if let Some(deparsed) = deparse::view_definition(
-            storage,
-            txid,
-            view.sql.as_str().trim().trim_end_matches(';'),
-            names,
-            layout,
-            arena,
-        )? {
+        let query = arena
+            .alloc_str(view.sql.as_str().trim().trim_end_matches(';'))
+            .map_err(|_| arena_full())?;
+        if let Ok(select) = crate::sql::parser::parse_query(query, arena)
+            && let Some(deparsed) =
+                deparse::view_definition(storage, txid, select, None, names, layout, arena)?
+        {
             return Ok(Some(deparsed));
         }
         return arena
@@ -16012,7 +16014,7 @@ pub(crate) fn view_def_text_pretty<'a>(
             .map_err(|_| arena_full());
     }
     let stored = rewrite::view_definition(storage, txid, oid, arena)?;
-    if let Some(text) = stored
+    if stored.is_some()
         && let Some(slot) = view_slot_by_oid(storage, txid, oid)
     {
         let view = storage.view(slot);
@@ -16023,10 +16025,27 @@ pub(crate) fn view_def_text_pretty<'a>(
         for (target, name) in names.iter_mut().zip(columns.names()) {
             *target = arena.alloc_str(name.as_str()).map_err(|_| arena_full())?;
         }
-        let query = text.trim().trim_end_matches(';');
-        if let Some(deparsed) =
-            deparse::view_definition(storage, txid, query, names, layout, arena)?
-        {
+        let query = storage.snapshot_view_query(slot, txid, arena)?;
+        let sql = arena
+            .alloc_str(query.sql.as_str())
+            .map_err(|_| arena_full())?;
+        let dependencies = query.dependencies.view();
+        if let Ok(select) = crate::sql::query::parse_stored_query(
+            sql,
+            query.input_source.unwrap_or(sql),
+            storage,
+            txid,
+            dependencies,
+            arena,
+        ) && let Some(deparsed) = deparse::view_definition(
+            storage,
+            txid,
+            select,
+            Some(dependencies),
+            names,
+            layout,
+            arena,
+        )? {
             return Ok(Some(deparsed));
         }
     }

@@ -187,7 +187,10 @@ Functions and expressions:
   defaults and `RETURN` bodies as PostgreSQL does: `DEFAULT 'x'` on a `text`
   column is shown as `'x'::text`, and `CHECK (v <> '')` on a `varchar` column as
   `CHECK (((v)::text <> ''::text))`. `pg_get_viewdef` uses PostgreSQL's
-  indented layout for views over plain tables joined with `ON`. Pretty output
+  indented layout for views over plain tables joined with `ON`, printing the
+  current names of renamed tables, functions, types and enum values
+  (`WHERE (x = 'z'::status)` after `ALTER TYPE status RENAME VALUE 'a' TO
+  'z'`). Pretty output
   (`pg_get_constraintdef(oid, true)`, as psql's `\d` uses) drops redundant
   parentheses as PostgreSQL does. Expressions outside the deparser's typed
   coverage and other views keep their stored spelling

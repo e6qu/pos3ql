@@ -1,5 +1,5 @@
-//! SQL-standard routine bodies (`RETURN`, `BEGIN ATOMIC`) are bound to the
-//! routines and types they named at CREATE: renaming or moving those objects
+//! SQL-standard routine bodies (`RETURN`, `BEGIN ATOMIC`) and views are bound
+//! to the objects they named at CREATE: renaming or moving those objects
 //! changes neither their results nor their printed form, before and after
 //! recovery from the journal alone or from a checkpoint.
 
@@ -37,8 +37,42 @@ const EXPECTED: [&str; 7] = [
 
 #[test]
 fn standard_bodies_follow_renames_through_journal_and_checkpoint_recovery() {
+    assert_recovered("standard-body-renames", SETUP, PROBE, &EXPECTED);
+}
+
+const VIEW_SETUP: &str = r#"
+CREATE TYPE ve AS ENUM ('a', 'b');
+CREATE TABLE vt (x ve, k integer);
+CREATE VIEW vv_filter AS SELECT x FROM vt WHERE x = 'a';
+CREATE VIEW vv_cast AS SELECT 'b'::ve AS c, k FROM vt;
+ALTER TYPE ve RENAME VALUE 'a' TO 'z';
+ALTER TYPE ve RENAME TO ve2;
+ALTER TABLE vt RENAME TO vt2"#;
+
+const VIEW_PROBE: &str = "
+SELECT pg_get_viewdef('vv_filter'::regclass);
+SELECT pg_get_viewdef('vv_cast'::regclass);";
+
+/// Enum literals print as PostgreSQL's constants, and renamed relations,
+/// types and enum values print under their current names.
+const VIEW_EXPECTED: [&str; 2] = [
+    " SELECT x\n   FROM vt2\n  WHERE (x = 'z'::ve2);",
+    " SELECT 'b'::ve2 AS c,\n    k\n   FROM vt2;",
+];
+
+#[test]
+fn view_definitions_follow_renames_through_journal_and_checkpoint_recovery() {
+    assert_recovered(
+        "view-definition-renames",
+        VIEW_SETUP,
+        VIEW_PROBE,
+        &VIEW_EXPECTED,
+    );
+}
+
+fn assert_recovered(prefix: &str, setup: &str, probe: &str, expected: &[&str]) {
     for checkpoint in [false, true] {
-        let name = format!("standard-body-renames-{checkpoint}");
+        let name = format!("{prefix}-{checkpoint}");
         let mut config = test_config(&name);
         config.object_store_on = true;
         config.object_store_sim = true;
@@ -49,12 +83,12 @@ fn standard_bodies_follow_renames_through_journal_and_checkpoint_recovery() {
         let mut budget = test_engine_budget(&config, 1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-        for statement in SETUP.split(";\n").filter(|sql| !sql.trim().is_empty()) {
+        for statement in setup.split(";\n").filter(|sql| !sql.trim().is_empty()) {
             session.success(&mut engine, statement, false);
         }
         assert_eq!(
-            data_rows(&session.success(&mut engine, PROBE, false)),
-            EXPECTED,
+            data_rows(&session.success(&mut engine, probe, false)),
+            expected,
             "{name}"
         );
         if checkpoint {
@@ -67,8 +101,8 @@ fn standard_bodies_follow_renames_through_journal_and_checkpoint_recovery() {
         let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
         let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
         assert_eq!(
-            data_rows(&session.success(&mut cold, PROBE, false)),
-            EXPECTED,
+            data_rows(&session.success(&mut cold, probe, false)),
+            expected,
             "{name}"
         );
         drop(session);

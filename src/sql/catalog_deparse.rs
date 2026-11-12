@@ -37,9 +37,29 @@ pub(crate) struct Context<'s> {
     pub parameters: &'s [crate::storage::RoutineParameterDef],
     /// The FROM items of a view, by exposed name. Column references are
     /// qualified when there is more than one, as PostgreSQL prints them.
-    pub joined: &'s [(&'s str, &'s TableDef)],
+    pub joined: &'s [Joined<'s>],
     /// `PRETTYFLAG_PAREN`: parentheses only where precedence requires them.
     pub pretty: bool,
+}
+
+/// A FROM item: the name stored references qualify columns with, the name
+/// printed for it (a renamed table's current name unless it has an alias)
+/// and its definition.
+#[derive(Clone, Copy)]
+pub(crate) struct Joined<'s> {
+    pub name: &'s str,
+    pub printed: &'s str,
+    pub table: &'s TableDef,
+}
+
+impl<'s> Joined<'s> {
+    pub(crate) fn new(name: &'s str, table: &'s TableDef) -> Self {
+        Self {
+            name,
+            printed: name,
+            table,
+        }
+    }
 }
 
 /// The node a pretty-printed child expression appears under.
@@ -165,9 +185,10 @@ impl Context<'_> {
     /// The one joined FROM item a column reference names.
     fn joined_source(&self, qualifier: Option<&str>, name: &str) -> Option<(&str, &TableDef)> {
         let mut found = None;
-        for (exposed, table) in self.joined {
-            if qualifier.is_some_and(|qualifier| qualifier != *exposed)
-                || !table
+        for joined in self.joined {
+            if qualifier.is_some_and(|qualifier| qualifier != joined.name)
+                || !joined
+                    .table
                     .columns()
                     .iter()
                     .any(|column| column.name.as_str() == name)
@@ -177,7 +198,7 @@ impl Context<'_> {
             if found.is_some() {
                 return None;
             }
-            found = Some((*exposed, *table));
+            found = Some((joined.printed, joined.table));
         }
         found
     }
@@ -208,14 +229,14 @@ impl Context<'_> {
             && self
                 .joined
                 .iter()
-                .any(|(_, table)| table.column_index(name).is_some())
+                .any(|joined| joined.table.column_index(name).is_some())
         {
             return None;
         }
         self.joined
             .iter()
-            .find(|(exposed, _)| *exposed == name)
-            .map(|(exposed, table)| (*exposed, *table))
+            .find(|joined| joined.name == name)
+            .map(|joined| (joined.printed, joined.table))
     }
 
     fn row_type(&self, table: &TableDef) -> Option<i32> {
@@ -1401,19 +1422,19 @@ fn plain_table<'r>(
 
 /// `pg_get_viewdef(view)` for a view over one table: PostgreSQL's indented
 /// layout, one target per line, with analyzed expressions. Other query shapes
-/// are reported as unsupported.
+/// are reported as unsupported. A stored view's relations, routines and types
+/// are bound to the identities they captured at CREATE and printed under
+/// their current names.
 pub(crate) fn view_definition<'a>(
     storage: &Storage,
     txid: u32,
-    query: &str,
+    select: &'a crate::sql::ast::Select<'a>,
+    dependencies: Option<crate::storage::StoredQueryDependencyView<'_>>,
     column_names: &[&str],
     layout: ViewLayout,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     let pretty = layout.pretty;
-    let Ok(select) = crate::sql::parser::parse_query(query, arena) else {
-        return Ok(None);
-    };
     let Some(from) = select.from else {
         return Ok(None);
     };
@@ -1443,25 +1464,54 @@ pub(crate) fn view_definition<'a>(
     if !wildcard && select.items.len() != column_names.len() {
         return Ok(None);
     }
+    // Binding substitutes captured names only; a subquery would expand the
+    // views it reads, which this layout cannot print.
+    let bind = |expression: &'a Expr<'a>| -> Result<Option<&'a Expr<'a>>, SqlError> {
+        let Some(dependencies) = dependencies else {
+            return Ok(Some(expression));
+        };
+        if expression.contains_subquery() {
+            return Ok(None);
+        }
+        crate::sql::query::bind_stored_expression(expression, storage, txid, dependencies, arena)
+            .map(Some)
+    };
     let sources = core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
     let mut reads: [Option<crate::storage::TableDefinitionRead<'_>>; MAX_JOINED] =
         core::array::from_fn(|_| None);
     for (read, source) in reads.iter_mut().zip(sources.clone()) {
-        let Some(crate::storage::ResolvedRelation::Table(slot)) =
-            storage.resolve_relation(source.schema, source.table, txid)
-        else {
+        let captured = dependencies
+            .and_then(|dependencies| {
+                dependencies.entries().iter().find(|dependency| {
+                    matches!(
+                        dependency.class,
+                        crate::storage::DependencyClass::Table
+                            | crate::storage::DependencyClass::View
+                    ) && dependency.referenced_schema.as_str() == source.schema.unwrap_or("")
+                        && dependency.referenced_name.as_str() == source.table
+                })
+            })
+            .map(|dependency| storage.resolve_stored_query_relation(dependency, txid))
+            .transpose()?;
+        let resolved = match captured {
+            Some(resolved) => Some(resolved),
+            None => storage.resolve_relation(source.schema, source.table, txid),
+        };
+        let Some(crate::storage::ResolvedRelation::Table(slot)) = resolved else {
             return Ok(None);
         };
         *read = Some(storage.table_def(slot, txid));
     }
     let table = reads[0].as_deref().expect("resolved base relation");
-    let mut joined: [(&str, &TableDef); MAX_JOINED] = [("", table); MAX_JOINED];
+    let mut joined = [Joined::new("", table); MAX_JOINED];
     let count = from.joins.len() + 1;
     for ((target, read), source) in joined.iter_mut().zip(&reads).zip(sources) {
-        *target = (
-            source.alias.unwrap_or(source.table),
-            read.as_deref().expect("resolved source"),
-        );
+        let read = read.as_deref().expect("resolved source");
+        *target = Joined {
+            name: source.alias.unwrap_or(source.table),
+            printed: source.alias.unwrap_or(read.name.as_str()),
+            table: read,
+        };
     }
     let context = Context {
         storage,
@@ -1498,7 +1548,10 @@ pub(crate) fn view_definition<'a>(
             let crate::sql::ast::SelectItem::Expr { expression, .. } = &select.items[index] else {
                 return Ok(None);
             };
-            *expression
+            let Some(expression) = bind(expression)? else {
+                return Ok(None);
+            };
+            expression
         };
         if let Expr::Case {
             operand: None,
@@ -1583,7 +1636,11 @@ pub(crate) fn view_definition<'a>(
         relation
     };
     output.push(relation(table, &from.base).as_str())?;
-    for (join, (_, joined_table)) in from.joins.iter().zip(&joined[1..]) {
+    for (join, joined_table) in from
+        .joins
+        .iter()
+        .zip(joined[1..].iter().map(|joined| joined.table))
+    {
         output.push(match join.kind {
             crate::sql::ast::JoinKind::Left => "\n     LEFT JOIN ",
             crate::sql::ast::JoinKind::Right => "\n     RIGHT JOIN ",
@@ -1592,16 +1649,18 @@ pub(crate) fn view_definition<'a>(
         })?;
         output.push(relation(joined_table, &join.table).as_str())?;
         output.push(if pretty { " ON " } else { " ON (" })?;
-        context.write(
-            join.on.expect("checked join condition"),
-            Some(oid::BOOL),
-            &mut output,
-        )?;
+        let Some(condition) = bind(join.on.expect("checked join condition"))? else {
+            return Ok(None);
+        };
+        context.write(condition, Some(oid::BOOL), &mut output)?;
         if !pretty {
             output.push("))")?;
         }
     }
     if let Some(condition) = select.where_clause {
+        let Some(condition) = bind(condition)? else {
+            return Ok(None);
+        };
         output.push("\n  WHERE ")?;
         context.write(condition, Some(oid::BOOL), &mut output)?;
     }
@@ -1611,6 +1670,9 @@ pub(crate) fn view_definition<'a>(
             if index != 0 {
                 output.push(", ")?;
             }
+            let Some(expression) = bind(expression)? else {
+                return Ok(None);
+            };
             let natural = context.type_of(expression)?;
             context.write(expression, natural, &mut output)?;
         }
@@ -1621,8 +1683,11 @@ pub(crate) fn view_definition<'a>(
             if index != 0 {
                 output.push(", ")?;
             }
-            let natural = context.type_of(order.expression)?;
-            context.write(order.expression, natural, &mut output)?;
+            let Some(expression) = bind(order.expression)? else {
+                return Ok(None);
+            };
+            let natural = context.type_of(expression)?;
+            context.write(expression, natural, &mut output)?;
             if order.descending {
                 output.push(" DESC")?;
             }
@@ -1637,6 +1702,9 @@ pub(crate) fn view_definition<'a>(
     }
     for (keyword, value) in [(" OFFSET ", select.offset), (" LIMIT ", select.limit)] {
         if let Some(value) = value {
+            let Some(value) = bind(value)? else {
+                return Ok(None);
+            };
             output.push("\n")?;
             output.push(keyword)?;
             let natural = context.type_of(value)?;

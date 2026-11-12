@@ -210,6 +210,17 @@ fn write_name<const N: usize>(output: &mut crate::util::StackStr<N>, name: &str)
     let _ = output.write_char('"');
 }
 
+/// Keeps the written spacing between tokens. A comment becomes a space, so
+/// only this writer's markers can appear between bound tokens.
+fn write_gap<const N: usize>(output: &mut crate::util::StackStr<N>, gap: &str) {
+    use core::fmt::Write;
+    let _ = output.write_str(if gap.chars().all(char::is_whitespace) {
+        gap
+    } else {
+        " "
+    });
+}
+
 pub(crate) fn bind_query<const N: usize>(
     source: &str,
     storage: &Storage,
@@ -260,7 +271,10 @@ pub(crate) fn bind_query<const N: usize>(
     let _ = output.write_str(QUERY_HEADER);
     let mut parameter = 0;
     let mut any_binding = false;
-    for token in tokens {
+    let mut previous = 0;
+    for (index, token) in tokens.iter().enumerate() {
+        write_gap(&mut output, &source[previous..token.start]);
+        previous = token.end;
         let mut binding = None;
         if let Tok::Str(label) = token.token {
             let oid = oids[parameter];
@@ -345,7 +359,12 @@ pub(crate) fn bind_query<const N: usize>(
             let _ = write!(output, "/*p3e:{dependency}:{member}*/");
         }
         let _ = output.write_str(&source[token.start..token.end]);
-        if let Some((_, _, schema, name)) = binding {
+        // A literal the query did not cast itself is cast to the type it was
+        // resolved to, so the respelled member keeps that type.
+        let cast = tokens
+            .get(index + 1)
+            .is_some_and(|next| next.token == Tok::Op("::"));
+        if let Some((_, _, schema, name)) = binding.filter(|_| !cast) {
             let _ = output.write_str("::");
             if !schema.as_str().is_empty() {
                 write_name(&mut output, schema.as_str());
@@ -353,8 +372,8 @@ pub(crate) fn bind_query<const N: usize>(
             }
             write_name(&mut output, name.as_str());
         }
-        let _ = output.write_char(' ');
     }
+    write_gap(&mut output, &source[previous..]);
     if !any_binding {
         return Ok(crate::util::StackStr::from_str(source));
     }
@@ -424,10 +443,16 @@ pub(crate) fn resolve_query<const N: usize>(
     let mut output = crate::util::StackStr::<N>::new();
     let mut previous = 0;
     for token in tokens {
-        let gap = source[previous..token.start].trim();
+        let gap = &source[previous..token.start];
         let binding = gap
+            .trim()
             .strip_prefix("/*p3e:")
             .and_then(|gap| gap.strip_suffix("*/"));
+        // The gap keeps the written spacing; a binding is not SQL.
+        let _ = output.write_str(match binding {
+            Some(_) => &gap[..gap.len() - gap.trim_start().len()],
+            None => gap,
+        });
         if let Some(binding) = binding {
             if !matches!(token.token, Tok::Str(_)) {
                 return Err(sql_err!(
@@ -483,9 +508,9 @@ pub(crate) fn resolve_query<const N: usize>(
         } else {
             let _ = output.write_str(&source[token.start..token.end]);
         }
-        let _ = output.write_char(' ');
         previous = token.end;
     }
+    let _ = output.write_str(&source[previous..]);
     if output.is_truncated() {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,

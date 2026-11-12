@@ -304,14 +304,12 @@ fails with `0A000` (PostgreSQL stores them bound by OID and follows the
 rename); views, rules, policies and SQL-standard routine bodies are bound and
 follow it. Renaming an enum value that a cast literal in a SQL-standard routine
 body spells (`RETURN 'a'::e`) leaves the body spelling the old label, so the
-call fails with `22P02`. `pg_get_viewdef` of a view with an enum literal (`'b'::e`) prints its
-bound query as spaced tokens with a doubled cast instead of PostgreSQL's
-form. An index key whose value is a row
+call fails with `22P02`. An index key whose value is a row
 (`CREATE INDEX ON t ((t))`) fails with `0A000`, since row values have no stored
 key encoding. A rule action that names its table's renamed column without
-`NEW.` or `OLD.` fails the rename with `0A000`. After a table rename,
-`pg_get_viewdef` of a view it cannot deparse still prints the old table name
-from the stored query text. A
+`NEW.` or `OLD.` fails the rename with `0A000`. After a table, routine or type rename,
+`pg_get_viewdef` of a view it cannot deparse (see below) still prints the old
+names from the stored query text. A
 partition's `UNIQUE` or `PRIMARY KEY` constraint cannot be attached to
 its parent's plain unique index, so attaching such a partition builds a
 separate copy where PostgreSQL reuses the constraint's index; constraint

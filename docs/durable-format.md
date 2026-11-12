@@ -437,7 +437,7 @@ Labels follow PostgreSQL's
 | Format | Rule |
 |---|---|
 | `pos3ql-catalog-expression-v1` | Retained CHECK, list, partition-bound and SQL routine-body nodes with source spans and bound column numbers; rendered via `pg_get_expr`. Not PostgreSQL's `pg_node_tree`. |
-| `pos3ql-bound-query-v1` | View SQL; `/*p3e:D:M*/` before each typed enum literal binds dependency D, member M. Unknown versions and invalid bindings fail. |
+| `pos3ql-bound-query-v1` | View SQL with its written spacing and comments dropped; `/*p3e:D:M*/` before each typed enum literal binds dependency D, member M, and a literal the query did not cast is followed by a cast to its type. Unknown versions and invalid bindings fail. |
 | `pos3ql-enum-check-v1` | Domain CHECK/DEFAULT on enum bases: `/*p3c:M*/` member, `/*p3a*/` member array, `/*p3t:N*/` N-token cast type, `/*p3o:TEXT*/` original default text (`%25`, `%2f` escaped). |
 | Stored-query dependencies | Marker `0xfc`, length-prefixed identity, complete read and written column sets, then a four-byte length and checked input image. Types `d:`/`e:`/`c:<slot>:<creation>`; tables and views `t:<creation>`/`v:<creation>` (1–9,999,999). Name-only or wrong-kind keys are rejected. |
 | `TIP2` | Checked literal map: four-byte identity, four-byte count, 44-byte records (two eight-byte source offsets, type OID, type modifier, input kind, collation flag, collation code, eight-byte value length) each followed by its value. Ordered by span and kind. `TIP1` rejected. |

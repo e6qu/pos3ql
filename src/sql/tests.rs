@@ -8,6 +8,7 @@ use super::*;
 use crate::mem::mutex::Mutex;
 
 mod array_element_comparisons;
+mod bound_definition_renames;
 mod builtin_aggregate_resolution;
 mod builtin_argument_binding;
 mod builtin_routine_changes;
@@ -64,7 +65,6 @@ mod shared_row_work;
 mod shared_statistics;
 mod special_datetime_inputs;
 mod sql_function_results;
-mod standard_body_renames;
 mod stored_relation_sources;
 mod table_metadata_capacity;
 mod table_publication;

@@ -86276,17 +86276,29 @@ fn reject_target_references(
                 }
             }
         }
+        let mut hidden_column = None;
         if let Some(select) = table.subquery {
             found |= select_names_target(select, exposed, &mut |inner: &Select<'_>, name| {
-                // A LATERAL body's unqualified column that neither its own
-                // FROM nor the items to its left answer is the target's.
-                lateral
-                    && target_columns.contains(&name)
-                    && !inner
+                // An unqualified column that the body's own FROM does not
+                // answer is the target's when a LATERAL body cannot find it
+                // in the items to its left either. Any other body cannot
+                // see the target (`errorMissingColumn`).
+                if !target_columns.contains(&name)
+                    || inner
                         .from
                         .is_some_and(|inner_from| from_may_answer(storage, txid, &inner_from, name))
-                    && !left_may_answer(storage, txid, from, index, name)
+                {
+                    return false;
+                }
+                if !lateral {
+                    hidden_column.get_or_insert_with(|| hidden_column_error(exposed, name));
+                    return false;
+                }
+                !left_may_answer(storage, txid, from, index, name)
             });
+        }
+        if let Some(error) = hidden_column {
+            return Err(error);
         }
         if index > 0
             && let Some(condition) = from.joins[index - 1].on
@@ -86313,6 +86325,30 @@ fn left_may_answer(
         .chain(from.joins.iter().map(|join| &join.table))
         .take(index)
         .any(|table| item_may_answer(storage, txid, table, name))
+}
+
+/// PostgreSQL's `errorMissingColumn` for an unqualified column of the target
+/// that a FROM item's body names but cannot see.
+fn hidden_column_error(exposed: &str, name: &str) -> SqlError {
+    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
+        detail: Some(crate::stack_format!(
+            crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+            "There is a column named \"{}\" in table \"{}\", but it cannot be referenced from this part of the query.",
+            name,
+            exposed
+        )),
+        hint: None,
+        objects: crate::sql::eval::ErrorObjects::default(),
+    });
+    crate::sql::error_position::column_reference(
+        sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" does not exist",
+            name
+        ),
+        None,
+        name,
+    )
 }
 
 fn target_reference_error(exposed: &str, kind: TargetReference) -> SqlError {

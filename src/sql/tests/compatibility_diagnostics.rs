@@ -1360,3 +1360,25 @@ fn unsupported_system_columns_fail_loudly_and_tables_cannot_take_their_names() {
         );
     });
 }
+
+#[test]
+fn a_plain_source_subquery_cannot_see_the_target_columns() {
+    with_engine("hidden-target-columns", |engine, budget| {
+        run_with(engine, budget, "CREATE TABLE lt (id int, v int)");
+        for sql in [
+            "UPDATE lt SET v = 1 FROM (SELECT v AS x) s",
+            "DELETE FROM lt USING (SELECT v AS x) s",
+        ] {
+            let position = sql.find("v AS").unwrap() + 1;
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, sql)),
+                [format!(
+                    "ERROR 42703 column \"v\" does not exist @{position} detail: There is a \
+                     column named \"v\" in table \"lt\", but it cannot be referenced from this \
+                     part of the query."
+                )],
+                "{sql}"
+            );
+        }
+    });
+}

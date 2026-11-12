@@ -337,7 +337,11 @@ and operators, failed constant input and non-boolean conditions, except a
 folded or quoted identifier in a statement that waited for typed inputs and a
 constant written inside a routine body. `INSERT INTO t (a[1], b) SELECT 1` reports PostgreSQL's
 `INSERT has more target columns than expressions` without its position; other
-target and expression count errors are positioned. An error raised while
+target and expression count errors are positioned. A FROM subquery that is
+not `LATERAL` and names another FROM item's column (`FROM ls, (SELECT w) s`)
+fails with `42703` without PostgreSQL's detail and `LATERAL` hint, and a
+source subquery's qualified reference to the `UPDATE` or `DELETE` target
+(`FROM (SELECT lt.v) s`) fails without a cursor position. An error raised while
 PostgreSQL inlines a SQL function's body
 (`SQL function "f" during inlining`) has no context line. Under
 `#variable_conflict use_variable` a variable that is also a column fails with

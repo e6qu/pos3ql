@@ -631,16 +631,18 @@ fn semi_join_exists(select: &Select<'_>, storage: &Storage, txid: u32) -> bool {
 /// subquery the planner keeps separate (aggregates, `GROUP BY`, `DISTINCT`,
 /// `LIMIT`/`OFFSET`, set operations, window or set-returning functions,
 /// volatile output expressions) keep the row the statement first read.
-enum LateralRecheck {
+enum LateralRecheck<'a> {
     Keep,
     Rerun,
+    /// A simple subquery with `FROM`, pulled up with its source rows.
+    RerunJoined(&'a Select<'a>),
 }
 
-fn lateral_recheck(
+fn lateral_recheck<'a>(
     storage: &Storage,
     txid: u32,
-    tref: &crate::sql::ast::TableRef<'_>,
-) -> Result<LateralRecheck, SqlError> {
+    tref: &crate::sql::ast::TableRef<'a>,
+) -> Result<LateralRecheck<'a>, SqlError> {
     let Some(select) = tref.subquery else {
         return Ok(LateralRecheck::Keep);
     };
@@ -670,12 +672,16 @@ fn lateral_recheck(
     }
     let rerun = lateral_recheck_select(storage, txid, select);
     if matches!(rerun, LateralRecheck::Rerun) && select.from.is_some() {
-        return Err(lateral_recheck_unsupported());
+        return Ok(LateralRecheck::RerunJoined(select));
     }
     Ok(rerun)
 }
 
-fn lateral_recheck_select(storage: &Storage, txid: u32, select: &Select<'_>) -> LateralRecheck {
+fn lateral_recheck_select<'a>(
+    storage: &Storage,
+    txid: u32,
+    select: &Select<'_>,
+) -> LateralRecheck<'a> {
     if select.distinct
         || !select.distinct_on.is_empty()
         || !select.group_by.is_empty()
@@ -762,7 +768,9 @@ fn expression_has_aggregate_use(expression: &Expr<'_>, storage: &Storage, txid: 
 }
 
 /// A pulled-up `LATERAL` subquery with `FROM` keeps the rows its tables
-/// first matched; pos3ql does not retain them for the recheck.
+/// first matched. pos3ql finds them again from the values the statement read,
+/// which a `UNION ALL` branch with `FROM` or several source rows producing
+/// the same values leave ambiguous.
 fn lateral_recheck_unsupported() -> SqlError {
     sql_err!(
         sqlstate::FEATURE_NOT_SUPPORTED,
@@ -905,6 +913,56 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                 };
                 match lateral_recheck(storage, txid, tref)? {
                     LateralRecheck::Keep => {}
+                    LateralRecheck::RerunJoined(select) => {
+                        if let Some(read_row) = read[table] {
+                            let BoundRow::Values(read_values) = read_row else {
+                                unreachable!("a read source is decoded");
+                            };
+                            let order = arena
+                                .alloc_slice_with(scope.n, |table| table)
+                                .map_err(|_| arena_full())?;
+                            let as_read_row = sources_row(scope, read, order, rowids);
+                            let as_read = Chained {
+                                inner: &as_read_row,
+                                outer: self.outer,
+                            };
+                            let left = sources_row(scope, bound, order, rowids);
+                            let latest = Chained {
+                                inner: &left,
+                                outer: self.outer,
+                            };
+                            match super::joined_from::recheck_lateral_select(
+                                storage,
+                                txid,
+                                select,
+                                arena,
+                                self.params,
+                                &as_read,
+                                &latest,
+                                read_values,
+                                self.hooks.sequences,
+                            )? {
+                                super::joined_from::LateralRowRecheck::Rerun(values) => {
+                                    bound[table] = Some(BoundRow::Values(values));
+                                }
+                                super::joined_from::LateralRowRecheck::Lost => {
+                                    bound[table] = None;
+                                    if table == 0
+                                        || matches!(
+                                            self.from.joins[table - 1].kind,
+                                            crate::sql::ast::JoinKind::Inner
+                                                | crate::sql::ast::JoinKind::Cross
+                                        )
+                                    {
+                                        return Ok(None);
+                                    }
+                                }
+                                super::joined_from::LateralRowRecheck::Ambiguous => {
+                                    return Err(lateral_recheck_unsupported());
+                                }
+                            }
+                        }
+                    }
                     LateralRecheck::Rerun => {
                         let order = arena
                             .alloc_slice_with(scope.n, |table| table)
@@ -1641,6 +1699,13 @@ fn observed_source_columns<'a>(
     order_exprs: &[Option<super::ResolvedSortKey<'a>>; MAX_PROJ],
     n_keys: usize,
 ) -> super::scan::PaxReadDemand {
+    // A pulled-up LATERAL subquery's recheck finds its source row again from
+    // every value it produced.
+    if scope.lateral[..scope.n].iter().any(|&lateral| lateral) {
+        return super::scan::PaxReadDemand::full_row(
+            super::scan::PaxFullRowReason::RetainedJoinRow,
+        );
+    }
     if statement
         .items
         .iter()

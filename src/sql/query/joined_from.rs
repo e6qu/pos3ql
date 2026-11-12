@@ -339,3 +339,195 @@ pub(crate) fn with_joined_from_row<'a, R>(
         outer: Some(target),
     })
 }
+
+/// The outcome of rechecking a pulled-up `LATERAL` subquery that reads tables.
+pub(super) enum LateralRowRecheck<'a> {
+    /// The subquery row's values for the latest outer row.
+    Rerun(&'a [Datum<'a>]),
+    /// Its conditions no longer hold for the latest outer row.
+    Lost,
+    /// Several of its source rows produced the row the statement read and
+    /// recheck differently, so the one PostgreSQL kept is unknown.
+    Ambiguous,
+}
+
+/// Rechecks a simple `LATERAL` subquery with `FROM` that PostgreSQL pulls up
+/// into the outer query: its source rows keep the versions first joined, its
+/// `WHERE` runs again with the latest outer row, and its output is
+/// projected again. The source row is the one whose output, for the outer
+/// row as read (`as_read`), equals the values the statement read (`read`).
+#[expect(clippy::too_many_arguments, reason = "locked row recheck inputs")]
+pub(super) fn recheck_lateral_select<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    select: &'a crate::sql::ast::Select<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    as_read: &dyn ColumnLookup<'a>,
+    latest: &dyn ColumnLookup<'a>,
+    read: &[Datum<'a>],
+    sequences: Option<&dyn SequenceAccess>,
+) -> Result<LateralRowRecheck<'a>, SqlError> {
+    let from = select.from.as_ref().ok_or_else(|| {
+        crate::sql_err!(
+            crate::sql::eval::sqlstate::INTERNAL_ERROR,
+            "a pulled-up LATERAL recheck has no FROM clause"
+        )
+    })?;
+    let mut found: Option<Option<&'a [u8]>> = None;
+    let mut ambiguous = false;
+    let mut values = [Datum::Null; crate::sql::exec::MAX_PROJ];
+    scan_from_matches(
+        storage,
+        from,
+        txid,
+        select.where_clause,
+        &[],
+        true,
+        arena,
+        params,
+        as_read,
+        sequences,
+        &mut |row, joined_as_read, hooks| {
+            let width = project_items(
+                select,
+                row,
+                joined_as_read,
+                arena,
+                params,
+                hooks,
+                &mut values,
+            )?;
+            if width != read.len() || values[..width] != *read {
+                return Ok(true);
+            }
+            let joined_latest = Chained {
+                inner: row,
+                outer: Some(latest),
+            };
+            let passes = match select.where_clause {
+                Some(predicate) => super::locked_row_where_passes(
+                    storage,
+                    txid,
+                    predicate,
+                    joined_as_read,
+                    &joined_latest,
+                    arena,
+                    params,
+                    hooks,
+                )?,
+                None => true,
+            };
+            let outcome = if passes {
+                let width = project_items(
+                    select,
+                    row,
+                    &joined_latest,
+                    arena,
+                    params,
+                    hooks,
+                    &mut values,
+                )?;
+                let len = crate::sql::exec::projected_row_len_by(width, |column| values[column])?;
+                let output = arena
+                    .alloc_persistent_slice_with(len, |_| 0u8)
+                    .map_err(|_| arena_full())?;
+                let len = crate::sql::exec::encode_projected_by_into(
+                    width,
+                    |column| values[column],
+                    output,
+                )?;
+                Some(&output[..len])
+            } else {
+                None
+            };
+            // Source rows that produced the same values qualify alike unless
+            // their rechecks differ.
+            match found {
+                None => found = Some(outcome),
+                Some(earlier) if earlier == outcome => {}
+                Some(_) => {
+                    ambiguous = true;
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        },
+    )?;
+    if ambiguous {
+        return Ok(LateralRowRecheck::Ambiguous);
+    }
+    match found {
+        None => Ok(LateralRowRecheck::Ambiguous),
+        Some(None) => Ok(LateralRowRecheck::Lost),
+        Some(Some(bytes)) => {
+            let width = crate::sql::exec::projected_row_width(bytes);
+            let values = arena
+                .alloc_slice_with(width, |_| Datum::Null)
+                .map_err(|_| arena_full())?;
+            crate::sql::exec::decode_projected_row_into(bytes, arena, values)?;
+            Ok(LateralRowRecheck::Rerun(values))
+        }
+    }
+}
+
+/// Evaluates `select`'s output list over one joined source row.
+fn project_items<'a>(
+    select: &'a crate::sql::ast::Select<'a>,
+    row: &JoinRow<'_, 'a, '_>,
+    lookup: &dyn ColumnLookup<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    out: &mut [Datum<'a>],
+) -> Result<usize, SqlError> {
+    use super::scope::ResolvedColumn;
+    let scope = row.scope;
+    let column = |entry: ResolvedColumn| -> Result<Datum<'a>, SqlError> {
+        match entry {
+            ResolvedColumn::Table(table, column) => Ok(row
+                .table_values(table)
+                .and_then(|values| values.get(column).copied())
+                .unwrap_or(Datum::Null)),
+            ResolvedColumn::Merged(merged) => lookup.lookup(None, scope.merged[merged].name),
+        }
+    };
+    let mut width = 0;
+    let mut push = |value: Datum<'a>| -> Result<(), SqlError> {
+        *out.get_mut(width).ok_or_else(|| {
+            crate::sql_err!(
+                crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "target lists can have at most {} entries",
+                crate::sql::exec::MAX_PROJ
+            )
+        })? = value;
+        width += 1;
+        Ok(())
+    };
+    for item in select.items {
+        match item {
+            crate::sql::ast::SelectItem::Expr { expression, .. } => {
+                push(crate::sql::eval::eval_full(
+                    expression, arena, params, &lookup, hooks,
+                )?)?;
+            }
+            crate::sql::ast::SelectItem::Wildcard => {
+                for index in 0..scope.star_columns() {
+                    push(column(scope.star_entry(index))?)?;
+                }
+            }
+            crate::sql::ast::SelectItem::TableWildcard(qualifier) => {
+                for index in 0..scope.qualified_star_columns(qualifier)? {
+                    push(column(scope.qualified_star_entry(qualifier, index)?)?)?;
+                }
+            }
+            crate::sql::ast::SelectItem::RecordStar(_) => {
+                return Err(crate::sql_err!(
+                    crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                    "a concurrently updated row locked with a LATERAL subquery that reads tables cannot be rechecked"
+                ));
+            }
+        }
+    }
+    Ok(width)
+}

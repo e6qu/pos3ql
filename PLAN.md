@@ -384,8 +384,10 @@ changes and nested `CALL`, but rejects DDL and other utility statements with
 table's or view's row type cannot
 appear in a routine signature: `CREATE FUNCTION f(orders)` fails with `0A000`
 where PostgreSQL accepts it. Under `READ COMMITTED`, a locked row's recheck
-fails with `0A000` for a simple `LATERAL` subquery that reads tables (PostgreSQL
-keeps the rows it first joined). `RETURNING`
+fails with `0A000` for a simple `LATERAL` subquery that reads tables when
+several of its source rows produced the values the statement read but
+recheck differently, or when it is a `UNION ALL` branch that reads tables
+(PostgreSQL keeps the rows it first joined). `RETURNING`
 of `UPDATE ... FROM` and `DELETE ... USING` cannot read the `FROM`/`USING`
 items (`42P01`). The
 [compatibility guide](docs/postgresql-18-compatibility.md) records the current

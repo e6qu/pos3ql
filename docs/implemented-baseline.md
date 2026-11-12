@@ -138,8 +138,13 @@ A `LATERAL` source follows the same plan rules: a simple subquery without
 function, a `VALUES` list of several rows and a subquery with aggregates,
 `GROUP BY`, `DISTINCT`, `LIMIT` or `OFFSET` keep the row first read; a `UNION
 ALL` of simple branches returns its first branch's row again. A simple
-`LATERAL` subquery that reads tables fails the recheck with `0A000`, because
-PostgreSQL keeps the rows it first joined and pos3ql does not retain them.
+`LATERAL` subquery that reads tables keeps the rows it first joined, as
+PostgreSQL does, and runs its `WHERE` and output list again with the latest
+row: `LATERAL (SELECT s.qty + i.qty AS y FROM stock s WHERE s.id = i.id)`
+returns the same stock row's quantity plus the item's new quantity. pos3ql
+finds those rows again from the values the subquery produced; when several of
+its rows produced the same values but recheck differently, or the subquery is
+a `UNION ALL` branch that reads tables, the recheck fails with `0A000`.
 
 A commit becomes visible all at once, and only after it is durable: new
 statements never see half of an order-and-invoice update. If commit waits for

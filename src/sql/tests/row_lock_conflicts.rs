@@ -843,14 +843,38 @@ fn read_committed_rechecks_run_lateral_sources_as_postgresql_plans_them() {
         assert!(error_sqlstates(&output).is_empty(), "{statement}");
         assert_eq!(data_rows(&output), expected, "{statement}");
     }
-    // A pulled-up subquery reading tables keeps rows pos3ql does not retain.
-    let output = after_concurrent_change(
-        &mut sessions,
-        "UPDATE items SET qty = qty + 1 WHERE id = 1",
-        "SELECT i.id, s.y FROM items i, LATERAL (SELECT stock.qty + i.qty AS y FROM stock \
-         WHERE stock.id = i.id) s WHERE i.id = 1 FOR UPDATE OF i",
-    );
-    assert_eq!(error_sqlstates(&output), ["0A000"]);
+    // A pulled-up subquery reading tables keeps the source rows it first
+    // joined: its conditions and output run again with the latest row.
+    for (statement, expected) in [
+        (
+            "SELECT i.id, s.y FROM items i, LATERAL (SELECT stock.qty + i.qty AS y FROM stock \
+             WHERE stock.id = i.id) s WHERE i.id = 1 FOR UPDATE OF i",
+            &["1|3"][..],
+        ),
+        (
+            "SELECT i.id, s.y FROM items i, LATERAL (SELECT stock.qty AS y FROM stock \
+             WHERE stock.qty >= i.qty) s ORDER BY i.id, s.y FOR UPDATE OF i",
+            &["1|2", "1|4", "2|2", "2|4", "3|4"],
+        ),
+        (
+            "SELECT i.id, s.qty FROM items i LEFT JOIN LATERAL (SELECT * FROM stock \
+             WHERE stock.qty > i.qty) s ON true WHERE i.id = 1 ORDER BY s.qty FOR UPDATE OF i",
+            &["1|NULL", "1|4"],
+        ),
+        (
+            "SELECT i.id, s.y FROM items i, LATERAL (SELECT 1 AS y FROM stock \
+             WHERE stock.id >= i.id) s WHERE i.id = 1 FOR UPDATE OF i",
+            &["1|1", "1|1", "1|1"],
+        ),
+    ] {
+        let output = after_concurrent_change(
+            &mut sessions,
+            "UPDATE items SET qty = qty + 1 WHERE id = 1",
+            statement,
+        );
+        assert!(error_sqlstates(&output).is_empty(), "{statement}");
+        assert_eq!(data_rows(&output), expected, "{statement}");
+    }
     sessions.finish();
 }
 

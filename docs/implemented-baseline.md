@@ -529,8 +529,14 @@ columns have that script's domains (`sql_identifier`, `cardinal_number`,
 types with their CHECK constraints.
 
 Every table, materialized view and view has a row type named like the relation,
-usable in casts, columns and routine signatures; the relation owns it, so
-dropping the relation reaches the routines and columns that use it.
+usable in casts, columns, attributes of `CREATE TYPE ... AS`, PL/pgSQL
+variables and routine signatures; the relation owns it, so dropping the
+relation reaches the routines, columns, composite attributes and domains that
+use it. **Example:** after `CREATE TYPE wrap AS (o orders, n int)`,
+`DROP TABLE orders CASCADE` drops attribute `o` and keeps `wrap`, and
+`ALTER TABLE orders ALTER COLUMN total TYPE float8` fails with `0A000` while a
+table column stores `wrap` values. In PL/pgSQL, `r.total := 5` assigns one
+field of a row variable.
 
 Column defaults, CHECK constraints and routine defaults are printed in
 PostgreSQL's analyzed form for the expression shapes listed in

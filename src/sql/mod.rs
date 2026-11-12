@@ -20088,8 +20088,10 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
                 command,
                 arena,
+                guc.seq_session(),
                 responder,
             ),
             Stmt::ImportForeignSchema(command) => exec::import_foreign_schema(
@@ -20397,10 +20399,12 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                &mut self.dml_scratch,
                 names,
                 *if_exists,
                 *cascade,
                 arena,
+                guc.seq_session(),
                 responder,
             ),
             Stmt::CreateSequence {

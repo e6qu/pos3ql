@@ -335,12 +335,13 @@ reports `42804` `cannot cast integer to timestamp` where PostgreSQL reports
 PL/pgSQL `CALL` in a trigger function fails with `0A000`, and a procedure
 called from PL/pgSQL that waits for storage or a lock runs again from its
 start when its statement resumes (finished effects replay from the statement
-journal) instead of resuming at a saved position inside the procedure. Relation row types: a composite
-attribute of one (`CREATE TYPE wrap AS (o orders)`) fails with `42704` and a
-PL/pgSQL variable of one with `0A000`; dropping a relation through `DROP
-SCHEMA`, `DROP MATERIALIZED VIEW`, `DROP FOREIGN TABLE ... CASCADE` or another
-object's cascade while another table's column or a domain uses its row type
-fails with `0A000`. `ALTER COLUMN ... TYPE` is refused for columns that a
+journal) instead of resuming at a saved position inside the procedure. A view
+dropped by the cascade of a function, sequence, collation, operator, text
+search object or type (`DROP FUNCTION f CASCADE` where view `v` calls `f`)
+fails with `0A000` while another table's column, a composite attribute or a
+domain uses the view's row type; PostgreSQL drops those users too. A
+subscripted field assignment in PL/pgSQL (`r.f[1] := x`) fails with `0A000`.
+`ALTER COLUMN ... TYPE` is refused for columns that a
 view, rule, trigger `WHEN` condition, policy or SQL-standard routine body
 reads (including a materialized view), but not yet for the target columns of
 a stored `INSERT` or `UPDATE`, whose `pg_depend` column rows are missing.

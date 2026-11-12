@@ -640,7 +640,8 @@ pub(super) fn groups_for_mask<'a>(
                 super::aggregate::HeldValues::default()
             })
             .map_err(|_| arena_full())?;
-        for (state, held) in states.iter().zip(held.iter_mut()) {
+        for (state, held) in states.iter_mut().zip(held.iter_mut()) {
+            state.keep_buffers_in(arena);
             state.hold(held, arena, arena)?;
         }
         let mut visit = |row: &JoinRow<'_, 'a, '_>| {

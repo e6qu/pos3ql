@@ -527,3 +527,64 @@ fn subquery_columns_are_described_with_their_declared_types() {
         assert_eq!(row_description_type_oids(&bytes), expected, "{sql}");
     }
 }
+
+/// Buffering aggregates (`DISTINCT`, aggregate `ORDER BY`, collecting,
+/// ordered-set and range aggregates) keep their buffers apart from each input
+/// row's evaluation scratch: 5000 to 20000 rows of 1 KiB scratch each fit
+/// the 2 MiB statement arena. Expected values were read from PostgreSQL 18.6
+/// (`initdb --locale=C`).
+#[test]
+fn buffering_aggregates_reclaim_row_scratch() {
+    let (mut e, mut b) = test_engine();
+    let mut t = TxnState::new(&mut b, 256).unwrap();
+    let rows_of = "generate_series(1, 20000) g";
+    let few = "generate_series(1, 5000) g";
+    for (sql, expected) in [
+        (
+            format!(
+                "SELECT length(string_agg(left(repeat('x', 1000) || g, 1), '')), \
+                 count(DISTINCT length(repeat('z', 1000) || g)), \
+                 sum(DISTINCT length(repeat('s', 1000) || g) % 10) FROM {rows_of}"
+            ),
+            vec!["20000|5|15"],
+        ),
+        (
+            format!(
+                "SELECT cardinality(array_agg(length(repeat('y', 1000) || g) ORDER BY g)), \
+                 length(jsonb_agg(length(repeat('j', 1000) || g) % 2)::text) \
+                 FROM {few}"
+            ),
+            vec!["5000|15000"],
+        ),
+        (
+            format!(
+                "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY length(repeat('w', 1000) || g)), \
+                 range_agg(int4range(length(repeat('r', 1000) || g), length(repeat('r', 1000) || g) + 1)) \
+                 FROM {few}"
+            ),
+            vec!["1004|{[1001,1005)}"],
+        ),
+        (
+            format!(
+                "SELECT g % 2, count(DISTINCT length(repeat('z', 1000) || g)), \
+                 cardinality(array_agg(DISTINCT length(repeat('y', 1000) || g) % 5)) \
+                 FROM {rows_of} GROUP BY 1 ORDER BY 1"
+            ),
+            vec!["0|5|5", "1|5|5"],
+        ),
+        (
+            "SELECT array_agg(DISTINCT x), json_agg(DISTINCT x) FROM (VALUES (2), (NULL), (1), (NULL), (2)) v(x)".to_owned(),
+            vec!["{1,2,NULL}|[1, 2, null]"],
+        ),
+        (
+            "SELECT jsonb_object_agg(k, v) FROM (VALUES ('b', 1), ('a', 2), ('b', 3), ('aa', 4)) t(k, v)".to_owned(),
+            vec![r#"{"a": 2, "b": 3, "aa": 4}"#],
+        ),
+        (
+            "SELECT xmlelement(name e, NULL, NULL), xmlelement(name e, xmlattributes(1 AS x), NULL)".to_owned(),
+            vec![r#"<e/>|<e x="1"/>"#],
+        ),
+    ] {
+        assert_eq!(rows(&mut e, &mut b, &mut t, &sql), expected, "{sql}");
+    }
+}

@@ -140,9 +140,10 @@ is owned.
     insertion order, and counts a larger table's rows first. A grouped query
     reclaims each input row's subquery values and scratch once its
     aggregates fold them, keeping a running text, numeric or other
-    variable-width value in one reused slot; `DISTINCT`, ordered, collecting
-    (`array_agg`, `string_agg`, JSON), range and user-defined aggregates
-    still keep every row's evaluation scratch until the statement ends.
+    variable-width value in one reused slot, and buffering aggregates
+    (`DISTINCT`, ordered, collecting, ordered-set) keeping their buffered
+    values in the arena's persistent tail; user-defined aggregates still keep
+    every row's evaluation scratch until the statement ends.
     Rewinding a
     retained child tree per outer row removes the analysis,
     set operations other than `UNION ALL` (and `UNION ALL` under

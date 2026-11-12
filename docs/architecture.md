@@ -345,12 +345,14 @@ pushing a restriction into one) copies the nodes around substituted columns
 but never an uncorrelated subquery's own `SELECT`; a sublink written twice
 (a `BETWEEN` operand is compared twice) keeps a slot per copy, as PostgreSQL
 plans one subquery per copy. Every way a nested query
-prepares its subqueries consults the slots carried by its outer row lookup. A grouped query whose aggregates keep only
-running values (`count`, `sum`, `avg`, `min`, `max`, the boolean, bitwise and
-statistical aggregates, without `DISTINCT` or `ORDER BY`) copies a
-variable-width running value such as a text maximum or numeric sum into a
-reused slot after each row (`HeldValues` in `src/sql/query/aggregate.rs`), so
-the scan reclaims the row's scratch; a derived table kept in local mode
+prepares its subqueries consults the slots carried by its outer row lookup.
+A grouped query of builtin aggregates copies a variable-width running value
+such as a text maximum, numeric sum or range union into a reused slot after
+each row (`HeldValues` in `src/sql/query/aggregate.rs`), and a buffering
+aggregate (`DISTINCT`, an aggregate `ORDER BY`, `array_agg`, `string_agg`,
+the JSON and XML aggregates, ordered-set aggregates) copies each buffered
+value into the arena's persistent tail (`AggState::keep_buffers_in`), so the
+scan reclaims the row's scratch; a derived table kept in local mode
 stores only its encoded rows.
 
 Every other shape runs in the general executor, which materializes in the

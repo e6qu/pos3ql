@@ -266,6 +266,10 @@ pub(crate) struct AggState<'a> {
     ord: *mut &'a [u8],
     ord_len: usize,
     ord_cap: usize,
+    /// When set, the buffers above and the values they hold live in this
+    /// arena's persistent tail, so a scan may reclaim each input row's
+    /// allocations once the row is folded in.
+    keep: Option<&'a Arena>,
 }
 
 // Built-in groups must not reserve maximum-width custom routine state.
@@ -826,6 +830,7 @@ impl Default for AggState<'_> {
             ord: core::ptr::null_mut(),
             ord_len: 0,
             ord_cap: 0,
+            keep: None,
         }
     }
 }
@@ -929,6 +934,38 @@ fn percentile_value<'a>(
 }
 
 impl<'a> AggState<'a> {
+    /// Keeps this state's buffers and buffered values in `keep`'s persistent
+    /// tail from now on (see [`Self::holds_values_only`]).
+    pub(crate) fn keep_buffers_in(&mut self, keep: &'a Arena) {
+        self.keep = Some(keep);
+    }
+
+    /// A buffer of `len` items: in the persistent tail when the state keeps
+    /// its buffers there, otherwise in `arena`.
+    fn alloc_buffer<T: Copy>(
+        &self,
+        arena: &'a Arena,
+        len: usize,
+        fill: impl FnMut(usize) -> T,
+    ) -> Result<&'a mut [T], SqlError> {
+        match self.keep {
+            Some(keep) => keep.alloc_persistent_slice_with(len, fill),
+            None => arena.alloc_slice_with(len, fill),
+        }
+        .map_err(|_| arena_full())
+    }
+
+    /// `bytes`, copied to the persistent tail when the state keeps its
+    /// buffers there.
+    fn kept_bytes(&self, bytes: &'a [u8]) -> Result<&'a [u8], SqlError> {
+        match self.keep {
+            Some(keep) => Ok(&*keep
+                .alloc_persistent_slice_with(bytes.len(), |index| bytes[index])
+                .map_err(|_| arena_full())?),
+            None => Ok(bytes),
+        }
+    }
+
     fn init_order_collations(&mut self, len: usize, arena: &'a Arena) -> Result<(), SqlError> {
         debug_assert!(self.ord_collations.is_null());
         let collations = arena
@@ -1160,20 +1197,29 @@ impl<'a> AggState<'a> {
     }
 
     /// Whether this state's running values are plain data plus at most the
-    /// values [`HeldValues`] keeps: no buffer that grows with each row. A
+    /// values [`HeldValues`] keeps, once buffering states (`DISTINCT`, an
+    /// aggregate `ORDER BY`, collecting and ordered-set aggregates) keep their
+    /// buffers in the persistent tail ([`Self::keep_buffers_in`]). A
     /// recycling scan may then reclaim each input row's allocations once
-    /// [`Self::hold`] has copied those values out.
+    /// [`Self::hold`] has copied the running values out.
     pub(crate) fn holds_values_only(&self, node: &Expr<'_>) -> bool {
-        let Expr::Call { order_by, .. } = node else {
+        if !matches!(node, Expr::Call { .. }) {
             return false;
-        };
+        }
         self.custom.is_none()
-            && !self.distinct
-            && !self.ordered
-            && order_by.is_empty()
             && (matches!(
                 self.kind,
-                AggKind::Count
+                AggKind::RangeAgg
+                    | AggKind::RangeIntersectAgg
+                    | AggKind::StringAgg
+                    | AggKind::ArrayAgg
+                    | AggKind::XmlAgg
+                    | AggKind::JsonAgg { .. }
+                    | AggKind::JsonObjectAgg { .. }
+                    | AggKind::PercentileCont
+                    | AggKind::PercentileDisc
+                    | AggKind::Mode
+                    | AggKind::Count
                     | AggKind::Sum
                     | AggKind::Avg
                     | AggKind::Min
@@ -2792,7 +2838,7 @@ impl<'a> AggState<'a> {
         };
         // Stash the first delimiter so the DISTINCT/ORDER BY fold can reuse it.
         if self.sep.is_none() {
-            self.sep = Some(sep_bytes);
+            self.sep = Some(self.kept_bytes(sep_bytes)?);
         }
         if self.ordered {
             // Keep each row's delimiter with its value: PostgreSQL applies the
@@ -2848,9 +2894,7 @@ impl<'a> AggState<'a> {
                 self.ord_cap * 2
             };
             let empty: &[u8] = &[];
-            let fresh = arena
-                .alloc_slice_with(new_cap, |_| empty)
-                .map_err(|_| arena_full())?;
+            let fresh = self.alloc_buffer(arena, new_cap, |_| empty)?;
             if self.ord_len > 0 {
                 let old = unsafe { core::slice::from_raw_parts(self.ord, self.ord_len) };
                 fresh[..self.ord_len].copy_from_slice(old);
@@ -2858,6 +2902,7 @@ impl<'a> AggState<'a> {
             self.ord = fresh.as_mut_ptr();
             self.ord_cap = new_cap;
         }
+        let enc = self.kept_bytes(enc)?;
         unsafe { self.ord.add(self.ord_len).write(enc) };
         self.ord_len += 1;
         Ok(())
@@ -2891,9 +2936,7 @@ impl<'a> AggState<'a> {
             while new_cap < need {
                 new_cap *= 2;
             }
-            let fresh = arena
-                .alloc_slice_with(new_cap, |_| 0u8)
-                .map_err(|_| arena_full())?;
+            let fresh = self.alloc_buffer(arena, new_cap, |_| 0u8)?;
             if self.str_len > 0 {
                 let old = unsafe { core::slice::from_raw_parts(self.str_buf, self.str_len) };
                 fresh[..self.str_len].copy_from_slice(old);
@@ -3052,9 +3095,7 @@ impl<'a> AggState<'a> {
             } else {
                 self.vals_cap * 2
             };
-            let fresh = arena
-                .alloc_slice_with(new_cap, |_| Datum::Null)
-                .map_err(|_| arena_full())?;
+            let fresh = self.alloc_buffer(arena, new_cap, |_| Datum::Null)?;
             if self.vals_len > 0 {
                 let old = unsafe { core::slice::from_raw_parts(self.vals, self.vals_len) };
                 fresh[..self.vals_len].copy_from_slice(old);
@@ -3062,6 +3103,14 @@ impl<'a> AggState<'a> {
             self.vals = fresh.as_mut_ptr();
             self.vals_cap = new_cap;
         }
+        // A kept value is re-read from its own encoded copy, which borrows
+        // nothing from the row being folded.
+        let v = if self.keep.is_some() {
+            let encoded = self.kept_bytes(crate::sql::exec::encode_projected_pub(&[v], arena)?)?;
+            crate::sql::exec::decode_projected_pub(encoded, 0)
+        } else {
+            v
+        };
         unsafe { self.vals.add(self.vals_len).write(v) };
         self.vals_len += 1;
         Ok(())
@@ -3079,16 +3128,16 @@ impl<'a> AggState<'a> {
             return Ok(());
         }
         let vals = unsafe { core::slice::from_raw_parts_mut(self.vals, self.vals_len) };
+        let collation = self.collation;
+        let compare = |a: &Datum<'a>, b: &Datum<'a>| compare_distinct(collation, catalog, a, b);
         let mut cmp_err: Option<SqlError> = None;
-        vals.sort_unstable_by(|a, b| {
-            match compare_datums_with_catalog(self.collation, catalog, a, b) {
-                Ok(o) => o,
-                Err(e) => {
-                    if cmp_err.is_none() {
-                        cmp_err = Some(e);
-                    }
-                    core::cmp::Ordering::Equal
+        vals.sort_unstable_by(|a, b| match compare(a, b) {
+            Ok(o) => o,
+            Err(e) => {
+                if cmp_err.is_none() {
+                    cmp_err = Some(e);
                 }
+                core::cmp::Ordering::Equal
             }
         });
         if let Some(e) = cmp_err {
@@ -3098,7 +3147,7 @@ impl<'a> AggState<'a> {
         for &v in vals.iter() {
             let fresh = match prev {
                 None => true,
-                Some(p) => !compare_datums_with_catalog(self.collation, catalog, &p, &v)?.is_eq(),
+                Some(p) => !compare(&p, &v)?.is_eq(),
             };
             if fresh {
                 self.count += 1;
@@ -3669,6 +3718,16 @@ impl<'a> AggState<'a> {
         let text = arena
             .alloc_str_display(JsonObjectAggregateDisplay { rows, jsonb })
             .map_err(|_| arena_full())?;
+        // A jsonb object sorts its keys and keeps the last value of a
+        // repeated key, as jsonb input does.
+        let text = if jsonb {
+            let tree = crate::sql::json::parse(text, arena)?;
+            arena
+                .alloc_str_display(crate::sql::json::JsonWrite(&tree))
+                .map_err(|_| arena_full())?
+        } else {
+            text
+        };
         Ok(Datum::Json { text, jsonb })
     }
 
@@ -3716,10 +3775,8 @@ impl<'a> AggState<'a> {
             }
             let vals = unsafe { core::slice::from_raw_parts_mut(self.vals, self.vals_len) };
             let mut cmp_err: Option<SqlError> = None;
-            crate::mem::arena::stable_sort_via(
-                arena,
-                vals,
-                |a, b| match compare_datums_with_catalog(self.collation, catalog, a, b) {
+            crate::mem::arena::stable_sort_via(arena, vals, |a, b| {
+                match compare_distinct(self.collation, catalog, a, b) {
                     Ok(o) => o,
                     Err(e) => {
                         if cmp_err.is_none() {
@@ -3727,8 +3784,8 @@ impl<'a> AggState<'a> {
                         }
                         core::cmp::Ordering::Equal
                     }
-                },
-            )
+                }
+            })
             .map_err(|_| arena_full())?;
             if let Some(e) = cmp_err {
                 return Err(e);
@@ -3736,13 +3793,7 @@ impl<'a> AggState<'a> {
             let mut unique = 0usize;
             for i in 0..vals.len() {
                 let same = i > 0
-                    && compare_datums_with_catalog(
-                        self.collation,
-                        catalog,
-                        &vals[i],
-                        &vals[i - 1],
-                    )?
-                    .is_eq();
+                    && compare_distinct(self.collation, catalog, &vals[i], &vals[i - 1])?.is_eq();
                 if !same {
                     vals[unique] = vals[i];
                     unique += 1;
@@ -3755,6 +3806,23 @@ impl<'a> AggState<'a> {
             }
             Ok(unsafe { core::slice::from_raw_parts(self.vals, self.vals_len) })
         }
+    }
+}
+
+/// Orders an aggregate's `DISTINCT` values. NULLs, which `array_agg` and
+/// `json_agg` keep, are one value that sorts last, as PostgreSQL's sort
+/// places them.
+fn compare_distinct(
+    collation: Collation,
+    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    a: &Datum<'_>,
+    b: &Datum<'_>,
+) -> Result<core::cmp::Ordering, SqlError> {
+    match (a.is_null(), b.is_null()) {
+        (true, true) => Ok(core::cmp::Ordering::Equal),
+        (true, false) => Ok(core::cmp::Ordering::Greater),
+        (false, true) => Ok(core::cmp::Ordering::Less),
+        (false, false) => compare_datums_with_catalog(collation, catalog, a, b),
     }
 }
 

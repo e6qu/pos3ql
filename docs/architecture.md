@@ -333,11 +333,17 @@ row-source executor runs it, its result type, collations and aggregate calls
 once per statement, before any outer row, and copies the bound aggregate
 states for each outer row (`bind_correlated_subqueries` in
 `src/sql/query/subquery.rs`). An uncorrelated subquery nested in a
-correlated one, at any depth, takes a slot the outermost statement reserves
-before its scan (`InitPlans::nested`), so it runs once for the statement as
+correlated one or a `LATERAL` FROM subquery, at any depth and in set
+operation branches, takes a slot the outermost statement reserves before its
+scan (`InitPlans::nested`), so it runs once for the statement as
 PostgreSQL's initPlan does: `SELECT (SELECT x + (SELECT nextval('s')) FROM z
 WHERE x <= t.id) FROM t` reads one sequence value, and 100000 outer rows do
-not each keep a copy of its value. A grouped query whose aggregates keep only
+not each keep a copy of its value. A slot is keyed by the sublink's kind and
+its `SELECT` (`Sublink` in `src/sql/eval/mod.rs`), not by the expression
+node, because rewriting a query for an outer row (merging a FROM subquery,
+pushing a restriction into one) copies the nodes around substituted columns
+but never an uncorrelated subquery's own `SELECT`. Every way a nested query
+prepares its subqueries consults the slots carried by its outer row lookup. A grouped query whose aggregates keep only
 running values (`count`, `sum`, `avg`, `min`, `max`, the boolean, bitwise and
 statistical aggregates, without `DISTINCT` or `ORDER BY`) copies a
 variable-width running value such as a text maximum or numeric sum into a

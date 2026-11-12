@@ -434,3 +434,92 @@ fn held_aggregate_values_and_derived_tables_reclaim_row_scratch() {
         assert_eq!(rows(&mut e, &mut b, &mut t, &sql), expected, "{sql}");
     }
 }
+
+/// An uncorrelated subquery keeps its statement slot when the query around it
+/// is rewritten for each outer row (an `IN` operand over a merged FROM
+/// subquery), sits in a set-operation branch, a `LATERAL` FROM subquery or a
+/// row-valued `IN`, so it runs once and 20000 outer rows share one value.
+/// Scalar subquery columns are described with their declared type. Expected
+/// values were read from PostgreSQL 18.6 (`initdb --locale=C`).
+#[test]
+fn rewritten_and_lateral_nested_subqueries_share_their_slot() {
+    let (mut e, mut b) = test_engine();
+    let mut t = TxnState::new(&mut b, 256).unwrap();
+    for sql in [
+        "CREATE TABLE rw_big (id int)",
+        "CREATE TABLE rw_z (x int)",
+        "CREATE SEQUENCE rw_s",
+        "INSERT INTO rw_big SELECT g FROM generate_series(1, 100) g",
+        "INSERT INTO rw_z VALUES (1), (2)",
+    ] {
+        run_txn(&mut e, &mut b, &mut t, sql);
+    }
+    for (sql, expected) in [
+        (
+            "SELECT sum((SELECT count(*) FROM (SELECT x FROM rw_z) d WHERE d.x <= rw_big.id \
+             AND d.x IN (SELECT max(x) FROM rw_z))) FROM rw_big, generate_series(1, 200) g",
+            vec!["19800"],
+        ),
+        (
+            "SELECT id, (SELECT count(*) FROM (SELECT x FROM rw_z) d WHERE d.x <= rw_big.id \
+             AND d.x IN (SELECT nextval('rw_s') + 1)) FROM rw_big WHERE id <= 3 ORDER BY id",
+            vec!["1|0", "2|1", "3|1"],
+        ),
+        (
+            "SELECT id, (SELECT x FROM rw_z WHERE x <= rw_big.id UNION \
+             SELECT (SELECT nextval('rw_s'))::int ORDER BY 1 DESC LIMIT 1) \
+             FROM rw_big WHERE id <= 3 ORDER BY id",
+            vec!["1|2", "2|2", "3|2"],
+        ),
+        (
+            "SELECT id, l.m FROM rw_big, LATERAL (SELECT max(x) + (SELECT nextval('rw_s')) m \
+             FROM rw_z WHERE x <= rw_big.id) l WHERE id <= 3 ORDER BY id",
+            vec!["1|4", "2|5", "3|5"],
+        ),
+        (
+            "SELECT id, (SELECT max(x) FROM rw_z WHERE (x, 4) IN \
+             (SELECT rw_big.id, (SELECT nextval('rw_s'))::int)) \
+             FROM rw_big WHERE id <= 3 ORDER BY id",
+            vec!["1|1", "2|2", "3|NULL"],
+        ),
+        ("SELECT last_value FROM rw_s", vec!["4"]),
+    ] {
+        assert_eq!(rows(&mut e, &mut b, &mut t, sql), expected, "{sql}");
+    }
+}
+
+/// A scalar or `ARRAY` subquery column is described with its declared type,
+/// however its value is computed. Type OIDs were read from PostgreSQL 18.6.
+#[test]
+fn subquery_columns_are_described_with_their_declared_types() {
+    let (mut e, mut b) = test_engine();
+    let mut t = TxnState::new(&mut b, 256).unwrap();
+    for sql in [
+        "CREATE TABLE sd_t (id int)",
+        "CREATE TABLE sd_z (x int)",
+        "INSERT INTO sd_t VALUES (1), (2)",
+        "INSERT INTO sd_z VALUES (1), (2)",
+    ] {
+        run_txn(&mut e, &mut b, &mut t, sql);
+    }
+    for (sql, expected) in [
+        ("SELECT (SELECT 1.5 FROM sd_z LIMIT 1)", vec![1700]),
+        ("SELECT (SELECT max(x::numeric) FROM sd_z)", vec![1700]),
+        ("SELECT (SELECT avg(x) FROM sd_z WHERE x > 10)", vec![1700]),
+        (
+            "SELECT id, (SELECT sum(x::bigint) FROM sd_z WHERE x <= t.id) FROM sd_t t",
+            vec![23, 1700],
+        ),
+        (
+            "SELECT ARRAY(SELECT x::numeric FROM sd_z WHERE x <= t.id) FROM sd_t t",
+            vec![1231],
+        ),
+        (
+            "SELECT (SELECT string_agg(x::text, ',') FROM sd_z WHERE x <= t.id) FROM sd_t t",
+            vec![25],
+        ),
+    ] {
+        let bytes = run_txn_bytes(&mut e, &mut b, &mut t, sql);
+        assert_eq!(row_description_type_oids(&bytes), expected, "{sql}");
+    }
+}

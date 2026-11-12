@@ -844,7 +844,7 @@ pub(crate) use subquery::{
 };
 use subquery::{
     correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, lazy_subqueries,
-    merge_correlated, prepare_outer_subqueries, subquery_witness,
+    merge_correlated, prepare_outer_subqueries,
 };
 pub(crate) use subquery::{expression_has_correlated_subquery, subquery_hooks_outer};
 pub use subquery::{prepare_subqueries, subquery_hooks};
@@ -7249,19 +7249,11 @@ pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
     Ok(Some((ptrs, values)))
 }
 
-fn array_subquery_column_type(witness: Datum) -> Option<ColType> {
-    match super::exec::coltype_of_oid(witness.type_oid())? {
-        ColType::Array(element) => Some(ColType::Array(element)),
-        scalar => super::types::ArrElem::from_coltype(scalar).map(ColType::Array),
-    }
-}
-
-/// Values established before RowDescription refine otherwise unknown columns.
-#[allow(clippy::too_many_arguments, reason = "query pipeline plumbing")]
-fn patch_subquery_column_types<'a>(
+/// A bare parameter whose type the description left as text takes its
+/// bound value's type.
+fn patch_param_column_types<'a>(
     items: &'a [SelectItem<'a>],
     scope: Option<&QueryScope<'a>>,
-    subs: &SubqueryValues,
     params: &[Datum],
     storage: &'a Storage,
     txid: u32,
@@ -7281,60 +7273,6 @@ fn patch_subquery_column_types<'a>(
                 slot += record_star_width(base, scope, storage, txid, arena)?;
             }
             SelectItem::Expr { expression, .. } => {
-                if slot < columns.len()
-                    && matches!(**expression, Expr::Subquery(_) | Expr::ArraySubquery(_))
-                {
-                    let node: *const Expr = *expression;
-                    match subs
-                        .scalars
-                        .iter()
-                        .find(|(p, _, _)| core::ptr::eq(*p, node))
-                    {
-                        Some((_, v, w)) => {
-                            let typed = if v.is_null() { w } else { v };
-                            let ct = if matches!(**expression, Expr::ArraySubquery(_)) {
-                                array_subquery_column_type(*typed)
-                            } else {
-                                super::exec::coltype_of_oid(typed.type_oid())
-                            };
-                            if !typed.is_null()
-                                && let Some(ct) = ct
-                            {
-                                columns[slot] = ColDesc::of_type(columns[slot].name, ct);
-                            }
-                        }
-                        // A correlated subquery has no pre-evaluated value;
-                        // infer its column type from the inner select's item.
-                        None => {
-                            if let Expr::Subquery(sub) | Expr::ArraySubquery(sub) = &**expression
-                                && let Some(SelectItem::Expr {
-                                    expression: inner, ..
-                                }) = sub.items.first()
-                                && let Some(from) = sub.from
-                                && let Ok(inner_scope) =
-                                    QueryScope::resolve_schema(storage, &from, txid, arena, None)
-                                && let Ok(witness) = subquery_witness(
-                                    storage,
-                                    txid,
-                                    inner,
-                                    Some(&inner_scope),
-                                    arena,
-                                )
-                            {
-                                let ct = if matches!(**expression, Expr::ArraySubquery(_)) {
-                                    array_subquery_column_type(witness)
-                                } else {
-                                    super::exec::coltype_of_oid(witness.type_oid())
-                                };
-                                if !witness.is_null()
-                                    && let Some(ct) = ct
-                                {
-                                    columns[slot] = ColDesc::of_type(columns[slot].name, ct);
-                                }
-                            }
-                        }
-                    }
-                }
                 if slot < columns.len()
                     && let Expr::Param(n) = **expression
                     && let Some(v) = params.get(n as usize - 1)
@@ -10128,10 +10066,9 @@ pub(crate) fn select_query_resumable<'a>(
     ) {
         return sql_fail(e);
     }
-    if let Err(error) = patch_subquery_column_types(
+    if let Err(error) = patch_param_column_types(
         statement.items,
         Some(&scope),
-        &outer_subs.base,
         params,
         storage,
         txid,
@@ -10729,6 +10666,7 @@ pub(crate) fn constant_select_resumable<'a>(
         storage,
         txid,
         None,
+        None,
         arena,
     ) {
         Ok(s) => s,
@@ -10744,10 +10682,9 @@ pub(crate) fn constant_select_resumable<'a>(
     ) {
         return sql_fail(e);
     }
-    if let Err(error) = patch_subquery_column_types(
+    if let Err(error) = patch_param_column_types(
         statement.items,
         None,
-        &subs,
         params,
         storage,
         txid,
@@ -11528,6 +11465,7 @@ fn select_into_rows_mode<'a>(
                 storage,
                 txid,
                 None,
+                outer,
                 arena,
             )?;
             let fromless_queries = ProceduralSubqueries { storage, txid };
@@ -11731,6 +11669,7 @@ fn select_into_rows_mode<'a>(
             storage,
             txid,
             None,
+            outer,
             arena,
         )?;
         let fromless_queries = ProceduralSubqueries { storage, txid };

@@ -5915,12 +5915,9 @@ fn reads_no_query_column(
                     .lists
                     .iter()
                     .any(|list| core::ptr::eq(list.node.cast::<()>(), address))
-                || subs.initplans.is_some_and(|plans| {
-                    plans
-                        .plans
-                        .iter()
-                        .any(|plan| core::ptr::eq(plan.node.cast::<()>(), address))
-                })
+                || subs
+                    .initplans
+                    .is_some_and(|plans| plans.plans.iter().any(|plan| plan.sublink.is(node)))
         })
     };
     match expression {
@@ -7278,6 +7275,19 @@ fn scan_source_mode<'a>(
                 inner: &outer_row,
                 outer,
             };
+            // The item's uncorrelated subqueries run once for the statement.
+            let scope_with_plans;
+            let lateral_outer: &dyn ColumnLookup<'a> =
+                match hooks.subs.and_then(|subs| subs.initplans) {
+                    Some(plans) if chained.statement_initplans().is_none() => {
+                        scope_with_plans = crate::sql::eval::InitPlanScope {
+                            row: &chained,
+                            nested: plans.nested,
+                        };
+                        &scope_with_plans
+                    }
+                    _ => &chained,
+                };
             match materialize_lateral_source(
                 storage,
                 txid,
@@ -7285,7 +7295,7 @@ fn scan_source_mode<'a>(
                 scope.defs.get(t).expect("resolved").n_columns,
                 arena,
                 params,
-                &chained,
+                &lateral_outer,
                 hooks,
             )? {
                 LateralRows::External(run) => {

@@ -10,8 +10,9 @@
 use crate::mem::arena::{Arena, ArenaList};
 use crate::sql::ast::{BinaryOp, Collation, Expr, Select, SelectItem, SetTree};
 use crate::sql::eval::{
-    ColumnLookup, EvalHooks, InitPlan, InitPlanOutput, InitPlanRunner, InitPlanScope, InitPlans,
-    SqlError, SubqueryList, SubqueryListProbe, SubqueryValues, eval_full, sqlstate,
+    ColumnLookup, EvalHooks, InitPlan, InitPlanOutput, InitPlanRead, InitPlanRunner, InitPlanScope,
+    InitPlans, SqlError, Sublink, SubqueryList, SubqueryListProbe, SubqueryValues, eval_full,
+    sqlstate,
 };
 use crate::sql::types::{ColType, Datum, RecordField};
 use crate::sql_err;
@@ -1413,8 +1414,11 @@ fn set_leaf<'a>(tree: &'a SetTree<'a>) -> &'a Select<'a> {
     }
 }
 
-/// Pre-evaluates every (uncorrelated) subquery in the statement and stores
-/// the results in the arena for hook-based lookup during evaluation.
+/// Evaluates the subqueries of `exprs` into arena values for hook-based
+/// lookup during evaluation. In a query run for an outer row, the
+/// subqueries the enclosing statement keeps slots for
+/// ([`InitPlans::nested`]) instead run when an expression first reads them,
+/// once for the statement.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_subqueries<'a>(
     exprs: &[Option<&'a Expr<'a>>],
@@ -1430,44 +1434,22 @@ pub fn prepare_subqueries<'a>(
     for expression in exprs.iter().flatten() {
         collect_subqueries(expression, &mut nodes)?;
     }
-    eval_subquery_nodes(
-        nodes.as_slice(),
-        storage,
-        txid,
-        arena,
-        params,
-        depth,
-        outer,
-        sequences,
-    )
-}
-
-/// [`prepare_subqueries`] for a query run for an outer row. The subqueries
-/// the enclosing statement keeps slots for ([`InitPlans::nested`]) run when
-/// an expression first reads them, once for the statement; the others run
-/// now.
-#[allow(clippy::too_many_arguments)]
-fn prepare_row_subqueries<'a>(
-    exprs: &[Option<&'a Expr<'a>>],
-    storage: &'a Storage,
-    txid: u32,
-    arena: &'a Arena,
-    params: &[Datum<'a>],
-    depth: u32,
-    outer: Option<&dyn ColumnLookup<'a>>,
-    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-) -> Result<SubqueryValues<'a, 'a>, SqlError> {
     let Some(nested) = outer.and_then(|outer| outer.statement_initplans()) else {
-        return prepare_subqueries(exprs, storage, txid, arena, params, depth, outer, sequences);
+        return eval_subquery_nodes(
+            nodes.as_slice(),
+            storage,
+            txid,
+            arena,
+            params,
+            depth,
+            outer,
+            sequences,
+        );
     };
-    let mut nodes = ArenaList::new(arena);
-    for expression in exprs.iter().flatten() {
-        collect_subqueries(expression, &mut nodes)?;
-    }
     let mut now = ArenaList::new(arena);
     let mut kept = ArenaList::new(arena);
     for &node in nodes.as_slice() {
-        match nested.iter().find(|plan| core::ptr::eq(plan.node, node)) {
+        match nested.iter().find(|plan| plan.sublink.is(node)) {
             Some(plan) => kept.push(*plan).map_err(|_| arena_full())?,
             None => now.push(node).map_err(|_| arena_full())?,
         }
@@ -1482,16 +1464,8 @@ fn prepare_row_subqueries<'a>(
         outer,
         sequences,
     )?;
-    let runner: &'a UncorrelatedSubqueries = arena
-        .alloc(UncorrelatedSubqueries {
-            storage,
-            txid,
-            command: None,
-        })
-        .map_err(|_| arena_full())?;
     values.initplans = Some(InitPlans {
         plans: kept.as_slice(),
-        runner,
         nested,
     });
     Ok(values)
@@ -1529,7 +1503,28 @@ pub(super) fn eval_subquery_nodes<'a>(
         .alloc_slice_with(n_list_nodes, |_| empty_subquery_list())
         .map_err(|_| arena_full())?;
     let (mut n_scalars, mut n_lists) = (0, 0);
+    // A subquery the enclosing statement keeps a slot for runs once for the
+    // statement, however many outer rows run the query around it.
+    let slots = outer
+        .and_then(|outer| outer.statement_initplans())
+        .unwrap_or(&[]);
     for node in nodes {
+        if let Some(plan) = slots.iter().find(|plan| plan.sublink.is(node)) {
+            match plan
+                .value(node, arena, params, sequences)?
+                .read(*node, arena)?
+            {
+                InitPlanRead::Scalar(value, witness) => {
+                    scalars[n_scalars] = (*node as *const _, value, witness);
+                    n_scalars += 1;
+                }
+                InitPlanRead::List(list) => {
+                    lists[n_lists] = list;
+                    n_lists += 1;
+                }
+            }
+            continue;
+        }
         match node {
             Expr::RowSubquery { select, arity } => {
                 let (values, _, witness) = run_row_subquery(
@@ -1727,7 +1722,7 @@ fn subquery_exists<'a>(
     if let Some(from) = &select.from {
         collect_table_sample_expressions(from, &mut item_exprs[1..]);
     }
-    let inner_subs = prepare_row_subqueries(
+    let inner_subs = prepare_subqueries(
         item_exprs,
         storage,
         txid,
@@ -2372,13 +2367,25 @@ pub(super) fn prepare_outer_subqueries<'a>(
             plans.push(node).map_err(|_| arena_full())?;
         }
     }
+    let runner = UncorrelatedSubqueries::runner(storage, txid, None, arena)?;
+    // A LATERAL subquery runs for each row of the items to its left.
+    let mut lateral = ArenaList::new(arena);
+    if let Some(from) = from {
+        for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
+            if let Some(select) = table.subquery.filter(|_| table.lateral) {
+                lateral.push(select).map_err(|_| arena_full())?;
+            }
+        }
+    }
     let nested = match row_types.statement_initplans() {
         Some(nested) => Some(nested),
-        None if corr.is_empty() && join_corr.is_empty() => None,
+        None if corr.is_empty() && join_corr.is_empty() && lateral.is_empty() => None,
         None => Some(nested_initplans(
             corr.as_slice().iter().chain(join_corr.as_slice()),
+            lateral.as_slice(),
             storage,
             txid,
+            runner,
             arena,
         )?),
     };
@@ -2388,8 +2395,7 @@ pub(super) fn prepare_outer_subqueries<'a>(
         initplans: None,
         bindings: &[],
     };
-    base.initplans =
-        UncorrelatedSubqueries::plans(plans.as_slice(), nested, storage, txid, None, arena)?;
+    base.initplans = UncorrelatedSubqueries::plans(plans.as_slice(), nested, runner, arena)?;
     base.bindings = bind_correlated_subqueries(corr.as_slice(), storage, txid, arena, row_types)?;
     Ok(OuterSubs {
         base,
@@ -2409,6 +2415,23 @@ pub(super) struct UncorrelatedSubqueries {
 }
 
 impl UncorrelatedSubqueries {
+    /// A runner for the uncorrelated subqueries of a statement over `txid`
+    /// that do not see `command`'s own writes.
+    pub(super) fn runner<'a>(
+        storage: &Storage,
+        txid: u32,
+        command: Option<u32>,
+        arena: &'a Arena,
+    ) -> Result<&'a dyn InitPlanRunner, SqlError> {
+        Ok(arena
+            .alloc(Self {
+                storage,
+                txid,
+                command,
+            })
+            .map_err(|_| arena_full())?)
+    }
+
     /// Lazy plans for `nodes`, with their results kept in `arena` unless the
     /// enclosing statement keeps a slot for one in `nested`, its slots for the
     /// uncorrelated subqueries nested in its correlated ones. `nested` is
@@ -2417,9 +2440,7 @@ impl UncorrelatedSubqueries {
     pub(super) fn plans<'a>(
         nodes: &[&'a Expr<'a>],
         nested: Option<&'a [InitPlan<'a>]>,
-        storage: &Storage,
-        txid: u32,
-        command: Option<u32>,
+        runner: &'a dyn InitPlanRunner,
         arena: &'a Arena,
     ) -> Result<Option<InitPlans<'a>>, SqlError> {
         if nodes.is_empty() && nested.is_none() {
@@ -2428,57 +2449,63 @@ impl UncorrelatedSubqueries {
         let nested = nested.unwrap_or(&[]);
         let mut plans = ArenaList::new(arena);
         for &node in nodes {
-            let plan = match nested.iter().find(|plan| core::ptr::eq(plan.node, node)) {
+            let plan = match nested.iter().find(|plan| plan.sublink.is(node)) {
                 Some(plan) => *plan,
-                None => new_initplan(node, arena)?,
+                None => new_initplan(node, runner, arena)?,
             };
             plans.push(plan).map_err(|_| arena_full())?;
         }
-        let runner: &'a Self = arena
-            .alloc(Self {
-                storage,
-                txid,
-                command,
-            })
-            .map_err(|_| arena_full())?;
         Ok(Some(InitPlans {
             plans: plans.as_slice(),
-            runner,
             nested,
         }))
     }
 }
 
 /// An empty slot for `node`'s value, kept in `arena`'s persistent tail.
-fn new_initplan<'a>(node: &'a Expr<'a>, arena: &'a Arena) -> Result<InitPlan<'a>, SqlError> {
+fn new_initplan<'a>(
+    node: &'a Expr<'a>,
+    runner: &'a dyn InitPlanRunner,
+    arena: &'a Arena,
+) -> Result<InitPlan<'a>, SqlError> {
     Ok(InitPlan {
-        node,
+        sublink: Sublink::of(node).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "an initPlan slot was requested for an expression that is not a subquery"
+            )
+        })?,
         result: arena.retain(None).map_err(|_| arena_full())?,
         keep: arena,
+        runner,
     })
 }
 
 /// Slots for the uncorrelated subqueries nested, at any depth, in the
-/// `correlated` subqueries of a query that no outer row runs. Each one
-/// reads only its own FROM items, so its value holds for the statement:
-/// PostgreSQL runs it once as an initPlan however many times the subquery
-/// around it runs, and here every run of that subquery finds the one slot.
+/// `correlated` subqueries and `LATERAL` FROM subqueries of a query that no
+/// outer row runs. Each one reads only its own FROM items, so its value
+/// holds for the statement: PostgreSQL runs it once as an initPlan however
+/// many times the query around it runs, and here every run of that query
+/// finds the one slot.
 fn nested_initplans<'a>(
     correlated: impl IntoIterator<Item = &'a &'a Expr<'a>>,
+    lateral: &[&'a Select<'a>],
     storage: &'a Storage,
     txid: u32,
+    runner: &'a dyn InitPlanRunner,
     arena: &'a Arena,
 ) -> Result<&'a [InitPlan<'a>], SqlError> {
     let mut found = ArenaList::new(arena);
-    for &node in correlated {
-        if let Some(select) = sublink_select(node) {
-            collect_nested_uncorrelated(select, &mut found, storage, txid, arena)?;
-        }
+    let correlated = correlated
+        .into_iter()
+        .filter_map(|node| sublink_select(node));
+    for select in correlated.chain(lateral.iter().copied()) {
+        collect_nested_uncorrelated(select, &mut found, storage, txid, arena)?;
     }
     let mut plans = ArenaList::new(arena);
     for &node in found.as_slice() {
         plans
-            .push(new_initplan(node, arena)?)
+            .push(new_initplan(node, runner, arena)?)
             .map_err(|_| arena_full())?;
     }
     Ok(plans.as_slice())
@@ -4158,7 +4185,7 @@ fn run_subquery<'a>(
     if let Some(from) = &select.from {
         collect_table_sample_expressions(from, &mut inner_expressions[4 + keys..]);
     }
-    let inner_subs = prepare_row_subqueries(
+    let inner_subs = prepare_subqueries(
         inner_expressions,
         storage,
         txid,
@@ -4883,7 +4910,7 @@ impl DmlSubqueries {
     ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
         // SAFETY: see the field invariant; no write is in progress.
         let storage: &'a Storage = unsafe { &*self.storage };
-        lazy_subqueries(exprs, storage, self.txid, Some(self.command), arena)
+        lazy_subqueries(exprs, storage, self.txid, Some(self.command), None, arena)
     }
 }
 
@@ -4891,12 +4918,15 @@ impl DmlSubqueries {
 /// expression first reads it and kept for the rest of the statement. The
 /// correlated ones are left to the evaluation's subquery executor, which
 /// runs them for each row that reads them. `command` is the data-modifying
-/// command whose own writes the plans do not see.
+/// command whose own writes the plans do not see. In a query run for an
+/// `outer` row, the subqueries the enclosing statement keeps slots for use
+/// those slots.
 pub(super) fn lazy_subqueries<'a>(
     exprs: impl IntoIterator<Item = &'a Expr<'a>>,
     storage: &'a Storage,
     txid: u32,
     command: Option<u32>,
+    outer: Option<&dyn ColumnLookup<'a>>,
     arena: &'a Arena,
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
     let mut nodes = ArenaList::new(arena);
@@ -4912,27 +4942,25 @@ pub(super) fn lazy_subqueries<'a>(
             plans.push(node).map_err(|_| arena_full())?;
         }
     }
-    let nested = if correlated.is_empty() {
+    let runner = UncorrelatedSubqueries::runner(storage, txid, command, arena)?;
+    let nested = if let Some(nested) = outer.and_then(|outer| outer.statement_initplans()) {
+        Some(nested)
+    } else if correlated.is_empty() {
         None
     } else {
         Some(nested_initplans(
             correlated.as_slice(),
+            &[],
             storage,
             txid,
+            runner,
             arena,
         )?)
     };
     Ok(SubqueryValues {
         scalars: &[],
         lists: &[],
-        initplans: UncorrelatedSubqueries::plans(
-            plans.as_slice(),
-            nested,
-            storage,
-            txid,
-            command,
-            arena,
-        )?,
+        initplans: UncorrelatedSubqueries::plans(plans.as_slice(), nested, runner, arena)?,
         bindings: &[],
     })
 }

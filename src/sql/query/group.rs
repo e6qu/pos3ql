@@ -141,6 +141,10 @@ impl<'a> ColumnLookup<'a> for GroupRow<'_, 'a> {
             .or_else(|| self.outer?.outer_aggregate(call))
     }
 
+    fn statement_initplans(&self) -> Option<&'a [crate::sql::eval::InitPlan<'a>]> {
+        self.outer?.statement_initplans()
+    }
+
     fn procedural_variable(
         &self,
         qualifier: Option<&str>,

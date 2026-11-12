@@ -1257,6 +1257,10 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
         (**self).outer_aggregate(call)
     }
 
+    fn statement_initplans(&self) -> Option<&'a [InitPlan<'a>]> {
+        (**self).statement_initplans()
+    }
+
     fn procedural_variable(
         &self,
         qualifier: Option<&str>,
@@ -2837,7 +2841,6 @@ pub struct SubqueryValues<'h, 'a> {
 #[derive(Clone, Copy)]
 pub struct InitPlans<'a> {
     pub(crate) plans: &'a [InitPlan<'a>],
-    pub(crate) runner: &'a dyn InitPlanRunner,
     /// The statement's slots for the uncorrelated subqueries nested in its
     /// correlated ones. A correlated subquery run for each outer row reuses
     /// these, so each runs once for the statement, as PostgreSQL's initPlans
@@ -2847,13 +2850,171 @@ pub struct InitPlans<'a> {
 
 #[derive(Clone, Copy)]
 pub struct InitPlan<'a> {
-    pub(crate) node: *const Expr<'a>,
+    pub(crate) sublink: Sublink,
     /// Once run, the value kept in `keep`'s persistent tail. Raw extents keep
     /// hooks covariant; the handle rejects a reset arena.
     pub(crate) result: crate::mem::arena::ArenaHandle<Option<InitPlanValue>>,
     /// The arena whose persistent tail keeps the result: the statement's, or
     /// a retained reader's own, which outlives each row's work arena.
     pub(crate) keep: &'a Arena,
+    /// Runs the subquery as of the statement that owns the slot.
+    pub(crate) runner: &'a dyn InitPlanRunner,
+}
+
+impl InitPlan<'_> {
+    /// The slot's value, running `node` (this sublink) the first time it is
+    /// read.
+    pub(crate) fn value<'a>(
+        &self,
+        node: &Expr<'a>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        sequences: Option<&dyn SequenceAccess>,
+    ) -> Result<InitPlanValue, SqlError> {
+        debug_assert!(
+            self.sublink.is(node),
+            "an initPlan slot read for another sublink"
+        );
+        match self.keep.retained(self.result) {
+            Some(Some(kept)) => Ok(kept),
+            Some(None) => {
+                let kept = match self.runner.run(node, arena, params, sequences)? {
+                    InitPlanOutput::Scalar(encoded) => {
+                        let kept = self
+                            .keep
+                            .alloc_persistent_slice_with(encoded.len(), |index| encoded[index])
+                            .map_err(|_| {
+                                sql_err!(
+                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                    "an uncorrelated subquery's value exceeds the statement's memory"
+                                )
+                            })?;
+                        InitPlanValue::Scalar {
+                            encoded: kept.as_ptr(),
+                            len: kept.len(),
+                        }
+                    }
+                    InitPlanOutput::List(list) => keep_subquery_list(&list, self.keep)?,
+                };
+                self.keep.replace_retained(self.result, Some(kept));
+                Ok(kept)
+            }
+            None => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "an uncorrelated subquery's value outlived its statement"
+            )),
+        }
+    }
+}
+
+/// A kept initPlan value read back for one evaluation.
+pub(crate) enum InitPlanRead<'a> {
+    /// The value and its type witness.
+    Scalar(Datum<'a>, Datum<'a>),
+    List(SubqueryList<'a>),
+}
+
+impl InitPlanValue {
+    /// Decodes the value for `node`, whose slot keeps it in an arena that
+    /// outlives `arena`.
+    pub(crate) fn read<'a>(
+        self,
+        node: *const Expr<'_>,
+        arena: &'a Arena,
+    ) -> Result<InitPlanRead<'a>, SqlError> {
+        // SAFETY (both arms): the slot's handle matched the owning arena's
+        // current identity when the value was read, so the persistent-tail
+        // extents it records are still allocated, and that arena outlives
+        // this evaluation's.
+        match self {
+            InitPlanValue::Scalar { encoded, len } => {
+                let encoded: &'a [u8] = unsafe { core::slice::from_raw_parts(encoded, len) };
+                Ok(InitPlanRead::Scalar(
+                    super::exec::decode_projected_col_record(encoded, 0, arena)?,
+                    super::exec::decode_projected_col_record(encoded, 1, arena)?,
+                ))
+            }
+            InitPlanValue::List {
+                probe,
+                witness,
+                witness_len,
+                saw_null,
+                collations,
+                collations_len,
+            } => {
+                let witness: &'a [u8] =
+                    unsafe { core::slice::from_raw_parts(witness, witness_len) };
+                let collations: &'a [Collation] =
+                    unsafe { core::slice::from_raw_parts(collations, collations_len) };
+                Ok(InitPlanRead::List(SubqueryList {
+                    node: node.cast(),
+                    values: &[],
+                    probe: Some(probe),
+                    saw_null,
+                    witness: super::exec::decode_projected_col_record(witness, 0, arena)?,
+                    collations,
+                }))
+            }
+        }
+    }
+}
+
+/// Which sublink an initPlan slot serves. A query rewritten for an outer
+/// row (a FROM subquery merged into it, a restriction pushed into one)
+/// copies the nodes over the columns it substitutes, so an `IN` whose
+/// operand reads a merged column gets a new node each row. The subquery's
+/// own `SELECT` reads none of those columns, so the rewrite keeps it, and it
+/// names the sublink however often the node around it is copied.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Sublink {
+    select: *const crate::sql::ast::Select<'static>,
+    kind: SublinkKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SublinkKind {
+    Scalar,
+    Row(u8),
+    Exists,
+    Array,
+    In {
+        negated: bool,
+    },
+    Quantified {
+        operator: crate::sql::ast::BinaryOp,
+        all: bool,
+    },
+}
+
+impl Sublink {
+    /// `node`'s identity, or `None` when it is not a sublink.
+    pub(crate) fn of(node: &Expr<'_>) -> Option<Self> {
+        let (select, kind) = match *node {
+            Expr::Subquery(select) => (select, SublinkKind::Scalar),
+            Expr::RowSubquery { select, arity } => (select, SublinkKind::Row(arity)),
+            Expr::Exists(select) => (select, SublinkKind::Exists),
+            Expr::ArraySubquery(select) => (select, SublinkKind::Array),
+            Expr::InSubquery {
+                select, negated, ..
+            } => (select, SublinkKind::In { negated }),
+            Expr::QuantifiedSubquery {
+                select,
+                operator,
+                all,
+                ..
+            } => (select, SublinkKind::Quantified { operator, all }),
+            _ => return None,
+        };
+        Some(Self {
+            select: (select as *const crate::sql::ast::Select<'_>).cast(),
+            kind,
+        })
+    }
+
+    /// Whether `node` is this sublink, or a rewritten copy of it.
+    pub(crate) fn is(self, node: &Expr<'_>) -> bool {
+        Self::of(node) == Some(self)
+    }
 }
 
 /// An outer row lookup that also carries the statement's nested initPlan
@@ -4812,54 +4973,16 @@ fn eval_full_inner<'a>(
             .lists
             .iter()
             .any(|list| core::ptr::eq(list.node, (expression as *const Expr).cast()))
-        && let Some(plan) = plans
-            .plans
-            .iter()
-            .find(|plan| core::ptr::eq(plan.node, expression))
+        && let Some(plan) = plans.plans.iter().find(|plan| plan.sublink.is(expression))
     {
-        let kept = match plan.keep.retained(plan.result) {
-            Some(Some(kept)) => kept,
-            Some(None) => {
-                let kept = match plans
-                    .runner
-                    .run(expression, arena, params, hooks.sequences)?
-                {
-                    InitPlanOutput::Scalar(encoded) => {
-                        let kept = plan
-                            .keep
-                            .alloc_persistent_slice_with(encoded.len(), |index| encoded[index])
-                            .map_err(|_| {
-                                sql_err!(
-                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                    "an uncorrelated subquery's value exceeds the statement's memory"
-                                )
-                            })?;
-                        InitPlanValue::Scalar {
-                            encoded: kept.as_ptr(),
-                            len: kept.len(),
-                        }
-                    }
-                    InitPlanOutput::List(list) => keep_subquery_list(&list, plan.keep)?,
-                };
-                plan.keep.replace_retained(plan.result, Some(kept));
-                kept
-            }
-            None => {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "an uncorrelated subquery's value outlived its statement"
-                ));
-            }
-        };
-        // SAFETY (both arms): the handle matched the owning arena's current
-        // identity, so the persistent-tail extents it records are still
-        // allocated, and that arena outlives this evaluation's.
         let mut scalars = [(expression as *const Expr, Datum::Null, Datum::Null)];
-        let values = match kept {
-            InitPlanValue::Scalar { encoded, len } => {
-                let encoded: &'a [u8] = unsafe { core::slice::from_raw_parts(encoded, len) };
-                scalars[0].1 = super::exec::decode_projected_col_record(encoded, 0, arena)?;
-                scalars[0].2 = super::exec::decode_projected_col_record(encoded, 1, arena)?;
+        let values = match plan
+            .value(expression, arena, params, hooks.sequences)?
+            .read(expression, arena)?
+        {
+            InitPlanRead::Scalar(value, witness) => {
+                scalars[0].1 = value;
+                scalars[0].2 = witness;
                 SubqueryValues {
                     scalars: &scalars,
                     lists: subs.lists,
@@ -4867,28 +4990,10 @@ fn eval_full_inner<'a>(
                     bindings: subs.bindings,
                 }
             }
-            InitPlanValue::List {
-                probe,
-                witness,
-                witness_len,
-                saw_null,
-                collations,
-                collations_len,
-            } => {
-                let witness: &'a [u8] =
-                    unsafe { core::slice::from_raw_parts(witness, witness_len) };
-                let collations: &'a [Collation] =
-                    unsafe { core::slice::from_raw_parts(collations, collations_len) };
+            InitPlanRead::List(list) => {
                 let lists = arena
                     .alloc_slice_with(subs.lists.len() + 1, |index| match index {
-                        0 => SubqueryList {
-                            node: (expression as *const Expr).cast(),
-                            values: &[],
-                            probe: Some(probe),
-                            saw_null,
-                            witness: Datum::Null,
-                            collations,
-                        },
+                        0 => list,
                         index => subs.lists[index - 1],
                     })
                     .map_err(|_| {
@@ -4897,7 +5002,6 @@ fn eval_full_inner<'a>(
                             "subquery lists exceed the statement's memory"
                         )
                     })?;
-                lists[0].witness = super::exec::decode_projected_col_record(witness, 0, arena)?;
                 SubqueryValues {
                     scalars: subs.scalars,
                     lists,

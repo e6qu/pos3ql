@@ -3107,16 +3107,9 @@ impl<'a> RetainedSelect<'a> {
             &mut columns,
             crate::sql::exec::DescriptionTarget::Sql,
         )?;
-        let subqueries = SubqueryValues {
-            scalars: &[],
-            lists: &[],
-            initplans: None,
-            bindings: &[],
-        };
-        patch_subquery_column_types(
+        patch_param_column_types(
             statement.items,
             Some(&scope),
-            &subqueries,
             params,
             storage,
             txid,
@@ -3470,16 +3463,9 @@ impl<'a> RetainedSelect<'a> {
             &mut description,
             crate::sql::exec::DescriptionTarget::Sql,
         )?;
-        let subqueries = SubqueryValues {
-            scalars: &[],
-            lists: &[],
-            initplans: None,
-            bindings: &[],
-        };
-        patch_subquery_column_types(
+        patch_param_column_types(
             statement.items,
             Some(&scope),
-            &subqueries,
             params,
             storage,
             txid,
@@ -3695,23 +3681,25 @@ impl<'a> RetainedSelect<'a> {
         if !self.sublinks.is_empty() && self.subqueries.is_none() {
             // Each runs when an expression first reads it, as PostgreSQL's
             // initPlans do, and keeps its value in the reader's allocation.
-            let initplans = super::subquery::UncorrelatedSubqueries::plans(
-                self.sublinks,
-                None,
-                storage,
-                txid,
-                None,
-                state_arena,
-            )
-            .map_err(|_| {
-                // Like a build that does not fit: the statement runs
-                // spooled, or in the general executor, instead.
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "subquery plans exceed the retained reader's allocation"
-                )
-                .plan_build_exhausted()
-            })?;
+            let initplans =
+                super::subquery::UncorrelatedSubqueries::runner(storage, txid, None, state_arena)
+                    .and_then(|runner| {
+                        super::subquery::UncorrelatedSubqueries::plans(
+                            self.sublinks,
+                            None,
+                            runner,
+                            state_arena,
+                        )
+                    })
+                    .map_err(|_| {
+                        // Like a build that does not fit: the statement runs
+                        // spooled, or in the general executor, instead.
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "subquery plans exceed the retained reader's allocation"
+                        )
+                        .plan_build_exhausted()
+                    })?;
             self.subqueries = Some(crate::sql::eval::SubqueryValues {
                 scalars: &[],
                 lists: &[],

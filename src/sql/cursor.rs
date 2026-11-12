@@ -530,7 +530,7 @@ impl CursorPool {
             }
         }
     }
-    pub fn budget_bytes(config: &Config) -> usize {
+    pub const fn budget_bytes(config: &Config) -> usize {
         let row_capacity = cursor_row_capacity(config);
         config
             .max_cursors
@@ -594,6 +594,17 @@ impl CursorPool {
             next_unnamed: 1,
             next_plan_generation: 1,
         })
+    }
+
+    /// A one-cursor pool for tests that fire triggers outside a session.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        let mut config = Config::default_dev();
+        config.max_cursors = 1;
+        config.cursor_bytes = 4096;
+        config.cursor_query_bytes = 4096;
+        let mut budget = Budget::new(Self::budget_bytes(&config));
+        Self::new(&config, &mut budget).expect("test cursor pool fits its budget")
     }
 
     /// Closes every cursor — used when a connection slot is recycled for a new

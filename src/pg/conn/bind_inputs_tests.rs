@@ -416,7 +416,11 @@ fn immediate_utility_resumes_durable_commit_without_repeating_ddl() {
             &mut conn.txn,
             &conn.guc,
             crate::sql::txn::CommitTarget::Ordinary,
-            None,
+            crate::sql::CursorCommitContext {
+                cursors: &mut conn.cursors,
+                plans: Some(&mut conn.sqlprep),
+                arena: &conn.arena,
+            },
             &conn.arena,
             &mut Responder::new(&mut conn.send),
         )

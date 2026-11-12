@@ -1283,7 +1283,9 @@ fn quoted_cursor_names_use_tokens_in_open_fetch_move_and_close() {
                         }
                     }
                     assert_eq!(
-                        parse_plpgsql_cursor_close("CLOSE \"cursor \"\" name\"", scratch).unwrap(),
+                        parse_plpgsql_cursor_close("CLOSE \"cursor \"\" name\"", scratch)
+                            .unwrap()
+                            .map(|close| close.variable),
                         Some(open.variable),
                     );
                 })
@@ -1467,7 +1469,7 @@ fn constant_validation_uses_the_innermost_handler_or_counter_binding() {
                         print_strict_params: parsed.print_strict_params,
                     };
                     let result =
-                        validate_plpgsql_constant_assignments(&program, false, &|_| false, scratch);
+                        validate_plpgsql_variable_uses(&program, false, &|_| false, scratch);
                     match expected {
                         Some(state) => assert_eq!(result.unwrap_err().sqlstate, state, "{source}"),
                         None => result.unwrap(),

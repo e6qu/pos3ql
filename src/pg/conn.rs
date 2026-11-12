@@ -2223,11 +2223,11 @@ impl Conn {
                                     &mut self.txn,
                                     &self.guc,
                                     crate::sql::txn::CommitTarget::Ordinary,
-                                    Some(crate::sql::CursorCommitContext {
+                                    crate::sql::CursorCommitContext {
                                         cursors: &mut self.cursors,
-                                        plans: &mut self.sqlprep,
+                                        plans: Some(&mut self.sqlprep),
                                         arena: &self.arena,
-                                    }),
+                                    },
                                     &self.arena,
                                     &mut responder,
                                 )
@@ -2937,6 +2937,7 @@ impl Conn {
                             crate::sql::CopyRowContext::new(
                                 &mut self.txn,
                                 &self.guc,
+                                &mut self.cursors,
                                 &self.arena,
                                 &mut responder,
                                 &mut self.copy_transition_scratch,
@@ -3026,6 +3027,7 @@ impl Conn {
                                 crate::sql::CopyRowContext::new(
                                     &mut self.txn,
                                     &self.guc,
+                                    &mut self.cursors,
                                     &self.arena,
                                     &mut responder,
                                     &mut self.copy_transition_scratch,
@@ -3087,6 +3089,7 @@ impl Conn {
                         crate::sql::CopyRowContext::new(
                             &mut self.txn,
                             &self.guc,
+                            &mut self.cursors,
                             &self.arena,
                             &mut responder,
                             &mut self.copy_transition_scratch,
@@ -3115,11 +3118,11 @@ impl Conn {
                         &copy.setup,
                         &mut self.txn,
                         &self.guc,
-                        Some(crate::sql::CursorCommitContext {
+                        crate::sql::CursorCommitContext {
                             cursors: &mut self.cursors,
-                            plans: &mut self.sqlprep,
+                            plans: Some(&mut self.sqlprep),
                             arena: &self.arena,
-                        }),
+                        },
                         &mut responder,
                         &self.copy_transition_scratch,
                         if extended {

@@ -299,10 +299,7 @@ IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 set, and omits an explicit `security_invoker=false`. A `CHECK` constraint
 marked `NO INHERIT` fails with `0A000`, and exclusion constraints support only
 GiST over range columns (`EXCLUDE USING btree (a WITH =)` fails with `0A000`).
-`pg_constraint` omits the system catalogs' own not-null constraints. A
-misplaced column constraint attribute (`a int NOT NULL DEFERRABLE`) is
-reported before a later syntax error in the same statement, where PostgreSQL
-reports the syntax error first. A rewrite rule `INSERT` action whose `VALUES` rows write
+`pg_constraint` omits the system catalogs' own not-null constraints. A rewrite rule `INSERT` action whose `VALUES` rows write
 `DEFAULT` in different columns runs as one insert per pattern, so `RETURNING`
 from such an action fails with `0A000`. A cursor whose query
 cannot stream runs it at `DECLARE` or `OPEN`, so a volatile function's side
@@ -319,11 +316,15 @@ A PL/pgSQL variable declared with a view's row type (`r v;` or
 assignable records with the table's row structure, as in PostgreSQL;
 assigning a row of another structure to one fails at the assignment with
 PostgreSQL's `returned row structure does not match` error, where PostgreSQL
-accepts it and fails only if a BEFORE trigger returns it. `OPEN` and `FETCH`
-in a trigger fired by an ordinary statement fail with `0A000` (`SQL cursors
-are not available in trigger execution`): the statement's executor holds only
-the storage while it fires the trigger, and a cursor needs the session's
-engine and cursor pool. `pg_sleep` and its
+accepts it and fails only if a BEFORE trigger returns it. A trigger fired
+inside a writing statement runs a cursor's `OPEN` query whole at `OPEN`, so a
+cursor it leaves open for the caller does not see the row its BEFORE trigger
+was inserting, where PostgreSQL's cursor reads it at the first `FETCH`; it
+cannot `FETCH` from a session cursor that evaluates rows as fetched, or open
+one with data-modifying `WITH` queries (`0A000`). A PL/pgSQL cursor variable
+named with its block label (`CLOSE b.c`) fails as a syntax error, and a
+parameter used as a cursor is type-checked when the statement runs rather
+than when the routine is created. `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,

@@ -580,16 +580,20 @@ pub(crate) enum CopyFinishMode {
     ImplicitTransaction,
 }
 
+/// The cursors a transaction end closes or saves. Subscription apply has no
+/// prepared statements, so it has no plans to retire.
 pub(crate) struct CursorCommitContext<'a> {
     pub(crate) cursors: &'a mut cursor::CursorPool,
-    pub(crate) plans: &'a mut SqlPreparedPool,
+    pub(crate) plans: Option<&'a mut SqlPreparedPool>,
     pub(crate) arena: &'a Arena,
 }
 
 impl CursorCommitContext<'_> {
     fn retire_closed(&mut self) {
-        if !type_input_plans::has_active_plan() {
-            self.plans
+        if let Some(plans) = self.plans.as_deref_mut()
+            && !type_input_plans::has_active_plan()
+        {
+            plans
                 .routine_inputs
                 .retire_invalid_cursors(|generation| self.cursors.contains_plan_owner(generation));
         }
@@ -754,6 +758,7 @@ pub(crate) struct CursorStatementContext<'a, 'response> {
 pub struct CopyRowContext<'a, 'response> {
     txn: &'a mut TxnState,
     guc: &'a GucState,
+    cursors: &'a mut cursor::CursorPool,
     arena: &'a Arena,
     responder: &'a mut Responder<'response>,
     transition_rows: &'a mut exec::CopyTransitionRows,
@@ -777,6 +782,7 @@ impl<'a, 'response> CopyRowContext<'a, 'response> {
     pub(crate) fn new(
         txn: &'a mut TxnState,
         guc: &'a GucState,
+        cursors: &'a mut cursor::CursorPool,
         arena: &'a Arena,
         responder: &'a mut Responder<'response>,
         transition_rows: &'a mut exec::CopyTransitionRows,
@@ -784,6 +790,7 @@ impl<'a, 'response> CopyRowContext<'a, 'response> {
         Self {
             txn,
             guc,
+            cursors,
             arena,
             responder,
             transition_rows,
@@ -2831,6 +2838,201 @@ enum CursorRowSink {
     Discard,
     /// Only the filter runs.
     FilterOnly,
+}
+
+/// Runs a bound cursor query whole into its saved rows. A query with
+/// data-modifying `WITH` queries is only described; it runs on its first read.
+fn save_cursor_rows(
+    cursors: &mut cursor::CursorPool,
+    at: usize,
+    storage: &Storage,
+    txid: u32,
+    work: &Arena,
+    render: guc::RenderContext,
+    seq_session: &guc::SeqSession,
+) -> Result<(), SqlError> {
+    let out = {
+        let (query, description, rows) = cursors.execution_parts(at);
+        let mut capture =
+            Responder::for_cursor(description, crate::pg::respond::CursorRowOutput::Save(rows));
+        capture.set_render(render);
+        query.with_query(|parsed, params, _| {
+            let sequence = sequence::SeqEval::new(storage, seq_session, txid);
+            match parsed {
+                cursor::CursorStatement::Select(select)
+                    if select.with.iter().any(|cte| cte.dml.is_some()) =>
+                {
+                    // Described now; it runs on its first read.
+                    let mut columns = [ColDesc::new("", 0, 0); crate::sql::MAX_PROJ];
+                    let described =
+                        query::expand_ctes(select, storage, txid, work).and_then(|select| {
+                            query::describe_select(
+                                select,
+                                storage,
+                                txid,
+                                work,
+                                &mut columns,
+                                exec::DescriptionTarget::Wire,
+                                None,
+                            )
+                        });
+                    match described {
+                        Ok(count) => capture.row_description(&columns[..count]).map(Ok),
+                        Err(error) => Ok(Err(error)),
+                    }
+                }
+                cursor::CursorStatement::Select(select) => {
+                    let select = match query::expand_ctes_exec(
+                        select,
+                        storage,
+                        txid,
+                        work,
+                        params,
+                        &[],
+                        Some(&sequence),
+                    ) {
+                        Ok(select) => select,
+                        Err(error) => {
+                            return Ok(Err(error));
+                        }
+                    };
+                    if let Err(error) = query::validate_locking(select, storage, txid, work) {
+                        return Ok(Err(error));
+                    }
+                    if select.from.is_none() {
+                        query::constant_select(
+                            storage,
+                            txid,
+                            select,
+                            work,
+                            params,
+                            Some(&sequence),
+                            &mut capture,
+                        )
+                    } else {
+                        query::select_query(
+                            storage,
+                            txid,
+                            select,
+                            work,
+                            params,
+                            Some(&sequence),
+                            &mut capture,
+                        )
+                    }
+                }
+                cursor::CursorStatement::SetQuery(query) => query::set_query(
+                    storage,
+                    txid,
+                    query,
+                    work,
+                    params,
+                    Some(&sequence),
+                    &mut capture,
+                ),
+            }
+        })?
+    };
+    out.map_err(|_| cursor_description_too_large())?
+}
+
+/// Opens a cursor for a trigger fired inside a statement that holds the
+/// engine's storage. The query runs whole at `OPEN` into the cursor's saved
+/// rows, so later reads need no engine. `locals` are the trigger's captured
+/// variables, read as the query's parameters.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a trigger cursor carries its statement services, query and variables"
+)]
+pub(crate) fn open_trigger_cursor(
+    storage: &Storage,
+    seq_session: &guc::SeqSession,
+    cursors: &mut cursor::CursorPool,
+    name: &str,
+    sql: &str,
+    scroll: cursor::CursorScroll,
+    locals: &[cursor::CursorLocal],
+    arena: &Arena,
+    params: &[Datum],
+    txid: u32,
+) -> Result<(), SqlError> {
+    let (source, position) = type_inputs::active_source_position(sql)?.ok_or_else(|| {
+        sql_err!(
+            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+            "cursor opening has no active SQL source lifetime"
+        )
+    })?;
+    let attempt = cursors.open_at(
+        cursor::CursorOpenSite {
+            owner: type_input_plans::owner()?,
+            source,
+            position,
+        },
+        name,
+        sql,
+        scroll,
+        false,
+        false,
+        datetime::now_micros(),
+    )?;
+    let at = attempt.index();
+    let mark = arena.mark();
+    let result = (|| {
+        if !cursors.opening_query_bound(at) {
+            let inputs = type_inputs::bindings_for_active_source(sql, arena)?.unwrap_or(&[]);
+            cursors.bind_query(at, sql, params, locals, inputs, storage, txid)?;
+        }
+        if cursors.execution_parts(at).0.writes() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a cursor query with data-modifying WITH is not supported in trigger execution"
+            ));
+        }
+        cursors.restart_opening_output(attempt)?;
+        cursors
+            .execution_parts(at)
+            .0
+            .prepare_result_types(storage, txid)?;
+        let render = guc::with_active_state(|guc| Ok(guc.render()))?;
+        save_cursor_rows(cursors, at, storage, txid, arena, render, seq_session)?;
+        cursors.seal(at)
+    })();
+    // The cursor copied its SQL, values, descriptors and rows.
+    unsafe { arena.rewind_to(mark) };
+    if let Err(error) = result {
+        cursors.abandon_attempt(attempt)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Moves a cursor for a trigger fired inside a statement that holds the
+/// engine's storage, and returns the row count as [`Engine::fetch_cursor`].
+/// Only saved rows can be read there: a cursor that evaluates its query as it
+/// is fetched needs the session's engine.
+pub(crate) fn fetch_trigger_cursor(
+    cursors: &mut cursor::CursorPool,
+    name: &str,
+    motion: cursor::FetchMotion,
+    move_only: bool,
+) -> Result<usize, SqlError> {
+    let result = (|| {
+        if cursors.pending_write_fill(name)?.is_some()
+            || cursors.scroll_slot(name).is_some()
+            || cursors.read_request(name, motion, move_only)?.is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cursor \"{}\" evaluates its rows when fetched, which is not supported in trigger execution",
+                name
+            ));
+        }
+        cursors.fetch(name, motion, move_only)
+    })();
+    if result.is_err() {
+        cursors.fail(name);
+    }
+    result
 }
 
 fn cursor_input_wait(error: &SqlError) -> bool {
@@ -8019,20 +8221,17 @@ impl Engine {
         Ok(())
     }
 
-    // Subscription apply has no SQL cursor pool; connection callers supply it.
     pub(crate) fn commit_txn_with_triggers(
         &mut self,
         txn: &mut TxnState,
         guc: &GucState,
         target: txn::CommitTarget,
-        mut cursors: Option<CursorCommitContext<'_>>,
+        mut cursors: CursorCommitContext<'_>,
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
         let _atomic_reads = self.atomic_block_read_scope();
-        let _active_cursors = cursors
-            .as_ref()
-            .map(|context| cursor::enter_active(&*context.cursors as *const _));
+        let _active_cursors = cursor::enter_active(&*cursors.cursors as *const _);
         if let Some(pending) = txn
             .staged_commit()
             .map(|staged| staged.target)
@@ -8045,35 +8244,30 @@ impl Engine {
                 ));
             }
             self.finish_pending_transaction(txn, guc)?;
-            if let Some(mut context) = cursors {
-                context.on_commit();
-            }
+            cursors.on_commit();
             return Ok(());
         }
         if let Err(error) = self.fire_constraint_trigger_boundary(
             txn,
             guc,
+            cursors.cursors,
             arena,
             responder,
             exec::TriggerQueueBoundary::Transaction,
         ) {
-            if let Some(context) = &mut cursors {
-                context.on_rollback();
-            }
+            cursors.on_rollback();
             self.rollback_txn(txn, guc);
             return Err(error);
         }
-        if let Some(context) = &mut cursors
-            && let Err(error) = self.save_hold_cursors(
-                txn,
-                context.cursors,
-                context.plans,
-                guc,
-                context.arena,
-                responder,
-            )
-        {
-            context.on_rollback();
+        if let Err(error) = self.save_hold_cursors(
+            txn,
+            cursors.cursors,
+            cursors.plans.as_deref_mut(),
+            guc,
+            cursors.arena,
+            responder,
+        ) {
+            cursors.on_rollback();
             self.rollback_txn(txn, guc);
             return Err(error);
         }
@@ -8081,23 +8275,20 @@ impl Engine {
         if let Err(error) = self.fire_constraint_trigger_boundary(
             txn,
             guc,
+            cursors.cursors,
             arena,
             responder,
             exec::TriggerQueueBoundary::Transaction,
         ) {
-            if let Some(context) = &mut cursors {
-                context.on_rollback();
-            }
+            cursors.on_rollback();
             self.rollback_txn(txn, guc);
             return Err(error);
         }
         let result = self.finish_txn(txn, guc, target);
-        if let Some(mut context) = cursors {
-            if result.is_ok() {
-                context.on_commit();
-            } else if !txn.is_active() {
-                context.on_rollback();
-            }
+        if result.is_ok() {
+            cursors.on_commit();
+        } else if !txn.is_active() {
+            cursors.on_rollback();
         }
         result
     }
@@ -8118,11 +8309,11 @@ impl Engine {
                 txn,
                 guc,
                 crate::sql::txn::CommitTarget::Ordinary,
-                Some(CursorCommitContext {
+                CursorCommitContext {
                     cursors,
-                    plans: sqlprep,
+                    plans: Some(sqlprep),
                     arena,
-                }),
+                },
                 arena,
                 responder,
             )
@@ -8335,6 +8526,7 @@ impl Engine {
         if let Err(error) = self.fire_constraint_trigger_boundary(
             txn,
             guc,
+            cursors,
             arena,
             responder,
             exec::TriggerQueueBoundary::Transaction,
@@ -8582,6 +8774,7 @@ impl Engine {
         &mut self,
         txn: &mut TxnState,
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         arena: &Arena,
         responder: &mut Responder,
         boundary: exec::TriggerQueueBoundary,
@@ -8592,7 +8785,7 @@ impl Engine {
             &mut self.storage,
             txn,
             arena,
-            guc.seq_session(),
+            &mut exec::TriggerServices::new(guc.seq_session(), cursors),
             responder,
             boundary,
         )
@@ -9730,12 +9923,17 @@ impl Engine {
         Ok(Ok(()))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "statement execution lends the session's cursors to the triggers it fires"
+    )]
     pub(crate) fn execute_set_constraints_statement(
         &mut self,
         targets: ast::ConstraintTargets<'_>,
         mode: ast::ConstraintMode,
         txn: &mut TxnState,
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
@@ -9844,6 +10042,7 @@ impl Engine {
                 if let Err(error) = self.fire_constraint_trigger_boundary(
                     txn,
                     guc,
+                    cursors,
                     arena,
                     responder,
                     exec::TriggerQueueBoundary::Constraints(None),
@@ -9855,6 +10054,7 @@ impl Engine {
                     if let Err(error) = self.fire_constraint_trigger_boundary(
                         txn,
                         guc,
+                        cursors,
                         arena,
                         responder,
                         exec::TriggerQueueBoundary::Constraints(Some(identity)),
@@ -10734,7 +10934,7 @@ impl Engine {
         exec::copy_row(
             &mut self.storage,
             context.txn,
-            context.guc.seq_session(),
+            &mut exec::TriggerServices::new(context.guc.seq_session(), context.cursors),
             setup,
             line,
             context.arena,
@@ -10769,7 +10969,7 @@ impl Engine {
         exec::copy_row_binary(
             &mut self.storage,
             context.txn,
-            context.guc.seq_session(),
+            &mut exec::TriggerServices::new(context.guc.seq_session(), context.cursors),
             setup,
             row,
             context.arena,
@@ -10783,6 +10983,7 @@ impl Engine {
         setup: &exec::CopySetup,
         txn: &mut TxnState,
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
@@ -10792,7 +10993,7 @@ impl Engine {
             &mut self.storage,
             txn,
             setup,
-            guc.seq_session(),
+            &mut exec::TriggerServices::new(guc.seq_session(), cursors),
             arena,
             responder,
         )
@@ -10820,21 +11021,17 @@ impl Engine {
         setup: &exec::CopySetup,
         txn: &mut TxnState,
         guc: &GucState,
-        cursors: Option<CursorCommitContext<'_>>,
+        mut cursors: CursorCommitContext<'_>,
         responder: &mut Responder,
         inserted: &exec::CopyTransitionRows,
         finish: CopyFinishMode,
     ) -> Result<(), SqlError> {
         let _settings = self.enter_copy_session(setup, txn, guc, responder)?;
         let _atomic_reads = self.atomic_block_read_scope();
-        let _active_cursors = cursors
-            .as_ref()
-            .map(|context| cursor::enter_active(&*context.cursors as *const _));
+        let _active_cursors = cursor::enter_active(&*cursors.cursors as *const _);
         if txn.staged_commit().is_some() || txn.commit_admission().is_some() {
             self.finish_pending_transaction(txn, guc)?;
-            if let Some(mut context) = cursors {
-                context.on_commit();
-            }
+            cursors.on_commit();
             return Ok(());
         }
         let transaction_boundary =
@@ -10851,31 +11048,29 @@ impl Engine {
             setup,
             txn,
             guc,
+            cursors.cursors,
             responder,
             inserted,
             boundary,
         );
         setup.release_snapshot();
         if let Err(error) = result {
-            if transaction_boundary && let Some(mut context) = cursors {
-                context.on_rollback();
+            if transaction_boundary {
+                cursors.on_rollback();
             }
             self.copy_abort(txn, guc);
             return Err(error);
         }
         if transaction_boundary {
-            if let Some(context) = cursors {
-                let arena = context.arena;
-                return self.commit_txn_with_triggers(
-                    txn,
-                    guc,
-                    crate::sql::txn::CommitTarget::Ordinary,
-                    Some(context),
-                    arena,
-                    responder,
-                );
-            }
-            return self.commit_txn(txn, guc);
+            let arena = cursors.arena;
+            return self.commit_txn_with_triggers(
+                txn,
+                guc,
+                crate::sql::txn::CommitTarget::Ordinary,
+                cursors,
+                arena,
+                responder,
+            );
         }
         Ok(())
     }
@@ -10885,6 +11080,7 @@ impl Engine {
         setup: &exec::CopySetup,
         txn: &mut TxnState,
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         responder: &mut Responder,
         workspace: SubscriptionCopyWorkspace<'_>,
     ) -> Result<(), SqlError> {
@@ -10905,6 +11101,7 @@ impl Engine {
             setup,
             txn,
             guc,
+            cursors,
             responder,
             workspace.transition_rows,
             boundary,
@@ -10925,6 +11122,7 @@ impl Engine {
         setup: &exec::CopySetup,
         txn: &mut TxnState,
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         responder: &mut Responder,
         inserted: &exec::CopyTransitionRows,
         boundary: exec::TriggerQueueBoundary,
@@ -10934,7 +11132,7 @@ impl Engine {
             storage,
             txn,
             setup,
-            guc.seq_session(),
+            &mut exec::TriggerServices::new(guc.seq_session(), cursors),
             arena,
             responder,
             inserted,
@@ -10944,7 +11142,7 @@ impl Engine {
             storage,
             txn,
             arena,
-            guc.seq_session(),
+            &mut exec::TriggerServices::new(guc.seq_session(), cursors),
             responder,
             boundary,
         )?;
@@ -11817,11 +12015,11 @@ impl Engine {
                         txn,
                         guc,
                         crate::sql::txn::CommitTarget::Ordinary,
-                        Some(CursorCommitContext {
+                        CursorCommitContext {
                             cursors,
-                            plans: sqlprep,
+                            plans: Some(sqlprep),
                             arena,
-                        }),
+                        },
                         arena,
                         responder,
                     )
@@ -11987,6 +12185,7 @@ impl Engine {
                         self.fire_constraint_trigger_boundary(
                             txn,
                             guc,
+                            cursors,
                             arena,
                             responder,
                             exec::TriggerQueueBoundary::Statement,
@@ -12176,11 +12375,11 @@ impl Engine {
                     txn,
                     guc,
                     crate::sql::txn::CommitTarget::Ordinary,
-                    Some(CursorCommitContext {
+                    CursorCommitContext {
                         cursors,
-                        plans: sqlprep,
+                        plans: Some(sqlprep),
                         arena,
-                    }),
+                    },
                     arena,
                     responder,
                 )
@@ -12532,11 +12731,11 @@ impl Engine {
                                 txn::CommitTarget::Utility(
                                     immediate.expect("validated utility target"),
                                 ),
-                                Some(CursorCommitContext {
+                                CursorCommitContext {
                                     cursors,
-                                    plans: sqlprep,
+                                    plans: Some(sqlprep),
                                     arena,
-                                }),
+                                },
                                 arena,
                                 responder,
                             )
@@ -12655,6 +12854,7 @@ impl Engine {
                                 self.fire_constraint_trigger_boundary(
                                     txn,
                                     guc,
+                                    cursors,
                                     arena,
                                     responder,
                                     exec::TriggerQueueBoundary::Statement,
@@ -12671,11 +12871,11 @@ impl Engine {
                                         txn,
                                         guc,
                                         txn::CommitTarget::Utility(command),
-                                        Some(CursorCommitContext {
+                                        CursorCommitContext {
                                             cursors,
-                                            plans: sqlprep,
+                                            plans: Some(sqlprep),
                                             arena,
-                                        }),
+                                        },
                                         arena,
                                         responder,
                                     )
@@ -12993,11 +13193,11 @@ impl Engine {
                     txn,
                     guc,
                     crate::sql::txn::CommitTarget::Ordinary,
-                    Some(CursorCommitContext {
+                    CursorCommitContext {
                         cursors,
-                        plans: sqlprep,
+                        plans: Some(sqlprep),
                         arena,
-                    }),
+                    },
                     arena,
                     responder,
                 )
@@ -14019,6 +14219,7 @@ impl Engine {
         arena: &'a Arena,
         params: &[Datum<'a>],
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         responder: &mut Responder,
     ) -> Result<Option<&'a [(&'a str, &'a ast::MaterializedCte<'a>)]>, SqlError> {
         if !with.iter().any(|c| c.dml.is_some()) {
@@ -14064,6 +14265,7 @@ impl Engine {
                     arena,
                     params,
                     guc,
+                    cursors,
                     responder,
                 )?)
             };
@@ -14129,6 +14331,7 @@ impl Engine {
         arena: &'a Arena,
         params: &[Datum<'e>],
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         responder: &mut Responder,
     ) -> Result<&'a [&'a [u8]], SqlError> {
         use crate::sql::exec::encode_projected_pub;
@@ -14164,6 +14367,7 @@ impl Engine {
                 txn,
                 params,
                 guc,
+                cursors,
                 responder,
                 Some(&mut sink),
             ),
@@ -14176,6 +14380,7 @@ impl Engine {
                 txn,
                 params,
                 guc,
+                cursors,
                 responder,
                 Some(&mut sink),
                 connection_id,
@@ -14234,6 +14439,7 @@ impl Engine {
                         arena,
                         params,
                         guc,
+                        cursors,
                         responder,
                     )?;
                     let length = exec::projected_rows_len(rows)?;
@@ -14287,6 +14493,7 @@ impl Engine {
         arena: &'a Arena,
         params: &[Datum<'a>],
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         responder: &mut Responder,
     ) -> Result<&'a [&'a [u8]], SqlError> {
         self.storage.set_read_snapshot(txn.command_id());
@@ -14317,6 +14524,7 @@ impl Engine {
             arena,
             params,
             guc,
+            cursors,
             responder,
         )
     }
@@ -14333,6 +14541,7 @@ impl Engine {
         arena: &'a Arena,
         params: &[Datum<'a>],
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
         if bound.iter().any(|(_, materialized)| {
@@ -14365,6 +14574,7 @@ impl Engine {
                 arena,
                 params,
                 guc,
+                cursors,
                 responder,
             )?);
             let materialized = arena
@@ -14386,6 +14596,7 @@ impl Engine {
         txn: &mut TxnState,
         params: &[Datum<'a>],
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
         connection_id: i32,
@@ -14433,6 +14644,7 @@ impl Engine {
                     txn,
                     params,
                     guc,
+                    cursors,
                     responder,
                     capture,
                 );
@@ -14455,6 +14667,7 @@ impl Engine {
                     txn,
                     params,
                     guc,
+                    cursors,
                     responder,
                     capture,
                 );
@@ -14514,6 +14727,7 @@ impl Engine {
                 txn,
                 params,
                 guc,
+                cursors,
                 responder,
                 capture,
             );
@@ -14859,6 +15073,7 @@ impl Engine {
                     txn,
                     params,
                     guc,
+                    cursors,
                     responder,
                     capture.take(),
                 )
@@ -15015,6 +15230,7 @@ impl Engine {
                             txn,
                             params,
                             guc,
+                            cursors,
                             responder,
                             if use_returning { capture.take() } else { None },
                             use_returning,
@@ -15047,6 +15263,7 @@ impl Engine {
                     txn,
                     params,
                     guc,
+                    cursors,
                     responder,
                     capture.take(),
                 )
@@ -15082,6 +15299,7 @@ impl Engine {
         txn: &mut TxnState,
         params: &[Datum<'a>],
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
         returning: bool,
@@ -15099,6 +15317,7 @@ impl Engine {
                         txn,
                         params,
                         guc,
+                        cursors,
                         responder,
                         capture,
                         connection_id,
@@ -15115,6 +15334,7 @@ impl Engine {
                         txn,
                         params,
                         guc,
+                        cursors,
                         responder,
                         None,
                         connection_id,
@@ -15187,6 +15407,7 @@ impl Engine {
         txn: &mut TxnState,
         params: &[Datum<'a>],
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
@@ -15233,6 +15454,7 @@ impl Engine {
                 txn,
                 params,
                 guc,
+                cursors,
                 responder,
                 capture,
             );
@@ -15259,6 +15481,7 @@ impl Engine {
                 txn,
                 params,
                 guc,
+                cursors,
                 responder,
                 capture,
             );
@@ -15267,7 +15490,7 @@ impl Engine {
             storage,
             txn,
             arena,
-            guc.seq_session(),
+            &mut exec::TriggerServices::new(guc.seq_session(), cursors),
             responder,
             view,
             statement,
@@ -15286,6 +15509,7 @@ impl Engine {
                 txn,
                 params,
                 guc,
+                cursors,
                 responder,
                 capture,
             )
@@ -15298,7 +15522,7 @@ impl Engine {
             storage,
             txn,
             arena,
-            guc.seq_session(),
+            &mut exec::TriggerServices::new(guc.seq_session(), cursors),
             responder,
             view,
             statement,
@@ -15328,6 +15552,7 @@ impl Engine {
         txn: &mut TxnState,
         params: &[Datum<'a>],
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
@@ -15357,7 +15582,7 @@ impl Engine {
             expanded,
             arena,
             params,
-            guc.seq_session(),
+            &mut exec::TriggerServices::new(guc.seq_session(), cursors),
             responder,
             capture,
         )
@@ -15373,6 +15598,7 @@ impl Engine {
         txn: &mut TxnState,
         params: &[Datum<'a>],
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
@@ -15450,7 +15676,7 @@ impl Engine {
                         view,
                         arena,
                         params,
-                        guc.seq_session(),
+                        &mut exec::TriggerServices::new(guc.seq_session(), cursors),
                         responder,
                         capture,
                     );
@@ -15514,7 +15740,7 @@ impl Engine {
                     view_check,
                     arena,
                     params,
-                    guc.seq_session(),
+                    &mut exec::TriggerServices::new(guc.seq_session(), cursors),
                     responder,
                     capture,
                     None,
@@ -15542,7 +15768,7 @@ impl Engine {
                         view,
                         arena,
                         params,
-                        guc.seq_session(),
+                        &mut exec::TriggerServices::new(guc.seq_session(), cursors),
                         responder,
                         capture,
                     );
@@ -15608,7 +15834,7 @@ impl Engine {
                     view_check,
                     arena,
                     params,
-                    guc.seq_session(),
+                    &mut exec::TriggerServices::new(guc.seq_session(), cursors),
                     responder,
                     capture,
                     None,
@@ -15633,7 +15859,7 @@ impl Engine {
                         view,
                         arena,
                         params,
-                        guc.seq_session(),
+                        &mut exec::TriggerServices::new(guc.seq_session(), cursors),
                         responder,
                         capture,
                     );
@@ -15686,7 +15912,7 @@ impl Engine {
                     authorization,
                     arena,
                     params,
-                    guc.seq_session(),
+                    &mut exec::TriggerServices::new(guc.seq_session(), cursors),
                     responder,
                     capture,
                     None,
@@ -15777,6 +16003,7 @@ impl Engine {
                 params,
                 txn,
                 guc,
+                cursors,
                 Some(&invocations),
                 responder,
             )?;
@@ -16212,6 +16439,7 @@ impl Engine {
                                     txn,
                                     params,
                                     guc,
+                                    cursors,
                                     responder,
                                     None,
                                     self.work.connection_id(),
@@ -16224,11 +16452,12 @@ impl Engine {
                                 txn,
                                 params,
                                 guc,
+                                cursors,
                                 responder,
                                 None,
                             )?,
                             Stmt::With { ctes, statement } => self.execute_with_data_modification(
-                                ctes, statement, arena, params, txn, guc, responder, None,
+                                ctes, statement, arena, params, txn, guc, cursors, responder, None,
                             )?,
                             _ => unreachable!("resumable modification has a mutation statement"),
                         })
@@ -16663,6 +16892,7 @@ impl Engine {
         params: &[Datum],
         txn: &mut TxnState,
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         invocations: Option<&'statement query::RoutineInvocationState>,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
@@ -16677,6 +16907,7 @@ impl Engine {
                     arena,
                     params,
                     guc,
+                    cursors,
                     responder,
                 ) {
                     Ok(materialized) => materialized.unwrap_or(&[]),
@@ -16705,6 +16936,7 @@ impl Engine {
                     arena,
                     params,
                     guc,
+                    cursors,
                     responder,
                 ))
             },
@@ -17815,6 +18047,10 @@ impl Engine {
         ))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "statement execution lends the session's cursors to the triggers it fires"
+    )]
     pub(crate) fn execute_explained_statement(
         &mut self,
         statement: &Stmt<'_>,
@@ -17822,11 +18058,12 @@ impl Engine {
         params: &[Datum],
         txn: &mut TxnState,
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         match statement {
             Stmt::Select(select) => {
-                self.execute_select_once(select, arena, params, txn, guc, None, responder)
+                self.execute_select_once(select, arena, params, txn, guc, cursors, None, responder)
             }
             Stmt::SetQuery(query) => {
                 let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
@@ -17849,6 +18086,7 @@ impl Engine {
                 txn,
                 params,
                 guc,
+                cursors,
                 responder,
                 None,
                 self.work.connection_id(),
@@ -17860,11 +18098,12 @@ impl Engine {
                 txn,
                 params,
                 guc,
+                cursors,
                 responder,
                 None,
             ),
             Stmt::With { ctes, statement } => self.execute_with_data_modification(
-                ctes, statement, arena, params, txn, guc, responder, None,
+                ctes, statement, arena, params, txn, guc, cursors, responder, None,
             ),
             _ => Ok(Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -17885,6 +18124,7 @@ impl Engine {
         params: &[Datum<'a>],
         txn: &mut TxnState,
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
@@ -17898,13 +18138,14 @@ impl Engine {
             return Ok(Err(error));
         }
         let main = query::CteReader::Statement(statement);
-        let dml_mats = match self.bind_dml_ctes(ctes, main, txn, arena, params, guc, responder) {
-            Ok(materialized) => materialized.unwrap_or(&[]),
-            Err(error) => return Ok(Err(error)),
-        };
+        let dml_mats =
+            match self.bind_dml_ctes(ctes, main, txn, arena, params, guc, cursors, responder) {
+                Ok(materialized) => materialized.unwrap_or(&[]),
+                Err(error) => return Ok(Err(error)),
+            };
         let output_mark = responder.mark();
         let outcome = self.execute_with_main_statement(
-            ctes, statement, dml_mats, params, txn, guc, responder, capture,
+            ctes, statement, dml_mats, params, txn, guc, cursors, responder, capture,
         )?;
         if outcome.is_err() {
             return Ok(outcome);
@@ -17918,6 +18159,7 @@ impl Engine {
             arena,
             params,
             guc,
+            cursors,
             responder,
         ))
     }
@@ -17937,11 +18179,12 @@ impl Engine {
         arena: &'a Arena,
         params: &[Datum<'a>],
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
-        let error = match self
-            .run_unread_dml_ctes(with, main, dml_mats, txn, arena, params, guc, responder)
-        {
+        let error = match self.run_unread_dml_ctes(
+            with, main, dml_mats, txn, arena, params, guc, cursors, responder,
+        ) {
             Ok(_) => return Ok(()),
             Err(error) => error,
         };
@@ -17961,6 +18204,7 @@ impl Engine {
         params: &[Datum<'a>],
         txn: &mut TxnState,
         guc: &GucState,
+        cursors: &mut cursor::CursorPool,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
@@ -17988,6 +18232,7 @@ impl Engine {
                 txn,
                 params,
                 guc,
+                cursors,
                 responder,
                 capture,
                 self.work.connection_id(),
@@ -17999,6 +18244,7 @@ impl Engine {
                 txn,
                 params,
                 guc,
+                cursors,
                 responder,
                 capture,
             ),
@@ -18740,11 +18986,11 @@ impl Engine {
                 txn,
                 guc,
                 crate::sql::txn::CommitTarget::Ordinary,
-                Some(CursorCommitContext {
+                CursorCommitContext {
                     cursors,
-                    plans: sqlprep,
+                    plans: Some(sqlprep),
                     arena,
-                }),
+                },
                 arena,
                 responder,
             )?;
@@ -19616,6 +19862,7 @@ impl Engine {
                         execution_params,
                         txn,
                         guc,
+                        cursors,
                         responder,
                     );
                     let output = responder.finish_discard_query_output();
@@ -19654,7 +19901,7 @@ impl Engine {
                 statement, arena, params, txn, sqlprep, cursors, guc, responder,
             ),
             Stmt::With { ctes, statement } => self.execute_with_data_modification(
-                ctes, statement, arena, params, txn, guc, responder, capture,
+                ctes, statement, arena, params, txn, guc, cursors, responder, capture,
             ),
             Stmt::Select(select) => {
                 self.execute_select(select, arena, params, txn, sqlprep, cursors, guc, responder)
@@ -20969,6 +21216,7 @@ impl Engine {
                 txn,
                 params,
                 guc,
+                cursors,
                 responder,
                 capture,
                 self.work.connection_id(),
@@ -20980,6 +21228,7 @@ impl Engine {
                 txn,
                 params,
                 guc,
+                cursors,
                 responder,
                 capture,
             ),
@@ -21000,7 +21249,7 @@ impl Engine {
                 &mut self.storage,
                 txn,
                 arena,
-                guc.seq_session(),
+                &mut exec::TriggerServices::new(guc.seq_session(), cursors),
                 tables,
                 *restart_identity,
                 *cascade,
@@ -21448,11 +21697,11 @@ impl Engine {
                         txn,
                         guc,
                         crate::sql::txn::CommitTarget::Ordinary,
-                        Some(CursorCommitContext {
+                        CursorCommitContext {
                             cursors,
-                            plans: sqlprep,
+                            plans: Some(sqlprep),
                             arena,
-                        }),
+                        },
                         arena,
                         responder,
                     ) {
@@ -21590,9 +21839,9 @@ impl Engine {
                 responder.command_complete("ROLLBACK")?;
                 Ok(Ok(()))
             }
-            Stmt::SetConstraints { targets, mode } => {
-                self.execute_set_constraints_statement(*targets, *mode, txn, guc, arena, responder)
-            }
+            Stmt::SetConstraints { targets, mode } => self.execute_set_constraints_statement(
+                *targets, *mode, txn, guc, cursors, arena, responder,
+            ),
             Stmt::Set {
                 name,
                 value,
@@ -21722,7 +21971,8 @@ impl Engine {
                     if let Err(error) = self.ensure_txn(txn, txn.mode, guc) {
                         return Ok(Err(error));
                     }
-                    if let Err(error) = self.copy_start(&setup, txn, guc, arena, responder) {
+                    if let Err(error) = self.copy_start(&setup, txn, guc, cursors, arena, responder)
+                    {
                         return Ok(Err(error));
                     }
                     responder.copy_in_response(setup.n_targets, setup.fmt.binary)?;
@@ -23506,96 +23756,15 @@ impl Engine {
                         Ok(false) => {}
                         Err(error) => return Err(error),
                     }
-                    let out = {
-                        let (query, description, rows) = cursors.execution_parts(at);
-                        let mut capture = Responder::for_cursor(
-                            description,
-                            crate::pg::respond::CursorRowOutput::Save(rows),
-                        );
-                        capture.set_render(guc.render());
-                        query.with_query(|parsed, params, _| {
-                            let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txid);
-                            match parsed {
-                                cursor::CursorStatement::Select(select)
-                                    if select.with.iter().any(|cte| cte.dml.is_some()) =>
-                                {
-                                    // Described now; it runs on its first read.
-                                    let mut columns =
-                                        [ColDesc::new("", 0, 0); crate::sql::MAX_PROJ];
-                                    let described = query::expand_ctes(select, storage, txid, work)
-                                        .and_then(|select| {
-                                            query::describe_select(
-                                                select,
-                                                storage,
-                                                txid,
-                                                work,
-                                                &mut columns,
-                                                exec::DescriptionTarget::Wire,
-                                                None,
-                                            )
-                                        });
-                                    match described {
-                                        Ok(count) => {
-                                            capture.row_description(&columns[..count]).map(Ok)
-                                        }
-                                        Err(error) => Ok(Err(error)),
-                                    }
-                                }
-                                cursor::CursorStatement::Select(select) => {
-                                    let select = match query::expand_ctes_exec(
-                                        select,
-                                        storage,
-                                        txid,
-                                        work,
-                                        params,
-                                        &[],
-                                        Some(&sequence),
-                                    ) {
-                                        Ok(select) => select,
-                                        Err(error) => {
-                                            return Ok(Err(error));
-                                        }
-                                    };
-                                    if let Err(error) =
-                                        query::validate_locking(select, storage, txid, work)
-                                    {
-                                        return Ok(Err(error));
-                                    }
-                                    if select.from.is_none() {
-                                        query::constant_select(
-                                            storage,
-                                            txid,
-                                            select,
-                                            work,
-                                            params,
-                                            Some(&sequence),
-                                            &mut capture,
-                                        )
-                                    } else {
-                                        query::select_query(
-                                            storage,
-                                            txid,
-                                            select,
-                                            work,
-                                            params,
-                                            Some(&sequence),
-                                            &mut capture,
-                                        )
-                                    }
-                                }
-                                cursor::CursorStatement::SetQuery(query) => query::set_query(
-                                    storage,
-                                    txid,
-                                    query,
-                                    work,
-                                    params,
-                                    Some(&sequence),
-                                    &mut capture,
-                                ),
-                            }
-                        })?
-                    };
-                    out.map_err(|_| cursor_description_too_large())?
+                    save_cursor_rows(
+                        cursors,
+                        at,
+                        storage,
+                        txid,
+                        work,
+                        guc.render(),
+                        guc.seq_session(),
+                    )
                 },
             )
         });
@@ -24068,11 +24237,21 @@ impl Engine {
         &mut self,
         txn: &mut TxnState,
         cursors: &mut cursor::CursorPool,
-        sqlprep: &mut SqlPreparedPool,
+        sqlprep: Option<&mut SqlPreparedPool>,
         guc: &GucState,
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
+        if cursors.next_hold_source().is_none() {
+            return Ok(());
+        }
+        // Only a client session declares WITH HOLD cursors.
+        let sqlprep = sqlprep.ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a held cursor has no session prepared-statement pool"
+            )
+        })?;
         while let Some(at) = cursors.next_hold_source() {
             if cursors.begin_scroll_hold(at) {
                 self.run_scroll_command(at, arena, txn, sqlprep, cursors, guc, responder)?;
@@ -24165,7 +24344,16 @@ impl Engine {
                 Some(query::RoutineInvocationContext::new(&invocations, arena)),
                 || {
                     let written = self
-                        .bind_dml_ctes(statement.with, main, txn, arena, params, guc, responder)?
+                        .bind_dml_ctes(
+                            statement.with,
+                            main,
+                            txn,
+                            arena,
+                            params,
+                            guc,
+                            cursors,
+                            responder,
+                        )?
                         .unwrap_or(&[]);
                     let mut capture = Responder::for_cursor(
                         description,
@@ -24194,6 +24382,7 @@ impl Engine {
                         arena,
                         params,
                         guc,
+                        cursors,
                         responder,
                     )
                 },
@@ -24692,6 +24881,28 @@ impl Engine {
         let deferred_at = deferred
             .cursor
             .map(|cursor| crate::pg::respond::CursorPosition::in_text(text, cursor).get());
+        // ALTER TABLE opens its relation before analysing the subcommands.
+        if let Stmt::AlterTable(alter) | Stmt::AlterForeignTable(alter) = statement
+            && !alter.if_exists
+            && self
+                .storage
+                .resolve_relation(alter.table.schema, alter.table.name, txid)
+                .is_none()
+        {
+            return Some(match alter.table.schema {
+                Some(schema) => sql_err!(
+                    eval::sqlstate::UNDEFINED_TABLE,
+                    "relation \"{}.{}\" does not exist",
+                    schema,
+                    alter.table.name
+                ),
+                None => sql_err!(
+                    eval::sqlstate::UNDEFINED_TABLE,
+                    "relation \"{}\" does not exist",
+                    alter.table.name
+                ),
+            });
+        }
         let described = match statement {
             Stmt::Select(select) => {
                 let mark = arena.mark();

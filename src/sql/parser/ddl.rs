@@ -8960,7 +8960,8 @@ impl<'a> Parser<'a> {
     /// The attribute elements PostgreSQL allows after a column constraint
     /// (`DEFERRABLE`, `INITIALLY ...`, `[NOT] ENFORCED`), applied to the
     /// constraint before them as its parse analysis does, with the same
-    /// errors at the offending attribute.
+    /// errors at the offending attribute. The grammar accepts any sequence,
+    /// so these errors wait until the whole statement has parsed.
     fn column_constraint_attributes(
         &mut self,
         target: ColumnAttributeTarget,
@@ -8988,10 +8989,10 @@ impl<'a> Parser<'a> {
             };
             if self.eat_ident("deferrable")? {
                 if !defers {
-                    return Err(misplaced("DEFERRABLE"));
+                    self.analysis_error(misplaced("DEFERRABLE"))?;
                 }
                 if saw_deferrability {
-                    return Err(multiple_deferrability(at));
+                    self.analysis_error(multiple_deferrability(at))?;
                 }
                 saw_deferrability = true;
                 deferrable = true;
@@ -9001,23 +9002,23 @@ impl<'a> Parser<'a> {
                 self.expect_ident("not")?;
                 if self.eat_ident("deferrable")? {
                     if !defers {
-                        return Err(misplaced("NOT DEFERRABLE"));
+                        self.analysis_error(misplaced("NOT DEFERRABLE"))?;
                     }
                     if saw_deferrability {
-                        return Err(multiple_deferrability(at));
+                        self.analysis_error(multiple_deferrability(at))?;
                     }
                     saw_deferrability = true;
                     deferrable = false;
                     if saw_initially && initially_deferred {
-                        return Err(deferred_not_deferrable(at));
+                        self.analysis_error(deferred_not_deferrable(at))?;
                     }
                 } else {
                     self.expect_ident("enforced")?;
                     if !enforces {
-                        return Err(misplaced("NOT ENFORCED"));
+                        self.analysis_error(misplaced("NOT ENFORCED"))?;
                     }
                     if saw_enforced {
-                        return Err(multiple_enforcement(at));
+                        self.analysis_error(multiple_enforcement(at))?;
                     }
                     saw_enforced = true;
                     enforced = false;
@@ -9030,17 +9031,17 @@ impl<'a> Parser<'a> {
                     false
                 };
                 if !defers {
-                    return Err(misplaced(if deferred {
+                    self.analysis_error(misplaced(if deferred {
                         "INITIALLY DEFERRED"
                     } else {
                         "INITIALLY IMMEDIATE"
-                    }));
+                    }))?;
                 }
                 if saw_initially {
-                    return Err(positioned_syntax_error(
+                    self.analysis_error(positioned_syntax_error(
                         at,
                         "multiple INITIALLY IMMEDIATE/DEFERRED clauses not allowed",
-                    ));
+                    ))?;
                 }
                 saw_initially = true;
                 initially_deferred = deferred;
@@ -9049,15 +9050,15 @@ impl<'a> Parser<'a> {
                     if !saw_deferrability {
                         deferrable = true;
                     } else if !deferrable {
-                        return Err(deferred_not_deferrable(at));
+                        self.analysis_error(deferred_not_deferrable(at))?;
                     }
                 }
             } else if self.eat_ident("enforced")? {
                 if !enforces {
-                    return Err(misplaced("ENFORCED"));
+                    self.analysis_error(misplaced("ENFORCED"))?;
                 }
                 if saw_enforced {
-                    return Err(multiple_enforcement(at));
+                    self.analysis_error(multiple_enforcement(at))?;
                 }
                 saw_enforced = true;
                 enforced = true;

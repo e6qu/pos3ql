@@ -330,12 +330,12 @@ impl CursorQuery {
         Ok(())
     }
 
-    pub(crate) fn prepare_source(
+    /// Records the SQL result types of the bound query once.
+    pub(crate) fn prepare_result_types(
         &mut self,
         storage: &crate::storage::Storage,
         txid: u32,
-        responder: &mut crate::pg::respond::Responder<'_>,
-    ) -> Result<bool, SqlError> {
+    ) -> Result<(), SqlError> {
         let bound = self.bound.as_ref().expect("bound cursor query");
         if self.result_type_oids.is_none() {
             let mut types = [0; crate::sql::MAX_PROJ];
@@ -392,6 +392,17 @@ impl CursorQuery {
                     )
                 })?);
         }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_source(
+        &mut self,
+        storage: &crate::storage::Storage,
+        txid: u32,
+        responder: &mut crate::pg::respond::Responder<'_>,
+    ) -> Result<bool, SqlError> {
+        self.prepare_result_types(storage, txid)?;
+        let bound = self.bound.as_ref().expect("bound cursor query");
         let CursorStatement::Select(statement) = bound.statement else {
             return Ok(false);
         };

@@ -534,11 +534,11 @@ fn catalog_publication_schema_cascade_waits_for_affected_readers_only() {
                     &mut editor.transaction,
                     &editor.guc,
                     crate::sql::txn::CommitTarget::Ordinary,
-                    Some(CursorCommitContext {
+                    CursorCommitContext {
                         cursors: &mut editor.cursors,
-                        plans: &mut editor.pool,
+                        plans: Some(&mut editor.pool),
                         arena: &editor.arena,
-                    }),
+                    },
                     &editor.arena,
                     &mut Responder::new(&mut editor.send),
                 )
@@ -18182,7 +18182,14 @@ fn copy_line(
     engine.copy_row_line(
         setup,
         line,
-        super::CopyRowContext::new(txn, guc, arena, &mut responder, inserted),
+        super::CopyRowContext::new(
+            txn,
+            guc,
+            &mut super::cursor::CursorPool::for_tests(),
+            arena,
+            &mut responder,
+            inserted,
+        ),
     )
 }
 
@@ -18205,7 +18212,14 @@ fn copy_binary_row(
     engine.copy_row_binary(
         setup,
         row,
-        super::CopyRowContext::new(txn, guc, arena, &mut responder, inserted),
+        super::CopyRowContext::new(
+            txn,
+            guc,
+            &mut super::cursor::CursorPool::for_tests(),
+            arena,
+            &mut responder,
+            inserted,
+        ),
     )
 }
 
@@ -18218,11 +18232,16 @@ fn finish_copy(
     inserted: &mut crate::sql::exec::CopyTransitionRows,
 ) -> Result<(), SqlError> {
     let mut send = crate::mem::FixedBuf::new(budget, "copy finish response", 1 << 16).unwrap();
+    let arena = Arena::new(budget, "copy finish arena", 1 << 12).unwrap();
     let result = engine.copy_finish(
         setup,
         txn,
         guc,
-        None,
+        CursorCommitContext {
+            cursors: &mut super::cursor::CursorPool::for_tests(),
+            plans: None,
+            arena: &arena,
+        },
         &mut Responder::new(&mut send),
         inserted,
         CopyFinishMode::ImplicitTransaction,
@@ -96310,6 +96329,7 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                     &setup,
                     &mut reader.transaction,
                     &reader.guc,
+                    &mut reader.cursors,
                     &arena,
                     &mut Responder::new(&mut send),
                 )
@@ -96323,6 +96343,7 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                 let context = CopyRowContext::new(
                     &mut reader.transaction,
                     &reader.guc,
+                    &mut reader.cursors,
                     &arena,
                     &mut responder,
                     &mut transition,
@@ -96365,11 +96386,11 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                         &setup,
                         &mut reader.transaction,
                         &reader.guc,
-                        Some(CursorCommitContext {
+                        CursorCommitContext {
                             cursors: &mut reader.cursors,
-                            plans: &mut reader.pool,
+                            plans: Some(&mut reader.pool),
                             arena: &reader.arena,
-                        }),
+                        },
                         &mut Responder::new(&mut send),
                         &transition,
                         CopyFinishMode::ImplicitTransaction,

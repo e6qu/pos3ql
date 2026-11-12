@@ -6,6 +6,7 @@ use crate::sql::lock::{AdvisoryDecision, AdvisoryKey, AdvisoryMode};
 
 #[test]
 fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_statements() {
+    let mut test_cursors = crate::sql::cursor::CursorPool::for_tests();
     const SOURCE: &str = "DECLARE n integer := 0; marker text := 'seed'; BEGIN \
         PERFORM pg_advisory_lock(41); n := n + 1; \
         FOR i IN 1..2 LOOP marker := marker || i::text; \
@@ -102,7 +103,10 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
             let mut context = TriggerExecContext {
                 host: PlpgsqlExecHost::Atomic {
                     storage: &mut storage,
-                    seq_session: guc.seq_session(),
+                    services: crate::sql::exec::TriggerServices::new(
+                        guc.seq_session(),
+                        &mut test_cursors,
+                    ),
                 },
                 txn: &mut command,
                 arena: &original,
@@ -210,7 +214,10 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
                 let mut context = TriggerExecContext {
                     host: PlpgsqlExecHost::Atomic {
                         storage: &mut storage,
-                        seq_session: guc.seq_session(),
+                        services: crate::sql::exec::TriggerServices::new(
+                            guc.seq_session(),
+                            &mut test_cursors,
+                        ),
                     },
                     txn: &mut command,
                     arena: &resumed,

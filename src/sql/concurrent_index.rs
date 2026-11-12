@@ -749,11 +749,11 @@ impl super::Engine {
             txn,
             guc,
             target,
-            Some(super::CursorCommitContext {
+            super::CursorCommitContext {
                 cursors,
-                plans: sqlprep,
+                plans: Some(sqlprep),
                 arena,
-            }),
+            },
             arena,
             responder,
         );

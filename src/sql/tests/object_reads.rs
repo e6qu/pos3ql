@@ -96,7 +96,11 @@ impl HttpObjectServer {
                 connections.push(std::thread::spawn(move || {
                 let mut request = [0u8; 8192];
                 let Some((received, header_end)) =
-                    crate::test_wait::read_request_head(&mut stream, &mut request, &server_stop)
+                    crate::test_wait::read_request_head_or_close(
+                            &mut stream,
+                            &mut request,
+                            &server_stop,
+                        )
                 else {
                     return;
                 };

@@ -138,6 +138,10 @@ enum ColdRequest {
     CteTwice,
     /// The same self-join through two derived tables.
     DerivedSelfJoin,
+    /// A paged portal filtered by an uncorrelated subquery of the same cold
+    /// table: the stream runs it once, before its first row, waiting on its
+    /// reads like any build.
+    Subquery,
 }
 
 #[test]
@@ -239,6 +243,11 @@ fn derived_self_joins_merge_and_stream() {
     );
 }
 
+#[test]
+fn uncorrelated_subqueries_run_once_before_the_stream() {
+    cold_result_stream("result-stream-cold-subquery", ColdRequest::Subquery);
+}
+
 fn cold_result_stream(name: &str, request: ColdRequest) {
     let paged = matches!(
         request,
@@ -248,6 +257,7 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
             | ColdRequest::Union
             | ColdRequest::Join
             | ColdRequest::RightJoin
+            | ColdRequest::Subquery
     );
     let mut config = test_config(name);
     config.object_store_on = true;
@@ -353,6 +363,11 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
             ColdRequest::DerivedSelfJoin => query(
                 "SELECT a.id, a.code FROM (SELECT id, code FROM cold_orders) a \
                  JOIN (SELECT id FROM cold_orders) b ON a.id = b.id",
+            ),
+            ColdRequest::Subquery => paged_request(
+                "SELECT id, code FROM cold_orders \
+                 WHERE id >= (SELECT min(id) FROM cold_orders) AND EXISTS (SELECT 1)",
+                50,
             ),
             ColdRequest::GroupedQuery => {
                 query("SELECT id, max(code), count(*) FROM cold_orders GROUP BY id")
@@ -472,7 +487,11 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
             // statement would read every object again.
             assert!(gets <= fetched + 1, "{gets} GETs of {}", fetched);
         }
-        ColdRequest::Paged | ColdRequest::Union | ColdRequest::Join | ColdRequest::RightJoin => {
+        ColdRequest::Paged
+        | ColdRequest::Union
+        | ColdRequest::Join
+        | ColdRequest::RightJoin
+        | ColdRequest::Subquery => {
             // Each full page suspends; the unlimited Execute returns the rest.
             assert_eq!(kinds.iter().filter(|kind| **kind == b's').count(), 3);
             assert_eq!(response[kinds.len() - 2].1, b"SELECT 170\0");

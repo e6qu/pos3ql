@@ -107,8 +107,9 @@ stream sorts itself (local mode), or a **retained grouping** of such a
 source (`GROUP BY`, `HAVING`, aggregates and plain `DISTINCT`, below), or
 `DISTINCT ON` the stream sorts (local mode), or a `UNION ALL` of such
 queries without its own `ORDER BY` (below);
-without grouping sets, other set operations, subqueries (a simple subquery in
-FROM is merged into its query first, below), CTEs that run once, row locking
+without grouping sets, other set operations, subqueries other than
+uncorrelated scalar ones (a simple subquery in FROM is merged into its query
+first, below), CTEs that run once, row locking
 or row security, whose read position (one
 record per resident row of each table plus the query text) fits
 `result_stream_bytes`. A retained join uses inner, cross and `LEFT` joins,
@@ -283,6 +284,17 @@ and otherwise (column privileges only, `security_barrier`) spools. So
 streams as the scan of `orders` it becomes, while the same query with `AS
 MATERIALIZED` spools (`src/sql/query/cte.rs`, `expand_stream_ctes`).
 
+**Built: uncorrelated subqueries.** A stream, or a top-level `SELECT` run in
+place, keeps scalar, `EXISTS`, `ARRAY` and row subqueries that read no column
+of its query and call no volatile or user-defined function. It runs them once
+before its first row, as the general executor runs them before its scan, and
+keeps their values in its own allocation (`result_stream_bytes`; one that
+does not fit spools for `capacity`), so `SELECT id, payload FROM orders WHERE
+id > (SELECT max(id) - 1000 FROM orders)` streams. A wait inside a subquery
+runs it again; no row exists yet. Correlated subqueries, `IN` and `ANY`/`ALL`
+lists, subqueries in a sorted or grouped stream, in a `UNION ALL` query or
+in a declared cursor still spool or save their rows.
+
 Every other shape runs in the general executor, which materializes in the
 statement arena and cannot pause after its first byte. New node kinds are the
 planned route for subqueries, set operations and sorts of results in
@@ -396,7 +408,8 @@ being built and are released when it is delivered.
 | `DISTINCT` (built: plain, as a grouping by the output list) | Each distinct output row | `plan_build_bytes` |
 | Sort (built: local mode, also for `DISTINCT ON`) | Sort keys, saved output and input columns of every row | `plan_build_bytes`; object-store mode: the external sorter's runs on the block grid (not built) |
 | Set operations (built: `UNION ALL` in streams) | `UNION ALL`: each query's own plan and the current query; others: sorted runs of both inputs with counts | Stream allocation; others: external runs |
-| Scalar, `IN`/`EXISTS` subquery | Per-outer-row child tree, rewound per row, or a cached sorted run when uncorrelated | Node record or external run |
+| Scalar, `EXISTS`, `ARRAY` and row subquery (built: uncorrelated, unsorted and ungrouped, run once before the first row) | Each value; correlated: a per-outer-row child tree, rewound per row | Stream allocation |
+| `IN`/`ANY`/`ALL` subquery | A cached sorted run when uncorrelated, or a per-outer-row child tree | External run |
 | Derived table, CTE read once | Child tree in place | Its nodes |
 
 **Choosing a stream before execution.** Eligibility is decided from the

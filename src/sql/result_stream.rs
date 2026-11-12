@@ -21,8 +21,8 @@ const STREAM_PLAN_HEADROOM: usize = 32 * 1024;
 pub(crate) enum StreamChoice {
     /// A `SELECT` reopens as a stream if its output first overflows.
     Promote,
-    /// The statement opens its stream before it runs. A `UNION ALL` always
-    /// does: the general executor's attempt would materialize every query
+    /// The statement opens its stream before it runs. A `UNION ALL`
+    /// statement always does: the general executor's attempt would materialize every query
     /// before its first row could overflow. In object-store mode a join,
     /// grouping or sort does too: its attempt would read a whole input
     /// before its first row, and again after each storage wait, so a cold
@@ -132,9 +132,12 @@ impl Engine {
             return Err(SpoolReason::Capacity);
         }
         let mark = self.work.mark();
+        // A UNION ALL statement, as opposed to a UNION ALL in FROM.
+        let mut set_query = false;
         let (source, source_len) = match statement {
             Stmt::Select(select) => (
                 query::stream_query(select, &self.storage, txid, &self.work).and_then(|stream| {
+                    set_query = select.set_body.is_some();
                     stream.map_or(Ok(None), |select| {
                         query::RetainedSelect::stream_source(
                             &self.storage,
@@ -150,6 +153,7 @@ impl Engine {
                 query::set_query_select(set, &self.work)
                     .and_then(|select| query::stream_query(select, &self.storage, txid, &self.work))
                     .and_then(|select| {
+                        set_query = true;
                         select.map_or(Ok(None), |select| {
                             query::RetainedSelect::stream_source(
                                 &self.storage,
@@ -167,6 +171,7 @@ impl Engine {
                     .copy_query_text(copy, txid, &self.work)
                     .and_then(|text| {
                         let select = crate::sql::parser::parse_query(text, &self.work)?;
+                        set_query = select.set_body.is_some();
                         let Some(select) =
                             query::stream_query(select, &self.storage, txid, &self.work)?
                         else {
@@ -189,7 +194,7 @@ impl Engine {
         // The probe resolved names in scratch memory only.
         unsafe { self.work.rewind_to(mark) };
         let opens = match source {
-            Ok(Some(query::StreamSource::Appended(_))) => true,
+            Ok(Some(query::StreamSource::Appended(_))) => set_query,
             Ok(Some(query::StreamSource::Table { builds, .. })) => {
                 builds && self.storage.spill_attached()
             }

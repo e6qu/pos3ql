@@ -26,6 +26,26 @@ pub(crate) fn read_request_head(
     buffer: &mut [u8],
     stop: &AtomicBool,
 ) -> Option<(usize, usize)> {
+    read_head(stream, buffer, stop, false)
+}
+
+/// [`read_request_head`] for a server that serves each connection on its
+/// own: a client that closes the connection before sending anything (a
+/// released read-ahead request) also returns `None`.
+pub(crate) fn read_request_head_or_close(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    stop: &AtomicBool,
+) -> Option<(usize, usize)> {
+    read_head(stream, buffer, stop, true)
+}
+
+fn read_head(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    stop: &AtomicBool,
+    close_allowed: bool,
+) -> Option<(usize, usize)> {
     stream.set_nonblocking(false).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_millis(10)))
@@ -44,6 +64,7 @@ pub(crate) fn read_request_head(
             "fixture request headers are too large"
         );
         match stream.read(&mut buffer[received..]) {
+            Ok(0) if close_allowed && received == 0 => return None,
             Ok(0) => panic!("request ended before its headers"),
             Ok(count) => received += count,
             Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {

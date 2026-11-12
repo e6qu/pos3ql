@@ -679,7 +679,7 @@ fn streaming_array_subquery<'a>(
 
 /// Walks an expression tree collecting subquery nodes, in discovery order and
 /// deduplicated by node identity so each subquery keeps one stable position.
-fn collect_subqueries<'a>(
+pub(super) fn collect_subqueries<'a>(
     expression: &'a Expr<'a>,
     out: &mut ArenaList<'a, &'a Expr<'a>>,
 ) -> Result<(), SqlError> {
@@ -1343,7 +1343,7 @@ pub fn prepare_subqueries<'a>(
 /// EXISTS) into arena-backed [`SubqueryValues`] keyed by node identity.
 /// EXISTS results are stored as boolean scalars.
 #[allow(clippy::too_many_arguments)]
-fn eval_subquery_nodes<'a>(
+pub(super) fn eval_subquery_nodes<'a>(
     nodes: &[&Expr<'a>],
     storage: &'a Storage,
     txid: u32,
@@ -1693,7 +1693,7 @@ impl ScopeChain<'_, '_> {
 
 /// Whether a top-level subquery node references any column from the enclosing
 /// query — i.e. is correlated and must be re-evaluated per outer row.
-fn subquery_node_correlated<'a>(
+pub(super) fn subquery_node_correlated<'a>(
     node: &'a Expr<'a>,
     storage: &'a Storage,
     txid: u32,
@@ -3744,7 +3744,7 @@ fn subquery_hooks_with_outer<'a>(
     detach_subquery_values(borrowed, arena)
 }
 
-fn detach_subquery_values<'a>(
+pub(super) fn detach_subquery_values<'a>(
     borrowed: SubqueryValues<'_, '_>,
     arena: &'a Arena,
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {

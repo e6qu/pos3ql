@@ -115,7 +115,9 @@ is owned.
     index-probed joins, `RIGHT` and `FULL` joins of more than two items or
     over generator calls, grouping sets,
     subqueries other than the simple FROM subqueries merged into their query
-    (scalar, `IN`/`EXISTS`, grouped or bounded derived tables, and scans of
+    and uncorrelated scalar, `EXISTS`, `ARRAY` and row subqueries of unsorted,
+    ungrouped streams (correlated ones, `IN`/`ANY`/`ALL` lists, subqueries
+    under a sort or grouping, grouped or bounded derived tables, and scans of
     CTEs that run once),
     set operations other than `UNION ALL` (and `UNION ALL` under
     `ORDER BY`, in a declared cursor, or with volatile or routine-calling

@@ -743,6 +743,21 @@ fn joins_stream_rows_as_the_client_reads() {
             "SELECT b.id, b.payload, c.id FROM big b, big c WHERE c.id = b.id",
             5000,
         ),
+        // RIGHT and FULL joins read a nested loop with a flag per row of
+        // big, then return big's unmatched rows, as the general executor.
+        (
+            "SELECT b.id, b.payload, t.label FROM tags t RIGHT JOIN big b ON t.k = b.id % 8",
+            5000,
+        ),
+        (
+            "SELECT b.id, b.payload, t.label FROM tags t FULL JOIN big b ON t.k = b.id % 8",
+            5000,
+        ),
+        (
+            "SELECT coalesce(b.id, 5001), b.payload, v.x FROM big b \
+             RIGHT JOIN (VALUES (1), (2), (99)) v(x) ON v.x = b.id % 2 + 1",
+            5001,
+        ),
     ] {
         let opened = fixture.engine.result_stream_metrics().opened;
         client.write_all(&query(sql)).unwrap();

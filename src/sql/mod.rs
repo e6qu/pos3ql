@@ -15790,6 +15790,7 @@ impl Engine {
                     query,
                     arena,
                     params,
+                    &[],
                     Some(&sequence),
                     responder,
                 )
@@ -17636,6 +17637,29 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
+        // A top-level set query runs as one, so its CTEs keep their own
+        // reference counts.
+        if let Some(body) = statement.set_body {
+            let set = ast::SetQuery {
+                with: statement.with,
+                body,
+                order_by: statement.order_by,
+                limit: statement.limit,
+                offset: statement.offset,
+                with_ties: statement.with_ties,
+                locking: statement.locking,
+            };
+            return query::set_query(
+                &self.storage,
+                txn.txid,
+                &set,
+                &self.work,
+                params,
+                dml_mats,
+                Some(&sequence),
+                responder,
+            );
+        }
         let statement = match query::expand_ctes_exec(
             statement,
             &self.storage,
@@ -18740,18 +18764,14 @@ impl Engine {
             Stmt::Select(select) => {
                 self.execute_select_once(select, arena, params, txn, guc, None, responder)
             }
-            Stmt::SetQuery(query) => {
-                let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
-                query::set_query(
-                    &self.storage,
-                    txn.txid,
-                    query,
-                    &self.work,
-                    params,
-                    Some(&sequence),
-                    responder,
-                )
-            }
+            // A set query runs as the Select form subqueries carry, so its
+            // data-modifying CTEs and routine calls run as a SELECT's do.
+            Stmt::SetQuery(query) => match query::set_query_select(query, arena) {
+                Ok(select) => {
+                    self.execute_select_once(select, arena, params, txn, guc, None, responder)
+                }
+                Err(error) => Ok(Err(error)),
+            },
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Self::execute_data_modification(
                 &mut self.storage,
                 &mut self.dml_scratch,
@@ -20839,18 +20859,11 @@ impl Engine {
             Stmt::Select(select) => {
                 self.execute_select(select, arena, params, txn, sqlprep, cursors, guc, responder)
             }
-            Stmt::SetQuery(q) => {
-                let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
-                query::set_query(
-                    &self.storage,
-                    txn.txid,
-                    q,
-                    &self.work,
-                    params,
-                    Some(&sequence),
-                    responder,
-                )
-            }
+            Stmt::SetQuery(q) => match query::set_query_select(q, arena) {
+                Ok(select) => self
+                    .execute_select(select, arena, params, txn, sqlprep, cursors, guc, responder),
+                Err(error) => Ok(Err(error)),
+            },
             Stmt::CreateTable(c) => {
                 exec::create_table(&mut self.storage, &mut self.wal, txn, c, arena, responder)
             }
@@ -24774,6 +24787,7 @@ impl Engine {
                                         query,
                                         work,
                                         params,
+                                        &[],
                                         Some(&sequence),
                                         &mut capture,
                                     ),

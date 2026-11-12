@@ -10238,6 +10238,20 @@ impl<'a> Parser<'a> {
         Ok(expression)
     }
 
+    /// Records where the `WHEN` comparing `value` with a simple `CASE`'s
+    /// operand was written.
+    pub(super) fn record_case_when(&self, value: &Expr<'a>, at: usize) -> Result<(), ParseError> {
+        if let Some(copies) = &self.source_copies
+            && copies
+                .borrow_mut()
+                .push(crate::sql::error_position::SourceCopy::case_when(value, at))
+                .is_err()
+        {
+            return Err(self.arena_full("statement too large for SQL arena"));
+        }
+        Ok(())
+    }
+
     fn arena_expr(&self, e: Expr<'a>) -> Result<&'a Expr<'a>, ParseError> {
         // A constant keeps no source text; its node records where its token
         // was written, so an error about it can point there.

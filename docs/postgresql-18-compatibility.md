@@ -310,6 +310,12 @@ Domains and checked inputs:
   integer parameter fails at Bind. `PREPARE saved AS SELECT
   '{paid}'::checked_status[]` checks the literal once at `PREPARE`;
   `ARRAY['paid']::checked_status[]` checks when executed.
+- `PREPARE` types every parameter as PostgreSQL does: declared types first,
+  then the type its use selects. `PREPARE q AS SELECT round($1)` records
+  `double precision` in `pg_prepared_statements`, so `EXECUTE q(2.5)` returns
+  2. A parameter that is never used (`SELECT $2::int` leaves `$1` unused) or
+  only passed where any type is accepted (`pg_typeof($1)`) fails with `42P18`;
+  an otherwise untyped one is `text`.
 - SQL functions are validated at `CREATE`, then each backend checks and keeps
   the first call's inputs for that definition and argument types. PL/pgSQL keeps
   one instance per resolved argument types and collation. Views, rules,

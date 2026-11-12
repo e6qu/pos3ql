@@ -5379,12 +5379,18 @@ fn infer_type_unpositioned(
                         infer_routine_argument_oid(operand, columns)?,
                         infer_routine_argument_oid(when, columns)?,
                         columns,
-                    )?;
+                    )
+                    .map_err(|error| {
+                        crate::sql::error_position::operator_at_case_when(error, when)
+                    })?;
                     let right = coltype_of_oid(infer_type_res(when, columns)?.0);
                     if let (Some(left), Some(right)) = (left, right)
                         && !comparable(left, right)
                     {
-                        return Err(operator_undefined(left, "=", right));
+                        return Err(crate::sql::error_position::operator_at_case_when(
+                            operator_undefined(left, "=", right),
+                            when,
+                        ));
                     }
                 }
             }

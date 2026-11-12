@@ -29,12 +29,27 @@ pub(crate) struct SourceCopy {
 /// address locates a constant that keeps no source text.
 const NODE: usize = usize::MAX;
 
+/// The length a [`SourceCopy`] of a simple `CASE`'s `WHEN` value records:
+/// the value's address locates its `WHEN` keyword, where PostgreSQL reports
+/// the comparison with the `CASE` operand.
+const CASE_WHEN: usize = usize::MAX - 1;
+
 impl SourceCopy {
     /// Records that the sublink querying `select` was written at byte `at`.
     pub(crate) fn query(select: &crate::sql::ast::Select<'_>, at: usize) -> Self {
         Self {
             address: core::ptr::from_ref(select) as usize,
             len: NODE,
+            at,
+        }
+    }
+
+    /// Records that the `WHEN` comparing `value` with a simple `CASE`'s
+    /// operand was written at byte `at`.
+    pub(crate) fn case_when(value: &crate::sql::ast::Expr<'_>, at: usize) -> Self {
+        Self {
+            address: core::ptr::from_ref(value) as usize,
+            len: CASE_WHEN,
             at,
         }
     }
@@ -58,6 +73,8 @@ struct Source {
     /// Where the text the statement was parsed from starts in `text`, which
     /// parsed source offsets are relative to.
     offset_base: usize,
+    /// Where the text `copies` were recorded from starts in `text`.
+    copies_base: usize,
     /// Whether `text` is a query a routine runs rather than the client's.
     internal: bool,
 }
@@ -68,6 +85,7 @@ const NO_SOURCE: Source = Source {
     copies: core::ptr::null(),
     copies_len: 0,
     offset_base: 0,
+    copies_base: 0,
     internal: false,
 };
 
@@ -183,6 +201,7 @@ pub(crate) fn with_statement_source<R>(
                 copies: copies.as_ptr(),
                 copies_len: copies.len(),
                 offset_base,
+                copies_base: 0,
                 internal: false,
             })
         }),
@@ -215,16 +234,18 @@ fn within_copy(
     const MAX_DELIMITER: usize = 64;
     let text = unsafe { core::slice::from_raw_parts(source.text, source.len) };
     copies.iter().find_map(|copy| {
-        if copy.len == NODE || address < copy.address || address + len > copy.address + copy.len {
+        if copy.len >= CASE_WHEN
+            || address < copy.address
+            || address + len > copy.address + copy.len
+        {
             return None;
         }
         // The copy lives in the statement arena for the statement's duration.
         let copied = unsafe { core::slice::from_raw_parts(copy.address as *const u8, copy.len) };
+        let at = copy.at + source.copies_base;
         (0..=MAX_DELIMITER)
-            .find(|delimiter| {
-                text.get(copy.at + delimiter..copy.at + delimiter + copy.len) == Some(copied)
-            })
-            .map(|delimiter| (copy.at + delimiter + (address - copy.address), source))
+            .find(|delimiter| text.get(at + delimiter..at + delimiter + copy.len) == Some(copied))
+            .map(|delimiter| (at + delimiter + (address - copy.address), source))
     })
 }
 
@@ -241,7 +262,7 @@ fn locate(subject: &str) -> Option<(usize, Source)> {
         .iter()
         .find(|copy| copy.address == address && copy.len == subject.len())
     {
-        return Some((copy.at, source));
+        return Some((copy.at + source.copies_base, source));
     }
     let start = source.text as usize;
     if address < start || address + subject.len() > start + source.len {
@@ -285,7 +306,7 @@ fn expression_start(expression: &crate::sql::ast::Expr<'_>) -> Option<(usize, So
             copies
                 .iter()
                 .find(|copy| copy.len == NODE && copy.address == address)
-                .map(|copy| (copy.at, source))
+                .map(|copy| (copy.at + source.copies_base, source))
         }
         Expr::Str(text) | Expr::NumericLit(text) | Expr::BitLit(text) => locate(text),
         Expr::Column { qualifier, name }
@@ -361,7 +382,7 @@ pub(crate) fn at_node(error: SqlError, expression: &crate::sql::ast::Expr<'_>) -
                 copies
                     .iter()
                     .find(|copy| copy.len == NODE && copy.address == address)
-                    .map(|copy| character_position(source, copy.at))
+                    .map(|copy| character_position(source, copy.at + source.copies_base))
             };
             at(node).or_else(|| query.and_then(at))
         })
@@ -386,6 +407,37 @@ pub(crate) fn operator_at_node(
     }
     let error = at_node(error, expression);
     record(&error, None, Some(BINARY_OPERATOR_HINT));
+    error
+}
+
+/// Positions a missing comparison operator between a simple `CASE`'s
+/// operand and its `WHEN` `value` at the `WHEN` keyword, with PostgreSQL's
+/// hint; other errors pass through.
+pub(crate) fn operator_at_case_when(
+    error: SqlError,
+    value: &crate::sql::ast::Expr<'_>,
+) -> SqlError {
+    if error.sqlstate != crate::sql::eval::sqlstate::UNDEFINED_FUNCTION
+        || !error
+            .message
+            .as_str()
+            .starts_with("operator does not exist: ")
+    {
+        return error;
+    }
+    let address = core::ptr::from_ref(value) as usize;
+    let source = SOURCE.with(Cell::get);
+    let position = (!source.copies.is_null())
+        .then(|| {
+            // with_statement_source keeps the copy map alive with its text.
+            let copies = unsafe { core::slice::from_raw_parts(source.copies, source.copies_len) };
+            copies
+                .iter()
+                .find(|copy| copy.len == CASE_WHEN && copy.address == address)
+                .map(|copy| character_position(source, copy.at + source.copies_base))
+        })
+        .flatten();
+    record(&error, position, Some(BINARY_OPERATOR_HINT));
     error
 }
 
@@ -639,6 +691,7 @@ pub(crate) fn with_internal_source<R>(text: &str, run: impl FnOnce() -> R) -> R 
                 copies: (&[] as &[SourceCopy]).as_ptr(),
                 copies_len: 0,
                 offset_base: 0,
+                copies_base: 0,
                 internal: true,
             })
         }),
@@ -676,12 +729,27 @@ pub(crate) fn with_copied_source<R>(written: &str, copy: &str, run: impl FnOnce(
 /// inside a utility statement (a `CREATE FUNCTION ... BEGIN ATOMIC` body):
 /// their parsed offsets count from the slice's start.
 pub(crate) fn with_analysis_in<R>(text: &str, run: impl FnOnce() -> R) -> R {
+    with_analysis_of_parsed(text, None, run)
+}
+
+/// [`with_analysis_in`] for a statement parsed on its own from `text`, whose
+/// parser recorded `copies` relative to `text`.
+pub(crate) fn with_analysis_of_parsed<R>(
+    text: &str,
+    copies: Option<&[SourceCopy]>,
+    run: impl FnOnce() -> R,
+) -> R {
     let current = SOURCE.with(Cell::get);
     let start = current.text as usize;
     let address = text.as_ptr() as usize;
     let mut source = current;
     if !current.text.is_null() && address >= start && address + text.len() <= start + current.len {
         source.offset_base = address - start;
+        if let Some(copies) = copies {
+            source.copies = copies.as_ptr();
+            source.copies_len = copies.len();
+            source.copies_base = address - start;
+        }
     }
     let _scope = SourceScope(
         SOURCE.with(|installed| installed.replace(source)),

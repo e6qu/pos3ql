@@ -445,6 +445,36 @@ impl Storage {
         self.bind_builtin_input_types(&declared[..actual_oids.len()], actual_oids, txid)
     }
 
+    /// The types a selected built-in gives its untyped parameter inputs. An
+    /// input declared `"any"` stays `"any"`: it does not determine a type.
+    pub(crate) fn builtin_call_parameter_oids(
+        &self,
+        routine_oid: i32,
+        argument_names: &[Option<&str>],
+        actual_oids: &[i32],
+        explicit_variadic: bool,
+        txid: u32,
+    ) -> Option<[i32; MAX_ROUTINE_ARGUMENTS]> {
+        let mut expected = self.builtin_call_input_oids(
+            routine_oid,
+            argument_names,
+            actual_oids,
+            explicit_variadic,
+            txid,
+        )?;
+        let signature = crate::sql::catalog::builtin_callable_by_oid(routine_oid)?;
+        let candidate = Candidate::builtin(0, signature, false);
+        let mapping = candidate.mapping(argument_names, actual_oids.len(), explicit_variadic)?;
+        for ((output, mapped), &actual) in expected.iter_mut().zip(mapping).zip(actual_oids) {
+            if actual == oid::UNKNOWN
+                && candidate.parameter_oid(usize::from(mapped), !explicit_variadic) == oid::ANY
+            {
+                *output = oid::ANY;
+            }
+        }
+        Some(expected)
+    }
+
     fn bind_builtin_input_types(
         &self,
         declared: &[i32],

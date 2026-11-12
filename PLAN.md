@@ -324,10 +324,13 @@ subquery that reads an earlier item's column fails when its own output
 column has the same name (`SELECT * FROM generate_series(1,2) g, LATERAL
 (SELECT g) x` reports `column reference "g" is ambiguous`) or when that item
 renames its columns (`generate_series(1,2) g(c), LATERAL (SELECT c) x` reports
-`column "c" does not exist`); PostgreSQL returns the rows. A SQL `PREPARE`
-without declared parameter types does not infer them from their use, so
-`PREPARE p AS SELECT * FROM t WHERE label > $1; EXECUTE p(2)` compares text
-with an integer and fails where PostgreSQL types `$1` as `text`. `pg_sleep` and its
+`column "c" does not exist`); PostgreSQL returns the rows. An untyped
+parameter of a built-in operator whose overloads PostgreSQL ranks by type
+category takes the other operand's type (`jsonb -> $1` reads `jsonb` where
+PostgreSQL reads `text`), and an ambiguous one (`date + $1`) reports
+`operator does not exist` instead of `operator is not unique`. `PREPARE`
+converts a constant (`'a'::int`) and checks a `WHERE` without `FROM` when the
+statement is executed, where PostgreSQL rejects them at `PREPARE`. `pg_sleep` and its
 variants are catalog entries only: calling them fails as an unknown function.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,

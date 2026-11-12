@@ -1034,8 +1034,15 @@ impl<'a> Parser<'a> {
                     Some(self.expression(0)?)
                 };
                 let mut whens = ArenaList::new(self.arena);
-                while self.eat_ident("when")? {
+                loop {
+                    let when_at = self.peek_at;
+                    if !self.eat_ident("when")? {
+                        break;
+                    }
                     let cond = self.expression(0)?;
+                    if operand.is_some() {
+                        self.record_case_when(cond, when_at)?;
+                    }
                     self.expect_ident("then")?;
                     let result = self.expression(0)?;
                     self.push(&mut whens, (cond, result))?;

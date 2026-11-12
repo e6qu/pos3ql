@@ -1049,3 +1049,38 @@ fn insert_target_counts_are_positioned() {
         }
     });
 }
+
+/// A simple `CASE` compares its operand with each `WHEN` value at the `WHEN`
+/// keyword, and `PREPARE` positions analysis errors in its own text.
+#[test]
+fn case_comparisons_and_prepared_analysis_are_positioned() {
+    with_engine("case-prepare-positions", |engine, budget| {
+        let hint = "hint: No operator matches the given name and argument types. \
+                    You might need to add explicit type casts.";
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "SELECT CASE 1 WHEN 2 THEN 1 WHEN 'a'::text THEN 2 END",
+                &["ERROR 42883 operator does not exist: integer = text @29 "],
+            ),
+            (
+                "PREPARE w AS SELECT CASE $1 WHEN 1 THEN 'a' END",
+                &["ERROR 42883 operator does not exist: text = integer @29 "],
+            ),
+            (
+                "PREPARE w2 AS  SELECT (SELECT 1, 2)",
+                &["ERROR 42601 subquery must return only one column @23"],
+            ),
+        ];
+        for (sql, expected) in cases {
+            let output = run_with(engine, budget, sql);
+            let expected: Vec<String> = expected
+                .iter()
+                .map(|line| match line.strip_suffix(' ') {
+                    Some(line) => format!("{line} {hint}"),
+                    None => (*line).to_owned(),
+                })
+                .collect();
+            assert_eq!(transcript(&output), expected, "{sql}");
+        }
+    });
+}

@@ -8465,7 +8465,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             def.n_checks = n_checks;
-            for k in 0..n_checks {
+            for slot in &mut def.checks[..n_checks] {
                 let constraint_name = take_name(&mut at)?;
                 let validation =
                     crate::storage::ConstraintValidation::from_code(*payload.get(at)?)?;
@@ -8483,7 +8483,7 @@ fn decode_op_inner<'a>(
                 if check.expression.is_truncated() {
                     return None;
                 }
-                def.checks[k] = check;
+                *slot = check;
             }
             // FOREIGN KEY constraints.
             let n_fkeys = *payload.get(at)? as usize;
@@ -8492,7 +8492,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             def.n_fkeys = n_fkeys;
-            for f in 0..n_fkeys {
+            for slot in &mut def.fkeys[..n_fkeys] {
                 let fname = take_name(&mut at)?;
                 let nc = *payload.get(at)? as usize;
                 at += 1;
@@ -8524,7 +8524,7 @@ fn decode_op_inner<'a>(
                 fk.on_update = FkAction::from_code(acts[1])?;
                 fk.timing = crate::storage::ConstraintTiming::from_code(acts[2])?;
                 fk.validation = crate::storage::ConstraintValidation::from_code(acts[3])?;
-                def.fkeys[f] = fk;
+                *slot = fk;
             }
             let n_exclusions = *payload.get(at)? as usize;
             at += 1;
@@ -8532,7 +8532,7 @@ fn decode_op_inner<'a>(
                 return None;
             }
             def.n_exclusions = n_exclusions;
-            for index in 0..n_exclusions {
+            for slot in &mut def.exclusions[..n_exclusions] {
                 let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
                 exclusion.name = SqlName::parse(take_name(&mut at)?).ok()?;
                 let meta = payload.get(at..at + 2)?;
@@ -8562,7 +8562,7 @@ fn decode_op_inner<'a>(
                     }
                     exclusion.predicate = Some(predicate);
                 }
-                def.exclusions[index] = exclusion;
+                *slot = exclusion;
             }
             def.schema = SqlName::parse(take_name(&mut at)?).ok()?;
             for f in 0..def.n_fkeys {

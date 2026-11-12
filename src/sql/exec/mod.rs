@@ -71506,12 +71506,11 @@ pub(crate) fn copy_row_binary(
     let generated_exprs = parse_generated(def, arena, storage, txn.txid)?;
     let mut values = [Datum::Null; MAX_COLUMNS];
     let mut explicit = [false; MAX_COLUMNS];
-    for i in 0..setup.n_targets {
+    for &col_index in &setup.targets[..setup.n_targets] {
         let field_len = reader.i32().map_err(|_| malformed())?;
         if field_len < -1 {
             return Err(malformed());
         }
-        let col_index = setup.targets[i];
         let col = def.columns()[col_index];
         values[col_index] = if field_len == -1 {
             Datum::Null

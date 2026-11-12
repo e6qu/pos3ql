@@ -19037,16 +19037,14 @@ pub fn index_def_text<'a>(
         let _ = s.write_str(")");
         if info.n_include_cols != 0 {
             let _ = s.write_str(" INCLUDE (");
-            for k in 0..info.n_include_cols {
+            for (k, column) in info.include_columns[..info.n_include_cols]
+                .iter()
+                .enumerate()
+            {
                 if k > 0 {
                     let _ = s.write_str(", ");
                 }
-                write_identifier(
-                    &mut s,
-                    def.columns()[info.include_columns[k] as usize]
-                        .name
-                        .as_str(),
-                );
+                write_identifier(&mut s, def.columns()[*column as usize].name.as_str());
             }
             let _ = s.write_str(")");
         }

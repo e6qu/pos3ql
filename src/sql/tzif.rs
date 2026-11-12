@@ -210,10 +210,11 @@ pub fn load(name: &str) -> Option<TzifSlot> {
     CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         let cache = cache.as_mut()?;
-        for i in 0..cache.n {
-            if cache.names[i].as_str() == canonical.as_str() {
-                return Some(TzifSlot(i as u16));
-            }
+        if let Some(i) = cache.names[..cache.n]
+            .iter()
+            .position(|name| name.as_str() == canonical.as_str())
+        {
+            return Some(TzifSlot(i as u16));
         }
         if cache.n == MAX_CACHED {
             // A loud limit, not an eviction: a session-visible zone must stay
@@ -518,8 +519,8 @@ fn parse_block(h: &TzifHeader, d: &[u8], time_size: usize, out: &mut ZoneData) -
         return false;
     }
     let mut at = 0usize;
-    for i in 0..timecnt {
-        out.times[i] = if time_size == 8 {
+    for time in &mut out.times[..timecnt] {
+        *time = if time_size == 8 {
             i64::from_be_bytes(d[at..at + 8].try_into().expect("8 bytes"))
         } else {
             i64::from(i32::from_be_bytes(
@@ -528,17 +529,17 @@ fn parse_block(h: &TzifHeader, d: &[u8], time_size: usize, out: &mut ZoneData) -
         };
         at += time_size;
     }
-    for i in 0..timecnt {
+    for type_after in &mut out.type_after[..timecnt] {
         let idx = d[at];
         if idx as usize >= typecnt {
             return false;
         }
-        out.type_after[i] = idx;
+        *type_after = idx;
         at += 1;
     }
     let abbrevs_at = at + typecnt * 6;
     let abbrevs = &d[abbrevs_at..abbrevs_at + h.charcnt as usize];
-    for i in 0..typecnt {
+    for slot in &mut out.types[..typecnt] {
         let utoff = i32::from_be_bytes(d[at..at + 4].try_into().expect("4 bytes"));
         let is_dst = d[at + 4] != 0;
         let abbrind = d[at + 5] as usize;
@@ -552,7 +553,7 @@ fn parse_block(h: &TzifHeader, d: &[u8], time_size: usize, out: &mut ZoneData) -
                 let _ = abbrev.write_char(b as char);
             }
         }
-        out.types[i] = TypeInfo {
+        *slot = TypeInfo {
             utoff,
             abbrev,
             is_dst,

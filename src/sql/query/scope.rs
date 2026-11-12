@@ -796,19 +796,90 @@ impl<'d> QueryScope<'d> {
             catalog_scan(&from.base, predicate, from.joins.is_empty()),
         )?;
         for j in from.joins {
-            scope.add_exec(
-                storage,
-                &j.table,
-                txid,
-                arena,
-                params,
-                sequences,
-                outer,
-                catalog_scan(&j.table, predicate, false),
-            )?;
+            scope
+                .add_exec(
+                    storage,
+                    &j.table,
+                    txid,
+                    arena,
+                    params,
+                    sequences,
+                    outer,
+                    catalog_scan(&j.table, predicate, false),
+                )
+                .map_err(|error| scope.left_column_detail(storage, txid, &j.table, error))?;
         }
         scope.build_merges(from, arena, Some(arena))?;
         Ok(scope)
+    }
+
+    /// PostgreSQL's detail and hint (`errorMissingColumn`) when a subquery
+    /// that is not `LATERAL` names, unqualified, a column of an item to its
+    /// left that its own `FROM` does not have.
+    fn left_column_detail(
+        &self,
+        storage: &Storage,
+        txid: u32,
+        tref: &TableRef<'_>,
+        error: SqlError,
+    ) -> SqlError {
+        let Some(select) = tref.subquery.filter(|_| !tref.lateral) else {
+            return error;
+        };
+        if error.sqlstate != sqlstate::UNDEFINED_COLUMN {
+            return error;
+        }
+        let mut found = None;
+        let mut visit = |expression: &Expr<'_>| {
+            visit_unqualified_columns(expression, &mut |name| {
+                if found.is_some()
+                    || select
+                        .from
+                        .is_some_and(|from| from_may_have_column(storage, txid, &from, name))
+                {
+                    return;
+                }
+                let message = crate::stack_format!(96, "column \"{}\" does not exist", name);
+                if error.message.as_str() != message.as_str() {
+                    return;
+                }
+                found = (0..self.n)
+                    .find(|&table| self.scope_column_index(table, name).is_some())
+                    .map(|table| (table, StackStr::<64>::from_str(name)));
+            });
+        };
+        for item in select.items {
+            if let crate::sql::ast::SelectItem::Expr { expression, .. }
+            | crate::sql::ast::SelectItem::RecordStar(expression) = item
+            {
+                visit(expression);
+            }
+        }
+        for expression in select
+            .where_clause
+            .into_iter()
+            .chain(select.group_by.iter().copied())
+            .chain(select.having)
+        {
+            visit(expression);
+        }
+        let Some((table, name)) = found else {
+            return error;
+        };
+        crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
+            detail: Some(crate::stack_format!(
+                crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+                "There is a column named \"{}\" in table \"{}\", but it cannot be referenced from this part of the query.",
+                name.as_str(),
+                self.names[table]
+            )),
+            hint: Some(crate::stack_format!(
+                crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
+                "To reference that column, you must mark this subquery with LATERAL."
+            )),
+            objects: crate::sql::eval::ErrorObjects::default(),
+        });
+        error
     }
 
     /// Registers a materialized recursive CTE's actual output columns and rows.
@@ -1110,7 +1181,9 @@ impl<'d> QueryScope<'d> {
         let mut scope = QueryScope::empty(storage, txid, arena, from)?;
         scope.add_schema(storage, &from.base, txid, arena, outer)?;
         for j in from.joins {
-            scope.add_schema(storage, &j.table, txid, arena, outer)?;
+            scope
+                .add_schema(storage, &j.table, txid, arena, outer)
+                .map_err(|error| scope.left_column_detail(storage, txid, &j.table, error))?;
         }
         scope.build_merges(from, arena, None)?;
         Ok(scope)
@@ -2307,6 +2380,52 @@ impl<'d> QueryScope<'d> {
                 .map(|index| definition.n_columns + index)
         })
     }
+}
+
+/// Calls `each` for every unqualified column of `expression` outside nested
+/// subqueries.
+fn visit_unqualified_columns(expression: &Expr<'_>, each: &mut dyn FnMut(&str)) {
+    if let Expr::Column {
+        qualifier: None,
+        name,
+    } = expression
+    {
+        each(name);
+        return;
+    }
+    if matches!(
+        expression,
+        Expr::Subquery(_)
+            | Expr::Exists(_)
+            | Expr::ArraySubquery(_)
+            | Expr::RowSubquery { .. }
+            | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. }
+    ) {
+        return;
+    }
+    let _ = super::walk_children(expression, &mut |child| {
+        visit_unqualified_columns(child, each);
+        Ok(())
+    });
+}
+
+/// Whether an item of `from` may have a column `name`. Only an ordinary
+/// relation's columns are known before it is resolved.
+fn from_may_have_column(storage: &Storage, txid: u32, from: &FromClause<'_>, name: &str) -> bool {
+    core::iter::once(&from.base)
+        .chain(from.joins.iter().map(|join| &join.table))
+        .any(|table| {
+            if table.subquery.is_some() || table.is_function_source() || table.cte.is_some() {
+                return true;
+            }
+            match storage.resolve_relation(table.schema, table.table, txid) {
+                Some(crate::storage::ResolvedRelation::Table(slot)) => {
+                    storage.table_def(slot, txid).column_index(name).is_some()
+                }
+                _ => true,
+            }
+        })
 }
 
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]

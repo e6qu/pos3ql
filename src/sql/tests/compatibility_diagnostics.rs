@@ -1380,5 +1380,26 @@ fn a_plain_source_subquery_cannot_see_the_target_columns() {
                 "{sql}"
             );
         }
+        // An item to the left could be read through LATERAL.
+        let sql = "SELECT * FROM lt, (SELECT v) s";
+        assert_eq!(
+            diagnostics(&run_with(engine, budget, sql)),
+            [format!(
+                "ERROR 42703 column \"v\" does not exist @{} hint: To reference that column, \
+                 you must mark this subquery with LATERAL. detail: There is a column named \
+                 \"v\" in table \"lt\", but it cannot be referenced from this part of the query.",
+                sql.find("v)").unwrap() + 1
+            )]
+        );
+        let sql = "UPDATE lt SET v = 1 FROM (SELECT lt.v) s";
+        assert_eq!(
+            diagnostics(&run_with(engine, budget, sql)),
+            [format!(
+                "ERROR 42P01 invalid reference to FROM-clause entry for table \"lt\" @{} \
+                 detail: There is an entry for table \"lt\", but it cannot be referenced \
+                 from this part of the query.",
+                sql.find("lt.v").unwrap() + 1
+            )]
+        );
     });
 }

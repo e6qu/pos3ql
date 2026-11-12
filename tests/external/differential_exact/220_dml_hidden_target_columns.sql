@@ -14,3 +14,9 @@ insert into lt values (1, 1); insert into ls values (1, 1);
 update lt set v = 2 from (select w from ls where w = id) s;
 update lt set v = 2 from (select id, w from ls) s where s.w = v;
 select * from lt;
+-- A plain subquery cannot see the items to its left either.
+select * from lt, (select v) s;
+select * from lt, ls, (select w + v from ls l2) s;
+select * from lt, (select id, v from ls) s;
+update lt set v = 1 from ls, (select w as y) s;
+update lt set v = 1 from (select lt.v) s;

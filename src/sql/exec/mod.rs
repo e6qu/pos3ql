@@ -86257,57 +86257,65 @@ fn reject_target_references(
         } else {
             TargetReference::Hidden
         };
-        let mut found = false;
+        let mut found = None;
         if let Some(arguments) = table.func_args {
             for argument in arguments {
-                found |= expression_names_target(argument, exposed, &mut |name| {
+                found = found.or(expression_names_target(argument, exposed, &mut |name| {
                     // An unqualified argument column the items to its left
                     // cannot answer is the target's.
                     !merge
                         && target_columns.contains(&name)
                         && !left_may_answer(storage, txid, from, index, name)
-                });
+                }));
             }
         }
         if let Some(rows_from) = table.rows_from {
             for function in rows_from {
                 for argument in function.func_args.unwrap_or(&[]) {
-                    found |= expression_names_target(argument, exposed, &mut |_| false);
+                    found = found.or(expression_names_target(argument, exposed, &mut |_| false));
                 }
             }
         }
         let mut hidden_column = None;
         if let Some(select) = table.subquery {
-            found |= select_names_target(select, exposed, &mut |inner: &Select<'_>, name| {
-                // An unqualified column that the body's own FROM does not
-                // answer is the target's when a LATERAL body cannot find it
-                // in the items to its left either. Any other body cannot
-                // see the target (`errorMissingColumn`).
-                if !target_columns.contains(&name)
-                    || inner
-                        .from
-                        .is_some_and(|inner_from| from_may_answer(storage, txid, &inner_from, name))
-                {
-                    return false;
-                }
-                if !lateral {
-                    hidden_column.get_or_insert_with(|| hidden_column_error(exposed, name));
-                    return false;
-                }
-                !left_may_answer(storage, txid, from, index, name)
-            });
+            found = found.or(select_names_target(
+                select,
+                exposed,
+                &mut |inner: &Select<'_>, name| {
+                    // An unqualified column that the body's own FROM does not
+                    // answer is the target's when a LATERAL body cannot find it
+                    // in the items to its left either. Any other body cannot
+                    // see the target (`errorMissingColumn`).
+                    if !target_columns.contains(&name)
+                        || inner.from.is_some_and(|inner_from| {
+                            from_may_answer(storage, txid, &inner_from, name)
+                        })
+                    {
+                        return false;
+                    }
+                    if !lateral {
+                        hidden_column.get_or_insert_with(|| hidden_column_error(exposed, name));
+                        return false;
+                    }
+                    !left_may_answer(storage, txid, from, index, name)
+                },
+            ));
         }
         if let Some(error) = hidden_column {
             return Err(error);
         }
         if index > 0
             && let Some(condition) = from.joins[index - 1].on
-            && expression_names_target(condition, exposed, &mut |_| false)
+            && let Some(reference) = expression_names_target(condition, exposed, &mut |_| false)
         {
-            return Err(target_reference_error(exposed, TargetReference::Hidden));
+            return Err(target_reference_error(
+                exposed,
+                reference,
+                TargetReference::Hidden,
+            ));
         }
-        if found {
-            return Err(target_reference_error(exposed, kind));
+        if let Some(reference) = found {
+            return Err(target_reference_error(exposed, reference, kind));
         }
     }
     Ok(())
@@ -86351,7 +86359,9 @@ fn hidden_column_error(exposed: &str, name: &str) -> SqlError {
     )
 }
 
-fn target_reference_error(exposed: &str, kind: TargetReference) -> SqlError {
+/// `reference` is the qualifier or column in the statement text that names
+/// the target, where PostgreSQL places the error's cursor.
+fn target_reference_error(exposed: &str, reference: &str, kind: TargetReference) -> SqlError {
     let explanation = crate::stack_format!(
         crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES,
         "There is an entry for table \"{}\", but it cannot be referenced from this part of the query.",
@@ -86366,20 +86376,23 @@ fn target_reference_error(exposed: &str, kind: TargetReference) -> SqlError {
         hint,
         objects: crate::sql::eval::ErrorObjects::default(),
     });
-    sql_err!(
-        state,
-        "invalid reference to FROM-clause entry for table \"{}\"",
-        exposed
+    crate::sql::error_position::at_reference(
+        sql_err!(
+            state,
+            "invalid reference to FROM-clause entry for table \"{}\"",
+            exposed
+        ),
+        reference,
     )
 }
 
-/// Whether `select` refers to `exposed` through a qualifier its own `FROM`
-/// does not answer.
-fn select_names_target(
-    select: &Select<'_>,
+/// The qualifier or column through which `select` refers to `exposed`, when
+/// its own `FROM` does not answer it.
+fn select_names_target<'a>(
+    select: &Select<'a>,
     exposed: &str,
     unqualified: &mut dyn FnMut(&Select<'_>, &str) -> bool,
-) -> bool {
+) -> Option<&'a str> {
     let shadows = |table: &crate::sql::ast::TableRef<'_>| {
         table
             .alias
@@ -86389,77 +86402,106 @@ fn select_names_target(
     if select.from.is_some_and(|from| {
         shadows(&from.base) || from.joins.iter().any(|join| shadows(&join.table))
     }) {
-        return false;
+        return None;
     }
-    let mut names = |expression: &Expr<'_>| {
+    let mut names = |expression: &Expr<'a>| {
         expression_names_target(expression, exposed, &mut |name| unqualified(select, name))
     };
-    let from_names = select.from.is_some_and(|from| {
-        core::iter::once(&from.base)
-            .chain(from.joins.iter().map(|join| &join.table))
-            .any(|table| {
-                table
-                    .subquery
-                    .is_some_and(|query| select_names_target(query, exposed, &mut |_, _| false))
-                    || table
+    let mut found = None;
+    if let Some(from) = select.from {
+        for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
+            found = found
+                .or_else(|| {
+                    table
+                        .subquery
+                        .and_then(|query| select_names_target(query, exposed, &mut |_, _| false))
+                })
+                .or_else(|| {
+                    table
                         .func_args
-                        .is_some_and(|arguments| arguments.iter().any(|argument| names(argument)))
-            })
-            || from
-                .joins
-                .iter()
-                .any(|join| join.on.is_some_and(&mut names))
-    });
-    from_names
-        || select.items.iter().any(|item| match item {
+                        .and_then(|arguments| arguments.iter().find_map(|argument| names(argument)))
+                });
+        }
+        for join in from.joins {
+            found = found.or_else(|| join.on.and_then(&mut names));
+        }
+    }
+    for item in select.items {
+        found = found.or_else(|| match item {
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
                 names(expression)
             }
-            SelectItem::Wildcard => false,
-            SelectItem::TableWildcard(qualifier) => qualifier.eq_ignore_ascii_case(exposed),
+            SelectItem::Wildcard => None,
+            SelectItem::TableWildcard(qualifier) => qualifier
+                .eq_ignore_ascii_case(exposed)
+                .then_some(*qualifier),
+        });
+    }
+    found
+        .or_else(|| select.where_clause.and_then(&mut names))
+        .or_else(|| select.having.and_then(&mut names))
+        .or_else(|| {
+            select
+                .group_by
+                .iter()
+                .find_map(|expression| names(expression))
         })
-        || select.where_clause.is_some_and(&mut names)
-        || select.having.is_some_and(&mut names)
-        || select.group_by.iter().any(|expression| names(expression))
-        || select
-            .distinct_on
-            .iter()
-            .any(|expression| names(expression))
-        || select.order_by.iter().any(|order| names(order.expression))
-        || select.limit.is_some_and(&mut names)
-        || select.offset.is_some_and(&mut names)
-        || select
-            .set_body
-            .is_some_and(|tree| set_tree_names_target(tree, exposed))
+        .or_else(|| {
+            select
+                .distinct_on
+                .iter()
+                .find_map(|expression| names(expression))
+        })
+        .or_else(|| {
+            select
+                .order_by
+                .iter()
+                .find_map(|order| names(order.expression))
+        })
+        .or_else(|| select.limit.and_then(&mut names))
+        .or_else(|| select.offset.and_then(&mut names))
+        .or_else(|| {
+            select
+                .set_body
+                .and_then(|tree| set_tree_names_target(tree, exposed))
+        })
 }
 
-fn set_tree_names_target(tree: &crate::sql::ast::SetTree<'_>, exposed: &str) -> bool {
+fn set_tree_names_target<'a>(
+    tree: &crate::sql::ast::SetTree<'a>,
+    exposed: &str,
+) -> Option<&'a str> {
     match tree {
         crate::sql::ast::SetTree::Select(select) => {
             select_names_target(select, exposed, &mut |_, _| false)
         }
         crate::sql::ast::SetTree::Op { left, right, .. } => {
-            set_tree_names_target(left, exposed) || set_tree_names_target(right, exposed)
+            set_tree_names_target(left, exposed).or_else(|| set_tree_names_target(right, exposed))
         }
     }
 }
 
-/// Whether `expression` refers to `exposed`: a column it qualifies, or an
-/// unqualified column `unqualified` assigns to the target.
-fn expression_names_target(
-    expression: &Expr<'_>,
+/// The qualifier or column through which `expression` refers to `exposed`:
+/// a column it qualifies, or an unqualified column `unqualified` assigns to
+/// the target.
+fn expression_names_target<'a>(
+    expression: &Expr<'a>,
     exposed: &str,
     unqualified: &mut dyn FnMut(&str) -> bool,
-) -> bool {
+) -> Option<&'a str> {
     match expression {
         Expr::Column {
             qualifier: Some(qualifier),
             ..
-        } => return qualifier.eq_ignore_ascii_case(exposed),
+        } => {
+            return qualifier
+                .eq_ignore_ascii_case(exposed)
+                .then_some(*qualifier);
+        }
         Expr::Column {
             qualifier: None,
             name,
-        } => return unqualified(name),
+        } => return unqualified(name).then_some(*name),
         Expr::Subquery(select)
         | Expr::Exists(select)
         | Expr::ArraySubquery(select)
@@ -86473,13 +86515,13 @@ fn expression_names_target(
             operand, select, ..
         } => {
             return expression_names_target(operand, exposed, unqualified)
-                || select_names_target(select, exposed, &mut |_, _| false);
+                .or_else(|| select_names_target(select, exposed, &mut |_, _| false));
         }
         _ => {}
     }
-    let mut found = false;
+    let mut found = None;
     let _ = super::query::walk_children(expression, &mut |child| {
-        found |= expression_names_target(child, exposed, unqualified);
+        found = found.or_else(|| expression_names_target(child, exposed, unqualified));
         Ok(())
     });
     found

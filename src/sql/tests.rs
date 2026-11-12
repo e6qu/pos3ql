@@ -61,6 +61,7 @@ mod routine_identity_diagnostics;
 mod routine_selection;
 mod row_history;
 mod row_layout;
+mod row_lock_conflicts;
 mod runtime_input_validity;
 mod runtime_plan_invalidation;
 mod sequence_inheritance;

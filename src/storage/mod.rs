@@ -52388,6 +52388,15 @@ impl Storage {
             }))
     }
 
+    /// Whether `txid` reads one snapshot for its whole life (repeatable read
+    /// or serializable), which registers it here at its first statement.
+    pub(crate) fn keeps_transaction_snapshot(&self, txid: u32) -> bool {
+        self.snapshot_state()
+            .active
+            .iter()
+            .any(|(owner, _)| *owner == txid)
+    }
+
     pub fn register_snapshot(&self, txid: u32, snapshot: u64) -> Result<(), SqlError> {
         self.validate_transaction_isolation(crate::sql::ast::TransactionIsolation::RepeatableRead)?;
         let mut snapshots = self.snapshot_state();

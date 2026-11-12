@@ -44,6 +44,36 @@ earlier status after another transaction changes it. In locking mode, a
 conflicting writer waits for the reader's relation lock, while work on
 unrelated tables continues.
 
+**Foreign keys and concurrent writers.** Inserting or updating a row that
+references another table locks the referenced (parent) row `FOR KEY SHARE`, as
+PostgreSQL does. A delete or key change of that parent waits for the inserting
+transaction, and an insert waits for a transaction that is deleting the parent
+or changing its key; after the wait each side checks the outcome again. For
+example, if one session deletes customer 7 while another inserts an order for
+customer 7, the order insert waits; when the delete commits the insert fails
+with `23503`, and when it rolls back the insert succeeds. Under `REPEATABLE
+READ` and `SERIALIZABLE`, an insert whose parent was deleted or had its key
+changed after the transaction's snapshot fails with `40001`. Changing other
+parent columns does not conflict. `ON DELETE`/`ON UPDATE` actions lock the
+referencing rows they check or rewrite. Each locked row takes one entry of the
+row-lock registry, (`max_connections` + `max_prepared_transactions`) ×
+`txn_rows` entries in total; a full registry fails the statement with `54000`.
+
+**Writes that meet a concurrently changed row.** `UPDATE`, `DELETE`,
+`MERGE` and `SELECT ... FOR UPDATE` (or `FOR SHARE`, `FOR KEY SHARE`, `FOR NO
+KEY UPDATE`) lock each row they select. When another transaction changed that
+row after the statement's snapshot, `READ COMMITTED` continues with the row's
+latest committed version, as PostgreSQL does: `UPDATE accounts SET balance =
+balance + 10` that waited for another session's `+ 1` stores the sum of both,
+a row that no longer meets the `WHERE` condition is skipped, and a deleted row
+is neither updated nor deleted again. `REPEATABLE READ` and `SERIALIZABLE`
+fail such a statement with `40001` (`could not serialize access due to
+concurrent update`, or `concurrent delete` for an `UPDATE`, `DELETE` or
+`MERGE` of a deleted row); `FOR KEY SHARE` still succeeds when the change kept
+every unique key column. Under `READ COMMITTED`, `MERGE` and `SELECT ... FOR`
+outside a cursor do not yet re-evaluate a row that was updated: they act on or
+return the version they read (see [PLAN.md](../PLAN.md#close-application-compatibility-gaps)).
+
 A commit becomes visible all at once, and only after it is durable: new
 statements never see half of an order-and-invoice update. If commit waits for
 storage, completed work is not repeated; a default that issued an order number

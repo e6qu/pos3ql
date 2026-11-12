@@ -305,7 +305,12 @@ column "t.v".`) is missing for a reference inside a `LIMIT`/`OFFSET`
 subquery and in `COPY ... WHERE`, and a set operation's later branch does
 not offer the earlier branches' columns (`*SELECT* 1`); an index
 expression's missing column has the suggestion but no cursor position. Virtual generated columns, PostgreSQL 18's
-default when `STORED` is not written, fail with `0A000`. A derived table computes output
+default when `STORED` is not written, fail with `0A000`. An aggregate inside a subquery whose arguments
+read only an enclosing query's columns belongs to that enclosing query in
+PostgreSQL; pos3ql computes it inside the subquery, so `SELECT (SELECT
+sum(t.a)) FROM t` returns one sum per row instead of one row, and a rule
+condition or `WHERE` containing one is accepted instead of failing with
+`aggregate functions are not allowed in WHERE`. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1
 FROM (SELECT 10 / t.x) s)` fails with division by zero on a zero `x` where
 PostgreSQL, which drops unread subquery outputs, returns the row. A

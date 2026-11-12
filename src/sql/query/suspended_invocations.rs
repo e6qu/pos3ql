@@ -39,6 +39,7 @@ impl PendingRoutineInvocation {
             }
             PendingRoutineTarget::Intrinsic(oid) => PendingRoutineTarget::Intrinsic(oid),
             PendingRoutineTarget::WriteQuery(write) => PendingRoutineTarget::WriteQuery(write),
+            PendingRoutineTarget::Trigger(call) => PendingRoutineTarget::Trigger(call),
         };
         Ok(Self {
             arguments,
@@ -78,6 +79,7 @@ impl RoutineInvocationState {
                 .transpose()?,
         );
         output.pending_replay.set(self.pending_replay.get());
+        output.pending_firing.set(self.pending_firing.get());
         let results = self.results.borrow();
         for index in 0..results.len() {
             let saved = invocation_results::result_at(&results, source, index)?;

@@ -339,7 +339,7 @@ mod tests {
             assert!(first_block.payload.iter().all(|byte| *byte == b'a'));
             assert!(second_block.payload.iter().all(|byte| *byte == b'b'));
             reply(&mut second, "second");
-            held.recv_timeout(Duration::from_secs(5)).unwrap();
+            held.recv_timeout(crate::test_wait::HANG).unwrap();
             reply(&mut first, "first");
         });
         let capacity = 2 * super::super::BLOCK_SIZE;
@@ -359,7 +359,7 @@ mod tests {
         });
         first.fill(b'x');
         second.fill(b'y');
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = crate::test_wait::deadline();
         loop {
             assert!(!forbid_alloc(|| output.drain(&mut uploads, Instant::now())).unwrap());
             if output.blocks[1].durable {

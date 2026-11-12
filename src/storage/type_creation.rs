@@ -40,7 +40,7 @@ mod tests {
     use crate::config::TransactionMode;
     use crate::sql::eval::{SqlError, sqlstate};
     use std::sync::atomic::Ordering;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     const KINDS: [NamedTypeKind; 3] = [
         NamedTypeKind::Domain,
@@ -147,7 +147,7 @@ mod tests {
                     finished.send(()).unwrap();
                     created
                 });
-                let progress = received.recv_timeout(Duration::from_secs(5));
+                let progress = received.recv_timeout(crate::test_wait::HANG);
                 drop(held);
                 let created = writer.join().unwrap().unwrap();
                 assert!(progress.is_ok());
@@ -190,7 +190,7 @@ mod tests {
                     finished.send(()).unwrap();
                     result
                 });
-                let progress = received.recv_timeout(Duration::from_secs(5));
+                let progress = received.recv_timeout(crate::test_wait::HANG);
                 drop(comments);
                 dropper.join().unwrap();
                 let (independent, conflicting) = writer.join().unwrap();
@@ -295,7 +295,7 @@ mod tests {
     }
 
     fn saw_wait(storage: &Storage, before: usize) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = crate::test_wait::deadline();
         while storage.definition_publication.waits.load(Ordering::Acquire) == before {
             if Instant::now() >= deadline {
                 return false;

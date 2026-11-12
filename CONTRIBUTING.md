@@ -89,6 +89,22 @@ python3 tools/generate-pg18-planner-properties.py \
   --type-io-source src/sql/catalog_builtin_properties.rs \
   --output src/sql/catalog_planner_properties.rs
 
+# Callable contracts: add OIDs (none re-verifies digests and the OID index).
+python3 tools/generate-pg18-callable-signatures.py \
+  --dsn 'host=127.0.0.1 port=5432 user=postgres' \
+  src/sql/catalog_callable_signatures.rs 6381 6388
+
+# Shipped pg_description text of the listed built-in routines (--mode check compares).
+python3 tools/generate-pg18-routine-descriptions.py --mode write \
+  --dsn 'host=127.0.0.1 port=5432 user=postgres' \
+  --signatures src/sql/catalog_callable_signatures.rs \
+  --output src/sql/catalog_routine_descriptions.rs
+
+# Every pg_catalog pg_type row, all 32 columns (--mode check compares).
+python3 tools/generate-pg18-type-rows.py --mode write \
+  --dsn 'host=127.0.0.1 port=5432 user=postgres dbname=template1' \
+  --output src/sql/catalog_type_rows.rs
+
 # Built-in view SQL from retained catalog-metadata.json evidence (--mode check compares).
 python3 tools/generate-pg18-view-definitions.py --mode write \
   --metadata /path/to/catalog-metadata.json --source https://example/evidence \
@@ -109,7 +125,7 @@ they add no callable functions.
 
 | Workflow | File | Gates |
 |---|---|---|
-| CI | `ci.yml` | Formatting and type checks; architecture, bug, docs, vendor, timeout and duplicate guards; tool tests; Linux amd64 build and Clippy; 8 library shards (`tools/test-lib-shard.sh N-of-8`); native build, test and lint on Linux arm64 and macOS arm64; macOS mutex ThreadSanitizer gate; Miri ownership (`memory-sql`, `storage`); object-store qualification; storage VOPR; release install; performance smoke; embedded capacity |
+| CI | `ci.yml` | Formatting and type checks; architecture, bug, docs, vendor, timeout and duplicate guards; tool tests; Linux amd64 build and Clippy; 12 library shards (`tools/test-lib-shard.sh N-of-12`); native build, test (call contracts and boundaries in separate jobs) and lint on Linux arm64 and macOS arm64; macOS mutex ThreadSanitizer gate; Miri ownership (`memory-sql`, `sql-exec`, `storage`, `storage-definitions`); object-store qualification; storage VOPR; release install; performance smoke; embedded capacity |
 | Differential | `differential.yml` | One release binary, then sharded PostgreSQL comparisons, vendored SQLLogicTest and regression slices, generated queries and external execution paths (`tests/external/ci_diff.sh`) |
 | Drivers | `drivers.yml` | pgJDBC, pgx, node-postgres, psycopg2, and SQLAlchemy/Alembic with both psycopg2 and psycopg 3, against PostgreSQL and pos3ql (`tests/external/ci_drivers.sh`) |
 | coverage | `coverage.yml` | Instrumented library and external shards (`tools/coverage.sh`), crash torture, merged 70% line floor (`tools/coverage-merge.py 70`) |
@@ -131,8 +147,10 @@ temporary validation workflows before the final head.
   (`tools/check-ci-timeouts.sh`). A shorter step timeout is extra protection,
   not a substitute.
 - Keep existing budgets. When work outgrows a job, shard it instead of raising
-  the timeout: coverage uses `COVERAGE_SHARD` (`lib:N-of-4`, `run:<groups>`,
+  the timeout: coverage uses `COVERAGE_SHARD` (`lib:N-of-6`, `run:<groups>`,
   `runtest:<groups>`), and external harness groups use `POS3QL_RUN_GROUPS`.
+  The exact-error corpus splits by file ordinal with `POS3QL_EXACT_SHARD` and
+  `POS3QL_EXACT_SHARDS`, like the SQLLogicTest query slices.
   Coverage tracing and `runtest:` correctness shards stay in separate matrix
   entries.
 - Bound compiler concurrency and debug data rather than adding time. Native
@@ -151,8 +169,9 @@ temporary validation workflows before the final head.
 - Native Linux amd64, Linux arm64 and macOS arm64 builds, lint and boundary
   regressions must pass. Jobs verify their compiler host first. Use libc's
   declared C types at C boundaries (`c_char` signedness differs by target).
-- Function-call regressions run before broader native boundary cases, so a
-  broken call contract fails fast.
+- Function-call contracts and broader native boundary cases run in separate
+  jobs per target, so each has its own budget and a broken call contract is
+  reported on its own.
 - Native SQL and storage fixtures stay in native gates and never enter
   interpreter startup; Miri ownership cases live beside their runtime modules.
 - The macOS mutex gate runs every `core_mutex_` ownership case and a direct
@@ -161,15 +180,18 @@ temporary validation workflows before the final head.
 
 ### Miri ownership
 
-`tools/test-miri-ownership.sh LOG GROUP` runs one of the two groups,
-`memory-sql` and `storage`. The `miri-ownership` Cargo feature omits unrelated
+`tools/test-miri-ownership.sh LOG GROUP` runs one of four groups:
+`memory-sql`, `sql-exec`, `storage` and `storage-definitions`. A proof belongs
+to the group of its longest matching module prefix in
+`tools/miri-ownership-manifest.py`; move slow modules into their own group
+when one approaches the 15-minute job budget. The `miri-ownership` Cargo feature omits unrelated
 test modules under Miri only, so interpreter startup does not compile
 irrelevant fixtures; native builds keep the full test set.
 
 - List every case by its full Rust name in `tools/miri-ownership-tests.txt`;
   each belongs to exactly one group and its module stays enabled in ownership
   mode. The script fails on any missing, repeated, failed or ignored proof.
-- Both groups must complete. Reducing startup work must not drop proofs.
+- Every group must complete. Reducing startup work must not drop proofs.
 - Tests that build an anonymous invocation install an explicit SQL plan owner
   through `type_input_plans::with_owner`, as the command executor does.
 - Keep deadline proofs independent of the host clock under Miri isolation.

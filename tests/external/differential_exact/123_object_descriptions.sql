@@ -1,0 +1,46 @@
+-- pg_describe_object names visible objects as PostgreSQL's
+-- getObjectDescription does: without their schema when the search path
+-- finds them.
+CREATE SCHEMA dob_hidden;
+CREATE TABLE dob_t(a integer DEFAULT 1 CONSTRAINT dob_check CHECK (a > 0));
+CREATE INDEX dob_i ON dob_t(a);
+CREATE VIEW dob_v AS SELECT a FROM dob_t;
+CREATE SEQUENCE dob_s;
+CREATE DOMAIN dob_d AS integer CONSTRAINT dob_dc CHECK (VALUE > 0);
+CREATE FUNCTION dob_f(integer, integer) RETURNS boolean LANGUAGE sql AS 'SELECT $1 < $2';
+CREATE OPERATOR <<< (LEFTARG = integer, RIGHTARG = integer, FUNCTION = dob_f);
+CREATE OPERATOR dob_hidden.<<< (LEFTARG = integer, RIGHTARG = integer, FUNCTION = dob_f);
+CREATE COLLATION dob_c (locale = 'C');
+CREATE COLLATION dob_hidden.dob_c (locale = 'C');
+CREATE TEXT SEARCH CONFIGURATION dob_ts (COPY = english);
+CREATE TEXT SEARCH CONFIGURATION dob_hidden.dob_ts (COPY = english);
+CREATE TEXT SEARCH DICTIONARY dob_dict (TEMPLATE = simple);
+CREATE STATISTICS dob_dup ON a, a FROM dob_t;
+CREATE STATISTICS dob_dup ON (a + 1), (a + 1) FROM dob_t;
+CREATE STATISTICS dob_st ON a, (a + 1) FROM dob_t;
+CREATE FUNCTION dob_trg() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+CREATE TRIGGER dob_tg BEFORE INSERT ON dob_t FOR EACH ROW EXECUTE FUNCTION dob_trg();
+CREATE RULE dob_r AS ON UPDATE TO dob_v DO INSTEAD NOTHING;
+SELECT pg_describe_object('pg_operator'::regclass, oid, 0) FROM pg_operator WHERE oprname = '<<<' ORDER BY 1;
+SELECT pg_describe_object('pg_collation'::regclass, oid, 0) FROM pg_collation WHERE collname = 'dob_c' ORDER BY 1;
+SELECT pg_describe_object('pg_ts_config'::regclass, oid, 0) FROM pg_ts_config WHERE cfgname = 'dob_ts' ORDER BY 1;
+SELECT pg_describe_object('pg_ts_dict'::regclass, oid, 0) FROM pg_ts_dict WHERE dictname = 'dob_dict';
+SELECT pg_describe_object('pg_constraint'::regclass, oid, 0) FROM pg_constraint WHERE conname IN ('dob_check', 'dob_dc') ORDER BY 1;
+SELECT pg_describe_object('pg_attrdef'::regclass, oid, 0) FROM pg_attrdef WHERE adrelid = 'dob_t'::regclass;
+SELECT pg_describe_object('pg_statistic_ext'::regclass, oid, 0) FROM pg_statistic_ext WHERE stxname = 'dob_st';
+SELECT pg_describe_object('pg_trigger'::regclass, oid, 0) FROM pg_trigger WHERE tgname = 'dob_tg';
+SELECT pg_describe_object('pg_rewrite'::regclass, oid, 0) FROM pg_rewrite WHERE rulename = 'dob_r';
+SELECT pg_describe_object('pg_class'::regclass, c.oid, 0) FROM pg_class c WHERE relname IN ('dob_i', 'dob_v', 'dob_s') ORDER BY 1;
+SELECT pg_describe_object('pg_type'::regclass, 'dob_d'::regtype, 0);
+SELECT pg_describe_object('pg_namespace'::regclass, 'dob_hidden'::regnamespace, 0);
+SELECT pg_describe_object('pg_am'::regclass, 403, 0), pg_describe_object('pg_language'::regclass, 14, 0);
+DROP SCHEMA dob_hidden CASCADE;
+DROP VIEW dob_v;
+DROP TABLE dob_t;
+DROP OPERATOR <<< (integer, integer);
+DROP FUNCTION dob_f(integer, integer), dob_trg();
+DROP DOMAIN dob_d;
+DROP SEQUENCE dob_s;
+DROP COLLATION dob_c;
+DROP TEXT SEARCH CONFIGURATION dob_ts;
+DROP TEXT SEARCH DICTIONARY dob_dict;

@@ -116,6 +116,19 @@ impl SqlSource {
                 None => type_inputs::validate_restored(parser, storage, transaction),
             },
         )?;
+        super::check_called_sql_routine_result(
+            storage,
+            transaction,
+            &program,
+            self.kind,
+            &self.columns,
+            &self.parameters,
+            self.result_contract(storage, transaction, arena)?,
+            self.stored
+                .as_ref()
+                .map(|stored| (stored.path, stored.view())),
+            arena,
+        )?;
         Ok(ParsedSource {
             text,
             inputs,
@@ -210,12 +223,54 @@ impl SqlResult {
                 Ok(())
             }
             Self::Rows(rows) => {
-                let width =
-                    if matches!(source.kind, crate::storage::RoutineKind::SetFunction { .. }) {
-                        1
-                    } else {
-                        source.columns.len()
-                    };
+                let set_function =
+                    matches!(source.kind, crate::storage::RoutineKind::SetFunction { .. });
+                // A set of composite values takes each row's columns as the
+                // fields unless the row is one value of that composite type.
+                if set_function
+                    && let ColType::Composite(Some(creation)) = source.return_type.ctype
+                    && !matches!(values, [Datum::Composite { slot, .. } | Datum::CompositeText { slot, .. }] if *slot == creation)
+                    && !matches!(values, [Datum::Null])
+                {
+                    let width = storage
+                        .require_row_type_definition(creation, txid)?
+                        .active_field_count();
+                    if values.len() != width {
+                        return Err(query::routine_result_width_mismatch(
+                            source.declared_result(storage, txid, arena)?,
+                            false,
+                            values.len(),
+                            width,
+                        ));
+                    }
+                    let fields = arena
+                        .alloc_slice_with(values.len(), |index| crate::sql::types::RecordField {
+                            name: "",
+                            type_oid: values[index].type_oid(),
+                            value: values[index],
+                        })
+                        .map_err(|_| query::arena_full_pub())?;
+                    for field in fields.iter_mut() {
+                        field.value = detach_routine_datum(field.value, arena)?;
+                    }
+                    let converted = arena
+                        .alloc_slice_with(1, |_| Datum::Null)
+                        .map_err(|_| query::arena_full_pub())?;
+                    converted[0] = coerce_routine_argument(
+                        Datum::Record(fields),
+                        source.return_type,
+                        storage,
+                        txid,
+                        arena,
+                        Some(sequences),
+                    )?;
+                    return rows.append(converted);
+                }
+                let width = if set_function {
+                    1
+                } else {
+                    source.columns.len()
+                };
                 if values.len() != width {
                     return Err(query::routine_result_width_mismatch(
                         source.declared_result(storage, txid, arena)?,
@@ -479,15 +534,16 @@ impl SqlExecution {
         arguments: &'a [Datum<'a>],
         context: &mut TriggerExecContext<'_, 'a, '_>,
     ) -> Result<FunctionOutput<'a>, SqlError> {
+        // The body's writes hand it their AFTER work, so those triggers run
+        // on the engine whether or not this call is kept across a wait.
         let prior = context.txn.write_completion_boundary;
-        if self.policy == query::RoutineExecution::Retained {
-            context.txn.write_completion_boundary =
-                Some(super::super::txn::WriteCompletionBoundary {
-                    mark: self.boundary,
-                    command: context.txn.command_id(),
-                    depth: context.txn.trigger_depth(),
-                });
-        }
+        context.txn.write_completion_boundary = Some(super::super::txn::WriteCompletionBoundary {
+            mark: self.boundary,
+            command: context.txn.command_id(),
+            depth: context.txn.trigger_depth(),
+            retained: self.policy == query::RoutineExecution::Retained,
+            statement_end: false,
+        });
         let name = self.source.name;
         let inlining = self.source.inlining(&parsed.program);
         let frame = crate::sql::error_context::SqlFunctionFrame {
@@ -650,7 +706,7 @@ impl SqlExecution {
             && self.pending_query.is_none()
         {
             let params = core::mem::replace(&mut context.params, arguments);
-            let bound = super::bind_plpgsql_dml_ctes(context, select);
+            let bound = super::bind_plpgsql_dml_ctes(context, select, &super::NoColumns);
             context.params = params;
             let (bound, written) = bound?;
             self.query(
@@ -802,6 +858,7 @@ impl SqlExecution {
             .unwrap_or_else(|| query::RoutineInvocationState::new(owner, self.policy));
         calls.require_arena(owner)?;
         let replay = sequence::begin_replay_cursor()?;
+        let mut progress = super::RowProgress::new(context.storage())?;
         let result = loop {
             sequence::rewind_replay_cursor(replay)?;
             calls.begin_attempt();
@@ -833,7 +890,8 @@ impl SqlExecution {
                     break Err(error);
                 }
             }
-            if capture {
+            // Rows a resumed write keeps also keep their returned values.
+            if capture && !progress.resuming() {
                 self.result.clear();
             }
             let shape = query::RoutineResultShape::from_contract(
@@ -847,18 +905,15 @@ impl SqlExecution {
                 let PlpgsqlExecHost::Routine { engine, .. } = &context.host else {
                     return Err(changed());
                 };
-                context.txn.statement_mark(
+                let (wal, lock) = (
                     engine.wal.stage_mark(context.txn.txid),
                     engine.storage.lock_mark(),
-                )
+                );
+                progress.begin_attempt(wal, lock);
+                context.txn.statement_mark(wal, lock)
             };
-            let before = context.txn.transaction_effect_mark();
-            let descriptors = context.txn.statement_large_object_descriptors(arena)?;
-            let advisory = context.storage().advisory_statement_mark();
-            let settings = match &context.host {
-                PlpgsqlExecHost::Routine { guc, .. } => guc.statement_settings(),
-                _ => return Err(changed()),
-            };
+            let effects = super::write_attempts::WriteAttemptEffects::capture(context)?
+                .ok_or_else(changed)?;
             let outcome = query::with_routine_invocation_scope(
                 Some(query::RoutineInvocationContext::new(&calls, owner)),
                 || {
@@ -893,6 +948,7 @@ impl SqlExecution {
                             None,
                             Some(&mut capture_rows),
                             &mut self.pending_write,
+                            Some(&mut progress),
                         )
                     } else {
                         let output_mark = context.responder.mark();
@@ -931,17 +987,7 @@ impl SqlExecution {
                     }
                 },
             );
-            let changed_effects = context.txn.transaction_effect_mark() != before
-                || !context
-                    .txn
-                    .matches_statement_large_object_descriptors(descriptors)
-                || context.storage().advisory_statement_mark() != advisory
-                || match &context.host {
-                    PlpgsqlExecHost::Routine { guc, .. } => {
-                        !guc.matches_statement_settings(&settings)
-                    }
-                    _ => true,
-                };
+            let changed_effects = effects.changed(context);
             match outcome {
                 Ok(_) => break Ok(()),
                 Err(error) if error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION => {
@@ -953,11 +999,15 @@ impl SqlExecution {
                         }
                         break result;
                     }
-                    if changed_effects {
-                        break Err(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "SQL row expression requires retained write progress"
-                        ));
+                    let unfinished = match progress.unfinished_row(context.txn) {
+                        Ok(unfinished) => unfinished,
+                        Err(error) => break Err(error),
+                    };
+                    if unfinished.is_none()
+                        && changed_effects
+                        && !calls.pending_firing_started_at(effects.transaction)
+                    {
+                        break Err(progress.progress_required());
                     }
                     let PlpgsqlExecHost::Routine {
                         engine,
@@ -969,7 +1019,11 @@ impl SqlExecution {
                     else {
                         return Err(changed());
                     };
-                    engine.rollback_waiting_statement(context.txn, mark);
+                    // Kept rows stay changed; only the unfinished row is undone.
+                    engine.rollback_waiting_statement(
+                        context.txn,
+                        unfinished.map_or(mark, |row| row.mark),
+                    );
                     let pending = calls.take_pending().ok_or_else(|| {
                         sql_err!(
                             sqlstate::INTERNAL_ERROR,
@@ -993,11 +1047,11 @@ impl SqlExecution {
                         break Err(error);
                     }
                 }
-                Err(error) if changed_effects && control_flow::is_execution_wait(&error) => {
-                    break Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "SQL row expression requires retained write progress"
-                    ));
+                Err(error)
+                    if (changed_effects || progress.changed_rows())
+                        && control_flow::is_execution_wait(&error) =>
+                {
+                    break Err(super::write_attempts::retained_progress_required());
                 }
                 Err(error) => break Err(error),
             }
@@ -1243,6 +1297,18 @@ fn check_polymorphic_result<'a>(
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     let _ = argument_oids;
+    // Other results are checked at CREATE and by the called-routine check;
+    // a polymorphic one only resolves with a call's argument types.
+    let polymorphic = routine
+        .function_result_contract()
+        .is_some_and(|result| result.polymorphic_type().is_some())
+        || routine
+            .arguments()
+            .iter()
+            .any(|argument| argument.polymorphic_type().is_some());
+    if !polymorphic {
+        return Ok(());
+    }
     // A polymorphic call runs an instance whose result is already resolved.
     let scalar = routine.kind.function_result().is_some_and(|result| {
         !matches!(

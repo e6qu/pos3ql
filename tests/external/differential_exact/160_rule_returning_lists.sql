@@ -1,0 +1,70 @@
+-- A rule's RETURNING list must match its relation's columns, and the
+-- triggering statement's own RETURNING list reads the rule's entries by
+-- position under the relation's column names.
+CREATE SCHEMA rule_returning;
+SET search_path = rule_returning, public;
+CREATE TABLE t (a int, b text);
+CREATE TABLE log (x int, y text, z int);
+CREATE VIEW v AS SELECT a AS va, b AS vb FROM t;
+CREATE RULE r1 AS ON INSERT TO v DO INSTEAD INSERT INTO t VALUES (new.va, new.vb) RETURNING a, b, 1;
+CREATE RULE r1 AS ON INSERT TO v DO INSTEAD INSERT INTO t VALUES (new.va, new.vb) RETURNING a;
+CREATE RULE r1 AS ON INSERT TO v DO INSTEAD INSERT INTO t VALUES (new.va, new.vb) RETURNING b, a;
+CREATE RULE r1 AS ON INSERT TO v DO INSTEAD INSERT INTO t VALUES (new.va, new.vb) RETURNING a::bigint, b;
+CREATE RULE r1 AS ON INSERT TO v DO INSTEAD INSERT INTO t VALUES (new.va, new.vb) RETURNING a, null;
+CREATE RULE r1 AS ON INSERT TO v DO INSTEAD INSERT INTO t VALUES (new.va, new.vb) RETURNING *;
+CREATE RULE r2 AS ON UPDATE TO v DO INSTEAD UPDATE t SET b = new.vb WHERE a = old.va RETURNING t.*;
+CREATE RULE r3 AS ON DELETE TO v DO INSTEAD DELETE FROM t WHERE a = old.va RETURNING a, b;
+INSERT INTO v VALUES (1, 'one'), (2, 'two') RETURNING *;
+INSERT INTO v VALUES (3, 'three') RETURNING vb, va + 1 AS next, v.va, new.vb;
+UPDATE v SET vb = 'TWO' WHERE va = 2 RETURNING vb, va;
+UPDATE v AS w SET vb = upper(vb) WHERE va = 1 RETURNING w.*, old.va;
+UPDATE v SET vb = 'x' WHERE va = 3 RETURNING nosuch;
+UPDATE v SET vb = 'x' WHERE va = 3 RETURNING q.va;
+DELETE FROM v WHERE va = 3 RETURNING va * 10 AS tens, vb;
+SELECT * FROM t ORDER BY a;
+-- A RETURNING list on a table rule names the triggering table's columns.
+CREATE RULE r4 AS ON INSERT TO log DO INSTEAD INSERT INTO t VALUES (new.x, new.y) RETURNING a, b, 7;
+CREATE RULE r4 AS ON INSERT TO log DO INSTEAD INSERT INTO t VALUES (new.x, new.y) RETURNING a, b, null;
+CREATE RULE r4 AS ON INSERT TO log DO INSTEAD INSERT INTO t VALUES (new.x, new.y) RETURNING a, b, a + 7;
+INSERT INTO log VALUES (4, 'four', 0) RETURNING *;
+INSERT INTO log VALUES (5, 'five', 0) RETURNING z, x + 1 AS q, log.y;
+-- Only one rule may supply the RETURNING rows of a statement.
+CREATE RULE r5 AS ON INSERT TO log DO INSTEAD INSERT INTO t VALUES (new.x, new.y) RETURNING a, b, a;
+INSERT INTO log VALUES (6, 'six', 0);
+INSERT INTO log VALUES (7, 'seven', 0) RETURNING x;
+-- Typmods must agree unless either side leaves them unspecified.
+CREATE TABLE n (a numeric(5,2), c varchar(3), d int[]);
+CREATE RULE rn AS ON INSERT TO n DO INSTEAD INSERT INTO t VALUES (1, 'x') RETURNING 1.0::numeric(6,2), b::varchar(3), null::int[];
+CREATE RULE rn AS ON INSERT TO n DO INSTEAD INSERT INTO t VALUES (1, 'x') RETURNING 1.0::numeric, b::varchar(4), null::int[];
+CREATE RULE rn AS ON INSERT TO n DO INSTEAD INSERT INTO t VALUES (1, 'x') RETURNING 1.0::numeric, b::varchar, '{1}';
+CREATE RULE rn AS ON INSERT TO n DO INSTEAD INSERT INTO t VALUES (1, 'x') RETURNING 1.0::numeric, b::varchar, '{1}'::int[];
+INSERT INTO n VALUES (1, 'x') RETURNING *;
+-- A table with a dropped column cannot take a RETURNING rule.
+CREATE TABLE e (a int, c int, b text);
+ALTER TABLE e DROP COLUMN c;
+CREATE RULE re AS ON INSERT TO e DO INSTEAD INSERT INTO t VALUES (new.a, new.b) RETURNING a, b;
+CREATE RULE re AS ON INSERT TO e DO INSTEAD INSERT INTO t VALUES (new.a, new.b) RETURNING a;
+CREATE VIEW ve AS SELECT * FROM e;
+CREATE RULE rve AS ON INSERT TO ve DO INSTEAD INSERT INTO t VALUES (new.a, new.b) RETURNING a, b;
+INSERT INTO ve VALUES (8, 'eight') RETURNING *;
+-- Conditional and non-INSTEAD rules take no RETURNING list.
+CREATE RULE rc AS ON UPDATE TO log WHERE new.x > 0 DO INSTEAD UPDATE t SET b = new.y RETURNING a, b, 0;
+CREATE RULE ra AS ON UPDATE TO log DO ALSO UPDATE t SET b = new.y RETURNING a, b, 0;
+CREATE RULE rm AS ON UPDATE TO log DO INSTEAD (UPDATE t SET b = new.y RETURNING a, b, 0; UPDATE t SET b = new.y RETURNING a, b, 1);
+-- Duplicate rule and trigger names report their relation.
+CREATE FUNCTION tf() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
+CREATE TRIGGER g1 BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION tf();
+CREATE TRIGGER g2 BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION tf();
+CREATE TRIGGER g1 BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION tf();
+CREATE TRIGGER g3 INSTEAD OF INSERT ON ve FOR EACH ROW EXECUTE FUNCTION tf();
+CREATE TRIGGER g3 INSTEAD OF INSERT ON ve FOR EACH ROW EXECUTE FUNCTION tf();
+ALTER TRIGGER g2 ON t RENAME TO g1;
+CREATE TABLE pp (a int) PARTITION BY RANGE (a);
+CREATE TABLE pc PARTITION OF pp FOR VALUES FROM (0) TO (10);
+CREATE TRIGGER g4 BEFORE INSERT ON pc FOR EACH ROW EXECUTE FUNCTION tf();
+CREATE TRIGGER g4 BEFORE INSERT ON pp FOR EACH ROW EXECUTE FUNCTION tf();
+CREATE TRIGGER g5 BEFORE INSERT ON pp FOR EACH ROW EXECUTE FUNCTION tf();
+CREATE OR REPLACE TRIGGER g5 BEFORE INSERT ON pc FOR EACH ROW EXECUTE FUNCTION tf();
+CREATE TRIGGER g5 BEFORE INSERT ON pc FOR EACH ROW EXECUTE FUNCTION tf();
+RESET search_path;
+DROP SCHEMA rule_returning CASCADE;

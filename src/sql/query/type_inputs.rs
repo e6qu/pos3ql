@@ -89,6 +89,10 @@ impl<'a> ColumnLookup<'a> for MetadataOnly<'_, '_> {
     fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
         self.row.column_type_oid(qualifier, name)
     }
+
+    fn row_variable(&self, name: &str) -> Option<crate::sql::eval::RowVariable> {
+        self.row.row_variable(name)
+    }
     fn collation(&self, qualifier: Option<&str>, name: &str) -> ast::Collation {
         self.row.collation(qualifier, name)
     }
@@ -374,6 +378,46 @@ fn discover_defaults(
                 domain.base_type_mod,
             )
         }
+        Stmt::AlterView {
+            name,
+            action: ast::AlterViewAction::SetDefault { column, expression },
+            ..
+        } => {
+            let Some(crate::storage::ResolvedRelation::View(slot)) =
+                storage.resolve_relation(name.schema, name.name, txid)
+            else {
+                return Ok(());
+            };
+            let view = storage.view(slot);
+            let Some(index) = view
+                .columns_for(txid)
+                .names()
+                .iter()
+                .position(|name| name.as_str() == *column)
+            else {
+                return Ok(());
+            };
+            let descriptions = arena
+                .alloc_slice_with(view.columns_for(txid).len(), |_| {
+                    crate::sql::types::ColDesc::new("", 0, 0)
+                })
+                .map_err(|_| super::arena_full())?;
+            let count = crate::sql::catalog::describe_view(&view, txid, arena, descriptions)?;
+            let description = descriptions
+                .get(index)
+                .filter(|_| index < count)
+                .ok_or_else(|| {
+                    sql_err!(
+                        super::sqlstate::INTERNAL_ERROR,
+                        "view default output type is missing"
+                    )
+                })?;
+            (
+                *expression,
+                Some(description.type_oid),
+                description.type_mod,
+            )
+        }
         _ => return Ok(()),
     };
     let Some(target) = target else {
@@ -421,7 +465,7 @@ fn discover_view_default(
             crate::sql::types::ColDesc::new("", 0, 0)
         })
         .map_err(|_| super::arena_full())?;
-    let count = crate::sql::catalog::describe_view(storage, txid, &view, arena, descriptions)?;
+    let count = crate::sql::catalog::describe_view(&view, txid, arena, descriptions)?;
     let description = descriptions
         .get(index)
         .filter(|_| index < count)
@@ -666,6 +710,47 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
         'storage: 'a,
     {
         self.statement(statement, Some(outer))
+    }
+
+    /// A `CALL`'s arguments, typed by `columns` and read from `row`.
+    fn call_statement<'a>(
+        &mut self,
+        statement: &'a Stmt<'a>,
+        columns: &dyn ColTypeResolver,
+        row: &dyn ColumnLookup<'a>,
+    ) -> Result<(), SqlError>
+    where
+        'storage: 'a,
+    {
+        let Stmt::Call {
+            name,
+            arguments,
+            argument_names,
+            variadic,
+            ..
+        } = statement
+        else {
+            return Ok(());
+        };
+        let name = match name.schema {
+            Some(schema) => self
+                .arena
+                .alloc_str_display(format_args!("{schema}.{}", name.name))
+                .map_err(|_| super::arena_full())?,
+            None => name.name,
+        };
+        for argument in *arguments {
+            self.expression(argument, columns, row)?;
+        }
+        self.call(
+            name,
+            None,
+            arguments,
+            argument_names,
+            *variadic,
+            true,
+            columns,
+        )
     }
 
     fn input(&mut self, expression: &Expr<'_>, target: i32, type_mod: i32) -> Result<(), SqlError> {
@@ -1052,6 +1137,8 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
     where
         'storage: 'a,
     {
+        // A plain derived table reads only the levels around its query; a
+        // LATERAL one also reads the tables beside it.
         if let Some(query) = table.subquery {
             let outer = if table.lateral { lateral } else { hidden };
             self.select(query, Some(outer), None)?;
@@ -1146,7 +1233,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                 let mark = arena.mark();
                 let result: Result<(), SqlError> = (|| {
                     let output = super::srf::describe_derived_definition(
-                        storage, select, "", None, txid, arena, None,
+                        storage, select, "", None, txid, arena, outer,
                     )?;
                     // Set outputs can repeat names such as ?column?. Bind by
                     // ordinal so one output never acquires a sibling's type.
@@ -1501,13 +1588,16 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                 self.statement(statement, outer)
             }
             Stmt::Explain { statement, .. } => self.statement(statement, outer),
-            Stmt::Call {
-                name,
-                arguments,
-                argument_names,
-                variadic,
-                ..
-            } => {
+            Stmt::Call { .. } => {
+                // A procedural CALL's arguments read the block's variables.
+                if let Some(outer) = outer {
+                    let catalog = super::storage_catalog(self.storage, self.arena, self.txid);
+                    let columns = RuntimeColumnTypes {
+                        row: outer,
+                        catalog: Some(&catalog),
+                    };
+                    return self.call_statement(statement, &columns, outer);
+                }
                 let catalog = crate::sql::exec::CatalogCols {
                     definition: None,
                     alias: None,
@@ -1516,25 +1606,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                     txid: self.txid,
                     arena: self.arena,
                 };
-                let name = match name.schema {
-                    Some(schema) => self
-                        .arena
-                        .alloc_str_display(format_args!("{schema}.{}", name.name))
-                        .map_err(|_| super::arena_full())?,
-                    None => name.name,
-                };
-                for argument in *arguments {
-                    self.expression(argument, &catalog, &crate::sql::eval::NoColumns)?;
-                }
-                self.call(
-                    name,
-                    None,
-                    arguments,
-                    argument_names,
-                    *variadic,
-                    true,
-                    &catalog,
-                )
+                self.call_statement(statement, &catalog, &crate::sql::eval::NoColumns)
             }
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
                 self.dml(statement, outer)
@@ -1582,6 +1654,7 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             extra,
             self.txid,
             self.arena,
+            outer.map(|outer| outer as &dyn ColumnLookup<'_>),
         )?;
         let schema = super::materialize::ScopeSchema(&scope);
         let row = super::Chained {

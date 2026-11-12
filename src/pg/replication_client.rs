@@ -226,6 +226,20 @@ pub(crate) fn validate_connection_syntax(input: &str) -> Result<(), ConnectionIn
     Ok(())
 }
 
+/// Whether a syntactically valid connection string names a password, as
+/// PostgreSQL's `walrcv_check_conninfo` requires of non-superusers.
+pub(crate) fn connection_names_password(input: &str) -> Result<bool, ConnectionInfoError> {
+    if input.starts_with("postgresql://") || input.starts_with("postgres://") {
+        return Ok(parse_uri_parts(input, false)?.password.is_some());
+    }
+    let mut parser = ConnectionParser { input, at: 0 };
+    let mut named = false;
+    while let Some((key, _)) = parser.pair()? {
+        named |= key == "password";
+    }
+    Ok(named)
+}
+
 fn decoded_uri_component<const N: usize>(input: &str) -> Result<StackStr<N>, ConnectionInfoError> {
     let mut bytes = [0_u8; N];
     let mut length = 0usize;
@@ -2431,7 +2445,7 @@ mod tests {
     fn bounded_client_drives_a_raw_postgres_replication_handshake() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
 
         fn message(kind: u8, payload: &[u8]) -> [u8; 64] {
             let mut out = [0_u8; 64];
@@ -2513,7 +2527,7 @@ mod tests {
             4096,
         )
         .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         let mut keepalive = None;
         while (!client.is_streaming() || keepalive.is_none()) && Instant::now() < deadline {
             client.writable().unwrap();
@@ -2549,7 +2563,7 @@ mod tests {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::Arc;
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
 
         fn message(kind: u8, payload: &[u8]) -> [u8; 64] {
             let mut out = [0_u8; 64];
@@ -2650,7 +2664,7 @@ mod tests {
                 manage_slot_behavior: false,
             })
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = crate::test_wait::deadline();
         while !client.is_streaming() && Instant::now() < deadline {
             if client.wants_write() {
                 client.writable().unwrap();

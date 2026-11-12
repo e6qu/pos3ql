@@ -64,11 +64,161 @@ worker. Completion or failure releases unused read-ahead requests. Commit does
 so as soon as its row images are in the journal, so an abandoned speculative
 download cannot hold up the next checkpoint.
 
+**Restarts always finish.** A statement that restarts after a wait reads its
+blocks again; a block it already consumed survives only in the block or disk
+cache. When the caches are off or smaller than the statement's blocks, every
+attempt could download them again and wait again, so the read path counts,
+per statement, how often it downloaded each block since the statement last
+kept progress (rows a resumed write kept, a delivered result row). An attempt
+after a wait that would download a block a third time, or one more distinct
+block than `statement_restart_waits` (default 64), reads the rest of the
+statement synchronously. With `block_cache_bytes = 0` and `disk_cache_bytes =
+0`, `SELECT ... UNION ALL ...` over three cold tables therefore waits a few
+times and then finishes, where it used to restart forever.
+
 The rule for statements: a statement can yield until it performs its first
 **effect** — something a restart could not undo or repeat. Effects are calling
 a volatile function or a user routine body, issuing `nextval`/`setval`, and
 output actually reaching the client. After the first effect, the remaining
-reads of that statement block until the statement ends.
+reads of that statement block until the statement ends, except inside the
+rows of a write (see below).
+
+**Writes restart before their row changes.** `INSERT ... SELECT`, `UPDATE`,
+`DELETE` and `MERGE`, at top level or as a statement of a `CALL` or `DO` body,
+first select their rows: `INSERT ... SELECT` materializes its source rows,
+`UPDATE` and `DELETE` collect the target rows and lock each one, and `MERGE`
+joins its source and target. Nothing has changed yet, so a cold read or a row
+lock wait in this phase rolls the statement back to its start (row images,
+locks, journal records and statistics) and yields; on resume it runs again and
+sees the rows as of its new start, as PostgreSQL would had it started then.
+A sequence or routine call in the scan is an effect as usual: later reads
+block, and a later row-lock wait replays its results. A `BEFORE STATEMENT`
+trigger therefore makes the whole scan synchronous.
+
+**Writes resume at their row.** Once a write starts changing rows, a
+storage or lock wait no longer blocks the worker or restarts the statement.
+The write's progress is kept while the statement waits: the unfinished row,
+finished steps, the routine-call log and the sequence replay, beside the
+command, snapshot, clock and deadline every waiting statement keeps. The
+transaction keeps it for a top-level write, and the procedure frame for a
+write in a `CALL` or `DO` body. Each row reads (index maintenance,
+unique and foreign key checks, trigger bodies, `RETURNING`) yielding; a wait
+rolls back only that row, with its trigger writes and output, and the
+statement's next run selects its rows again under the same command and
+snapshot, skips the changed ones and continues at that row. Sequence values
+and routine results the row already had replay from the statement's log,
+and trigger bodies run again after their writes rolled back, so each
+happens once. An effect a rerun would not repeat identically (a volatile
+built-in such as `random()`, an advisory lock, output that reached the
+client) makes the rest of its row read synchronously; one before the rows,
+in the scan, would select different rows, so such a write reads its rows
+synchronously and a lock wait runs it again from its first start. A wait inside a routine body run for a row keeps the body's progress
+and continues it.
+
+**AFTER events queue in one spilling log.** Every queued `AFTER ROW`
+trigger, constraint trigger and foreign key check is a record in the
+transaction's event log, fired at its statement's end (or at `SET
+CONSTRAINTS` and commit when deferred) as PostgreSQL's after-trigger queue
+does. A written row's foreign key checks, its own references and the NO
+ACTION and RESTRICT checks of keys it removes, wait beside the row until its
+`AFTER` triggers are queued and take their places among them by the name of
+PostgreSQL's `RI_ConstraintTrigger_c_<oid>`/`_a_<oid>` triggers. A referencing
+check reads the row's current version, so a row deleted before the check is
+not checked; a referenced check carries the old key, and NO ACTION passes
+when another row provides that key again. Checks see every change of their
+transaction, and those of a data-modifying `WITH` sub-statement wait for the
+end of the whole statement, so `WITH d AS (DELETE FROM p ...) INSERT INTO p
+SELECT ...` passes as in PostgreSQL. The log is cut into 64 KiB pages:
+`deferred_trigger_bytes` of them stay in memory per connection and older
+pages move to the `trigger_event_spill_bytes` file shared by all
+connections, recreated empty at startup. Only when both are full does
+queuing fail with `54000`. A fired event carries the number of its firing,
+so a rollback to a statement or savepoint re-arms exactly the events fired
+after it.
+
+**Work after a write's last row resumes too.** A top-level `INSERT`,
+`UPDATE`, `DELETE` or `MERGE` keeps its finished `AFTER` work across a
+wait: queued `AFTER ROW` events, then the transaction's immediate
+constraint checks (deferrable unique and exclusion constraints in
+`IMMEDIATE` mode), then `AFTER STATEMENT` triggers. An event
+stays selected until it completes. A wait inside a PL/pgSQL trigger body
+keeps the body and continues at its waiting statement; a wait before the
+body starts runs the same event again, replaying its sequence values from
+the event's start. Each event's reads yield until its own first effect
+(a write, sequence call or routine call in its body), after which the rest
+of that event reads synchronously; the next event yields again. A write in
+a `CALL` or `DO` body keeps its `AFTER` work the same way in the body's
+frame. The steps of a multi-step write (rule actions, data-modifying `WITH`)
+run their `AFTER` work inline and synchronously.
+Cancellation, a statement or lock timeout, an error and
+the end of the transaction release the kept progress.
+
+**Routine calls keep a write's changed rows.** A row expression, row trigger
+or `RETURNING` item of `INSERT`, `UPDATE`, `DELETE` or `MERGE` (including
+its join condition) that calls a PL/pgSQL or
+data-modifying function ends the write attempt, because the call runs on the
+engine. Before the first row change the attempt rolls back and runs again,
+replaying the call's saved result. After it, the write keeps its changed rows:
+only the unfinished row rolls back, the call runs and sees the earlier rows'
+changes, and the next attempt selects its rows again under the same command,
+skips the changed ones and continues at that row, or at its `RETURNING`
+values when the call was there. Statement triggers, transition rows,
+sequence values and returned rows each happen once. Queued `AFTER` row
+events belong to the statement that queued them (its nesting depth and
+command), so a call that runs between attempts never fires the kept rows'
+events early; they fire when the write ends, as in PostgreSQL. An error inside
+such a call still rolls the whole statement back; a wait inside it keeps the
+write's rows (above). `INSTEAD OF` view triggers
+keep their rows the same way. A statement made of several steps (the
+sub-statements of a data-modifying `WITH` and its main statement; a rule's
+original statement and actions) also keeps the steps it finished: their
+output rows and row counts are saved, the next attempt skips them, and the
+unfinished step continues at its row, or runs again from its own start.
+A multi-step statement inside another's step (a rule action whose target
+has rules of its own) keeps its steps one level deeper, up to
+`write_step_levels` levels (4 by default);
+a step that is resumed keeps the effects of the calls that ran before it
+resumed. Where a write cannot keep its rows (a foreign table, or a step
+that changed rows without row progress), a call after its first change
+fails with `0A000` instead of running after a rollback that would hide
+those changes; one level deeper than `write_step_levels` it fails with
+`54000`, naming the setting. Writes that rules rewrite into
+several steps finish each step's `AFTER` triggers before the next step, so
+they never hand their completion to the caller.
+
+**Trigger bodies run on the engine when they need it.** A write fires its
+`BEFORE` and `INSTEAD OF` triggers, row and statement, on its own storage.
+When such a body reaches work only the engine runs (DDL, a write to a view
+or a table with rules, a procedure that runs DDL, or a routine call), the
+outermost firing becomes the pending call instead: the attempt rolls back
+its unfinished row with the body's partial work, the engine runs the whole
+body once, and the invocation log keeps whether the row is kept and the
+`NEW` row it returned. The next attempt reaches the same firing at the same
+log position and takes that result, so the body's writes, notices and
+sequence values happen once and its calls see its own earlier writes. Writes
+in a body run on the engine hand their `AFTER` triggers to it, which runs
+them on the engine too. So does a PL/pgSQL or SQL-language function called
+from a query (`SELECT f()`): its writes' `AFTER` triggers can run DDL and
+call routines; a wait inside them restarts the statement, as any wait in
+such a call does.
+
+`INSERT ... SELECT` materializes its source first; an output item that
+calls a volatile user routine is split so that the source reads only its
+other parts, and the row phase runs the calls as each row is inserted, as
+PostgreSQL computes its output list.
+
+**Example:** `UPDATE items SET total = running_total()`, where
+`running_total()` sums `items`, gives each row the sum including the rows
+updated before it, as in PostgreSQL.
+
+**Example:** `UPDATE orders SET status = 'late' WHERE due < now()` over cold
+`orders` yields while it downloads the blocks it scans; other clients run
+meanwhile. Each wait discards only the scan, and the rows change once.
+
+**Example:** `INSERT INTO order_lines SELECT ... FROM staging`, where each
+line's foreign key check reads a cold `products` block, yields at each such
+row; the rows before it stay inserted, and their serial defaults and
+trigger audit rows happen once.
 
 **The worker never waits for a client.** A result larger than the
 connection's send buffer (`conn_send_buffer_bytes`) queues in the
@@ -92,12 +242,36 @@ stay queued until it finishes; if such a routine is first called after rows
 already reached the client, the statement fails with `0A000` instead of
 repeating them.
 
-**Large results resume row by row.** Before a top-level `SELECT` runs (simple
-Query, or an unpaged extended `Execute`), the engine decides whether it can
-become a **result stream**: a single ordinary table without joins, grouping,
-sorting, `DISTINCT`, set operations, subqueries, CTEs, row locking or row
-security, whose read position (one record per resident row plus the query
-text) fits `result_stream_bytes`. If such a statement's output first outgrows
+**Large results resume row by row.** Before a top-level `SELECT` or
+`COPY ... TO STDOUT` runs (simple Query or extended `Execute`), the engine
+decides whether it (or the query a COPY reads: its own, or `SELECT columns
+FROM ONLY table` for a table) can become a **result stream**: one ordinary table, or
+builtin set-returning functions with constant arguments (`generate_series`,
+`generate_subscripts`, a one-array `unnest`, `regexp_matches`,
+`regexp_split_to_table`, the `json`/`jsonb` `_each`, `_array_elements` and
+`_object_keys` families; alone or in `ROWS FROM`, with or without `WITH
+ORDINALITY`), or a **retained join** of up to eight such items or literal
+`VALUES` lists (a nested loop, or a hash join built in `plan_build_bytes`
+where the general executor would hash), optionally with an `ORDER BY` the
+stream sorts itself (local mode), or a **retained grouping** of such a
+source (`GROUP BY`, `HAVING`, aggregates and plain `DISTINCT`, below), or
+`DISTINCT ON` the stream sorts (local mode), or a `UNION ALL` of such
+queries without its own `ORDER BY` (below);
+without grouping sets, other set operations, subqueries other than
+uncorrelated scalar ones (a simple subquery in FROM is merged into its query
+first, below), CTEs that run once, row locking
+or row security, whose read position (one
+record per resident row of each table plus the query text) fits
+`result_stream_bytes`. A retained join uses inner, cross and `LEFT` joins,
+or one `RIGHT` or `FULL` join of two items whose right item is a table or
+`VALUES` list, whose `ON`/`USING` conditions are scalar, non-volatile and call no
+SQL-language routine; a join whose inner table the general executor would
+probe through an index for each outer row spools for `shape` instead. A
+sorted stream's keys and filter must be non-volatile and call no
+SQL-language routine; its output items either are too (they run before the
+sort) or are volatile (they run after it, as PostgreSQL postpones volatile
+output past a sort); with `LIMIT` or `OFFSET`, items that run before the sort
+must be columns or constants. If such a statement's output first outgrows
 the send buffer before any byte left and before any effect, that attempt is
 discarded and the statement reopens from a retained read position in the
 connection's `result_stream_bytes` allocation. It then delivers rows while the
@@ -105,9 +279,65 @@ client reads and yields when the client is behind (`Client`/`ClientWrite` in
 `pg_stat_activity`), when a row waits for an object download, and when a row
 waits for a lock. Delivered rows are final: a wait inside a row rolls back and
 re-evaluates only that row, and an effect makes only the rest of that row read
-synchronously. Every other large result uses the spool above, decided before
+synchronously. A delivered row's receipts (sequence values, routine results)
+are released before the next row starts, so statement memory holds one row's
+receipts however long the stream runs. Every other large result uses the spool above, decided before
 any of its rows reach the client; `pos3ql_result_stream_spooled_total` counts
-those by reason (`shape`, `capacity`, `effects`).
+those by reason (`shape`, `capacity`, `effects`). A spooled result yields on
+cold storage only until its first byte reaches the client, then reads
+synchronously until it ends. Today that covers other joins, other groupings, sorted
+results in object-store mode, subqueries, set operations other than `UNION ALL`, `VALUES` lists, other function sources,
+row locking, row security, a result that started an effect before it
+overflowed, and a `FETCH` from a scrollable cursor that saves its history. A buffered paged portal
+sends nothing before its first page, so its reads yield throughout.
+
+A paged portal whose statement can stream opens its stream before the
+statement runs: its attempt would stop at its first row anyway, so a sort,
+grouping or hash table is built once, in the stream, and its input reads
+resume instead of restarting the statement on each cold read. Under the
+other protocols a join or grouping runs in the general executor first and
+streams only once its output overflows.
+
+A statement that does not stream restarts from its start after each cold
+read, finding the objects its earlier attempts read only in the block
+caches. It reruns only once one of its own reads has completed: while every
+read it waits on is still in flight, another session's completed read does
+not wake it. Restarts that repeat downloads without progress are bounded as
+described above (`statement_restart_waits`).
+A result stream resumes from its read position and never restarts this way.
+
+A forward `FETCH n` or `FETCH ALL` (simple Query or unpaged `Execute`) from
+a cursor that reads as it fetches and saves no history opens such a stream
+over the cursor's own retained query before its first row: rows are evaluated
+as the client reads them, none is saved in `cursor_bytes`, and the cursor's
+position advances with each delivered row. A failure after delivered rows
+marks the cursor failed, as PostgreSQL does. A cursor saves no history when it
+is `NO SCROLL` or forward-only, and also when it is scrollable but unordered,
+not locking, and free of volatile functions: such a cursor keeps only its
+current fetch's rows, and backward motion beyond them rewinds its retained
+input (table position, literal list or function arguments) to the first row
+under the same snapshot and reads forward to the target, so memory stays
+fixed however far the cursor has moved. Scrollable cursors that evaluate
+revisited rows again, or that sort or lock, still save every visited row in
+`cursor_bytes`. A cursor over a retained join reads its levels as it fetches
+and is `NO SCROLL` unless declared `SCROLL`, as PostgreSQL's join plans
+cannot scan backward; a `SCROLL` join cursor with a volatile output list or
+filter saves its output rows, as PostgreSQL's Material node does, so a
+revisited row returns its first values.
+
+**Paged portals evaluate rows per `Execute`.** An `Execute` with a row limit
+opens such a statement's stream before running it. Each `Execute`
+evaluates only the rows it returns, then the portal suspends with
+`PortalSuspended`, keeping its read position and snapshot while other
+statements of the transaction run. The connection has `result_stream_slots`
+stream allocations: a running stream uses one and each suspended portal keeps
+one, so a client can page a second portal while the first is suspended. When
+all are held, other large results spool for `capacity`, and another paged
+portal buffers its whole result in `portal_result_bytes` (`54000` naming that
+setting when full), as do paged portals of other shapes.
+DDL on a table a suspended portal reads fails with `55006`, as in PostgreSQL. The
+stream ends when its portal completes, is closed or rebound, or its
+transaction ends.
 
 **Example:** `SELECT id, payload FROM orders` sent by a client on a slow link
 delivers rows as the client reads them; while it waits for the client or for a
@@ -121,10 +351,20 @@ BY id` sorts first, so its output queues in the spool instead.
 | Maintenance: checkpoint capture, merges, index builds, journal and saved-file cleanup | Yields, using a separate maintenance read owner and fixed clients |
 | A statement after its first effect (volatile function, routine body, sequence change, first output byte reaching the client) | Blocks until the statement ends |
 | Output queued for a slow client | Never blocks; the connection waits for the client between messages |
-| Result streams (see above): each row before its first effect | Yields; delivered rows are kept |
-| Writing statements: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, DDL, `CALL`, `DO`, `COPY FROM` | Blocks for the whole statement |
+| Result streams (see above), including `COPY ... TO STDOUT` and a streamed `FETCH`: each row before its first effect | Yields; delivered rows are kept |
+| Writes (`INSERT ... SELECT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`), also in a `CALL` or `DO` body: selecting and locking rows before the first row change, `VALUES` row or trigger body | Yields; the statement restarts from its start (see above) |
+| Writes after their first row change, also in a `CALL` or `DO` body: each row's index maintenance, constraint checks, trigger bodies and `RETURNING`, until an effect a rerun would not repeat identically | Yields; only the unfinished row rolls back (see above) |
+| A write's row after an effect a rerun would not repeat, or every row when such an effect ran in its scan | Blocks until the next step's rows or the statement's end |
+| A top-level write's `AFTER ROW` events, immediate constraint checks and `AFTER STATEMENT` triggers | Yields; finished events are kept (see above). An event's reads after its first effect block until that event ends |
+| A rule action's row selection after the rule's earlier steps, when their rows could resume | Yields; the step rolls back to its start and the finished steps are kept |
+| A data-modifying `WITH` main statement's row selection; `AFTER` triggers between the steps of a rule-rewritten write, and `AFTER` work of writes inside routine bodies | Blocks until the next step's rows or that work ends |
+| Routine calls inside a write's rows (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, rule actions, `INSTEAD OF` view triggers): row expressions, row triggers, `RETURNING`; `BEFORE` and `INSTEAD OF` trigger bodies that need the engine | Run on the engine between attempts; the write keeps its changed rows and finished steps and continues at the unfinished row (see above). A storage or lock wait inside the call restarts the whole statement |
+| DDL and `COPY FROM` | Blocks for the whole statement |
+| Top-level `CALL` and `DO` bodies: queries and write scans before the statement's first effect | Yields; the body resumes at its waiting statement |
+| Statements after the first effect inside a `CALL` or `DO` body | Blocks |
+| PL/pgSQL `OPEN`, `FETCH` and cursor `FOR` loops reading cold rows (a lock wait parks) | Blocks |
 | Commit processing, deferred constraint triggers, `SET CONSTRAINTS`, `PREPARE TRANSACTION`, `COMMIT PREPARED`/`ROLLBACK PREPARED` | Blocks |
-| `COPY` rows and completion; logical-replication apply and initial copy | Blocks |
+| `COPY FROM` rows and completion; a `COPY TO` that cannot stream once its first byte reaches the client; logical-replication apply and initial copy | Blocks |
 | Large-object fast-path calls, login event triggers, manual `CHECKPOINT` | Blocks |
 
 Lock waits are separate: a command waiting for a row, table or advisory lock
@@ -137,6 +377,266 @@ connection's cached lookup and a third connection's commit can finish. If the
 first connection's statement had already called `nextval('order_ids')`, its
 remaining reads would instead block the worker.
 
+### Retained plan tree
+
+A result stream, a retained cursor and a top-level `SELECT` run in place
+read their rows through a **plan tree**: a chain of nodes that each produce
+one row at a time and keep their position between rows. The chain is a leaf
+(a scan of one table position, literal list, generator calls or FROM-less
+row; or a join whose levels are such scans), an optional filter, an optional
+sort or grouping, the projection and the limit. Each node is a fixed record
+inside the reader, which lives in the stream's `result_stream_bytes`
+allocation or the cursor's slot; sorts, groupings and hash joins keep their
+rows in `plan_build_bytes` leases. Every node implements the same steps:
+advance to the next row (or report the end), expose the current row, release
+it once the driver is done, rewind for a scrollable cursor. A wait inside any
+node returns to the driver with every node's state kept, and the same step
+resumes. The filter, projection and limit at the top run in the statement
+driver itself, so a routine call there hands off on its row; a filter under a
+sort or grouping runs as that node reads its input
+(`src/sql/query/retained/tree.rs`).
+
+**Aggregate levels.** Before a query is planned, each aggregate call is
+given to the query PostgreSQL assigns it: the innermost one whose columns its
+arguments read. `SELECT (SELECT max(t.id) FROM u) FROM t` aggregates `t` and
+returns one row. Analysis rewrites such a call inside a subquery as an outer
+aggregate; the owning query folds it with its own aggregates and evaluates
+that subquery once per group, whose row supplies the value. The same pass
+reports PostgreSQL's placement errors (an aggregate in `WHERE`, `JOIN ... ON`,
+`GROUP BY`, `FILTER`, `LIMIT`, a function in `FROM`, or nested in another of
+its level) before any row is read (`src/sql/query/aggregate_levels.rs`).
+
+**Subqueries in FROM.** Before a query is planned, each simple subquery in its
+FROM clause is merged into it, as PostgreSQL's `pull_up_subqueries` does: the
+subquery's FROM items join the outer query in its place, its `WHERE` joins the
+outer restrictions, and every reference to one of its output columns
+becomes that column's expression. So `SELECT * FROM (SELECT 10/x AS q, x FROM
+t) s WHERE x <> 0` filters before it divides, and an output column nothing
+reads is never computed. A subquery is merged only when that is exact: no
+grouping, aggregates, window functions, `DISTINCT`, `ORDER BY`, `LIMIT`,
+locking, set-returning or volatile output, security-barrier view, or name the
+merge could rebind. A table among its FROM items whose name another item of
+the query already has (a `NOT MATERIALIZED` CTE read twice, a self-join
+through two derived tables) takes a name no SQL text can spell, longer than
+the 63 bytes kept of an identifier, as PostgreSQL tells such items apart by
+position. Under an outer join that can null its rows it merges only
+without a `WHERE` (which would otherwise run per joined pair) and when each
+output it substitutes is null whenever its columns are (PostgreSQL substitutes
+those without a placeholder). A view merges when the caller holds `SELECT` on all of it.
+`USING` and `NATURAL` joins of the outer query are first spelled out as `ON`
+joins. A subquery that stays in place receives each outer `WHERE` conjunct
+that reads only its columns, under the view-filter safety rules (no bounds,
+volatile, window or `DISTINCT ON` hazards); and every query moves `HAVING`
+conjuncts without aggregates, volatile calls or subqueries into `WHERE`, so
+they filter rows before aggregation. This happens in the general executor and
+in stream admission alike, so a merged derived table streams like the query it
+became (`src/sql/query/pullup.rs`).
+
+**CTEs and views in streams.** Stream admission expands a query's `WITH`
+list and views as the general executor does, then merges the result as
+above. A CTE is inlined, as PostgreSQL's planner inlines it, when nothing
+forces it to run once: it is not recursive or data-modifying, not
+`MATERIALIZED`, calls nothing volatile, and is read once (or is `NOT
+MATERIALIZED`). A CTE nothing reads never runs. When any CTE, at any depth
+or inside a view, must run once, the statement spools for `shape`: the
+general executor runs that CTE to its end before the first row. A view
+expands under its owner's privileges and is locked as the general executor
+locks it; it merges only when the caller holds `SELECT` on the whole view,
+and otherwise (column privileges only, `security_barrier`) spools. So
+`WITH recent AS (SELECT * FROM orders WHERE id > 100) SELECT * FROM recent`
+streams as the scan of `orders` it becomes, while the same query with `AS
+MATERIALIZED` spools (`src/sql/query/cte.rs`, `expand_stream_ctes`).
+
+**Built: uncorrelated subqueries.** A stream, or a top-level `SELECT` run in
+place, keeps scalar, `EXISTS`, `ARRAY` and row subqueries that read no column
+of its query and call no volatile or user-defined function. Each runs when an
+expression first reads it, as PostgreSQL's initPlans do (in the general
+executor too), and keeps its value for the rest of the statement in the
+reader's allocation (`result_stream_bytes`) or the statement arena's
+persistent tail, so `SELECT (SELECT 1/x FROM z) FROM empty_table` returns no
+rows. A `WHERE` conjunct that reads no column of its query runs once before
+the scan, as PostgreSQL's one-time filter: `SELECT id, payload FROM orders
+WHERE id > (SELECT max(id) - 1000 FROM orders)` streams, and a false one
+returns no rows without reading any. A wait inside a subquery runs it again. Correlated subqueries, `IN` and `ANY`/`ALL`
+lists, subqueries in a sorted or grouped stream, in a `UNION ALL` query or
+in a declared cursor still spool or save their rows.
+
+Every other shape runs in the general executor, which materializes in the
+statement arena and cannot pause after its first byte. New node kinds are the
+planned route for subqueries, set operations and sorts of results in
+object-store mode, for removing the per-call restart of a top-level `SELECT`
+in those shapes (each routine call then hands off on its row, as single
+sources and retained joins already do), and for removing synchronous cold
+reads from spooled results after their first byte.
+
+**Built: nested-loop joins.** A retained join keeps one level per FROM item
+in the general executor's execution order (FROM order, or its cost order for
+a cross join). Each level owns its source position, its current row in the
+reader's allocation, and for a `LEFT JOIN` whether the row above found a
+partner; an inner level rewinds its source for each row of the level above,
+as PostgreSQL's nested loop rescans its inner plan. Rows nest in the
+allocation like a stack, so finishing a row releases exactly its bytes. The
+`ON` condition and the error-safe `WHERE` conjuncts whose tables are bound
+run at each level, as the general nested loop prunes; the full `WHERE` and
+the output list run in the statement driver, so routine calls hand off on
+their row. A storage wait at any level returns to the driver with every
+level's position kept, and the same row is read again on resume. Admission
+reuses the general planner's choice, so streaming never turns a hashed or
+indexed join into a full nested loop: a two-table equality join the general
+executor would hash is read as a hash join that builds the same side, and a
+join it would probe through an index per outer row is not retained.
+
+**Built: `RIGHT` and `FULL` joins.** As in the general executor, a `RIGHT`
+or `FULL` join of two items is a nested loop over the left item that keeps
+one flag per row of the right item, in a `plan_build_bytes` lease that
+grows as the first left row's pass reads the right item. Each right row that
+passes `ON` sets its flag; a `FULL JOIN` also returns each unmatched left
+row NULL-extended. After the last left row, the right item is read once
+more and each row whose flag is clear is returned with the left columns
+NULL, in the right item's order. A `FULL JOIN` whose `ON` condition, once
+constant conjuncts fold away, has no equality between an expression of the
+left tables and one of the right table fails with `0A000`, as PostgreSQL
+plans it only as a merge or hash join. A scrollable cursor rewinds both
+items and clears the flags.
+
+**Built: hash joins.** The build level reads its whole table once, at the
+join's first row (a declared cursor's at `DECLARE`), into three `plan_build_bytes` leases owned by the level:
+bucket heads sized from the planner's row estimate, one entry per row, and
+the rows' columns in projected encoding. A wait during the build keeps the
+rows inserted so far and the table position. Each outer row hashes its keys
+and walks its bucket; equal keys are compared, then the `ON` condition runs,
+and a `LEFT JOIN` returns a NULL-extended row when nothing matched. A cursor
+moving back rereads only its outer table: the build stays. A build that does
+not fit the free `plan_build_bytes` runs the statement the general executor's
+way instead (below), which builds the same table in statement memory
+(`sql_arena_bytes`).
+
+**Built: grouping.** A stream or a top-level `SELECT` run in place (not a
+declared cursor) groups a single source or retained join itself when its
+keys, `WHERE` and aggregate inputs are non-volatile and call no SQL-language
+routine, its custom aggregates' support functions are builtins (in
+object-store mode, also not combined in parts), and its `ORDER BY`, if any,
+is a prefix of its keys ascending with NULLs last; without grouping sets or
+`DISTINCT ON`. A plain `SELECT DISTINCT` without grouping or aggregates
+groups by its output list the same way: the general executor also returns
+it sorted by that list, and each distinct value keeps its first row's
+spelling (`1` before `1.00`), as PostgreSQL's hashed `DISTINCT` does; the
+general executor's sort is now stable for that reason. At its first row it reads its whole input and filters it; a
+storage wait keeps what was saved and the input position. How it saves its
+input is decided before any row, from the aggregates' kinds and argument
+types:
+
+- **Per group** when every aggregate's transition state has a fixed size or
+  holds one value: `count`, `sum`/`avg` over integers, `money`, floats and
+  `interval`, `min`/`max` of any type, `bool_and`/`bool_or`/`every`, the
+  bitwise aggregates over integers, variance and standard deviation over
+  floats, and the two-argument statistical aggregates, without `DISTINCT` or
+  an aggregate `ORDER BY`. Each group keeps its key and a few bytes per
+  aggregate in `plan_build_bytes`, found through a balanced tree ordered by
+  key; a `min`/`max` of a type passed by reference (text, numeric, arrays)
+  keeps its current value there too, rewritten in place when the new one
+  fits. Each input row folds into its group as it is read, and a group's
+  results are computed as its row is returned: `SELECT k, f(count(*)) FROM t
+  GROUP BY k` holds one record per distinct `k`, however many rows `t` has.
+- **Per input row** otherwise (numeric sums, collecting, ordered-set and
+  custom aggregates, `DISTINCT` or `ORDER BY` inside an aggregate): it saves
+  each row's keys and the input columns its aggregates read, orders them by
+  key (equal keys keep input order), folds each group over its rows and
+  saves its keys and results in two more leases.
+
+Either way a group folds its rows in input order with the general
+executor's aggregate states, each initialized once per aggregate and copied
+for every group (the general executor now does the same). Transition states never cross a wait inside a
+row: only reading input waits, and folding calls no routine body. Groups
+come out in the general executor's order (keys ascending, NULLs last), each
+reporting its first input row's key as PostgreSQL's hashed grouping does
+(the general executor now does too). `HAVING` and the output list run per
+group as its row is returned, so a routine call there hands off on its row.
+An error in an aggregate's input is reported before the first row; one in
+an aggregate's result (an overflowing `sum`), `HAVING` or the output list
+follows the groups already returned, as PostgreSQL's executor returns them
+(per input row, the results are computed before the first row). A grouping that does not fit
+`plan_build_bytes` runs in the general executor, as a sort does. A top-level
+`SELECT` is run in place only when its output list, `WHERE` or `HAVING` may
+hand a call off to a routine; builtin aggregate calls alone, as in `SELECT
+count(*) FROM t`, stay in the general executor.
+
+**Nodes.** A node never repeats an effect: row receipts stay with the row
+being built and are released when it is delivered.
+
+| Node | State it retains | Memory owner |
+|---|---|---|
+| Scan (built: table, literal list, generator calls, FROM-less row) | The read position and current row | Stream or cursor allocation |
+| Filter, projection, `LIMIT`/`OFFSET` (built) | The condition, items, and remaining counts | Node record |
+| Nested-loop join (built: inner, cross and `LEFT`; `RIGHT` and `FULL` of two items) | Each level's row bytes, position and matched flag; a flag per right row for `RIGHT`/`FULL` | The stream or cursor allocation, the right-row flags in `plan_build_bytes`; the inner source rewinds as scrollable cursors do |
+| Hash join (built: two tables, inner, cross and `LEFT`) | Build-side rows, entries and bucket heads | `plan_build_bytes` / `plan_build_leases`; exhaustion is `54000` naming them |
+| Grouping (built: `GROUP BY`, `HAVING`, aggregates) | Each group's key, states and held values; or every input row's keys and aggregated columns, then each group's keys and results | `plan_build_bytes` |
+| `DISTINCT` (built: plain, as a grouping by the output list) | Each distinct output row | `plan_build_bytes` |
+| Sort (built: local mode, also for `DISTINCT ON`) | Sort keys, saved output and input columns of every row | `plan_build_bytes`; object-store mode: the external sorter's runs on the block grid (not built) |
+| Set operations (built: `UNION ALL` in streams) | `UNION ALL`: each query's own plan and the current query; others: sorted runs of both inputs with counts | Stream allocation; others: external runs |
+| Scalar, `EXISTS`, `ARRAY` and row subquery (built: uncorrelated, unsorted and ungrouped, run when first read) | Each value; correlated: a per-outer-row child tree, rewound per row | Stream allocation |
+| `IN`/`ANY`/`ALL` subquery | A cached sorted run when uncorrelated, or a per-outer-row child tree | External run |
+| Derived table, CTE read once | Child tree in place | Its nodes |
+
+**Choosing a stream before execution.** Eligibility is decided from the
+query's shape before it runs: a statement either opens as a tree (all its
+nodes supported) or takes today's path, and the stream's eligibility and its
+reader share one admission function, so they cannot disagree. Promotion never
+makes a result fail that would have spooled. A stream keeps its opening
+messages (RowDescription, or CopyOutResponse and a COPY header) in a 16 KiB
+part of its `result_stream_bytes` until its first row is prepared, which is
+when its sort or hash table is complete. If opening the stream or building
+its table fails for capacity (`54000`: `result_stream_bytes`, the opening
+messages, or `plan_build_bytes`), nothing of it has been queued and no row or
+effect exists, so the connection releases the stream and runs the statement
+again with its output spooled, counted in
+`pos3ql_result_stream_spooled_total{reason="capacity"}`. This holds for a
+simple Query, an unpaged or paged Execute and `COPY ... TO STDOUT`; a re-run
+that waits for storage spools again rather than promoting. Any other error
+during the build follows the opening messages, as PostgreSQL sends them first.
+A top-level `SELECT` that a retained reader runs in place (one whose routine
+calls hand off on their row) holds its RowDescription the same way and runs
+in the general executor when its build does not fit. A declared cursor builds
+its hash table at `DECLARE`; one that does not fit saves its rows in
+`cursor_bytes` instead, so a streamed `FETCH` never builds.
+
+**Built: `UNION ALL`.** A stream (not a declared cursor) reads a `UNION
+ALL` as PostgreSQL's Append node does: each query has its own plan in the
+stream's allocation and is read to its end before the next one starts. A
+query's filter, bounds and output run as its rows are read, below the
+statement driver, so every query's expressions must be non-volatile and call
+no routine body; its values are coerced to the combined column types (as the
+general executor coerces them) before the row goes up. The physical tables
+of all queries together are limited to eight, as a retained join's are. A
+`LIMIT` or `OFFSET` on the whole `UNION ALL` applies to the combined rows.
+Every protocol opens it before running (a simple Query, an unpaged or paged
+Execute and `COPY`), since the general executor's attempt would materialize
+every query before its first row could overflow; a result that small still
+streams, and one without a free stream slot spools for `capacity`.
+
+**Built: sorts in local mode.** At its first row a sort reads its whole input
+(yielding on storage waits with the rows saved so far kept), filters it, and
+saves each passing row in projected encoding in two `plan_build_bytes`
+leases: the sort keys, the output items that run before the sort, and, when a
+volatile item runs after it, the row's input columns. It orders the rows with
+an in-place heap sort (equal keys keep input order) and then returns them one
+by one; a volatile item runs as its row is returned, so `nextval` numbers
+rows in output order. `DISTINCT ON` sorts by `ORDER BY`, then by its
+expressions missing from it, ascending, and returns only the first row of
+each run of equal expressions; as in the general executor, its output items
+all run before the sort. The choice depends only on the storage mode, never on
+the input size: in object-store mode the general executor sorts in external
+runs on the block grid, and such a result spools. Streaming those runs needs
+a run reader per stream, sized at startup with `result_stream_slots`, since
+the external sorter today is a shared pool of eight statement-scoped
+producers.
+
+**Cursors.** A scrollable cursor over a tree moves back by rewinding: scans,
+literal lists and generator calls rewind as now, sort nodes reread their
+finished run, and joins rewind their outer source. A tree containing a
+volatile function under a node that cannot evaluate rows again saves its
+outputs, as scrollable cursors over such shapes do now.
+
 ### How saved state is owned
 
 A paused command must resume exactly where it stopped, without repeating
@@ -148,12 +648,12 @@ replays instead of running the effect again.
 | Saved state | Owner |
 |---|---|
 | Procedural positions, lexical frames, source images, resolved local declarations, loop scopes, named-output bindings, caught error text | `execution_control_bytes` / `execution_control_leases` |
-| Saved local values, trigger `OLD`/`NEW` rows and arguments, transition tables, loop inputs, set-returning results, `EXECUTE ... INTO` results | `row_work_bytes` / `row_work_leases` |
+| Saved local values, trigger `OLD`/`NEW` rows and arguments, transition tables, loop inputs, set-returning results, `EXECUTE ... INTO` results, finished expression values of a waiting statement | `row_work_bytes` / `row_work_leases` |
 | Completed function results, argument values, selected functions and casts, sequence and advisory-lock receipts | The statement arena's retained region (the invocation log), within existing statement capacity |
 | Checked literal inputs saved with routines and stored definitions | `table_metadata_bytes` / `table_metadata_leases`, with `routine_input_slots` control records |
 | Execution schemas | `definition_image_slots` |
 | Result output queued for a slow client | Rows: `result_spool_bytes` / `result_spool_leases`, released as soon as the client drains them. Closing messages: a private reserve of `conn_send_buffer_bytes` per connection |
-| A result stream's query text, parameters, row positions and saved-file readers | `result_stream_bytes` per connection; released at completion, error, cancel, timeout or disconnect. Not visible in `pg_cursors` and not counted in `max_cursors` |
+| A result stream's query text, parameters, row positions and saved-file readers | `result_stream_bytes` per stream, `result_stream_slots` streams per connection; released at completion, error, cancel, timeout or disconnect, and for a paged portal when the portal is closed or rebound or its transaction ends. Not visible in `pg_cursors` and not counted in `max_cursors`. A streamed `FETCH` keeps its rows' state in its cursor's own allocations |
 
 Further rules that apply to every saved owner:
 
@@ -173,7 +673,9 @@ Further rules that apply to every saved owner:
   call's receipt instead of taking another hold.
 - **Unsupported restarts fail loudly.** A path that cannot save its progress
   returns `0A000` and rolls back rather than repeat a write — for example
-  `SQL row expression requires retained write progress`, or an unsaved volatile
+  `SQL row expression requires retained write progress` for a routine call
+  after a SQL-language function's `MERGE` or data-modifying `WITH`, or a
+  foreign table's write, changed rows; or an unsaved volatile
   value such as `random()`. Contexts with no resumable executor reject advisory
   unlocks with `0A000`.
 - **Typed wait markers.** Internal waits use a typed marker, not a SQLSTATE.
@@ -182,6 +684,16 @@ Further rules that apply to every saved owner:
 - **Exhaustion.** A full pool returns `54000` naming its settings. Growing a
   saved buffer reserves its replacement first, so failure keeps the previous
   value readable.
+
+A top-level `CALL` or `DO` keeps its waiting PL/pgSQL body on the
+transaction: lexical position, local values, settings, timer and journal
+position, in the same pools as a saved function. A nested `CALL` keeps the
+callee's body in its caller's saved frame. Each body statement is its own
+rollback boundary: a write that waits for a row lock rolls back only itself
+and runs again on resume, so the body can wait after its own `COMMIT` or
+`ROLLBACK`, which start new transactions without ending the statement or its
+effect journal. Ending the statement by error, timeout, cancel or disconnect
+releases the saved body.
 
 Write completion follows PostgreSQL's
 [write executor](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/executor/nodeModifyTable.c):
@@ -438,6 +950,7 @@ explicitly.
 | `index_statistics_slots` | Index activity counters | Starter: 4,096. Reserved at index creation; a table without indexes owns none |
 | `definition_image_slots` | Retained execution-schema identities | A paused trigger pins its completion's existing image rather than reserving another |
 | `result_spool_bytes` / `result_spool_leases` | Result rows queued behind clients that read slower than statements produce them | A connection holds at most one lease, growing geometrically and returned once its queue drains. Exhaustion fails only the lagging statement with `54000` after the rows already queued |
+| `plan_build_bytes` / `plan_build_leases` | Build sides of retained plan nodes: a retained hash join's buckets, entries and encoded build rows | Starter: 16 MiB and 64 leases; a hash join holds three leases and a sort two, from opening (a cursor's from `DECLARE`) until the stream or cursor ends. A build that does not fit runs its statement as it ran without streaming: the result spools, a cursor saves its rows |
 | `memtable_bytes` | Resident row heap | At most 4,294,967,295 bytes per buffer, two buffers reserved; a cache limit, not total table size |
 
 **Example:** a function with 128 declared locals and one named input stages
@@ -455,7 +968,7 @@ row-work memory.
 | `cursor_query_bytes` | Per-cursor query state, including the declared type IDs a `WITH HOLD` cursor keeps after commit |
 | `cursor_bytes` | Per-cursor typed output rows, sharing their bytes and `floor(cursor_bytes / 6)` row positions with the saved input rows a scrollable cursor evaluates again or an ordered row-locking cursor sorts |
 | `conn_send_buffer_bytes` | Reserved twice per connection: the send buffer and the private output reserve that holds a result's closing messages. The largest single backend message must fit it |
-| `result_stream_bytes` | One result stream per connection; required (starter: 256 KiB, minimum 64 KiB); zero disables streams. The estimate counts every resident row of the table, so a table with many uncheckpointed rows spools instead |
+| `result_stream_bytes`, `result_stream_slots` | `result_stream_slots` result streams per connection of `result_stream_bytes` each; both required (starter: 256 KiB, minimum 64 KiB, and 2 slots, at least 1); zero bytes disables streams. The estimate counts every resident row of the table, so a table with many uncheckpointed rows spools instead |
 | Held notifications | 64 KiB per connection for notifications that arrive while a result is in progress; a listener further behind is closed rather than sent a truncated stream |
 
 Tables store their actual columns, not a maximum-width array; dropped columns

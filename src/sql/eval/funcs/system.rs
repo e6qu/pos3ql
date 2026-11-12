@@ -10,7 +10,7 @@
 //! `format_type`, `pg_encoding_to_char`, and `pg_typeof`.
 
 use crate::sql::array;
-use crate::sql::ast::Expr;
+use crate::sql::ast::{Expr, TextSearchObjectKind};
 use crate::sql::exec;
 use crate::sql::types::{ArrElem, ColType, Datum, TypeMod};
 use crate::sql_err;
@@ -451,6 +451,48 @@ fn object_address_parts<'a, const N: usize>(
     })
 }
 
+/// An untyped literal argument (`'{public,t}'`) is read as the declared
+/// `text[]`; other values keep their type.
+/// An unknown-type literal argument takes the routine's declared type, as
+/// PostgreSQL's function resolution coerces it.
+fn unknown_as<'a>(
+    expression: &Expr<'a>,
+    value: Datum<'a>,
+    target: ColType,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if matches!(value, Datum::Text(_)) && matches!(expression, Expr::Str(_)) {
+        crate::sql::eval::cast_to(value, target, arena)
+    } else {
+        Ok(value)
+    }
+}
+
+fn transaction_type(legacy: bool) -> ColType {
+    if legacy { ColType::Int8 } else { ColType::Xid8 }
+}
+
+fn snapshot_type(legacy: bool) -> ColType {
+    if legacy {
+        ColType::TxidSnapshot
+    } else {
+        ColType::PgSnapshot
+    }
+}
+
+fn untyped_text_array<'a>(
+    value: Datum<'a>,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Datum<'a>, SqlError> {
+    match value {
+        Datum::Text(literal) => Ok(Datum::Array {
+            element: ArrElem::Text,
+            raw: array::parse_literal(literal, ArrElem::Text, arena)?,
+        }),
+        other => Ok(other),
+    }
+}
+
 fn text_array_parts<'a>(
     value: Datum<'a>,
 ) -> Result<
@@ -635,6 +677,357 @@ fn identify_object_record<'a>(
     Ok(Datum::Record(fields))
 }
 
+/// `pg_describe_object(class, object, sub)`: PostgreSQL's
+/// `getObjectDescription`, or `None` for an object that does not exist.
+pub(crate) fn describe_object_text<'a>(
+    catalog: &dyn super::super::CatalogAccess,
+    class_id: i32,
+    object_id: i32,
+    sub_id: i32,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    if class_id == 826 {
+        if sub_id != 0 {
+            return Ok(None);
+        }
+        return catalog.default_acl_description(object_id, arena);
+    }
+    if class_id == 1418 {
+        if sub_id != 0 {
+            return Ok(None);
+        }
+        return catalog.user_mapping_description(object_id, arena);
+    }
+    if class_id == 1262 {
+        let Some(name) = catalog
+            .database_name_by_oid(object_id)
+            .filter(|_| sub_id == 0)
+        else {
+            return Ok(None);
+        };
+        return described(stack_format!(1024, "database {}", name.as_str()), arena).map(Some);
+    }
+    if class_id == 2604 {
+        let Some((relation, column)) = catalog.attribute_default_column(object_id) else {
+            return Ok(None);
+        };
+        let Some(column) = describe_object_text(catalog, 1259, relation, column, arena)? else {
+            return Ok(None);
+        };
+        return described(stack_format!(1024, "default value for {}", column), arena).map(Some);
+    }
+    let object = catalog.catalog_object(class_id, object_id, sub_id)?;
+    if object.identity.is_empty() {
+        return Ok(None);
+    }
+    if class_id == 3256 {
+        return policy_description(catalog, object, arena).map(Some);
+    }
+    if class_id == 2605
+        && let Some((source, target)) = catalog.cast_type_oids(object_id)
+    {
+        let name = |oid: i32| match super::super::regtype_of_oid_with_catalog(
+            i64::from(oid),
+            Some(catalog),
+            arena,
+        )? {
+            Datum::Regtype { name, .. } => Ok(name),
+            _ => Err(arena_full()),
+        };
+        let (source, target) = (name(source)?, name(target)?);
+        return described(
+            stack_format!(1024, "cast from {} to {}", source, target),
+            arena,
+        )
+        .map(Some);
+    }
+    if class_id == 2616 || class_id == 2753 {
+        let visible = if class_id == 2616 {
+            catalog.operator_class_is_visible(object_id)
+        } else {
+            catalog.operator_family_is_visible(object_id)
+        };
+        let name = crate::sql::types::acl_identifier(
+            object.object_name.as_ref().map_or("", |name| name.as_str()),
+        );
+        let name = if visible == Some(true) {
+            stack_format!(130, "{}", name.as_str())
+        } else {
+            let schema = crate::sql::types::acl_identifier(
+                object
+                    .schema_name
+                    .as_ref()
+                    .map_or("", |schema| schema.as_str()),
+            );
+            stack_format!(130, "{}.{}", schema.as_str(), name.as_str())
+        };
+        return described(
+            stack_format!(
+                1024,
+                "{} {} for access method {}",
+                object.object_type.as_str(),
+                name.as_str(),
+                object.address_args[0].as_str()
+            ),
+            arena,
+        )
+        .map(Some);
+    }
+    if let Some(text) = attached_object_description(catalog, object, arena)? {
+        return Ok(Some(text));
+    }
+    if let Some(text) = schema_object_description(catalog, class_id, object_id, object, arena)? {
+        return Ok(Some(text));
+    }
+    if let Some(text) = visible_object_description(catalog, class_id, object_id, object, arena)? {
+        return Ok(Some(text));
+    }
+    describe_catalog_object(object, arena).map(Some)
+}
+
+fn described(
+    description: crate::util::StackStr<1024>,
+    arena: &crate::mem::arena::Arena,
+) -> Result<&str, SqlError> {
+    if description.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "catalog object description exceeds static capacity"
+        ));
+    }
+    arena
+        .alloc_str(description.as_str())
+        .map_err(|_| arena_full())
+}
+
+/// A relation's own description (`table t`, `view v`), naming it without
+/// its schema when the search path finds it.
+fn relation_description<'a>(
+    catalog: &dyn super::super::CatalogAccess,
+    schema: &str,
+    name: &str,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let qualified = stack_format!(
+        264,
+        "{}.{}",
+        crate::sql::types::acl_identifier(schema).as_str(),
+        crate::sql::types::acl_identifier(name).as_str()
+    );
+    let Some(relation) = catalog.reloid(qualified.as_str())? else {
+        return Ok(None);
+    };
+    describe_object_text(catalog, 1259, relation, 0, arena)
+}
+
+/// PostgreSQL describes constraints, triggers and rules by name followed by
+/// their relation's description (`trigger tg on table t`).
+fn attached_object_description<'a>(
+    catalog: &dyn super::super::CatalogAccess,
+    object: crate::sql::event_trigger::EventObject,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let kind = match object.object_type.as_str() {
+        "table constraint" => "constraint",
+        "trigger" => "trigger",
+        "rule" => "rule",
+        _ => return Ok(None),
+    };
+    if object.address_name_count != 3 {
+        return Ok(None);
+    }
+    let Some(relation) = relation_description(
+        catalog,
+        object.address_names[0].as_str(),
+        object.address_names[1].as_str(),
+        arena,
+    )?
+    else {
+        return Ok(None);
+    };
+    described(
+        stack_format!(
+            1024,
+            "{} {} on {}",
+            kind,
+            object.address_names[2].as_str(),
+            relation
+        ),
+        arena,
+    )
+    .map(Some)
+}
+
+/// Schema-qualified objects other than relations, functions and types are
+/// named without their schema when the search path finds them, with
+/// `quote_identifier` quoting (`collation "C"`, `operator <<<(integer,integer)`).
+fn schema_object_description<'a>(
+    catalog: &dyn super::super::CatalogAccess,
+    class_id: i32,
+    object_id: i32,
+    object: crate::sql::event_trigger::EventObject,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    use core::fmt::Write;
+    let visible = match class_id {
+        2617 => catalog.operator_is_visible(object_id),
+        3456 => catalog.collation_is_visible(object_id),
+        2607 => catalog.conversion_is_visible(object_id),
+        3381 => catalog.statistics_object_is_visible(object_id),
+        3601 => catalog.text_search_is_visible(object_id, TextSearchObjectKind::Parser),
+        3764 => catalog.text_search_is_visible(object_id, TextSearchObjectKind::Template),
+        3600 => catalog.text_search_is_visible(object_id, TextSearchObjectKind::Dictionary),
+        3602 => catalog.text_search_is_visible(object_id, TextSearchObjectKind::Configuration),
+        _ => return Ok(None),
+    };
+    let (Some(visible), 2) = (visible, object.address_name_count) else {
+        return Ok(None);
+    };
+    // getObjectDescription names an operator as regoperator output does
+    // (format_operator), its operand types unqualified when visible.
+    if class_id == 2617
+        && let Some(signature) = catalog.operator_name(object_id, true, arena)?
+    {
+        return described(stack_format!(1024, "operator {}", signature), arena).map(Some);
+    }
+    let schema = object.address_names[0].as_str();
+    let name = object.address_names[1].as_str();
+    let mut text = crate::util::StackStr::<1024>::new();
+    let _ = write!(text, "{} ", object.object_type.as_str());
+    if !visible {
+        let _ = write!(
+            text,
+            "{}.",
+            super::super::args::quote_identifier(schema).as_str()
+        );
+    }
+    if class_id == 2617 {
+        // format_operator: the operator name is never quoted.
+        let _ = write!(text, "{}(", name);
+        for (index, argument) in object.address_args[..2].iter().enumerate() {
+            let separator = if index == 0 { "" } else { "," };
+            let argument = argument.as_str();
+            let _ = write!(
+                text,
+                "{separator}{}",
+                if argument.is_empty() {
+                    "NONE"
+                } else {
+                    argument
+                }
+            );
+        }
+        let _ = text.write_char(')');
+    } else {
+        let _ = write!(
+            text,
+            "{}",
+            super::super::args::quote_identifier(name).as_str()
+        );
+    }
+    described(text, arena).map(Some)
+}
+
+/// PostgreSQL's `policy p on table t`: the policy name as stored, then the
+/// table as `regclass` output names it.
+fn policy_description<'a>(
+    catalog: &dyn super::super::CatalogAccess,
+    object: crate::sql::event_trigger::EventObject,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<&'a str, SqlError> {
+    let qualified = stack_format!(
+        264,
+        "{}.{}",
+        crate::sql::types::acl_identifier(object.address_names[0].as_str()).as_str(),
+        crate::sql::types::acl_identifier(object.address_names[1].as_str()).as_str()
+    );
+    let table = match super::super::regobject_cast(
+        Datum::Text(
+            arena
+                .alloc_str(qualified.as_str())
+                .map_err(|_| arena_full())?,
+        ),
+        ColType::Regclass,
+        Some(catalog),
+        arena,
+    )? {
+        Datum::RegObject { name, .. } => name,
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "policy table has no regclass name"
+            ));
+        }
+    };
+    let description = stack_format!(
+        1024,
+        "policy {} on table {}",
+        object.address_names[2].as_str(),
+        table
+    );
+    if description.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "catalog object description exceeds static capacity"
+        ));
+    }
+    arena
+        .alloc_str(description.as_str())
+        .map_err(|_| arena_full())
+}
+
+/// PostgreSQL's `getObjectDescription` names functions, types and relations
+/// as their `regprocedure`, `regtype` and `regclass` output does: without a
+/// schema when the search path finds them (`function lower(text)`, `table
+/// t`, `column a of table t`).
+fn visible_object_description<'a>(
+    catalog: &dyn super::super::CatalogAccess,
+    class_id: i32,
+    object_id: i32,
+    object: crate::sql::event_trigger::EventObject,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let target = match class_id {
+        1255 => ColType::Regprocedure,
+        1247 => ColType::Regtype,
+        1259 => ColType::Regclass,
+        _ => return Ok(None),
+    };
+    let name = match if target == ColType::Regtype {
+        super::super::regtype_of_oid_with_catalog(i64::from(object_id), Some(catalog), arena)?
+    } else {
+        super::super::regobject_cast(Datum::Oid(object_id as u32), target, Some(catalog), arena)?
+    } {
+        Datum::RegObject { name, .. } | Datum::Regtype { name, .. } => name,
+        _ => return Ok(None),
+    };
+    let description = match class_id {
+        1255 => stack_format!(1024, "function {}", name),
+        1247 => stack_format!(1024, "type {}", name),
+        _ => match object.object_type.as_str().strip_suffix(" column") {
+            Some(kind) if object.address_name_count == 3 => stack_format!(
+                1024,
+                "column {} of {} {}",
+                crate::sql::types::acl_identifier(object.address_names[2].as_str()).as_str(),
+                kind,
+                name
+            ),
+            Some(_) => return Ok(None),
+            None => stack_format!(1024, "{} {}", object.object_type.as_str(), name),
+        },
+    };
+    if description.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "catalog object description exceeds static capacity"
+        ));
+    }
+    arena
+        .alloc_str(description.as_str())
+        .map(Some)
+        .map_err(|_| arena_full())
+}
+
 fn describe_catalog_object(
     object: crate::sql::event_trigger::EventObject,
     arena: &crate::mem::arena::Arena,
@@ -731,6 +1124,7 @@ pub(crate) const CATALOG_PREDICATES: &[(&str, CatalogPredicateKind)] = &[
     ("has_server_privilege", CatalogPredicateKind::Privilege),
     ("has_largeobject_privilege", CatalogPredicateKind::Privilege),
     ("has_parameter_privilege", CatalogPredicateKind::Privilege),
+    ("pg_has_role", CatalogPredicateKind::Privilege),
     ("pg_table_is_visible", CatalogPredicateKind::Object),
     ("pg_type_is_visible", CatalogPredicateKind::Object),
     ("pg_function_is_visible", CatalogPredicateKind::Object),
@@ -740,6 +1134,8 @@ pub(crate) const CATALOG_PREDICATES: &[(&str, CatalogPredicateKind)] = &[
     ("pg_opfamily_is_visible", CatalogPredicateKind::Object),
     ("pg_conversion_is_visible", CatalogPredicateKind::Object),
     ("pg_statistics_obj_is_visible", CatalogPredicateKind::Object),
+    ("pg_ts_parser_is_visible", CatalogPredicateKind::Object),
+    ("pg_ts_template_is_visible", CatalogPredicateKind::Object),
     ("pg_ts_dict_is_visible", CatalogPredicateKind::Object),
     ("pg_ts_config_is_visible", CatalogPredicateKind::Object),
     ("pg_relation_is_publishable", CatalogPredicateKind::Object),
@@ -770,10 +1166,14 @@ pub(crate) fn dispatch<'a>(
         && !matches!(
             name,
             "version"
+                | "pg_sleep"
+                | "pg_sleep_for"
+                | "pg_sleep_until"
                 | "pg_backend_pid"
                 | "pg_blocking_pids"
                 | "pg_cancel_backend"
                 | "pg_terminate_backend"
+                | "pg_log_backend_memory_contexts"
                 | "pg_listening_channels"
                 | "pg_notification_queue_usage"
                 | "pg_advisory_lock"
@@ -1043,6 +1443,27 @@ pub(crate) fn dispatch<'a>(
                 })?;
                 Ok(Datum::Bool(catalog.signal_backend(pid, terminate)?))
             }
+            "pg_log_backend_memory_contexts" => {
+                arity(1)?;
+                let pid = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Int2(value) => i32::from(value),
+                    Datum::Int4(value) => value,
+                    Datum::Int8(value) => i32::try_from(value).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range")
+                    })?,
+                    Datum::Null => return Ok(Datum::Null),
+                    other => {
+                        return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                    }
+                };
+                let catalog = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "backend signaling is unavailable"
+                    )
+                })?;
+                Ok(Datum::Bool(catalog.log_backend_memory_contexts(pid)?))
+            }
             "pg_listening_channels" => {
                 arity(0)?;
                 let Some(index) = hooks.srf_index.and_then(|index| index.checked_sub(1)) else {
@@ -1141,6 +1562,51 @@ pub(crate) fn dispatch<'a>(
                     )
                 })
             }
+            // `pg_sleep_for` and `pg_sleep_until` are SQL functions over
+            // `pg_sleep` in PostgreSQL; each computes its delay from
+            // `clock_timestamp()` when the sleep starts.
+            "pg_sleep" | "pg_sleep_for" | "pg_sleep_until" => {
+                arity(1)?;
+                let value = eval_full(args[0], arena, params, row, hooks)?;
+                if value.is_null() {
+                    return Ok(Datum::Null);
+                }
+                let value = match name {
+                    "pg_sleep" => cast_to(value, ColType::Float8, arena)?,
+                    "pg_sleep_for" => cast_to(value, ColType::Interval, arena)?,
+                    _ => cast_to(value, ColType::Timestamptz, arena)?,
+                };
+                // The journal identifies a sleep by its position: a volatile
+                // argument such as clock_timestamp() changes when the
+                // statement resumes, but the sleep's end time does not.
+                crate::sql::sequence::sleep(
+                    &[Datum::Text(name)],
+                    || {
+                        let now = crate::sql::datetime::now_micros();
+                        let epoch = |micros: i64| micros as f64 / 1_000_000.0;
+                        Ok(match value {
+                            Datum::Float8(seconds) => seconds,
+                            Datum::Interval(interval) => {
+                                let end =
+                                    crate::sql::datetime::checked_add_timestamptz(now, interval)
+                                        .ok_or_else(|| {
+                                            sql_err!(
+                                                sqlstate::DATETIME_FIELD_OVERFLOW,
+                                                "timestamp out of range"
+                                            )
+                                        })?;
+                                epoch(end) - epoch(crate::sql::datetime::now_micros())
+                            }
+                            Datum::Timestamptz(end) => {
+                                epoch(end) - epoch(crate::sql::datetime::now_micros())
+                            }
+                            _ => unreachable!("sleep input was converted"),
+                        })
+                    },
+                    arena,
+                )?;
+                Ok(Datum::Text(""))
+            }
             "pg_advisory_unlock_all" => {
                 arity(0)?;
                 hooks
@@ -1200,7 +1666,12 @@ pub(crate) fn dispatch<'a>(
             | "txid_snapshot_xmax" => {
                 arity(1)?;
                 let expected_legacy = name.starts_with("txid_");
-                let snapshot = match eval_full(args[0], arena, params, row, hooks)? {
+                let snapshot = match unknown_as(
+                    args[0],
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    snapshot_type(expected_legacy),
+                    arena,
+                )? {
                     Datum::Snapshot { value, legacy } if legacy == expected_legacy => value,
                     Datum::Null => return Ok(Datum::Null),
                     other => {
@@ -1223,7 +1694,12 @@ pub(crate) fn dispatch<'a>(
             "pg_visible_in_snapshot" | "txid_visible_in_snapshot" => {
                 arity(2)?;
                 let expected_legacy = name.starts_with("txid_");
-                let transaction_id = match eval_full(args[0], arena, params, row, hooks)? {
+                let transaction_id = match unknown_as(
+                    args[0],
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    transaction_type(expected_legacy),
+                    arena,
+                )? {
                     Datum::Xid8(value) if !expected_legacy => value,
                     Datum::Int8(value) if expected_legacy => {
                         u64::try_from(value).map_err(|_| {
@@ -1246,7 +1722,12 @@ pub(crate) fn dispatch<'a>(
                         return Err(crate::sql::eval::function_argument_mismatch(name, &other));
                     }
                 };
-                let snapshot = match eval_full(args[1], arena, params, row, hooks)? {
+                let snapshot = match unknown_as(
+                    args[1],
+                    eval_full(args[1], arena, params, row, hooks)?,
+                    snapshot_type(expected_legacy),
+                    arena,
+                )? {
                     Datum::Snapshot { value, legacy } if legacy == expected_legacy => value,
                     Datum::Null => return Ok(Datum::Null),
                     other => {
@@ -1258,7 +1739,12 @@ pub(crate) fn dispatch<'a>(
             "pg_xact_status" | "txid_status" => {
                 arity(1)?;
                 let legacy = name == "txid_status";
-                let transaction_id = match eval_full(args[0], arena, params, row, hooks)? {
+                let transaction_id = match unknown_as(
+                    args[0],
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    transaction_type(legacy),
+                    arena,
+                )? {
                     Datum::Xid8(value) if !legacy => value,
                     Datum::Int8(value) if legacy => u64::try_from(value).map_err(|_| {
                         sql_err!(
@@ -1632,10 +2118,33 @@ pub(crate) fn dispatch<'a>(
                     cat, oid, arena,
                 )?))
             }
-            "pg_partition_ancestors" | "pg_partition_root" | "pg_partition_tree" => {
+            "pg_partition_root" => {
                 arity(1)?;
-                eval_full(args[0], arena, params, row, hooks)
+                let Some(cat) = hooks.catalog else {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "pg_partition_root requires catalog access"
+                    ));
+                };
+                let relation = super::super::regobject_cast(
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    ColType::Regclass,
+                    Some(cat),
+                    arena,
+                )?;
+                let Some(oid) = relation.catalog_oid() else {
+                    return Ok(Datum::Null);
+                };
+                Ok(cat
+                    .partition_ancestors(oid as i32, arena)?
+                    .last()
+                    .copied()
+                    .unwrap_or(Datum::Null))
             }
+            "pg_partition_ancestors" | "pg_partition_tree" => Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "set-valued function called in context that cannot accept a set"
+            )),
             _ if predicate == Some(CatalogPredicateKind::Privilege) => {
                 let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
                 let Some(cat) = hooks.catalog else {
@@ -1753,6 +2262,7 @@ pub(crate) fn dispatch<'a>(
                         | "has_foreign_data_wrapper_privilege"
                         | "has_server_privilege"
                         | "has_largeobject_privilege"
+                        | "pg_has_role"
                 ) {
                     let target = match object {
                         Datum::Text(name) => super::super::PrivilegeObject::Name(name),
@@ -1788,6 +2298,7 @@ pub(crate) fn dispatch<'a>(
                         "has_largeobject_privilege" => {
                             cat.has_largeobject_privilege(role, target, privilege)?
                         }
+                        "pg_has_role" => cat.has_role_privilege(role, target, privilege)?,
                         _ => unreachable!("typed object privilege function was classified"),
                     };
                     return Ok(answer.map_or(Datum::Null, Datum::Bool));
@@ -1821,8 +2332,18 @@ pub(crate) fn dispatch<'a>(
                     "pg_opfamily_is_visible" => cat.operator_family_is_visible(oid.0),
                     "pg_conversion_is_visible" => cat.conversion_is_visible(oid.0),
                     "pg_statistics_obj_is_visible" => cat.statistics_object_is_visible(oid.0),
-                    "pg_ts_dict_is_visible" => cat.text_search_dictionary_is_visible(oid.0),
-                    "pg_ts_config_is_visible" => cat.text_search_configuration_is_visible(oid.0),
+                    "pg_ts_parser_is_visible" => {
+                        cat.text_search_is_visible(oid.0, TextSearchObjectKind::Parser)
+                    }
+                    "pg_ts_template_is_visible" => {
+                        cat.text_search_is_visible(oid.0, TextSearchObjectKind::Template)
+                    }
+                    "pg_ts_dict_is_visible" => {
+                        cat.text_search_is_visible(oid.0, TextSearchObjectKind::Dictionary)
+                    }
+                    "pg_ts_config_is_visible" => {
+                        cat.text_search_is_visible(oid.0, TextSearchObjectKind::Configuration)
+                    }
                     "pg_relation_is_publishable" => cat.relation_is_publishable(oid.0),
                     _ => unreachable!(),
                 }
@@ -1864,14 +2385,13 @@ pub(crate) fn dispatch<'a>(
                         ));
                     }
                 };
-                let object = catalog.catalog_object(class_id, object_id, sub_id)?;
                 if name == "pg_describe_object" {
-                    if object.identity.is_empty() {
-                        Ok(Datum::Null)
-                    } else {
-                        Ok(Datum::Text(describe_catalog_object(object, arena)?))
-                    }
+                    Ok(
+                        describe_object_text(catalog, class_id, object_id, sub_id, arena)?
+                            .map_or(Datum::Null, Datum::Text),
+                    )
                 } else {
+                    let object = catalog.catalog_object(class_id, object_id, sub_id)?;
                     identify_object_record(object, name == "pg_identify_object_as_address", arena)
                 }
             }
@@ -1887,13 +2407,17 @@ pub(crate) fn dispatch<'a>(
                         ));
                     }
                 };
-                let Some((names, name_count)) =
-                    text_array_parts(eval_full(args[1], arena, params, row, hooks)?)?
+                let Some((names, name_count)) = text_array_parts(untyped_text_array(
+                    eval_full(args[1], arena, params, row, hooks)?,
+                    arena,
+                )?)?
                 else {
                     return Ok(Datum::Null);
                 };
-                let Some((arguments, argument_count)) =
-                    text_array_parts(eval_full(args[2], arena, params, row, hooks)?)?
+                let Some((arguments, argument_count)) = text_array_parts(untyped_text_array(
+                    eval_full(args[2], arena, params, row, hooks)?,
+                    arena,
+                )?)?
                 else {
                     return Ok(Datum::Null);
                 };
@@ -2024,8 +2548,16 @@ pub(crate) fn dispatch<'a>(
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };
+                let pretty = match args.get(1) {
+                    Some(argument) => match eval_full(argument, arena, params, row, hooks)? {
+                        Datum::Null => return Ok(Datum::Null),
+                        Datum::Bool(pretty) => pretty,
+                        _ => false,
+                    },
+                    None => false,
+                };
                 Ok(cat
-                    .constraint_def(oid, arena)?
+                    .constraint_def_pretty(oid, pretty, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2074,8 +2606,21 @@ pub(crate) fn dispatch<'a>(
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };
+                let pretty = match args.get(1) {
+                    Some(argument) => match eval_full(argument, arena, params, row, hooks)? {
+                        Datum::Bool(pretty) => pretty,
+                        Datum::Null => return Ok(Datum::Null),
+                        other => {
+                            return Err(crate::sql::eval::function_argument_mismatch(
+                                "pg_get_triggerdef",
+                                &other,
+                            ));
+                        }
+                    },
+                    None => false,
+                };
                 Ok(cat
-                    .trigger_def(oid, arena)?
+                    .trigger_def(oid, pretty, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2103,9 +2648,16 @@ pub(crate) fn dispatch<'a>(
             }
             "pg_get_function_sqlbody" => {
                 arity(1)?;
-                // Supported bodies are stored as prosrc; pg_dump selects it
-                // whenever this SQL-standard parse-tree representation is NULL.
-                Ok(Datum::Null)
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
+                };
+                Ok(cat
+                    .function_sqlbody(oid, arena)?
+                    .map_or(Datum::Null, Datum::Text))
             }
             "obj_description" => {
                 if !(1..=2).contains(&args.len()) || star {
@@ -2271,8 +2823,25 @@ pub(crate) fn dispatch<'a>(
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };
+                // `pretty` is a boolean, or a wrap column that implies it.
+                let (pretty, wrap_column) = match args.get(1) {
+                    Some(argument) => match eval_full(argument, arena, params, row, hooks)? {
+                        Datum::Null => return Ok(Datum::Null),
+                        Datum::Bool(pretty) => (pretty, 0),
+                        value => match super::super::cast_to(value, ColType::Int4, arena)? {
+                            Datum::Int4(wrap_column) => (true, wrap_column),
+                            other => {
+                                return Err(crate::sql::eval::function_argument_mismatch(
+                                    "pg_get_viewdef",
+                                    &other,
+                                ));
+                            }
+                        },
+                    },
+                    None => (false, 0),
+                };
                 Ok(cat
-                    .view_def(oid, arena)?
+                    .view_def_pretty(oid, pretty, wrap_column, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
@@ -2435,10 +3004,14 @@ pub(crate) fn dispatch<'a>(
                         None => -1,
                     },
                 };
-                let type_mod = match eval_full(args[1], arena, params, row, hooks)? {
+                let modifier = eval_full(args[1], arena, params, row, hooks)?;
+                // A NULL modifier means "no modifier", not a NULL result. An
+                // explicit -1 still marks the modifier as given, which makes
+                // PostgreSQL spell unconstrained `character` as `bpchar`.
+                let modifier_given = !modifier.is_null();
+                let type_mod = match modifier {
                     Datum::Int4(v) => v,
                     Datum::Int8(v) => v as i32,
-                    // A NULL modifier means "no modifier", not a NULL result.
                     _ => -1,
                 };
                 if let Some(cat) = hooks.catalog
@@ -2446,10 +3019,15 @@ pub(crate) fn dispatch<'a>(
                 {
                     return Ok(Datum::Text(name));
                 }
-                Ok(Datum::Text(match builtin_type_with_type_mod(o, type_mod) {
-                    Some(text) => arena.alloc_str(text.as_str()).map_err(|_| arena_full())?,
-                    None => "???",
-                }))
+                if crate::storage::NamedTypeKind::from_oid(o).is_some() {
+                    return Ok(Datum::Text("???"));
+                }
+                let Some(text) = format_builtin_type(o, type_mod, modifier_given) else {
+                    return Ok(Datum::Text("???"));
+                };
+                Ok(Datum::Text(
+                    arena.alloc_str(text.as_str()).map_err(|_| arena_full())?,
+                ))
             }
             "to_regclass" | "to_regproc" | "to_regprocedure" | "to_regoper" | "to_regoperator"
             | "to_regtype" | "to_regnamespace" | "to_regrole" | "to_regcollation"
@@ -2503,7 +3081,9 @@ pub(crate) fn dispatch<'a>(
                             name: rendered,
                         });
                     }
-                    return match super::super::regtype_of_name(type_name) {
+                    return match super::super::regtype_of_normalized_name(
+                        type_name, type_name, arena,
+                    ) {
                         Ok(value) => Ok(value),
                         Err(error) if error.sqlstate == sqlstate::UNDEFINED_OBJECT => {
                             Ok(Datum::Null)
@@ -2639,21 +3219,25 @@ pub(crate) fn dispatch<'a>(
     })())
 }
 
-/// `format_type(oid, typmod)` for a built-in type: its SQL spelling with the
-/// modifier; `None` for a named or unknown type.
-pub(crate) fn builtin_type_with_type_mod(
-    oid: i32,
+/// PostgreSQL's `format_type` spelling of a built-in type under a modifier;
+/// `None` for an OID that is not a built-in column type.
+/// `modifier_given` distinguishes an explicit `-1` from no modifier, which
+/// makes PostgreSQL spell unconstrained `character` as `bpchar`.
+pub(crate) fn format_builtin_type(
+    o: i32,
     type_mod: i32,
+    modifier_given: bool,
 ) -> Option<crate::util::StackStr<80>> {
-    if crate::storage::NamedTypeKind::from_oid(oid).is_some() {
-        return None;
-    }
-    let coltype = exec::coltype_of_oid(oid)?;
+    let coltype = exec::coltype_of_oid(o)?;
     let (base, array) = match coltype {
         ColType::Array(element) => (element.to_coltype(), true),
         scalar => (scalar, false),
     };
-    let name = base.name();
+    let name = if base == ColType::Bpchar && modifier_given && type_mod < 0 {
+        "bpchar"
+    } else {
+        base.name()
+    };
     // Array typmods describe their elements. Render the base under
     // that modifier, then attach [] as PostgreSQL does.
     let mut text = match TypeMod::decode(base, type_mod) {
@@ -2701,7 +3285,9 @@ pub(crate) fn format_type_with_type_mod(
     oid: i32,
     type_mod: i32,
 ) -> Result<crate::util::StackStr<260>, SqlError> {
-    if let Some(text) = builtin_type_with_type_mod(oid, type_mod) {
+    if crate::storage::NamedTypeKind::from_oid(oid).is_none()
+        && let Some(text) = format_builtin_type(oid, type_mod, true)
+    {
         let mut name = crate::util::StackStr::<260>::new();
         let _ = core::fmt::Write::write_str(&mut name, text.as_str());
         return Ok(name);

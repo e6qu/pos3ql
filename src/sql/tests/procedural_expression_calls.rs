@@ -51,3 +51,93 @@ fn procedural_expressions_resume_nested_calls_without_repeating_effects() {
         );
     }
 }
+
+// PostgreSQL 18.6 accepts PL/pgSQL data changes, static and dynamic, whose
+// expressions call a PL/pgSQL function, and runs each call once.
+// Reference SQL SHA256:
+// 6a10b164dc20a9bbca33c195a1a3067cb471099d6829954daf937b5130a78b80.
+#[test]
+fn procedural_writes_call_procedural_functions() {
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("procedural-write-calls-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE TABLE t(a int, b text); CREATE TABLE audit(v int); \
+             CREATE FUNCTION plfn(x int) RETURNS int LANGUAGE plpgsql AS \
+             $$BEGIN INSERT INTO audit VALUES (x); RETURN x * 10; END$$",
+            true,
+        );
+        let output = session.execute(
+            &mut engine,
+            "DO $$BEGIN INSERT INTO t VALUES (plfn(1), 'a'); END$$; \
+             DO $$BEGIN INSERT INTO t SELECT plfn(g), 'g' FROM generate_series(2,3) g; END$$; \
+             DO $$BEGIN UPDATE t SET a = plfn(a) WHERE a = 10; END$$; \
+             DO $$BEGIN DELETE FROM t WHERE a = plfn(2) / 10 * 10; END$$; \
+             DO $$BEGIN INSERT INTO t VALUES (plfn(4), 'r'); END$$; \
+             DO $$BEGIN EXECUTE 'INSERT INTO t VALUES (plfn($1), ''e'')' USING 5; END$$; \
+             SELECT a, b FROM t ORDER BY a; SELECT v FROM audit ORDER BY v",
+            true,
+        );
+        assert!(
+            error_sqlstates(&output).is_empty(),
+            "{mode:?}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(
+            data_rows(&output),
+            [
+                "30|g", "40|r", "50|e", "100|a", "1", "2", "2", "2", "2", "3", "4", "5", "10"
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+// Static PL/pgSQL data changes with RETURNING assign the returned row to
+// their INTO targets; without INTO the returned rows have no destination, as
+// in PostgreSQL 18.
+#[test]
+fn procedural_writes_return_into_targets() {
+    let config = test_config("procedural-write-returning");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE t(a int); CREATE TABLE seen(v text)",
+        true,
+    );
+    let output = session.execute(
+        &mut engine,
+        "DO $$BEGIN INSERT INTO t VALUES (1) RETURNING a; END$$",
+        true,
+    );
+    assert_eq!(error_sqlstates(&output), ["42601"]);
+    assert!(String::from_utf8_lossy(&output).contains("query has no destination for result data"));
+    session.success(
+        &mut engine,
+        "DO $$DECLARE r int; k text; BEGIN \
+         INSERT INTO t VALUES (1) RETURNING a INTO r; INSERT INTO seen VALUES (r); \
+         UPDATE t SET a = 2 RETURNING a INTO r; INSERT INTO seen VALUES (r); \
+         MERGE INTO t USING (VALUES (2)) s(a) ON t.a = s.a \
+           WHEN MATCHED THEN UPDATE SET a = 3 RETURNING merge_action(), t.a INTO k, r; \
+         INSERT INTO seen VALUES (k || r); \
+         DELETE FROM t RETURNING a INTO STRICT r; INSERT INTO seen VALUES (r); END$$",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT v FROM seen; SELECT count(*) FROM t",
+            true
+        )),
+        ["1", "2", "UPDATE3", "3", "0"]
+    );
+}

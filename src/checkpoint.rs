@@ -218,7 +218,7 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v38";
+pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v39";
 
 struct ManifestMetadata {
     lsn: u64,
@@ -311,7 +311,9 @@ fn parse_manifest_metadata(text: &str) -> Result<ManifestMetadata, &'static str>
                     .next()
                     .and_then(|word| word.parse().ok())
                     .ok_or("invalid role identity allocator")?;
-                if !(crate::storage::RoleOid::USER_FLOOR..=i32::MAX as u64).contains(&sequence) {
+                if !(crate::storage::RoleOid::USER_FLOOR..=crate::storage::RoleOid::LAST_USER)
+                    .contains(&sequence)
+                {
                     return Err("invalid role identity allocator");
                 }
                 role_sequence = Some(sequence);
@@ -1289,6 +1291,18 @@ impl AtomicBlockReadScope {
                 .expect("block store lock poisoned")
                 .base_mut()
                 .enter_atomic_reads();
+        }
+    }
+
+    /// Lets this owner's reads yield again; an enclosing atomic owner still
+    /// keeps them synchronous.
+    pub(crate) fn deactivate(&self) {
+        if self.active.replace(false) {
+            self.blocks
+                .lock()
+                .expect("block store lock poisoned")
+                .base_mut()
+                .leave_atomic_reads();
         }
     }
 }
@@ -2691,11 +2705,48 @@ impl Checkpointer {
             .set_read_owner(owner);
     }
 
+    pub(crate) fn begin_statement_reads(
+        &mut self,
+        owner: crate::store::ReadOwner,
+        restarted: bool,
+        progress: usize,
+    ) -> Result<(), SqlError> {
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .base_mut()
+            .begin_statement_reads(owner, restarted, progress)
+            .map_err(|error| sst_to_sql(crate::store::SstError::Store(error)))
+    }
+
+    pub(crate) fn statement_progressed(&mut self, owner: crate::store::ReadOwner) {
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .base_mut()
+            .statement_progressed(owner);
+    }
+
+    pub(crate) fn forget_statement_reads(&mut self, owner: crate::store::ReadOwner) {
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .base_mut()
+            .forget_statement_reads(owner);
+    }
+
     pub(crate) fn cancel_read_owner(&mut self, owner: crate::store::ReadOwner) {
         self.blocks
             .lock()
             .expect("block store lock poisoned")
             .cancel_read_owner(owner);
+    }
+
+    pub(crate) fn owner_awaits_read(&self, owner: crate::store::ReadOwner) -> bool {
+        self.blocks
+            .lock()
+            .expect("block store lock poisoned")
+            .owner_awaits_read(owner)
     }
 
     pub(crate) fn read_capacity_generation(&self) -> u64 {
@@ -4153,6 +4204,7 @@ impl Checkpointer {
             .map_err(|_| CheckpointSetupError::Corrupt("invalid role identity allocator"))?;
         storage.restore_next_large_object_oid(metadata.next_large_object_oid);
         storage.clear_schemas_for_restore();
+        storage.clear_initdb_role_memberships();
         let lines = text.lines().skip(1);
         let mut database_identities = Vec::with_capacity(storage.database_count());
         let mut system_setting_names = Vec::with_capacity(crate::storage::MAX_SYSTEM_SETTINGS);
@@ -5197,7 +5249,8 @@ impl Checkpointer {
                 }
                 Some("rmem") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
-                    let identity = parse_catalog_position(&mut words, metadata.catalog_sequence)?;
+                    let identity =
+                        parse_membership_position(&mut words, metadata.catalog_sequence)?;
                     let role_oid =
                         |word, name| -> Result<crate::storage::RoleOid, CheckpointSetupError> {
                             crate::storage::RoleOid::parse(parse_field(word, name)?).ok_or(
@@ -5503,7 +5556,11 @@ impl Checkpointer {
                     let class: u8 = parse_field(words.next(), "own class")?;
                     let class = crate::storage::AccessClass::from_u8(class)
                         .ok_or(CheckpointSetupError::Corrupt("invalid own class"))?;
-                    let object_oid = if class == crate::storage::AccessClass::Routine {
+                    let object_oid = if matches!(
+                        class,
+                        crate::storage::AccessClass::Routine
+                            | crate::storage::AccessClass::BuiltinRoutine
+                    ) {
                         parse_field(words.next(), "own routine oid")?
                     } else {
                         0
@@ -5529,13 +5586,9 @@ impl Checkpointer {
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("malformed own record"));
                     }
-                    let object = (if class == crate::storage::AccessClass::Routine {
-                        storage
-                            .routine_slot_by_oid(object_oid, 0)
-                            .map(crate::storage::Storage::routine_access_object)
-                    } else {
-                        storage.resolve_access_object(class, &schema, &name, 0)
-                    })
+                    let object = storage
+                        .resolve_recorded_access_object(class, object_oid, &schema, &name, 0)
+                        .map_err(|_| CheckpointSetupError::Corrupt("invalid routine reference"))?
                     .ok_or_else(|| {
                         CheckpointSetupError::ObjectStore(format!(
                             "manifest ownership target does not exist: database {} class {} schema {:?} name {:?}",
@@ -5584,7 +5637,11 @@ impl Checkpointer {
                     let class: u8 = parse_field(words.next(), "acl class")?;
                     let class = crate::storage::AccessClass::from_u8(class)
                         .ok_or(CheckpointSetupError::Corrupt("invalid acl class"))?;
-                    let object_oid = if class == crate::storage::AccessClass::Routine {
+                    let object_oid = if matches!(
+                        class,
+                        crate::storage::AccessClass::Routine
+                            | crate::storage::AccessClass::BuiltinRoutine
+                    ) {
                         parse_field(words.next(), "acl routine oid")?
                     } else {
                         0
@@ -5608,14 +5665,10 @@ impl Checkpointer {
                     {
                         return Err(CheckpointSetupError::Corrupt("invalid acl record"));
                     }
-                    let object = (if class == crate::storage::AccessClass::Routine {
-                        storage
-                            .routine_slot_by_oid(object_oid, 0)
-                            .map(crate::storage::Storage::routine_access_object)
-                    } else {
-                        storage.resolve_access_object(class, &schema, &name, 0)
-                    })
-                    .ok_or(CheckpointSetupError::Corrupt("acl target does not exist"))?;
+                    let object = storage
+                        .resolve_recorded_access_object(class, object_oid, &schema, &name, 0)
+                        .map_err(|_| CheckpointSetupError::Corrupt("invalid routine reference"))?
+                        .ok_or(CheckpointSetupError::Corrupt("acl target does not exist"))?;
                     let grantee = if grantee == "PUBLIC" {
                         crate::storage::PUBLIC_ROLE
                     } else {
@@ -5799,6 +5852,66 @@ impl Checkpointer {
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest default privilege rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
+                Some("brtn") => {
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
+                    let routine: i32 = parse_field(words.next(), "brtn routine")?;
+                    let routine = crate::storage::BuiltinRoutineOid::parse(routine)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid brtn routine"))?;
+                    let mut flags = [0u8; 5];
+                    for flag in &mut flags {
+                        *flag = parse_field(words.next(), "brtn attribute")?;
+                    }
+                    let flag = |value: u8| match value {
+                        0 => Ok(false),
+                        1 => Ok(true),
+                        _ => Err(CheckpointSetupError::Corrupt("invalid brtn flag")),
+                    };
+                    let attributes = crate::storage::RoutineAttributes {
+                        strict: flag(flags[0])?,
+                        volatility: crate::storage::RoutineVolatility::from_code(flags[1])
+                            .ok_or(CheckpointSetupError::Corrupt("invalid brtn volatility"))?,
+                        parallel: crate::storage::RoutineParallel::from_code(flags[2])
+                            .ok_or(CheckpointSetupError::Corrupt("invalid brtn parallel"))?,
+                        security_definer: flag(flags[3])?,
+                        leakproof: flag(flags[4])?,
+                        cost_bits: Some(parse_field(words.next(), "brtn cost")?),
+                        rows_bits: Some(parse_field(words.next(), "brtn rows")?),
+                    };
+                    // The settings use the journal image's encoding.
+                    let configs = decode_manifest_hex_bytes(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("brtn settings missing"))?,
+                    )?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("invalid brtn record"));
+                    }
+                    let mut encoded = Vec::with_capacity(21 + configs.len());
+                    encoded.extend_from_slice(&[
+                        u8::from(attributes.strict),
+                        attributes.volatility.code(),
+                        attributes.parallel.code(),
+                        u8::from(attributes.security_definer),
+                        u8::from(attributes.leakproof),
+                    ]);
+                    encoded.extend_from_slice(&attributes.cost_bits.unwrap_or(0).to_le_bytes());
+                    encoded.extend_from_slice(&attributes.rows_bits.unwrap_or(0).to_le_bytes());
+                    encoded.extend_from_slice(&configs);
+                    let image = crate::wal::decode_builtin_routine_image(routine, &encoded)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid brtn image"))?;
+                    storage
+                        .replay_builtin_routine_attributes(
+                            storage.current_database_oid(),
+                            routine,
+                            image,
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest built-in routine rejected: {}",
                                 error.message.as_str()
                             ))
                         })?;
@@ -10171,7 +10284,10 @@ impl Checkpointer {
 
         // Roles are durable catalog authority. Parsed verifier material crosses
         // this object-backed manifest; plaintext passwords never do.
-        for (slot, role) in storage.live_roles() {
+        for (slot, role) in storage
+            .live_roles()
+            .filter(|(slot, _)| crate::storage::PredefinedRole::from_slot(*slot).is_none())
+        {
             use core::fmt::Write;
             let attributes = role.attributes;
             let mut name = StackStr::<130>::new();
@@ -13183,13 +13299,13 @@ impl Checkpointer {
             for byte in owner.as_str().as_bytes() {
                 let _ = write!(owner_hex, "{byte:02x}");
             }
-            if object.class == crate::storage::AccessClass::Routine {
+            if let Some(routine_oid) = storage.access_object_routine_oid(object) {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
                         "own {} {} {} {} {}",
                         object.class as u8,
-                        crate::storage::routine_oid(&storage.routine(object.slot as usize)),
+                        routine_oid,
                         schema_hex.as_str(),
                         name_hex.as_str(),
                         owner_hex.as_str()
@@ -13284,6 +13400,14 @@ impl Checkpointer {
                 slot: slot as u16,
             })?;
         }
+        for (slot, entry) in storage.checkpoint_builtin_routines() {
+            if entry.ownership.owner != crate::storage::BOOTSTRAP_ROLE {
+                write_owner(crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::BuiltinRoutine,
+                    slot: slot as u16,
+                })?;
+            }
+        }
         for (_, acl) in storage.checkpoint_acls() {
             if storage.access_object_is_temporary(acl.object, 0) {
                 continue;
@@ -13318,13 +13442,13 @@ impl Checkpointer {
             for byte in grantor.as_str().as_bytes() {
                 let _ = write!(grantor_hex, "{byte:02x}");
             }
-            if acl.object.class == crate::storage::AccessClass::Routine {
+            if let Some(routine_oid) = storage.access_object_routine_oid(acl.object) {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
                         "acl {} {} {} {} {} {} {} {} {}",
                         acl.object.class as u8,
-                        crate::storage::routine_oid(&storage.routine(acl.object.slot as usize)),
+                        routine_oid,
                         schema_hex.as_str(),
                         name_hex.as_str(),
                         grantee_hex.as_str(),
@@ -13477,6 +13601,46 @@ impl Checkpointer {
                     image.oid().get(),
                     manifest_hex::<130>(row.parameter.as_str()),
                     GrantsHex(image.grants())
+                ),
+            )?;
+        }
+        for (_, entry) in storage.checkpoint_builtin_routines() {
+            let routine = entry.routine.expect("checkpoint built-in rows are claimed");
+            let image = entry.committed;
+            let attributes = image.attributes;
+            write_database_context(
+                &mut self.manifest_output,
+                &mut database_context,
+                entry.database,
+            )?;
+            struct ConfigsHex<'a>(&'a [crate::storage::RoutineConfig]);
+            impl core::fmt::Display for ConfigsHex<'_> {
+                fn fmt(&self, out: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    write!(out, "{:02x}", self.0.len())?;
+                    for config in self.0 {
+                        for text in [config.name.as_str(), config.value.as_str()] {
+                            write!(out, "{:02x}", text.len())?;
+                            for byte in text.as_bytes() {
+                                write!(out, "{byte:02x}")?;
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+            }
+            write_manifest(
+                &mut self.manifest_output,
+                format_args!(
+                    "brtn {} {} {} {} {} {} {} {} {}",
+                    routine.get(),
+                    u8::from(attributes.strict),
+                    attributes.volatility.code(),
+                    attributes.parallel.code(),
+                    u8::from(attributes.security_definer),
+                    u8::from(attributes.leakproof),
+                    image.cost().to_bits(),
+                    image.rows().to_bits(),
+                    ConfigsHex(image.configs()),
                 ),
             )?;
         }
@@ -18955,6 +19119,8 @@ fn load_view(
     }
     let mut names = [crate::storage::SqlName::EMPTY; crate::storage::MAX_COLUMNS];
     let mut defaults = [ColumnDefault::NONE; crate::storage::MAX_COLUMNS];
+    let mut identities = [None; crate::storage::MAX_COLUMNS];
+    let mut types = [crate::storage::ViewColumnType::PLACEHOLDER; crate::storage::MAX_COLUMNS];
     if count == 0 {
         if !encoded_entries.is_empty() {
             return Err(CheckpointSetupError::Corrupt("invalid empty view columns"));
@@ -18965,7 +19131,7 @@ fn load_view(
             let entry = entries
                 .next()
                 .ok_or(CheckpointSetupError::Corrupt("view column missing"))?;
-            let mut fields = entry.splitn(4, '/');
+            let mut fields = entry.split('/');
             names[index] =
                 sql_name(&decode_hex_name(fields.next().ok_or(
                     CheckpointSetupError::Corrupt("view column name missing"),
@@ -18977,6 +19143,29 @@ fn load_view(
             let expression = fields.next().ok_or(CheckpointSetupError::Corrupt(
                 "view column default expression missing",
             ))?;
+            let stamp = parse_field::<u64>(fields.next(), "view column default identity")?;
+            types[index] = crate::storage::ViewColumnType::new(
+                parse_field(fields.next(), "view column type")?,
+                parse_field(fields.next(), "view column type length")?,
+                parse_field(fields.next(), "view column type modifier")?,
+                crate::sql::ast::Collation::from_code(parse_field(
+                    fields.next(),
+                    "view column collation",
+                )?)
+                .ok_or(CheckpointSetupError::Corrupt(
+                    "invalid view column collation",
+                ))?,
+            )
+            .ok_or(CheckpointSetupError::Corrupt("invalid view column type"))?;
+            if fields.next().is_some() {
+                return Err(CheckpointSetupError::Corrupt("trailing view column fields"));
+            }
+            identities[index] = match stamp {
+                0 => None,
+                stamp => Some(crate::storage::ConstraintIdentity::parse(stamp).ok_or(
+                    CheckpointSetupError::Corrupt("invalid view column default identity"),
+                )?),
+            };
             let expression = if expression == "0" {
                 None
             } else {
@@ -19004,7 +19193,7 @@ fn load_view(
             return Err(CheckpointSetupError::Corrupt("trailing view columns"));
         }
     }
-    let mut columns = crate::storage::ViewColumns::from_sql_names(&names[..count])
+    let mut columns = crate::storage::ViewColumns::from_sql_names(&names[..count], &types[..count])
         .map(|columns| columns.with_aliases(aliases))
         .map_err(|error| {
             CheckpointSetupError::ObjectStore(format!(
@@ -19019,7 +19208,19 @@ fn load_view(
                 error.message.as_str()
             ))
         })?;
+        if matches!(default, ColumnDefault::None) != identities[index].is_none() {
+            return Err(CheckpointSetupError::Corrupt(
+                "view column default identity does not match its default",
+            ));
+        }
+        if let Some(identity) = identities[index] {
+            columns = columns.with_default_identity(index, identity).ok_or(
+                CheckpointSetupError::Corrupt("view column default identity has no default"),
+            )?;
+        }
     }
+    crate::storage::validate_constraint_identities(columns.default_identities())
+        .map_err(|_| CheckpointSetupError::Corrupt("duplicate view column default identity"))?;
     let bytes = decode_manifest_hex_bytes(words.next().ok_or(CheckpointSetupError::Corrupt(
         "view default type inputs missing",
     ))?)?;
@@ -19085,6 +19286,26 @@ fn parse_catalog_position(
     }
     crate::storage::CatalogPosition::new(slot, created_at)
         .map_err(|_| CheckpointSetupError::Corrupt("invalid catalog source identity"))
+}
+
+/// A membership position: a catalog source position, or an initdb
+/// membership's reserved identity at its own position.
+fn parse_membership_position(
+    words: &mut core::str::Split<'_, char>,
+    catalog_sequence: u64,
+) -> Result<crate::storage::CatalogPosition, CheckpointSetupError> {
+    let slot: usize = parse_field(words.next(), "catalog source slot")?;
+    let created_at: u64 = parse_field(words.next(), "catalog source creation")?;
+    if crate::storage::initdb_membership(created_at).is_none() && created_at > catalog_sequence {
+        return Err(CheckpointSetupError::Corrupt(
+            "catalog source exceeds saved identity allocator",
+        ));
+    }
+    let position = crate::storage::CatalogPosition::new(slot, created_at)
+        .map_err(|_| CheckpointSetupError::Corrupt("invalid catalog source identity"))?;
+    crate::storage::Storage::require_membership_identity(position)
+        .map_err(|_| CheckpointSetupError::Corrupt("invalid role membership identity"))?;
+    Ok(position)
 }
 
 #[inline(never)]
@@ -19352,6 +19573,24 @@ impl core::fmt::Display for ManifestViewColumns {
                     return Err(core::fmt::Error);
                 }
             }
+            // The `pg_attrdef` stamp; zero for a column without a default.
+            let identity = match default {
+                ColumnDefault::None => 0,
+                _ => self
+                    .0
+                    .default_identity(index)
+                    .ok_or(core::fmt::Error)?
+                    .created_at(),
+            };
+            let column_type = self.0.types()[index];
+            write!(
+                output,
+                "/{identity}/{}/{}/{}/{}",
+                column_type.oid(),
+                column_type.typlen(),
+                column_type.type_mod(),
+                column_type.collation().code()
+            )?;
         }
         Ok(())
     }
@@ -19395,7 +19634,11 @@ impl core::fmt::Display for ManifestDependencies<'_> {
             for byte in dependency.referenced_name.as_str().as_bytes() {
                 write!(output, "{byte:02x}")?;
             }
-            write!(output, " {}", dependency.referenced_columns)?;
+            write!(
+                output,
+                " {} {}",
+                dependency.referenced_columns, dependency.written_columns
+            )?;
         }
         write!(
             output,
@@ -19487,6 +19730,7 @@ fn parse_stored_query_dependencies<'a>(
             CheckpointSetupError::Corrupt("stored-query referenced name missing"),
         )?)?;
         let referenced_columns = parse_field(words.next(), "stored-query referenced columns")?;
+        let written_columns = parse_field(words.next(), "stored-query written columns")?;
         dependencies
             .serialized_push(SerializedStoredQueryDependency {
                 class,
@@ -19496,6 +19740,7 @@ fn parse_stored_query_dependencies<'a>(
                 referenced_schema: sql_name(&referenced_schema)?,
                 referenced_name: sql_name(&referenced_name)?,
                 referenced_columns,
+                written_columns,
             })
             .map_err(|_| CheckpointSetupError::Corrupt("too many stored-query dependencies"))?;
     }
@@ -20157,7 +20402,7 @@ mod stored_dependency_tests {
 
     #[test]
     fn checkpoint_reads_full_table_capture_and_large_row_output_resume_once() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
         use std::sync::{
             Arc,
@@ -20280,22 +20525,13 @@ mod stored_dependency_tests {
                         }
                         Err(error) => panic!("accept saved-row read: {error}"),
                     };
-                    // BSD sockets inherit the listener's nonblocking mode.
-                    socket.set_nonblocking(false).unwrap();
-                    socket
-                        .set_read_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
-                    socket
-                        .set_write_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
-                    let mut bytes = Vec::new();
-                    while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
-                        let mut part = [0; 4096];
-                        let n = socket.read(&mut part).unwrap();
-                        assert_ne!(n, 0);
-                        bytes.extend_from_slice(&part[..n]);
-                    }
-                    let headers = core::str::from_utf8(&bytes).unwrap();
+                    let mut bytes = [0; 8192];
+                    let Some((_, head)) =
+                        crate::test_wait::read_request_head(&mut socket, &mut bytes, &server_stop)
+                    else {
+                        continue;
+                    };
+                    let headers = core::str::from_utf8(&bytes[..head]).unwrap();
                     assert!(headers.starts_with("GET "));
                     let path = headers
                         .lines()
@@ -20336,7 +20572,7 @@ mod stored_dependency_tests {
                 }
             });
             checkpoint.enable_async_block_reads();
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = crate::test_wait::deadline();
             while requests.load(Ordering::Acquire) == 0 {
                 for slot in 0..checkpoint.block_read_slots() {
                     crate::mem::guard::forbid_alloc(|| checkpoint.advance_pending_block_read(slot))
@@ -20359,7 +20595,7 @@ mod stored_dependency_tests {
                 assert_eq!(checkpoint.table_output.len(), captured);
             }
             release.store(true, Ordering::Release);
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = crate::test_wait::deadline();
             while checkpoint.table_job.is_some() {
                 for slot in 0..checkpoint.block_read_slots() {
                     crate::mem::guard::forbid_alloc(|| checkpoint.advance_pending_block_read(slot))
@@ -20475,11 +20711,11 @@ mod stored_dependency_tests {
         use std::io::{Read, Write};
         use std::net::{TcpListener, TcpStream};
         use std::sync::mpsc;
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
 
         fn request(stream: &mut TcpStream) -> (String, Vec<u8>) {
             stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
+                .set_read_timeout(Some(crate::test_wait::HANG))
                 .unwrap();
             let mut bytes = Vec::new();
             let mut part = [0u8; 4096];
@@ -20557,7 +20793,7 @@ mod stored_dependency_tests {
                 if case == "read-only" {
                     reply(&mut put, "403 Forbidden", b"");
                     listener.set_nonblocking(true).unwrap();
-                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let deadline = crate::test_wait::deadline();
                     let mut reads = 0;
                     loop {
                         assert!(
@@ -20628,7 +20864,7 @@ mod stored_dependency_tests {
             let result = crate::mem::guard::forbid_alloc(|| {
                 checkpoint.begin_credential_reload(candidate).unwrap();
                 assert!(checkpoint.client.credentials() == Some(installed));
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = crate::test_wait::deadline();
                 loop {
                     assert!(
                         Instant::now() < deadline,
@@ -20859,7 +21095,7 @@ mod stored_dependency_tests {
             )
             .unwrap();
         let manifest = format!(
-            "pos3ql-manifest-v38\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
+            "pos3ql-manifest-v39\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
             index_gc_hex(old.roster)
         );
         // Two backups and two readers share the same graph at the four-block limit.
@@ -21698,7 +21934,7 @@ mod stored_dependency_tests {
             );
             let empty_list =
                 b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>";
-            let manifest = b"pos3ql-manifest-v38\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
+            let manifest = b"pos3ql-manifest-v39\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
             let body: &[u8] = match phase {
                 "rows" | "index" => &root_body,
                 "manifest" => manifest,
@@ -21829,7 +22065,7 @@ mod stored_dependency_tests {
         let mut budget = Budget::new(Checkpointer::budget_bytes(&config));
         let mut checkpoint = Checkpointer::new(&config, &mut budget).unwrap();
         assert_eq!(budget.remaining(), 0);
-        let manifest = b"pos3ql-manifest-v38\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
+        let manifest = b"pos3ql-manifest-v39\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
         for index in 0..65 {
             checkpoint
                 .client
@@ -22413,7 +22649,7 @@ mod stored_dependency_tests {
                     (10, "nsp 7 0 6669727374\nnsp 7 0 7365636f6e64\n"),
                     (10, "nsp 7 0 6669727374\nnsp 8 0 6669727374\n"),
                     (10, "nsp 7 0 6669727374\nnsp 11 0 7365636f6e64\n"),
-                    (1_920_000, "nsp 7 0 6669727374\nnsp 1920000 0 7365636f6e64\n"),
+                    (10_000_000, "nsp 7 0 6669727374\nnsp 10000000 0 7365636f6e64\n"),
                     (10, "nsp 7 0 6669727374\nnsp 8 2 7365636f6e64\n"),
                     (10, "nsp 7 0 6669727374\nnsp 8 0 7365636f6e64 trailing\n"),
                     (10, "nsp 7 0 6669727374\nnsp 8 0 \n"),
@@ -22438,7 +22674,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let mut manifest = String::from("pos3ql-manifest-v38\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
+                    let mut manifest = String::from("pos3ql-manifest-v39\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
                     for (oid, name) in [(first_oid, first_name), (second_oid, second_name)] {
                         let encoded = name
                             .as_bytes()
@@ -22464,7 +22700,7 @@ mod stored_dependency_tests {
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     assert!(matches!(checkpointer.load_manifest_text(&mut storage,
-                        "pos3ql-manifest-v38\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
+                        "pos3ql-manifest-v39\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
                         Err(CheckpointSetupError::Corrupt("duplicate system setting record"))));
                     assert_eq!(storage.system_settings().find(|(_, image)| image.live).unwrap().1
                         .value.as_str(), "first");
@@ -22473,7 +22709,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let manifest = format!("pos3ql-manifest-v38\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
+                    let manifest = format!("pos3ql-manifest-v39\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
                     match checkpointer.load_manifest_text(&mut storage, &manifest) {
                         Err(CheckpointSetupError::ObjectStore(message)) => {
                             assert!(message.contains("duplicate prepared transaction catalog identity"));
@@ -22678,7 +22914,8 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v35",
                 "pos3ql-manifest-v36",
                 "pos3ql-manifest-v37",
-                "pos3ql-manifest-v38 trailing",
+                "pos3ql-manifest-v38",
+                "pos3ql-manifest-v39 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");
                 assert!(matches!(
@@ -22760,11 +22997,11 @@ mod stored_dependency_tests {
 
     #[test]
     fn backup_commit_floor_includes_prepared_transactions_and_logical_slots() {
-        let manifest = b"pos3ql-manifest-v38\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let manifest = b"pos3ql-manifest-v39\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_lsn(manifest).unwrap(), 100);
         assert_eq!(manifest_commit_retention_floor(manifest).unwrap(), 40);
 
-        let slot_only = b"pos3ql-manifest-v38\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let slot_only = b"pos3ql-manifest-v39\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_commit_retention_floor(slot_only).unwrap(), 60);
     }
 
@@ -22858,6 +23095,7 @@ mod stored_dependency_tests {
                 referenced_schema: SqlName::parse("").unwrap(),
                 referenced_name: SqlName::parse("original_name").unwrap(),
                 referenced_columns: crate::storage::ColumnSet::from_low_word(0b101),
+                written_columns: crate::storage::ColumnSet::EMPTY,
             })
             .unwrap();
         dependencies
@@ -22871,6 +23109,7 @@ mod stored_dependency_tests {
                 referenced_schema: SqlName::parse("").unwrap(),
                 referenced_name: SqlName::parse("original_function").unwrap(),
                 referenced_columns: crate::storage::ColumnSet::EMPTY,
+                written_columns: crate::storage::ColumnSet::EMPTY,
             })
             .unwrap();
         let encoded = format!("{}", ManifestDependencies(dependencies.view()));
@@ -22900,6 +23139,7 @@ mod stored_dependency_tests {
                     referenced_schema: SqlName::parse("").unwrap(),
                     referenced_name: SqlName::parse("original_type").unwrap(),
                     referenced_columns: crate::storage::ColumnSet::EMPTY,
+                    written_columns: crate::storage::ColumnSet::EMPTY,
                 })
                 .unwrap();
             let encoded = format!("{}", ManifestDependencies(dependencies.view()));
@@ -22933,14 +23173,16 @@ mod stored_dependency_tests {
                 "v:31"
             };
             let valid = format!(
-                "i2 1 {} {valid_key} 7075626c6963 6974656d73  6974656d73 {} -",
+                "i2 1 {} {valid_key} 7075626c6963 6974656d73  6974656d73 {} {} -",
                 class as u8,
+                crate::storage::ColumnSet::EMPTY,
                 crate::storage::ColumnSet::EMPTY
             );
             assert!(parse_stored_query_dependencies(&mut valid.split(' ')).is_ok());
             let input = format!(
-                "i2 1 {} {key} 7075626c6963 6974656d73  6974656d73 {} -",
+                "i2 1 {} {key} 7075626c6963 6974656d73  6974656d73 {} {} -",
                 class as u8,
+                crate::storage::ColumnSet::EMPTY,
                 crate::storage::ColumnSet::EMPTY
             );
             assert!(
@@ -23173,7 +23415,7 @@ mod stored_dependency_tests {
         let mut manifest = FixedBuf::new(&mut budget, "manifest", 1024).unwrap();
         manifest
             .append(
-                b"pos3ql-manifest-v38\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
+                b"pos3ql-manifest-v39\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
             );
         let before = manifest.readable().to_vec();
         retag_manifest_root(&mut manifest, replacement).unwrap();

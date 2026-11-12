@@ -148,6 +148,7 @@ impl Storage {
             ),
             (AccessClass::ForeignDataWrapper, foreign_wrapper_capacity),
             (AccessClass::ForeignServer, foreign_server_capacity),
+            (AccessClass::BuiltinRoutine, self.builtin_routine_count()),
         ];
         let mut owned = false;
         for (class, count) in classes {

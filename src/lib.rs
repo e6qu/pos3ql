@@ -28,6 +28,8 @@ pub(crate) mod sim;
 pub mod sql;
 pub(crate) mod storage;
 pub(crate) mod store;
+#[cfg(test)]
+pub(crate) mod test_wait;
 pub(crate) mod util;
 pub(crate) mod wal;
 

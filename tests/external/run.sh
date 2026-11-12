@@ -88,6 +88,7 @@ write_credentials "$POS3QL_CREDENTIALS_FILE" "$S3_TEST_ACCESS_KEY" "$S3_TEST_SEC
 # a complete run of what it selects.
 #   proto      psql golden files, protocol versions, raw wire probes,
 #              the psycopg driver suite and the \copy round trip
+#   streams    stalled result clients in object-store mode
 #   dur        durability cycles on the main server: kill -9 recovery,
 #              durable WAL rebuild, commit-durable-on-bucket, cold start
 #   overlay    row-map pressure: 5000 rows through a 1024-entry map, plus
@@ -261,6 +262,7 @@ max_extended_statistics = 512
 max_views = 64
 max_materialized_views = 64
 max_routines = 64
+max_cursors = 24
 max_casts = 64
 max_operators = 64
 max_operator_families = 64
@@ -281,8 +283,12 @@ statistics_bytes = 1MiB
 statistics_leases = 1024
 result_spool_bytes = 16MiB
 result_spool_leases = 64
+plan_build_bytes = 16MiB
+plan_build_leases = 64
 result_stream_bytes = 256KiB
+result_stream_slots = 2
 index_statistics_slots = 4096
+trigger_event_spill_bytes = 64MiB
 max_value_indexes = 64
 max_prepared_transactions = 8
 max_subscriptions = 2
@@ -434,18 +440,6 @@ else
   tail -120 "$WORK/server-wire.log"
 fi
 
-step "stalled result clients do not stall other sessions (object-store mode)"
-restart_main_server result-streams
-ensure_psycopg_venv || exit 1
-if "$VENV/bin/python" "$EXT/result_streams.py" --host 127.0.0.1 --p3 "$PG_PORT" \
-    > "$WORK/result_streams.out" 2>&1; then
-  ok "stalled result clients"
-else
-  bad "stalled result clients"
-  cat "$WORK/result_streams.out"
-  tail -120 "$WORK/server-result-streams.log"
-fi
-
 step "driver test (psycopg 3, extended protocol with binary parameters)"
 restart_main_server psycopg
 ensure_psycopg_venv || exit 1
@@ -478,9 +472,26 @@ out=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A \
 
 fi # proto
 
+if want streams; then
+
+step "stalled result clients do not stall other sessions (object-store mode)"
+restart_main_server result-streams
+ensure_psycopg_venv || exit 1
+if "$VENV/bin/python" "$EXT/result_streams.py" --host 127.0.0.1 --p3 "$PG_PORT" \
+    --storage-mode object-store --operations "127.0.0.1:${OPERATIONS_PORT}" \
+    > "$WORK/result_streams.out" 2>&1; then
+  ok "stalled result clients"
+else
+  bad "stalled result clients"
+  cat "$WORK/result_streams.out"
+  tail -120 "$WORK/server-result-streams.log"
+fi
+
+fi # streams
+
 if want dur; then
 
-if want proto; then
+if want proto || want streams; then
   step "isolate durability fixtures"
   stop_pos3ql "$SERVER_PID"
   rm -rf "$WORK/data"
@@ -658,8 +669,12 @@ statistics_bytes = 1MiB
 statistics_leases = 1024
 result_spool_bytes = 16MiB
 result_spool_leases = 64
+plan_build_bytes = 16MiB
+plan_build_leases = 64
 result_stream_bytes = 256KiB
+result_stream_slots = 2
 index_statistics_slots = 4096
+trigger_event_spill_bytes = 64MiB
 listen_addr = 127.0.0.1:$((PG_PORT + 2))
 data_dir = ${WORK}/rpo0-data
 object_store = on
@@ -763,8 +778,12 @@ statistics_bytes = 1MiB
 statistics_leases = 1024
 result_spool_bytes = 16MiB
 result_spool_leases = 64
+plan_build_bytes = 16MiB
+plan_build_leases = 64
 result_stream_bytes = 256KiB
+result_stream_slots = 2
 index_statistics_slots = 4096
+trigger_event_spill_bytes = 64MiB
 object_store = on
 object_store_endpoint = 127.0.0.1:${S3_TEST_PORT}
 object_store_bucket = ${S3_TEST_BUCKET}
@@ -1246,8 +1265,12 @@ statistics_bytes = 1MiB
 statistics_leases = 1024
 result_spool_bytes = 16MiB
 result_spool_leases = 64
+plan_build_bytes = 16MiB
+plan_build_leases = 64
 result_stream_bytes = 256KiB
+result_stream_slots = 2
 index_statistics_slots = 4096
+trigger_event_spill_bytes = 64MiB
 max_value_indexes = 16
 max_replication_slots = 4
 work_arena_bytes = 16MiB
@@ -1583,8 +1606,12 @@ statistics_bytes = 1MiB
 statistics_leases = 1024
 result_spool_bytes = 16MiB
 result_spool_leases = 64
+plan_build_bytes = 16MiB
+plan_build_leases = 64
 result_stream_bytes = 256KiB
+result_stream_slots = 2
 index_statistics_slots = 4096
+trigger_event_spill_bytes = 64MiB
 listen_addr = 127.0.0.1:${STLS_PORT}
 data_dir = ${WORK}/server-tls-data
 object_store = off

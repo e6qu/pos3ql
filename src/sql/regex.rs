@@ -402,7 +402,10 @@ fn prepare_pattern(
             escaped = false;
         }
     }
-    if escaped {
+    // Basic and extended patterns hold back an escape until the next
+    // character; advanced patterns already copied it, so a trailing backslash
+    // stays unpaired and fails as PostgreSQL's invalid escape.
+    if escaped && matches!(options.flavor, RegexFlavor::Basic | RegexFlavor::Extended) {
         let _ = out.write_char('\\');
     }
     if out.is_truncated() {
@@ -686,7 +689,7 @@ fn validate(pattern: &str) -> Result<(), SqlError> {
                 let Some(close) = class_end(pattern, i) else {
                     return Err(sql_err!(
                         sqlstate::INVALID_REGULAR_EXPRESSION,
-                        "invalid regular expression: unbalanced ["
+                        "invalid regular expression: brackets [] not balanced"
                     ));
                 };
                 validate_class(&pattern[i..=close])?;
@@ -715,7 +718,7 @@ fn validate(pattern: &str) -> Result<(), SqlError> {
                 if depth == 0 {
                     return Err(sql_err!(
                         sqlstate::INVALID_REGULAR_EXPRESSION,
-                        "invalid regular expression: unbalanced ("
+                        "invalid regular expression: parentheses () not balanced"
                     ));
                 }
                 depth -= 1;
@@ -754,7 +757,7 @@ fn validate(pattern: &str) -> Result<(), SqlError> {
     if depth != 0 {
         return Err(sql_err!(
             sqlstate::INVALID_REGULAR_EXPRESSION,
-            "invalid regular expression: unbalanced ("
+            "invalid regular expression: parentheses () not balanced"
         ));
     }
     Ok(())
@@ -1548,7 +1551,18 @@ fn parse_bound(pat: &str) -> Result<(u32, u32, usize), SqlError> {
         }
         pat[start..*i].parse::<u32>().ok()
     };
-    let min = read_int(&mut i).ok_or_else(bad)?;
+    // A bound the pattern ends inside is unbalanced, not a bad count.
+    let malformed = |i: usize| {
+        if i >= b.len() {
+            sql_err!(
+                sqlstate::INVALID_REGULAR_EXPRESSION,
+                "invalid regular expression: braces {{}} not balanced"
+            )
+        } else {
+            bad()
+        }
+    };
+    let min = read_int(&mut i).ok_or_else(|| malformed(i))?;
     let max = match b.get(i) {
         Some(b'}') => min,
         Some(b',') => {
@@ -1556,13 +1570,13 @@ fn parse_bound(pat: &str) -> Result<(u32, u32, usize), SqlError> {
             if b.get(i) == Some(&b'}') {
                 u32::MAX
             } else {
-                read_int(&mut i).ok_or_else(bad)?
+                read_int(&mut i).ok_or_else(|| malformed(i))?
             }
         }
-        _ => return Err(bad()),
+        _ => return Err(malformed(i)),
     };
     if b.get(i) != Some(&b'}') {
-        return Err(bad());
+        return Err(malformed(i));
     }
     i += 1;
     if min > MAX_REPEAT || (max != u32::MAX && (max > MAX_REPEAT || min > max)) {

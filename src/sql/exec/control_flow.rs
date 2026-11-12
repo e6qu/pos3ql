@@ -130,25 +130,33 @@ pub(super) fn at_routine_exit<T>(
     invocation: TriggerInvocation<'_>,
     run: impl FnOnce() -> Result<T, SqlError>,
 ) -> Result<T, SqlError> {
-    run().map_err(|error| {
-        if error.sqlstate.internal_control().is_some() {
-            return error;
+    run().map_err(|error| routine_exit_error(context, invocation, error))
+}
+
+/// Adds the routine-exit context line to `error`; waits and other internal
+/// control pass through unchanged so a resumed call reports them later.
+pub(super) fn routine_exit_error(
+    context: &TriggerExecContext<'_, '_, '_>,
+    invocation: TriggerInvocation<'_>,
+    error: SqlError,
+) -> SqlError {
+    if error.sqlstate.internal_control().is_some() {
+        return error;
+    }
+    let signature = match procedural_signature(context, invocation) {
+        Ok(signature) => signature,
+        Err(signature_error) => return signature_error,
+    };
+    let activity = if error.sqlstate == sqlstate::FUNCTION_EXECUTED_NO_RETURN_STATEMENT {
+        ProceduralActivity::Routine
+    } else {
+        ProceduralActivity::Phase {
+            source: None,
+            text: "while casting return value to function's return type",
         }
-        let signature = match procedural_signature(context, invocation) {
-            Ok(signature) => signature,
-            Err(signature_error) => return signature_error,
-        };
-        let activity = if error.sqlstate == sqlstate::FUNCTION_EXECUTED_NO_RETURN_STATEMENT {
-            ProceduralActivity::Routine
-        } else {
-            ProceduralActivity::Phase {
-                source: None,
-                text: "while casting return value to function's return type",
-            }
-        };
-        let frame = ProceduralFrame::new(signature, None, activity, invocation.print_strict_params);
-        crate::sql::error_context::with_frame(&frame, || crate::sql::error_context::capture(error))
-    })
+    };
+    let frame = ProceduralFrame::new(signature, None, activity, invocation.print_strict_params);
+    crate::sql::error_context::with_frame(&frame, || crate::sql::error_context::capture(error))
 }
 
 /// Checks a BEFORE trigger's returned row, which PostgreSQL reports
@@ -185,6 +193,7 @@ pub(super) fn statement_name(statement: TriggerStatement<'_>) -> &'static str {
         TriggerStatement::SelectInto(_)
         | TriggerStatement::Utility { .. }
         | TriggerStatement::Dml { .. } => "SQL statement",
+        TriggerStatement::Call { .. } => "CALL",
         TriggerStatement::DynamicQuery(_) | TriggerStatement::DynamicSelectInto(_) => "EXECUTE",
         TriggerStatement::CursorOpen(_) => "OPEN",
         TriggerStatement::CursorMotion(motion) if motion.move_only => "MOVE",
@@ -201,7 +210,8 @@ pub(super) fn statement_name(statement: TriggerStatement<'_>) -> &'static str {
         TriggerStatement::Case(_) => "CASE",
         TriggerStatement::For(program) => match program.source {
             TriggerForSource::Numeric { .. } => "FOR with integer loop variable",
-            TriggerForSource::Query(_) => "FOR over SELECT rows",
+            TriggerForSource::Query(_) | TriggerForSource::Dml(_) => "FOR over SELECT rows",
+            TriggerForSource::Cursor { .. } => "FOR over cursor",
             TriggerForSource::DynamicQuery(_) => "FOR over EXECUTE statement",
             TriggerForSource::Array { .. } => "FOREACH over array",
         },
@@ -295,6 +305,10 @@ enum EntryState<'a> {
         position: ScopeBlock,
         workspace: NumericLoopWorkspace<'a>,
     },
+    Cursor {
+        position: CursorLoop,
+        workspace: NumericLoopWorkspace<'a>,
+    },
     Protected(TriggerSubtransaction),
     Handler,
 }
@@ -335,6 +349,7 @@ impl<Resource> Frame<Resource> {
                 | Continuation::Loop
                 | Continuation::Numeric(_)
                 | Continuation::Rows { .. }
+                | Continuation::Cursor(_)
         )
     }
 }
@@ -367,9 +382,27 @@ struct NumericLoop {
     reverse: bool,
 }
 
+/// A cursor `FOR` loop's place: its locals extend the enclosing scope's
+/// `count` slots with its record `target` and the hidden `portal` slot
+/// holding the name of the portal it opened.
+#[derive(Clone, Copy)]
+struct CursorLoop {
+    count: usize,
+    portal: usize,
+    /// The cursor variable was NULL before `OPEN` named the portal: the loop
+    /// resets it when it ends.
+    reset: bool,
+    opened: bool,
+    /// Whether a row was fetched: `FOUND` once the loop ends.
+    iterated: bool,
+}
+
 enum FrameResource<'a> {
     Empty,
-    Numeric { workspace: NumericLoopWorkspace<'a> },
+    /// The locals of a loop that declares its own variable.
+    Numeric {
+        workspace: NumericLoopWorkspace<'a>,
+    },
     Rows(super::loop_rows::LoopRows),
 }
 
@@ -386,6 +419,7 @@ enum Continuation {
         index: usize,
     },
     Scope(ScopeBlock),
+    Cursor(CursorLoop),
     Protected {
         boundary: TriggerSubtransaction,
         releasing: bool,
@@ -668,6 +702,13 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
                 Continuation::Scope(position),
                 FrameResource::Numeric { workspace },
             ),
+            EntryState::Cursor {
+                position,
+                workspace,
+            } => (
+                Continuation::Cursor(position),
+                FrameResource::Numeric { workspace },
+            ),
             EntryState::Protected(boundary) => (
                 Continuation::Protected {
                     boundary,
@@ -678,9 +719,15 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
             EntryState::Handler => (Continuation::Handler, FrameResource::Empty),
         };
         self.state.resources[self.state.active] = resource;
+        // A cursor loop opens its portal and fetches before its body runs.
+        let next = if matches!(continuation, Continuation::Cursor(_)) {
+            entry.block.statements.len()
+        } else {
+            0
+        };
         self.state.slots[self.state.active] = Some(Frame {
             block: self.program.index(entry.block),
-            next: 0,
+            next,
             source,
             continuation,
             resource: (),
@@ -800,6 +847,10 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
                     continuation: Continuation::Numeric(NumericLoop { count, .. }),
                     ..
                 }) => *count,
+                Some(Frame {
+                    continuation: Continuation::Cursor(CursorLoop { count, .. }),
+                    ..
+                }) => *count,
                 // Declarations are visible as they are initialized.
                 Some(Frame {
                     continuation: Continuation::Scope(scope),
@@ -808,7 +859,7 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
                 _ => continue,
             };
             let FrameResource::Numeric { workspace, .. } = resource else {
-                unreachable!("scope frame resource")
+                unreachable!("loop variable or scope frame resource")
             };
             return (
                 &workspace.locals[..count],
@@ -836,6 +887,30 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
         }
     }
 
+    /// [`Self::finish`] for a frame leaving the running program: a cursor
+    /// loop closes the portal it opened on every exit. After an error, a
+    /// savepoint or transaction rollback may already have closed it.
+    fn finish_in(
+        &mut self,
+        context: &mut TriggerExecContext<'_, 'a, '_>,
+        frame: Frame<FrameResource<'a>>,
+        locals: &[TriggerLocalDecl],
+        values: &mut [Datum<'a>],
+        status: &mut TriggerExecutionStatus<'a>,
+        success: bool,
+    ) {
+        if let (
+            Continuation::Cursor(scope),
+            FrameResource::Numeric { workspace },
+            PlpgsqlExecHost::Routine { cursors, .. },
+        ) = (frame.continuation, &frame.resource, &mut context.host)
+            && let Datum::Text(portal) = workspace.values[scope.portal]
+        {
+            cursors.close_pinned(portal);
+        }
+        self.finish(frame, locals, values, status, success);
+    }
+
     fn finish(
         &mut self,
         frame: Frame<FrameResource<'a>>,
@@ -845,6 +920,33 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
         success: bool,
     ) {
         match frame.continuation {
+            Continuation::Cursor(scope) => {
+                let FrameResource::Numeric { workspace } = frame.resource else {
+                    unreachable!("cursor loop frame resource")
+                };
+                let TriggerStatement::For(TriggerFor {
+                    source: TriggerForSource::Cursor { open, .. },
+                    ..
+                }) = self.source_statement(frame.source)
+                else {
+                    unreachable!("cursor loop frame source")
+                };
+                let (_, parent_values, _) = self.scope(locals, values);
+                // The record and portal slots follow the enclosing ones,
+                // whose assignments are copied back.
+                parent_values.copy_from_slice(&workspace.values[..parent_values.len()]);
+                if scope.reset
+                    && let Some(variable) = workspace.locals[..parent_values.len()]
+                        .iter()
+                        .rposition(|local| open.variable.names(local))
+                {
+                    parent_values[variable] = Datum::Null;
+                }
+                status.numeric_frames.restore(workspace);
+                if success {
+                    status.set_found(scope.iterated);
+                }
+            }
             Continuation::Numeric(_) | Continuation::Scope(_) => {
                 let FrameResource::Numeric { workspace } = frame.resource else {
                     unreachable!("scope frame resource")
@@ -1018,6 +1120,63 @@ pub(super) fn start_row_loop<'syntax, 'a>(
     )))
 }
 
+/// Enters a cursor `FOR` loop: its record and portal slots extend the
+/// enclosing scope, and its frame opens the cursor before the body runs.
+pub(super) fn start_cursor_loop<'syntax, 'a>(
+    program: TriggerFor<'syntax>,
+    loop_scope: PlpgsqlScope,
+    locals: &[TriggerLocalDecl],
+    values: &[Datum<'a>],
+    status: &mut TriggerExecutionStatus<'a>,
+) -> Result<Step<'syntax, 'a>, SqlError> {
+    // The record is a new variable even when it shadows one of the same
+    // name, as an integer loop's counter is.
+    let target = locals.len();
+    let portal = target + 1;
+    let count = portal + 1;
+    let mut workspace = status.numeric_frames.take()?;
+    if count > workspace.locals.len() || count > workspace.values.len() {
+        status.numeric_frames.restore(workspace);
+        return Err(frame_full());
+    }
+    for (index, local) in workspace.locals[..count].iter_mut().enumerate() {
+        *local = if index == target {
+            TriggerLocalDecl {
+                scope: loop_scope,
+                label: program.label,
+                name: program.target.name,
+                ctype: ColType::Record,
+                record_shape: Some(PlpgsqlRecordShape::Dynamic),
+                ..empty_plpgsql_local()
+            }
+        } else if index == portal {
+            TriggerLocalDecl {
+                scope: loop_scope,
+                name: cursor_loop_portal_local(),
+                ctype: ColType::Refcursor,
+                ..empty_plpgsql_local()
+            }
+        } else {
+            locals[index]
+        };
+    }
+    workspace.values[..count].fill(Datum::Null);
+    workspace.values[..locals.len()].copy_from_slice(&values[..locals.len()]);
+    Ok(Step::Enter(FrameEntry::new(
+        program.block,
+        EntryState::Cursor {
+            position: CursorLoop {
+                count,
+                portal,
+                reset: false,
+                opened: false,
+                iterated: false,
+            },
+            workspace,
+        },
+    )))
+}
+
 fn initialize_phase<'s, 'a, 'b, T>(
     status: &mut TriggerExecutionStatus<'a>,
     context: &mut TriggerExecContext<'s, 'a, 'b>,
@@ -1026,7 +1185,7 @@ fn initialize_phase<'s, 'a, 'b, T>(
         Option<&mut Option<super::super::query::RoutineInvocationState>>,
     ) -> Result<T, SqlError>,
 ) -> Result<T, SqlError> {
-    let retained = context.txn.write_completion_boundary.is_some()
+    let retained = context.txn.retains_write_frame()
         && matches!(&context.host, PlpgsqlExecHost::Routine { .. });
     if !retained {
         return evaluate(context, None);
@@ -1265,7 +1424,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                                 }
                                 TriggerFlow::Exit(0) => {
                                     let frame = frames.pop();
-                                    frames.finish(frame, locals, values, status, true);
+                                    frames.finish_in(context, frame, locals, values, status, true);
                                     break;
                                 }
                                 TriggerFlow::Continue(depth) => {
@@ -1299,7 +1458,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                             }
                         }
                         let frame = frames.pop();
-                        frames.finish(frame, locals, values, status, true);
+                        frames.finish_in(context, frame, locals, values, status, true);
                         if frames.state.active == 0 {
                             outcome = Ok(Some(flow));
                         }
@@ -1337,7 +1496,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                                 }
                                 Err(rollback_error) => {
                                     let frame = frames.pop();
-                                    frames.finish(frame, locals, values, status, false);
+                                    frames.finish_in(context, frame, locals, values, status, false);
                                     drop(error);
                                     if let Err(error) = frames.begin_error(
                                         rollback_error,
@@ -1351,7 +1510,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                             }
                         }
                         let frame = frames.pop();
-                        frames.finish(frame, locals, values, status, false);
+                        frames.finish_in(context, frame, locals, values, status, false);
                         if handler.is_some() {
                             break;
                         }
@@ -1509,21 +1668,26 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                             context.arena,
                         )?;
                         let (scope, scope_values, _) = frames.scope(locals, values);
-                        if trigger_condition(
-                            context,
-                            condition,
-                            definition,
-                            invocation,
-                            records.old.value(),
-                            records.new.value(),
-                            scope,
-                            scope_values,
-                            status.found,
-                        )? {
+                        let found = status.found;
+                        // The repeated check is its own statement boundary.
+                        if initialize_phase(status, context, |context, continuation| {
+                            trigger_condition(
+                                context,
+                                condition,
+                                definition,
+                                invocation,
+                                records.old.value(),
+                                records.new.value(),
+                                scope,
+                                scope_values,
+                                found,
+                                continuation,
+                            )
+                        })? {
                             frames.last_mut().next = 0;
                         } else {
                             let frame = frames.pop();
-                            frames.finish(frame, locals, values, status, true);
+                            frames.finish_in(context, frame, locals, values, status, true);
                         }
                     }
                     Continuation::Numeric(ref range) => {
@@ -1554,7 +1718,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                             workspace.values[target] = Datum::Int4(next);
                         } else {
                             let frame = frames.pop();
-                            frames.finish(frame, locals, values, status, true);
+                            frames.finish_in(context, frame, locals, values, status, true);
                         }
                     }
                     Continuation::Rows { target, index } => {
@@ -1575,7 +1739,87 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                             frame.next = 0;
                         } else {
                             let frame = frames.pop();
-                            frames.finish(frame, locals, values, status, true);
+                            frames.finish_in(context, frame, locals, values, status, true);
+                        }
+                    }
+                    Continuation::Cursor(state) => {
+                        let TriggerStatement::For(TriggerFor {
+                            source: TriggerForSource::Cursor { open, fetch },
+                            ..
+                        }) = frames.source_statement(frames.last().source)
+                        else {
+                            unreachable!("cursor loop frame source")
+                        };
+                        let child_scope = PlpgsqlScope::frame(frames.state.active + 1);
+                        if !state.opened {
+                            let statement = TriggerStatement::CursorOpen(*open);
+                            let invocation = bind_exception_variables(
+                                invocation,
+                                frames.diagnostic(),
+                                statement,
+                                context.arena,
+                            )?;
+                            let (scope, scope_values, exception) = frames.scope(locals, values);
+                            let variable = trigger_local_index(scope, open.variable)?;
+                            let reset = scope_values[variable].is_null();
+                            execute_trigger_step(
+                                context,
+                                definition,
+                                invocation,
+                                records,
+                                transition_relations,
+                                scope,
+                                scope_values,
+                                statement,
+                                child_scope,
+                                status,
+                                exception,
+                            )?;
+                            let Datum::Text(portal) = scope_values[variable] else {
+                                return Err(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "cursor FOR loop opened no portal"
+                                ));
+                            };
+                            if let PlpgsqlExecHost::Routine { cursors, .. } = &mut context.host {
+                                cursors.pin(portal)?;
+                            }
+                            scope_values[state.portal] = Datum::Text(portal);
+                            let Continuation::Cursor(state) = &mut frames.last_mut().continuation
+                            else {
+                                unreachable!("cursor loop frame")
+                            };
+                            state.opened = true;
+                            state.reset = reset;
+                        }
+                        // The loop leaves FOUND alone until it ends.
+                        let found = status.found;
+                        let (scope, scope_values, exception) = frames.scope(locals, values);
+                        execute_trigger_step(
+                            context,
+                            definition,
+                            invocation,
+                            records,
+                            transition_relations,
+                            scope,
+                            scope_values,
+                            TriggerStatement::CursorMotion(*fetch),
+                            child_scope,
+                            status,
+                            exception,
+                        )?;
+                        let fetched = status.found == Some(true);
+                        status.found = found;
+                        if fetched {
+                            let frame = frames.last_mut();
+                            let Continuation::Cursor(state) = &mut frame.continuation else {
+                                unreachable!("cursor loop frame")
+                            };
+                            state.iterated = true;
+                            frame.next = 0;
+                        } else {
+                            let frame = frames.pop();
+                            frames.finish_in(context, frame, locals, values, status, true);
                         }
                     }
                     Continuation::Protected { .. } => {
@@ -1590,14 +1834,14 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                         *releasing = true;
                         release_trigger_subtransaction(context, boundary)?;
                         let frame = frames.pop();
-                        frames.finish(frame, locals, values, status, true);
+                        frames.finish_in(context, frame, locals, values, status, true);
                     }
                     Continuation::Once
                     | Continuation::Labeled
                     | Continuation::Scope(_)
                     | Continuation::Handler => {
                         let frame = frames.pop();
-                        frames.finish(frame, locals, values, status, true);
+                        frames.finish_in(context, frame, locals, values, status, true);
                     }
                 }
                 Ok(None)
@@ -1632,7 +1876,7 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
         if !paused {
             while frames.state.active != 0 {
                 let frame = frames.pop();
-                frames.finish(frame, locals, values, status, false);
+                frames.finish_in(context, frame, locals, values, status, false);
             }
             frames.state.progress = ExecutionProgress::Complete;
         }
@@ -1683,11 +1927,16 @@ fn bind_exception_variables<'a>(
             site(Kind::Query, core::ptr::from_ref(query) as usize)
         }
         TriggerStatement::Utility { source, .. }
-        | TriggerStatement::Dml { source, .. }
-        | TriggerStatement::CursorOpen(PlpgsqlCursorOpen {
+        | TriggerStatement::Call { source, .. }
+        | TriggerStatement::Dml { source, .. } => site(Kind::Statement, source.as_ptr() as usize),
+        TriggerStatement::CursorOpen(PlpgsqlCursorOpen {
             query: PlpgsqlCursorQuery::Static(source),
+            arguments,
             ..
-        }) => site(Kind::Statement, source.as_ptr() as usize),
+        }) => {
+            site(Kind::Statement, source.as_ptr() as usize)
+                || arguments.iter().any(|argument| expression(argument.value))
+        }
         TriggerStatement::DynamicQuery(query)
         | TriggerStatement::ReturnDynamicQuery(query)
         | TriggerStatement::DynamicSelectInto(PlpgsqlDynamicSelectInto { query, .. })
@@ -1718,9 +1967,12 @@ fn bind_exception_variables<'a>(
             TriggerForSource::Numeric {
                 lower, upper, step, ..
             } => expression(lower) || expression(upper) || expression(step),
+            // The loop's OPEN binds them when it runs.
+            TriggerForSource::Cursor { .. } => false,
             TriggerForSource::Query(query) => {
                 site(Kind::Query, core::ptr::from_ref(query) as usize)
             }
+            TriggerForSource::Dml(source) => site(Kind::Statement, source.as_ptr() as usize),
             TriggerForSource::DynamicQuery(query) => dynamic(query),
             TriggerForSource::Array {
                 expression: value, ..

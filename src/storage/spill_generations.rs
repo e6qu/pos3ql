@@ -1682,6 +1682,7 @@ impl SpilledRowState {
                 checkpoint_change_lsn: 0,
                 history: super::CommittedHistory::empty(),
                 pending: super::PendingVersions::empty(),
+                committed_moved_out: false,
             },
             snapshot.row_layout,
         )
@@ -3490,7 +3491,7 @@ mod tests {
 
     #[test]
     fn guarded_spill_generations_retain_roots_before_releasing_list() {
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
         let config = test_config();
         let mut budget = Budget::new(
             SpillRootRegistry::budget_bytes(&config)
@@ -3514,7 +3515,7 @@ mod tests {
                     snapshot.retain_members(&list, &registry).unwrap();
                 });
             });
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = crate::test_wait::deadline();
             while !ready.load(Ordering::Acquire) && Instant::now() < deadline {
                 std::thread::yield_now();
             }
@@ -5469,7 +5470,7 @@ mod tests {
     #[test]
     fn retained_object_rows_allow_replacement_while_a_reader_consumes_old_bytes() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
         struct Release<'a>(&'a AtomicBool);
         impl Drop for Release<'_> {
             fn drop(&mut self) {
@@ -5508,7 +5509,7 @@ mod tests {
                         .unwrap();
                 });
             });
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = crate::test_wait::deadline();
             while !ready.load(Ordering::Acquire) && Instant::now() < deadline {
                 std::thread::yield_now();
             }

@@ -1449,7 +1449,7 @@ mod tests {
             }
             #[cfg(not(miri))]
             {
-                let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let until = crate::test_wait::deadline();
                 while !done.load(Ordering::Acquire) && std::time::Instant::now() < until {
                     std::thread::yield_now();
                 }

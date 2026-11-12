@@ -290,3 +290,50 @@ fn trigger_functions_run_data_modifying_with_queries() {
         );
     });
 }
+
+#[test]
+fn plpgsql_with_queries_read_routine_variables() {
+    with_engine("plpgsql-with-variables", |engine, budget| {
+        run_with(
+            engine,
+            budget,
+            "CREATE FUNCTION wv_rows(n int) RETURNS SETOF int LANGUAGE plpgsql AS $$ BEGIN \
+             RETURN QUERY WITH c AS MATERIALIZED (SELECT n AS v UNION ALL SELECT n + 1) \
+             SELECT v FROM c ORDER BY v; END $$",
+        );
+        assert_eq!(
+            data_rows(&run_with(engine, budget, "SELECT * FROM wv_rows(5)")),
+            ["5", "6"]
+        );
+        // Results from PostgreSQL 18.6.
+        assert_eq!(
+            diagnostics(&run_with(
+                engine,
+                budget,
+                "DO $$ DECLARE k int := 7; t text := 'x'; r record; s int; BEGIN \
+                 WITH c AS MATERIALIZED (SELECT k * 2 AS v) SELECT v INTO s FROM c; \
+                 RAISE NOTICE 's=%', s; \
+                 WITH c AS (SELECT k + 1 AS v, t || 'y' AS w) \
+                 SELECT c.v + d.v INTO s FROM c, c AS d; RAISE NOTICE 's=%', s; \
+                 FOR r IN WITH c AS MATERIALIZED (SELECT k - 1 AS v) SELECT v FROM c LOOP \
+                 RAISE NOTICE 'r=%', r.v; END LOOP; END $$",
+            )),
+            [
+                "NOTICE 00000 s=14",
+                "NOTICE 00000 s=16",
+                "NOTICE 00000 r=6",
+                "DO"
+            ]
+        );
+        // A WITH query still cannot read the columns of the query reading it.
+        assert_eq!(
+            diagnostics(&run_with(
+                engine,
+                budget,
+                "DO $$ DECLARE s int; BEGIN WITH c AS MATERIALIZED (SELECT g AS v) \
+                 SELECT max(v) INTO s FROM c, generate_series(1, 2) g; END $$",
+            ))[0],
+            "ERROR 42703 column \"g\" does not exist"
+        );
+    });
+}

@@ -215,6 +215,9 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
     config.result_spool_bytes = 64 << 10;
     config.result_spool_leases = 1;
     config.result_stream_bytes = 64 << 10;
+    config.result_stream_slots = 1;
+    config.plan_build_bytes = 64 << 10;
+    config.plan_build_leases = 1;
     config.query_workspace_slots = 1;
     config.max_prepared_transactions = 0;
     config.max_subscriptions = 1;
@@ -225,6 +228,7 @@ fn measure() -> Result<(), Box<dyn std::error::Error>> {
     config.work_arena_bytes = 8 << 20;
     config.object_store_on = false;
     config.temporary_spill_bytes = 0;
+    config.trigger_event_spill_bytes = 0;
     config.data_dir = arguments[19].clone();
     let limit: usize = arguments[21].parse()?;
     let plan = config.memory_plan(0, Engine::extra_budget_bytes(&config));

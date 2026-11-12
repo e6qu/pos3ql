@@ -191,23 +191,6 @@ pub(crate) fn element_type_oid(array_oid: i32) -> Option<i32> {
             NamedTypeKind::Composite => oid::composite_oid(creation),
         });
     }
-    // Table and view row types have their arrays a fixed distance away.
-    for (first_array, first, end) in [
-        (
-            oid::FIRST_TABLE_COMPOSITE_ARRAY,
-            oid::FIRST_TABLE_COMPOSITE,
-            oid::FIRST_VIEW_COMPOSITE_ARRAY,
-        ),
-        (
-            oid::FIRST_VIEW_COMPOSITE_ARRAY,
-            oid::FIRST_VIEW_COMPOSITE,
-            oid::FIRST_DOMAIN,
-        ),
-    ] {
-        if (first_array..end).contains(&array_oid) {
-            return Some(array_oid - first_array + first);
-        }
-    }
     None
 }
 

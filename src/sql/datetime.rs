@@ -192,6 +192,13 @@ pub fn parse_date(s: &str) -> Result<i32, SqlError> {
     if trimmed.eq_ignore_ascii_case("infinity") {
         return Ok(DATE_INFINITY);
     }
+    if trimmed.eq_ignore_ascii_case("epoch") {
+        return Ok(-(PG_EPOCH_SECS / 86_400) as i32);
+    }
+    if let Some(day) = special_day(trimmed) {
+        let local = special_local_micros(day).ok_or_else(out_of_range)?;
+        return Ok(local.div_euclid(86_400_000_000) as i32);
+    }
     if trimmed.eq_ignore_ascii_case("-infinity") {
         return Ok(DATE_NEG_INFINITY);
     }
@@ -1077,6 +1084,31 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
     if t.eq_ignore_ascii_case("infinity") {
         return Ok(TIMESTAMP_INFINITY);
     }
+    if t.eq_ignore_ascii_case("epoch") {
+        return Ok(-PG_EPOCH_SECS * 1_000_000);
+    }
+    if let Some(day) = special_day(t) {
+        let out_of_range = || {
+            sql_err!(
+                sqlstate::DATETIME_FIELD_OVERFLOW,
+                "date/time field value out of range: \"{}\"",
+                s
+            )
+        };
+        return match day {
+            SpecialDay::Now if apply_timezone => Ok(transaction_micros()),
+            day => {
+                let local = special_local_micros(day).ok_or_else(out_of_range)?;
+                if apply_timezone {
+                    super::timezone::session()
+                        .resolve_local(local)
+                        .ok_or_else(out_of_range)
+                } else {
+                    Ok(local)
+                }
+            }
+        };
+    }
     if t.eq_ignore_ascii_case("-infinity") {
         return Ok(TIMESTAMP_NEG_INFINITY);
     }
@@ -1253,6 +1285,17 @@ fn parse_time_parts(s: &str, type_name: &str) -> Result<(i64, Option<i32>), SqlE
             s
         )
     };
+    // PostgreSQL's special time inputs: midnight UTC and the transaction's
+    // session-zone time of day.
+    if s.trim().eq_ignore_ascii_case("allballs") {
+        return Ok((0, Some(0)));
+    }
+    if s.trim().eq_ignore_ascii_case("now") {
+        let now = transaction_micros();
+        let offset = super::timezone::session().resolve(now).0;
+        let local = now + i64::from(offset) * 1_000_000;
+        return Ok((local.rem_euclid(86_400_000_000), Some(offset)));
+    }
     let t = s.trim();
     // Split off a trailing zone: `Z`, a named `UTC`, or `±HH[:MM[:SS]]`. The
     // sign has to be past the start so a lone offset is not read as a time.
@@ -1373,6 +1416,91 @@ pub fn format_time(micros: i64) -> StackStr<24> {
 
 /// Parses an `interval` in PostgreSQL's verbose form (`1 year 2 months`,
 /// `90 minutes`, `-5 days`, `1 day 03:04:05`). Returns (months, days, micros).
+/// One lexical field of PostgreSQL interval input.
+#[derive(Clone, Copy)]
+enum IntervalToken<'a> {
+    At,
+    Number(&'a str),
+    Word(&'a str),
+    Clock(&'a str),
+    /// `Y-M`: a sign and the unsigned year and month counts.
+    YearMonth(bool, i64, i64),
+    Invalid,
+}
+
+/// Splits interval input at whitespace and at each number/letter boundary.
+struct IntervalTokens<'a> {
+    rest: &'a str,
+}
+
+impl<'a> IntervalTokens<'a> {
+    fn new(text: &'a str) -> Self {
+        Self { rest: text }
+    }
+
+    fn peek_any(&self) -> bool {
+        !self.rest.trim_start().is_empty()
+    }
+
+    fn next(&mut self) -> Option<IntervalToken<'a>> {
+        let text = self.rest.trim_start();
+        let first = text.chars().next()?;
+        let (token, length) = if first == '@' {
+            (IntervalToken::At, 1)
+        } else if first.is_ascii_alphabetic() {
+            let length = text
+                .find(|c: char| !c.is_ascii_alphabetic())
+                .unwrap_or(text.len());
+            (IntervalToken::Word(&text[..length]), length)
+        } else if first.is_ascii_digit() || matches!(first, '-' | '+' | '.') {
+            let length = text
+                .char_indices()
+                .skip(1)
+                .find(|(_, c)| !(c.is_ascii_digit() || matches!(c, '.' | ':' | '-')))
+                .map_or(text.len(), |(at, _)| at);
+            let field = &text[..length];
+            if field.contains(':') {
+                (IntervalToken::Clock(field), length)
+            } else if let Some((years, month_count)) = field[1..]
+                .find('-')
+                .map(|at| (&field[..at + 1], &field[at + 2..]))
+            {
+                let negative = years.starts_with('-');
+                match (
+                    years.trim_start_matches(['-', '+']).parse::<i64>(),
+                    month_count.parse::<i64>(),
+                ) {
+                    (Ok(years), Ok(month_count)) if (0..12).contains(&month_count) => (
+                        IntervalToken::YearMonth(negative, years, month_count),
+                        length,
+                    ),
+                    _ => (IntervalToken::Invalid, length),
+                }
+            } else {
+                (IntervalToken::Number(field), length)
+            }
+        } else {
+            (IntervalToken::Invalid, text.len())
+        };
+        self.rest = &text[length..];
+        Some(token)
+    }
+}
+
+trait AsciiLowercaseStack {
+    fn to_ascii_lowercase_stack(&self) -> StackStr<32>;
+}
+
+impl AsciiLowercaseStack for str {
+    fn to_ascii_lowercase_stack(&self) -> StackStr<32> {
+        let mut lower = StackStr::<32>::new();
+        for character in self.chars() {
+            let _ = core::fmt::Write::write_char(&mut lower, character.to_ascii_lowercase());
+        }
+        lower
+    }
+}
+
 pub fn parse_interval(s: &str) -> Result<super::types::Interval, SqlError> {
     use super::types::Interval;
     if s.trim().eq_ignore_ascii_case("infinity") {
@@ -1428,64 +1556,131 @@ pub fn parse_interval(s: &str) -> Result<super::types::Interval, SqlError> {
         *month_total = month_total.checked_add(whole as i64).ok_or_else(overflow)?;
         add_days(day_total, micro_total, (value - whole) * 30.0)
     };
-    let mut it = s.split_whitespace().peekable();
+    // PostgreSQL's DecodeInterval accepts a number glued to its unit
+    // (`200ms`, `2h30m`), any letter case, a leading `@`, a trailing `ago`,
+    // `Y-M` year-month fields, and a number before a clock as days.
+    let mut tokens = IntervalTokens::new(s.trim());
     let mut saw = false;
-    while let Some(tok) = it.next() {
-        if tok.contains(':') {
-            // Interval hours are a duration and are not restricted to a
-            // clock's 0..24 range.
-            let neg = tok.starts_with('-');
-            let t = tok.trim_start_matches(['-', '+']);
-            let mut parts = t.splitn(3, ':');
-            let hour: i64 = parts
-                .next()
-                .and_then(|part| part.parse().ok())
-                .ok_or_else(bad)?;
-            let minute: i64 = parts
-                .next()
-                .and_then(|part| part.parse().ok())
-                .ok_or_else(bad)?;
-            let second: f64 = parts
-                .next()
-                .map(|part| part.parse().map_err(|_| bad()))
-                .transpose()?
-                .unwrap_or(0.0);
-            if !(0..60).contains(&minute) || !(0.0..60.0).contains(&second) {
-                return Err(overflow());
-            }
-            let clock = (hour as f64 * 3600.0 + minute as f64 * 60.0 + second) * 1_000_000.0;
-            if !clock.is_finite() || clock > i64::MAX as f64 {
-                return Err(overflow());
-            }
-            let clock = clock.round() as i64;
-            micros = micros
-                .checked_add(if neg { -clock } else { clock })
-                .ok_or_else(overflow)?;
-            saw = true;
-            continue;
+    let mut ago = false;
+    let mut pending: Option<f64> = None;
+    let apply_clock = |tok: &str, micros: &mut i64| -> Result<(), SqlError> {
+        let neg = tok.starts_with('-');
+        let t = tok.trim_start_matches(['-', '+']);
+        let mut parts = t.splitn(3, ':');
+        let hour: i64 = parts
+            .next()
+            .and_then(|part| part.parse().ok())
+            .ok_or_else(bad)?;
+        let minute: i64 = parts
+            .next()
+            .and_then(|part| part.parse().ok())
+            .ok_or_else(bad)?;
+        let second: f64 = parts
+            .next()
+            .map(|part| part.parse().map_err(|_| bad()))
+            .transpose()?
+            .unwrap_or(0.0);
+        // Interval hours are a duration, not a clock's 0..24 range.
+        if !(0..60).contains(&minute) || !(0.0..60.0).contains(&second) {
+            return Err(overflow());
         }
-        // A signed number, optionally followed by a unit word. A number with
-        // no unit is seconds, as PostgreSQL reads a bare `INTERVAL '90'`.
-        let n: f64 = tok.parse().map_err(|_| bad())?;
-        let Some(unit) = it.next() else {
-            add_micros(&mut micros, n * 1_000_000.0)?;
-            saw = true;
-            continue;
-        };
-        let u = unit.trim_end_matches('s'); // singular/plural
-        match u {
-            "year" | "yr" => add_months(&mut months, &mut days, &mut micros, n * 12.0)?,
-            "month" | "mon" => add_months(&mut months, &mut days, &mut micros, n)?,
-            "week" | "wk" => add_days(&mut days, &mut micros, n * 7.0)?,
-            "day" | "d" => add_days(&mut days, &mut micros, n)?,
-            "hour" | "hr" | "h" => add_micros(&mut micros, n * 3_600_000_000.0)?,
-            "minute" | "min" | "m" => add_micros(&mut micros, n * 60_000_000.0)?,
-            "second" | "sec" | "s" => add_micros(&mut micros, n * 1_000_000.0)?,
-            "millisecond" | "msec" | "ms" => add_micros(&mut micros, n * 1_000.0)?,
-            "microsecond" | "usec" | "us" => add_micros(&mut micros, n)?,
-            _ => return Err(bad()),
+        let clock = (hour as f64 * 3600.0 + minute as f64 * 60.0 + second) * 1_000_000.0;
+        if !clock.is_finite() || clock > i64::MAX as f64 {
+            return Err(overflow());
         }
+        let clock = clock.round() as i64;
+        *micros = micros
+            .checked_add(if neg { -clock } else { clock })
+            .ok_or_else(overflow)?;
+        Ok(())
+    };
+    while let Some(token) = tokens.next() {
+        match token {
+            IntervalToken::At if !saw && pending.is_none() => {}
+            IntervalToken::Clock(clock) => {
+                if let Some(day_count) = pending.take() {
+                    add_days(&mut days, &mut micros, day_count)?;
+                }
+                apply_clock(clock, &mut micros)?;
+                saw = true;
+            }
+            IntervalToken::YearMonth(negative, years, month_count) => {
+                if pending.is_some() {
+                    return Err(bad());
+                }
+                let total = years
+                    .checked_mul(12)
+                    .and_then(|total| total.checked_add(month_count))
+                    .ok_or_else(overflow)?;
+                months = months
+                    .checked_add(if negative { -total } else { total })
+                    .ok_or_else(overflow)?;
+                saw = true;
+            }
+            IntervalToken::Number(text) => {
+                if pending.is_some() {
+                    return Err(bad());
+                }
+                pending = Some(text.parse().map_err(|_| bad())?);
+            }
+            IntervalToken::Word(word) if word.eq_ignore_ascii_case("ago") => {
+                if pending.is_some() || !saw || tokens.peek_any() {
+                    return Err(bad());
+                }
+                ago = true;
+            }
+            IntervalToken::Word(unit) => {
+                let n = pending.take().ok_or_else(bad)?;
+                let unit = unit.to_ascii_lowercase_stack();
+                match unit.as_str() {
+                    "millennium" | "millennia" | "millenniums" | "mil" | "mils" => {
+                        add_months(&mut months, &mut days, &mut micros, n * 12_000.0)?
+                    }
+                    "century" | "centuries" | "cent" | "c" => {
+                        add_months(&mut months, &mut days, &mut micros, n * 1_200.0)?
+                    }
+                    "decade" | "decades" | "dec" | "decs" => {
+                        add_months(&mut months, &mut days, &mut micros, n * 120.0)?
+                    }
+                    "year" | "years" | "yr" | "yrs" | "y" => {
+                        add_months(&mut months, &mut days, &mut micros, n * 12.0)?
+                    }
+                    "month" | "months" | "mon" | "mons" => {
+                        add_months(&mut months, &mut days, &mut micros, n)?
+                    }
+                    "week" | "weeks" | "w" => add_days(&mut days, &mut micros, n * 7.0)?,
+                    "day" | "days" | "d" => add_days(&mut days, &mut micros, n)?,
+                    "hour" | "hours" | "hr" | "hrs" | "h" => {
+                        add_micros(&mut micros, n * 3_600_000_000.0)?
+                    }
+                    "minute" | "minutes" | "min" | "mins" | "m" => {
+                        add_micros(&mut micros, n * 60_000_000.0)?
+                    }
+                    "second" | "seconds" | "sec" | "secs" | "s" => {
+                        add_micros(&mut micros, n * 1_000_000.0)?
+                    }
+                    "millisecond" | "milliseconds" | "msec" | "msecs" | "ms" => {
+                        add_micros(&mut micros, n * 1_000.0)?
+                    }
+                    "microsecond" | "microseconds" | "usec" | "usecs" | "us" => {
+                        add_micros(&mut micros, n)?
+                    }
+                    _ => return Err(bad()),
+                }
+                saw = true;
+            }
+            IntervalToken::At | IntervalToken::Invalid => return Err(bad()),
+        }
+    }
+    // A number with no unit is seconds, as PostgreSQL reads `INTERVAL '90'`.
+    if let Some(seconds) = pending {
+        add_micros(&mut micros, seconds * 1_000_000.0)?;
         saw = true;
+    }
+    if ago {
+        months = months.checked_neg().ok_or_else(overflow)?;
+        days = days.checked_neg().ok_or_else(overflow)?;
+        micros = micros.checked_neg().ok_or_else(overflow)?;
     }
     if !saw {
         return Err(bad());
@@ -2439,6 +2634,42 @@ pub fn statement_micros() -> i64 {
 pub fn transaction_micros() -> i64 {
     let at = TRANSACTION_START.with(|t| t.get());
     if at == 0 { statement_micros() } else { at }
+}
+
+/// PostgreSQL's special date and timestamp inputs that name a day.
+#[derive(Clone, Copy)]
+enum SpecialDay {
+    Now,
+    Today,
+    Tomorrow,
+    Yesterday,
+}
+
+fn special_day(text: &str) -> Option<SpecialDay> {
+    [
+        ("now", SpecialDay::Now),
+        ("today", SpecialDay::Today),
+        ("tomorrow", SpecialDay::Tomorrow),
+        ("yesterday", SpecialDay::Yesterday),
+    ]
+    .into_iter()
+    .find_map(|(name, day)| text.eq_ignore_ascii_case(name).then_some(day))
+}
+
+/// The session-zone wall time a special input denotes: the transaction's
+/// timestamp for `now`, else midnight of the named day.
+fn special_local_micros(day: SpecialDay) -> Option<i64> {
+    const DAY: i64 = 86_400_000_000;
+    let now = transaction_micros();
+    let local =
+        now.checked_add(i64::from(super::timezone::session().resolve(now).0) * 1_000_000)?;
+    let midnight = local.div_euclid(DAY) * DAY;
+    match day {
+        SpecialDay::Now => Some(local),
+        SpecialDay::Today => Some(midnight),
+        SpecialDay::Tomorrow => midnight.checked_add(DAY),
+        SpecialDay::Yesterday => midnight.checked_sub(DAY),
+    }
 }
 
 /// `clock_timestamp()`: the actual wall clock, read afresh each call.

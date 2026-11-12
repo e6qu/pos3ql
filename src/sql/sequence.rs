@@ -41,9 +41,11 @@ struct SequenceEffect {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatementEffectKind {
     StatisticsVoid,
+    FunctionCall,
     Cursor,
     RoutineInput,
     PlanAllocation,
+    Sleep,
 }
 
 #[derive(Clone, Copy)]
@@ -263,6 +265,107 @@ pub(super) fn enter_statement<'arena, 'session>(
 
 pub(crate) fn finish_statement(session: &SeqSession) {
     session.statement_replay.set(StatementSequenceReplay::EMPTY);
+    session.set_sleep_until(None);
+    session.set_database_wait_since(None);
+}
+
+/// How long PostgreSQL's `CountOtherDBBackends` waits for other sessions to
+/// leave a database (50 checks, 100 ms apart) before reporting it in use.
+const DATABASE_SESSION_WAIT_MICROS: i64 = 5_000_000;
+const DATABASE_SESSION_POLL_MICROS: i64 = 100_000;
+
+/// Waits, as PostgreSQL does, for other sessions to leave a database that a
+/// statement must use exclusively. While `in_use` holds and the five-second
+/// window is open, it records a wake time and reports a wait, so the
+/// connection parks on a timer and the statement re-checks the count when it
+/// resumes. `Ok` means the database is free or the window has closed; the
+/// caller then reports the database as in use.
+pub(crate) fn wait_for_database_sessions(
+    session: &SeqSession,
+    in_use: bool,
+) -> Result<(), SqlError> {
+    session.set_sleep_until(None);
+    if !in_use {
+        session.set_database_wait_since(None);
+        return Ok(());
+    }
+    super::query::check_timeout()?;
+    let now = super::datetime::now_micros();
+    let started = session.database_wait_since().unwrap_or(now);
+    session.set_database_wait_since(Some(started));
+    if now.saturating_sub(started) >= DATABASE_SESSION_WAIT_MICROS {
+        session.set_database_wait_since(None);
+        return Ok(());
+    }
+    session.set_sleep_until(Some(now.saturating_add(DATABASE_SESSION_POLL_MICROS)));
+    Err(sql_err!(
+        sqlstate::INTERNAL_LOCK_WAIT,
+        "statement is waiting for other sessions to leave the database"
+    ))
+}
+
+/// `pg_sleep` and its variants. The first attempt records the wake time in the
+/// session and reports a wait, so the connection parks on a timer instead of
+/// holding the SQL worker; the resumed statement replays the sleeps that
+/// already finished from its effect journal. `seconds` runs once, when the
+/// sleep starts, as PostgreSQL computes its end time once. The statement
+/// timeout is checked at every attempt, as PostgreSQL checks interrupts.
+pub(crate) fn sleep(
+    key: &[super::types::Datum<'_>],
+    seconds: impl FnOnce() -> Result<f64, SqlError>,
+    output: &Arena,
+) -> Result<(), SqlError> {
+    let session = STATEMENT_SESSION.with(Cell::get);
+    if session.is_null() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "pg_sleep requires a resumable statement"
+        ));
+    }
+    // SAFETY: enter_statement keeps the session borrowed on this thread for
+    // the whole statement; this call returns before the scope ends.
+    let session = unsafe { &*session };
+    statement_effect(
+        StatementEffectKind::Sleep,
+        key,
+        StatementEffectRetry::Restart,
+        output,
+        || StatementEffectAttempt {
+            result: (|| {
+                super::query::check_timeout()?;
+                let now = super::datetime::now_micros();
+                let deadline = match session.sleep_until() {
+                    Some(deadline) => deadline,
+                    None => {
+                        let seconds = seconds()?;
+                        // NaN and non-positive delays end at once, as in
+                        // PostgreSQL's loop; infinity sleeps until interrupted.
+                        if seconds.is_nan() || seconds <= 0.0 {
+                            return Ok(&[][..]);
+                        }
+                        let micros = (seconds * 1_000_000.0).ceil();
+                        let deadline = if micros >= (i64::MAX - now) as f64 {
+                            i64::MAX
+                        } else {
+                            now + micros as i64
+                        };
+                        session.set_sleep_until(Some(deadline));
+                        deadline
+                    }
+                };
+                if now >= deadline {
+                    session.set_sleep_until(None);
+                    return Ok(&[][..]);
+                }
+                Err(sql_err!(
+                    sqlstate::INTERNAL_LOCK_WAIT,
+                    "statement is sleeping"
+                ))
+            })(),
+            rewound_state: false,
+        },
+    )
+    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -313,7 +416,8 @@ fn statement_call(
         call.operation,
         SequenceOperation::Next | SequenceOperation::Set { .. }
     ) {
-        super::query::protect_statement_effects();
+        // The statement's replay log returns the same value after a wait.
+        super::query::protect_replayable_effect();
     }
     STATEMENT_ARENA.with(|active| {
         let pointer = active.get();
@@ -421,7 +525,7 @@ pub(crate) fn record_caught_cancellation(session: &SeqSession) {
     let mut replay = session.statement_replay.get();
     replay.nonreplayable = true;
     session.statement_replay.set(replay);
-    super::query::protect_statement_effects();
+    super::query::protect_unreplayable_effect();
 }
 
 fn effect_full() -> SqlError {

@@ -256,7 +256,7 @@ impl CatalogCollation {
         matches!(self.algorithm, CollationAlgorithm::UnicodeCaseMapping)
     }
     pub(crate) const fn oid(self) -> i32 {
-        580_000_000 + self.created_at() as i32
+        crate::storage::OidBand::Collation.oid(self.created_at())
     }
 }
 
@@ -2676,6 +2676,9 @@ pub struct CreateCast<'a> {
 pub struct DropCast<'a> {
     pub source_type: &'a str,
     pub target_type: &'a str,
+    /// PostgreSQL's `TypeNameToString` spellings, for the skip notice.
+    pub source_written: &'a str,
+    pub target_written: &'a str,
     pub if_exists: bool,
     pub cascade: bool,
 }
@@ -3297,7 +3300,7 @@ pub enum LockWait {
 }
 
 /// PostgreSQL's table-level lock modes, weakest to strongest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TableLockMode {
     AccessShare,
     RowShare,
@@ -5865,6 +5868,11 @@ pub enum AlterStatisticsAction<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParameterSource {
     SqlRoutine,
+    /// `p.f` in a SQL-language routine, where `p` names a composite
+    /// parameter: a column `f` of a FROM item `p` wins, and otherwise the
+    /// reference is field `f` (the node's `name`) of parameter `index`, as
+    /// PostgreSQL's `sql_fn_post_column_ref` resolves it.
+    SqlRoutineField,
     /// A PL/pgSQL variable captured by a cursor query, with the body's
     /// `plpgsql.variable_conflict` rule for a column of the same name.
     PlpgsqlCursor(crate::sql::guc::VariableConflict),
@@ -5882,9 +5890,9 @@ impl ParameterSource {
     pub(crate) const fn collision(self) -> ParameterCollision {
         use crate::sql::guc::VariableConflict;
         match self {
-            Self::SqlRoutine | Self::PlpgsqlCursor(VariableConflict::UseColumn) => {
-                ParameterCollision::Column
-            }
+            Self::SqlRoutine
+            | Self::SqlRoutineField
+            | Self::PlpgsqlCursor(VariableConflict::UseColumn) => ParameterCollision::Column,
             Self::PlpgsqlCursor(VariableConflict::UseVariable) => ParameterCollision::Parameter,
             Self::PlpgsqlCursor(VariableConflict::Error) => ParameterCollision::Ambiguous,
         }
@@ -5943,6 +5951,14 @@ pub enum Expr<'a> {
         source: ParameterSource,
     },
     Param(u32),
+    /// An aggregate call inside a subquery whose arguments read only columns
+    /// of the query `levels_up` levels out, which therefore computes it per
+    /// group (PostgreSQL's `agglevelsup`). Here it reads that query's value
+    /// for the current group; `call` is the node the owning query folds.
+    OuterAggregate {
+        call: &'a Expr<'a>,
+        levels_up: u32,
+    },
     Unary {
         source_position: SourcePosition,
         operator: UnaryOp,
@@ -6045,11 +6061,10 @@ pub enum Expr<'a> {
         operand: Option<&'a Expr<'a>>,
         whens: &'a [(&'a Expr<'a>, &'a Expr<'a>)],
         otherwise: Option<&'a Expr<'a>>,
-        /// True when this `CASE` is the desugaring of a syntactic construct that
-        /// is not itself a `CASE` — `IS TRUE`, `IS DISTINCT FROM`. PostgreSQL
-        /// labels those output columns `?column?`, not `case`, so the flag lets
-        /// naming tell them from a `CASE` the query actually wrote.
-        synthetic: bool,
+        /// The syntax this node represents. PostgreSQL labels `IS TRUE` and
+        /// `IS DISTINCT FROM` output columns `?column?`, not `case`, and
+        /// deparses them in their own spelling.
+        origin: CaseOrigin,
     },
     /// The DEFAULT keyword inside INSERT VALUES.
     DefaultMarker,
@@ -6136,7 +6151,29 @@ pub enum Expr<'a> {
     },
 }
 
+/// The SQL construct an [`Expr::Case`] node was parsed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseOrigin {
+    /// A `CASE` expression the query wrote.
+    Written,
+    /// `x IS [NOT] TRUE` (`value`) or `x IS [NOT] FALSE`: one `WHEN` whose
+    /// condition is `x`, or `NOT x` for `FALSE`.
+    BooleanTest { value: bool, negated: bool },
+    /// `x IS [NOT] DISTINCT FROM y`: `WHEN x IS NULL AND y IS NULL`, then
+    /// `WHEN x IS NULL OR y IS NULL`, else the `=` comparison of `x` and `y`
+    /// (negated for `IS DISTINCT FROM`), as PostgreSQL's `DistinctExpr` calls
+    /// the equality operator's function.
+    DistinctFrom { negated: bool },
+}
+
 pub(crate) fn is_volatile_function(name: &str) -> bool {
+    // Every PostgreSQL 18.6 built-in declared volatile (`provolatile = 'v'`),
+    // whichever overload a call selects, plus extension routines below.
+    if super::catalog::builtin_callable_signatures(name.strip_prefix("pg_catalog.").unwrap_or(name))
+        .any(|signature| signature.catalog.volatility == "v")
+    {
+        return true;
+    }
     const NAMES: &[&str] = &[
         "clock_timestamp",
         "timeofday",
@@ -6162,6 +6199,7 @@ pub(crate) fn is_volatile_function(name: &str) -> bool {
         "pg_blocking_pids",
         "pg_cancel_backend",
         "pg_terminate_backend",
+        "pg_log_backend_memory_contexts",
         "pg_notification_queue_usage",
         "pg_advisory_lock",
         "pg_advisory_lock_shared",
@@ -6250,7 +6288,66 @@ fn is_nonimmutable_function(name: &str) -> bool {
             .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
-impl Expr<'_> {
+impl<'a> Expr<'a> {
+    /// The operands of `x IS [NOT] DISTINCT FROM y` and whether it is negated
+    /// (`IS NOT DISTINCT FROM`).
+    pub(crate) fn distinct_from_operands(&self) -> Option<(&'a Expr<'a>, &'a Expr<'a>, bool)> {
+        let Expr::Case {
+            origin: CaseOrigin::DistinctFrom { negated },
+            otherwise: Some(otherwise),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let otherwise: &'a Expr<'a> = otherwise;
+        let equality: &'a Expr<'a> = match otherwise {
+            Expr::Unary {
+                operator: UnaryOp::Not,
+                operand,
+                ..
+            } if !negated => operand,
+            _ if *negated => otherwise,
+            _ => return None,
+        };
+        match equality {
+            Expr::Binary {
+                operator: BinaryOp::Eq,
+                left,
+                right,
+                ..
+            } => Some((left, right, *negated)),
+            _ => None,
+        }
+    }
+
+    /// The operand of `x IS [NOT] TRUE/FALSE`, the tested value and whether
+    /// the test is negated.
+    pub(crate) fn boolean_test_operand(&self) -> Option<(&'a Expr<'a>, bool, bool)> {
+        let Expr::Case {
+            origin: CaseOrigin::BooleanTest { value, negated },
+            whens: [(condition, _)],
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let condition: &'a Expr<'a> = condition;
+        let operand = if *value {
+            condition
+        } else {
+            match condition {
+                Expr::Unary {
+                    operator: UnaryOp::Not,
+                    operand,
+                    ..
+                } => operand,
+                _ => return None,
+            }
+        };
+        Some((operand, *value, *negated))
+    }
+
     pub(crate) const fn source_position(&self) -> SourcePosition {
         match self {
             Self::Call {
@@ -6308,6 +6405,7 @@ impl Expr<'_> {
             | Expr::RecursiveState { .. }
             | Expr::RoutineParam { .. }
             | Expr::Param(_)
+            | Expr::OuterAggregate { .. }
             | Expr::Subquery(_)
             | Expr::RowSubquery { .. }
             | Expr::InSubquery { .. }
@@ -6402,7 +6500,7 @@ impl Expr<'_> {
     /// evaluated per inserted row rather than folded once.
     pub fn contains_call(&self) -> bool {
         match self {
-            Expr::Call { .. } => true,
+            Expr::Call { .. } | Expr::OuterAggregate { .. } => true,
             Expr::Null
             | Expr::Bool(_)
             | Expr::Int(_)
@@ -6507,6 +6605,7 @@ impl Expr<'_> {
             | Expr::SchemaColumn { .. }
             | Expr::RecursiveState { .. }
             | Expr::Param(_)
+            | Expr::OuterAggregate { .. }
             | Expr::DefaultMarker => false,
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
@@ -6603,15 +6702,24 @@ impl Expr<'_> {
     /// (PostgreSQL requires immutability, 42P17). Every other function is treated
     /// as immutable.
     pub fn contains_nonimmutable_function(&self) -> Option<&str> {
-        self.find_function(is_nonimmutable_function)
+        self.find_function(&is_nonimmutable_function)
+    }
+
+    /// As [`Self::contains_nonimmutable_function`], also treating a function
+    /// as non-immutable when `changed` reports that the database altered it.
+    pub fn contains_nonimmutable_function_with(
+        &self,
+        changed: &dyn Fn(&str) -> bool,
+    ) -> Option<&str> {
+        self.find_function(&|name| is_nonimmutable_function(name) || changed(name))
     }
 
     /// The volatile subset relevant to PostgreSQL's CTE inlining rule.
     pub fn contains_volatile_function(&self) -> Option<&str> {
-        self.find_function(is_volatile_function)
+        self.find_function(&is_volatile_function)
     }
 
-    fn find_function(&self, matches: fn(&str) -> bool) -> Option<&str> {
+    fn find_function(&self, matches: &dyn Fn(&str) -> bool) -> Option<&str> {
         match self {
             Expr::Call { name, args, .. } => {
                 if matches(name) {
@@ -6619,6 +6727,7 @@ impl Expr<'_> {
                 }
                 args.iter().find_map(|a| a.find_function(matches))
             }
+            Expr::OuterAggregate { call, .. } => call.find_function(matches),
             Expr::Null
             | Expr::Bool(_)
             | Expr::Int(_)
@@ -6718,6 +6827,7 @@ impl Expr<'_> {
             | Expr::SchemaColumn { .. }
             | Expr::RecursiveState { .. }
             | Expr::Param(_)
+            | Expr::OuterAggregate { .. }
             | Expr::DefaultMarker
             | Expr::Subquery(_)
             | Expr::RowSubquery { .. }
@@ -6818,6 +6928,7 @@ impl Expr<'_> {
             | Expr::SchemaColumn { .. }
             | Expr::RecursiveState { .. }
             | Expr::Param(_)
+            | Expr::OuterAggregate { .. }
             | Expr::RoutineParam { .. }
             | Expr::DefaultMarker
             | Expr::Subquery(_)
@@ -7016,6 +7127,16 @@ pub enum BinaryOp {
     /// (`ILike` is the case-insensitive form). Plain `x LIKE y` uses `Expr::Like`.
     Like,
     ILike,
+    /// POSIX match, used only as the operator of a quantified `~ ANY/ALL`
+    /// (`RegexIMatch` is `~*`). Plain `x ~ y` uses `Expr::Match`.
+    RegexMatch,
+    RegexIMatch,
+    /// The negated forms (`!~~`, `!~~*`, `!~`, `!~*`) of the quantified
+    /// pattern operators above.
+    NotLike,
+    NotILike,
+    RegexNotMatch,
+    RegexNotIMatch,
 }
 
 impl BinaryOp {
@@ -7125,7 +7246,15 @@ impl BinaryOp {
             Self::AbovePoint => ">^",
             Self::NetContainedEq => "<<=",
             Self::NetContainsEq => ">>=",
-            Self::And | Self::Or | Self::Like | Self::ILike => return None,
+            Self::Like => "~~",
+            Self::ILike => "~~*",
+            Self::RegexMatch => "~",
+            Self::RegexIMatch => "~*",
+            Self::NotLike => "!~~",
+            Self::NotILike => "!~~*",
+            Self::RegexNotMatch => "!~",
+            Self::RegexNotIMatch => "!~*",
+            Self::And | Self::Or => return None,
         })
     }
 
@@ -7157,7 +7286,14 @@ impl BinaryOp {
             | Self::BelowPoint
             | Self::AbovePoint => 4,
             Self::NetContainedEq | Self::NetContainsEq => 4,
-            Self::Like | Self::ILike => 4,
+            Self::Like
+            | Self::ILike
+            | Self::RegexMatch
+            | Self::RegexIMatch
+            | Self::NotLike
+            | Self::NotILike
+            | Self::RegexNotMatch
+            | Self::RegexNotIMatch => 4,
             Self::JsonExists | Self::JsonExistsAny | Self::JsonExistsAll | Self::JsonPathExists => {
                 4
             }

@@ -4,6 +4,9 @@ use super::tests::{test_budget, test_config};
 use super::*;
 use crate::sql::txn::DdlUndo;
 
+/// The first role catalog slot after `postgres` and the predefined roles.
+const USER_SLOT: usize = 1 + PREDEFINED_ROLE_COUNT;
+
 fn collation(storage: &Storage, name: &str) -> CollationDefinition {
     CollationDefinition {
         schema: SqlName::parse("public").unwrap(),
@@ -175,7 +178,7 @@ fn prepared_membership_regrant_keeps_the_committed_identity_until_publication() 
             .change_role_membership(role, member, 0, RoleMembershipOptions::DEFAULT, true, 7)
             .unwrap();
         storage.commit_role_membership_change(slot);
-        let original = storage.role_membership(slot).creation_to(0).created_at();
+        let original = storage.role_membership(slot).creation_to(0);
         let replacement = CatalogPosition::new(slot, original + 10).unwrap();
         let role_oid = storage.role(role).oid();
         let member_oid = storage.role(member).oid();
@@ -194,18 +197,12 @@ fn prepared_membership_regrant_keeps_the_committed_identity_until_publication() 
             )
             .unwrap();
         let pending = storage.role_membership(slot);
-        assert_eq!(pending.creation_to(9).created_at(), original);
+        assert_eq!(pending.creation_to(9), original);
         assert!(!pending.options_to(9).admin);
-        assert_eq!(
-            pending.creation_to(7).created_at(),
-            replacement.created_at()
-        );
+        assert_eq!(pending.creation_to(7), replacement.created_at());
         assert!(pending.options_to(7).admin);
         storage.rollback_role_membership_change(slot, prior);
-        assert_eq!(
-            storage.role_membership(slot).creation_to(7).created_at(),
-            original
-        );
+        assert_eq!(storage.role_membership(slot).creation_to(7), original);
         storage
             .restore_prepared_role_membership(
                 replacement,
@@ -218,7 +215,7 @@ fn prepared_membership_regrant_keeps_the_committed_identity_until_publication() 
             .unwrap();
         storage.commit_role_membership_change(slot);
         assert_eq!(
-            storage.role_membership(slot).creation_to(0).created_at(),
+            storage.role_membership(slot).creation_to(0),
             replacement.created_at()
         );
         let stale = storage
@@ -320,11 +317,11 @@ fn prepared_role_cannot_replace_its_own_uncommitted_identifier() {
         let name = SqlName::parse("saved_role").unwrap();
         let first = RoleOid::parse(20_000).unwrap();
         storage
-            .restore_prepared_role(3, first, name, RoleAttributes::ORDINARY, 7)
+            .restore_prepared_role(USER_SLOT + 2, first, name, RoleAttributes::ORDINARY, 7)
             .unwrap();
         let error = storage
             .restore_prepared_role(
-                3,
+                USER_SLOT + 2,
                 RoleOid::parse(20_001).unwrap(),
                 name,
                 RoleAttributes::ORDINARY,
@@ -332,13 +329,16 @@ fn prepared_role_cannot_replace_its_own_uncommitted_identifier() {
             )
             .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::DATA_EXCEPTION);
-        assert_eq!(storage.role(3).oid(), first);
+        assert_eq!(storage.role(USER_SLOT + 2).oid(), first);
         assert_eq!(storage.find_role_visible("saved_role", 0), None);
-        assert_eq!(storage.find_role_visible("saved_role", 7), Some(3));
+        assert_eq!(
+            storage.find_role_visible("saved_role", 7),
+            Some(USER_SLOT + 2)
+        );
         assert!(
             storage
                 .restore_prepared_role(
-                    2,
+                    USER_SLOT + 1,
                     first,
                     SqlName::parse("duplicate_role").unwrap(),
                     RoleAttributes::ORDINARY,
@@ -349,7 +349,7 @@ fn prepared_role_cannot_replace_its_own_uncommitted_identifier() {
         assert_eq!(storage.find_role_visible("duplicate_role", 7), None);
         let error = storage
             .restore_prepared_role(
-                2,
+                USER_SLOT + 1,
                 first,
                 SqlName::parse("foreign_duplicate_role").unwrap(),
                 RoleAttributes::ORDINARY,
@@ -357,7 +357,7 @@ fn prepared_role_cannot_replace_its_own_uncommitted_identifier() {
             )
             .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::DATA_EXCEPTION);
-        assert_eq!(storage.role(3).oid(), first);
+        assert_eq!(storage.role(USER_SLOT + 2).oid(), first);
         assert_eq!(storage.find_role_visible("foreign_duplicate_role", 9), None);
     });
 }
@@ -420,16 +420,16 @@ fn restored_role_renames_keep_original_and_target_names_reserved() {
         let target = SqlName::parse("restored_target").unwrap();
         let first = RoleOid::parse(20_000).unwrap();
         storage
-            .restore_prepared_role(3, first, original, RoleAttributes::ORDINARY, 7)
+            .restore_prepared_role(USER_SLOT + 2, first, original, RoleAttributes::ORDINARY, 7)
             .unwrap();
         storage
-            .restore_prepared_role(3, first, target, RoleAttributes::ORDINARY, 7)
+            .restore_prepared_role(USER_SLOT + 2, first, target, RoleAttributes::ORDINARY, 7)
             .unwrap();
-        assert_eq!(storage.role(3).name, original);
+        assert_eq!(storage.role(USER_SLOT + 2).name, original);
         for (index, name) in [original, target].into_iter().enumerate() {
             let error = storage
                 .restore_prepared_role(
-                    2,
+                    USER_SLOT + 1,
                     RoleOid::parse(20_001 + index as i32).unwrap(),
                     name,
                     RoleAttributes::ORDINARY,
@@ -444,15 +444,21 @@ fn restored_role_renames_keep_original_and_target_names_reserved() {
         }
         storage
             .restore_prepared_role(
-                2,
+                USER_SLOT + 1,
                 RoleOid::parse(20_003).unwrap(),
                 original,
                 RoleAttributes::ORDINARY,
                 7,
             )
             .unwrap();
-        assert_eq!(storage.find_role_visible("restored_original", 7), Some(2));
-        assert_eq!(storage.find_role_visible("restored_target", 7), Some(3));
+        assert_eq!(
+            storage.find_role_visible("restored_original", 7),
+            Some(USER_SLOT + 1)
+        );
+        assert_eq!(
+            storage.find_role_visible("restored_target", 7),
+            Some(USER_SLOT + 2)
+        );
     });
 }
 
@@ -611,7 +617,7 @@ fn restored_subscription_owners_require_a_role_visible_to_the_reference_transact
                 .ownership
                 .owner
         };
-        for invalid in [u16::MAX, (config.max_roles - 1) as u16] {
+        for invalid in [u16::MAX, (config.role_catalog_slots() - 1) as u16] {
             let error = storage
                 .restore_subscription_owner(slot, invalid, 0)
                 .unwrap_err();

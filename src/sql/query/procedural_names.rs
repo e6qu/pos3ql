@@ -188,6 +188,14 @@ impl<'a: 's, 's> Check<'a, 's> {
                     self.arena.alloc(Stmt::Delete(*rebuilt))?
                 }
             }
+            Stmt::Merge(merge) => {
+                let rebuilt = self.merge(merge)?;
+                if core::ptr::eq(rebuilt, merge) {
+                    statement
+                } else {
+                    self.arena.alloc(Stmt::Merge(*rebuilt))?
+                }
+            }
             Stmt::With {
                 ctes,
                 statement: main,
@@ -343,6 +351,104 @@ impl<'a: 's, 's> Check<'a, 's> {
         keep(delete, rebuilt, changed, self.arena)
     }
 
+    /// A `MERGE` as PostgreSQL's `transformMergeStmt` analyses it: the
+    /// source, the join condition over target and source, each `WHEN`
+    /// clause with the relations its kind can see (`NOT MATCHED [BY TARGET]`
+    /// sees only the source, `NOT MATCHED BY SOURCE` only the target), and
+    /// `RETURNING`.
+    fn merge(
+        &self,
+        merge: &'a crate::sql::ast::Merge<'a>,
+    ) -> Bound<&'a crate::sql::ast::Merge<'a>> {
+        use crate::sql::ast::{MergeSourceAction, MergeTargetAction, MergeWhen};
+        let mut changed = false;
+        let source = self.table(merge.source, &Level::root(), &mut changed)?;
+        let source_from: &'a FromClause<'a> = self.arena.alloc(FromClause {
+            base: source,
+            joins: &[],
+        })?;
+        let (Some(both), Some(target_only), Some(source_only)) = (
+            self.dml_scope(merge.target, merge.target_alias, Some(source_from)),
+            self.dml_scope(merge.target, merge.target_alias, None),
+            self.quietly(|| {
+                QueryScope::resolve_schema(
+                    self.storage,
+                    source_from,
+                    self.txid,
+                    self.arena,
+                    Some(self.variables),
+                )
+            }),
+        ) else {
+            return Ok(merge);
+        };
+        let level = |scope| Level {
+            scope: Some(scope),
+            parent: None,
+        };
+        let (both, target_only, source_only) =
+            (level(&both), level(&target_only), level(&source_only));
+        let mut rebuilt = *merge;
+        rebuilt.source = source;
+        rebuilt.on = self.expression(merge.on, &both)?;
+        changed |= !core::ptr::eq(rebuilt.on, merge.on);
+        let mut whens: Option<&'a mut [MergeWhen<'a>]> = None;
+        for (index, when) in merge.whens.iter().enumerate() {
+            let mut when_changed = false;
+            let target_action = |action: MergeTargetAction<'a>,
+                                 visible: &Level<'_, 's>,
+                                 changed: &mut bool|
+             -> Bound<MergeTargetAction<'a>> {
+                Ok(match action {
+                    MergeTargetAction::Update(assignments) => MergeTargetAction::Update(
+                        self.assignments(assignments, visible, changed)?,
+                    ),
+                    other => other,
+                })
+            };
+            let new = match *when {
+                MergeWhen::Matched { cond, action } => MergeWhen::Matched {
+                    cond: self.optional(cond, &both, &mut when_changed)?,
+                    action: target_action(action, &both, &mut when_changed)?,
+                },
+                MergeWhen::NotMatchedBySource { cond, action } => MergeWhen::NotMatchedBySource {
+                    cond: self.optional(cond, &target_only, &mut when_changed)?,
+                    action: target_action(action, &target_only, &mut when_changed)?,
+                },
+                MergeWhen::NotMatchedByTarget { cond, action } => MergeWhen::NotMatchedByTarget {
+                    cond: self.optional(cond, &source_only, &mut when_changed)?,
+                    action: match action {
+                        MergeSourceAction::Insert {
+                            columns,
+                            values,
+                            default_values,
+                            overriding,
+                        } => MergeSourceAction::Insert {
+                            columns,
+                            values: self.expressions(values, &source_only, &mut when_changed)?,
+                            default_values,
+                            overriding,
+                        },
+                        MergeSourceAction::DoNothing => MergeSourceAction::DoNothing,
+                    },
+                },
+            };
+            if when_changed {
+                let copy = match whens.as_deref_mut() {
+                    Some(copy) => copy,
+                    None => whens.insert(self.arena.alloc_slice_copy(merge.whens)?),
+                };
+                copy[index] = new;
+                changed = true;
+            }
+        }
+        if let Some(copy) = whens {
+            rebuilt.whens = copy;
+        }
+        rebuilt.returning = self.returning(merge.returning, &both, &mut changed)?;
+        keep(merge, rebuilt, changed, self.arena)
+    }
+
     fn dml_scope(
         &self,
         target: crate::sql::ast::QualName<'a>,
@@ -357,6 +463,7 @@ impl<'a: 's, 's> Check<'a, 's> {
                 extra,
                 self.txid,
                 self.arena,
+                Some(self.variables),
             )
         })
     }
@@ -377,7 +484,19 @@ impl<'a: 's, 's> Check<'a, 's> {
             Some(VariableConflict::UseVariable) if level.has_column(qualifier, name) => {
                 self.variable_value(reference, qualifier, name).map(Some)
             }
-            Some(_) if self.detached.get().is_some() && !level.has_column(qualifier, name) => {
+            // A record variable stays a reference: its fields are typed by
+            // the enclosing row the query reads, which a constant loses.
+            Some(_)
+                if self.detached.get().is_some()
+                    && !level.has_column(qualifier, name)
+                    && !matches!(
+                        self.variables.col_type(qualifier, name),
+                        Some(
+                            crate::sql::types::ColType::Record
+                                | crate::sql::types::ColType::Composite(_)
+                        )
+                    ) =>
+            {
                 self.variable_value(reference, qualifier, name).map(Some)
             }
             // A trigger's `NEW` and `OLD` rows are variables too.
@@ -779,7 +898,13 @@ impl<'a: 's, 's> Check<'a, 's> {
                     let from = select.from.as_ref().expect("expansion keeps FROM");
                     let from =
                         super::cte::expand_from_schema(from, self.storage, self.txid, self.arena)?;
-                    QueryScope::resolve_schema(self.storage, from, self.txid, self.arena, None)
+                    QueryScope::resolve_schema(
+                        self.storage,
+                        from,
+                        self.txid,
+                        self.arena,
+                        Some(self.variables),
+                    )
                 });
                 match expanded {
                     Some(scope) => Some(scope),

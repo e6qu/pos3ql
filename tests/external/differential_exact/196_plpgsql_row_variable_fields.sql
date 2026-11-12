@@ -52,3 +52,4 @@ SELECT f190_record();
 SELECT ROW(1.0) IN (SELECT ROW(1.00));
 SELECT ROW(1.0) = ANY (SELECT ROW(1.00));
 SELECT 1 IN (SELECT 'a'::text WHERE false);
+DROP ROUTINE f190_values(), f190_unassigned_row(), f190_unassigned_composite(), f190_assigned(), f190_subquery(), f190_record() CASCADE;

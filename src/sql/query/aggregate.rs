@@ -214,10 +214,12 @@ pub(crate) struct AggState<'a> {
     sum_numeric: Option<crate::sql::numeric::Numeric<'a>>,
     // Statistical-aggregate accumulators (all in f64). `sum_float` holds Σx (the
     // second argument for the two-argument regression/covariance aggregates).
-    sum_sq: f64, // Σx²
-    sum_y: f64,  // Σy (first argument of a two-arg aggregate)
-    sum_xy: f64, // Σxy
-    sum_yy: f64, // Σy²
+    // PostgreSQL's float accumulators (Youngs-Cramer): `sum_sq` is Sxx, the
+    // sum of squared deviations of x, `sum_yy` Syy and `sum_xy` Sxy.
+    sum_sq: f64,
+    sum_y: f64, // Σy (first argument of a two-arg aggregate)
+    sum_xy: f64,
+    sum_yy: f64,
     // Exact Σx² for the single-argument variance/stddev family over
     // integer/numeric inputs, which return numeric (Σx reuses `sum_numeric`).
     sum_sq_numeric: Option<crate::sql::numeric::Numeric<'a>>,
@@ -413,6 +415,238 @@ impl AggKind {
     }
 }
 
+/// A builtin aggregate transition state saved in fixed bytes outside the
+/// statement arena, so a grouping can keep one state per group instead of
+/// every input row. Each layout holds exactly the running values its
+/// aggregates fold.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FixedState {
+    /// `count(*)`, `count(x)`.
+    Count,
+    /// `sum`/`avg` over integers and `sum(money)`.
+    Integer,
+    /// `sum`/`avg` over `real` and `double precision`.
+    Float,
+    /// `sum`/`avg` over `interval`.
+    Interval,
+    /// `min`/`max` over types passed by value, and the bitwise aggregates
+    /// over integers.
+    Value,
+    /// `min`/`max` over other types: the row count here, and the running
+    /// value, which varies in size, kept by the caller.
+    Reference,
+    /// `bool_and`, `bool_or`, `every`.
+    Bool,
+    /// Variance and standard deviation over floating-point input.
+    Statistics,
+    /// The two-argument statistical aggregates.
+    Regression,
+}
+
+impl FixedState {
+    /// Saved bytes: the row count, then the layout's running values.
+    pub(crate) const fn bytes(self) -> usize {
+        8 + match self {
+            FixedState::Count => 0,
+            FixedState::Integer => 1 + 16,
+            FixedState::Float => 1 + 8 + 4,
+            FixedState::Interval => 1 + 3 * 16 + 1,
+            FixedState::Value => FIXED_VALUE_BYTES,
+            FixedState::Reference => 0,
+            FixedState::Bool => 1,
+            FixedState::Statistics => 1 + 2 * 8,
+            FixedState::Regression => 5 * 8,
+        }
+    }
+}
+
+/// A by-value datum: one tag byte and up to 16 payload bytes.
+const FIXED_VALUE_BYTES: usize = 17;
+
+fn fixed_state_mismatch() -> SqlError {
+    sql_err!(
+        sqlstate::INTERNAL_ERROR,
+        "aggregate state outgrew its fixed-size layout"
+    )
+}
+
+impl ArgKind {
+    fn from_tag(tag: u8) -> Self {
+        [
+            ArgKind::None,
+            ArgKind::Int4,
+            ArgKind::Int8,
+            ArgKind::Money,
+            ArgKind::Numeric,
+            ArgKind::Float4,
+            ArgKind::Float,
+            ArgKind::Interval,
+        ][usize::from(tag)]
+    }
+}
+
+struct FixedReader<'b> {
+    bytes: &'b [u8],
+    at: usize,
+}
+
+impl FixedReader<'_> {
+    fn take<const N: usize>(&mut self) -> [u8; N] {
+        let value = self.bytes[self.at..self.at + N]
+            .try_into()
+            .expect("fixed state field");
+        self.at += N;
+        value
+    }
+
+    fn u8(&mut self) -> u8 {
+        self.take::<1>()[0]
+    }
+
+    fn u32(&mut self) -> u32 {
+        u32::from_le_bytes(self.take())
+    }
+
+    fn u64(&mut self) -> u64 {
+        u64::from_le_bytes(self.take())
+    }
+
+    fn i128(&mut self) -> i128 {
+        i128::from_le_bytes(self.take())
+    }
+
+    fn f64(&mut self) -> f64 {
+        f64::from_le_bytes(self.take())
+    }
+
+    fn value(&mut self) -> Option<Datum<'static>> {
+        let tag = self.u8();
+        let payload: [u8; 16] = self.take();
+        let word = |index: usize| {
+            i64::from_le_bytes(
+                payload[index * 8..index * 8 + 8]
+                    .try_into()
+                    .expect("eight bytes"),
+            )
+        };
+        let half = |index: usize| {
+            i32::from_le_bytes(
+                payload[index * 4..index * 4 + 4]
+                    .try_into()
+                    .expect("four bytes"),
+            )
+        };
+        Some(match tag {
+            0 => return None,
+            1 => Datum::Bool(payload[0] != 0),
+            2 => Datum::Int2(half(0) as i16),
+            3 => Datum::Int4(half(0)),
+            4 => Datum::Oid(half(0) as u32),
+            5 => Datum::Int8(word(0)),
+            6 => Datum::Money(word(0)),
+            7 => Datum::Float4(f32::from_bits(half(0) as u32)),
+            8 => Datum::Float8(f64::from_bits(word(0) as u64)),
+            9 => Datum::Char(payload[0]),
+            10 => Datum::Date(half(0)),
+            11 => Datum::Time(word(0)),
+            12 => Datum::Timestamp(word(0)),
+            13 => Datum::Timestamptz(word(0)),
+            14 => Datum::Timetz(word(0), half(2)),
+            15 => Datum::Interval(crate::sql::types::Interval {
+                months: half(0),
+                days: half(1),
+                micros: word(1),
+            }),
+            16 => Datum::Uuid(payload),
+            17 => Datum::Xid8(word(0) as u64),
+            _ => Datum::PgLsn(word(0) as u64),
+        })
+    }
+}
+
+struct FixedWriter<'b> {
+    bytes: &'b mut [u8],
+    at: usize,
+}
+
+impl FixedWriter<'_> {
+    fn put(&mut self, bytes: &[u8]) {
+        self.bytes[self.at..self.at + bytes.len()].copy_from_slice(bytes);
+        self.at += bytes.len();
+    }
+
+    fn value(&mut self, value: Option<Datum<'_>>) -> Result<(), SqlError> {
+        let mut payload = [0u8; 16];
+        let mut half = |index: usize, value: i32| {
+            payload[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        let tag = match value {
+            None => 0,
+            Some(Datum::Bool(value)) => {
+                half(0, i32::from(value));
+                1
+            }
+            Some(Datum::Int2(value)) => {
+                half(0, i32::from(value));
+                2
+            }
+            Some(Datum::Int4(value)) => {
+                half(0, value);
+                3
+            }
+            Some(Datum::Oid(value)) => {
+                half(0, value as i32);
+                4
+            }
+            Some(Datum::Float4(value)) => {
+                half(0, value.to_bits() as i32);
+                7
+            }
+            Some(Datum::Char(value)) => {
+                half(0, i32::from(value));
+                9
+            }
+            Some(Datum::Date(value)) => {
+                half(0, value);
+                10
+            }
+            Some(Datum::Uuid(bytes)) => {
+                payload = bytes;
+                16
+            }
+            Some(Datum::Timetz(micros, zone)) => {
+                payload[..8].copy_from_slice(&micros.to_le_bytes());
+                payload[8..12].copy_from_slice(&zone.to_le_bytes());
+                14
+            }
+            Some(Datum::Interval(interval)) => {
+                payload[..4].copy_from_slice(&interval.months.to_le_bytes());
+                payload[4..8].copy_from_slice(&interval.days.to_le_bytes());
+                payload[8..].copy_from_slice(&interval.micros.to_le_bytes());
+                15
+            }
+            Some(other) => {
+                let (tag, word) = match other {
+                    Datum::Int8(value) => (5, value),
+                    Datum::Money(value) => (6, value),
+                    Datum::Float8(value) => (8, value.to_bits() as i64),
+                    Datum::Time(value) => (11, value),
+                    Datum::Timestamp(value) => (12, value),
+                    Datum::Timestamptz(value) => (13, value),
+                    Datum::Xid8(value) => (17, value as i64),
+                    Datum::PgLsn(value) => (18, value as i64),
+                    _ => return Err(fixed_state_mismatch()),
+                };
+                payload[..8].copy_from_slice(&word.to_le_bytes());
+                tag
+            }
+        };
+        self.put(&[tag]);
+        self.put(&payload);
+        Ok(())
+    }
+}
+
 impl Default for AggState<'_> {
     fn default() -> Self {
         Self {
@@ -486,6 +720,13 @@ fn agg_f64(d: &Datum) -> Option<f64> {
         Datum::Numeric(n) => Some(n.to_f64()),
         _ => None,
     }
+}
+
+fn float_overflow() -> SqlError {
+    sql_err!(
+        sqlstate::NUMERIC_OUT_OF_RANGE,
+        "value out of range: overflow"
+    )
 }
 
 fn percentile_fraction(value: Datum<'_>) -> Result<f64, SqlError> {
@@ -669,6 +910,24 @@ impl<'a> AggState<'a> {
         Ok(())
     }
 
+    /// The support functions a custom aggregate calls: transition, final,
+    /// combine, serialization and moving-aggregate functions.
+    pub(crate) fn custom_support_oids(&self) -> impl Iterator<Item = i32> + '_ {
+        let routine = self.custom.map(|(_, routine)| *routine);
+        let partial = routine.and_then(|routine| routine.partial);
+        let moving = routine.and_then(|routine| routine.moving);
+        routine
+            .map(|routine| routine.transition_oid)
+            .into_iter()
+            .chain(routine.and_then(|routine| routine.final_function.map(|f| f.function_oid)))
+            .chain(partial.map(|partial| partial.combine_oid))
+            .chain(partial.and_then(|partial| partial.serde.map(|serde| serde.serialize_oid)))
+            .chain(partial.and_then(|partial| partial.serde.map(|serde| serde.deserialize_oid)))
+            .chain(moving.map(|moving| moving.transition_oid))
+            .chain(moving.map(|moving| moving.inverse_oid))
+            .chain(moving.and_then(|moving| moving.final_function.map(|f| f.function_oid)))
+    }
+
     pub(crate) fn supports_partial(&self) -> bool {
         self.custom.is_some_and(|(_, aggregate)| {
             matches!(aggregate.kind, crate::storage::AggregateKind::Normal)
@@ -776,6 +1035,259 @@ impl<'a> AggState<'a> {
         // reclaims after each row — every other aggregate buffers or folds
         // arena-backed values the same way.
         self.custom.is_none() && matches!(self.kind, AggKind::Count) && !self.distinct
+    }
+
+    /// The fixed-size layout this builtin aggregate's transition state can be
+    /// saved in, decided from its kind and its arguments' static types before
+    /// any row is read. `None` for a state that grows: `DISTINCT`, an
+    /// aggregate `ORDER BY`, custom, collecting, ordered-set and
+    /// numeric-accumulating aggregates.
+    pub(crate) fn fixed_state(
+        &self,
+        node: &Expr<'_>,
+        columns: &dyn crate::sql::exec::ColTypeResolver,
+    ) -> Option<FixedState> {
+        use crate::sql::types::oid;
+        let Expr::Call { args, order_by, .. } = node else {
+            return None;
+        };
+        if self.custom.is_some() || self.distinct || self.ordered || !order_by.is_empty() {
+            return None;
+        }
+        if self.star || self.kind == AggKind::Count {
+            return Some(FixedState::Count);
+        }
+        if self.kind.is_two_arg_stat() {
+            return Some(FixedState::Regression);
+        }
+        let argument = crate::sql::exec::infer_routine_argument_oid(args.first()?, columns).ok()?;
+        match self.kind {
+            AggKind::Sum | AggKind::Avg => match argument {
+                oid::INT2 | oid::INT4 | oid::INT8 | oid::MONEY => Some(FixedState::Integer),
+                oid::FLOAT4 | oid::FLOAT8 => Some(FixedState::Float),
+                oid::INTERVAL => Some(FixedState::Interval),
+                _ => None,
+            },
+            AggKind::Min | AggKind::Max => Some(
+                if matches!(
+                    argument,
+                    oid::INT2
+                        | oid::INT4
+                        | oid::INT8
+                        | oid::OID
+                        | oid::FLOAT4
+                        | oid::FLOAT8
+                        | oid::MONEY
+                        | oid::DATE
+                        | oid::TIME
+                        | oid::TIMETZ
+                        | oid::TIMESTAMP
+                        | oid::TIMESTAMPTZ
+                        | oid::INTERVAL
+                        | oid::CHAR
+                        | oid::XID8
+                        | oid::PG_LSN
+                ) {
+                    FixedState::Value
+                } else {
+                    FixedState::Reference
+                },
+            ),
+            AggKind::BitAnd | AggKind::BitOr | AggKind::BitXor => {
+                matches!(argument, oid::INT2 | oid::INT4 | oid::INT8).then_some(FixedState::Value)
+            }
+            AggKind::BoolAnd | AggKind::BoolOr => Some(FixedState::Bool),
+            AggKind::VarPop | AggKind::VarSamp | AggKind::StddevPop | AggKind::StddevSamp => {
+                matches!(argument, oid::FLOAT4 | oid::FLOAT8).then_some(FixedState::Statistics)
+            }
+            _ => None,
+        }
+    }
+
+    /// Folds one input row into the state saved in `saved`, using this state
+    /// (initialized before any row, in an arena that outlives `arena`) for
+    /// everything but the running values. A [`FixedState::Reference`]
+    /// state's running value is read from and returned in `value`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn update_fixed<'w>(
+        &self,
+        layout: FixedState,
+        saved: &mut [u8],
+        value: &mut Option<Datum<'w>>,
+        node: &Expr<'w>,
+        arena: &'w Arena,
+        params: &[Datum<'w>],
+        row: &impl ColumnLookup<'w>,
+        hooks: &EvalHooks<'_, 'w>,
+    ) -> Result<(), SqlError>
+    where
+        'a: 'w,
+    {
+        let mut state: AggState<'w> = self.shortened();
+        state.load_fixed(layout, saved);
+        if layout == FixedState::Reference {
+            state.best = *value;
+        }
+        state.update(node, arena, params, row, hooks)?;
+        if layout == FixedState::Reference {
+            *value = state.best;
+        }
+        state.save_fixed(layout, saved)
+    }
+
+    /// The result of the state saved in `saved`.
+    pub(crate) fn finish_fixed<'w>(
+        &self,
+        layout: FixedState,
+        saved: &[u8],
+        value: Option<Datum<'w>>,
+        arena: &'w Arena,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Result<Datum<'w>, SqlError>
+    where
+        'a: 'w,
+    {
+        let mut state: AggState<'w> = self.shortened();
+        state.load_fixed(layout, saved);
+        if layout == FixedState::Reference {
+            state.best = value;
+        }
+        state.finish(arena, catalog)
+    }
+
+    /// A copy of this freshly initialized state for another group, with its
+    /// own order collations, so a grouping initializes each aggregate once
+    /// rather than once per group.
+    pub(crate) fn fresh_copy<'w>(&self, arena: &'w Arena) -> Result<AggState<'w>, SqlError>
+    where
+        'a: 'w,
+    {
+        let mut copy: AggState<'w> = self.shortened();
+        if self.ord_collations_len != 0 {
+            let collations = arena
+                .alloc_slice_copy(self.order_collations())
+                .map_err(|_| arena_full())?;
+            copy.ord_collations = collations.as_mut_ptr();
+        }
+        Ok(copy)
+    }
+
+    fn shortened<'w>(&self) -> AggState<'w>
+    where
+        'a: 'w,
+    {
+        // SAFETY: only the lifetime shortens. Every reference and pointer in
+        // the copy was allocated for 'a, which outlives 'w, and the copy is a
+        // value: nothing it receives during 'w is written back into `self`.
+        unsafe { core::mem::transmute::<AggState<'a>, AggState<'w>>(*self) }
+    }
+
+    /// The initial saved bytes of a fixed state: a fresh state's.
+    pub(crate) fn initial_fixed(&self, layout: FixedState, out: &mut [u8]) -> Result<(), SqlError> {
+        self.save_fixed(layout, out)
+    }
+
+    fn load_fixed(&mut self, layout: FixedState, bytes: &[u8]) {
+        let mut reader = FixedReader { bytes, at: 0 };
+        self.count = reader.u64();
+        match layout {
+            FixedState::Count => {}
+            FixedState::Integer => {
+                self.arg_kind = ArgKind::from_tag(reader.u8());
+                self.sum_int = reader.i128();
+            }
+            FixedState::Float => {
+                self.arg_kind = ArgKind::from_tag(reader.u8());
+                self.sum_float = reader.f64();
+                self.sum_float4 = f32::from_bits(reader.u32());
+            }
+            FixedState::Interval => {
+                self.arg_kind = ArgKind::from_tag(reader.u8());
+                self.sum_interval_months = reader.i128();
+                self.sum_interval_days = reader.i128();
+                self.sum_interval_micros = reader.i128();
+                self.sum_interval_infinity = reader.u8() as i8;
+            }
+            FixedState::Value => self.best = reader.value(),
+            FixedState::Reference => {}
+            FixedState::Bool => {
+                self.bool_acc = match reader.u8() {
+                    0 => None,
+                    1 => Some(false),
+                    _ => Some(true),
+                }
+            }
+            FixedState::Statistics => {
+                self.arg_kind = ArgKind::from_tag(reader.u8());
+                self.sum_float = reader.f64();
+                self.sum_sq = reader.f64();
+            }
+            FixedState::Regression => {
+                self.sum_float = reader.f64();
+                self.sum_sq = reader.f64();
+                self.sum_y = reader.f64();
+                self.sum_xy = reader.f64();
+                self.sum_yy = reader.f64();
+            }
+        }
+    }
+
+    fn save_fixed(&self, layout: FixedState, out: &mut [u8]) -> Result<(), SqlError> {
+        // Admission chose this layout from static types; a state that came to
+        // hold anything else would not survive outside the statement arena.
+        if self.sum_numeric.is_some()
+            || self.sum_sq_numeric.is_some()
+            || self.vals_len != 0
+            || self.str_len != 0
+            || self.ord_len != 0
+        {
+            return Err(fixed_state_mismatch());
+        }
+        let mut writer = FixedWriter { bytes: out, at: 0 };
+        writer.put(&self.count.to_le_bytes());
+        match layout {
+            FixedState::Count => {}
+            FixedState::Integer => {
+                writer.put(&[self.arg_kind as u8]);
+                writer.put(&self.sum_int.to_le_bytes());
+            }
+            FixedState::Float => {
+                writer.put(&[self.arg_kind as u8]);
+                writer.put(&self.sum_float.to_le_bytes());
+                writer.put(&self.sum_float4.to_bits().to_le_bytes());
+            }
+            FixedState::Interval => {
+                writer.put(&[self.arg_kind as u8]);
+                writer.put(&self.sum_interval_months.to_le_bytes());
+                writer.put(&self.sum_interval_days.to_le_bytes());
+                writer.put(&self.sum_interval_micros.to_le_bytes());
+                writer.put(&[self.sum_interval_infinity as u8]);
+            }
+            FixedState::Value => writer.value(self.best)?,
+            FixedState::Reference => {}
+            FixedState::Bool => writer.put(&[match self.bool_acc {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            }]),
+            FixedState::Statistics => {
+                writer.put(&[self.arg_kind as u8]);
+                writer.put(&self.sum_float.to_le_bytes());
+                writer.put(&self.sum_sq.to_le_bytes());
+            }
+            FixedState::Regression => {
+                for value in [
+                    self.sum_float,
+                    self.sum_sq,
+                    self.sum_y,
+                    self.sum_xy,
+                    self.sum_yy,
+                ] {
+                    writer.put(&value.to_le_bytes());
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn init(
@@ -1473,12 +1985,7 @@ impl<'a> AggState<'a> {
                 return Ok(());
             };
             self.count += 1;
-            self.sum_float += x;
-            self.sum_sq += x * x;
-            self.sum_y += y;
-            self.sum_xy += x * y;
-            self.sum_yy += y * y;
-            return Ok(());
+            return self.accumulate_regression(y, x);
         }
         let Some(arg) = args.first() else {
             return Err(sql_err!(
@@ -1682,17 +2189,28 @@ impl<'a> AggState<'a> {
                 }
                 // sum(real) -> real, accumulated in single precision; avg(real)
                 // -> double precision, accumulated in the f64 running sum.
+                // sum(real) and sum(double precision) start from their first
+                // input, as PostgreSQL's strict transition does, so a lone
+                // -0 sums to -0; avg starts from zero.
                 Datum::Float4(x) => {
                     self.arg_kind = ArgKind::Float4;
                     if self.kind == AggKind::Sum {
-                        self.sum_float4 += x;
+                        self.sum_float4 = if self.count == 1 {
+                            x
+                        } else {
+                            self.sum_float4 + x
+                        };
                     } else {
                         self.sum_float += f64::from(x);
                     }
                 }
                 Datum::Float8(x) => {
                     self.arg_kind = ArgKind::Float;
-                    self.sum_float += x;
+                    self.sum_float = if self.kind == AggKind::Sum && self.count == 1 {
+                        x
+                    } else {
+                        self.sum_float + x
+                    };
                 }
                 Datum::Interval(interval) => {
                     self.arg_kind = ArgKind::Interval;
@@ -1870,15 +2388,12 @@ impl<'a> AggState<'a> {
                     // in f64 exactly as a float8 input does.
                     Datum::Float4(x) => {
                         self.arg_kind = ArgKind::Float;
-                        let x = f64::from(x);
-                        self.sum_float += x;
-                        self.sum_sq += x * x;
+                        self.accumulate_float(f64::from(x))?;
                         None
                     }
                     Datum::Float8(x) => {
                         self.arg_kind = ArgKind::Float;
-                        self.sum_float += x;
-                        self.sum_sq += x * x;
+                        self.accumulate_float(x)?;
                         None
                     }
                     other => {
@@ -1918,6 +2433,81 @@ impl<'a> AggState<'a> {
             | AggKind::RegrSxx
             | AggKind::RegrSyy
             | AggKind::RegrSxy => {}
+        }
+        Ok(())
+    }
+
+    /// PostgreSQL's `float8_accum` for one input; `count` already includes it.
+    fn accumulate_float(&mut self, x: f64) -> Result<(), SqlError> {
+        let n = self.count as f64;
+        let previous_sum = self.sum_float;
+        self.sum_float += x;
+        if self.count > 1 {
+            let deviation = x * n - self.sum_float;
+            self.sum_sq += deviation * deviation / (n * (n - 1.0));
+            if self.sum_float.is_infinite() || self.sum_sq.is_infinite() {
+                if !previous_sum.is_infinite() && !x.is_infinite() {
+                    return Err(float_overflow());
+                }
+                self.sum_sq = f64::NAN;
+            }
+        } else if !x.is_finite() {
+            self.sum_sq = f64::NAN;
+        }
+        Ok(())
+    }
+
+    /// PostgreSQL's `float8_regr_accum` for one `(Y, X)` input; `count`
+    /// already includes it.
+    fn accumulate_regression(&mut self, y: f64, x: f64) -> Result<(), SqlError> {
+        let n = self.count as f64;
+        let (previous_x, previous_y) = (self.sum_float, self.sum_y);
+        self.sum_float += x;
+        self.sum_y += y;
+        if self.count > 1 {
+            let deviation_x = x * n - self.sum_float;
+            let deviation_y = y * n - self.sum_y;
+            // Unfused multiplications, as PostgreSQL computes them where
+            // its compiler does not contract them into fused multiply-adds.
+            let scale = 1.0 / (n * (n - 1.0));
+            self.sum_sq += deviation_x * deviation_x * scale;
+            self.sum_yy += deviation_y * deviation_y * scale;
+            self.sum_xy += deviation_x * deviation_y * scale;
+            if self.sum_float.is_infinite()
+                || self.sum_sq.is_infinite()
+                || self.sum_y.is_infinite()
+                || self.sum_yy.is_infinite()
+                || self.sum_xy.is_infinite()
+            {
+                let x_overflow = (self.sum_float.is_infinite() || self.sum_sq.is_infinite())
+                    && !previous_x.is_infinite()
+                    && !x.is_infinite();
+                let y_overflow = (self.sum_y.is_infinite() || self.sum_yy.is_infinite())
+                    && !previous_y.is_infinite()
+                    && !y.is_infinite();
+                let product_overflow = self.sum_xy.is_infinite()
+                    && !previous_x.is_infinite()
+                    && !x.is_infinite()
+                    && !previous_y.is_infinite()
+                    && !y.is_infinite();
+                if x_overflow || y_overflow || product_overflow {
+                    return Err(float_overflow());
+                }
+                for value in [&mut self.sum_sq, &mut self.sum_yy, &mut self.sum_xy] {
+                    if value.is_infinite() {
+                        *value = f64::NAN;
+                    }
+                }
+            }
+        } else {
+            if !x.is_finite() {
+                self.sum_sq = f64::NAN;
+                self.sum_xy = f64::NAN;
+            }
+            if !y.is_finite() {
+                self.sum_yy = f64::NAN;
+                self.sum_xy = f64::NAN;
+            }
         }
         Ok(())
     }
@@ -2483,16 +3073,16 @@ impl<'a> AggState<'a> {
                         },
                     );
                 }
+                // PostgreSQL's float8 final functions over N, Sx, Sxx, Sy,
+                // Syy and Sxy.
                 let n = self.count as f64;
-                let sxx = self.sum_sq - self.sum_float * self.sum_float / n;
-                let syy = self.sum_yy - self.sum_y * self.sum_y / n;
-                let sxy = self.sum_xy - self.sum_float * self.sum_y / n;
+                let (sxx, syy, sxy) = (self.sum_sq, self.sum_yy, self.sum_xy);
                 let samp_ok = self.count >= 2;
                 let value = match self.kind {
                     AggKind::VarPop => Some(sxx / n),
                     AggKind::VarSamp => samp_ok.then(|| sxx / (n - 1.0)),
-                    AggKind::StddevPop => Some((sxx / n).max(0.0).sqrt()),
-                    AggKind::StddevSamp => samp_ok.then(|| (sxx / (n - 1.0)).max(0.0).sqrt()),
+                    AggKind::StddevPop => Some((sxx / n).sqrt()),
+                    AggKind::StddevSamp => samp_ok.then(|| (sxx / (n - 1.0)).sqrt()),
                     AggKind::CovarPop => Some(sxy / n),
                     AggKind::CovarSamp => samp_ok.then(|| sxy / (n - 1.0)),
                     AggKind::Corr => {
@@ -2504,7 +3094,7 @@ impl<'a> AggState<'a> {
                     }
                     AggKind::RegrSlope => (sxx != 0.0).then(|| sxy / sxx),
                     AggKind::RegrIntercept => {
-                        (sxx != 0.0).then(|| self.sum_y / n - (sxy / sxx) * (self.sum_float / n))
+                        (sxx != 0.0).then(|| (self.sum_y - self.sum_float * sxy / sxx) / n)
                     }
                     AggKind::RegrR2 => {
                         if sxx == 0.0 {
@@ -2903,6 +3493,8 @@ impl<'a> AggState<'a> {
             let out = arena
                 .alloc_slice_with(rows.len(), |_| Datum::Null)
                 .map_err(|_| arena_full())?;
+            // Records keep their structure: a whole-row value aggregated in
+            // ORDER BY order must reach the array or JSON as a record.
             for (i, &row) in rows.iter().enumerate() {
                 out[i] = crate::sql::exec::decode_projected_col_record(row, 0, arena)?;
             }

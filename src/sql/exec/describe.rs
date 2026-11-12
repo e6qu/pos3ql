@@ -92,6 +92,16 @@ pub(crate) fn wire_column_description<'a>(
     storage: &crate::storage::Storage,
     txid: u32,
 ) -> Result<ColDesc<'a>, SqlError> {
+    if let Some((domain, false)) =
+        crate::sql::information_schema_domains::InformationSchemaDomain::from_oid(
+            description.type_oid,
+        )
+    {
+        description.type_oid = domain.base().oid();
+        description.typlen = domain.base().typlen();
+        description.type_mod = domain.base_type_mod();
+        return Ok(description);
+    }
     let Some((crate::storage::NamedTypeKind::Domain, creation, false)) =
         crate::storage::NamedTypeKind::from_oid(description.type_oid)
     else {
@@ -577,8 +587,7 @@ pub(crate) fn visit_catalog_rowtype_fields(
                             "view description exceeds the statement arena"
                         )
                     })?;
-                let count =
-                    crate::sql::catalog::describe_view(storage, txid, &view, arena, columns)?;
+                let count = crate::sql::catalog::describe_view(&view, txid, arena, columns)?;
                 for (out, column) in fields.iter_mut().zip(&columns[..count]) {
                     let (ctype, _) =
                         crate::sql::exec::catalog_column_type(storage, txid, column.type_oid)
@@ -855,36 +864,15 @@ impl ColTypeResolver for CatalogCols<'_> {
                 variadic,
             );
         }
-        let routine = if let Some(oid) = bound_oid {
-            self.storage.function_for_captured_call(
-                oid,
-                argument_names,
-                arguments,
-                variadic,
-                self.txid,
-            )
-        } else if argument_names.is_empty() {
-            self.storage
-                .function_for_call_syntax_oids(name, arguments, variadic, self.txid)
-        } else {
-            self.storage.function_for_named_call_oids(
-                name,
-                argument_names,
-                arguments,
-                variadic,
-                self.txid,
-            )
-        };
-        let result = routine
-            .and_then(|routine| routine.function_result_contract())
-            .or_else(|| {
-                if bound_oid.is_some() {
-                    return None;
-                }
-                self.storage
-                    .aggregate_for_call_oids(name, arguments, self.txid)
-                    .map(|(_, _, aggregate)| aggregate.result_type)
-            })?;
+        let result = user_routine_call_result(
+            self.storage,
+            self.txid,
+            name,
+            bound_oid,
+            argument_names,
+            arguments,
+            variadic,
+        )?;
         let ctype = result.ctype;
         Some(StaticTypeMeta {
             type_oid: self
@@ -989,6 +977,24 @@ impl ColTypeResolver for CatalogCols<'_> {
             || self.definition.is_some_and(|definition| {
                 crate::sql::eval::qualifier_answers_target(definition, self.alias, name)
             })
+    }
+
+    /// The target relation's own row type, found by the definition's
+    /// qualified name; an unnamed definition stays an anonymous record.
+    fn whole_row_composite_type(&self, name: &str) -> Option<ColType> {
+        let definition = self.definition?;
+        if !crate::sql::eval::qualifier_answers_target(definition, self.alias, name) {
+            return None;
+        }
+        let slot = self.storage.find_visible(
+            definition.schema.as_str(),
+            definition.name.as_str(),
+            self.txid,
+        )?;
+        Some(ColType::Composite(Some(
+            self.storage
+                .relation_row_type_creation(crate::storage::RowTypeRelation::Table(slot)),
+        )))
     }
 
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
@@ -1236,12 +1242,7 @@ fn describe_record_star<'q>(
             if let Some(error) = error {
                 return Err(error);
             }
-            width.ok_or_else(|| {
-                sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "row expansion is not supported on this expression"
-                )
-            })?;
+            width.ok_or_else(|| row_expansion_error(base, &resolver))?;
             Ok(())
         }
         Expr::WholeRow(table)
@@ -1321,23 +1322,19 @@ fn describe_record_star<'q>(
                             .composite_for(slot, txid)
                             .creation()
                     }),
-                _ => None,
+                _ => infer_type_res(base, resolver)
+                    .ok()
+                    .and_then(|(oid, _)| crate::sql::query::named_composite_creation(oid)),
             };
             if let Some(slot) = slot {
                 let storage = storage.expect("checked");
-                let target = crate::storage::TypeDefinitionTarget::by_creation(
-                    storage,
-                    crate::storage::NamedTypeKind::Composite,
-                    slot,
-                )?;
-                let composite = storage
-                    .read_composite_definition(target, txid)?
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "composite type no longer exists"
-                        )
-                    })?;
+
+                let composite = storage.row_type_definition(slot, txid)?.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "composite type no longer exists"
+                    )
+                })?;
                 for field in composite.active_fields_for(txid) {
                     let name = arena.alloc_str(field.name.as_str()).map_err(|_| {
                         sql_err!(
@@ -1365,10 +1362,16 @@ fn describe_record_star<'q>(
                 return Ok(());
             }
             let Some(handle) = expr_record_handle(base, resolver) else {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "row expansion is not supported on this expression"
-                ));
+                // Name the value's type through the catalog, as PostgreSQL does.
+                let catalog = CatalogCols {
+                    definition: def,
+                    alias: table_alias,
+                    output_aliases,
+                    storage: storage.expect("checked"),
+                    txid,
+                    arena,
+                };
+                return Err(row_expansion_error(base, &catalog));
             };
             let mut push_err = None;
             visit_record_shape_metadata(handle, |field_name, meta| {
@@ -1413,10 +1416,7 @@ fn describe_record_star<'q>(
                 None => &NoCols,
             };
             let Some(handle) = expr_record_handle(base, resolver) else {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "row expansion is not supported on this expression"
-                ));
+                return Err(row_expansion_error(base, resolver));
             };
             let mut push_err = None;
             visit_record_shape_metadata(handle, |field_name, meta| {
@@ -1519,6 +1519,7 @@ fn agg_undefined(name: &str, arg_oid: i32) -> SqlError {
 /// name), or a CASE whose ELSE yields a name. `None` for anything unnamed.
 fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
     match expression {
+        Expr::OuterAggregate { call, .. } => name_of(call),
         Expr::Column { name, .. }
         | Expr::RoutineParam { name, .. }
         | Expr::SchemaColumn { name, .. } => Some(name),
@@ -1644,7 +1645,8 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
             | Expr::Array(_)
             | Expr::ArraySubquery(_)
             | Expr::Case {
-                synthetic: false, ..
+                origin: crate::sql::ast::CaseOrigin::Written,
+                ..
             } => name_of(operand),
             Expr::Cast { operand, .. } => {
                 cast_source_name(operand).or_else(|| cast_target_name(type_name))
@@ -1660,7 +1662,10 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         // A desugared CASE (`IS TRUE`, `IS DISTINCT FROM`) is anonymous, as
         // PostgreSQL labels those `?column?`; a real CASE forwards to its ELSE.
         Expr::Case {
-            synthetic: true, ..
+            origin:
+                crate::sql::ast::CaseOrigin::BooleanTest { .. }
+                | crate::sql::ast::CaseOrigin::DistinctFrom { .. },
+            ..
         } => None,
         Expr::Case {
             otherwise: Some(e), ..
@@ -1720,6 +1725,10 @@ fn cast_target_name(type_name: &str) -> Option<&str> {
             .map(ColType::internal_name)
             .or_else(|| type_name.trim_end_matches("[]").rsplit('.').next());
     }
+    // An array type written by its `pg_type` name (`_int4`) keeps that name.
+    if let Some(ColType::Array(_)) = ColType::from_sql_name(type_name) {
+        return type_name.rsplit('.').next();
+    }
     ColType::from_sql_name(type_name)
         .map(ColType::internal_name)
         .or_else(|| type_name.rsplit('.').next())
@@ -1734,7 +1743,8 @@ pub fn derived_name<'a>(expression: &Expr<'a>) -> &'a str {
     }
     match expression {
         Expr::Case {
-            synthetic: false, ..
+            origin: crate::sql::ast::CaseOrigin::Written,
+            ..
         } => "case",
         Expr::WholeRow(t) => t,
         Expr::Exists(_) => "exists",
@@ -1935,13 +1945,52 @@ pub(crate) fn builtin_type_name_fixed(type_oid: i32) -> Option<crate::util::Stac
     Some(crate::util::StackStr::from_str(name))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FunctionLookupFailure {
     Missing,
     Ambiguous,
+    /// `CALL` selected a function: `f(integer) is not a procedure`.
+    NotProcedure,
 }
 
 pub(crate) fn function_lookup_error(
+    name: &str,
+    argument_oids: &[i32],
+    argument_names: &[Option<&str>],
+    failure: FunctionLookupFailure,
+    columns: &dyn ColTypeResolver,
+) -> SqlError {
+    routine_lookup_error(
+        "function ",
+        name,
+        argument_oids,
+        argument_names,
+        failure,
+        columns,
+    )
+}
+
+/// `CALL` lookup failures name the procedure and its argument types, as
+/// PostgreSQL's `ParseFuncOrColumn` does.
+pub(crate) fn procedure_lookup_error(
+    name: &str,
+    argument_oids: &[i32],
+    argument_names: &[Option<&str>],
+    failure: FunctionLookupFailure,
+    columns: &dyn ColTypeResolver,
+) -> SqlError {
+    routine_lookup_error(
+        "procedure ",
+        name,
+        argument_oids,
+        argument_names,
+        failure,
+        columns,
+    )
+}
+
+fn routine_lookup_error(
+    noun: &str,
     name: &str,
     argument_oids: &[i32],
     argument_names: &[Option<&str>],
@@ -1954,12 +2003,13 @@ pub(crate) fn function_lookup_error(
             "function diagnostic argument mapping changed"
         );
     }
-    let state = match failure {
-        FunctionLookupFailure::Missing => sqlstate::UNDEFINED_FUNCTION,
-        FunctionLookupFailure::Ambiguous => sqlstate::AMBIGUOUS_FUNCTION,
+    let (state, noun) = match failure {
+        FunctionLookupFailure::Missing => (sqlstate::UNDEFINED_FUNCTION, noun),
+        FunctionLookupFailure::Ambiguous => (sqlstate::AMBIGUOUS_FUNCTION, noun),
+        FunctionLookupFailure::NotProcedure => (sqlstate::WRONG_OBJECT_TYPE, ""),
     };
     crate::sql::error_position::full_message_error(state, |message| {
-        let _ = write!(message, "function {}(", name);
+        let _ = write!(message, "{}{}(", noun, name);
         for (index, type_oid) in argument_oids.iter().copied().enumerate() {
             if index != 0 {
                 let _ = message.write_str(", ");
@@ -1979,6 +2029,7 @@ pub(crate) fn function_lookup_error(
         let _ = message.write_str(match failure {
             FunctionLookupFailure::Missing => ") does not exist",
             FunctionLookupFailure::Ambiguous => ") is not unique",
+            FunctionLookupFailure::NotProcedure => ") is not a procedure",
         });
         Ok(())
     })
@@ -2128,6 +2179,12 @@ pub trait ColTypeResolver {
         None
     }
 
+    /// The declared row type of a whole-row reference that is neither a scalar
+    /// nor an anonymous record: a relation source's own row type.
+    fn whole_row_composite_type(&self, _name: &str) -> Option<ColType> {
+        None
+    }
+
     /// The columns of the FROM item exposed as `name`, for resolving a
     /// whole-row record's field shape (`(t).c`, `(t).*`). Defaults to None.
     fn table_columns(&self, _name: &str) -> Option<&[ColumnMeta]> {
@@ -2274,6 +2331,11 @@ pub(crate) fn bound_parameter_type_oid(index: u32) -> Option<i32> {
     })
 }
 
+/// Whether statement parameter `$index` is bound (its type may be unknown).
+pub(crate) fn bound_parameter_exists(index: u32) -> bool {
+    index >= 1 && BOUND_PARAMETER_TYPES.with(|types| (index as usize) <= types.get().len)
+}
+
 pub(crate) fn bound_parameter_context_active() -> bool {
     matches!(PARAMETER_CONTEXT.with(Cell::get), ParameterContext::Bound)
 }
@@ -2357,6 +2419,22 @@ impl Drop for RoutineParameterScope {
 
 fn routine_parameter_type(index: u32) -> Option<(i32, i16)> {
     routine_parameter_metadata(index).map(|metadata| (metadata.type_oid, metadata.ctype.typlen()))
+}
+
+/// A statement parameter bound to a named composite or relation row type
+/// (`PREPARE q(t)`, or a Parse type OID), typed through its catalog identity.
+fn bound_composite_parameter(index: u32) -> Option<StaticTypeMeta> {
+    if !bound_parameter_context_active() {
+        return None;
+    }
+    let type_oid = bound_parameter_type_oid(index)?;
+    match crate::storage::NamedTypeKind::from_oid(type_oid)? {
+        (crate::storage::NamedTypeKind::Composite, creation, false) => Some(StaticTypeMeta {
+            type_oid,
+            ..StaticTypeMeta::of(ColType::Composite(Some(creation)))
+        }),
+        _ => None,
+    }
 }
 
 fn routine_parameter_metadata(index: u32) -> Option<StaticTypeMeta> {
@@ -2591,17 +2669,11 @@ pub(crate) fn catalog_composite_field(
     slot: Option<crate::storage::TypeCreation>,
     name: &str,
 ) -> Option<StaticTypeMeta> {
-    let target = crate::storage::TypeDefinitionTarget::by_creation(
-        storage,
-        crate::storage::NamedTypeKind::Composite,
-        slot?,
-    )
-    .ok()?;
-    let definition = storage.read_composite_definition(target, txid).ok()??;
+    let definition = storage.row_type_definition(slot?, txid).ok()??;
     let field = definition
         .active_fields()
         .find(|field| field.name.as_str().eq_ignore_ascii_case(name))?;
-    composite_field_metadata(storage, txid, field)
+    composite_field_metadata(storage, txid, &field)
 }
 
 pub(crate) fn visit_catalog_composite_fields(
@@ -2610,18 +2682,12 @@ pub(crate) fn visit_catalog_composite_fields(
     slot: Option<crate::storage::TypeCreation>,
     visit: &mut dyn FnMut(&str, StaticTypeMeta),
 ) -> Option<usize> {
-    let target = crate::storage::TypeDefinitionTarget::by_creation(
-        storage,
-        crate::storage::NamedTypeKind::Composite,
-        slot?,
-    )
-    .ok()?;
-    let definition = storage.read_composite_definition(target, txid).ok()??;
+    let definition = storage.row_type_definition(slot?, txid).ok()??;
     let mut count = 0;
     for field in definition.active_fields() {
         visit(
             field.name.as_str(),
-            composite_field_metadata(storage, txid, field)?,
+            composite_field_metadata(storage, txid, &field)?,
         );
         count += 1;
     }
@@ -3520,10 +3586,7 @@ pub(crate) fn expand_record_call_items<'a>(
             return Err(error);
         }
         if width.is_none() {
-            return Err(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "row expansion is not supported on this expression"
-            ));
+            return Err(row_expansion_error(base, columns));
         }
     }
     Ok(expanded.as_slice())
@@ -3540,6 +3603,7 @@ fn record_shape_metadata_dyn(
         {
             routine_parameter_metadata(*index)
         }
+        Expr::Param(index) => bound_composite_parameter(*index),
         Expr::RoutineParam {
             qualifier,
             name,
@@ -3823,6 +3887,35 @@ pub fn record_field_metadata(
             "row expansion via \"*\" is not supported here"
         ));
     }
+    // Outside a routine, the parameters are the ones bound to the statement;
+    // a simple query has none (`SELECT ($1).a`).
+    if let Expr::Param(index) = base
+        && bound_parameter_context_active()
+        && !bound_parameter_exists(*index)
+    {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_PARAMETER,
+            "there is no parameter ${}",
+            index
+        ));
+    }
+    if let Expr::Param(index) = base
+        && let Some(parameter) = bound_composite_parameter(*index)
+        && let ColType::Composite(slot) = parameter.ctype
+    {
+        return columns.composite_field(slot, field).ok_or_else(|| {
+            match columns.type_name_fixed(parameter.type_oid) {
+                Ok(Some(name)) => sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" not found in data type {}",
+                    field,
+                    name.as_str()
+                ),
+                Ok(None) => could_not_identify(field),
+                Err(error) => error,
+            }
+        });
+    }
     // A bare unknown literal cannot be coerced out of a ROW(...) — but only
     // selecting *that* field (star expansion checks every field elsewhere)
     // hits the failure; a typed sibling selects fine.
@@ -3938,9 +4031,9 @@ pub fn record_field_metadata(
             }
             Ok(ColType::Record) => match expr_record_handle(base, columns) {
                 Some(handle) => record_shape_field_metadata(handle, field).map(|value| value.0),
-                None if qualifier.is_none() && columns.is_whole_row(name) => {
-                    columns.column_meta(Some(name), field)
-                }
+                // A whole row, or a PL/pgSQL record variable holding a row,
+                // names its fields as `name.field`.
+                None if qualifier.is_none() => columns.column_meta(Some(name), field),
                 None => None,
             },
             Ok(_) => None,
@@ -3993,17 +4086,37 @@ pub fn record_field_metadata(
             found = Some(meta);
         }
     })?;
+    let base_oid = infer_type_res(base, columns).ok().map(|(oid, _)| oid);
     if shape.is_none() {
         // Not a record at all: PostgreSQL names the non-composite type.
-        let type_name = infer_type_res(base, columns)
-            .ok()
-            .and_then(|(oid, _)| coltype_of_oid(oid))
+        if let Some(oid) = base_oid
+            && oid != oid::RECORD
+            && let Some(name) = columns.type_name_fixed(oid)?
+        {
+            return Err(not_composite(field, name.as_str()));
+        }
+        let type_name = base_oid
+            .and_then(coltype_of_oid)
             .map(|t| t.name())
             .unwrap_or("record");
         if type_name == "record" {
             return Err(could_not_identify(field));
         }
         return Err(not_composite(field, type_name));
+    }
+    if found.is_none()
+        && !matches!(base, Expr::WholeRow(_))
+        && !matches!(base, Expr::Column { qualifier: None, name } if columns.is_whole_row(name))
+        && let Some(oid) =
+            base_oid.filter(|oid| crate::sql::query::named_composite_creation(*oid).is_some())
+        && let Some(name) = columns.type_name_fixed(oid)?
+    {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" not found in data type {}",
+            field,
+            name.as_str()
+        ));
     }
     found.ok_or_else(|| match base {
         // A whole-row reference names the missing column with its table; a
@@ -4044,6 +4157,39 @@ pub fn could_not_identify(field: &str) -> SqlError {
         "could not identify column \"{}\" in record data type",
         field
     )
+}
+
+/// PostgreSQL's 42809 for `(value).*`: a value of a known non-row type names
+/// that type; a row whose fields pos3ql cannot list says so instead.
+pub(crate) fn row_expansion_error(base: &Expr, columns: &dyn ColTypeResolver) -> SqlError {
+    let scalar = |ctype: ColType| !matches!(ctype, ColType::Record | ColType::Composite(_));
+    let type_oid = match base {
+        Expr::Null | Expr::Str(_) => Some(oid::UNKNOWN),
+        // A domain names itself; one over a row type expands elsewhere.
+        Expr::Cast { type_name, .. }
+            if let Some(named) = columns.named_type_oid(type_name)
+                && let Some(base_type) = columns.domain_base_type(named) =>
+        {
+            scalar(base_type).then_some(named)
+        }
+        _ => infer_type_res(base, columns)
+            .ok()
+            .map(|(type_oid, _)| type_oid)
+            .filter(|type_oid| ColType::from_oid(*type_oid).is_some_and(scalar)),
+    };
+    let scalar_name =
+        type_oid.and_then(|type_oid| columns.type_name_fixed(type_oid).ok().flatten());
+    match scalar_name {
+        Some(name) => sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "type {} is not composite",
+            name.as_str()
+        ),
+        None => sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "row expansion is not supported on this expression"
+        ),
+    }
 }
 
 /// PostgreSQL's 42809 for column notation on a non-composite value.
@@ -4166,6 +4312,10 @@ impl<'a> ColumnLookup<'a> for DefCols<'_> {
 
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         ColTypeResolver::is_whole_row(self, table).then_some(ColType::Record)
+    }
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        ColTypeResolver::is_whole_row(self, table)
+            .then(|| (self.0.schema.as_str(), self.0.name.as_str()))
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
@@ -4297,6 +4447,14 @@ impl<'a> ColumnLookup<'a> for AliasedDefCols<'_, '_> {
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
         ColTypeResolver::is_whole_row(self, table).then_some(ColType::Record)
     }
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        ColTypeResolver::is_whole_row(self, table).then(|| {
+            (
+                self.definition.schema.as_str(),
+                self.definition.name.as_str(),
+            )
+        })
+    }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         self.resolve(qualifier, name)?;
@@ -4382,6 +4540,85 @@ fn comparable(a: ColType, b: ColType) -> bool {
         || (timeofday(a) && timeofday(b))
         || (bit(a) && bit(b))
         || (stringy(a) && stringy(b))
+}
+
+/// An untyped literal compared with a type that has no comparison operators
+/// (`json`, `refcursor`, `cstring`) finds no operator to adopt a type from:
+/// PostgreSQL reports `json = unknown`.
+/// Resolves a quantified comparison's operator (`x op ANY/ALL (array)`, or
+/// against a subquery's column) from the declared types, as PostgreSQL does
+/// before reading any element.
+fn validate_quantified_comparison(
+    operator: crate::sql::ast::BinaryOp,
+    operand: &Expr<'_>,
+    left_oid: i32,
+    element_oid: i32,
+    columns: &dyn ColTypeResolver,
+) -> Result<(), SqlError> {
+    // A visible user-defined operator answers for its own operand types.
+    if let Some(name) = operator.operator_name()
+        && columns
+            .operator_result(name, left_oid, element_oid)
+            .is_some()
+    {
+        return Ok(());
+    }
+    let left = coltype_of_oid(left_oid);
+    let right = (element_oid != oid::UNKNOWN)
+        .then(|| coltype_of_oid(element_oid))
+        .flatten();
+    if element_oid != oid::UNKNOWN
+        && let Some(error) = untyped_comparison_undefined(
+            left_oid,
+            operator.operator_name().unwrap_or("?"),
+            element_oid,
+        )
+    {
+        return Err(error);
+    }
+    validate_declared_enum_comparison(
+        operator,
+        infer_routine_argument_oid(operand, columns)?,
+        element_oid,
+        columns,
+    )?;
+    if let (Some(left), Some(right)) = (left, right) {
+        use crate::sql::ast::BinaryOp::{Eq, Gt, GtEq, Lt, LtEq, NotEq};
+        let invalid = match operator {
+            Eq | NotEq => !comparable(left, right),
+            Lt | LtEq | Gt | GtEq => {
+                !comparable(left, right)
+                    || !left.has_builtin_ordering()
+                    || !right.has_builtin_ordering()
+            }
+            _ => false,
+        };
+        if invalid {
+            return Err(operator_undefined(
+                left,
+                operator.operator_name().unwrap_or("?"),
+                right,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn untyped_comparison_undefined(left: i32, operator: &str, right: i32) -> Option<SqlError> {
+    let typed = match (left, right) {
+        (oid::UNKNOWN, oid::UNKNOWN) => return None,
+        (oid::UNKNOWN, typed) | (typed, oid::UNKNOWN) => coltype_of_oid(typed)?,
+        _ => return None,
+    };
+    if matches!(typed, ColType::Array(_)) || typed.has_builtin_equality() {
+        return None;
+    }
+    let unknown = ColType::Pseudo(crate::sql::types::PseudoType::Unknown);
+    Some(if left == oid::UNKNOWN {
+        operator_undefined(unknown, operator, typed)
+    } else {
+        operator_undefined(typed, operator, unknown)
+    })
 }
 
 /// [`builtin_binary_type`], naming the operand types in a missing-operator
@@ -4605,6 +4842,52 @@ pub(crate) fn infer_routine_argument_oid(
     }
 }
 
+/// The result contract of a call to a user-defined function or aggregate.
+/// A stored query binds the call to its OID; otherwise the call's name and
+/// argument types select it.
+pub(crate) fn user_routine_call_result(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    name: &str,
+    bound_oid: Option<i32>,
+    argument_names: &[Option<&str>],
+    arguments: &[i32],
+    variadic: bool,
+) -> Option<crate::storage::RoutineResult> {
+    let routine = if let Some(oid) = bound_oid {
+        storage.function_for_captured_call(oid, argument_names, arguments, variadic, txid)
+    } else if argument_names.is_empty() {
+        storage.function_for_call_syntax_oids(name, arguments, variadic, txid)
+    } else {
+        storage.function_for_named_call_oids(name, argument_names, arguments, variadic, txid)
+    };
+    routine
+        .and_then(|routine| routine.function_result_contract())
+        .or_else(|| {
+            // A stored query binds an aggregate call to its OID.
+            if let Some(oid) = bound_oid {
+                // Its declared result is exact unless polymorphic.
+                let slot = storage.routine_slot_by_oid(oid, txid)?;
+                let crate::storage::RoutineKind::Aggregate(declared) =
+                    storage.routine_for(slot, txid).kind
+                else {
+                    return None;
+                };
+                if declared.result_type.polymorphic_type().is_none() {
+                    return Some(declared.result_type);
+                }
+                let routine = storage.routine_for_bound_call(slot, arguments, txid)?;
+                let crate::storage::RoutineKind::Aggregate(aggregate) = routine.kind else {
+                    return None;
+                };
+                return Some(aggregate.result_type);
+            }
+            storage
+                .aggregate_for_call_oids(name, arguments, txid)
+                .map(|(_, _, aggregate)| aggregate.result_type)
+        })
+}
+
 pub(crate) fn routine_result_metadata(
     expression: &Expr,
     columns: &dyn ColTypeResolver,
@@ -4714,6 +4997,11 @@ pub(crate) fn builtin_binary_type(
     let is_bit = |o: i32| matches!(o, oid::BIT | oid::VARBIT);
     Ok(match operator {
         Eq | NotEq | Lt | LtEq | Gt | GtEq => {
+            if let Some(error) =
+                untyped_comparison_undefined(lo, operator.operator_name().unwrap_or("?"), ro)
+            {
+                return Err(error);
+            }
             // Unknown coerces; two concrete types must be comparable.
             if lo != oid::UNKNOWN
                 && ro != oid::UNKNOWN
@@ -4746,7 +5034,8 @@ pub(crate) fn builtin_binary_type(
             }
             of(ColType::Bool)
         }
-        And | Or | Like | ILike => of(ColType::Bool),
+        And | Or | Like | ILike | RegexMatch | RegexIMatch | NotLike | NotILike | RegexNotMatch
+        | RegexNotIMatch => of(ColType::Bool),
         TextSearchMatch => of(ColType::Bool),
         TextSearchPhrase => of(ColType::TsQuery),
         Overlaps if lo == oid::TSQUERY || ro == oid::TSQUERY => of(ColType::TsQuery),
@@ -4888,6 +5177,40 @@ pub(crate) fn builtin_binary_type(
             }
         }
         Add | Sub | Mul | Div | Mod => {
+            // An untyped operand takes the other operand's type, except that
+            // `+` beside a timestamp or time can only add an interval.
+            let resolve = |unknown: i32, known: i32| {
+                if unknown != oid::UNKNOWN || known == oid::UNKNOWN {
+                    unknown
+                } else if *operator == Add
+                    && matches!(known, oid::TIMESTAMP | oid::TIMESTAMPTZ | oid::TIME)
+                {
+                    oid::INTERVAL
+                } else {
+                    known
+                }
+            };
+            if *operator == Add {
+                for (left, unknown, known) in [(true, lo, ro), (false, ro, lo)] {
+                    let name = match known {
+                        oid::DATE => "date",
+                        oid::TIMETZ => "time with time zone",
+                        _ => continue,
+                    };
+                    if unknown == oid::UNKNOWN {
+                        return Err(sql_err!(
+                            sqlstate::AMBIGUOUS_FUNCTION,
+                            "operator is not unique: {}",
+                            if left {
+                                crate::stack_format!(64, "unknown + {}", name)
+                            } else {
+                                crate::stack_format!(64, "{} + unknown", name)
+                            }
+                        ));
+                    }
+                }
+            }
+            let (lo, ro) = (resolve(lo, ro), resolve(ro, lo));
             if matches!(operator, Add | Sub) && lo == oid::ACLITEM_ARRAY && ro == oid::ACLITEM {
                 return Ok((oid::ACLITEM_ARRAY, -1));
             }
@@ -5133,6 +5456,9 @@ fn infer_type_unpositioned(
     expression: &Expr,
     columns: &dyn ColTypeResolver,
 ) -> Result<(i32, i16), SqlError> {
+    if let Expr::OuterAggregate { call, .. } = expression {
+        return infer_type_unpositioned(call, columns);
+    }
     let of = |t: ColType| (t.oid(), t.typlen());
     let selected = selected_call(expression, columns)?;
     if let Expr::Call {
@@ -5240,6 +5566,7 @@ fn infer_type_unpositioned(
         ),
         Expr::RecursiveState { ctype, .. } => of(*ctype),
         Expr::Null | Expr::Str(_) => (oid::UNKNOWN, -2),
+        Expr::OuterAggregate { .. } => unreachable!("outer aggregates take their call's type"),
         Expr::Param(index) => bound_parameter_type_oid(*index)
             .map(|oid| (oid, coltype_of_oid(oid).map_or(-1, ColType::typlen)))
             .or_else(|| routine_parameter_type(*index))
@@ -5267,6 +5594,13 @@ fn infer_type_unpositioned(
             {
                 match source {
                     crate::sql::ast::ParameterSource::SqlRoutine => routine_parameter_type(*index),
+                    // A field the parameter's type lacks leaves the column
+                    // reference unresolved, as in PostgreSQL.
+                    crate::sql::ast::ParameterSource::SqlRoutineField => {
+                        let meta = record_field_metadata(&Expr::Param(*index), name, columns)
+                            .map_err(|_| error)?;
+                        Some((meta.type_oid, meta.ctype.typlen()))
+                    }
                     crate::sql::ast::ParameterSource::PlpgsqlCursor(_) => {
                         bound_parameter_type_oid(*index)
                             .map(|oid| (oid, coltype_of_oid(oid).map_or(-1, ColType::typlen)))
@@ -5278,7 +5612,10 @@ fn infer_type_unpositioned(
         },
         // A whole-row reference is an anonymous record — unless it is a function
         // scan's whole row, which is its single scalar column.
-        Expr::WholeRow(t) => match columns.whole_row_scalar_type(t) {
+        Expr::WholeRow(t) => match columns
+            .whole_row_scalar_type(t)
+            .or_else(|| columns.whole_row_composite_type(t))
+        {
             Some(ty) => of(ty),
             None => (oid::RECORD, -1),
         },
@@ -5325,7 +5662,10 @@ fn infer_type_unpositioned(
             // which is its single scalar column.
             Err(e) if qualifier.is_none() && columns.is_whole_row(name) => {
                 let _ = e;
-                match columns.whole_row_scalar_type(name) {
+                match columns
+                    .whole_row_scalar_type(name)
+                    .or_else(|| columns.whole_row_composite_type(name))
+                {
                     Some(t) => of(t),
                     None => (oid::RECORD, -1),
                 }
@@ -5338,6 +5678,11 @@ fn infer_type_unpositioned(
             crate::sql::ast::UnaryOp::Not => of(ColType::Bool),
             crate::sql::ast::UnaryOp::Neg => {
                 let inferred = infer_type_res(operand, columns)?;
+                // A domain operand uses its base type's operator.
+                let inferred = match columns.domain_base_type(inferred.0) {
+                    Some(base) => (base.oid(), base.typlen()),
+                    None => inferred,
+                };
                 let ctype = coltype_of_oid(inferred.0).unwrap_or(ColType::Text);
                 if !matches!(
                     ctype,
@@ -5385,6 +5730,23 @@ fn infer_type_unpositioned(
             use crate::sql::ast::BinaryOp::*;
             let lo = infer_type_res(left, columns)?.0;
             let ro = infer_type_res(right, columns)?.0;
+            // PostgreSQL compares two row constructors field by field, each
+            // pair through its own operator.
+            if matches!(operator, Eq | NotEq | Lt | LtEq | Gt | GtEq)
+                && let (Some(left_fields), Some(right_fields)) = (
+                    crate::sql::eval::row_constructor_fields(left),
+                    crate::sql::eval::row_constructor_fields(right),
+                )
+                && left_fields.len() == right_fields.len()
+            {
+                for (left, right) in left_fields.iter().zip(right_fields.iter()) {
+                    builtin_binary_type(
+                        operator,
+                        infer_type_res(left, columns)?.0,
+                        infer_type_res(right, columns)?.0,
+                    )?;
+                }
+            }
             if let Some(result) = operator.operator_name().and_then(|name| {
                 crate::sql::eval::funcs::geometry::operator_result(name, &[lo, ro])
             }) {
@@ -5409,6 +5771,14 @@ fn infer_type_unpositioned(
             builtin_binary_type_named(operator, lo, ro, columns)?
         }
         Expr::Collate { operand, .. } => infer_type_res(operand, columns)?,
+        // A cast to `"any"` converts nothing: the value keeps its type.
+        Expr::Cast {
+            operand, type_name, ..
+        } if ColType::from_sql_name(type_name)
+            == Some(ColType::Pseudo(crate::sql::types::PseudoType::Any)) =>
+        {
+            infer_type_res(operand, columns)?
+        }
         Expr::Cast {
             operand, type_name, ..
         } => {
@@ -5489,7 +5859,8 @@ fn infer_type_unpositioned(
         }
         Expr::IsNull { .. } => of(ColType::Bool),
         Expr::InList { operand, list, .. } => {
-            let left = coltype_of_oid(infer_type_res(operand, columns)?.0);
+            let left_oid = infer_type_res(operand, columns)?.0;
+            let left = coltype_of_oid(left_oid);
             for item in *list {
                 validate_declared_enum_comparison(
                     crate::sql::ast::BinaryOp::Eq,
@@ -5497,7 +5868,18 @@ fn infer_type_unpositioned(
                     infer_routine_argument_oid(item, columns)?,
                     columns,
                 )?;
-                let right = coltype_of_oid(infer_type_res(item, columns)?.0);
+                let right_oid = infer_type_res(item, columns)?.0;
+                // One item is a plain `=`; a longer list first takes one
+                // common type, which an untyped item adopts.
+                let right_oid = if list.len() > 1 && right_oid == oid::UNKNOWN {
+                    left_oid
+                } else {
+                    right_oid
+                };
+                if let Some(error) = untyped_comparison_undefined(left_oid, "=", right_oid) {
+                    return Err(error);
+                }
+                let right = coltype_of_oid(right_oid);
                 if let (Some(left), Some(right)) = (left, right)
                     && !comparable(left, right)
                 {
@@ -5514,7 +5896,8 @@ fn infer_type_unpositioned(
             ..
         } => {
             if let Some(operand) = operand {
-                let left = coltype_of_oid(infer_type_res(operand, columns)?.0);
+                let left_oid = infer_type_res(operand, columns)?.0;
+                let left = coltype_of_oid(left_oid);
                 for (when, _) in *whens {
                     validate_declared_enum_comparison(
                         crate::sql::ast::BinaryOp::Eq,
@@ -5525,7 +5908,11 @@ fn infer_type_unpositioned(
                     .map_err(|error| {
                         crate::sql::error_position::operator_at_case_when(error, when)
                     })?;
-                    let right = coltype_of_oid(infer_type_res(when, columns)?.0);
+                    let right_oid = infer_type_res(when, columns)?.0;
+                    if let Some(error) = untyped_comparison_undefined(left_oid, "=", right_oid) {
+                        return Err(error);
+                    }
+                    let right = coltype_of_oid(right_oid);
                     if let (Some(left), Some(right)) = (left, right)
                         && !comparable(left, right)
                     {
@@ -5645,8 +6032,26 @@ fn infer_type_unpositioned(
                     (metadata.type_oid, metadata.ctype.typlen())
                 })
         }
-        // `x IN (subquery)` and EXISTS are predicates: their result is boolean.
-        Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } | Expr::Exists(_) => {
+        Expr::Exists(_) => of(ColType::Bool),
+        // `x IN (subquery)` and `x op ANY (subquery)` resolve their operator
+        // from the subquery's declared column type before reading any row. A
+        // row operand compares field by field when the subquery runs.
+        Expr::InSubquery {
+            operand, select, ..
+        }
+        | Expr::QuantifiedSubquery {
+            operand, select, ..
+        } => {
+            let operator = match expression {
+                Expr::QuantifiedSubquery { operator, .. } => *operator,
+                _ => crate::sql::ast::BinaryOp::Eq,
+            };
+            if crate::sql::eval::row_constructor_fields(operand).is_none()
+                && let Some((column_oid, _)) = columns.subquery_type(&Expr::Subquery(select))?
+            {
+                let left_oid = infer_type_res(operand, columns)?.0;
+                validate_quantified_comparison(operator, operand, left_oid, column_oid, columns)?;
+            }
             of(ColType::Bool)
         }
         Expr::AnyAll {
@@ -5655,45 +6060,14 @@ fn infer_type_unpositioned(
             array,
             ..
         } => {
-            let left = coltype_of_oid(infer_type_res(operand, columns)?.0);
-            let right = coltype_of_oid(infer_type_res(array, columns)?.0).and_then(|ctype| {
-                if let ColType::Array(element) = ctype {
-                    Some(element.to_coltype())
-                } else {
-                    None
-                }
-            });
+            let left_oid = infer_type_res(operand, columns)?.0;
             let element_oid = coltype_of_oid(infer_type_res(array, columns)?.0)
                 .and_then(|ctype| match ctype {
                     ColType::Array(element) => Some(element.element_oid()),
                     _ => None,
                 })
                 .unwrap_or(oid::UNKNOWN);
-            validate_declared_enum_comparison(
-                *operator,
-                infer_routine_argument_oid(operand, columns)?,
-                element_oid,
-                columns,
-            )?;
-            if let (Some(left), Some(right)) = (left, right) {
-                use crate::sql::ast::BinaryOp::{Eq, Gt, GtEq, Lt, LtEq, NotEq};
-                let invalid = match operator {
-                    Eq | NotEq => !comparable(left, right),
-                    Lt | LtEq | Gt | GtEq => {
-                        !comparable(left, right)
-                            || !left.has_builtin_ordering()
-                            || !right.has_builtin_ordering()
-                    }
-                    _ => false,
-                };
-                if invalid {
-                    return Err(operator_undefined(
-                        left,
-                        operator.operator_name().unwrap_or("?"),
-                        right,
-                    ));
-                }
-            }
+            validate_quantified_comparison(*operator, operand, left_oid, element_oid, columns)?;
             of(ColType::Bool)
         }
         Expr::Array(items) => of(ColType::Array(
@@ -5871,7 +6245,9 @@ fn infer_type_unpositioned(
             "pg_backend_pid" => of(ColType::Int4),
             "brin_summarize_new_values" | "brin_summarize_range" => of(ColType::Int4),
             "brin_desummarize_range" => of(ColType::Void),
-            "pg_cancel_backend" | "pg_terminate_backend" => of(ColType::Bool),
+            "pg_cancel_backend" | "pg_terminate_backend" | "pg_log_backend_memory_contexts" => {
+                of(ColType::Bool)
+            }
             "pg_listening_channels" => of(ColType::Text),
             "pg_notification_queue_usage" => of(ColType::Float8),
             "pg_blocking_pids" => of(ColType::Array(crate::sql::types::ArrElem::Int4)),
@@ -6153,11 +6529,7 @@ fn infer_type_unpositioned(
                 .map(|a| infer_type_res(a, columns))
                 .transpose()?
                 .unwrap_or((oid::TEXT, -1)),
-            "pg_partition_ancestors" | "pg_partition_root" | "pg_partition_tree" => args
-                .first()
-                .map(|a| infer_type_res(a, columns))
-                .transpose()?
-                .unwrap_or((oid::INT4, 4)),
+            "pg_partition_ancestors" | "pg_partition_root" => of(ColType::Regclass),
             // Window-only functions.
             "row_number" | "rank" | "dense_rank" | "ntile" => of(ColType::Int8),
             "percent_rank" | "cume_dist" => of(ColType::Float8),

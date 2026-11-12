@@ -126,9 +126,6 @@ pub(crate) struct OutputSink<'b> {
     failed: bool,
     /// Overflow length that triggers the next write attempt.
     next_write_at: usize,
-    promotion: Promotion,
-    /// Why the current statement's overflow queued instead of streaming.
-    spooled: Option<SpoolReason>,
     /// A result stream keeps at most one row beyond `send` and parks; that
     /// row may use the private reserve instead of the shared spool.
     rows_use_reserve: bool,
@@ -138,14 +135,16 @@ pub(crate) struct OutputSink<'b> {
     publication_epoch: Option<u64>,
 }
 
-/// Why a result that outgrew the send buffer queued in the result spool
-/// instead of resuming as a result stream. The engine decides before the
-/// statement runs, except for effects, which only execution reveals.
+/// Why a result that outgrew the send buffer queued in the result spool, or
+/// a paged portal buffered its result, instead of resuming as a result
+/// stream. The engine decides before the statement runs, except for effects,
+/// which only execution reveals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SpoolReason {
     /// The query shape cannot resume from a retained read position.
     Shape,
-    /// Its retained read position would exceed `result_stream_bytes`.
+    /// Its retained read position would exceed `result_stream_bytes`, or
+    /// suspended portals hold every one of the connection's streams.
     Capacity,
     /// The statement started an effect before its output overflowed.
     Effects,
@@ -155,15 +154,29 @@ pub(crate) enum SpoolReason {
 enum Promotion {
     /// This output never resumes as a stream.
     Disabled,
+    /// The protocol allows a stream, but the connection's stream allocation
+    /// is held by a suspended portal; overflow queues for `Capacity`.
+    Unavailable,
     /// The protocol allows a stream; the current statement did not arm one.
     Allowed,
-    /// The first overflow of a restartable statement requests a stream.
+    /// The first overflow (or, for a paged portal, the first row) of a
+    /// restartable statement requests a stream.
     Armed { mark: OutputMark, epoch: u64 },
     /// The statement's overflow queues; `spooled` records why.
     Declined(SpoolReason),
     /// The statement stopped at its first overflow and must reopen as a
     /// stream; output after `mark` belongs to the discarded attempt.
     Requested { mark: OutputMark },
+}
+
+/// What makes an armed statement request a stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromotionTrigger {
+    /// Its output first outgrows the send buffer.
+    Overflow,
+    /// It emits its first row into a paged portal's buffer: a paged portal
+    /// evaluates each row when an Execute asks for it.
+    FirstRow,
 }
 
 impl<'b> OutputSink<'b> {
@@ -178,8 +191,6 @@ impl<'b> OutputSink<'b> {
             writer,
             failed: false,
             next_write_at: 0,
-            promotion: Promotion::Disabled,
-            spooled: None,
             rows_use_reserve: false,
             publication_epoch: None,
         }
@@ -190,12 +201,6 @@ impl<'b> OutputSink<'b> {
     pub(crate) fn guard_publication(mut self, publication_required: bool) -> Self {
         self.publication_epoch =
             publication_required.then(crate::sql::query::statement_effect_epoch);
-        self
-    }
-
-    /// Lets a top-level `SELECT` in this output resume as a result stream.
-    pub(crate) fn allow_promotion(mut self) -> Self {
-        self.promotion = Promotion::Allowed;
         self
     }
 
@@ -312,6 +317,82 @@ pub struct Responder<'b> {
     discard_serialize: ExplainSerialize,
     serialized_bytes: u64,
     serialization_micros: u64,
+    promotion: Promotion,
+    promotion_trigger: PromotionTrigger,
+    /// Why the current statement's output queued instead of streaming.
+    spooled: Option<SpoolReason>,
+    /// The first statement re-runs after its result stream could not build
+    /// its sort or hash table: its output queues for `Capacity`.
+    respool: bool,
+    /// The setting that bounds `buffer` when there is no output sink.
+    buffer_setting: &'static str,
+    /// Set while a `DROP` runs its executors after its dependency report:
+    /// their own cascade notices are checked against it instead of sent.
+    dependency_report: Option<DependencyReport>,
+}
+
+/// See [`Responder::attempt_mark`].
+#[derive(Clone, Copy)]
+pub(crate) struct AttemptMark {
+    output: OutputMark,
+    eval_messages: usize,
+}
+
+impl AttemptMark {
+    /// The same attempt restarted from an earlier output position, such as
+    /// the start of a write's unfinished row.
+    pub(crate) fn restarted_at(self, output: OutputMark) -> Self {
+        Self { output, ..self }
+    }
+
+    pub(crate) fn output(self) -> OutputMark {
+        self.output
+    }
+}
+
+/// One `DROP`'s dependency report while its executors run. The `CASCADE`
+/// notice waits until the executors hold their locks, so a statement that
+/// waits and restarts never sends it twice.
+pub(crate) struct DependencyReport {
+    pub(crate) filter: DependencyReportFilter,
+    /// `drop cascades to ...` lines and their count, not yet sent.
+    pub(crate) notice: Option<(
+        crate::util::StackStr<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>,
+        usize,
+    )>,
+}
+
+/// The objects one `DROP`'s dependency report reached, as a fixed bit set of
+/// their descriptions. A lookup can report a false match but never misses an
+/// inserted description.
+#[derive(Clone, Copy)]
+pub(crate) struct DependencyReportFilter {
+    bits: [u64; 64],
+}
+
+impl DependencyReportFilter {
+    pub(crate) const EMPTY: Self = Self { bits: [0; 64] };
+
+    fn positions(description: &str) -> [usize; 2] {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in description.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        [(hash & 0xfff) as usize, ((hash >> 32) & 0xfff) as usize]
+    }
+
+    pub(crate) fn insert(&mut self, description: &str) {
+        for position in Self::positions(description) {
+            self.bits[position / 64] |= 1 << (position % 64);
+        }
+    }
+
+    pub(crate) fn contains(&self, description: &str) -> bool {
+        Self::positions(description)
+            .into_iter()
+            .all(|position| self.bits[position / 64] & (1 << (position % 64)) != 0)
+    }
 }
 
 pub(crate) struct ResultFormatScope<'scope, 'buffer> {
@@ -755,6 +836,12 @@ impl<'b> Responder<'b> {
             discard_serialize: ExplainSerialize::None,
             serialized_bytes: 0,
             serialization_micros: 0,
+            promotion: Promotion::Disabled,
+            promotion_trigger: PromotionTrigger::Overflow,
+            spooled: None,
+            respool: false,
+            buffer_setting: "conn_send_buffer_bytes",
+            dependency_report: None,
         }
     }
 
@@ -776,6 +863,12 @@ impl<'b> Responder<'b> {
             discard_serialize: ExplainSerialize::None,
             serialized_bytes: 0,
             serialization_micros: 0,
+            promotion: Promotion::Disabled,
+            promotion_trigger: PromotionTrigger::Overflow,
+            spooled: None,
+            respool: false,
+            buffer_setting: "conn_send_buffer_bytes",
+            dependency_report: None,
         }
     }
 
@@ -798,11 +891,17 @@ impl<'b> Responder<'b> {
             discard_serialize: ExplainSerialize::None,
             serialized_bytes: 0,
             serialization_micros: 0,
+            promotion: Promotion::Disabled,
+            promotion_trigger: PromotionTrigger::Overflow,
+            spooled: None,
+            respool: false,
+            buffer_setting: "conn_send_buffer_bytes",
+            dependency_report: None,
         }
     }
 
     /// Rows only: the cursor already holds this result's description.
-    pub(crate) fn without_row_description(mut self) -> Self {
+    pub(crate) fn rows_only(mut self) -> Self {
         self.suppress_row_description = true;
         self
     }
@@ -827,6 +926,12 @@ impl<'b> Responder<'b> {
             discard_serialize: ExplainSerialize::None,
             serialized_bytes: 0,
             serialization_micros: 0,
+            promotion: Promotion::Disabled,
+            promotion_trigger: PromotionTrigger::Overflow,
+            spooled: None,
+            respool: false,
+            buffer_setting: "conn_send_buffer_bytes",
+            dependency_report: None,
         }
     }
 
@@ -835,6 +940,61 @@ impl<'b> Responder<'b> {
     pub(crate) fn with_output(mut self, sink: OutputSink<'b>) -> Self {
         self.output = Some(sink);
         self
+    }
+
+    /// Lets a top-level `SELECT` in this output resume as a result stream
+    /// when its output first outgrows the send buffer. With `available`
+    /// false the connection's stream allocation is held by a suspended
+    /// portal, and overflow queues for that reason.
+    pub(crate) fn allow_promotion(mut self, available: bool) -> Self {
+        self.promotion = if available {
+            Promotion::Allowed
+        } else {
+            Promotion::Unavailable
+        };
+        self.promotion_trigger = PromotionTrigger::Overflow;
+        self
+    }
+
+    /// Output of a paged portal into its `portal_result_bytes` buffer. A
+    /// restartable `SELECT` stops at its first row and reopens as a result
+    /// stream that evaluates rows as each Execute asks for them.
+    pub(crate) fn for_portal_page(mut self, stream_available: bool) -> Self {
+        self = self.allow_promotion(stream_available);
+        self.promotion_trigger = PromotionTrigger::FirstRow;
+        self.buffer_setting = "portal_result_bytes";
+        self
+    }
+
+    /// Re-runs a statement whose result stream outgrew its capacity before
+    /// sending anything: that statement's output queues in the result spool.
+    pub(crate) fn respool(mut self, respool: bool) -> Self {
+        self.respool = respool;
+        self
+    }
+
+    /// Whether the statement about to run is a re-run that must spool;
+    /// consumed by that statement.
+    pub(crate) fn take_respool(&mut self) -> bool {
+        core::mem::take(&mut self.respool)
+    }
+
+    /// Runs `operation` with its output captured in `header` instead of
+    /// queued, with this responder's formats, rendering and description
+    /// suppression. A result stream keeps its opening messages there until
+    /// its first row is ready. Without room, a message fails with `WireFull`.
+    pub(crate) fn capture<T>(
+        &mut self,
+        header: &mut FixedBuf,
+        operation: impl FnOnce(&mut Responder<'_>) -> T,
+    ) -> T {
+        let mut capture = Responder::for_execute(header, self.formats);
+        capture.suppress_row_description = self.suppress_row_description;
+        capture.render = self.render;
+        let result = operation(&mut capture);
+        self.result_type_oids = capture.result_type_oids;
+        self.result_columns = capture.result_columns;
+        result
     }
 
     /// Whether the client transport failed during this statement.
@@ -861,6 +1021,23 @@ impl<'b> Responder<'b> {
             ),
             None => mark.excess(self.buffer.len(), 0),
         }
+    }
+
+    /// The start of one evaluation attempt that a pending routine call may
+    /// restart, covering builtin notices not yet sent as well as output.
+    pub(crate) fn attempt_mark(&self) -> AttemptMark {
+        AttemptMark {
+            output: self.mark(),
+            eval_messages: crate::sql::eval::eval_message_mark(),
+        }
+    }
+
+    /// Discards an attempt's unsent output and notices; the next attempt
+    /// evaluates and raises them again.
+    pub(crate) fn restart_attempt(&mut self, mark: AttemptMark) -> Result<(), SqlError> {
+        self.truncate_to(mark.output)?;
+        crate::sql::eval::truncate_eval_messages(mark.eval_messages);
+        Ok(())
     }
 
     /// Discards unsent output after `mark` so a statement attempt can run
@@ -927,35 +1104,79 @@ impl<'b> Responder<'b> {
         class: OutputClass,
         build: impl Fn(&mut FixedBuf) -> Result<(), WireFull>,
     ) -> Result<(), WireFull> {
-        let Some(sink) = self.output.as_mut() else {
-            return Self::append_message(self.buffer, &build);
-        };
-        if matches!(sink.promotion, Promotion::Requested { .. }) {
+        self.send_eval_messages()?;
+        self.emit_now(class, build)
+    }
+
+    /// Sends the notices and warnings builtin evaluation queued, ahead of the
+    /// message that follows them. Cursor capture leaves them for the client
+    /// responder.
+    fn send_eval_messages(&mut self) -> Result<(), WireFull> {
+        if !matches!(self.cursor_rows, CursorRowOutput::Wire) {
+            return Ok(());
+        }
+        while let Some(pending) = crate::sql::eval::peek_eval_message() {
+            let (level, severity) = match pending.level {
+                crate::sql::eval::EvalMessageLevel::Notice => {
+                    (crate::sql::guc::MessageLevel::Notice, "NOTICE")
+                }
+                crate::sql::eval::EvalMessageLevel::Warning => {
+                    (crate::sql::guc::MessageLevel::Warning, "WARNING")
+                }
+            };
+            if self.render_context().min_message_level.allows(level) {
+                let sqlstate = pending.sqlstate;
+                let message = pending.message;
+                let diagnostic = pending.detail.map(|detail| crate::sql::eval::Diagnostic {
+                    detail: Some(crate::util::StackStr::from_str(detail)),
+                    hint: None,
+                    objects: crate::sql::eval::ErrorObjects::default(),
+                });
+                self.emit_now(OutputClass::Control, |buffer| {
+                    Self::build_notice_response(
+                        buffer,
+                        severity,
+                        sqlstate.as_str(),
+                        message.as_str(),
+                        diagnostic.as_ref(),
+                        None,
+                    )
+                })?;
+            }
+            crate::sql::eval::pop_eval_message();
+        }
+        Ok(())
+    }
+
+    fn emit_now(
+        &mut self,
+        class: OutputClass,
+        build: impl Fn(&mut FixedBuf) -> Result<(), WireFull>,
+    ) -> Result<(), WireFull> {
+        if matches!(self.promotion, Promotion::Requested { .. }) {
             // The attempt is being discarded; nothing more of it may queue.
             return Err(WireFull);
         }
+        if class == OutputClass::Bulk && self.promotion_trigger == PromotionTrigger::FirstRow {
+            self.request_promotion();
+            if matches!(self.promotion, Promotion::Requested { .. }) {
+                return Err(WireFull);
+            }
+            self.record_spooled();
+        }
+        let Some(sink) = self.output.as_mut() else {
+            return Self::append_message(self.buffer, &build);
+        };
         if sink.overflow.is_empty() && Self::append_message(self.buffer, &build).is_ok() {
             return Ok(());
         }
-        if class == OutputClass::Bulk
-            && let Promotion::Armed { mark, epoch } = sink.promotion
-        {
-            // Before any byte of this statement leaves and before any effect,
-            // the statement can stop and reopen as a resumable stream.
-            let restartable = mark
-                .excess(
-                    self.buffer.len() + sink.overflow.len(),
-                    sink.overflow.written(),
-                )
-                .is_some()
-                && epoch == crate::sql::query::statement_effect_epoch()
-                && crate::sql::sequence::ensure_statement_effects_replayable().is_ok();
-            if restartable {
-                sink.promotion = Promotion::Requested { mark };
+        if class == OutputClass::Bulk {
+            self.request_promotion();
+            if matches!(self.promotion, Promotion::Requested { .. }) {
                 return Err(WireFull);
             }
-            sink.promotion = Promotion::Declined(SpoolReason::Effects);
         }
+        let sink = self.output.as_mut().expect("checked above");
         // Retry a full send buffer at once; with output already queued, retry
         // once half a send buffer more has accumulated.
         if sink.overflow.is_empty() || sink.overflow.len() >= sink.next_write_at {
@@ -964,12 +1185,10 @@ impl<'b> Responder<'b> {
                 return Ok(());
             }
         }
-        if class == OutputClass::Bulk
-            && sink.spooled.is_none()
-            && let Promotion::Declined(reason) = sink.promotion
-        {
-            sink.spooled = Some(reason);
+        if class == OutputClass::Bulk {
+            self.record_spooled();
         }
+        let sink = self.output.as_mut().expect("checked above");
         let class = if sink.rows_use_reserve {
             OutputClass::Control
         } else {
@@ -978,19 +1197,77 @@ impl<'b> Responder<'b> {
         sink.overflow.push(sink.spool.as_ref(), class, &build)
     }
 
+    /// Stops an armed statement for a stream before any byte of it leaves
+    /// and before any effect; otherwise its output queues for its effects.
+    fn request_promotion(&mut self) {
+        let Promotion::Armed { mark, epoch } = self.promotion else {
+            return;
+        };
+        let restartable = self.excess_since(mark).is_some()
+            && epoch == crate::sql::query::statement_effect_epoch()
+            && crate::sql::sequence::ensure_statement_effects_replayable().is_ok();
+        self.promotion = if restartable {
+            Promotion::Requested { mark }
+        } else {
+            Promotion::Declined(SpoolReason::Effects)
+        };
+    }
+
+    fn record_spooled(&mut self) {
+        if self.spooled.is_none() {
+            self.spooled = match self.promotion {
+                Promotion::Declined(reason) => Some(reason),
+                Promotion::Unavailable => Some(SpoolReason::Capacity),
+                _ => None,
+            };
+        }
+    }
+
+    /// Requests a stream before the statement emits anything: a FETCH whose
+    /// rows are evaluated only as its client reads them. A paged portal
+    /// buffers a FETCH's rows instead, as PostgreSQL runs a FETCH portal to
+    /// completion before paging it. Returns whether the stream was requested.
+    pub(crate) fn request_stream(&mut self) -> bool {
+        if self.promotion != Promotion::Allowed {
+            return false;
+        }
+        if self.promotion_trigger == PromotionTrigger::FirstRow {
+            self.promotion = Promotion::Declined(SpoolReason::Shape);
+            return false;
+        }
+        self.promotion = Promotion::Requested { mark: self.mark() };
+        true
+    }
+
+    /// Requests a paged portal's stream before its statement runs. Its
+    /// attempt would stop at its first row anyway, so a sort, grouping or
+    /// hash table is built once, in the stream, and its input reads resume
+    /// instead of restarting the statement. Returns whether it was requested.
+    pub(crate) fn request_page_stream(&mut self) -> bool {
+        if self.promotion != Promotion::Allowed
+            || self.promotion_trigger != PromotionTrigger::FirstRow
+        {
+            return false;
+        }
+        self.promotion = Promotion::Requested { mark: self.mark() };
+        true
+    }
+
+    /// Whether a stream was requested before the statement ran.
+    pub(crate) fn stream_requested(&self) -> bool {
+        matches!(self.promotion, Promotion::Requested { .. })
+    }
+
     /// Whether this output may resume a `SELECT` as a result stream.
     pub(crate) fn promotion_allowed(&self) -> bool {
-        self.output
-            .as_ref()
-            .is_some_and(|sink| sink.promotion == Promotion::Allowed)
+        self.promotion == Promotion::Allowed
     }
 
     /// Starts a statement whose first overflow may request a result stream.
     pub(crate) fn arm_promotion(&mut self) {
-        let mark = self.mark();
-        if let Some(sink) = self.output.as_mut() {
-            sink.promotion = Promotion::Armed {
-                mark,
+        if self.promotion != Promotion::Disabled {
+            self.promotion = Promotion::Armed {
+                mark: self.mark(),
                 epoch: crate::sql::query::statement_effect_epoch(),
             };
         }
@@ -998,27 +1275,23 @@ impl<'b> Responder<'b> {
 
     /// Starts a statement whose overflow queues for `reason`.
     pub(crate) fn decline_promotion(&mut self, reason: SpoolReason) {
-        if let Some(sink) = self.output.as_mut() {
-            sink.promotion = Promotion::Declined(reason);
+        if self.promotion != Promotion::Disabled {
+            self.promotion = Promotion::Declined(reason);
         }
     }
 
     /// Ends a statement's promotion decision: the mark of a requested stream
     /// (output after it belongs to the discarded attempt), and why its
-    /// overflow queued instead.
+    /// output queued instead.
     pub(crate) fn finish_promotion(&mut self) -> (Option<OutputMark>, Option<SpoolReason>) {
-        let Some(sink) = self.output.as_mut() else {
-            return (None, None);
-        };
-        if sink.promotion == Promotion::Disabled {
-            return (None, None);
-        }
-        let requested = match sink.promotion {
+        let requested = match self.promotion {
+            Promotion::Disabled => return (None, None),
+            Promotion::Unavailable => return (None, self.spooled.take()),
             Promotion::Requested { mark } => Some(mark),
             _ => None,
         };
-        sink.promotion = Promotion::Allowed;
-        (requested, sink.spooled.take())
+        self.promotion = Promotion::Allowed;
+        (requested, self.spooled.take())
     }
 
     /// Writes what the client accepts, then reports whether a result stream
@@ -2029,6 +2302,7 @@ impl<'b> Responder<'b> {
     }
 
     pub fn command_complete(&mut self, tag: &str) -> Result<(), WireFull> {
+        self.send_dependency_notice()?;
         if self.discard_query_output || self.suppress_command_complete {
             return Ok(());
         }
@@ -2112,6 +2386,60 @@ impl<'b> Responder<'b> {
         let result = operation(self);
         self.suppress_command_complete = prior;
         result
+    }
+
+    /// Runs `operation` with RowDescription suppressed, as for a COPY whose
+    /// query describes its columns in CopyOutResponse instead.
+    pub(crate) fn without_row_description<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let prior = self.suppress_row_description;
+        self.suppress_row_description = true;
+        let result = operation(self);
+        self.suppress_row_description = prior;
+        result
+    }
+
+    /// Runs a `DROP`'s executors after its dependency report.
+    pub(crate) fn with_dependency_report<T>(
+        &mut self,
+        report: DependencyReport,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let prior = self.dependency_report.replace(report);
+        let result = operation(self);
+        self.dependency_report = prior;
+        result
+    }
+
+    /// The dependency report covering the running `DROP`, if any.
+    pub(crate) fn dependency_report(&self) -> Option<&DependencyReportFilter> {
+        self.dependency_report.as_ref().map(|report| &report.filter)
+    }
+
+    /// Sends the running `DROP`'s `CASCADE` notice once its executors hold
+    /// their locks: at their first own report or at the command tag.
+    pub(crate) fn send_dependency_notice(&mut self) -> Result<(), WireFull> {
+        let Some((detail, count)) = self
+            .dependency_report
+            .as_mut()
+            .and_then(|report| report.notice.take())
+        else {
+            return Ok(());
+        };
+        if count == 1 {
+            self.notice(
+                crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                detail.as_str(),
+            )
+        } else {
+            crate::sql::eval::stash_diagnostic(Some(detail), None);
+            self.notice(
+                crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                crate::stack_format!(128, "drop cascades to {} other objects", count).as_str(),
+            )
+        }
     }
 
     /// Runs an internal statement without exposing its row description, rows,
@@ -2244,6 +2572,19 @@ impl<'b> Responder<'b> {
         cursor: Option<CursorPosition>,
     ) -> Result<(), WireFull> {
         self.control(|buffer| {
+            Self::build_notice_response(buffer, severity, sqlstate, message, diagnostic, cursor)
+        })
+    }
+
+    fn build_notice_response(
+        buffer: &mut FixedBuf,
+        severity: &str,
+        sqlstate: &str,
+        message: &str,
+        diagnostic: Option<&crate::sql::eval::Diagnostic>,
+        cursor: Option<CursorPosition>,
+    ) -> Result<(), WireFull> {
+        {
             let mut m = MsgOut::begin(buffer, wire::MSG_NOTICE_RESPONSE);
             m.u8(b'S');
             m.cstr(severity);
@@ -2279,7 +2620,7 @@ impl<'b> Responder<'b> {
             }
             m.u8(0);
             m.finish()
-        })
+        }
     }
 
     /// ErrorResponse with the fields every client expects: severity (twice,
@@ -2417,7 +2758,14 @@ impl<'b> Responder<'b> {
             .and_then(|sink| sink.overflow.take_exhaustion())
             .unwrap_or(OverflowExhaustion::NoSpool);
         let mut message = crate::util::StackStr::<512>::new();
-        let _ = core::fmt::Write::write_fmt(&mut message, format_args!("{exhaustion}"));
+        let _ = if exhaustion == OverflowExhaustion::NoSpool {
+            core::fmt::Write::write_fmt(
+                &mut message,
+                format_args!("statement response exceeds {}", self.buffer_setting),
+            )
+        } else {
+            core::fmt::Write::write_fmt(&mut message, format_args!("{exhaustion}"))
+        };
         self.error(
             crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
             message.as_str(),
@@ -2548,14 +2896,13 @@ mod tests {
         let mut send = super::FixedBuf::new(&mut budget, "send", 256).unwrap();
         let row = crate::sql::types::Datum::Text("abcdefghijklmnopqrstuvwx");
         crate::mem::guard::forbid_alloc(|| {
-            let mut responder = super::Responder::new(&mut send).with_output(
-                super::OutputSink::new(
+            let mut responder = super::Responder::new(&mut send)
+                .with_output(super::OutputSink::new(
                     &mut overflow,
                     Some(spool.clone()),
                     super::ClientWriter::None,
-                )
-                .allow_promotion(),
-            );
+                ))
+                .allow_promotion(true);
             responder.arm_promotion();
             let mark = responder.mark();
             let full = loop {

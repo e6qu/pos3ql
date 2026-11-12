@@ -32,3 +32,4 @@ SELECT il112_pl(0);
 CREATE FUNCTION il112_inner(x int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 10 / x; END $$;
 CREATE FUNCTION il112_outer(a int) RETURNS int LANGUAGE sql AS 'SELECT il112_inner(a)';
 SELECT il112_outer(0);
+DROP ROUTINE il112_i(integer), il112_v(integer), il112_s(integer), il112_m(integer), il112_w(integer), il112_pl(integer), il112_inner(integer), il112_outer(integer) CASCADE;

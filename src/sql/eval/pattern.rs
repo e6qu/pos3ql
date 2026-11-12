@@ -354,45 +354,15 @@ pub fn regex_split_piece_at_pub<'a>(
     options: crate::sql::regex::RegexOptions,
     wanted: usize,
 ) -> Result<Option<&'a str>, SqlError> {
-    if pattern.is_empty() {
-        return Ok(src
-            .char_indices()
-            .nth(wanted)
-            .map(|(index, character)| &src[index..index + character.len_utf8()]));
-    }
-    let mut piece = 0usize;
-    let mut last = 0usize;
-    let mut pos = 0usize;
-    let mut previous_match_end = None;
-    while pos <= src.len() {
-        let Some((start, end)) = crate::sql::regex::find_with_options(pattern, src, pos, options)?
-        else {
-            break;
-        };
-        if end == start {
-            if start != 0 && start != src.len() && previous_match_end != Some(start) {
-                if piece == wanted {
-                    return Ok(Some(&src[last..start]));
-                }
-                piece += 1;
-                last = start;
-            }
-            previous_match_end = Some(end);
-            let Some(next) = crate::sql::regex::next_match_from(src, start, end) else {
-                break;
-            };
-            pos = next;
-            continue;
+    let mut split = RegexSplit::new(src);
+    let mut index = 0usize;
+    while let Some(piece) = split.next(pattern, options)? {
+        if index == wanted {
+            return Ok(Some(piece));
         }
-        if piece == wanted {
-            return Ok(Some(&src[last..start]));
-        }
-        piece += 1;
-        last = end;
-        previous_match_end = Some(end);
-        pos = end;
+        index += 1;
     }
-    Ok((piece == wanted).then_some(&src[last..]))
+    Ok(None)
 }
 
 pub(crate) fn for_each_regex_split<'a>(
@@ -401,48 +371,120 @@ pub(crate) fn for_each_regex_split<'a>(
     options: crate::sql::regex::RegexOptions,
     mut visit: impl FnMut(&'a str, usize) -> Result<(), SqlError>,
 ) -> Result<usize, SqlError> {
+    let mut split = RegexSplit::new(src);
     let mut n = 0usize;
-    let mut push = |piece: &'a str, n: &mut usize| -> Result<(), SqlError> {
-        visit(piece, *n)?;
-        *n += 1;
-        Ok(())
-    };
-    if pattern.is_empty() {
-        for (i, ch) in src.char_indices() {
-            push(&src[i..i + ch.len_utf8()], &mut n)?;
-        }
-        return Ok(n);
+    while let Some(piece) = split.next(pattern, options)? {
+        visit(piece, n)?;
+        n += 1;
     }
-    let mut last = 0usize;
-    let mut pos = 0usize;
-    let mut previous_match_end = None;
-    while pos <= src.len() {
-        let Some((start, end)) = crate::sql::regex::find_with_options(pattern, src, pos, options)?
-        else {
-            break;
-        };
-        if end == start {
-            // PostgreSQL ignores a zero-width separator at either edge or
-            // immediately after the previous match, but an isolated interior
-            // zero-width match still splits the string.
-            if start != 0 && start != src.len() && previous_match_end != Some(start) {
-                push(&src[last..start], &mut n)?;
-                last = start;
-            }
-            previous_match_end = Some(end);
-            let Some(next) = crate::sql::regex::next_match_from(src, start, end) else {
+    Ok(n)
+}
+
+/// The position of one `regexp_split_to_table` call, advanced one piece at a
+/// time so a retained reader keeps only these offsets.
+#[derive(Clone, Copy)]
+pub(crate) struct RegexSplit<'a> {
+    src: &'a str,
+    /// Start of the piece being built.
+    last: usize,
+    /// Where the next separator search begins.
+    pos: usize,
+    previous_match_end: Option<usize>,
+    done: bool,
+}
+
+impl<'a> RegexSplit<'a> {
+    pub(crate) fn new(src: &'a str) -> Self {
+        Self {
+            src,
+            last: 0,
+            pos: 0,
+            previous_match_end: None,
+            done: false,
+        }
+    }
+
+    pub(crate) fn next(
+        &mut self,
+        pattern: &str,
+        options: crate::sql::regex::RegexOptions,
+    ) -> Result<Option<&'a str>, SqlError> {
+        if self.done {
+            return Ok(None);
+        }
+        let src = self.src;
+        if pattern.is_empty() {
+            // An empty pattern splits into characters.
+            let Some(character) = src[self.pos..].chars().next() else {
+                self.done = true;
+                return Ok(None);
+            };
+            let start = self.pos;
+            self.pos += character.len_utf8();
+            return Ok(Some(&src[start..self.pos]));
+        }
+        while self.pos <= src.len() {
+            let Some((start, end)) =
+                crate::sql::regex::find_with_options(pattern, src, self.pos, options)?
+            else {
                 break;
             };
-            pos = next;
-            continue;
+            if end == start {
+                // PostgreSQL ignores a zero-width separator at either edge or
+                // immediately after the previous match, but an isolated
+                // interior zero-width match still splits the string.
+                let split =
+                    start != 0 && start != src.len() && self.previous_match_end != Some(start);
+                let piece_start = self.last;
+                if split {
+                    self.last = start;
+                }
+                self.previous_match_end = Some(end);
+                match crate::sql::regex::next_match_from(src, start, end) {
+                    Some(next) => self.pos = next,
+                    None => self.pos = src.len() + 1,
+                }
+                if split {
+                    return Ok(Some(&src[piece_start..start]));
+                }
+                continue;
+            }
+            let piece_start = self.last;
+            self.last = end;
+            self.previous_match_end = Some(end);
+            self.pos = end;
+            return Ok(Some(&src[piece_start..start]));
         }
-        push(&src[last..start], &mut n)?;
-        last = end;
-        previous_match_end = Some(end);
-        pos = end;
+        self.done = true;
+        Ok(Some(&src[self.last..]))
     }
-    push(&src[last..], &mut n)?;
-    Ok(n)
+}
+
+/// One `regexp_match`/`regexp_matches` result: the capture groups as
+/// `text[]` (an unmatched group is NULL), or the whole match when the pattern
+/// has no groups.
+pub(crate) fn regexp_match_array<'a>(
+    string: &'a str,
+    whole: (usize, usize),
+    groups: &[(i64, i64)],
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let mut elements = [Datum::Null; crate::sql::regex::MAX_GROUPS];
+    let count = if groups.is_empty() {
+        elements[0] = Datum::Text(&string[whole.0..whole.1]);
+        1
+    } else {
+        for (element, (start, end)) in elements.iter_mut().zip(groups) {
+            if *start >= 0 {
+                *element = Datum::Text(&string[*start as usize..*end as usize]);
+            }
+        }
+        groups.len()
+    };
+    Ok(Datum::Array {
+        element: crate::sql::types::ArrElem::Text,
+        raw: crate::sql::array::build(&elements[..count], arena)?,
+    })
 }
 
 /// Parsed PostgreSQL regex flags: global result selection is kept separate

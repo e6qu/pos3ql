@@ -30,13 +30,18 @@ use super::{
     window_row,
 };
 
+/// The WHERE conjuncts the scan applies, and the correlated subqueries the
+/// rest of WHERE reads per row.
 fn window_scan_where<'a>(
     statement: &'a Select<'a>,
     correlated: &[&'a Expr<'a>],
     arena: &'a Arena,
-) -> Result<Option<&'a Expr<'a>>, SqlError> {
+) -> Result<(Option<&'a Expr<'a>>, &'a [&'a Expr<'a>]), SqlError> {
     let where_correlated = correlated_in_expression(statement.where_clause, correlated, arena)?;
-    correlated_scan_conjuncts(statement.where_clause, where_correlated, arena)
+    Ok((
+        correlated_scan_conjuncts(statement.where_clause, where_correlated, arena)?,
+        where_correlated,
+    ))
 }
 
 fn window_pax_columns<'a>(
@@ -777,7 +782,15 @@ fn compute_window<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<&'a [Datum<'a>], SqlError> {
+    // Outer references, such as PL/pgSQL variables, read the caller's row.
+    let scope_columns = super::ScopeCols(scope);
+    let outer_columns = super::aggregate_outer_columns(Some(scope), outer, storage, txid, arena);
+    let aggregate_columns: &dyn crate::sql::exec::ColTypeResolver = match &outer_columns {
+        Some(columns) => columns,
+        None => &scope_columns,
+    };
     let Expr::Call {
         name,
         args,
@@ -894,9 +907,21 @@ fn compute_window<'a>(
                     Ok::<bool, SqlError>(
                         acc && {
                             let ra = window_row(scope, rows[p[j - 1]], offs);
-                            let va = eval_full(o.expression, arena, params, &ra, hooks)?;
+                            let va = eval_full(
+                                o.expression,
+                                arena,
+                                params,
+                                &super::Chained { inner: &ra, outer },
+                                hooks,
+                            )?;
                             let rb = window_row(scope, rows[p[j]], offs);
-                            let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
+                            let vb = eval_full(
+                                o.expression,
+                                arena,
+                                params,
+                                &super::Chained { inner: &rb, outer },
+                                hooks,
+                            )?;
                             match (va.is_null(), vb.is_null()) {
                                 (true, true) => true,
                                 (true, false) | (false, true) => false,
@@ -945,7 +970,13 @@ fn compute_window<'a>(
             let sign: isize = if *name == "lag" { -1 } else { 1 };
             let offset: isize = if args.len() >= 2 {
                 let r = window_row(scope, rows[p[0]], offs);
-                match eval_full(args[1], arena, params, &r, hooks)? {
+                match eval_full(
+                    args[1],
+                    arena,
+                    params,
+                    &super::Chained { inner: &r, outer },
+                    hooks,
+                )? {
                     Datum::Int4(v) => v as isize,
                     Datum::Int8(v) => v as isize,
                     _ => 1,
@@ -957,10 +988,22 @@ fn compute_window<'a>(
                 let src = j as isize + sign * offset;
                 out[p[j]] = if src >= 0 && (src as usize) < m {
                     let r = window_row(scope, rows[p[src as usize]], offs);
-                    eval_full(args[0], arena, params, &r, hooks)?
+                    eval_full(
+                        args[0],
+                        arena,
+                        params,
+                        &super::Chained { inner: &r, outer },
+                        hooks,
+                    )?
                 } else if args.len() >= 3 {
                     let r = window_row(scope, rows[p[j]], offs);
-                    eval_full(args[2], arena, params, &r, hooks)?
+                    eval_full(
+                        args[2],
+                        arena,
+                        params,
+                        &super::Chained { inner: &r, outer },
+                        hooks,
+                    )?
                 } else {
                     Datum::Null
                 };
@@ -1009,7 +1052,13 @@ fn compute_window<'a>(
                     (Some((fs, fe)), "first_value") => match (fs..=fe).find(|&i| !excluded(i)) {
                         Some(i) => {
                             let r = window_row(scope, rows[p[i]], offs);
-                            eval_full(args[0], arena, params, &r, hooks)?
+                            eval_full(
+                                args[0],
+                                arena,
+                                params,
+                                &super::Chained { inner: &r, outer },
+                                hooks,
+                            )?
                         }
                         None => Datum::Null,
                     },
@@ -1017,14 +1066,26 @@ fn compute_window<'a>(
                         match (fs..=fe).rev().find(|&i| !excluded(i)) {
                             Some(i) => {
                                 let r = window_row(scope, rows[p[i]], offs);
-                                eval_full(args[0], arena, params, &r, hooks)?
+                                eval_full(
+                                    args[0],
+                                    arena,
+                                    params,
+                                    &super::Chained { inner: &r, outer },
+                                    hooks,
+                                )?
                             }
                             None => Datum::Null,
                         }
                     }
                     (Some((fs, fe)), _) => {
                         let r = window_row(scope, rows[p[j]], offs);
-                        let nth = match eval_full(args[1], arena, params, &r, hooks)? {
+                        let nth = match eval_full(
+                            args[1],
+                            arena,
+                            params,
+                            &super::Chained { inner: &r, outer },
+                            hooks,
+                        )? {
                             Datum::Int4(v) => v as i64,
                             Datum::Int8(v) => v,
                             _ => 1,
@@ -1037,7 +1098,13 @@ fn compute_window<'a>(
                         match target {
                             Some(i) => {
                                 let r = window_row(scope, rows[p[i]], offs);
-                                eval_full(args[0], arena, params, &r, hooks)?
+                                eval_full(
+                                    args[0],
+                                    arena,
+                                    params,
+                                    &super::Chained { inner: &r, outer },
+                                    hooks,
+                                )?
                             }
                             None => Datum::Null,
                         }
@@ -1060,9 +1127,21 @@ fn compute_window<'a>(
                         Ok::<bool, SqlError>(
                             acc && {
                                 let ra = window_row(scope, rows[p[e]], offs);
-                                let va = eval_full(o.expression, arena, params, &ra, hooks)?;
+                                let va = eval_full(
+                                    o.expression,
+                                    arena,
+                                    params,
+                                    &super::Chained { inner: &ra, outer },
+                                    hooks,
+                                )?;
                                 let rb = window_row(scope, rows[p[e + 1]], offs);
-                                let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
+                                let vb = eval_full(
+                                    o.expression,
+                                    arena,
+                                    params,
+                                    &super::Chained { inner: &rb, outer },
+                                    hooks,
+                                )?;
                                 match (va.is_null(), vb.is_null()) {
                                     (true, true) => true,
                                     (true, false) | (false, true) => false,
@@ -1090,7 +1169,13 @@ fn compute_window<'a>(
                 "ntile" => {
                     let buckets = {
                         let r = window_row(scope, rows[p[0]], offs);
-                        match eval_full(args[0], arena, params, &r, hooks)? {
+                        match eval_full(
+                            args[0],
+                            arena,
+                            params,
+                            &super::Chained { inner: &r, outer },
+                            hooks,
+                        )? {
                             Datum::Int4(v) => v as i64,
                             Datum::Int8(v) => v,
                             _ => 1,
@@ -1111,7 +1196,13 @@ fn compute_window<'a>(
                 "first_value" => {
                     // Frame start is always the partition start.
                     let r = window_row(scope, rows[p[0]], offs);
-                    let value = eval_full(args[0], arena, params, &r, hooks)?;
+                    let value = eval_full(
+                        args[0],
+                        arena,
+                        params,
+                        &super::Chained { inner: &r, outer },
+                        hooks,
+                    )?;
                     for &row_index in p {
                         out[row_index] = value;
                     }
@@ -1122,7 +1213,13 @@ fn compute_window<'a>(
                     while j < m {
                         let end = peer_end(j)?;
                         let r = window_row(scope, rows[p[end]], offs);
-                        let value = eval_full(args[0], arena, params, &r, hooks)?;
+                        let value = eval_full(
+                            args[0],
+                            arena,
+                            params,
+                            &super::Chained { inner: &r, outer },
+                            hooks,
+                        )?;
                         for &row_index in &p[j..=end] {
                             out[row_index] = value;
                         }
@@ -1134,7 +1231,13 @@ fn compute_window<'a>(
                     // the frame start); NULL until the frame has reached it.
                     let nth = {
                         let r = window_row(scope, rows[p[0]], offs);
-                        match eval_full(args[1], arena, params, &r, hooks)? {
+                        match eval_full(
+                            args[1],
+                            arena,
+                            params,
+                            &super::Chained { inner: &r, outer },
+                            hooks,
+                        )? {
                             Datum::Int4(v) => v as usize,
                             Datum::Int8(v) => v as usize,
                             _ => 1,
@@ -1142,7 +1245,13 @@ fn compute_window<'a>(
                     };
                     let nth_value = if nth >= 1 && nth <= m {
                         let r = window_row(scope, rows[p[nth - 1]], offs);
-                        Some(eval_full(args[0], arena, params, &r, hooks)?)
+                        Some(eval_full(
+                            args[0],
+                            arena,
+                            params,
+                            &super::Chained { inner: &r, outer },
+                            hooks,
+                        )?)
                     } else {
                         None
                     };
@@ -1167,7 +1276,7 @@ fn compute_window<'a>(
             // frame aggregates zero rows — count 0, sum NULL).
             if frame.exclusion == crate::sql::ast::FrameExclusion::NoOthers {
                 let mut moving_state = AggState::default();
-                if moving_state.init_moving(node, storage, txid, &super::ScopeCols(scope), arena)? {
+                if moving_state.init_moving(node, storage, txid, aggregate_columns, arena)? {
                     let mut active: Option<(usize, usize)> = None;
                     for j in 0..m {
                         let range = frame_range(
@@ -1190,7 +1299,7 @@ fn compute_window<'a>(
                                 node,
                                 storage,
                                 txid,
-                                &super::ScopeCols(scope),
+                                aggregate_columns,
                                 arena,
                             )?;
                             debug_assert!(selected);
@@ -1206,9 +1315,13 @@ fn compute_window<'a>(
                                 let remove_end = start.min(old_end.saturating_add(1));
                                 for index in old_start..remove_end {
                                     let row = window_row(scope, rows[p[index]], offs);
-                                    if !moving_state
-                                        .remove_moving(node, arena, params, &row, hooks)?
-                                    {
+                                    if !moving_state.remove_moving(
+                                        node,
+                                        arena,
+                                        params,
+                                        &super::Chained { inner: &row, outer },
+                                        hooks,
+                                    )? {
                                         rebuild = true;
                                         break;
                                     }
@@ -1221,14 +1334,26 @@ fn compute_window<'a>(
                                     };
                                     for index in add_start..=end {
                                         let row = window_row(scope, rows[p[index]], offs);
-                                        moving_state.update(node, arena, params, &row, hooks)?;
+                                        moving_state.update(
+                                            node,
+                                            arena,
+                                            params,
+                                            &super::Chained { inner: &row, outer },
+                                            hooks,
+                                        )?;
                                     }
                                 }
                             }
                         } else {
                             for index in start..=end {
                                 let row = window_row(scope, rows[p[index]], offs);
-                                moving_state.update(node, arena, params, &row, hooks)?;
+                                moving_state.update(
+                                    node,
+                                    arena,
+                                    params,
+                                    &super::Chained { inner: &row, outer },
+                                    hooks,
+                                )?;
                             }
                         }
                         if rebuild {
@@ -1237,13 +1362,19 @@ fn compute_window<'a>(
                                 node,
                                 storage,
                                 txid,
-                                &super::ScopeCols(scope),
+                                aggregate_columns,
                                 arena,
                             )?;
                             debug_assert!(selected);
                             for index in start..=end {
                                 let row = window_row(scope, rows[p[index]], offs);
-                                moving_state.update(node, arena, params, &row, hooks)?;
+                                moving_state.update(
+                                    node,
+                                    arena,
+                                    params,
+                                    &super::Chained { inner: &row, outer },
+                                    hooks,
+                                )?;
                             }
                         }
                         active = Some((start, end));
@@ -1285,14 +1416,20 @@ fn compute_window<'a>(
                     )?
                 };
                 let mut st = AggState::default();
-                st.init(node, storage, txid, &super::ScopeCols(scope), arena)?;
+                st.init(node, storage, txid, aggregate_columns, arena)?;
                 if let Some((fs, fe)) = range {
                     for i in fs..=fe {
                         if frame_excludes(frame.exclusion, j, peers, i) {
                             continue;
                         }
                         let r = window_row(scope, rows[p[i]], offs);
-                        st.update(node, arena, params, &r, hooks)?;
+                        st.update(
+                            node,
+                            arena,
+                            params,
+                            &super::Chained { inner: &r, outer },
+                            hooks,
+                        )?;
                     }
                 }
                 out[p[j]] = st.finish(arena, hooks.catalog)?;
@@ -1305,10 +1442,16 @@ fn compute_window<'a>(
             //    value at the end of their peer group.
             if spec.order_by.is_empty() {
                 let mut st = AggState::default();
-                st.init(node, storage, txid, &super::ScopeCols(scope), arena)?;
+                st.init(node, storage, txid, aggregate_columns, arena)?;
                 for &ri in p {
                     let r = window_row(scope, rows[ri], offs);
-                    st.update(node, arena, params, &r, hooks)?;
+                    st.update(
+                        node,
+                        arena,
+                        params,
+                        &super::Chained { inner: &r, outer },
+                        hooks,
+                    )?;
                 }
                 let v = st.finish(arena, hooks.catalog)?;
                 for &ri in p {
@@ -1325,9 +1468,21 @@ fn compute_window<'a>(
                             Ok::<bool, SqlError>(
                                 acc && {
                                     let ra = window_row(scope, rows[p[e]], offs);
-                                    let va = eval_full(o.expression, arena, params, &ra, hooks)?;
+                                    let va = eval_full(
+                                        o.expression,
+                                        arena,
+                                        params,
+                                        &super::Chained { inner: &ra, outer },
+                                        hooks,
+                                    )?;
                                     let rb = window_row(scope, rows[p[e + 1]], offs);
-                                    let vb = eval_full(o.expression, arena, params, &rb, hooks)?;
+                                    let vb = eval_full(
+                                        o.expression,
+                                        arena,
+                                        params,
+                                        &super::Chained { inner: &rb, outer },
+                                        hooks,
+                                    )?;
                                     match (va.is_null(), vb.is_null()) {
                                         (true, true) => true,
                                         (true, false) | (false, true) => false,
@@ -1355,10 +1510,16 @@ fn compute_window<'a>(
                     }
                     // Frame is p[0..=e]; aggregate and assign to peers p[j..=e].
                     let mut st = AggState::default();
-                    st.init(node, storage, txid, &super::ScopeCols(scope), arena)?;
+                    st.init(node, storage, txid, aggregate_columns, arena)?;
                     for &ri in &p[..=e] {
                         let r = window_row(scope, rows[ri], offs);
-                        st.update(node, arena, params, &r, hooks)?;
+                        st.update(
+                            node,
+                            arena,
+                            params,
+                            &super::Chained { inner: &r, outer },
+                            hooks,
+                        )?;
                     }
                     let v = st.finish(arena, hooks.catalog)?;
                     for &ri in &p[j..=e] {
@@ -1628,7 +1789,7 @@ pub(crate) fn project_window_rows<'a>(
     // body; its columns resolve after this query's own.
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<WindowRows<'a>, SqlError> {
-    let scan_where = window_scan_where(statement, correlated, arena)?;
+    let (scan_where, where_correlated) = window_scan_where(statement, correlated, arena)?;
     let pax_columns = window_pax_columns(statement, scope, from, win_nodes, arena)?;
     // Per-row correlated-subquery scratch, allocated once and reused across
     // both passes and the per-output-row merge below: per-row merges must not
@@ -1660,7 +1821,7 @@ pub(crate) fn project_window_rows<'a>(
         pax_columns,
         &mut |row| {
             if !row_passes_correlated_where(
-                correlated,
+                where_correlated,
                 statement.where_clause,
                 storage,
                 txid,
@@ -1697,7 +1858,7 @@ pub(crate) fn project_window_rows<'a>(
         pax_columns,
         &mut |row| {
             if !row_passes_correlated_where(
-                correlated,
+                where_correlated,
                 statement.where_clause,
                 storage,
                 txid,
@@ -1737,8 +1898,9 @@ pub(crate) fn project_window_rows<'a>(
         .alloc_slice_with(win_nodes.len(), |_| empty)
         .map_err(|_| arena_full())?;
     for (wi, &node) in win_nodes.iter().enumerate() {
-        win_vals[wi] =
-            compute_window(storage, txid, node, rows, scope, offs, arena, params, hooks)?;
+        win_vals[wi] = compute_window(
+            storage, txid, node, rows, scope, offs, arena, params, hooks, outer,
+        )?;
     }
     let win_ptrs: &[*const Expr] = arena
         .alloc_slice_with(win_nodes.len(), |i| win_nodes[i] as *const Expr)
@@ -2086,7 +2248,7 @@ pub(crate) fn external_window_into<'a>(
     offset: u64,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<bool, SqlError>,
 ) -> Result<u64, SqlError> {
-    let scan_where = window_scan_where(statement, correlated, arena)?;
+    let (scan_where, where_correlated) = window_scan_where(statement, correlated, arena)?;
     let pax_columns = window_pax_columns(statement, scope, from, win_nodes, arena)?;
     // Per-row correlated-subquery scratch, allocated once and reused across
     // every scan pass below: per-row merges must not grow the statement arena.
@@ -2198,7 +2360,7 @@ pub(crate) fn external_window_into<'a>(
             pax_columns,
             &mut |row| {
                 if !row_passes_correlated_where(
-                    correlated,
+                    where_correlated,
                     statement.where_clause,
                     storage,
                     txid,
@@ -2291,8 +2453,9 @@ pub(crate) fn external_window_into<'a>(
                                         pos_of: &[i64],
                                         rank_of: &[i64]|
              -> Result<(), SqlError> {
-                let out =
-                    compute_window(storage, txid, node, rows, scope, offs, arena, params, hooks)?;
+                let out = compute_window(
+                    storage, txid, node, rows, scope, offs, arena, params, hooks, outer,
+                )?;
                 for (r, &pos) in pos_of.iter().enumerate() {
                     storage
                         .with_block_store(|blocks| {
@@ -2503,7 +2666,7 @@ pub(crate) fn external_window_into<'a>(
         pax_columns,
         &mut |row| {
             if !row_passes_correlated_where(
-                correlated,
+                where_correlated,
                 statement.where_clause,
                 storage,
                 txid,

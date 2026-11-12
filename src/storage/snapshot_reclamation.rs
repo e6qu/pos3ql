@@ -313,7 +313,7 @@ mod tests {
     use crate::storage::tests::{make_def, test_budget, test_config};
     use crate::storage::{RowState, SNAPSHOT_ALL};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     fn fixture() -> (Storage, usize, usize) {
         let config = test_config();
@@ -520,7 +520,7 @@ mod tests {
                     })
                 });
                 crate::mem::guard::forbid_alloc(|| {
-                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let deadline = crate::test_wait::deadline();
                     while Instant::now() < deadline {
                         if storage.tables[first]
                             .rows
@@ -557,7 +557,7 @@ mod tests {
                     })
                 });
                 crate::mem::guard::forbid_alloc(|| {
-                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let deadline = crate::test_wait::deadline();
                     while !completed.load(Ordering::Acquire) && Instant::now() < deadline {
                         std::thread::yield_now();
                     }
@@ -773,7 +773,7 @@ mod tests {
                 reader
             });
             let progressed = crate::mem::guard::forbid_alloc(|| {
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = crate::test_wait::deadline();
                 while !finished.load(Ordering::Acquire) && Instant::now() < deadline {
                     std::thread::yield_now();
                 }
@@ -890,7 +890,7 @@ mod tests {
                     finished.store(true, Ordering::Release);
                 });
                 let progressed = crate::mem::guard::forbid_alloc(|| {
-                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let deadline = crate::test_wait::deadline();
                     while !finished.load(Ordering::Acquire) && Instant::now() < deadline {
                         std::thread::yield_now();
                     }
@@ -969,7 +969,7 @@ mod tests {
                     finished.store(true, Ordering::Release);
                 });
                 let progressed = crate::mem::guard::forbid_alloc(|| {
-                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let deadline = crate::test_wait::deadline();
                     while !finished.load(Ordering::Acquire) && Instant::now() < deadline {
                         std::thread::yield_now();
                     }

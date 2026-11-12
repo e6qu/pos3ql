@@ -44,6 +44,136 @@ earlier status after another transaction changes it. In locking mode, a
 conflicting writer waits for the reader's relation lock, while work on
 unrelated tables continues.
 
+**Referential actions.** `ON DELETE`/`ON UPDATE` `CASCADE`, `SET NULL` and
+`SET DEFAULT` run when the statement that deleted or re-keyed the referenced
+rows ends, in the order of that row's `AFTER` events, as in PostgreSQL. So
+`UPDATE tree SET k = k + 10` on a self-referencing `ON UPDATE CASCADE` table
+first renumbers every row and then repoints each child, and an `AFTER DELETE`
+trigger on `orders` already sees the cascaded `lines` gone. These actions are
+never deferred, even for a `DEFERRABLE` key. A `SET DEFAULT` whose default is
+the deleted key fails like `NO ACTION` (`23503`, `Key (...) is still
+referenced`). The rewritten rows do not yet fire the referencing table's
+triggers or rules ([plan](../PLAN.md#pause-and-resume-every-query-path)).
+
+**Foreign keys between different types.** A referencing column may have a
+different type than the key it references whenever PostgreSQL 18 accepts the
+pair: an `integer` `customer_id` can reference a `bigint` primary key, a
+`varchar` code a `text` key, a `timestamp` a `date`. As in PostgreSQL, the
+check compares with the key type's own cross-type equality (`integer` with
+`bigint` compares exactly) or first converts the referencing value to the key's
+type (an `integer` referencing `numeric` or `real`, `text` referencing
+`char(n)`, which ignores trailing blanks); `ON UPDATE CASCADE` assigns the new
+key to the referencing column with its usual conversion, so a `bigint` key too
+large for an `integer` referencing column fails with `22003`. Other pairs fail
+with PostgreSQL's `42804` (`foreign key constraint "orders_customer_fkey"
+cannot be implemented`, with a `DETAIL` naming both types), also when
+`ALTER COLUMN ... TYPE` would leave a key in that state. `pg_constraint`
+reports the chosen operators in `conpfeqop`, `conppeqop` and `conffeqop`. Two
+different composite types, which PostgreSQL compares field by field, and keys
+that need a user-defined implicit cast fail with `0A000`.
+
+**Foreign keys and concurrent writers.** Inserting or updating a row that
+references another table locks the referenced (parent) row `FOR KEY SHARE`, as
+PostgreSQL does. A delete or key change of that parent waits for the inserting
+transaction, and an insert waits for a transaction that is deleting the parent
+or changing its key; after the wait each side checks the outcome again. For
+example, if one session deletes customer 7 while another inserts an order for
+customer 7, the order insert waits; when the delete commits the insert fails
+with `23503`, and when it rolls back the insert succeeds. Under `REPEATABLE
+READ` and `SERIALIZABLE`, an insert whose parent was deleted or had its key
+changed after the transaction's snapshot fails with `40001`; a partitioned
+parent table is read with a current snapshot instead, as PostgreSQL's check
+does, so a parent inserted after the snapshot counts and one deleted after it
+fails the insert with `23503`. A check that waited for the parent row keeps
+the snapshot it started with, as PostgreSQL's check query does: under read
+committed a parent deleted and inserted again with the same key while the
+check waited does not count (`23503`), and under repeatable read a parent
+deleted or moved while a check of a partitioned parent waited fails it with
+`40001`. Changing other
+parent columns does not conflict, nor does an assignment that keeps the key
+value, such as `UPDATE customers SET id = id`. `ON DELETE`/`ON UPDATE` actions lock the
+referencing rows they check or rewrite. Each locked row takes one entry of the
+row-lock registry, (`max_connections` + `max_prepared_transactions`) ×
+`txn_rows` entries in total; a full registry fails the statement with `54000`.
+
+**Writes that meet a concurrently changed row.** `UPDATE`, `DELETE`,
+`MERGE` and `SELECT ... FOR UPDATE` (or `FOR SHARE`, `FOR KEY SHARE`, `FOR NO
+KEY UPDATE`) lock each row they select. When another transaction changed that
+row after the statement's snapshot, `READ COMMITTED` continues with the row's
+latest committed version, as PostgreSQL does: `UPDATE accounts SET balance =
+balance + 10` that waited for another session's `+ 1` stores the sum of both,
+a row that no longer meets the `WHERE` condition is skipped, and a deleted row
+is neither updated nor deleted again. `REPEATABLE READ` and `SERIALIZABLE`
+fail such a statement with `40001` (`could not serialize access due to
+concurrent update`, or `concurrent delete` for an `UPDATE`, `DELETE` or
+`MERGE` of a deleted row); `FOR KEY SHARE` still succeeds when the change kept
+every unique key column.
+
+A row another transaction moved to a different partition (an `UPDATE` or
+`MERGE` that changed its partition key) cannot be followed into its new
+partition. A statement that waited for that row fails with `40001`, as in
+PostgreSQL: `tuple to be locked was already moved to another partition due to
+concurrent update` under `READ COMMITTED`, and `could not serialize access due
+to concurrent update` under `REPEATABLE READ` and `SERIALIZABLE`. For example,
+`UPDATE orders SET note = 'x' WHERE id = 7` fails when another session's
+`UPDATE orders SET region = 'eu' WHERE id = 7` moved the order to another
+partition first; retry the statement to update it in its new partition. A foreign
+key check that waited for its parent row fails the same way under `READ
+COMMITTED`. The move is recorded in the journal, so a prepared transaction's
+move still fails waiting statements after a restart.
+
+Under `READ COMMITTED`, `SELECT ... FOR UPDATE` returns the locked row's latest
+version: the join conditions, `WHERE` and output list run again over it, while
+the other tables in the join keep the rows first read. For example, a job
+queue's `SELECT id FROM jobs WHERE state = 'new' ORDER BY id LIMIT 1 FOR
+UPDATE` that waited for another worker skips the job that worker claimed and
+returns the next one. The result keeps its original order. `MERGE` chooses the
+action again for the target row's latest version: a `WHEN MATCHED` pair whose
+`ON` condition still holds checks its `WHEN` conditions from the first one; a
+pair whose `ON` condition no longer holds runs the `WHEN NOT MATCHED BY SOURCE`
+actions on the target row and the `WHEN NOT MATCHED` action for the source
+row; a deleted target row leaves only the `WHEN NOT MATCHED` action, as in
+PostgreSQL 15 and later. A source row that loses several matches runs its
+`WHEN NOT MATCHED` action once for each lost pair, right after that pair, as
+PostgreSQL does.
+
+`UPDATE`, `DELETE` and `SELECT ... FOR UPDATE` recheck their `WHERE` the way
+PostgreSQL's plan does. An `IN (subquery)` condition that does not refer to
+the outer query, and an `EXISTS (subquery)` condition that does (both at the
+top level of `WHERE`), are semi-joins in PostgreSQL's plan: the row stays only
+if the subquery row it first matched still matches. For example, `UPDATE jobs
+SET state = 'done' WHERE EXISTS (SELECT 1 FROM workers w WHERE w.slot =
+jobs.slot)` that waited for another session's change to `jobs.slot` skips the
+job when the worker it first matched no longer has that slot, even if another
+worker does. pos3ql takes the first match in its own scan order, which equals
+PostgreSQL's for a sequential scan of one table; a different join plan in
+PostgreSQL can pick a different first row. Other conditions, and correlated
+subqueries PostgreSQL keeps as subplans (under `OR`, with aggregates or
+volatile functions), run again over the latest version.
+
+`UPDATE ... FROM` and `DELETE ... USING` keep the `FROM` row each target row
+joined. A target row that another transaction changed is rechecked against
+that row, and the assignments read it; the statement does not join the new
+version to other `FROM` rows. When that row no longer meets the conditions,
+the next `FROM` row the first version joined is tried, as PostgreSQL tries
+each joined row in turn. For example, `UPDATE accounts SET rate = r.rate FROM
+rates r WHERE accounts.tier = r.tier` that waited for another session to move
+an account from tier 1 to tier 2 skips the account instead of giving it tier
+2's rate.
+
+A `LATERAL` source follows the same plan rules: a simple subquery without
+`FROM` (`LATERAL (SELECT t.qty * 10 AS x)`) runs again over the latest row; a
+function, a `VALUES` list of several rows and a subquery with aggregates,
+`GROUP BY`, `DISTINCT`, `LIMIT` or `OFFSET` keep the row first read; a `UNION
+ALL` of simple branches returns its first branch's row again. A simple
+`LATERAL` subquery that reads tables keeps the rows it first joined, as
+PostgreSQL does, and runs its `WHERE` and output list again with the latest
+row: `LATERAL (SELECT s.qty + i.qty AS y FROM stock s WHERE s.id = i.id)`
+returns the same stock row's quantity plus the item's new quantity. pos3ql
+finds those rows again from the values the subquery produced; when several of
+its rows produced the same values but recheck differently, or the subquery is
+a `UNION ALL` branch that reads tables, the recheck fails with `0A000`.
+
 A commit becomes visible all at once, and only after it is durable: new
 statements never see half of an order-and-invoice update. If commit waits for
 storage, completed work is not repeated; a default that issued an order number
@@ -145,9 +275,14 @@ with its next message once its client has read the result.
 reads it gradually. Meanwhile other applications keep inserting orders. If the
 tool falls behind by more than `result_spool_bytes`, it receives the rows
 already queued followed by `54000` naming that setting, and its session stays
-usable. A large `SELECT` from one ordinary table without sorting, grouping or
-joins resumes row by row instead: it waits for the client and for cold storage
-without holding the worker, and rows already delivered are never repeated.
+usable. A large `SELECT` from one ordinary table or one builtin series such
+as `generate_series`, also joined, sorted (local mode) or grouped with
+`GROUP BY` and aggregates, resumes row by row instead: it waits for the client and for cold storage without holding the
+worker, and rows already delivered are never repeated. A paged portal (an
+extended `Execute` with a row limit) over such a query evaluates rows only as
+each `Execute` asks for them, as PostgreSQL does, so
+`CASE WHEN id > 1 THEN nextval('s') END` takes nine numbers for a first page
+of ten rows.
 Other large results, once their first byte reaches the client, read cold
 storage without yielding; extending resumable output to them is tracked in
 [the plan](../PLAN.md#pause-and-resume-every-query-path).
@@ -212,18 +347,28 @@ change the cursor. Dynamic SQL sees only the explicit `USING` arguments.
 
 ### Cursors that read as you fetch
 
-A cursor over one table, over constant `VALUES` rows, or over
-`generate_series` (integer, bigint, numeric or timestamp) or a one-array
-`unnest` with constant arguments, reads input only as rows are fetched when
+A cursor over one table, over constant `VALUES` rows, or over a builtin
+set-returning function with constant arguments (literals, parameters and
+casts of them) reads input only as rows are fetched when
 its query uses only columns, constants, parameters,
 built-in operators and casts, boolean logic, `CASE`, `BETWEEN`, null tests,
 array construction, subscripts, slices, scalar function calls, `LIMIT` and
-`OFFSET`. A row-locking cursor (`FOR UPDATE`, `FOR SHARE` and their variants)
-over one table may also order by its columns. Other cursor queries, including
-other orderings, joins, grouping, user-defined operators or row-level
-security, are described when declared and run whole at their first `FETCH`
-or `MOVE`, as PostgreSQL first runs a portal's plan there; see
-[the plan](../PLAN.md#pause-and-resume-every-query-path).
+`OFFSET`. A cursor over one table, including a row-locking cursor (`FOR
+UPDATE`, `FOR SHARE` and their variants), may also order by its columns. Other
+cursor queries, including orderings by other expressions,
+user-defined operators or row-level security, are described when declared and
+run whole at their first `FETCH` or `MOVE`, as PostgreSQL first runs a portal's
+plan there; see [the plan](../PLAN.md#pause-and-resume-every-query-path). The
+functions are
+`generate_series` (integer, bigint, numeric or timestamp),
+`generate_subscripts`, a one-array `unnest`, `regexp_matches`,
+`regexp_split_to_table`, and the `json`/`jsonb` `_each`, `_each_text`,
+`_array_elements`, `_array_elements_text` and `_object_keys` functions, alone
+or combined in `ROWS FROM (...)` (which `FROM unnest(a, b)` expands to), with
+or without `WITH ORDINALITY`. Such a cursor keeps only the arguments and the
+next position; argument errors, such as `jsonb_each('[1]')`, are raised by the
+first `FETCH`. Other function sources, including column definition lists such
+as `jsonb_to_recordset(...) AS t(a int)`, run whole at the first read.
 
 Every cursor reads the snapshot taken when it was declared or opened: its
 transaction's changes from earlier commands, and transactions committed by
@@ -264,11 +409,17 @@ cursor that does not scroll raises `55000`.
 ```sql
 DECLARE c NO SCROLL CURSOR FOR SELECT id, label FROM orders;
 FETCH 2 FROM c;  -- reads two rows
+DECLARE parts NO SCROLL CURSOR FOR
+  SELECT key, value FROM jsonb_each('{"a": 1, "b": 2}');
+FETCH 1 FROM parts;  -- produces only the "a" row
 ```
 
 - `FETCH 0` before the first row reads nothing; `MOVE` skips without saving
   output. Each batch reuses the result buffer, so many small fetches do not
-  accumulate memory.
+  accumulate memory. A forward `FETCH n` or `FETCH ALL` sent by the client
+  from a `NO SCROLL` cursor saves no rows at all: each row is evaluated as the
+  client reads it, like a large `SELECT`, so `FETCH ALL` returns any number
+  of rows and other sessions keep running while the client reads slowly.
 - `SELECT 100/id FROM orders WHERE id<>0` divides only fetched rows.
   `CASE WHEN id<>0 THEN 100/id END` evaluates only the chosen branch.
 - `DECLARE c NO SCROLL CURSOR FOR SELECT nextval('order_numbers')` issues no
@@ -292,8 +443,15 @@ FETCH 2 FROM c;  -- reads two rows
 - Selecting `id` from a row with a 128 KiB text column does not copy that text
   into cursor memory.
 
-`SCROLL` cursors save visited rows so `FETCH PRIOR` and jumps backward need no
-new reads; `FETCH LAST` reads the rest. When the output list calls a volatile
+A `SCROLL` cursor (and a table scan's or function's cursor declared without a
+scroll option) whose output list and filter call no volatile function keeps
+only the rows of its current `FETCH`: a forward fetch from the client streams
+like a `NO SCROLL` cursor's, and a motion back to rows it no longer holds reads
+the input again from its first row with the cursor's snapshot, so rows
+inserted since `DECLARE` stay invisible. `FETCH PRIOR` right after a fetch
+reuses that fetch's rows; otherwise moving back costs a read of the input up
+to the target row, and `pg_stat_*_tables.seq_tup_read` counts the rows read
+again. When the output list calls a volatile
 function such as `nextval`, a row reached again by `FETCH PRIOR`, `ABSOLUTE`,
 `RELATIVE` or a later forward fetch is evaluated again, as PostgreSQL scans
 backward: with `SELECT id, nextval('s') FROM t`, `FETCH NEXT` twice then
@@ -302,10 +460,29 @@ input columns of each row instead of its output, and a volatile filter also
 saves the rows it rejected, because the filter runs again too. `LIMIT` returns
 the row at the edge of its window again without evaluating it, and `MOVE` and
 `FETCH ABSOLUTE` take PostgreSQL's steps (an absolute target less than halfway
-back rewinds and reads forward). History must fit `cursor_bytes`; exhaustion
+back rewinds and reads forward). Such a cursor's history, and an ordered
+scrollable cursor's, must fit `cursor_bytes`; exhaustion
 returns `54000` and leaves the cursor failed until closed. Without a scroll
 option, scrolling follows PostgreSQL's plan for the query, as
 [described above](#cursors-that-read-as-you-fetch).
+
+A cursor over a join of tables, `VALUES` lists and retained set-returning
+functions (inner, cross or `LEFT`, with a non-volatile condition) also reads
+as it fetches, as a nested loop or, for a two-table equality join, a hash
+join whose build table is read into `plan_build_bytes` at `DECLARE` (a table
+that does not fit makes the cursor save its rows at `DECLARE` instead):
+
+```sql
+DECLARE c CURSOR FOR SELECT nextval('s'), o.id, c.name
+  FROM orders o JOIN customers c ON c.id = o.customer_id + 0;
+FETCH 1 FROM c;  -- reads one joined row and takes one number
+```
+
+Such a cursor is `NO SCROLL` without a scroll option, as in PostgreSQL. A
+`SCROLL` join cursor whose output list or filter calls a volatile function
+returns a revisited row's first values, as PostgreSQL's Material node does;
+without volatile functions it reads its input again to move back. A join the
+engine reads with index lookups per outer row still runs at `DECLARE`.
 
 A row-locking cursor locks each row when a `FETCH` or `MOVE` reaches it, not
 at `DECLARE`, after evaluating its output list and before `OFFSET` counts it:
@@ -315,8 +492,15 @@ DECLARE c CURSOR FOR SELECT id, v FROM orders ORDER BY id FOR UPDATE;
 FETCH 1 FROM c;  -- locks only the first row
 ```
 
-An ordered cursor first saves every qualifying row in `cursor_bytes` (a full
-buffer returns `54000` before any row is locked) and sorts them. A `FETCH` that
+An ordered cursor sorts at its first `FETCH`, as PostgreSQL's sort reads its
+whole input then: it saves the columns it reads of every row its filter
+passes in `cursor_bytes` (a full buffer returns `54000` before any row is
+returned or locked) and sorts them, keeping scan order for equal keys. Each
+row's output list is then evaluated when a fetch reaches it, so
+`SELECT v, nextval('s') FROM t ORDER BY id` takes numbers in sorted order, and
+a scrollable ordered cursor evaluates a revisited row's volatile output again
+without running its filter again. A row-locking ordered cursor saves whole
+rows. A `FETCH` that
 meets a row locked by another transaction waits like `SELECT ... FOR UPDATE`;
 `lock_timeout`, `statement_timeout` and cancel end the wait. A row changed by a
 transaction that committed after `DECLARE` is checked again: under `READ
@@ -354,7 +538,11 @@ COPY (SELECT id, status FROM orders ORDER BY id) TO STDOUT (FORMAT csv);
 
 Table-form `COPY TO` returns `42809` for a partitioned parent without an
 applicable row-security rewrite and `0A000` for an unpopulated materialized
-view. Views, foreign tables and catalog tables require query form.
+view. Views, foreign tables and catalog tables require query form. Otherwise
+it sends the rows of `SELECT columns FROM ONLY table`, in the same order a
+`SELECT` without `ORDER BY` returns them. A large `COPY ... TO STDOUT` from
+one table or a streamable query resumes row by row like a large `SELECT`:
+it waits for a slow client and for cold storage without holding the worker.
 
 `COPY FROM` statement triggers declared with
 `REFERENCING NEW TABLE AS inserted_rows` see the values saved after BEFORE
@@ -432,6 +620,19 @@ Evaluation order follows PostgreSQL:
   handler sees the original table. Cursors opened inside the failed block close;
   older cursors keep their position. See the
   [PostgreSQL reference results](https://github.com/e6qu/pos3ql/tree/854feb372391d1c87f3d5b261e85a78430d96449/tests/external/reference/2026-11-05-procedural-subtransactions).
+- `CALL` works inside `DO` blocks, procedures, functions and trigger
+  functions, assigning output parameters to the argument variables. A
+  procedure called from a `DO` block may `COMMIT`. A PL/pgSQL procedure or
+  `DO` block that waits for a lock, storage or `pg_sleep` resumes at the
+  waiting statement, also after its own `COMMIT` or `ROLLBACK`: finished
+  statements, inserts, sequence values and `pg_stat_user_functions` calls are
+  not repeated, and a write that was waiting runs again from its own start.
+  For example, `CALL import_batches()` that commits each batch keeps the
+  committed batches when a later batch waits for a row lock, and continues
+  with that batch once the lock is free. A lock timeout or cancel while it
+  waits ends only the current transaction; earlier commits stay.
+- `pg_sleep(1)` releases the SQL worker while it waits, so other connections
+  keep running; `statement_timeout` and cancel requests end the sleep.
 - DDL succeeds only after its end-of-command event triggers. A failing hook for
   `DO 'BEGIN CREATE TABLE orders(id integer); END'` leaves no `orders` table and
   sends no `DO` success tag. Static DDL in routines uses the same path as
@@ -526,15 +727,22 @@ names and types, and also keeps the view's options.
 A materialized view created `WITH NO DATA` fails ordinary reads with `55000`,
 including `LIMIT 0`. REFRESH requires MAINTAIN, runs as the owner and holds an
 exclusive lock until the transaction ends. Rollback restores both rows and
-populated status.
+populated status. Like a view, a materialized view owns a `_RETURN` rule in
+`pg_rewrite` whose `pg_depend` rows name each column it reads, so
+`ALTER TABLE orders ALTER COLUMN total TYPE numeric` fails with `0A000` while
+a materialized view reads `orders.total`. Rule commands on a materialized view
+fail as in PostgreSQL (`0A000` for `CREATE RULE`, `2BP01` for dropping
+`_RETURN`); only `COMMENT ON RULE "_RETURN"` is accepted.
 
 Rewrite rules take the target table's exclusive lock, so a rule that redirects
 an insert conflicts with ordinary reads of that table. A rule condition may
 use subqueries over other tables and the event's `OLD` and `NEW` rows
 (`WHERE EXISTS (SELECT 1 FROM allowed WHERE allowed.id = new.id)`). `_RETURN`
-cannot be renamed. `pg_get_ruledef` supports both formatting modes for unconditional
-`DO NOTHING` rules; other rules return their saved SQL, and pretty formatting
-of a condition or action returns `0A000`. A missing rule returns NULL.
+cannot be renamed or dropped apart from its view. `pg_get_ruledef` supports both
+formatting modes for unconditional `DO NOTHING` rules and for `_RETURN` rules,
+whose action is printed as `pg_get_viewdef` prints the view; other rules
+return their saved SQL, and pretty formatting of a condition or action returns
+`0A000`. A missing rule returns NULL.
 
 ## Catalog listings and current lookups
 
@@ -551,7 +759,25 @@ deparsing can fail with `XX000`. This matches PostgreSQL's
 
 Information-schema views follow the pinned PostgreSQL 18.6
 [definitions](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/information_schema.sql),
-including hiding definitions from non-owners and masking password fields.
+including hiding definitions from non-owners and masking password fields. Their
+columns have that script's domains (`sql_identifier`, `cardinal_number`,
+`character_data`, `yes_or_no`, `time_stamp`), which also exist as ordinary
+types with their CHECK constraints.
+
+Every table, materialized view and view has a row type named like the relation,
+usable in casts, columns, attributes of `CREATE TYPE ... AS`, PL/pgSQL
+variables and routine signatures; the relation owns it, so dropping the
+relation reaches the routines, columns, composite attributes and domains that
+use it. **Example:** after `CREATE TYPE wrap AS (o orders, n int)`,
+`DROP TABLE orders CASCADE` drops attribute `o` and keeps `wrap`, and
+`ALTER TABLE orders ALTER COLUMN total TYPE float8` fails with `0A000` while a
+table column stores `wrap` values. In PL/pgSQL, `r.total := 5` assigns one
+field of a row variable.
+
+Column defaults, CHECK constraints and routine defaults are printed in
+PostgreSQL's analyzed form for the expression shapes listed in
+[PLAN](../PLAN.md#close-application-compatibility-gaps): **example:**
+`DEFAULT 'x'` on a `text` column is `'x'::text` in `pg_get_expr`.
 
 - `tableoid` must be named explicitly.
 - Index vectors start at subscript zero and keep that bound when cast to

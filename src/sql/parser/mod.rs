@@ -406,6 +406,9 @@ pub struct Parser<'a> {
     routine_name: Option<&'a str>,
     /// Local variables and record fields captured by a procedural OPEN.
     named_parameters: &'a [NamedParameter<'a>],
+    /// `$n.field` selections, kept so a parameter whose type stays undetermined
+    /// reports PostgreSQL's `unknown` composite error.
+    parameter_fields: core::cell::RefCell<ArenaList<'a, (u32, &'a str)>>,
 }
 
 /// One step of an assignment target after its column: a field of a
@@ -1040,6 +1043,7 @@ impl<'a> Parser<'a> {
             routine_parameters: [None; crate::storage::MAX_ROUTINE_ARGUMENTS],
             routine_name: None,
             named_parameters: &[],
+            parameter_fields: core::cell::RefCell::new(ArenaList::new(arena)),
         };
         parser.note_token_source()?;
         Ok(parser)
@@ -1135,6 +1139,11 @@ impl<'a> Parser<'a> {
             cursor: None,
             raw: true,
         })
+    }
+
+    /// The `$n.field` selections parsed so far.
+    pub(crate) fn parameter_fields(&self) -> &'a [(u32, &'a str)] {
+        self.parameter_fields.borrow().as_slice()
     }
 
     pub(crate) fn capture_type_inputs(&mut self) {
@@ -1399,6 +1408,24 @@ impl<'a> Parser<'a> {
             .is_some_and(|routine| routine == qualifier)
             .then(|| self.routine_parameter(name))
             .flatten()
+            .or_else(|| self.routine_parameter_field(qualifier))
+    }
+
+    /// `parameter.field` in a SQL-language routine body; the qualifier names
+    /// the parameter and the reference's column name is the field.
+    pub(super) fn routine_parameter_field(
+        &self,
+        parameter: &str,
+    ) -> Option<(u32, crate::sql::ast::ParameterSource)> {
+        self.routine_parameters
+            .iter()
+            .position(|candidate| candidate.is_some_and(|candidate| candidate == parameter))
+            .map(|index| {
+                (
+                    index as u32 + 1,
+                    crate::sql::ast::ParameterSource::SqlRoutineField,
+                )
+            })
     }
 
     fn column_default_expression(&mut self) -> Result<&'a Expr<'a>, ParseError> {
@@ -3423,9 +3450,7 @@ impl<'a> Parser<'a> {
                 None
             };
             if (search.is_some() || cycle.is_some()) && (!recursive || dml.is_some()) {
-                return Err(self.err_here(
-                    "SEARCH and CYCLE clauses require a recursive SELECT common table expression",
-                ));
+                return Err(self.err_here("WITH query is not recursive"));
             }
             self.push(
                 &mut ctes,
@@ -3930,11 +3955,13 @@ impl<'a> Parser<'a> {
                 .arena
                 .alloc(select)
                 .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+            // After `AS`, only an alias may follow: anything else, including
+            // a reserved word, is PostgreSQL's syntax error at that token.
             let explicit_as = self.eat_ident("as")?;
             let alias = if let Tok::Ident(word) = self.peeked {
                 if is_column_name_keyword(word) {
                     if explicit_as {
-                        return Err(self.err_here("subquery alias is missing"));
+                        return Err(self.syntax_error_here());
                     }
                     None
                 } else {
@@ -3942,7 +3969,7 @@ impl<'a> Parser<'a> {
                     Some(word)
                 }
             } else if explicit_as {
-                return Err(self.err_here("subquery alias is missing"));
+                return Err(self.syntax_error_here());
             } else {
                 None
             };
@@ -9463,6 +9490,12 @@ impl<'a> Parser<'a> {
             end: self.lexer.token_end(),
         };
         let mut quoted = matches!(self.peeked, Tok::QuotedIdent(_));
+        // A fully reserved word never names a type (`f(x any)`); `"any"` does.
+        if let Tok::Ident(word) = self.peeked
+            && keyword_category(word) == Some(Keyword::Reserved)
+        {
+            return Err(self.syntax_error_here());
+        }
         let mut name = self.any_ident("type name")?;
         let mut written = WrittenTypeName {
             schema: None,
@@ -9510,7 +9543,7 @@ impl<'a> Parser<'a> {
                 name: base,
                 array: false,
             };
-            name = if schema == "pg_catalog" || schema == "information_schema" {
+            name = if schema == "pg_catalog" {
                 quoted = base_quoted;
                 base
             } else {
@@ -10086,6 +10119,34 @@ impl<'a> Parser<'a> {
         Ok(next == Tok::Ident(word))
     }
 
+    /// Whether the current identifier starts a call: `lower(a)`.
+    fn peek_is_function_call(&mut self) -> Result<bool, ParseError> {
+        if !matches!(self.peeked, Tok::Ident(_) | Tok::QuotedIdent(_)) {
+            return Ok(false);
+        }
+        let mark = self.lexer.mark();
+        let mut next = self
+            .lexer
+            .next_token()
+            .map_err(|error| ParseError::lexical(error, self.text))?;
+        // A qualified name: `schema.function(`.
+        while next == Tok::Op(".") {
+            let name = self
+                .lexer
+                .next_token()
+                .map_err(|error| ParseError::lexical(error, self.text))?;
+            if !matches!(name, Tok::Ident(_) | Tok::QuotedIdent(_)) {
+                break;
+            }
+            next = self
+                .lexer
+                .next_token()
+                .map_err(|error| ParseError::lexical(error, self.text))?;
+        }
+        self.lexer.reset(mark);
+        Ok(next == Tok::Op("("))
+    }
+
     fn eat_op(&mut self, operator: &str) -> Result<bool, ParseError> {
         if self.peeked == Tok::Op(operator) {
             self.advance()?;
@@ -10329,6 +10390,15 @@ impl<'a> Parser<'a> {
                     },
                 })
                 .map_err(|_| self.arena_full("column source map exceeds SQL arena"))?;
+        }
+        if let Expr::Field { base, field } = e
+            && let Expr::Param(index) = base
+            && field != "*"
+        {
+            self.parameter_fields
+                .borrow_mut()
+                .push((*index, field))
+                .map_err(|_| self.arena_full("parameter field list exceeds SQL arena"))?;
         }
         let expression = self
             .arena
@@ -10814,17 +10884,6 @@ impl<'a> Parser<'a> {
 
     fn err_here(&self, message: &'static str) -> ParseError {
         ParseError::new(self.peek_at, message)
-    }
-
-    /// [`Self::invalid_function_definition`] with formatted text.
-    fn invalid_function_definition_owned(
-        &self,
-        message: StackStr<PARSE_MESSAGE_BYTES>,
-    ) -> ParseError {
-        ParseError {
-            message,
-            ..self.invalid_function_definition("")
-        }
     }
 
     /// A CREATE FUNCTION definition error that PostgreSQL raises after
@@ -12814,7 +12873,11 @@ mod tests {
         });
         with_parser("SELECT * FROM (SELECT 1) AS", |p| {
             let error = p.next_stmt().unwrap_err();
-            assert_eq!(error.message.as_str(), "subquery alias is missing");
+            assert_eq!(error.message.as_str(), "syntax error at end of input");
+        });
+        with_parser("SELECT * FROM (SELECT 1) AS select", |p| {
+            let error = p.next_stmt().unwrap_err();
+            assert_eq!(error.message.as_str(), "syntax error at or near \"select\"");
         });
     }
 

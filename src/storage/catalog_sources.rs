@@ -69,11 +69,16 @@ pub(crate) struct RoleOid(NonZeroU32);
 
 impl RoleOid {
     pub(crate) const BOOTSTRAP: Self = Self(NonZeroU32::new(10).unwrap());
-    pub(crate) const USER_FLOOR: u64 = 16_384;
+    pub(crate) const USER_FLOOR: u64 = super::OidBand::UserRole.base() as u64;
+    pub(crate) const LAST_USER: u64 = super::OidBand::UserRole.last() as u64;
 
     pub(crate) fn parse(value: i32) -> Option<Self> {
-        (value == 10 || value > Self::USER_FLOOR as i32)
-            .then(|| Self(NonZeroU32::new(value as u32).expect("a valid role OID is nonzero")))
+        (value == 10
+            || super::OidBand::UserRole.contains(value)
+            || super::PredefinedRole::ALL
+                .iter()
+                .any(|role| role.oid() == value))
+        .then(|| Self(NonZeroU32::new(value as u32).expect("a valid role OID is nonzero")))
     }
 
     pub(crate) fn get(self) -> i32 {
@@ -104,7 +109,7 @@ impl CatalogSources {
         loop {
             let next = current
                 .checked_add(1)
-                .filter(|next| *next <= i32::MAX as u64)
+                .filter(|next| *next <= RoleOid::LAST_USER)
                 .ok_or_else(|| {
                     crate::sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -313,10 +318,11 @@ impl Storage {
 
     pub(crate) fn lock_role_for_drop(&self, slot: usize, transaction: u32) -> Result<(), SqlError> {
         let source = self.role(slot).oid();
-        if source == RoleOid::BOOTSTRAP {
+        if source == RoleOid::BOOTSTRAP || super::PredefinedRole::from_slot(slot).is_some() {
             return Err(crate::sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                "cannot drop role because it is required by the database system"
+                "cannot drop role {} because it is required by the database system",
+                self.role(slot).name_to(transaction).as_str()
             ));
         }
         if transaction != 0 {
@@ -345,7 +351,7 @@ impl Storage {
     }
 
     pub(crate) fn restore_role_identity_sequence(&self, sequence: u64) -> Result<(), SqlError> {
-        if !(RoleOid::USER_FLOOR..=i32::MAX as u64).contains(&sequence) {
+        if !(RoleOid::USER_FLOOR..=RoleOid::LAST_USER).contains(&sequence) {
             return Err(crate::sql_err!(
                 sqlstate::DATA_EXCEPTION,
                 "invalid role identity allocator"
@@ -765,24 +771,27 @@ mod tests {
         for value in [i32::MIN, -1, 0, 1, 9, 11, 16_384] {
             assert!(RoleOid::parse(value).is_none());
         }
-        for value in [10, 16_385, i32::MAX] {
+        for value in [i32::MAX, 10_000_000] {
+            assert!(RoleOid::parse(value).is_none());
+        }
+        for value in [10, 16_385, 9_999_999] {
             assert_eq!(RoleOid::parse(value).unwrap().get(), value);
         }
     }
 
     #[test]
     fn catalog_creation_role_lifetimes_reject_exhaustion_without_reuse() {
-        let counter = AtomicU64::new(i32::MAX as u64 - 1);
+        let counter = AtomicU64::new(RoleOid::LAST_USER - 1);
         crate::mem::guard::forbid_alloc(|| {
             assert_eq!(
                 CatalogSources::reserve(&counter, "role").unwrap().get(),
-                i32::MAX as u64
+                RoleOid::LAST_USER
             );
             for _ in 0..2 {
                 let error = CatalogSources::reserve(&counter, "role").unwrap_err();
                 assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
                 assert_eq!(error.message.as_str(), "role identity space exhausted");
-                assert_eq!(counter.load(Ordering::Relaxed), i32::MAX as u64);
+                assert_eq!(counter.load(Ordering::Relaxed), RoleOid::LAST_USER);
             }
         });
     }

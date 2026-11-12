@@ -205,7 +205,7 @@ pub(crate) fn array_set_op<'a>(
         ));
     };
     // PostgreSQL looks up the element equality before it reads either array.
-    if !le.to_coltype().has_builtin_equality() {
+    if !le.to_coltype().has_default_equality() {
         return Err(could_not_identify_equality(le.to_coltype()));
     }
     let member = |needle: &Datum<'a>, elem, raw: &'a [u8]| -> Result<bool, SqlError> {
@@ -1320,7 +1320,7 @@ pub(crate) fn compare_datums_as(
         ) => record_ordering(a, b, false, &builtin_record_field_type_name)?,
         (Datum::Array { element, raw: ra }, Datum::Array { raw: rb, .. }) => {
             let element_type = element.to_coltype();
-            if matches!(operator, "=" | "<>") && !element_type.has_builtin_equality() {
+            if matches!(operator, "=" | "<>") && !element_type.has_default_equality() {
                 // PostgreSQL's array_eq answers "not equal" for different
                 // shapes before it needs the element equality operator.
                 let shape_a = array::shape(ra).expect("array datum invariant");
@@ -1601,6 +1601,41 @@ pub(crate) fn arithmetic<'a>(
     r_unknown: bool,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    // PostgreSQL has no `+` between two timestamps or two times, so an
+    // untyped operand of `+` beside one is an interval. `date` and `timetz`
+    // have several `+` candidates and the call is ambiguous.
+    let (mut l, mut r) = (l, r);
+    if operator == BinaryOp::Add {
+        for (unknown_left, unknown, other) in [(true, l_unknown, r), (false, r_unknown, l)] {
+            if !unknown {
+                continue;
+            }
+            let ambiguous = match other {
+                Datum::Date(_) => Some("date"),
+                Datum::Timetz(..) => Some("time with time zone"),
+                _ => None,
+            };
+            if let Some(type_name) = ambiguous {
+                return Err(sql_err!(
+                    sqlstate::AMBIGUOUS_FUNCTION,
+                    "operator is not unique: {}",
+                    if unknown_left {
+                        crate::stack_format!(64, "unknown + {}", type_name)
+                    } else {
+                        crate::stack_format!(64, "{} + unknown", type_name)
+                    }
+                ));
+            }
+            let value = if unknown_left { &mut l } else { &mut r };
+            if let (
+                Datum::Timestamp(_) | Datum::Timestamptz(_) | Datum::Time(_),
+                Datum::Text(text),
+            ) = (other, *value)
+            {
+                *value = Datum::Interval(datetime::parse_interval(text)?);
+            }
+        }
+    }
     if l.is_null() || r.is_null() {
         return Ok(Datum::Null);
     }
@@ -2565,9 +2600,10 @@ pub(crate) fn membership_eq<'a>(
         ));
     }
     if let (
-        Datum::Record(a) | Datum::Composite { fields: a, .. },
+        Datum::Composite { fields: a, .. },
         Datum::Record(b) | Datum::Composite { fields: b, .. },
-    ) = (l, r)
+    )
+    | (Datum::Record(a), Datum::Composite { fields: b, .. }) = (l, r)
     {
         return Ok(
             match record_compare(BinaryOp::Eq, a, b, &builtin_record_field_type_name)? {
@@ -2845,6 +2881,23 @@ pub(crate) fn binary<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     use BinaryOp::*;
     let (mut l, mut r) = (l, r);
+    // Every range and multirange operator has a variant taking the same type
+    // on both sides, so PostgreSQL reads an untyped operand as the other
+    // operand's type (`int4range @> '[2,3)'` compares two ranges).
+    if r_unknown && matches!(r, Datum::Text(_)) {
+        match l {
+            Datum::Range { kind, .. } => r = cast_to(r, ColType::Range(kind), arena)?,
+            Datum::Multirange { kind, .. } => r = cast_to(r, ColType::Multirange(kind), arena)?,
+            _ => {}
+        }
+    }
+    if l_unknown && matches!(l, Datum::Text(_)) {
+        match r {
+            Datum::Range { kind, .. } => l = cast_to(l, ColType::Range(kind), arena)?,
+            Datum::Multirange { kind, .. } => l = cast_to(l, ColType::Multirange(kind), arena)?,
+            _ => {}
+        }
+    }
     // One unknown string beside a built-in scalar takes the input type of the
     // operator PostgreSQL's candidate selection chooses (`numeric * '2'`,
     // `interval * '2'`, `now() - '1 day'`).
@@ -3157,7 +3210,7 @@ pub(crate) fn binary<'a>(
             // Record values compare with record_eq/record_cmp; comparisons
             // between two row constructors use `row_constructor_compare`.
             (
-                Datum::Record(a) | Datum::Composite { fields: a, .. },
+                Datum::Composite { fields: a, .. },
                 Datum::Record(b) | Datum::Composite { fields: b, .. },
             ) => record_compare(operator, a, b, &builtin_record_field_type_name),
             _ => compare(operator, l, r, l_unknown, r_unknown),
@@ -3283,6 +3336,44 @@ pub(crate) fn binary<'a>(
             operator.operator_name().unwrap_or("?"),
             type_name_of(&r)
         )),
+        NotLike | NotILike | RegexNotMatch | RegexNotIMatch => {
+            let positive = match operator {
+                NotLike => Like,
+                NotILike => ILike,
+                RegexNotMatch => RegexMatch,
+                _ => RegexIMatch,
+            };
+            match binary(positive, l, r, l_unknown, r_unknown, arena) {
+                Ok(Datum::Bool(matched)) => Ok(Datum::Bool(!matched)),
+                Err(error) if error.sqlstate == sqlstate::UNDEFINED_FUNCTION => Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "operator does not exist: {} {} {}",
+                    type_name_of(&l),
+                    operator.operator_name().unwrap_or("?"),
+                    type_name_of(&r)
+                )),
+                other => other,
+            }
+        }
+        // Only reached as the per-element operator of a quantified `~ ANY/ALL`.
+        RegexMatch | RegexIMatch => match (l, r) {
+            (Datum::Null, _) | (_, Datum::Null) => Ok(Datum::Null),
+            (
+                Datum::Text(text) | Datum::Bpchar(text),
+                Datum::Text(pattern) | Datum::Bpchar(pattern),
+            ) => Ok(Datum::Bool(super::super::regex::regex_search(
+                pattern,
+                text,
+                operator == RegexIMatch,
+            )?)),
+            _ => Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "operator does not exist: {} {} {}",
+                type_name_of(&l),
+                operator.operator_name().unwrap_or("?"),
+                type_name_of(&r)
+            )),
+        },
         // Only reached as the per-element operator of a quantified `LIKE ANY/ALL`.
         Like | ILike => {
             if l.is_null() || r.is_null() {

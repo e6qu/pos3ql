@@ -1776,6 +1776,28 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// [`Self::unmodified_type_name`] plus PostgreSQL's `TypeNameToString`
+    /// of the written name (`pg_catalog.int4` for `int`).
+    fn unmodified_type_name_written(&mut self) -> Result<(&'a str, &'a str), ParseError> {
+        let (name, modifier, written) = self.type_name_written()?;
+        if modifier != -1 {
+            return Err(self.err_here("type modifiers are not allowed in this definition"));
+        }
+        let text = stack_format!(
+            264,
+            "{}{}{}{}",
+            written.schema.unwrap_or(""),
+            if written.schema.is_some() { "." } else { "" },
+            written.name,
+            if written.array { "[]" } else { "" }
+        );
+        let written = self
+            .arena
+            .alloc_str(text.as_str())
+            .map_err(|_| self.err_here("type name too long"))?;
+        Ok((name, written))
+    }
+
     pub(super) fn unmodified_type_name(&mut self) -> Result<&'a str, ParseError> {
         let (name, modifier) = self.type_name_mod()?;
         if modifier != -1 {
@@ -2853,6 +2875,29 @@ impl<'a> Parser<'a> {
                 let source =
                     index_expression_source(expression, self.text[start..self.peek_at].trim());
                 self.expect_op(")")?;
+                StatisticsKey::Expression(StatisticsExpression { expression, source })
+            } else if matches!(self.peeked, Tok::Ident(_) | Tok::QuotedIdent(_)) && {
+                // PostgreSQL's `stats_param` also takes a bare function call.
+                let mut lexer = self.lexer.clone();
+                matches!(
+                    lexer
+                        .next_token()
+                        .map_err(|error| ParseError::lexical(error, self.text))?,
+                    Tok::Op("(") | Tok::Op(".")
+                )
+            } {
+                let start = self.peek_at;
+                let expression = self.prefix()?;
+                if !matches!(
+                    expression,
+                    Expr::Call {
+                        kind: crate::sql::ast::CallKind::Routine,
+                        ..
+                    }
+                ) {
+                    return Err(self.syntax_error_here());
+                }
+                let source = self.text[start..self.peek_at].trim();
                 StatisticsKey::Expression(StatisticsExpression { expression, source })
             } else {
                 StatisticsKey::Column(self.col_ident("column name")?)
@@ -4295,8 +4340,14 @@ impl<'a> Parser<'a> {
                 return Err(self.syntax_error_here());
             }
         }
-        let language =
-            language.ok_or_else(|| self.invalid_function_definition("no language specified"))?;
+        // PostgreSQL's CreateFunction: a SQL-standard body implies LANGUAGE SQL.
+        let language = match (language, body) {
+            (Some(language), _) => language,
+            (None, Some(body)) if !matches!(body, crate::sql::ast::RoutineBody::String(_)) => {
+                crate::sql::ast::RoutineLanguage::Sql
+            }
+            (None, _) => return Err(self.invalid_function_definition("no language specified")),
+        };
         if body.is_some_and(|body| {
             !matches!(body, crate::sql::ast::RoutineBody::String(_))
                 && language != crate::sql::ast::RoutineLanguage::Sql
@@ -4351,19 +4402,6 @@ impl<'a> Parser<'a> {
                 near: None,
                 detail: None,
             });
-        }
-        // PostgreSQL's SQL-function validator rejects these pseudo-types.
-        if language == crate::sql::ast::RoutineLanguage::Sql
-            && let Some(result) = match kind {
-                RoutineCreateKind::Trigger => Some("trigger"),
-                RoutineCreateKind::EventTrigger => Some("event_trigger"),
-                _ => None,
-            }
-        {
-            return Err(self.invalid_function_definition_owned(stack_format!(
-                super::PARSE_MESSAGE_BYTES,
-                "SQL functions cannot return type {result}"
-            )));
         }
         if language == crate::sql::ast::RoutineLanguage::PlPgSql
             && !matches!(
@@ -7372,9 +7410,9 @@ impl<'a> Parser<'a> {
                 false
             };
             self.expect_op("(")?;
-            let source_type = self.unmodified_type_name()?;
+            let (source_type, source_written) = self.unmodified_type_name_written()?;
             self.expect_ident("as")?;
-            let target_type = self.unmodified_type_name()?;
+            let (target_type, target_written) = self.unmodified_type_name_written()?;
             self.expect_op(")")?;
             let cascade = if self.eat_ident("cascade")? {
                 true
@@ -7385,6 +7423,8 @@ impl<'a> Parser<'a> {
             return Ok(Stmt::DropCast(crate::sql::ast::DropCast {
                 source_type,
                 target_type,
+                source_written,
+                target_written,
                 if_exists,
                 cascade,
             }));
@@ -8001,6 +8041,16 @@ impl<'a> Parser<'a> {
         let mut actions = [AlterRoutineAction::SetStrict(false); 32];
         let mut action_count = 0usize;
         loop {
+            // OWNER TO, RENAME TO, SET SCHEMA and DEPENDS ON EXTENSION are
+            // whole commands in PostgreSQL's grammar, never list items.
+            if action_count > 0
+                && matches!(
+                    self.peeked,
+                    Tok::Ident("owner" | "rename" | "depends" | "no")
+                )
+            {
+                return Err(self.syntax_error_here());
+            }
             let action = if self.eat_ident("owner")? {
                 self.expect_ident("to")?;
                 AlterRoutineAction::SetOwner(self.any_ident("role name")?)
@@ -8008,6 +8058,9 @@ impl<'a> Parser<'a> {
                 self.expect_ident("to")?;
                 AlterRoutineAction::Rename(self.col_ident("routine name")?)
             } else if self.eat_ident("set")? {
+                if action_count > 0 && self.eat_ident("schema")? {
+                    return Err(self.syntax_error_here());
+                }
                 if self.eat_ident("schema")? {
                     AlterRoutineAction::SetSchema(self.col_ident("schema name")?)
                 } else {
@@ -8733,6 +8786,16 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         let mut columns = ArenaList::new(self.arena);
         loop {
+            // PostgreSQL accepts `(expression)` and function-call keys too;
+            // pos3ql partitions only by columns and refuses the rest loudly.
+            let at = self.peek_at;
+            if self.peeked == Tok::Op("(") || self.peek_is_function_call()? {
+                self.expression(0)?;
+                let mut error =
+                    ParseError::new(at, "partition keys that are expressions are not supported");
+                error.sqlstate = crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED;
+                return Err(error);
+            }
             let column = self.col_ident("partition key column")?;
             self.push(&mut columns, column)?;
             if !self.eat_op(",")? {

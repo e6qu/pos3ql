@@ -69,10 +69,45 @@ pub(crate) enum CommonTypeError {
     Conversion { from: ColType, to: ColType },
 }
 
+/// The name PostgreSQL reports when a column is declared with a pseudo-type
+/// (`column "c" has pseudo-type cstring`). Only `record` and `cstring` have
+/// array types: `record[]` is itself a pseudo-type, and an array of `cstring`
+/// is rejected for its element.
+pub(crate) fn pseudo_type_column_name(type_name: &str) -> Option<&'static str> {
+    let name = type_name.strip_prefix("pg_catalog.").unwrap_or(type_name);
+    let (base, array) = match name.strip_suffix("[]") {
+        Some(base) => (base, true),
+        None => match name.strip_prefix('_') {
+            Some(base @ ("record" | "cstring")) => (base, true),
+            _ => (name, false),
+        },
+    };
+    let base = super::catalog::builtin_type_rows()
+        .iter()
+        .find(|row| row.kind == b'p' && row.name == base)?
+        .name;
+    Some(match (base, array) {
+        ("record", true) => "record[]",
+        ("cstring", _) => "cstring",
+        (_, true) => return None,
+        ("any", false) => "\"any\"",
+        (base, false) => base,
+    })
+}
+
+/// PostgreSQL 18.6 `pg_type.typispreferred`: bool, text, oid, float8, inet,
+/// timestamptz, interval and varbit.
+pub(crate) fn preferred_type_oid(type_oid: i32) -> bool {
+    let rows = super::catalog::builtin_type_rows();
+    rows.binary_search_by_key(&type_oid, |row| row.oid)
+        .is_ok_and(|position| rows[position].preferred)
+}
+
 pub(crate) fn type_category(ctype: ColType) -> &'static str {
     use ColType::*;
     match ctype {
-        Void | Internal | PgDdlCommand | Record | AnyArray => "P",
+        Pseudo(PseudoType::Unknown) => "X",
+        Void | Internal | PgDdlCommand | Record | AnyArray | Pseudo(_) => "P",
         Bool => "B",
         Int2 | Int4 | Int8 | Numeric | Float4 | Float8 | Money | Oid | Regtype | Regproc
         | Regprocedure | Regoper | Regoperator | Regclass | Regnamespace | Regrole | Regconfig
@@ -232,6 +267,12 @@ pub mod oid {
     /// PostgreSQL's opaque server-state pseudo-type.
     pub const INTERNAL: i32 = 2281;
     pub const FDW_HANDLER: i32 = 3115;
+    pub const CSTRING: i32 = 2275;
+    pub const CSTRING_ARRAY: i32 = 1263;
+    pub const LANGUAGE_HANDLER: i32 = 2280;
+    pub const INDEX_AM_HANDLER: i32 = 325;
+    pub const TABLE_AM_HANDLER: i32 = 269;
+    pub const TSM_HANDLER: i32 = 3310;
     pub const ANY: i32 = 2276;
     pub const ANYELEMENT: i32 = 2283;
     pub const ANYNONARRAY: i32 = 2776;
@@ -292,17 +333,15 @@ pub mod oid {
     pub const REGCOLLATION_ARRAY: i32 = 4192;
     /// Base OIDs for user-defined domains, enums, composites, and the array types PostgreSQL
     /// creates alongside each of them. Each identifier adds a checked creation
-    /// stamp; the bands are independent of configured catalog positions.
-    pub const FIRST_DOMAIN: i32 = 180_000_000;
-    pub const FIRST_ENUM: i32 = 200_000_000;
-    pub const FIRST_TABLE_COMPOSITE: i32 = 130_000_000;
-    pub const FIRST_VIEW_COMPOSITE: i32 = 140_000_000;
-    pub const FIRST_COMPOSITE: i32 = 220_000_000;
-    pub const FIRST_DOMAIN_ARRAY: i32 = 240_000_000;
-    pub const FIRST_ENUM_ARRAY: i32 = 260_000_000;
-    pub const FIRST_COMPOSITE_ARRAY: i32 = 280_000_000;
-    pub const FIRST_TABLE_COMPOSITE_ARRAY: i32 = 150_000_000;
-    pub const FIRST_VIEW_COMPOSITE_ARRAY: i32 = 160_000_000;
+    /// stamp; the bands are independent of configured catalog positions. A
+    /// relation's row type is a composite identified by the relation's stamp,
+    /// which shares the same creation sequence.
+    pub const FIRST_DOMAIN: i32 = crate::storage::OidBand::Domain.base();
+    pub const FIRST_ENUM: i32 = crate::storage::OidBand::Enum.base();
+    pub const FIRST_COMPOSITE: i32 = crate::storage::OidBand::Composite.base();
+    pub const FIRST_DOMAIN_ARRAY: i32 = crate::storage::OidBand::DomainArray.base();
+    pub const FIRST_ENUM_ARRAY: i32 = crate::storage::OidBand::EnumArray.base();
+    pub const FIRST_COMPOSITE_ARRAY: i32 = crate::storage::OidBand::CompositeArray.base();
     pub fn domain_oid(creation: crate::storage::TypeCreation) -> i32 {
         FIRST_DOMAIN + creation.created_at() as i32
     }
@@ -465,6 +504,91 @@ pub(crate) fn acl_identifier(name: &str) -> crate::util::StackStr<132> {
     quoted
 }
 
+/// PostgreSQL pseudo-types that name routine contracts rather than values:
+/// built-in input functions take `cstring`, `format` takes `"any"`, handlers
+/// return `fdw_handler`. They identify routine signatures (`int4in(cstring)`
+/// in `GRANT`, `regprocedure` input and object identities) and never reach a
+/// stored column, a value or durable state. Polymorphic types are
+/// [`crate::storage::PolymorphicType`]; `void`, `internal`, `record`,
+/// `anyarray` and `pg_ddl_command` keep their own [`ColType`] variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PseudoType {
+    Cstring,
+    Any,
+    Trigger,
+    EventTrigger,
+    LanguageHandler,
+    FdwHandler,
+    IndexAmHandler,
+    TableAmHandler,
+    TsmHandler,
+    Unknown,
+}
+
+impl PseudoType {
+    pub const ALL: [Self; 10] = [
+        Self::Cstring,
+        Self::Any,
+        Self::Trigger,
+        Self::EventTrigger,
+        Self::LanguageHandler,
+        Self::FdwHandler,
+        Self::IndexAmHandler,
+        Self::TableAmHandler,
+        Self::TsmHandler,
+        Self::Unknown,
+    ];
+
+    pub const fn oid(self) -> i32 {
+        match self {
+            Self::Cstring => oid::CSTRING,
+            Self::Any => oid::ANY,
+            Self::Trigger => oid::TRIGGER,
+            Self::EventTrigger => oid::EVENT_TRIGGER,
+            Self::LanguageHandler => oid::LANGUAGE_HANDLER,
+            Self::FdwHandler => oid::FDW_HANDLER,
+            Self::IndexAmHandler => oid::INDEX_AM_HANDLER,
+            Self::TableAmHandler => oid::TABLE_AM_HANDLER,
+            Self::TsmHandler => oid::TSM_HANDLER,
+            Self::Unknown => oid::UNKNOWN,
+        }
+    }
+
+    /// `pg_type.typname`.
+    pub const fn catalog_name(self) -> &'static str {
+        match self {
+            Self::Cstring => "cstring",
+            Self::Any => "any",
+            Self::Trigger => "trigger",
+            Self::EventTrigger => "event_trigger",
+            Self::LanguageHandler => "language_handler",
+            Self::FdwHandler => "fdw_handler",
+            Self::IndexAmHandler => "index_am_handler",
+            Self::TableAmHandler => "table_am_handler",
+            Self::TsmHandler => "tsm_handler",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// `format_type` output: `any` is a reserved word and prints quoted.
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Any => "\"any\"",
+            other => other.catalog_name(),
+        }
+    }
+
+    pub fn from_catalog_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.catalog_name() == name)
+    }
+
+    pub fn from_oid(type_oid: i32) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.oid() == type_oid)
+    }
+}
+
 /// Column types the engine stores. A deliberately small, growing set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColType {
@@ -624,6 +748,8 @@ pub enum ColType {
     /// A named composite type (`CREATE TYPE ... AS (...)`). Unlike `Record`,
     /// this is durable and carries a catalog identity.
     Composite(Option<crate::storage::TypeCreation>),
+    /// A routine-contract pseudo-type; see [`PseudoType`].
+    Pseudo(PseudoType),
 }
 
 /// B-tree operator classes whose comparison semantics the executor implements.
@@ -719,7 +845,7 @@ impl BtreeOperatorClass {
             Bit { varying: true } => Self::Varbit,
             Void | Internal | PgDdlCommand | AnyArray | Int2Vector | OidVector | PgNodeTree
             | PgNdistinct | PgDependencies | PgMcvList | PgStatisticArray | Json | Xml
-            | Jsonpath => {
+            | Jsonpath | Pseudo(_) => {
                 return None;
             }
         })
@@ -1003,6 +1129,7 @@ impl HashOperatorClass {
             | Internal
             | PgDdlCommand
             | AnyArray
+            | Pseudo(_)
             | Int2Vector
             | PgNodeTree
             | PgNdistinct
@@ -2505,15 +2632,36 @@ impl ColType {
             self,
             Self::Json
                 | Self::Refcursor
+                | Self::Pseudo(PseudoType::Cstring)
                 | Self::Array(ArrElem::Json)
                 | Self::Array(ArrElem::Refcursor)
+                | Self::Array(ArrElem::Cstring)
         )
+    }
+
+    /// Whether PostgreSQL finds a default btree or hash equality for the type
+    /// (`lookup_type_cache` with `TYPECACHE_EQ_OPR`), as DISTINCT, grouping,
+    /// set operations, array comparison and array search require. Geometric
+    /// types keep their `=` operators (box area equality, for example) but
+    /// have no such operator class, like `xml` and the snapshot types. An
+    /// array has one exactly when its element does.
+    pub fn has_default_equality(self) -> bool {
+        match self {
+            Self::Array(element) => element.to_coltype().has_default_equality(),
+            _ => {
+                self.has_builtin_equality()
+                    && !matches!(
+                        self,
+                        Self::Xml | Self::Geometry(_) | Self::PgSnapshot | Self::TxidSnapshot
+                    )
+            }
+        }
     }
 
     /// Whether PostgreSQL exposes the ordering operators needed by SQL sort
     /// keys. Command IDs have equality but deliberately have no ordering.
-    pub const fn has_builtin_ordering(self) -> bool {
-        self.has_builtin_equality() && !matches!(self, Self::Cid | Self::Array(ArrElem::Cid))
+    pub fn has_builtin_ordering(self) -> bool {
+        self.has_default_equality() && !matches!(self, Self::Cid | Self::Array(ArrElem::Cid))
     }
 
     /// Whether values of this type carry a PostgreSQL collation.
@@ -2527,11 +2675,32 @@ impl ColType {
         }
     }
 
+    /// The type PostgreSQL names when a table or view column of this type is
+    /// rejected (`column "a" has pseudo-type cstring`); an array of
+    /// `cstring` is rejected for its element. `unknown` columns become text.
+    pub fn rejected_column_pseudo_type(self) -> Option<&'static str> {
+        match self {
+            Self::Array(ArrElem::Record) => Some("record[]"),
+            Self::Array(ArrElem::Cstring) => Some("cstring"),
+            Self::Pseudo(PseudoType::Unknown) => None,
+            Self::Pseudo(kind) => Some(kind.display_name()),
+            Self::Void | Self::Internal | Self::PgDdlCommand | Self::AnyArray | Self::Record => {
+                Some(self.internal_name())
+            }
+            _ => None,
+        }
+    }
+
     /// Pseudo-types describe executor contracts rather than stored values.
     pub const fn is_pseudo(self) -> bool {
         matches!(
             self,
-            Self::Void | Self::Internal | Self::PgDdlCommand | Self::AnyArray | Self::Record
+            Self::Void
+                | Self::Internal
+                | Self::PgDdlCommand
+                | Self::AnyArray
+                | Self::Record
+                | Self::Pseudo(_)
         )
     }
 
@@ -2596,6 +2765,14 @@ impl ColType {
         // `element[]` is an array of a scalar element type.
         if let Some(base) = name.strip_suffix("[]") {
             return ArrElem::from_coltype(ColType::from_sql_name(base)?).map(ColType::Array);
+        }
+        // `_element` is the array type's own `pg_type` name.
+        if name.starts_with('_')
+            && let Some(element) = ArrElem::BUILTIN
+                .into_iter()
+                .find(|element| element.catalog_name() == name)
+        {
+            return Some(Self::Array(element));
         }
         if let Some(k) = RangeKind::from_name(name) {
             return Some(Self::Range(k));
@@ -2672,7 +2849,7 @@ impl ColType {
             "macaddr" => Self::Macaddr,
             "macaddr8" => Self::Macaddr8,
             "record" => Self::Record,
-            _ => return None,
+            other => Self::Pseudo(PseudoType::from_catalog_name(other)?),
         })
     }
 
@@ -2755,6 +2932,7 @@ impl ColType {
             Self::Record => oid::RECORD,
             Self::Enum(slot) => oid::enum_oid(slot?),
             Self::Composite(slot) => oid::composite_oid(slot?),
+            Self::Pseudo(kind) => kind.oid(),
         })
     }
     /// Inverse of [`ColType::oid`]: the column type a PostgreSQL type OID names,
@@ -2830,7 +3008,10 @@ impl ColType {
             oid::MACADDR8 => Some(Self::Macaddr8),
             oid::RECORD => Some(Self::Record),
             oid::RECORD_ARRAY => Some(Self::Array(ArrElem::Record)),
-            _ => None,
+            // An untyped literal's `unknown` is not a column type here; only
+            // a written signature names it.
+            oid::UNKNOWN => None,
+            other => PseudoType::from_oid(other).map(Self::Pseudo),
         };
         if scalar.is_some() {
             return scalar;
@@ -3001,6 +3182,7 @@ impl ColType {
             // Resolve the current name through the bound creation identity.
             Self::Enum(_) => "enum",
             Self::Composite(_) => "record",
+            Self::Pseudo(kind) => kind.catalog_name(),
         }
     }
 
@@ -3087,6 +3269,7 @@ impl ColType {
             Self::Record => "record",
             Self::Enum(_) => "enum",
             Self::Composite(_) => "record",
+            Self::Pseudo(kind) => kind.display_name(),
         }
     }
 
@@ -3174,10 +3357,11 @@ impl ColType {
             Self::Geometry(GeometryKind::Circle) => 225,
             Self::Multirange(k) => MULTIRANGE_CODE_BASE + k.code(),
             Self::Array(e) => ARRAY_CODE_BASE + e.code(),
-            // Records are transient (never a stored column); the code is a
-            // loud sentinel with no `from_code` inverse, so any leak into the
-            // persistence layer fails visibly at reload.
-            Self::Record => 46,
+            // Records and routine-contract pseudo-types are transient (never a
+            // stored column or a durable routine); the code is a loud sentinel
+            // with no `from_code` inverse, so any leak into the persistence
+            // layer fails visibly at reload.
+            Self::Record | Self::Pseudo(_) => 46,
             // The code marks "an enum column"; *which* enum is carried
             // alongside as the type name (slots are not stable across restart),
             // and a stored enum value carries its own label + sort inline.
@@ -3298,6 +3482,9 @@ pub enum ArrElem {
     Float8,
     Text,
     Refcursor,
+    /// `cstring[]`: text-shaped elements of the pseudo-type that typmod input
+    /// functions take. It is never a stored column type.
+    Cstring,
     /// `aclitem[]` uses text-shaped values with PostgreSQL's distinct catalog
     /// and wire identity. An individual aclitem is not a general stored type.
     AclItem,
@@ -3377,7 +3564,7 @@ impl ArrElem {
     /// transmits as an array. This is the single inventory for OID decoding
     /// and catalog synthesis, so adding an accepted array cannot leave its
     /// `pg_type` identity behind.
-    pub const BUILTIN: [Self; 73] = [
+    pub const BUILTIN: [Self; 74] = [
         Self::Bool,
         Self::Char,
         Self::Int2,
@@ -3396,6 +3583,7 @@ impl ArrElem {
         Self::Float8,
         Self::Text,
         Self::Refcursor,
+        Self::Cstring,
         Self::AclItem,
         Self::Name,
         Self::Varchar,
@@ -3499,6 +3687,7 @@ impl ArrElem {
             ArrElem::Float8 => "_float8",
             ArrElem::Text => "_text",
             ArrElem::Refcursor => "_refcursor",
+            ArrElem::Cstring => "_cstring",
             ArrElem::AclItem => "_aclitem",
             ArrElem::Numeric => "_numeric",
             ArrElem::Date => "_date",
@@ -3590,6 +3779,7 @@ impl ArrElem {
             ArrElem::Float8 => "double precision[]",
             ArrElem::Text => "text[]",
             ArrElem::Refcursor => "refcursor[]",
+            ArrElem::Cstring => "cstring[]",
             ArrElem::AclItem => "aclitem[]",
             ArrElem::Numeric => "numeric[]",
             ArrElem::Date => "date[]",
@@ -3746,6 +3936,7 @@ impl ArrElem {
             ColType::Bpchar => return Some(ArrElem::Bpchar),
             ColType::Name => return Some(ArrElem::Name),
             ColType::Refcursor => return Some(ArrElem::Refcursor),
+            ColType::Pseudo(PseudoType::Cstring) => return Some(ArrElem::Cstring),
             ColType::Oid => return Some(ArrElem::Oid),
             ColType::Xid => return Some(ArrElem::Xid),
             ColType::Tid => return Some(ArrElem::Tid),
@@ -3831,6 +4022,7 @@ impl ArrElem {
             ArrElem::Float8 => ColType::Float8,
             ArrElem::Text => ColType::Text,
             ArrElem::Refcursor => ColType::Refcursor,
+            ArrElem::Cstring => ColType::Pseudo(PseudoType::Cstring),
             ArrElem::AclItem => ColType::AclItem,
             ArrElem::Numeric => ColType::Numeric,
             ArrElem::Date => ColType::Date,
@@ -3914,6 +4106,7 @@ impl ArrElem {
             ArrElem::Float8 => 1022,
             ArrElem::Text => 1009,
             ArrElem::Refcursor => oid::REFCURSOR_ARRAY,
+            ArrElem::Cstring => oid::CSTRING_ARRAY,
             ArrElem::AclItem => oid::ACLITEM_ARRAY,
             ArrElem::Numeric => 1231,
             ArrElem::Date => 1182,
@@ -3994,6 +4187,7 @@ impl ArrElem {
             ArrElem::Float8 => 3,
             ArrElem::Text => 4,
             ArrElem::Refcursor => 166,
+            ArrElem::Cstring => 169,
             ArrElem::AclItem => 125,
             ArrElem::Numeric => 5,
             ArrElem::Date => 6,
@@ -4068,6 +4262,7 @@ impl ArrElem {
             3 => ArrElem::Float8,
             4 => ArrElem::Text,
             166 => ArrElem::Refcursor,
+            169 => ArrElem::Cstring,
             125 => ArrElem::AclItem,
             5 => ArrElem::Numeric,
             6 => ArrElem::Date,

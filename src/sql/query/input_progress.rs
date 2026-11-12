@@ -440,6 +440,27 @@ impl RoutineInputs {
     pub(super) fn begin_attempt(&self) {
         self.next.set(0);
     }
+
+    pub(super) fn position(&self) -> usize {
+        self.next.get()
+    }
+
+    pub(super) fn seek(&self, position: usize) {
+        self.next.set(position);
+    }
+
+    /// Forgets the inputs saved from `position` on, by work an attempt
+    /// abandoned before it reached a call of its own.
+    pub(super) fn forget_from(&self, position: usize, arena: &Arena) -> Result<(), SqlError> {
+        let mut saved = self.saved.borrow_mut();
+        let kept = saved
+            .with_slice(arena, |values| {
+                values.partition_point(|entry| entry.ordinal < position)
+            })
+            .map_err(|_| changed())?;
+        saved.truncate(kept);
+        Ok(())
+    }
 }
 
 struct InputAttempt<'statement, 'query> {

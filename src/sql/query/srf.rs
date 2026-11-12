@@ -8,7 +8,7 @@
 //! scan machinery can resolve against, which is what is synthesized here.
 
 use crate::mem::arena::{Arena, ArenaList, ArenaString};
-use crate::sql::ast::{Expr, Select, SelectItem, TableRef};
+use crate::sql::ast::{Expr, Select, SelectItem, SetTree, TableRef};
 use crate::sql::eval::{ColumnLookup, EvalHooks, ProjectSetValue, SqlError, eval_full, sqlstate};
 use crate::sql::exec::MAX_PROJ;
 
@@ -61,6 +61,8 @@ fn srf_arity_unqualified(name: &str) -> Option<SrfArity> {
             "pg_snapshot_xip",
             "txid_snapshot_xip",
             "pg_options_to_table",
+            "pg_partition_ancestors",
+            "pg_partition_tree",
             "aclexplode",
             "pg_get_sequence_data",
             "ts_token_type",
@@ -1355,6 +1357,42 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 }
                 return Ok(values);
             }
+            if name.eq_ignore_ascii_case("pg_partition_tree") {
+                if args.len() != 1 || *variadic {
+                    return Err(srf_signature_error(name));
+                }
+                let rows = partition_tree_rows(
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    storage,
+                    txid,
+                    arena,
+                )?;
+                let values = arena
+                    .alloc_slice_with(rows.len(), |_| Datum::Null)
+                    .map_err(|_| arena_full())?;
+                for (value, row) in values.iter_mut().zip(rows) {
+                    let fields = arena
+                        .alloc_slice_with(4, |index| crate::sql::types::RecordField {
+                            name: PARTITION_TREE_COLUMNS[index].0,
+                            type_oid: PARTITION_TREE_COLUMNS[index].1.oid(),
+                            value: row[index],
+                        })
+                        .map_err(|_| arena_full())?;
+                    *value = Datum::Record(fields);
+                }
+                return Ok(values);
+            }
+            if name.eq_ignore_ascii_case("pg_partition_ancestors") {
+                if args.len() != 1 || *variadic {
+                    return Err(srf_signature_error(name));
+                }
+                return partition_ancestor_values(
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    storage,
+                    txid,
+                    arena,
+                );
+            }
             if name.eq_ignore_ascii_case("pg_snapshot_xip")
                 || name.eq_ignore_ascii_case("txid_snapshot_xip")
             {
@@ -2072,8 +2110,6 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
         }
         let jsonb =
             name.eq_ignore_ascii_case("jsonb_each") || name.eq_ignore_ascii_case("jsonb_each_text");
-        let as_text = name.eq_ignore_ascii_case("json_each_text")
-            || name.eq_ignore_ascii_case("jsonb_each_text");
         let document = eval_full(args[0], arena, params, row, hooks)?;
         crate::sql::eval::funcs::json::check_json_family(name, &document)?;
         let text = match crate::sql::eval::text_view(document) {
@@ -2081,13 +2117,14 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
             Datum::Text(s) => s,
             Datum::Null => return Ok(0),
             _ => {
-                return Err(sql_err!(
-                    sqlstate::INVALID_PARAMETER_VALUE,
-                    "cannot deconstruct a scalar"
+                return Err(crate::sql::json::each_error(
+                    name,
+                    jsonb,
+                    crate::sql::json::Kind::Scalar,
                 ));
             }
         };
-        Ok(crate::sql::eval::json_each_pairs(text, jsonb, as_text, arena)?.len())
+        Ok(crate::sql::eval::json_each_pairs(name, text, arena)?.len())
     } else if name.eq_ignore_ascii_case("regexp_split_to_table") {
         if !(2..=3).contains(&args.len()) {
             return Err(sql_err!(
@@ -2273,6 +2310,81 @@ pub(super) fn preserve_projection_type_identities(
     Ok(())
 }
 
+/// A record column of a set operation has the field shape of its leftmost
+/// query's expression, as PostgreSQL resolves `(u.tail).f1` through the
+/// first query's target list.
+fn register_set_record_shapes<'a>(
+    storage: &Storage,
+    tree: &SetTree<'_>,
+    txid: u32,
+    arena: &'a Arena,
+    descriptors: &mut [ColDesc<'a>],
+) -> Result<(), SqlError> {
+    let mut leaf = tree;
+    while let SetTree::Op { left, .. } = leaf {
+        leaf = left;
+    }
+    let SetTree::Select(leaf) = leaf else {
+        unreachable!("set tree leaf");
+    };
+    if leaf.set_body.is_some()
+        || !descriptors
+            .iter()
+            .any(|column| column.type_oid == crate::sql::types::oid::RECORD)
+    {
+        return Ok(());
+    }
+    let scope = leaf
+        .from
+        .as_ref()
+        .map(|from| QueryScope::resolve_schema(storage, from, txid, arena, None))
+        .transpose()?;
+    let scoped = scope.as_ref().map(|scope| super::CatalogScopeCols {
+        scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    });
+    let fromless = crate::sql::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    let columns: &dyn crate::sql::exec::ColTypeResolver = match scoped.as_ref() {
+        Some(columns) => columns,
+        None => &fromless,
+    };
+    let mut slot = 0usize;
+    for item in leaf.items {
+        match item {
+            SelectItem::Wildcard(_) => slot += scope.as_ref().map_or(0, QueryScope::star_columns),
+            SelectItem::TableWildcard(name) => {
+                if let Some(scope) = scope.as_ref() {
+                    slot += scope.qualified_star_columns(name)?;
+                }
+            }
+            SelectItem::RecordStar(base) => {
+                slot += record_star_width(base, scope.as_ref(), storage, txid, arena)?;
+            }
+            SelectItem::Expr { expression, .. } => {
+                if let Some(column) = descriptors.get_mut(slot)
+                    && column.type_oid == crate::sql::types::oid::RECORD
+                    && let Some(handle) =
+                        crate::sql::exec::register_shape_for(expression, columns, arena)?
+                {
+                    column.type_mod = handle;
+                }
+                slot += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Describes a derived table without retaining a maximum-width arena image.
 /// `outer` resolves the names the derived table may read from outside
 /// itself: the enclosing queries, and for a `LATERAL` item first the FROM
@@ -2296,11 +2408,10 @@ pub(crate) fn describe_derived_definition<'a>(
     let outer_columns = outer;
     let mut descriptors = [ColDesc::new("", 0, 0); MAX_PROJ];
     let mut type_oids = [0_i32; MAX_PROJ];
-    let mut output_collations = [crate::sql::ast::Collation::None; MAX_PROJ];
     let n_cols = match sub.set_body {
         Some(tree) => {
             let outer_types = outer.map(super::scope::OuterColumnTypes);
-            describe_set_body(
+            let n = describe_set_body(
                 storage,
                 tree,
                 txid,
@@ -2311,7 +2422,9 @@ pub(crate) fn describe_derived_definition<'a>(
                 outer_types
                     .as_ref()
                     .map(|types| types as &dyn ColumnLookup<'_>),
-            )?
+            )?;
+            register_set_record_shapes(storage, tree, txid, arena, &mut descriptors[..n])?;
+            n
         }
         None => match &sub.from {
             // A FROM-less body may still read the enclosing queries
@@ -2394,31 +2507,19 @@ pub(crate) fn describe_derived_definition<'a>(
                         }
                     }
                 }
-                let mut slot = 0usize;
+                // Collation conflicts in the projection fail here; the
+                // descriptors already carry each column's collation.
                 for item in sub.items {
                     match item {
-                        SelectItem::Wildcard(_) => {
-                            for position in 0..ss.star_columns() {
-                                output_collations[slot] =
-                                    ss.output_collation(ss.star_entry(position));
-                                slot += 1;
-                            }
-                        }
                         SelectItem::TableWildcard(name) => {
                             for index in 0..ss.qualified_star_columns(name)? {
-                                output_collations[slot] =
-                                    ss.output_collation(ss.qualified_star_entry(name, index)?);
-                                slot += 1;
+                                ss.qualified_star_entry(name, index)?;
                             }
                         }
-                        SelectItem::RecordStar(base) => {
-                            slot += record_star_width(base, Some(&ss), storage, txid, arena)?;
-                        }
                         SelectItem::Expr { expression, .. } => {
-                            output_collations[slot] =
-                                ss.expression_collation(storage, arena, expression)?;
-                            slot += 1;
+                            ss.enclosed_expression_collation(storage, arena, expression, outer)?;
                         }
+                        SelectItem::Wildcard(_) | SelectItem::RecordStar(_) => {}
                     }
                 }
                 preserve_projection_type_identities(
@@ -2487,12 +2588,27 @@ pub(crate) fn describe_derived_definition<'a>(
             }
         },
     };
-    for (output, description) in output_collations[..n_cols]
-        .iter_mut()
-        .zip(&descriptors[..n_cols])
-    {
-        *output = description.collation;
-    }
+    finish_derived_definition(
+        storage,
+        exposed,
+        col_alias,
+        txid,
+        arena,
+        &mut descriptors[..n_cols],
+        &type_oids[..n_cols],
+    )
+}
+
+fn finish_derived_definition<'a, 'd>(
+    storage: &Storage,
+    exposed: &str,
+    col_alias: Option<&[&'d str]>,
+    txid: u32,
+    arena: &'a Arena,
+    descriptors: &mut [ColDesc<'d>],
+    type_oids: &[i32],
+) -> Result<RelationDefinition<'a>, SqlError> {
+    let n_cols = descriptors.len();
     if n_cols > MAX_COLUMNS {
         return Err(sql_err!(
             sqlstate::TOO_MANY_COLUMNS,
@@ -2547,7 +2663,7 @@ pub(crate) fn describe_derived_definition<'a>(
             ctype,
             type_mod: descriptors[i].type_mod,
             collation: if ctype.is_collatable() {
-                match output_collations[i] {
+                match descriptors[i].collation {
                     crate::sql::ast::Collation::None => crate::sql::ast::Collation::Default,
                     collation => collation,
                 }
@@ -2833,57 +2949,16 @@ fn populate_record_append_columns<'a, C: ColumnLookup<'a>>(
         count += 1;
         Ok(())
     };
-    use crate::sql::types::oid;
-    if let Some(ColType::Composite(Some(creation))) = ColType::from_oid(composite_oid) {
-        let target = crate::storage::TypeDefinitionTarget::by_creation(
-            storage,
-            crate::storage::NamedTypeKind::Composite,
-            creation,
-        )?;
-        let definition = storage
-            .read_composite_definition(target, txid)?
-            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "composite type does not exist"))?;
-        for field in definition.active_fields() {
-            push(table_function_column(
-                field.name,
-                field.ctype,
-                field.user_type,
-                field.type_mod,
-                field.collation,
-            ))?;
-        }
-        return Ok(count);
-    }
-    // A table or view rowtype contributes its own columns.
-    if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_VIEW_COMPOSITE).contains(&composite_oid) {
-        let slot =
-            crate::sql::catalog::table_slot_by_row_type_oid(storage, txid, composite_oid, false)
-                .ok_or_else(|| {
-                    sql_err!(sqlstate::INTERNAL_ERROR, "table rowtype OID is not a table")
-                })?;
-        for column in storage.table_def(slot, txid).columns() {
-            push(table_function_column(
-                column.name,
-                column.ctype,
-                None,
-                column.type_mod,
-                column.collation,
-            ))?;
-        }
-        return Ok(count);
-    }
-    if (oid::FIRST_VIEW_COMPOSITE..oid::FIRST_TABLE_COMPOSITE_ARRAY).contains(&composite_oid) {
-        let slot =
-            crate::sql::catalog::view_slot_by_row_type_oid(storage, txid, composite_oid, false)
-                .ok_or_else(|| {
-                    sql_err!(sqlstate::INTERNAL_ERROR, "view rowtype OID is not a view")
-                })?;
+    // A view's row type is described from its stored query.
+    if let Some(slot) =
+        crate::sql::catalog::view_slot_by_row_type_oid(storage, txid, composite_oid, false)
+    {
         let view = storage.view(slot);
         let width = view.columns_for(txid).names().len();
         let described = arena
             .alloc_slice_with(width, |_| crate::sql::types::ColDesc::new("", 0, 0))
             .map_err(|_| arena_full())?;
-        let count = crate::sql::catalog::describe_view(storage, txid, &view, arena, described)?;
+        let count = crate::sql::catalog::describe_view(&view, txid, arena, described)?;
         for column in &described[..count] {
             let (ctype, user_type) =
                 crate::sql::exec::catalog_column_type(storage, txid, column.type_oid).ok_or_else(
@@ -2901,6 +2976,19 @@ fn populate_record_append_columns<'a, C: ColumnLookup<'a>>(
                 user_type,
                 column.type_mod,
                 column.collation,
+            ))?;
+        }
+        return Ok(count);
+    }
+    if let Some(ColType::Composite(Some(creation))) = ColType::from_oid(composite_oid) {
+        let definition = storage.require_row_type_definition(creation, txid)?;
+        for field in definition.active_fields() {
+            push(table_function_column(
+                field.name,
+                field.ctype,
+                field.user_type,
+                field.type_mod,
+                field.collation,
             ))?;
         }
         return Ok(count);
@@ -3163,6 +3251,8 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     let is_gsub = builtin_name.eq_ignore_ascii_case("generate_subscripts");
     let is_snapshot_xip = builtin_name.eq_ignore_ascii_case("pg_snapshot_xip")
         || builtin_name.eq_ignore_ascii_case("txid_snapshot_xip");
+    let is_partition_ancestors = builtin_name.eq_ignore_ascii_case("pg_partition_ancestors");
+    let is_partition_tree = builtin_name.eq_ignore_ascii_case("pg_partition_tree");
     let is_stt = builtin_name.eq_ignore_ascii_case("string_to_table");
     let is_options = builtin_name.eq_ignore_ascii_case("pg_options_to_table");
     let is_acl_explode = builtin_name.eq_ignore_ascii_case("aclexplode");
@@ -3194,6 +3284,8 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         || is_rstt
         || is_gsub
         || is_snapshot_xip
+        || is_partition_ancestors
+        || is_partition_tree
         || is_stt
         || is_options
         || is_acl_explode
@@ -3602,13 +3694,8 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         names.len()
     } else if let Some((_, ref routine)) = routine {
         if let Some(creation) = routine_composite_result(routine, storage, txid)? {
-            let target = crate::storage::TypeDefinitionTarget::by_creation(
-                storage,
-                crate::storage::NamedTypeKind::Composite,
-                creation,
-            )?;
             let definition = storage
-                .read_composite_definition(target, txid)?
+                .row_type_definition(creation, txid)?
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
@@ -3672,6 +3759,17 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             crate::sql::ast::Collation::None,
         );
         2
+    } else if is_partition_tree {
+        for (index, (name, ctype)) in PARTITION_TREE_COLUMNS.into_iter().enumerate() {
+            default_cols[index] = table_function_column(
+                SqlName::parse(name)?,
+                ctype,
+                None,
+                -1,
+                crate::sql::ast::Collation::None,
+            );
+        }
+        4
     } else if is_acl_explode {
         for (index, (name, ctype)) in [
             ("grantor", ColType::Oid),
@@ -3793,8 +3891,10 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
                     Expr::Cast { type_mod, .. } => *type_mod,
                     _ => -1,
                 };
+                // A single array's element column takes the table alias, as a
+                // scalar function's column does; several stay `unnest`.
                 default_cols[index] = table_function_column(
-                    SqlName::parse("unnest")?,
+                    SqlName::parse(if args.len() == 1 { name } else { "unnest" })?,
                     ctype,
                     user_type,
                     type_mod,
@@ -3830,6 +3930,8 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             crate::sql::eval::generate_series_result_type(start, has_numeric, has_int8)
         } else if is_gsub {
             ColType::Int4
+        } else if is_partition_ancestors {
+            ColType::Regclass
         } else if is_snapshot_xip {
             if tref.table.eq_ignore_ascii_case("txid_snapshot_xip") {
                 ColType::Int8
@@ -3861,9 +3963,16 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             ));
         };
         // A single-column function's default column name is `value` for
-        // array_elements, else the (aliased) function name.
+        // array_elements, its OUT parameter's name for pg_partition_ancestors,
+        // else the (aliased) function name.
         default_cols[0] = table_function_column(
-            SqlName::parse(if is_elems { "value" } else { name })?,
+            SqlName::parse(if is_elems {
+                "value"
+            } else if is_partition_ancestors {
+                "relid"
+            } else {
+                name
+            })?,
             single_type,
             None,
             -1,
@@ -4220,15 +4329,10 @@ pub(crate) fn table_func_rows_outer<'a, C: ColumnLookup<'a>>(
         statement_arena,
     )?;
     let rows = if let Some(creation) = produced.composite {
-        let target = crate::storage::TypeDefinitionTarget::by_creation(
-            storage,
-            crate::storage::NamedTypeKind::Composite,
-            creation,
-        )?;
         // Release this declaration reader before materializing individual values.
         let width = {
             let definition = storage
-                .read_composite_definition(target, txid)?
+                .row_type_definition(creation, txid)?
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
@@ -4651,6 +4755,38 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     .alloc_slice_with(1, |_| encoded)
                     .map(|rows| &*rows)
                     .map_err(|_| arena_full());
+            }
+            if tref.table.eq_ignore_ascii_case("pg_partition_tree") {
+                if args.len() != 1 {
+                    return Err(srf_signature_error(tref.table));
+                }
+                let tree = partition_tree_rows(eval_argument(args[0])?, storage, txid, arena)?;
+                const EMPTY: &[u8] = &[];
+                let rows = arena
+                    .alloc_slice_with(tree.len(), |_| EMPTY)
+                    .map_err(|_| arena_full())?;
+                for (row, values) in rows.iter_mut().zip(tree) {
+                    *row = crate::sql::exec::encode_projected_pub(values, arena)?;
+                }
+                return Ok(&*rows);
+            }
+            if tref.table.eq_ignore_ascii_case("pg_partition_ancestors") {
+                if args.len() != 1 {
+                    return Err(srf_signature_error(tref.table));
+                }
+                let values =
+                    partition_ancestor_values(eval_argument(args[0])?, storage, txid, arena)?;
+                const EMPTY: &[u8] = &[];
+                let rows = arena
+                    .alloc_slice_with(values.len(), |_| EMPTY)
+                    .map_err(|_| arena_full())?;
+                for (row, value) in rows.iter_mut().zip(values) {
+                    *row = crate::sql::exec::encode_projected_pub(
+                        core::slice::from_ref(value),
+                        arena,
+                    )?;
+                }
+                return Ok(&*rows);
             }
             if tref.table.eq_ignore_ascii_case("pg_snapshot_xip")
                 || tref.table.eq_ignore_ascii_case("txid_snapshot_xip")
@@ -5224,7 +5360,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         Datum::Null => {
                             return Err(sql_err!(
                                 sqlstate::NULL_VALUE_NOT_ALLOWED,
-                                "null value not allowed"
+                                "null array element not allowed in this context"
                             ));
                         }
                         _ => return Err(srf_signature_error(tref.table)),
@@ -5241,8 +5377,6 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             if is_json_each_name(tref.table) {
                 let jsonb = tref.table.eq_ignore_ascii_case("jsonb_each")
                     || tref.table.eq_ignore_ascii_case("jsonb_each_text");
-                let as_text = tref.table.eq_ignore_ascii_case("json_each_text")
-                    || tref.table.eq_ignore_ascii_case("jsonb_each_text");
                 let document = eval_argument(args[0])?;
                 crate::sql::eval::funcs::json::check_json_family(tref.table, &document)?;
                 let text = match crate::sql::eval::text_view(document) {
@@ -5250,13 +5384,14 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     Datum::Text(s) => s,
                     Datum::Null => return Ok(&[]),
                     _ => {
-                        return Err(sql_err!(
-                            sqlstate::INVALID_PARAMETER_VALUE,
-                            "cannot deconstruct a scalar"
+                        return Err(crate::sql::json::each_error(
+                            tref.table,
+                            jsonb,
+                            crate::sql::json::Kind::Scalar,
                         ));
                     }
                 };
-                let pairs = crate::sql::eval::json_each_pairs(text, jsonb, as_text, arena)?;
+                let pairs = crate::sql::eval::json_each_pairs(tref.table, text, arena)?;
                 const EMPTY: &[u8] = &[];
                 let rows = arena
                     .alloc_slice_with(pairs.len(), |_| EMPTY)
@@ -5454,24 +5589,12 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         &mut spans,
                     )?
                 {
-                    let mut elems = [Datum::Null; crate::sql::regex::MAX_GROUPS];
-                    let count = if ng == 0 {
-                        elems[0] = Datum::Text(&string[mstart..mend]);
-                        1
-                    } else {
-                        for (i, span) in spans[..ng].iter().enumerate() {
-                            elems[i] = if span.0 < 0 {
-                                Datum::Null
-                            } else {
-                                Datum::Text(&string[span.0 as usize..span.1 as usize])
-                            };
-                        }
-                        ng
-                    };
-                    let arr = Datum::Array {
-                        element: crate::sql::types::ArrElem::Text,
-                        raw: crate::sql::array::build(&elems[..count], arena)?,
-                    };
+                    let arr = crate::sql::eval::regexp_match_array(
+                        string,
+                        (mstart, mend),
+                        &spans[..ng],
+                        arena,
+                    )?;
                     rows.push(crate::sql::exec::encode_projected_pub(&[arr], arena)?)
                         .map_err(|_| arena_full())?;
                     if !parsed.global {
@@ -5932,6 +6055,22 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     super::validate_stored_type_inputs(parser, storage, txid, dependencies.view())
                 },
             )?;
+            super::super::exec::check_called_sql_routine_result(
+                storage,
+                txid,
+                &program,
+                routine.kind,
+                super::super::exec::record_columns(
+                    routine.table_columns().unwrap_or(&[]),
+                    routine.parameters(),
+                    arena,
+                )?,
+                routine.arguments(),
+                super::RoutineResultContract::stored(storage, txid, routine, arena)?,
+                super::stored_routine_path(storage, routine, txid)
+                    .map(|path| (path, dependencies.view())),
+                arena,
+            )?;
             let access = super::routine_program_access(&program);
             let sequences = hooks.sequences;
             if access == super::RoutineProgramAccess::Engine
@@ -6217,8 +6356,9 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             .alloc_slice_with(count, |_| EMPTY)
             .map_err(|_| arena_full())?;
         for slot in rows.iter_mut() {
-            let value = series.next(arena)?.expect("integer series count");
-            *slot = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+            let mut value = [Datum::Null];
+            assert!(series.next_row(arena, &mut value)?, "integer series count");
+            *slot = crate::sql::exec::encode_projected_pub(&value, arena)?;
         }
         Ok(&*rows)
     })?;
@@ -7162,4 +7302,44 @@ fn rows_from_base_rows_outer<'a, C: ColumnLookup<'a>>(
         *encoded = crate::sql::exec::encode_projected_pub(&values[..total_width], arena)?;
     }
     Ok(&*rows)
+}
+
+/// `pg_partition_ancestors(regclass)` for a regclass-coercible argument.
+fn partition_ancestor_values<'a>(
+    relation: Datum<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [Datum<'a>], SqlError> {
+    let catalog = super::storage_catalog(storage, arena, txid);
+    let relation =
+        crate::sql::eval::regobject_cast(relation, ColType::Regclass, Some(&catalog), arena)?;
+    let Some(oid) = relation.catalog_oid() else {
+        return Ok(&[]);
+    };
+    crate::sql::catalog::partition_ancestors(storage, txid, oid as i32, arena)
+}
+
+/// `pg_partition_tree`'s OUT columns.
+const PARTITION_TREE_COLUMNS: [(&str, ColType); 4] = [
+    ("relid", ColType::Regclass),
+    ("parentrelid", ColType::Regclass),
+    ("isleaf", ColType::Bool),
+    ("level", ColType::Int4),
+];
+
+/// `pg_partition_tree(regclass)` for a regclass-coercible argument.
+fn partition_tree_rows<'a>(
+    relation: Datum<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [[Datum<'a>; 4]], SqlError> {
+    let catalog = super::storage_catalog(storage, arena, txid);
+    let relation =
+        crate::sql::eval::regobject_cast(relation, ColType::Regclass, Some(&catalog), arena)?;
+    let Some(oid) = relation.catalog_oid() else {
+        return Ok(&[]);
+    };
+    crate::sql::catalog::partition_tree(storage, txid, oid as i32, arena)
 }

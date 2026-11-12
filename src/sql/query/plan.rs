@@ -269,7 +269,21 @@ pub(super) fn conjunct_passes<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<bool, SqlError> {
-    match crate::sql::eval::boolean_argument(eval_full(e, arena, params, row, hooks)?, "WHERE")
+    filter_passes(e, "WHERE", arena, params, row, hooks)
+}
+
+/// [`conjunct_passes`] for an operand of the `AND` chain `context` names:
+/// PostgreSQL rejects a non-boolean operand as an argument of AND, not of
+/// the WHERE clause the chain forms.
+fn filter_passes<'a>(
+    e: &Expr<'a>,
+    context: &str,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<bool, SqlError> {
+    match crate::sql::eval::boolean_argument(eval_full(e, arena, params, row, hooks)?, context)
         .map_err(|error| crate::sql::error_position::at_expression(error, e))?
     {
         Datum::Bool(true) => Ok(true),
@@ -283,6 +297,60 @@ pub(super) fn conjunct_passes<'a>(
 
 /// Flattens a top-level `AND` chain into `out`, returning the count, or `None`
 /// if it would overflow (caller then evaluates the predicate whole).
+/// PostgreSQL plans a FULL JOIN only as a merge or hash join: once constant
+/// conditions fold away, any condition left must include an equality between
+/// an expression of the tables to its left and one of its right table
+/// (`right`, a scope index), else its planner reports 0A000.
+pub(crate) fn check_full_join_condition(
+    on: &Expr<'_>,
+    scope: &QueryScope<'_>,
+    right: usize,
+) -> Result<(), SqlError> {
+    // Table masks cover 64 tables; a wider FROM list runs its nested loop.
+    if scope.n > MAX_OPTIMIZED_JOIN_TABLES {
+        return Ok(());
+    }
+    let mut buffer = [on; MAX_CONJUNCTS];
+    let mut count = 0;
+    let conjuncts: &[&Expr] = if flatten_and(on, &mut buffer, &mut count) {
+        &buffer[..count]
+    } else {
+        core::slice::from_ref(&on)
+    };
+    let right_bit = 1u64 << right;
+    let left_mask = right_bit - 1;
+    let left_only = |mask: u64| mask != 0 && mask & !left_mask == 0;
+    let mut conditions = false;
+    let mut mergeable = false;
+    for &conjunct in conjuncts {
+        if expr_tables(conjunct, scope) == Some(0)
+            && conjunct.contains_volatile_function().is_none()
+        {
+            continue;
+        }
+        conditions = true;
+        if let Expr::Binary {
+            operator: crate::sql::ast::BinaryOp::Eq,
+            left,
+            right: other,
+            ..
+        } = conjunct
+            && let (Some(first), Some(second)) =
+                (expr_tables(left, scope), expr_tables(other, scope))
+            && (left_only(first) && second == right_bit || left_only(second) && first == right_bit)
+        {
+            mergeable = true;
+        }
+    }
+    if conditions && !mergeable {
+        return Err(crate::sql_err!(
+            crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+            "FULL JOIN is only supported with merge-joinable or hash-joinable join conditions"
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn flatten_and<'e, 'a>(
     e: &'e Expr<'a>,
     out: &mut [&'e Expr<'a>],
@@ -376,7 +444,7 @@ pub(super) fn where_passes<'e, 'a>(
         return conjunct_passes(predicate, arena, params, row, hooks);
     }
     for &c in &conjuncts[..n] {
-        if !conjunct_passes(c, arena, params, row, hooks)? {
+        if !filter_passes(c, "AND", arena, params, row, hooks)? {
             return Ok(false);
         }
     }
@@ -1014,6 +1082,7 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         | BitLit(_)
         | BoundLiteral { .. }
         | Param(_)
+        | OuterAggregate { .. }
         | RoutineParam { .. }
         | DefaultMarker
         | Column { .. }

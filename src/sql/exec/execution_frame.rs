@@ -58,6 +58,10 @@ pub(super) struct SuspendedExecutionFrame {
     pending_write: Option<write_completion::PendingNestedWrite>,
     pending_statement: Option<super::super::sequence::SavedStatementPosition>,
     pending_query: Option<super::super::query::RoutineInvocationState>,
+    write_calls: Option<super::super::query::RoutineInvocationState>,
+    write_progress: Option<RowProgress>,
+    expressions: local_values::ExpressionProgress,
+    pending_call: Option<procedure_execution::SuspendedProcedure>,
     initialization: Initialization,
 }
 
@@ -125,6 +129,10 @@ impl<'declarations, 'values> ExecutionFrame<'declarations, 'values> {
             pending_write,
             pending_statement,
             pending_query,
+            write_calls,
+            write_progress,
+            expressions,
+            pending_call,
         } = self.status;
         Ok(SuspendedExecutionFrame {
             locals,
@@ -140,6 +148,10 @@ impl<'declarations, 'values> ExecutionFrame<'declarations, 'values> {
             pending_write,
             pending_statement,
             pending_query,
+            write_calls,
+            write_progress,
+            expressions,
+            pending_call,
             initialization: self.initialization,
         })
     }
@@ -159,9 +171,11 @@ impl SuspendedExecutionFrame {
         arena: &'out Arena,
         program: &CompiledProgram<'_>,
     ) -> Result<ExecutionFrame<'out, 'out>, (Self, SqlError)> {
-        if let Some(query) = &self.pending_query
-            && let Err(error) = query.require_arena(arena.retention_owner())
-        {
+        let owned = [&self.pending_query, &self.write_calls]
+            .into_iter()
+            .flatten()
+            .try_for_each(|query| query.require_arena(arena.retention_owner()));
+        if let Err(error) = owned {
             return Err((self, error));
         }
         let Self {
@@ -176,6 +190,10 @@ impl SuspendedExecutionFrame {
             pending_write,
             pending_statement,
             pending_query,
+            write_calls,
+            write_progress,
+            expressions,
+            pending_call,
             initialization,
         } = self;
         let mark = arena.mark();
@@ -195,6 +213,10 @@ impl SuspendedExecutionFrame {
                         pending_write,
                         pending_statement,
                         pending_query,
+                        write_calls,
+                        write_progress,
+                        expressions,
+                        pending_call,
                         initialization,
                     },
                     error,
@@ -215,6 +237,10 @@ impl SuspendedExecutionFrame {
                 pending_write,
                 pending_statement,
                 pending_query,
+                write_calls,
+                write_progress,
+                expressions,
+                pending_call,
                 initialization,
             };
             // SAFETY: suspension removed all references created while decoding.
@@ -239,6 +265,10 @@ impl SuspendedExecutionFrame {
                 pending_write,
                 pending_statement,
                 pending_query,
+                write_calls,
+                write_progress,
+                expressions,
+                pending_call,
             },
             initialization,
         })

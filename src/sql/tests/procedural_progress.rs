@@ -2247,26 +2247,139 @@ fn unhandled_diagnostic_details_preserve_original_errors_at_small_control_capaci
 }
 
 #[test]
-fn procedural_bound_cursor_declarations_are_rejected_as_unsupported() {
+fn procedural_bound_cursors_open_with_checked_arguments() {
     let config = test_config("procedural-bound-cursor");
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    for declaration in [
-        "c CURSOR FOR SELECT 1",
-        "c SCROLL CURSOR FOR SELECT 1",
-        "c NO SCROLL CURSOR (n integer) FOR SELECT n",
+    session.success(
+        &mut engine,
+        "CREATE TABLE bound_rows(id integer, v text); \
+         INSERT INTO bound_rows VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        true,
+    );
+    // Expected values come from PostgreSQL 18.6.
+    for (function, call, expected) in [
+        (
+            "CREATE FUNCTION bound_plain() RETURNS text LANGUAGE plpgsql AS $$\
+             DECLARE c CURSOR FOR SELECT v FROM bound_rows ORDER BY id; r text; acc text := '';\
+             BEGIN OPEN c; LOOP FETCH c INTO r; EXIT WHEN NOT FOUND; acc := acc || r; END LOOP;\
+             CLOSE c; RETURN acc; END$$",
+            "SELECT bound_plain()",
+            "abc",
+        ),
+        (
+            // Positional and named arguments; the query also reads a
+            // routine parameter when the cursor opens.
+            "CREATE FUNCTION bound_arguments(lim integer) RETURNS text LANGUAGE plpgsql AS $$\
+             DECLARE c NO SCROLL CURSOR (lo int, hi integer) FOR \
+               SELECT v FROM bound_rows WHERE id BETWEEN lo AND hi AND id <= lim ORDER BY id;\
+             r text; acc text := '';\
+             BEGIN OPEN c(2, hi := 3); FETCH c INTO r; acc := acc || r; FETCH c INTO r;\
+             acc := acc || r; CLOSE c; OPEN c(lo => 1, hi => 1); FETCH c INTO r; CLOSE c;\
+             RETURN acc || r; END$$",
+            "SELECT bound_arguments(5)",
+            "bca",
+        ),
+        (
+            "CREATE FUNCTION bound_scroll() RETURNS integer LANGUAGE plpgsql AS $$\
+             DECLARE c SCROLL CURSOR IS SELECT id FROM bound_rows ORDER BY id; r integer;\
+             BEGIN OPEN c; FETCH LAST FROM c INTO r; FETCH PRIOR FROM c INTO r; RETURN r; END$$",
+            "SELECT bound_scroll()",
+            "2",
+        ),
+        (
+            // An assigned name names the portal.
+            "CREATE FUNCTION bound_renamed() RETURNS text LANGUAGE plpgsql AS $$\
+             DECLARE c CURSOR FOR SELECT 1; BEGIN c := 'renamed'; OPEN c;\
+             RETURN (SELECT string_agg(name, ',') FROM pg_cursors); END$$",
+            "SELECT bound_renamed()",
+            "renamed",
+        ),
+        (
+            // Arguments convert to their declared types and shadow the
+            // routine parameter of the same name.
+            "CREATE FUNCTION bound_typed(x numeric) RETURNS text LANGUAGE plpgsql AS $$\
+             DECLARE c CURSOR (x text) FOR SELECT pg_typeof(x)::text || ':' || x; r text;\
+             BEGIN OPEN c(x); FETCH c INTO r; RETURN r; END$$",
+            "SELECT bound_typed(1.5)",
+            "text:1.5",
+        ),
+    ] {
+        session.success(&mut engine, function, true);
+        assert_eq!(
+            data_rows(&session.success(&mut engine, &format!("BEGIN; {call}; COMMIT"), true)),
+            [expected],
+            "{call}"
+        );
+    }
+    // PostgreSQL 18 leaves a bound cursor variable NULL until OPEN names it,
+    // so opening it twice finds the generated portal already in use.
+    session.success(
+        &mut engine,
+        "CREATE FUNCTION bound_twice() RETURNS text LANGUAGE plpgsql AS $$\
+         DECLARE c CURSOR FOR SELECT 1; BEGIN OPEN c; OPEN c; RETURN 'x'; END$$",
+        true,
+    );
+    let response = session.execute(&mut engine, "BEGIN; SELECT bound_twice()", true);
+    assert_eq!(error_sqlstates(&response), ["42P03"]);
+    session.execute(&mut engine, "ROLLBACK", true);
+    // Argument mistakes are rejected when the routine is created.
+    for (body, message) in [
+        (
+            "DECLARE c CURSOR (x int) FOR SELECT x; BEGIN OPEN c; RETURN 'x'; END",
+            "cursor \"c\" has arguments",
+        ),
+        (
+            "DECLARE c CURSOR FOR SELECT 1; BEGIN OPEN c(1); RETURN 'x'; END",
+            "cursor \"c\" has no arguments",
+        ),
+        (
+            "DECLARE c CURSOR (x int) FOR SELECT x; BEGIN OPEN c(1, 2); RETURN 'x'; END",
+            "too many arguments for cursor \"c\"",
+        ),
+        (
+            "DECLARE c CURSOR (x int, y int) FOR SELECT x; BEGIN OPEN c(1); RETURN 'x'; END",
+            "not enough arguments for cursor \"c\"",
+        ),
+        (
+            "DECLARE c CURSOR (x int) FOR SELECT x; BEGIN OPEN c(z := 1); RETURN 'x'; END",
+            "cursor \"c\" has no argument named \"z\"",
+        ),
+        (
+            "DECLARE c CURSOR (x int, y int) FOR SELECT x; \
+             BEGIN OPEN c(x := 1, x := 2); RETURN 'x'; END",
+            "value for parameter \"x\" of cursor \"c\" specified more than once",
+        ),
+        (
+            "DECLARE c CURSOR FOR SELECT 1; BEGIN OPEN c FOR SELECT 2; RETURN 'x'; END",
+            "syntax error at or near \"FOR\"",
+        ),
     ] {
         let response = session.execute(
             &mut engine,
-            &format!(
-                "CREATE FUNCTION bound_cursor() RETURNS integer LANGUAGE plpgsql AS \
-                 $$DECLARE {declaration}; BEGIN RETURN 1; END$$"
-            ),
+            &format!("CREATE FUNCTION bound_invalid() RETURNS text LANGUAGE plpgsql AS $${body}$$"),
             true,
         );
-        assert_eq!(error_sqlstates(&response), ["0A000"], "{declaration}");
+        assert_eq!(error_sqlstates(&response), ["42601"], "{body}");
+        assert!(
+            String::from_utf8_lossy(&response).contains(message),
+            "{body}: {}",
+            String::from_utf8_lossy(&response)
+        );
     }
+    // A FOR loop over a bound cursor opens it with its arguments.
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "CREATE FUNCTION bound_loop() RETURNS text LANGUAGE plpgsql AS $$\
+             DECLARE c CURSOR (x int) FOR SELECT x * 2 AS d; rec record; acc text := '';\
+             BEGIN FOR rec IN c(21) LOOP acc := acc || rec.d; END LOOP; RETURN acc; END$$; \
+             SELECT bound_loop()",
+            true,
+        )),
+        ["42"]
+    );
     // Locals merely named like the keywords keep their declared types.
     assert_eq!(
         data_rows(&session.success(
@@ -2278,4 +2391,47 @@ fn procedural_bound_cursor_declarations_are_rejected_as_unsupported() {
         )),
         ["6"]
     );
+}
+
+#[test]
+fn builtin_notices_and_warnings_reach_the_client_once_and_in_order() {
+    let config = test_config("builtin-evaluation-messages");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let output = session.success(
+        &mut engine,
+        "select timestamptypmodin('{7}'), timetypmodin('{9}'), intervaltypmodin('{32767,8}');
+         set client_min_messages = error;
+         select timestamptypmodin('{8}');
+         reset client_min_messages;
+         select to_tsquery('english', 'the'), plainto_tsquery('english', '');
+         select pg_cancel_backend(999999);
+         select to_tsvector('simple', repeat('x', 2048) || ' y');
+         select ts_rewrite('a & b'::tsquery, 'a'::tsquery, 'c'::tsquery);",
+        true,
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["6|6|2147418118", "6", "|", "f", "'y':1", "'b' & 'c'"]
+    );
+    let wire = String::from_utf8_lossy(&output);
+    let expected = [
+        "SWARNING\0VWARNING\0C22023\0MTIMESTAMP(7) precision reduced to maximum allowed, 6\0\0",
+        "SWARNING\0VWARNING\0C22023\0MTIME(9) precision reduced to maximum allowed, 6\0\0",
+        "SWARNING\0VWARNING\0C22023\0MINTERVAL(8) precision reduced to maximum allowed, 6\0\0",
+        "SNOTICE\0VNOTICE\0C00000\0Mtext-search query contains only stop words or doesn't contain lexemes, ignored\0\0",
+        "SNOTICE\0VNOTICE\0C00000\0Mtext-search query doesn't contain lexemes: \"\"\0\0",
+        "SWARNING\0VWARNING\0C01000\0MPID 999999 is not a PostgreSQL backend process\0\0",
+        "SNOTICE\0VNOTICE\0C54000\0Mword is too long to be indexed\0DWords longer than 2047 characters are ignored.\0\0",
+    ];
+    let mut from = 0;
+    for message in expected {
+        assert_eq!(wire.matches(message).count(), 1, "{message:?} in {wire:?}");
+        let at = wire[from..]
+            .find(message)
+            .unwrap_or_else(|| panic!("{message:?} out of order in {wire:?}"));
+        from += at + message.len();
+    }
+    assert!(!wire.contains("TIMESTAMP(8)"), "{wire:?}");
 }

@@ -243,10 +243,10 @@ pub(super) fn reject_atomic<'a>(
         if parser.type_input_candidates().iter().any(|candidate| {
             super::type_inputs::candidate_target_oid(storage, txid, candidate).is_some()
         }) {
-            return Err(sql_err!(
+            return Err(super::exec::engine_required(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "checked type inputs in data-change triggers require a resumable execution context"
-            ));
+            )));
         }
         Ok(())
     })();

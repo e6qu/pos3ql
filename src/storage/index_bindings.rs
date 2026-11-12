@@ -96,6 +96,12 @@ impl IndexDef {
             .map_or(self.schema, |pending| pending.schema)
     }
 
+    pub(super) fn table_for(&self, transaction: u32) -> SqlName {
+        self.pending_table
+            .filter(|pending| pending.transaction == transaction)
+            .map_or(self.table, |pending| pending.table)
+    }
+
     pub(super) fn namespace_blocker(
         &self,
         schema: SqlName,
@@ -1070,7 +1076,7 @@ mod tests {
                         storage.create_index(index("selected_index", "binding_source", 0, 1), 7)
                     })
                 });
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let deadline = crate::test_wait::deadline();
                 while storage
                     .definition_publication
                     .waits
@@ -1091,7 +1097,7 @@ mod tests {
                     });
                     send.send(result).unwrap();
                 });
-                let progress = receive.recv_timeout(std::time::Duration::from_secs(5));
+                let progress = receive.recv_timeout(crate::test_wait::HANG);
                 if replace {
                     storage.tables[table].definition.write().identity.created_at += 1;
                 } else {

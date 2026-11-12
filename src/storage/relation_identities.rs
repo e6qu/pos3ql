@@ -7,7 +7,7 @@ use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
 pub(crate) const MAX_RELATION_GENERATION: u64 = 9_999_999;
-pub(crate) const FIRST_RELATION_OID: i32 = 300_000_000;
+pub(crate) const FIRST_RELATION_OID: i32 = super::OidBand::Relation.base();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RelationIdentity(NonZeroU32);

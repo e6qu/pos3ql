@@ -165,3 +165,4 @@ DO $$ BEGIN DECLARE c CONSTANT int := 1; BEGIN c := 2; END; END $$;
 DO $$ <<b>> DECLARE x int; BEGIN RAISE NOTICE '%', b.nope; END $$;
 DO $$ <<b>> DECLARE x int := 1; BEGIN b.nope := 3; END $$;
 DO $$ BEGIN DECLARE z int := 1/0; BEGIN NULL; END; END $$;
+DROP ROUTINE lb85_nested(), lb85_exit_block(), lb85_loops(), lb85_counter_shadow(), lb85_routine_label(integer), lb85_parameter_label(integer), lb85_local_not_routine(integer), lb85_targets(), lb85_in_query(), lb85_handler_exit(), lb85_scope_loop(), lb85_init_error(), lb85_types() CASCADE;

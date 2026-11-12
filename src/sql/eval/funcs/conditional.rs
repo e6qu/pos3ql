@@ -10,65 +10,25 @@ use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 
 use super::super::{
-    ColumnLookup, EvalHooks, SqlError, arity_err, eval_full, sqlstate, static_type,
+    ColumnLookup, EvalHooks, SqlError, arity_err, cast_to, eval_full, sqlstate, static_type,
 };
 
 /// The type an unknown-type literal argument of `coalesce`, `greatest` or
-/// `least` takes: the arguments' common numeric type, or else the first typed
-/// argument's type. None leaves the literal as text.
+/// `least` takes at analysis: PostgreSQL's common type of the arguments. None
+/// when an argument's type is not known statically or no builtin type is common.
 pub(crate) fn literal_argument_type<'e, 'a: 'e>(
     args: &'e [&'e Expr<'a>],
     infer: &dyn Fn(&'e Expr<'a>) -> Option<ColType>,
 ) -> Option<ColType> {
-    let rank = |t: ColType| match t {
-        ColType::Int2 => 1,
-        ColType::Int4 => 2,
-        ColType::Int8 => 3,
-        ColType::Numeric => 4,
-        ColType::Float4 => 5,
-        ColType::Float8 => 6,
-        _ => 0,
-    };
-    let mut first = None;
-    let mut widest: Option<ColType> = None;
-    for argument in args {
-        if matches!(argument, Expr::Str(_) | Expr::Null) {
-            continue;
-        }
-        let Some(ctype) = infer(argument) else {
-            continue;
-        };
-        first.get_or_insert(ctype);
-        if rank(ctype) > widest.map_or(0, rank) {
-            widest = Some(ctype);
+    const FUNCTION_ARGUMENTS: usize = 100;
+    let mut inputs = [(false, crate::sql::types::oid::UNKNOWN); FUNCTION_ARGUMENTS];
+    let inputs = inputs.get_mut(..args.len())?;
+    for (input, argument) in inputs.iter_mut().zip(args) {
+        if !matches!(argument, Expr::Str(_) | Expr::Null) {
+            input.1 = infer(argument)?.oid();
         }
     }
-    widest.or(first).filter(|ctype| {
-        !matches!(
-            ctype,
-            ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name
-        )
-    })
-}
-
-/// Evaluates one argument of `coalesce`, `greatest` or `least`, converting
-/// an unknown-type literal to the arguments' type as PostgreSQL's analysis does.
-fn eval_argument<'a>(
-    argument: &Expr<'a>,
-    literal_type: Option<ColType>,
-    arena: &'a crate::mem::arena::Arena,
-    params: &[Datum<'a>],
-    row: &impl ColumnLookup<'a>,
-    hooks: &EvalHooks<'_, 'a>,
-) -> Result<Datum<'a>, SqlError> {
-    let value = eval_full(argument, arena, params, row, hooks)?;
-    match (argument, literal_type) {
-        (Expr::Str(text), Some(target)) => {
-            crate::sql::eval::cast_to(Datum::Text(text), target, arena)
-                .map_err(|error| crate::sql::error_position::at_subject(error, text))
-        }
-        _ => Ok(value),
-    }
+    crate::storage::builtin_compatible_element_oid(inputs).and_then(ColType::from_oid)
 }
 
 /// Handles the conditional/null-handling family. Returns `None` if `name` is not
@@ -123,12 +83,17 @@ pub(crate) fn dispatch<'a>(
                 }
             }
             "coalesce" => {
-                let literal_type =
-                    literal_argument_type(args, &|argument| static_type(argument, row));
-                for arg in args {
-                    let v = eval_argument(arg, literal_type, arena, params, row, hooks)?;
+                let (common, declared) =
+                    super::array::common_argument_type(args, arena, row, hooks)?;
+                for (arg, declared) in args.iter().zip(declared) {
+                    let v = eval_full(arg, arena, params, row, hooks)?;
                     if !v.is_null() {
-                        return Ok(v);
+                        return match common {
+                            Some(common) if *declared == crate::sql::types::oid::UNKNOWN => {
+                                cast_to(v, common, arena)
+                            }
+                            _ => Ok(v),
+                        };
                     }
                 }
                 Ok(Datum::Null)
@@ -178,13 +143,32 @@ pub(crate) fn dispatch<'a>(
                 };
                 let mut best: Option<Datum> = None;
                 let mut widest = 0u8;
-                let literal_type =
-                    literal_argument_type(args, &|argument| static_type(argument, row));
-                for a in args {
+                let (common, declared) =
+                    super::array::common_argument_type(args, arena, row, hooks)?;
+                // PostgreSQL looks up the common type's btree comparison
+                // before evaluating anything; arrays find theirs and fail per
+                // element when compared.
+                if let Some(common) = common
+                    && !matches!(common, ColType::Array(_))
+                    && !common.has_builtin_ordering()
+                {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "could not identify a comparison function for type {}",
+                        common.name()
+                    ));
+                }
+                for (a, declared) in args.iter().zip(declared) {
                     if let Some(t) = static_type(a, row) {
                         widest = widest.max(static_rank(t));
                     }
-                    let v = eval_argument(a, literal_type, arena, params, row, hooks)?;
+                    let mut v = eval_full(a, arena, params, row, hooks)?;
+                    if let Some(common) = common
+                        && *declared == crate::sql::types::oid::UNKNOWN
+                        && !v.is_null()
+                    {
+                        v = cast_to(v, common, arena)?;
+                    }
                     widest = widest.max(rank(&v));
                     if v.is_null() {
                         continue;

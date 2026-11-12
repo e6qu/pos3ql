@@ -514,17 +514,48 @@ impl<'a> DerivedTableOuter<'_, '_, '_, 'a> {
         (self.visible_from..self.preceding).contains(&table)
     }
 
-    /// Whether an earlier FROM item in reach answers `qualifier.name`.
-    fn sibling_column(&self, qualifier: Option<&str>, name: &str) -> bool {
+    /// PostgreSQL's ambiguity error when more than one earlier FROM item in
+    /// reach answers `qualifier.name`.
+    fn sibling_ambiguity(&self, qualifier: Option<&str>, name: &str) -> Option<SqlError> {
         if self.visible_from >= self.preceding {
-            return false;
+            return None;
         }
-        match self.siblings.find_column_unpositioned(qualifier, name) {
-            Ok(ResolvedColumn::Table(table, _)) => self.reachable(table),
-            Ok(ResolvedColumn::Merged(_)) => {
-                self.visible_from == 0 && self.preceding == self.siblings.n
+        match self
+            .siblings
+            .find_column_prefix(self.preceding, qualifier, name)
+        {
+            Err(error) if error.sqlstate == sqlstate::AMBIGUOUS_COLUMN => Some(
+                crate::sql::error_position::column_reference(error, qualifier, name),
+            ),
+            _ => None,
+        }
+    }
+
+    /// The qualifier that names `qualifier.name`'s earlier FROM item in
+    /// `siblings` itself, when one in reach answers it. `siblings` may
+    /// already hold this item and later ones, so an unqualified name is
+    /// resolved among the preceding items and then qualified by its item.
+    fn sibling_qualifier<'q>(
+        &'q self,
+        qualifier: Option<&'q str>,
+        name: &str,
+    ) -> Option<Option<&'q str>> {
+        if self.visible_from >= self.preceding {
+            return None;
+        }
+        match self
+            .siblings
+            .find_column_prefix(self.preceding, qualifier, name)
+        {
+            Ok(ResolvedColumn::Table(table, _)) if self.reachable(table) => {
+                Some(qualifier.or(Some(self.siblings.names[table])))
             }
-            Err(_) => false,
+            Ok(ResolvedColumn::Merged(_))
+                if self.visible_from == 0 && self.preceding == self.siblings.n =>
+            {
+                Some(qualifier)
+            }
+            _ => None,
         }
     }
 
@@ -650,7 +681,10 @@ impl<'a> DerivedTableOuter<'_, '_, '_, 'a> {
                     sqlstate::UNDEFINED_COLUMN | sqlstate::UNDEFINED_TABLE
                 ) =>
             {
-                Err(self.unreachable(qualifier, name).unwrap_or(error))
+                Err(self
+                    .sibling_ambiguity(qualifier, name)
+                    .or_else(|| self.unreachable(qualifier, name))
+                    .unwrap_or(error))
             }
             answer => answer,
         }
@@ -674,7 +708,7 @@ fn target_hint(error: SqlError, table: &str, qualifier: Option<&str>, name: &str
 
 impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
-        if self.sibling_column(qualifier, name) {
+        if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
             return super::ScopeSchema(self.siblings).lookup(qualifier, name);
         }
         self.answer(qualifier, name, self.target().lookup(qualifier, name))
@@ -689,7 +723,7 @@ impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
     }
 
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
-        if self.sibling_column(qualifier, name) {
+        if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
             return super::ScopeSchema(self.siblings).column_type_mod(qualifier, name);
         }
         self.target().column_type_mod(qualifier, name)
@@ -700,7 +734,7 @@ impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ColType, SqlError> {
-        if self.sibling_column(qualifier, name) {
+        if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
             return super::ScopeSchema(self.siblings).resolve_column_type(qualifier, name);
         }
         let enclosing = match self.enclosing {
@@ -728,7 +762,7 @@ impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
     }
 
     fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
-        if self.sibling_column(qualifier, name) {
+        if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
             return super::ScopeSchema(self.siblings).column_identity(qualifier, name);
         }
         self.target().column_identity(qualifier, name)
@@ -792,21 +826,21 @@ impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        if self.sibling_column(qualifier, name) {
+        if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
             return super::ScopeSchema(self.siblings).col_type(qualifier, name);
         }
         self.target().col_type(qualifier, name)
     }
 
     fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
-        if self.sibling_column(qualifier, name) {
+        if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
             return super::ScopeSchema(self.siblings).column_type_oid(qualifier, name);
         }
         self.target().column_type_oid(qualifier, name)
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
-        if self.sibling_column(qualifier, name) {
+        if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
             return super::ScopeSchema(self.siblings).collation(qualifier, name);
         }
         self.target().collation(qualifier, name)
@@ -821,7 +855,7 @@ impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
     }
 
     fn column_user_type(&self, qualifier: Option<&str>, name: &str) -> Option<UserTypeName> {
-        if self.sibling_column(qualifier, name) {
+        if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
             return super::ScopeSchema(self.siblings).column_user_type(qualifier, name);
         }
         self.target().column_user_type(qualifier, name)
@@ -3462,7 +3496,19 @@ impl<'d> QueryScope<'d> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ResolvedColumn, SqlError> {
-        self.find_column_unpositioned(qualifier, name)
+        self.find_column_among(self.n, qualifier, name)
+    }
+
+    /// [`Self::find_column`] over the first `visible` FROM items only: a
+    /// `LATERAL` body reads just the items to its left, never its own or a
+    /// later item's columns.
+    pub(crate) fn find_column_among(
+        &self,
+        visible: usize,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ResolvedColumn, SqlError> {
+        self.find_column_prefix(visible, qualifier, name)
             .map_err(|error| crate::sql::error_position::column_reference(error, qualifier, name))
     }
 
@@ -3471,19 +3517,29 @@ impl<'d> QueryScope<'d> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ResolvedColumn, SqlError> {
-        self.find_relation_column(qualifier, name).map_err(|error| {
-            if error.sqlstate == sqlstate::UNDEFINED_COLUMN
-                && self.names_system_column(qualifier, name)
-            {
-                sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "system column \"{}\" is not supported",
-                    name
-                )
-            } else {
-                error
-            }
-        })
+        self.find_column_prefix(self.n, qualifier, name)
+    }
+
+    fn find_column_prefix(
+        &self,
+        visible: usize,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ResolvedColumn, SqlError> {
+        self.find_relation_column(visible, qualifier, name)
+            .map_err(|error| {
+                if error.sqlstate == sqlstate::UNDEFINED_COLUMN
+                    && self.names_system_column(qualifier, name)
+                {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "system column \"{}\" is not supported",
+                        name
+                    )
+                } else {
+                    error
+                }
+            })
     }
 
     /// Whether `name` is a PostgreSQL system column of a relation the
@@ -3511,9 +3567,19 @@ impl<'d> QueryScope<'d> {
 
     fn find_relation_column(
         &self,
+        visible: usize,
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ResolvedColumn, SqlError> {
+        let visible = visible.min(self.n);
+        // A merged column is visible when every item it merges is.
+        let entry_visible = |entry: ResolvedColumn| match entry {
+            ResolvedColumn::Table(table, _) => table < visible,
+            ResolvedColumn::Merged(merged) => self.merged[merged]
+                .parts
+                .iter()
+                .all(|&(table, _)| table < visible),
+        };
         match qualifier {
             Some(q) => {
                 if let Some(alias) = self.using_alias(q) {
@@ -3531,6 +3597,13 @@ impl<'d> QueryScope<'d> {
                         });
                 }
                 let source = self.source(q)?;
+                if source.table >= visible {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "missing FROM-clause entry for table \"{}\"",
+                        q
+                    ));
+                }
                 if let Some(position) = name.strip_prefix('\0') {
                     return position
                         .parse::<usize>()
@@ -3584,7 +3657,8 @@ impl<'d> QueryScope<'d> {
                 if self.n_output > 0 {
                     let mut found = None;
                     for k in 0..self.n_output {
-                        if self.output_name(self.output[k]) == name {
+                        if entry_visible(self.output[k]) && self.output_name(self.output[k]) == name
+                        {
                             if found.is_some() {
                                 return Err(sql_err!(
                                     crate::sql::eval::sqlstate::AMBIGUOUS_COLUMN,
@@ -3596,7 +3670,10 @@ impl<'d> QueryScope<'d> {
                         }
                     }
                     return found
-                        .or_else(|| self.func_scalar_column(name))
+                        .or_else(|| {
+                            self.func_scalar_column(name)
+                                .filter(|&entry| entry_visible(entry))
+                        })
                         .ok_or_else(|| {
                             sql_err!(
                                 sqlstate::UNDEFINED_COLUMN,
@@ -3606,7 +3683,7 @@ impl<'d> QueryScope<'d> {
                         });
                 }
                 let mut found = None;
-                for t in 0..self.n {
+                for t in 0..visible {
                     if let Some(c) = self.scope_column_index(t, name) {
                         let duplicated = || {
                             self.defs
@@ -3629,7 +3706,10 @@ impl<'d> QueryScope<'d> {
                     }
                 }
                 found
-                    .or_else(|| self.func_scalar_column(name))
+                    .or_else(|| {
+                        self.func_scalar_column(name)
+                            .filter(|&entry| entry_visible(entry))
+                    })
                     .ok_or_else(|| {
                         sql_err!(
                             sqlstate::UNDEFINED_COLUMN,

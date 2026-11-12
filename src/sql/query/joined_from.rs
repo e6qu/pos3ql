@@ -35,7 +35,8 @@ pub(crate) struct JoinedFromRow<'a>(&'a [u8]);
 impl<'a> JoinedFromRow<'a> {
     fn encode(row: &JoinRow<'_, '_, '_>, arena: &'a Arena) -> Result<Self, SqlError> {
         let scope = row.scope;
-        let columns = scope.total_columns();
+        // Every stored column, a parenthesized join's members included.
+        let columns = scope.stored_columns();
         let width = columns + 2 * scope.n;
         let value = |index: usize| {
             if index >= columns + scope.n {
@@ -53,7 +54,7 @@ impl<'a> JoinedFromRow<'a> {
             }
             let mut column = index;
             for table in 0..scope.n {
-                let n_columns = scope.defs.get(table).expect("resolved").n_columns;
+                let n_columns = scope.stored_width(table);
                 if column < n_columns {
                     return row
                         .table_values(table)
@@ -75,7 +76,7 @@ impl<'a> JoinedFromRow<'a> {
     /// The sources of this row, bound for a scope resolved from the same FROM
     /// clause: `None` for a null-extended source.
     fn bind(self, scope: &QueryScope<'_>, arena: &'a Arena) -> Result<BoundSources<'a>, SqlError> {
-        let columns = scope.total_columns();
+        let columns = scope.stored_columns();
         let width = columns + 2 * scope.n;
         let decoded = arena
             .alloc_slice_with(width, |_| Datum::Null)
@@ -90,7 +91,7 @@ impl<'a> JoinedFromRow<'a> {
         let mut offset = 0;
         let bound = arena
             .alloc_slice_with(scope.n, |table| {
-                let n_columns = scope.defs.get(table).expect("resolved").n_columns;
+                let n_columns = scope.stored_width(table);
                 let values = &decoded[offset..offset + n_columns];
                 offset += n_columns;
                 matches!(decoded[columns + table], Datum::Bool(true))

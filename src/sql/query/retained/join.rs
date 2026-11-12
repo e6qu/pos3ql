@@ -1241,6 +1241,7 @@ impl<'a> JoinState<'a> {
                 buffer_offsets: &[],
             },
             rowids,
+            visible: scope.n,
         })
     }
 }

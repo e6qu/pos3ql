@@ -10068,6 +10068,7 @@ fn window_row<'r, 'a>(
             offsets: offs,
         },
         rowids: &[],
+        visible: scope.n,
     }
 }
 
@@ -15793,6 +15794,7 @@ impl<'a> ReturningJoin<'a> {
                 offsets: self.offsets,
             },
             rowids: self.rowids,
+            visible: self.scope.n,
         })
     }
 }

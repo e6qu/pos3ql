@@ -432,6 +432,7 @@ pub(super) fn sources_row<'s, 'a>(
             buffer_offsets: &[],
         },
         rowids: &rowids[..scope.n],
+        visible: scope.n,
     }
 }
 
@@ -928,12 +929,13 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                             let order = arena
                                 .alloc_slice_with(scope.n, |table| table)
                                 .map_err(|_| arena_full())?;
-                            let as_read_row = sources_row(scope, read, order, rowids);
+                            let as_read_row =
+                                sources_row(scope, read, order, rowids).left_of(table);
                             let as_read = Chained {
                                 inner: &as_read_row,
                                 outer: self.outer,
                             };
-                            let left = sources_row(scope, bound, order, rowids);
+                            let left = sources_row(scope, bound, order, rowids).left_of(table);
                             let latest = Chained {
                                 inner: &left,
                                 outer: self.outer,
@@ -974,7 +976,7 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                         let order = arena
                             .alloc_slice_with(scope.n, |table| table)
                             .map_err(|_| arena_full())?;
-                        let left = sources_row(scope, bound, order, rowids);
+                        let left = sources_row(scope, bound, order, rowids).left_of(table);
                         let chained = Chained {
                             inner: &left,
                             outer: self.outer,

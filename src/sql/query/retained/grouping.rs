@@ -1155,6 +1155,7 @@ fn fold_group<'t: 'w, 'w>(
                 offsets: &offsets[..scope.n],
             },
             rowids: &[None; MAX_RETAINED_SOURCES][..scope.n],
+            visible: scope.n,
         };
         for (state, (_, node)) in states.iter_mut().zip(aggregates) {
             state.update(node, work, params, &row, &hooks)?;

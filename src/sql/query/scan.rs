@@ -4182,9 +4182,30 @@ pub struct JoinRow<'s, 'v, 'd> {
     /// Stable MVCC identities for physical base-table contributors. Derived
     /// rows, function rows, and outer-join null sides carry `None`.
     pub rowids: &'s [Option<u64>],
+    /// Names resolve over the first `visible` FROM items. A `LATERAL` item's
+    /// body sees only the items to its left, not its own or later columns.
+    pub(crate) visible: usize,
 }
 
 impl<'s, 'v> JoinRow<'s, 'v, '_> {
+    /// The row as the body of the `LATERAL` item at FROM position `table`
+    /// reads it: only the items to its left.
+    pub(crate) fn left_of(self, table: usize) -> Self {
+        Self {
+            visible: table,
+            ..self
+        }
+    }
+
+    /// The column a name resolves to among the visible items.
+    fn visible_column(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ResolvedColumn, SqlError> {
+        self.scope.find_column_among(self.visible, qualifier, name)
+    }
+
     /// None means the source has not joined yet. A present zero-column row
     /// remains distinct from an outer join's absent source.
     pub(crate) fn table_present(&self, table: usize) -> Option<bool> {
@@ -4264,6 +4285,17 @@ impl<'v> JoinRow<'_, 'v, '_> {
 
 impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        if self.visible < self.scope.n {
+            return match self.visible_column(qualifier, name) {
+                Ok(ResolvedColumn::Table(table, column)) => self
+                    .scope
+                    .defs
+                    .get(table)
+                    .and_then(|definition| definition.columns.get(column))
+                    .map_or(-1, |column| column.type_mod),
+                _ => -1,
+            };
+        }
         super::ScopeSchema(self.scope).column_type_mod(qualifier, name)
     }
     fn whole_row_field_metadata(
@@ -4279,11 +4311,16 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<crate::sql::types::ColType, SqlError> {
+        if self.visible < self.scope.n {
+            return self
+                .visible_column(qualifier, name)
+                .map(|entry| self.scope.output_type(entry));
+        }
         super::ScopeSchema(self.scope).resolve_column_type(qualifier, name)
     }
 
     fn is_empty_scope(&self) -> bool {
-        self.scope.n == 0
+        self.visible == 0
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
@@ -4297,7 +4334,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
                 name
             )),
         };
-        match self.scope.find_column(qualifier, name)? {
+        match self.visible_column(qualifier, name)? {
             ResolvedColumn::Table(t, c) => one(t, c),
             // Merged USING/NATURAL column: the first non-null contributor.
             ResolvedColumn::Merged(m) => {
@@ -4329,12 +4366,12 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
-        let entry = self.scope.find_column(qualifier, name).ok()?;
+        let entry = self.visible_column(qualifier, name).ok()?;
         Some(self.scope.output_type(entry))
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
-        match self.scope.find_column(qualifier, name).ok() {
+        match self.visible_column(qualifier, name).ok() {
             Some(ResolvedColumn::Table(table, column)) => self
                 .scope
                 .defs
@@ -4362,7 +4399,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        match self.scope.find_column(qualifier, name).ok()? {
+        match self.visible_column(qualifier, name).ok()? {
             ResolvedColumn::Table(t, c) => self
                 .scope
                 .defs
@@ -6527,6 +6564,7 @@ fn scan_source_mode<'a>(
                 buffer_offsets: buffers.offsets,
             },
             rowids: &bound_rowids[..scope.n],
+            visible: scope.n,
         })
     }
 
@@ -7535,7 +7573,8 @@ fn scan_source_mode<'a>(
                 depth,
                 decode_buffers,
                 arena,
-            )?;
+            )?
+            .left_of(t);
             let chained = Chained {
                 inner: &outer_row,
                 outer,

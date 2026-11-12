@@ -613,6 +613,7 @@ impl<'a> SortState<'a> {
                 buffer_offsets: &[],
             },
             rowids,
+            visible: scope.n,
         })
     }
 }

@@ -89,6 +89,7 @@ impl<'a> ScanNode<'a> {
                 offsets: &[0],
             },
             rowids: &rowids,
+            visible: scope.n,
         })
     }
 }

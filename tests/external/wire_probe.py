@@ -6201,7 +6201,7 @@ def test_generated_expression_lifecycle_over_raw_wire():
         and has_sqlstate(add_identity, "55000")
         and rewritten_rows == [["2", "20"], ["4", "40"]]
         and dropped_rows == [["2", "99", ""], ["4", "40", ""], ["7", "8", ""]]
-        and any(kind == b"N" and b"not a stored generated column, skipping" in payload for kind, payload in drop_expression),
+        and any(kind == b"N" and b"is not a generated column, skipping" in payload for kind, payload in drop_expression),
         results,
     )
     s.close()

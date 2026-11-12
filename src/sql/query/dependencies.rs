@@ -579,6 +579,120 @@ fn collect_set_query(
     result
 }
 
+/// The table or view a stored `INSERT` or `UPDATE` writes.
+fn written_relation(
+    name: crate::sql::ast::QualName<'_>,
+    storage: &Storage,
+    txid: u32,
+    path: &PathContext,
+) -> Option<(DependencyClass, usize)> {
+    match storage.resolve_relation_under(path, name.schema, name.name, txid)? {
+        ResolvedRelation::Table(slot) => Some((DependencyClass::Table, slot)),
+        ResolvedRelation::View(slot) => Some((DependencyClass::View, slot)),
+        ResolvedRelation::Catalog => None,
+    }
+}
+
+/// Records an `INSERT`'s target columns, as PostgreSQL's target list names
+/// them: the column list, or the leading columns its values fill, and every
+/// column for `ON CONFLICT DO UPDATE`.
+#[allow(clippy::too_many_arguments)]
+fn record_insert_targets(
+    insert: &crate::sql::ast::Insert<'_>,
+    scope: &super::QueryScope<'_>,
+    storage: &Storage,
+    txid: u32,
+    path: &PathContext,
+    dependencies: &mut StoredQueryDependencies,
+    arena: &Arena,
+    context: CollectionContext<'_>,
+) -> Result<(), SqlError> {
+    let Some((class, slot)) = written_relation(insert.table, storage, txid, path) else {
+        return Ok(());
+    };
+    let target = scope.defs.get(0).expect("target resolved");
+    let width = target.columns().len();
+    if insert
+        .on_conflict
+        .is_some_and(|conflict| conflict.update.is_some())
+    {
+        for column in 0..width {
+            dependencies.mark_written_column(class, slot, column)?;
+        }
+        return Ok(());
+    }
+    if !insert.columns.is_empty() {
+        for name in insert.columns {
+            if let Some(column) = target.column_index(name) {
+                dependencies.mark_written_column(class, slot, column)?;
+            }
+        }
+        return Ok(());
+    }
+    let values = match (insert.rows.first(), insert.select) {
+        (Some(row), _) => row.len(),
+        (None, Some(select)) => select_output_width(select, storage, txid, arena, context)?,
+        (None, None) => 0,
+    };
+    for column in 0..values.min(width) {
+        dependencies.mark_written_column(class, slot, column)?;
+    }
+    Ok(())
+}
+
+/// The number of output columns of a stored `SELECT` (its first set-operation
+/// branch), with `*` expanded.
+fn select_output_width(
+    select: &Select<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    context: CollectionContext<'_>,
+) -> Result<usize, SqlError> {
+    if let Some(body) = select.set_body {
+        let mut tree = body;
+        loop {
+            match tree {
+                SetTree::Select(first) => {
+                    return select_output_width(first, storage, txid, arena, context);
+                }
+                SetTree::Op { left, .. } => tree = left,
+            }
+        }
+    }
+    let scope = select
+        .from
+        .as_ref()
+        .map(|from| super::QueryScope::resolve_schema(storage, from, txid, arena, None))
+        .transpose()?;
+    let columns = DependencyTypes {
+        scope: scope.as_ref(),
+        excluded: None,
+        transition: context.transition,
+        storage,
+        txid,
+        returning_output: None,
+        arena,
+    };
+    let mut width = 0usize;
+    for item in select.items {
+        width += match item {
+            SelectItem::Expr { .. } => 1,
+            SelectItem::Wildcard => scope.as_ref().map_or(0, |scope| scope.star_columns()),
+            SelectItem::TableWildcard(name) => match &scope {
+                Some(scope) => scope.qualified_star_columns(name)?,
+                None => 0,
+            },
+            SelectItem::RecordStar(expression) => {
+                let mut fields = 0usize;
+                crate::sql::exec::record_shape_metadata(expression, &columns, |_, _| fields += 1)?;
+                fields
+            }
+        };
+    }
+    Ok(width)
+}
+
 fn record_routine_target(
     name: crate::sql::ast::QualName<'_>,
     storage: &Storage,
@@ -621,6 +735,7 @@ fn record_routine_target(
         slot: slot as u16,
         identity,
         referenced_columns: crate::storage::ColumnSet::EMPTY,
+        written_columns: crate::storage::ColumnSet::EMPTY,
         schema,
         name: catalog_name,
         referenced_schema: SqlName::parse(name.schema.unwrap_or(""))?,
@@ -769,6 +884,16 @@ fn collect_statement(
             let result = (|| {
                 record_routine_target(insert.table, storage, txid, path, dependencies)?;
                 let scope = dml_dependency_scope(storage, insert.table, None, None, txid, arena)?;
+                record_insert_targets(
+                    insert,
+                    &scope,
+                    storage,
+                    txid,
+                    path,
+                    dependencies,
+                    arena,
+                    context,
+                )?;
                 let excluded = match storage.resolve_relation_under(
                     path,
                     insert.table.schema,
@@ -842,6 +967,14 @@ fn collect_statement(
                     txid,
                     arena,
                 )?;
+                if let Some((class, slot)) = written_relation(update.table, storage, txid, path) {
+                    let target = scope.defs.get(0).expect("target resolved");
+                    for (name, _) in update.assignments {
+                        if let Some(column) = target.column_index(name) {
+                            dependencies.mark_written_column(class, slot, column)?;
+                        }
+                    }
+                }
                 if let Some(from) = update.from {
                     collect_table_ref(
                         &from.base,
@@ -3081,6 +3214,7 @@ fn record_support_routine(
         slot: slot as u16,
         identity: StoredDependencyIdentity::RoutineOid(oid),
         referenced_columns: crate::storage::ColumnSet::EMPTY,
+        written_columns: crate::storage::ColumnSet::EMPTY,
         schema: routine.schema_for(txid),
         name: routine.name_for(txid),
         referenced_schema: routine.schema_for(txid),
@@ -3255,6 +3389,7 @@ fn record_routine_call(
         slot: slot as u16,
         identity: StoredDependencyIdentity::RoutineOid(crate::storage::routine_oid(&routine)),
         referenced_columns: crate::storage::ColumnSet::EMPTY,
+        written_columns: crate::storage::ColumnSet::EMPTY,
         schema: routine.schema_for(txid),
         name: routine.name_for(txid),
         referenced_schema: SqlName::parse(referenced_schema)?,
@@ -3349,6 +3484,7 @@ fn record_operator_call(
         slot: slot as u16,
         identity: StoredDependencyIdentity::OperatorOid(storage.operator(slot).oid()),
         referenced_columns: crate::storage::ColumnSet::EMPTY,
+        written_columns: crate::storage::ColumnSet::EMPTY,
         schema: operator.schema,
         name: operator.name,
         referenced_schema: SqlName::parse(schema.unwrap_or(""))?,
@@ -4166,6 +4302,7 @@ fn collect_table_ref<'a>(
                     slot: slot as u16,
                     identity,
                     referenced_columns: crate::storage::ColumnSet::EMPTY,
+                    written_columns: crate::storage::ColumnSet::EMPTY,
                     schema: definition.schema,
                     name: definition.name,
                     referenced_schema: SqlName::parse(table.schema.unwrap_or(""))?,
@@ -4181,6 +4318,7 @@ fn collect_table_ref<'a>(
                     slot: slot as u16,
                     identity,
                     referenced_columns: crate::storage::ColumnSet::EMPTY,
+                    written_columns: crate::storage::ColumnSet::EMPTY,
                     schema: view.schema_for(txid),
                     name: view.name_for(txid),
                     referenced_schema: SqlName::parse(table.schema.unwrap_or(""))?,
@@ -4304,6 +4442,7 @@ fn collect_expression<'a>(
             slot: slot as u16,
             identity: StoredDependencyIdentity::Collation(storage.collation(slot).binding()),
             referenced_columns: crate::storage::ColumnSet::EMPTY,
+            written_columns: crate::storage::ColumnSet::EMPTY,
             schema: definition.schema,
             name: definition.name,
             referenced_schema: SqlName::parse(name.schema.unwrap_or(""))?,
@@ -4560,6 +4699,7 @@ fn record_relation_row_type(
         slot: slot as u16,
         identity,
         referenced_columns: crate::storage::ColumnSet::EMPTY,
+        written_columns: crate::storage::ColumnSet::EMPTY,
         schema,
         name,
         referenced_schema,
@@ -4676,6 +4816,7 @@ fn collect_type_oid(
                 slot: reference.catalog_slot(),
                 identity,
                 referenced_columns: crate::storage::ColumnSet::EMPTY,
+                written_columns: crate::storage::ColumnSet::EMPTY,
                 schema,
                 name,
                 referenced_schema,
@@ -4705,6 +4846,7 @@ fn collect_type(
             slot: slot as u16,
             identity: storage.capture_type_dependency(class, slot, txid)?,
             referenced_columns: crate::storage::ColumnSet::EMPTY,
+            written_columns: crate::storage::ColumnSet::EMPTY,
             schema,
             name,
             referenced_schema,
@@ -4848,6 +4990,7 @@ fn collect_regcollation(
         slot: slot as u16,
         identity: StoredDependencyIdentity::Collation(storage.collation(slot).binding()),
         referenced_columns: crate::storage::ColumnSet::EMPTY,
+        written_columns: crate::storage::ColumnSet::EMPTY,
         schema: definition.schema,
         name: definition.name,
         referenced_schema: SqlName::parse(referenced_schema.unwrap_or(""))?,
@@ -4903,6 +5046,7 @@ fn collect_text_search_configuration(
         slot: slot as u16,
         identity: StoredDependencyIdentity::TextSearchConfigurationOid(definition.oid()),
         referenced_columns: crate::storage::ColumnSet::EMPTY,
+        written_columns: crate::storage::ColumnSet::EMPTY,
         schema: definition.schema(),
         name: definition.name(),
         referenced_schema: SqlName::parse(schema.unwrap_or(""))?,
@@ -5002,6 +5146,7 @@ fn collect_sequence(
             slot: slot as u16,
             identity: StoredDependencyIdentity::Name,
             referenced_columns: crate::storage::ColumnSet::EMPTY,
+            written_columns: crate::storage::ColumnSet::EMPTY,
             schema: sequence.schema,
             name: sequence.name,
             referenced_schema,

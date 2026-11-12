@@ -1391,8 +1391,8 @@ fn type_dependencies(
     Ok(())
 }
 
-/// `dependent`'s normal dependencies on what a stored query reads: one row per
-/// referenced column, or one for the whole object, each once. Pinned built-in
+/// `dependent`'s normal dependencies on what a stored query reads or writes:
+/// one row per column, or one for the whole object, each once. Pinned built-in
 /// objects get no rows, as in PostgreSQL.
 fn stored_query_edges(
     storage: &Storage,
@@ -1415,8 +1415,8 @@ fn stored_query_edges(
             entries[..index].iter().any(|earlier| {
                 reference(earlier) == Some((class, object))
                     && match column {
-                        None => earlier.referenced_columns.is_empty(),
-                        Some(column) => earlier.referenced_columns.contains(column),
+                        None => !earlier.names_columns(),
+                        Some(column) => earlier.uses_column(column),
                     }
             })
         };
@@ -1427,14 +1427,14 @@ fn stored_query_edges(
                 kind: b'n',
             })
         };
-        if dependency.referenced_columns.is_empty() {
+        if !dependency.names_columns() {
             if !recorded(None) {
                 edge(0)?;
             }
             continue;
         }
         for column in 0..MAX_COLUMNS {
-            if dependency.referenced_columns.contains(column) && !recorded(Some(column)) {
+            if dependency.uses_column(column) && !recorded(Some(column)) {
                 edge(stored_column_number(storage, txid, dependency, column))?;
             }
         }

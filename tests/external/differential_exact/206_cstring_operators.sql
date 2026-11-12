@@ -1,0 +1,24 @@
+-- cstring has no comparison operators; PL/pgSQL record fields.
+SELECT 'a'::cstring = 'a';
+SELECT 'a'::cstring < 'b'::cstring;
+SELECT 'a'::cstring = 'a'::text;
+SELECT 'a'::cstring <> 'a'::cstring;
+SELECT 'a'::cstring || 'b'::cstring;
+SELECT 'b'::text || 'a'::cstring;
+SELECT 'a'::cstring || 1;
+SELECT 'a'::cstring || 'b';
+SELECT 'a'::cstring || 'b'::varchar;
+SELECT 'a'::cstring IS NULL;
+SELECT 'a'::cstring + 1;
+SELECT 'a'::cstring LIKE 'a';
+CREATE FUNCTION rf(r record) RETURNS text LANGUAGE plpgsql AS $$ BEGIN RETURN r.b; END $$;
+SELECT rf(ROW(1, 'a'));
+CREATE TABLE t5 (a int);
+INSERT INTO t5 VALUES (1);
+SELECT rf(t5) FROM t5;
+CREATE FUNCTION rv() RETURNS text LANGUAGE plpgsql AS $$ DECLARE x record; BEGIN x := ROW(1, 'x'); RETURN x.b; END $$;
+SELECT rv();
+CREATE FUNCTION rt(r t5) RETURNS text LANGUAGE plpgsql AS $$ BEGIN RETURN r.b; END $$;
+SELECT rt(t5) FROM t5;
+DROP TABLE t5 CASCADE;
+DROP FUNCTION rf(record), rv();

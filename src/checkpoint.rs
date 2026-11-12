@@ -19585,7 +19585,11 @@ impl core::fmt::Display for ManifestDependencies<'_> {
             for byte in dependency.referenced_name.as_str().as_bytes() {
                 write!(output, "{byte:02x}")?;
             }
-            write!(output, " {}", dependency.referenced_columns)?;
+            write!(
+                output,
+                " {} {}",
+                dependency.referenced_columns, dependency.written_columns
+            )?;
         }
         write!(
             output,
@@ -19677,6 +19681,7 @@ fn parse_stored_query_dependencies<'a>(
             CheckpointSetupError::Corrupt("stored-query referenced name missing"),
         )?)?;
         let referenced_columns = parse_field(words.next(), "stored-query referenced columns")?;
+        let written_columns = parse_field(words.next(), "stored-query written columns")?;
         dependencies
             .serialized_push(SerializedStoredQueryDependency {
                 class,
@@ -19686,6 +19691,7 @@ fn parse_stored_query_dependencies<'a>(
                 referenced_schema: sql_name(&referenced_schema)?,
                 referenced_name: sql_name(&referenced_name)?,
                 referenced_columns,
+                written_columns,
             })
             .map_err(|_| CheckpointSetupError::Corrupt("too many stored-query dependencies"))?;
     }
@@ -23049,6 +23055,7 @@ mod stored_dependency_tests {
                 referenced_schema: SqlName::parse("").unwrap(),
                 referenced_name: SqlName::parse("original_name").unwrap(),
                 referenced_columns: crate::storage::ColumnSet::from_low_word(0b101),
+                written_columns: crate::storage::ColumnSet::EMPTY,
             })
             .unwrap();
         dependencies
@@ -23062,6 +23069,7 @@ mod stored_dependency_tests {
                 referenced_schema: SqlName::parse("").unwrap(),
                 referenced_name: SqlName::parse("original_function").unwrap(),
                 referenced_columns: crate::storage::ColumnSet::EMPTY,
+                written_columns: crate::storage::ColumnSet::EMPTY,
             })
             .unwrap();
         let encoded = format!("{}", ManifestDependencies(dependencies.view()));
@@ -23091,6 +23099,7 @@ mod stored_dependency_tests {
                     referenced_schema: SqlName::parse("").unwrap(),
                     referenced_name: SqlName::parse("original_type").unwrap(),
                     referenced_columns: crate::storage::ColumnSet::EMPTY,
+                    written_columns: crate::storage::ColumnSet::EMPTY,
                 })
                 .unwrap();
             let encoded = format!("{}", ManifestDependencies(dependencies.view()));
@@ -23124,14 +23133,16 @@ mod stored_dependency_tests {
                 "v:31"
             };
             let valid = format!(
-                "i2 1 {} {valid_key} 7075626c6963 6974656d73  6974656d73 {} -",
+                "i2 1 {} {valid_key} 7075626c6963 6974656d73  6974656d73 {} {} -",
                 class as u8,
+                crate::storage::ColumnSet::EMPTY,
                 crate::storage::ColumnSet::EMPTY
             );
             assert!(parse_stored_query_dependencies(&mut valid.split(' ')).is_ok());
             let input = format!(
-                "i2 1 {} {key} 7075626c6963 6974656d73  6974656d73 {} -",
+                "i2 1 {} {key} 7075626c6963 6974656d73  6974656d73 {} {} -",
                 class as u8,
+                crate::storage::ColumnSet::EMPTY,
                 crate::storage::ColumnSet::EMPTY
             );
             assert!(

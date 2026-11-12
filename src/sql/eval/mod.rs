@@ -3313,6 +3313,64 @@ fn validate_enum_operator_types<'a>(
     Ok(())
 }
 
+/// `cstring` has no operators of its own: PostgreSQL only concatenates it
+/// with text through `anytextcat`, so `'a'::cstring = 'a'::cstring` and
+/// `'a'::cstring || 1` fail with `42883`.
+fn validate_cstring_operator_types<'a>(
+    operator: &str,
+    concatenation: bool,
+    left: &Expr<'a>,
+    right: &Expr<'a>,
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<(), SqlError> {
+    use super::types::oid;
+    // Only casts and calls produce `cstring`; other operands skip the lookup.
+    let may_be_cstring = |expression: &Expr<'_>| match expression {
+        Expr::Cast { type_name, .. } => {
+            ColType::from_sql_name(type_name)
+                == Some(ColType::Pseudo(super::types::PseudoType::Cstring))
+        }
+        Expr::Call { .. } => true,
+        _ => false,
+    };
+    if !may_be_cstring(left) && !may_be_cstring(right) {
+        return Ok(());
+    }
+    let left_type = expression_type_identity(left, row, hooks)?.routine_argument_oid();
+    let right_type = expression_type_identity(right, row, hooks)?.routine_argument_oid();
+    if left_type != oid::CSTRING && right_type != oid::CSTRING {
+        return Ok(());
+    }
+    let other = if left_type == oid::CSTRING {
+        right_type
+    } else {
+        left_type
+    };
+    if concatenation
+        && matches!(
+            other,
+            oid::TEXT | oid::UNKNOWN | oid::VARCHAR | oid::BPCHAR | oid::NAME
+        )
+    {
+        return Ok(());
+    }
+    let name = |type_oid: i32| {
+        if type_oid == oid::UNKNOWN {
+            "unknown"
+        } else {
+            ColType::from_oid(type_oid).map_or("unknown", ColType::name)
+        }
+    };
+    Err(sql_err!(
+        sqlstate::UNDEFINED_FUNCTION,
+        "operator does not exist: {} {} {}",
+        name(left_type),
+        operator,
+        name(right_type)
+    ))
+}
+
 fn eval_binary_expression<'a>(
     expression: BinaryExpression<'_, 'a>,
     arena: &'a Arena,
@@ -3864,6 +3922,14 @@ fn eval_binary_values<'a>(
     if let Some(name) = operator.operator_name() {
         require_builtin_operator_execute(name, Some(left), right, row, hooks)?;
     }
+    validate_cstring_operator_types(
+        operator.operator_name().unwrap_or("?"),
+        operator == BinaryOp::Concat,
+        left,
+        right,
+        row,
+        hooks,
+    )?;
     if comparison_collation.is_some() {
         validate_enum_operator_types(operator, left, right, row, hooks, arena)?;
     }
@@ -5054,6 +5120,19 @@ fn eval_full_inner<'a>(
             escape,
         } => {
             require_node_builtin_execute(expression, row, hooks)?;
+            validate_cstring_operator_types(
+                match (negated, case_insensitive) {
+                    (false, false) => "~~",
+                    (true, false) => "!~~",
+                    (false, true) => "~~*",
+                    (true, true) => "!~~*",
+                },
+                false,
+                operand,
+                pattern,
+                row,
+                hooks,
+            )?;
             let v = eval_full(operand, arena, params, row, hooks)?;
             let p = eval_full(pattern, arena, params, row, hooks)?;
             let binary = matches!(v, Datum::Bytea(_));

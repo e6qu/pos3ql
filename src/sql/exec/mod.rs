@@ -43600,6 +43600,7 @@ fn publish_rewritten_view(
                 || old.slot != new.slot
                 || old.identity != new.identity
                 || old.referenced_columns != new.referenced_columns
+                || old.written_columns != new.written_columns
                 || old.referenced_schema != new.referenced_schema
                 || old.referenced_name != new.referenced_name
         })
@@ -51302,7 +51303,7 @@ fn dependency_references_table_column(
 ) -> bool {
     dependency.class == crate::storage::DependencyClass::Table
         && usize::from(dependency.slot) == table
-        && dependency.referenced_columns.contains(column)
+        && dependency.uses_column(column)
 }
 
 fn policy_depends_on_selected_stored_query(

@@ -5039,6 +5039,10 @@ pub struct StoredQueryDependency {
     /// retain zero; this avoids treating an unknown column set as every
     /// column when reconstructing catalog dependencies.
     pub referenced_columns: ColumnSet,
+    /// Target columns of a stored `INSERT` or `UPDATE` (`INSERT INTO t (e)`
+    /// writes `t.e`). They are `pg_depend` column rows like the read columns,
+    /// but grant no read access and need no read privilege.
+    pub written_columns: ColumnSet,
     pub schema: SqlName,
     pub name: SqlName,
     pub referenced_schema: SqlName,
@@ -5050,6 +5054,7 @@ pub(crate) struct SerializedStoredQueryDependency {
     pub class: DependencyClass,
     pub identity: StoredDependencyIdentity,
     pub referenced_columns: ColumnSet,
+    pub written_columns: ColumnSet,
     pub schema: SqlName,
     pub name: SqlName,
     pub referenced_schema: SqlName,
@@ -5057,11 +5062,22 @@ pub(crate) struct SerializedStoredQueryDependency {
 }
 
 impl StoredQueryDependency {
+    /// Whether the query reads or writes column position `column`.
+    pub(crate) fn uses_column(&self, column: usize) -> bool {
+        self.referenced_columns.contains(column) || self.written_columns.contains(column)
+    }
+
+    /// Whether the dependency names columns rather than the whole object.
+    pub(crate) fn names_columns(&self) -> bool {
+        !self.referenced_columns.is_empty() || !self.written_columns.is_empty()
+    }
+
     pub(crate) const EMPTY: Self = Self {
         class: DependencyClass::Table,
         slot: 0,
         identity: StoredDependencyIdentity::Name,
         referenced_columns: ColumnSet::EMPTY,
+        written_columns: ColumnSet::EMPTY,
         schema: SqlName::EMPTY,
         name: SqlName::EMPTY,
         referenced_schema: SqlName::EMPTY,
@@ -5457,6 +5473,36 @@ impl StoredQueryDependencies {
         Ok(())
     }
 
+    /// Records a target column of a stored `INSERT` or `UPDATE` on a relation
+    /// the query already depends on.
+    pub fn mark_written_column(
+        &mut self,
+        class: DependencyClass,
+        slot: usize,
+        column: usize,
+    ) -> Result<(), SqlError> {
+        if column >= MAX_COLUMNS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "stored query writes a column beyond the static attribute bound"
+            ));
+        }
+        let len = usize::from(self.len);
+        let dependency = self
+            .entry_storage_mut()
+            .iter_mut()
+            .take(len)
+            .find(|entry| entry.class == class && entry.slot as usize == slot)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "written column has no owning relation dependency"
+                )
+            })?;
+        dependency.written_columns.insert(column);
+        Ok(())
+    }
+
     pub(crate) fn serialized_push(
         &mut self,
         dependency: SerializedStoredQueryDependency,
@@ -5480,6 +5526,7 @@ impl StoredQueryDependencies {
             slot: u16::MAX,
             identity: dependency.identity,
             referenced_columns: dependency.referenced_columns,
+            written_columns: dependency.written_columns,
             schema: dependency.schema,
             name: dependency.name,
             referenced_schema: dependency.referenced_schema,
@@ -21019,6 +21066,7 @@ impl Storage {
             slot: slot as u16,
             identity: dependency.identity,
             referenced_columns: dependency.referenced_columns,
+            written_columns: dependency.written_columns,
             schema,
             name,
             referenced_schema: dependency.referenced_schema,

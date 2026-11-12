@@ -1860,6 +1860,7 @@ mod tests {
                 .capture_type_dependency(movement.class(), movement.identity.slot().index(), 0)
                 .unwrap(),
             referenced_columns: super::super::ColumnSet::EMPTY,
+            written_columns: super::super::ColumnSet::EMPTY,
             schema: movement.prior.schema,
             name: movement.prior.name,
             referenced_schema: movement.prior.schema,
@@ -2571,6 +2572,7 @@ mod tests {
                     slot: slot as u16,
                     identity,
                     referenced_columns: ColumnSet::EMPTY,
+                    written_columns: ColumnSet::EMPTY,
                     schema: movement.prior.schema,
                     name: movement.prior.name,
                     referenced_schema: movement.prior.schema,
@@ -2587,6 +2589,7 @@ mod tests {
                     )
                     .unwrap(),
                     referenced_columns: ColumnSet::EMPTY,
+                    written_columns: ColumnSet::EMPTY,
                     schema: movement.prior.schema,
                     name: movement.prior.name,
                     referenced_schema: movement.prior.schema,

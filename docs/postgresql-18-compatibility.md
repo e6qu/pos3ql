@@ -248,9 +248,10 @@ Functions and expressions:
   (`CREATE FUNCTION f(r record) ... RETURN r.a`). `'abc'::cstring`,
   `name_column::cstring` and `'abc'::unknown` are values of those types, as in
   PostgreSQL, and a cast to `"any"` keeps its operand; other sources fail
-  with `42846` (`cannot cast type integer to cstring`). Limits: renaming or
-  moving a built-in fails with `0A000`; `cstring` arrays and operators are
-  not modeled.
+  with `42846` (`cannot cast type integer to cstring`). A `cstring` only
+  concatenates with text (`'a'::cstring || 'b'` is `ab`); comparing or
+  matching it (`'a'::cstring = 'a'`) fails with `42883`. Limits: renaming or
+  moving a built-in fails with `0A000`; `cstring` arrays fail with `0A000`.
   Dropping a built-in fails with `2BP01`, as in PostgreSQL.
 - PostgreSQL 18.6's predefined roles exist from the start, with their
   OIDs, and initdb's memberships of `pg_monitor` in `pg_read_all_settings`,

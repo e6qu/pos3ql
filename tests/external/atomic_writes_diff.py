@@ -200,6 +200,7 @@ class Node:
             "result_spool_bytes": "16MiB", "result_spool_leases": 64,
             "result_stream_bytes": "256KiB",
             "index_statistics_slots": 4096,
+            "trigger_event_spill_bytes": "64MiB",
             "max_ddl_per_transaction": 16, "max_value_indexes": 8,
             "max_indexes": 8, "max_extended_statistics": 64,
             "max_casts": 8, "max_operators": 8,

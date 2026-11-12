@@ -38,6 +38,7 @@ tree and the packaged `/etc/pos3ql/pos3ql.conf`; physical limits are in
 | `result_spool_bytes` | yes | Shared bytes queuing result rows for clients that read slower than statements produce them; a multiple of 64 (e.g. `16MiB`). A client further behind gets `54000` naming this setting after the rows already queued. |
 | `result_spool_leases` | yes | Connections that can hold queued result rows at once (e.g. `max_connections`). |
 | `result_stream_bytes` | yes | Per-connection query, parameters and read positions of a large result that resumes row by row as its client reads (e.g. `256KiB`); at least 64 KiB, or `0` to disable resuming so such results queue in the spool. |
+| `trigger_event_spill_bytes` | yes | Local file shared by all connections for queued `AFTER` trigger and foreign key events once a connection's `deferred_trigger_bytes` (default `256KiB`) is full; recreated empty at startup. `0` keeps every queue in memory, otherwise at least `64KiB` (e.g. `1GiB`). A statement queuing past both gets `54000`. |
 | `large_object_pages` | no (default `8192`, must be nonzero) | Resident 2 KiB large-object pages. |
 
 ## Operational listener

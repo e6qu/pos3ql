@@ -534,6 +534,7 @@ Exhaustion returns `54000` naming the pool, before any partial effect.
 | `table_metadata_bytes`, `table_metadata_leases` | Schema images and routine input values (starter 64 MiB, 8,192) |
 | `statistics_bytes`, `statistics_leases` | Column statistics (starter 1 MiB, 1,024) |
 | `index_statistics_slots` | Index counters (starter 4,096) |
+| `deferred_trigger_bytes`, `trigger_event_spill_bytes` (required; `0` disables spilling) | Queued `AFTER` trigger and foreign key events: per-connection memory pages, then a local file shared by all connections |
 | `definition_image_slots` | Schema pins held by executing statements |
 | `execution_control_bytes`, `execution_control_leases` | PL/pgSQL source images, locals, loop frames, saved outputs, caught errors, and the step records of a running multi-step write |
 | `write_step_levels` (optional, default 4, at most 64) | Levels of multi-step statements (rule actions on tables with rules, rules on `WITH` targets) nested in one another's steps whose progress a write keeps; a routine call after rows changed one level deeper fails with `54000` naming the setting |

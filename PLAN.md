@@ -226,8 +226,8 @@ is owned.
     scalar subqueries bound once per statement; aggregates of a scalar
     subquery (`sum((SELECT v FROM u LIMIT 1))`, which fails with `42725`) and
     held running aggregate values that do not keep each row's scratch; and
-    a correlated `LIMIT` in an `ARRAY(...)` subquery (`ARRAY(SELECT w ...
-    LIMIT t.id)`),
+    outer references through a subquery's `LIMIT` or `OFFSET` (`ARRAY(SELECT
+    w ... LIMIT t.id)`, `(SELECT array_agg(w) ... OFFSET t.id - 1)`),
     set operations other than `UNION ALL` (and `UNION ALL` under
     `ORDER BY`, in a declared cursor, or with volatile or routine-calling
     expressions), sorts in object-store mode (external runs

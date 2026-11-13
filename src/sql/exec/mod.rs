@@ -8599,6 +8599,18 @@ fn drop_table_kind_with_columns(
                         Ok(closure) => closure,
                         Err(error) => return sql_fail(error),
                     };
+                    // A rule of a table this statement also drops goes with
+                    // that table, as PostgreSQL drops the listed objects
+                    // together.
+                    for (slot, selected) in dependent_rules.iter_mut().enumerate() {
+                        if *selected
+                            && let crate::storage::RuleTarget::Table(table) =
+                                storage.rule(slot).definition_for(txn.txid).target
+                            && selected_tables[..selected_table_count].contains(&usize::from(table))
+                        {
+                            *selected = false;
+                        }
+                    }
                     let policy_root = PolicyDependencySelection::Catalog {
                         class: crate::storage::DependencyClass::Table,
                         slot: index,
@@ -81061,6 +81073,9 @@ where
                 Ok(())
             };
             {
+                // A resumed attempt reads the source as the first one did,
+                // without the rows earlier attempts inserted.
+                let _snapshot = storage.dml_expression_snapshot(txn.command_id());
                 let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
                 if let Err(e) = super::query::select_into_rows_recycling(
                     storage,

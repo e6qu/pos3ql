@@ -680,7 +680,31 @@ pub fn resolve_view_for_dml<'a>(
     else {
         return Ok(None);
     };
-    let view = resolve_updatable_view(storage, slot, txid, arena, Some(write))?;
+    let view = resolve_updatable_view(storage, slot, txid, arena, Some(write), None)?;
+    if let Some(reason) = view.levels[0].blocked {
+        return Err(reason.error(write, view.levels[0].name));
+    }
+    Ok(Some(view))
+}
+
+/// [`resolve_view_for_dml`] for a `MERGE` whose actions write with the
+/// trigger events in `events`: the levels stop at a view PostgreSQL's
+/// rewriter then targets with the MERGE, one with an `INSTEAD OF` row
+/// trigger for any of those events or with a rewrite rule.
+pub fn resolve_view_for_merge<'a>(
+    storage: &Storage,
+    name: QualName,
+    txid: u32,
+    arena: &'a Arena,
+    events: u8,
+) -> Result<Option<UpdatableView<'a>>, SqlError> {
+    let Some(crate::storage::ResolvedRelation::View(slot)) =
+        storage.resolve_relation(name.schema, name.name, txid)
+    else {
+        return Ok(None);
+    };
+    let write = ViewWrite::MergeUpdate;
+    let view = resolve_updatable_view(storage, slot, txid, arena, Some(write), Some(events))?;
     if let Some(reason) = view.levels[0].blocked {
         return Err(reason.error(write, view.levels[0].name));
     }
@@ -709,7 +733,7 @@ pub fn view_is_auto_updatable(
     txid: u32,
     arena: &Arena,
 ) -> Result<bool, SqlError> {
-    let view = resolve_updatable_view(storage, slot, txid, arena, None)?;
+    let view = resolve_updatable_view(storage, slot, txid, arena, None, None)?;
     Ok(view.blocked().is_none())
 }
 
@@ -722,7 +746,7 @@ pub fn view_column_is_updatable(
     txid: u32,
     arena: &Arena,
 ) -> Result<bool, SqlError> {
-    let view = resolve_updatable_view(storage, slot, txid, arena, None)?;
+    let view = resolve_updatable_view(storage, slot, txid, arena, None, None)?;
     Ok(view.blocked().is_none()
         && view.levels[0]
             .base_columns
@@ -751,6 +775,7 @@ fn resolve_updatable_view<'a>(
     txid: u32,
     arena: &'a Arena,
     write: Option<ViewWrite>,
+    merge_events: Option<u8>,
 ) -> Result<UpdatableView<'a>, SqlError> {
     let check_columns = write.is_none_or(ViewWrite::checks_columns);
     let mut raw: [Option<RawLevel<'a>>; MAX_VIEW_LEVELS] = [None; MAX_VIEW_LEVELS];
@@ -777,7 +802,7 @@ fn resolve_updatable_view<'a>(
                 columns,
             } => {
                 if let Some(write) = write
-                    && view_writes_itself(storage, inner, write, txid)
+                    && view_writes_itself(storage, inner, write, merge_events, txid)
                 {
                     let definition = storage.view(inner);
                     let schema = arena
@@ -907,8 +932,36 @@ fn resolve_updatable_view<'a>(
 }
 
 /// Whether PostgreSQL would write the view in `slot` with its own INSTEAD OF
-/// triggers or rewrite rules rather than through its base relation.
-fn view_writes_itself(storage: &Storage, slot: usize, write: ViewWrite, txid: u32) -> bool {
+/// triggers or rewrite rules rather than through its base relation. A
+/// `MERGE` (`merge_events`) stops at any trigger for its actions' events and
+/// at any rule, which refuses it there.
+fn view_writes_itself(
+    storage: &Storage,
+    slot: usize,
+    write: ViewWrite,
+    merge_events: Option<u8>,
+    txid: u32,
+) -> bool {
+    if let Some(events) = merge_events {
+        let target = crate::storage::RuleTarget::View(slot as u16);
+        return storage.triggers_for_view(slot, txid).any(|(_, trigger)| {
+            matches!(trigger.level, crate::sql::ast::TriggerLevel::Row)
+                && matches!(trigger.timing, crate::sql::ast::TriggerTiming::InsteadOf)
+                && [
+                    crate::sql::ast::TriggerEvents::INSERT,
+                    crate::sql::ast::TriggerEvents::UPDATE,
+                    crate::sql::ast::TriggerEvents::DELETE,
+                ]
+                .into_iter()
+                .any(|event| events & event != 0 && trigger.events.contains(event))
+        }) || [
+            crate::storage::RewriteEvent::Insert,
+            crate::storage::RewriteEvent::Update,
+            crate::storage::RewriteEvent::Delete,
+        ]
+        .into_iter()
+        .any(|event| storage.rules_for(target, event, txid).next().is_some());
+    }
     let (event, rule_event) = match write {
         ViewWrite::Insert | ViewWrite::MergeInsert => (
             crate::sql::ast::TriggerEvents::INSERT,

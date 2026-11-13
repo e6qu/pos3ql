@@ -547,10 +547,7 @@ SQL/JSON result types) are reported when the statement would run. In a
 written before the failing modifier are reported first, as PostgreSQL's
 analysis order finds them; in other statements the modifier error comes first.
 Writes to catalog views other than `pg_settings`, and to system catalogs,
-fail with `42P01`. `MERGE` into a view whose every action has an `INSTEAD OF`
-trigger, directly or through views above it, fails with `0A000` (`MERGE into
-view "v" through its INSTEAD OF triggers is not supported`); PostgreSQL fires
-the triggers.
+fail with `42P01`.
 A `RETURNING` list routed through a rule's `RETURNING` list reads the rule's
 relation and the statement's `FROM` or `USING` items (`UPDATE v ... FROM o
 RETURNING o.label, *`), but a subquery in that list fails with `0A000` where

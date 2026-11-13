@@ -1459,6 +1459,7 @@ pub(crate) use sql_function_execution::{
 mod engine_triggers;
 mod plpgsql_conditions;
 pub(crate) use engine_triggers::{engine_required, run_pending_trigger};
+mod merge_view;
 mod row_conflicts;
 mod row_progress;
 mod trigger_firing;
@@ -76342,7 +76343,54 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
     }
 
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        if self.whole_row_image(table).is_some() {
+            return Some(ColType::Record);
+        }
         self.source_members.range(table).map(|_| ColType::Record)
+    }
+
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        // The source is a derived row with no stored row type.
+        (self.old_name == Some(table) || self.new_name == Some(table) || table == self.target_alias)
+            .then(|| {
+                (
+                    self.target_def.schema.as_str(),
+                    self.target_def.name.as_str(),
+                )
+            })
+    }
+
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Option<(StackStr<64>, StaticTypeMeta)> {
+        let (definition, _) = self.whole_row_image(table)?;
+        crate::sql::eval::stored_row_field_metadata(definition.columns().get(index)?, catalog)
+    }
+
+    fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        match self.whole_row_image(table) {
+            Some((_, image)) => Ok(image.is_some()),
+            None => Ok(self.source_members.range(table).is_some() && self.source.is_some()),
+        }
+    }
+
+    fn whole_row_expansion_fields(
+        &self,
+        table: &str,
+        arena: &'v Arena,
+    ) -> Result<&'v [RecordField<'v>], SqlError> {
+        match self.whole_row_image(table) {
+            Some((definition, image)) => merge_row_fields(definition, image, arena),
+            None => self.whole_row_fields(table, arena)?.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "null whole-row expansion lacks its declared shape"
+                )
+            }),
+        }
     }
 
     fn whole_row_fields(
@@ -76350,6 +76398,12 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
         table: &str,
         arena: &'v Arena,
     ) -> Result<Option<&'v [RecordField<'v>]>, SqlError> {
+        if let Some((definition, image)) = self.whole_row_image(table) {
+            return match image {
+                Some(_) => merge_row_fields(definition, image, arena).map(Some),
+                None => Ok(None),
+            };
+        }
         let Some(columns) = self.source_members.range(table) else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_TABLE,
@@ -76394,6 +76448,63 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
     ) -> Option<crate::storage::UserTypeName> {
         self.column(qualifier, name)
             .and_then(|column| column.user_type)
+    }
+}
+
+/// A MERGE row image as record fields: NULL fields for an absent image.
+fn merge_row_fields<'v>(
+    definition: crate::storage::RelationDefinition<'_>,
+    image: Option<&[Datum<'v>]>,
+    arena: &'v Arena,
+) -> Result<&'v [RecordField<'v>], SqlError> {
+    let fields = arena
+        .alloc_slice_with(definition.n_columns, |index| RecordField {
+            name: "",
+            type_oid: definition.columns()[index].ctype.oid(),
+            type_mod: definition.columns()[index].type_mod,
+            value: image.map_or(Datum::Null, |values| values[index]),
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    for (field, column) in fields.iter_mut().zip(definition.columns()) {
+        field.name = arena
+            .alloc_str(column.name.as_str())
+            .map_err(|_| super::query::arena_full_pub())?;
+    }
+    Ok(&*fields)
+}
+
+impl<'d, 'v> MergeLookup<'d, 'v> {
+    /// The row a whole-row reference to `table` reads: the `RETURNING`
+    /// images, the target, or the source (its visible columns), with `None`
+    /// for an absent row.
+    fn whole_row_image(
+        &self,
+        table: &str,
+    ) -> Option<(
+        crate::storage::RelationDefinition<'d>,
+        Option<&'v [Datum<'v>]>,
+    )> {
+        if self.old_name == Some(table) {
+            return Some((self.target_def, self.old));
+        }
+        if self.new_name == Some(table) {
+            return Some((self.target_def, self.new));
+        }
+        if table == self.target_alias {
+            return Some((self.target_def, Some(self.target)));
+        }
+        if !self.source_alias.is_empty()
+            && table == self.source_alias
+            && (self.source.is_some() || self.source_namespace_when_absent)
+        {
+            let visible = self.source_def.n_columns.min(self.source_members.visible);
+            let definition = crate::storage::RelationDefinition {
+                n_columns: visible,
+                ..*self.source_def
+            };
+            return Some((definition, self.source.map(|values| &values[..visible])));
+        }
+        None
     }
 }
 
@@ -76804,10 +76915,10 @@ fn describe_joined_returning<'a>(
                 found = *qualifier == returning.old_name() || *qualifier == returning.new_name();
             }
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-                expression.for_each_column_reference(&mut |qualifier, _| {
-                    found |= qualifier.is_some_and(|qualifier| {
-                        qualifier == returning.old_name() || qualifier == returning.new_name()
-                    });
+                // A bare `old` or `new` is a whole-row reference to an image.
+                expression.for_each_column_reference(&mut |qualifier, name| {
+                    let named = qualifier.unwrap_or(name);
+                    found |= named == returning.old_name() || named == returning.new_name();
                 });
             }
             SelectItem::Wildcard(_) => {}
@@ -76922,11 +77033,30 @@ pub(crate) fn merge<'a>(
             None,
         );
     };
-    if let Err(error) = reject_merge_instead_triggers(storage, view_slot, statement, txn.txid) {
-        return sql_fail(error);
+    // A view whose every writing action has an INSTEAD OF row trigger is the
+    // MERGE's result relation, as PostgreSQL's `view_has_instead_trigger`
+    // decides.
+    if merge_view::merge_is_trigger_updatable(storage, view_slot, statement, txn.txid) {
+        return merge_view::merge_through_instead_triggers(
+            storage,
+            txn,
+            statement,
+            merge_view::TriggerMergeTarget {
+                view: view_slot,
+                above: None,
+            },
+            arena,
+            params,
+            services,
+            responder,
+            capture,
+            progress,
+            outer,
+        );
     }
     // PostgreSQL rejects a view that is not automatically updatable for the
-    // first action that would write it.
+    // first action that has no INSTEAD OF trigger to write it.
+    let mut events = 0u8;
     for when in statement.whens {
         let write = match when.action() {
             MergeAction::Insert { .. } => super::query::ViewWrite::MergeInsert,
@@ -76934,38 +77064,54 @@ pub(crate) fn merge<'a>(
             MergeAction::Delete => super::query::ViewWrite::MergeDelete,
             MergeAction::DoNothing => continue,
         };
+        let event = merge_view::merge_action_event(when.action()).unwrap_or(0);
+        events |= event;
+        if merge_view::view_has_instead_trigger(storage, view_slot, event, txn.txid) {
+            continue;
+        }
         if let Err(error) =
             super::query::resolve_view_for_dml(storage, target_qual, txn.txid, arena, write)
         {
             return sql_fail(error);
         }
     }
-    let view = match super::query::resolve_view_for_dml(
-        storage,
-        target_qual,
-        txn.txid,
-        arena,
-        super::query::ViewWrite::MergeUpdate,
-    ) {
-        Ok(Some(view)) => view,
-        Ok(None) => {
-            return sql_fail(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "MERGE target view is absent during rewriting"
-            ));
-        }
-        Err(error) => return sql_fail(error),
-    };
+    if let Err(error) =
+        merge_view::reject_partial_merge_triggers(storage, view_slot, statement, txn.txid)
+    {
+        return sql_fail(error);
+    }
+    let view =
+        match super::query::resolve_view_for_merge(storage, target_qual, txn.txid, arena, events) {
+            Ok(Some(view)) => view,
+            Ok(None) => {
+                return sql_fail(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "MERGE target view is absent during rewriting"
+                ));
+            }
+            Err(error) => return sql_fail(error),
+        };
     // The levels can end at a view that writes itself, as PostgreSQL's
     // rewriter then targets it with the MERGE.
-    if let Some(base) = view.base_view {
-        let target = crate::storage::ResolvedRelation::View(base);
-        if let Err(error) = reject_merge_rules(storage, target, txn.txid)
-            .and_then(|()| reject_merge_instead_triggers(storage, base, statement, txn.txid))
-        {
-            return sql_fail(error);
+    let base_triggered = match view.base_view {
+        Some(base) => {
+            let target = crate::storage::ResolvedRelation::View(base);
+            if let Err(error) = reject_merge_rules(storage, target, txn.txid) {
+                return sql_fail(error);
+            }
+            if merge_view::merge_is_trigger_updatable(storage, base, statement, txn.txid) {
+                Some(base)
+            } else {
+                if let Err(error) =
+                    merge_view::reject_partial_merge_triggers(storage, base, statement, txn.txid)
+                {
+                    return sql_fail(error);
+                }
+                None
+            }
         }
-    }
+        None => None,
+    };
     let original = match arena.alloc(Stmt::Merge(*statement)) {
         Ok(original) => &*original,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
@@ -77003,6 +77149,24 @@ pub(crate) fn merge<'a>(
         },
         (Err(error), _) | (_, Err(error)) => return sql_fail(error),
     };
+    if let Some(base) = base_triggered {
+        return merge_view::merge_through_instead_triggers(
+            storage,
+            txn,
+            rewritten,
+            merge_view::TriggerMergeTarget {
+                view: base,
+                above: Some(view_target),
+            },
+            arena,
+            params,
+            services,
+            responder,
+            capture,
+            progress,
+            outer,
+        );
+    }
     merge_target(
         storage,
         txn,
@@ -77065,39 +77229,6 @@ fn reject_merge_rules(
     ))
 }
 
-/// A MERGE whose every action has an `INSTEAD OF` row trigger on the view
-/// it writes is PostgreSQL's trigger-updatable MERGE, which pos3ql does not
-/// run; it fails instead of writing the view's base relation.
-fn reject_merge_instead_triggers(
-    storage: &Storage,
-    view: usize,
-    statement: &crate::sql::ast::Merge<'_>,
-    txid: u32,
-) -> Result<(), SqlError> {
-    use crate::sql::ast::MergeActionRef as MergeAction;
-    let has_trigger = |event| {
-        storage.triggers_for_view(view, txid).any(|(_, trigger)| {
-            matches!(trigger.level, TriggerLevel::Row)
-                && matches!(trigger.timing, TriggerTiming::InsteadOf)
-                && trigger.events.contains(event)
-        })
-    };
-    let triggered = statement.whens.iter().all(|when| match when.action() {
-        MergeAction::Insert { .. } => has_trigger(TriggerEvents::INSERT),
-        MergeAction::Update(_) => has_trigger(TriggerEvents::UPDATE),
-        MergeAction::Delete => has_trigger(TriggerEvents::DELETE),
-        MergeAction::DoNothing => true,
-    });
-    if !triggered {
-        return Ok(());
-    }
-    Err(sql_err!(
-        sqlstate::FEATURE_NOT_SUPPORTED,
-        "MERGE into view \"{}\" through its INSTEAD OF triggers is not supported",
-        storage.view(view).name_for(txid).as_str()
-    ))
-}
-
 /// The rules of the auto-updatable view a MERGE writes through.
 #[derive(Clone, Copy)]
 struct MergeViewTarget<'a> {
@@ -77107,6 +77238,284 @@ struct MergeViewTarget<'a> {
     check: ViewCheck<'a>,
     /// The authorization the base table is checked with.
     authorization: DmlAuthorization,
+}
+
+/// The columns a MERGE's `UPDATE` actions and `INSERT` column lists write,
+/// after PostgreSQL's per-action checks of the target's column names.
+fn merge_written_columns<Definition0: crate::storage::DefinitionBacking>(
+    statement: &crate::sql::ast::Merge<'_>,
+    def: &crate::storage::TableDefinition<Definition0>,
+) -> Result<(ColumnSet, ColumnSet), SqlError> {
+    use crate::sql::ast::MergeActionRef as MergeAction;
+    let mut update_columns = ColumnSet::EMPTY;
+    let mut insert_columns = ColumnSet::EMPTY;
+    for when in statement.whens {
+        match when.action() {
+            MergeAction::Update(assignments) => {
+                let mut assigned = ColumnSet::EMPTY;
+                for (name, expression) in assignments {
+                    let column = def
+                        .column_index(name)
+                        .ok_or_else(|| undefined_column(name))?;
+                    if assigned.contains(column) {
+                        return Err(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "multiple assignments to same column \"{}\"",
+                            name
+                        ));
+                    }
+                    if !matches!(expression, Expr::DefaultMarker) {
+                        reject_generated_write(def, column)?;
+                    }
+                    assigned.insert(column);
+                    update_columns.insert(column);
+                }
+            }
+            MergeAction::Insert {
+                columns,
+                default_values,
+                ..
+            } if !default_values => {
+                if columns.is_empty() {
+                    insert_columns |= all_columns_mask(def);
+                } else {
+                    let mut assigned = ColumnSet::EMPTY;
+                    for name in columns {
+                        let column = def
+                            .column_index(name)
+                            .ok_or_else(|| undefined_column(name))?;
+                        if assigned.contains(column) {
+                            return Err(sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "column \"{}\" specified more than once",
+                                name
+                            ));
+                        }
+                        assigned.insert(column);
+                        insert_columns.insert(column);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok((update_columns, insert_columns))
+}
+
+/// Whether a WHEN clause's `AND` condition holds for the candidate's row
+/// scope; a clause without one always applies.
+fn merge_condition_holds<'a, R: ColumnLookup<'a>>(
+    when: &crate::sql::ast::MergeWhen<'a>,
+    storage: &Storage,
+    txid: u32,
+    seq_session: &crate::sql::guc::SeqSession,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &R,
+) -> Result<bool, SqlError> {
+    let Some(condition) = when.condition() else {
+        return Ok(true);
+    };
+    Ok(matches!(
+        eval_merge_expression(
+            condition,
+            storage,
+            txid,
+            seq_session,
+            arena,
+            params,
+            row,
+            None
+        )?,
+        Datum::Bool(true)
+    ))
+}
+
+/// A MERGE source as `SELECT * FROM <source>`, narrowed to the columns the
+/// statement reads when it names them all.
+struct MergeSource<'a> {
+    alias: &'a str,
+    members: MergeSourceMembers<'a>,
+    select: crate::sql::ast::Select<'a>,
+    def: crate::storage::RelationDefinition<'a>,
+}
+
+fn merge_source<'a>(
+    storage: &Storage,
+    statement: &'a crate::sql::ast::Merge<'a>,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<MergeSource<'a>, SqlError> {
+    let alias = statement
+        .source
+        .alias
+        .unwrap_or(if statement.source.table.is_empty() {
+            ""
+        } else {
+            statement.source.table
+        });
+    let source_from = crate::sql::ast::FromClause {
+        base: statement.source,
+        joins: &[],
+    };
+    // An unaliased parenthesized join's members follow its own columns.
+    let members = match (statement.source.alias, statement.source.join_members) {
+        (None, Some(members)) => members,
+        _ => &[],
+    };
+    let star = arena
+        .alloc_slice_with(1 + members.len(), |index| match index {
+            0 => SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN),
+            index => SelectItem::TableWildcard(members[index - 1].name),
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let source_all_select = crate::sql::ast::Select {
+        items: star,
+        distinct: false,
+        distinct_on: &[],
+        windows: &[],
+        from: Some(source_from),
+        where_clause: None,
+        group_by: &[],
+        grouping_set_quantifier: crate::sql::ast::GroupingSetQuantifier::All,
+        grouping_sets: &[],
+        having: None,
+        order_by: &[],
+        limit: None,
+        offset: None,
+        with_ties: false,
+        with: &[],
+        set_body: None,
+        locking: &[],
+    };
+    // Keep temporary source descriptions by value. Retaining full copies here
+    // would consume the fixed statement arena before selecting source rows.
+    let source_all_def = super::query::describe_derived_definition(
+        storage,
+        &source_all_select,
+        alias,
+        statement.source.col_alias,
+        txid,
+        arena,
+        outer,
+    )?;
+    let source_members = merge_source_members(storage, statement, &source_all_select, txid, arena)?;
+    let select = match merge_source_columns(statement, alias, &source_all_def) {
+        Some(columns) => {
+            let mut items =
+                [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_COLUMNS];
+            let mut count = 0usize;
+            for (index, column) in source_all_def
+                .columns()
+                .iter()
+                .take(u64::BITS as usize)
+                .enumerate()
+            {
+                if columns & (1u64 << index) == 0 {
+                    continue;
+                }
+                let expression = arena
+                    .alloc(Expr::Column {
+                        qualifier: Some(alias),
+                        name: column.name.as_str(),
+                    })
+                    .map_err(|_| super::query::arena_full_pub())?;
+                items[count] = SelectItem::Expr {
+                    expression,
+                    alias: Some(column.name.as_str()),
+                };
+                count += 1;
+            }
+            if count == 0 {
+                let expression = arena
+                    .alloc(Expr::Int(1))
+                    .map_err(|_| super::query::arena_full_pub())?;
+                items[0] = SelectItem::Expr {
+                    expression,
+                    alias: Some("__pos3ql_merge_source"),
+                };
+                count = 1;
+            }
+            let items = arena
+                .alloc_slice_copy(&items[..count])
+                .map_err(|_| super::query::arena_full_pub())?;
+            crate::sql::ast::Select {
+                items,
+                ..source_all_select
+            }
+        }
+        None => source_all_select,
+    };
+    let def = super::query::describe_derived_definition(
+        storage, &select, alias, None, txid, arena, outer,
+    )?;
+    Ok(MergeSource {
+        alias,
+        members: source_members,
+        select,
+        def,
+    })
+}
+
+/// Selects the MERGE source's rows exactly once. Evaluating it again to
+/// count first would repeat volatile effects and could observe a different
+/// foreign snapshot.
+fn merge_source_rows<'a>(
+    storage: &Storage,
+    txid: u32,
+    source: &MergeSource<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    outer: Option<&dyn ColumnLookup<'a>>,
+    seq_session: &crate::sql::guc::SeqSession,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    let mut n_source = 0usize;
+    let mut source_capacity = 0usize;
+    let mut source_rows_ptr: *mut &[u8] = core::ptr::null_mut();
+    let source_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
+    let source_outer = outer.map(crate::sql::eval::EnclosingRow);
+    super::query::select_into_rows(
+        storage,
+        txid,
+        &source.select,
+        arena,
+        params,
+        source_outer
+            .as_ref()
+            .map(|row| row as &dyn ColumnLookup<'_>),
+        Some(&source_sequences),
+        &mut |values| {
+            let encoded = encode_projected_pub(values, arena)?;
+            if n_source == source_capacity {
+                let next_capacity = if source_capacity == 0 {
+                    8
+                } else {
+                    source_capacity
+                        .checked_mul(2)
+                        .ok_or_else(super::query::arena_full_pub)?
+                };
+                let fresh = arena
+                    .alloc_slice_with(next_capacity, |_| &[][..])
+                    .map_err(|_| super::query::arena_full_pub())?;
+                if n_source != 0 {
+                    let previous =
+                        unsafe { core::slice::from_raw_parts(source_rows_ptr, n_source) };
+                    fresh[..n_source].copy_from_slice(previous);
+                }
+                source_rows_ptr = fresh.as_mut_ptr();
+                source_capacity = next_capacity;
+            }
+            unsafe { source_rows_ptr.add(n_source).write(encoded) };
+            n_source += 1;
+            Ok(())
+        },
+    )?;
+    Ok(if n_source == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(source_rows_ptr, n_source) }
+    })
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -77190,60 +77599,10 @@ fn merge_target<'a>(
     };
     let foreign_target = def.kind == crate::storage::TableKind::Foreign;
     let target_alias = statement.target_alias.or(Some(statement.target.name));
-    let mut update_columns = ColumnSet::EMPTY;
-    let mut insert_columns = ColumnSet::EMPTY;
-    for when in statement.whens {
-        match when.action() {
-            MergeAction::Update(assignments) => {
-                let mut assigned = ColumnSet::EMPTY;
-                for (name, expression) in assignments {
-                    let Some(column) = def.column_index(name) else {
-                        return sql_fail(undefined_column(name));
-                    };
-                    if assigned.contains(column) {
-                        return sql_fail(sql_err!(
-                            sqlstate::SYNTAX_ERROR,
-                            "multiple assignments to same column \"{}\"",
-                            name
-                        ));
-                    }
-                    if !matches!(expression, Expr::DefaultMarker)
-                        && let Err(error) = reject_generated_write(def, column)
-                    {
-                        return sql_fail(error);
-                    }
-                    assigned.insert(column);
-                    update_columns.insert(column);
-                }
-            }
-            MergeAction::Insert {
-                columns,
-                default_values,
-                ..
-            } if !default_values => {
-                if columns.is_empty() {
-                    insert_columns |= all_columns_mask(def);
-                } else {
-                    let mut assigned = ColumnSet::EMPTY;
-                    for name in columns {
-                        let Some(column) = def.column_index(name) else {
-                            return sql_fail(undefined_column(name));
-                        };
-                        if assigned.contains(column) {
-                            return sql_fail(sql_err!(
-                                sqlstate::SYNTAX_ERROR,
-                                "column \"{}\" specified more than once",
-                                name
-                            ));
-                        }
-                        assigned.insert(column);
-                        insert_columns.insert(column);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    let (update_columns, insert_columns) = match merge_written_columns(statement, def) {
+        Ok(columns) => columns,
+        Err(error) => return sql_fail(error),
+    };
     let reads_target = match (|| -> Result<ColumnSet, SqlError> {
         let mut columns = expression_dml_target_columns(
             statement.on,
@@ -77459,17 +77818,7 @@ fn merge_target<'a>(
     } else {
         None
     };
-    let mut merge_update_columns = ColumnSet::EMPTY;
-    for when in statement.whens {
-        if let MergeAction::Update(assignments) = when.action() {
-            for (name, _) in assignments {
-                let Some(column) = def.column_index(name) else {
-                    return sql_fail(undefined_column(name));
-                };
-                merge_update_columns.insert(column);
-            }
-        }
-    }
+    let merge_update_columns = update_columns;
     let merge_events = statement.whens.iter().fold(0u8, |events, when| {
         events
             | match when.action() {
@@ -77521,133 +77870,13 @@ fn merge_target<'a>(
         return sql_fail(error);
     }
     let target_alias = statement.target_alias.unwrap_or(statement.target.name);
-    let source_alias = statement
-        .source
-        .alias
-        .unwrap_or(if statement.source.table.is_empty() {
-            ""
-        } else {
-            statement.source.table
-        });
-
-    // Materialize the source as `SELECT * FROM <source>`: its column set (a
-    // synthesized def) and its rows.
-    let source_from = crate::sql::ast::FromClause {
-        base: statement.source,
-        joins: &[],
-    };
-    // An unaliased parenthesized join's members follow its own columns.
-    let members = match (statement.source.alias, statement.source.join_members) {
-        (None, Some(members)) => members,
-        _ => &[],
-    };
-    let star = match arena.alloc_slice_with(1 + members.len(), |index| match index {
-        0 => SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN),
-        index => SelectItem::TableWildcard(members[index - 1].name),
-    }) {
-        Ok(s) => &*s,
-        Err(_) => return sql_fail(super::query::arena_full_pub()),
-    };
-    let source_all_select = crate::sql::ast::Select {
-        items: star,
-        distinct: false,
-        distinct_on: &[],
-        windows: &[],
-        from: Some(source_from),
-        where_clause: None,
-        group_by: &[],
-        grouping_set_quantifier: crate::sql::ast::GroupingSetQuantifier::All,
-        grouping_sets: &[],
-        having: None,
-        order_by: &[],
-        limit: None,
-        offset: None,
-        with_ties: false,
-        with: &[],
-        set_body: None,
-        locking: &[],
-    };
-    // Keep temporary source descriptions by value. Retaining full copies here
-    // would consume the fixed statement arena before selecting source rows.
-    let source_all_def = match super::query::describe_derived_definition(
-        storage,
-        &source_all_select,
-        source_alias,
-        statement.source.col_alias,
-        txn.txid,
-        arena,
-        outer,
-    ) {
-        Ok(d) => d,
-        Err(e) => return sql_fail(e),
-    };
-    let source_members =
-        match merge_source_members(storage, statement, &source_all_select, txn.txid, arena) {
-            Ok(members) => members,
-            Err(error) => return sql_fail(error),
-        };
-    let source_select = match merge_source_columns(statement, source_alias, &source_all_def) {
-        Some(columns) => {
-            let mut items =
-                [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_COLUMNS];
-            let mut count = 0usize;
-            for (index, column) in source_all_def
-                .columns()
-                .iter()
-                .take(u64::BITS as usize)
-                .enumerate()
-            {
-                if columns & (1u64 << index) == 0 {
-                    continue;
-                }
-                let expression = match arena.alloc(Expr::Column {
-                    qualifier: Some(source_alias),
-                    name: column.name.as_str(),
-                }) {
-                    Ok(expression) => expression,
-                    Err(_) => return sql_fail(super::query::arena_full_pub()),
-                };
-                items[count] = SelectItem::Expr {
-                    expression,
-                    alias: Some(column.name.as_str()),
-                };
-                count += 1;
-            }
-            if count == 0 {
-                let expression = match arena.alloc(Expr::Int(1)) {
-                    Ok(expression) => expression,
-                    Err(_) => return sql_fail(super::query::arena_full_pub()),
-                };
-                items[0] = SelectItem::Expr {
-                    expression,
-                    alias: Some("__pos3ql_merge_source"),
-                };
-                count = 1;
-            }
-            let items = match arena.alloc_slice_copy(&items[..count]) {
-                Ok(items) => items,
-                Err(_) => return sql_fail(super::query::arena_full_pub()),
-            };
-            crate::sql::ast::Select {
-                items,
-                ..source_all_select
-            }
-        }
-        None => source_all_select,
-    };
-    let source_def = match super::query::describe_derived_definition(
-        storage,
-        &source_select,
-        source_alias,
-        None,
-        txn.txid,
-        arena,
-        outer,
-    ) {
-        Ok(definition) => definition,
+    let source = match merge_source(storage, statement, txn.txid, arena, outer) {
+        Ok(source) => source,
         Err(error) => return sql_fail(error),
     };
-    let source_def = &source_def;
+    let source_alias = source.alias;
+    let source_members = source.members;
+    let source_def = &source.def;
     if !statement.returning.is_empty() && !capturing && !resuming {
         let mark = arena.mark();
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
@@ -77677,57 +77906,19 @@ fn merge_target<'a>(
     // also when a resumed attempt selects them again after earlier rows
     // changed.
     let selection_snapshot = storage.dml_expression_snapshot(txn.command_id());
-    // Materialize the source exactly once. Re-evaluating it to count first
-    // would duplicate volatile effects and could observe a different foreign
-    // snapshot on the second pass.
-    let mut n_source = 0usize;
-    let mut source_capacity = 0usize;
-    let mut source_rows_ptr: *mut &[u8] = core::ptr::null_mut();
-    let source_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-    let source_outer = outer.map(crate::sql::eval::EnclosingRow);
-    if let Err(e) = super::query::select_into_rows(
+    let source_rows = match merge_source_rows(
         storage,
         txn.txid,
-        &source_select,
+        &source,
         arena,
         params,
-        source_outer
-            .as_ref()
-            .map(|row| row as &dyn ColumnLookup<'_>),
-        Some(&source_sequences),
-        &mut |values| {
-            let encoded = encode_projected_pub(values, arena)?;
-            if n_source == source_capacity {
-                let next_capacity = if source_capacity == 0 {
-                    8
-                } else {
-                    source_capacity
-                        .checked_mul(2)
-                        .ok_or_else(super::query::arena_full_pub)?
-                };
-                let fresh = arena
-                    .alloc_slice_with(next_capacity, |_| &[][..])
-                    .map_err(|_| super::query::arena_full_pub())?;
-                if n_source != 0 {
-                    let previous =
-                        unsafe { core::slice::from_raw_parts(source_rows_ptr, n_source) };
-                    fresh[..n_source].copy_from_slice(previous);
-                }
-                source_rows_ptr = fresh.as_mut_ptr();
-                source_capacity = next_capacity;
-            }
-            unsafe { source_rows_ptr.add(n_source).write(encoded) };
-            n_source += 1;
-            Ok(())
-        },
+        outer,
+        seq_session,
     ) {
-        return sql_fail(e);
-    }
-    let source_rows: &[&[u8]] = if n_source == 0 {
-        &[]
-    } else {
-        unsafe { core::slice::from_raw_parts(source_rows_ptr, n_source) }
+        Ok(rows) => rows,
+        Err(error) => return sql_fail(error),
     };
+    let n_source = source_rows.len();
     let replication_role = match crate::sql::guc::active_session_replication_role() {
         Ok(role) => role,
         Err(error) => return sql_fail(error),
@@ -78249,30 +78440,24 @@ fn merge_target<'a>(
                             values: sv,
                             alias: None,
                         };
-                        for when in statement.whens.iter().filter(|w| {
-                            matches!(
-                                w.kind(),
-                                crate::sql::ast::MergeMatchKind::NotMatchedByTarget
-                            )
+                        for when in statement.whens.iter().filter(|when| {
+                            when.kind() == crate::sql::ast::MergeMatchKind::NotMatchedByTarget
                         }) {
-                            if let Some(cond) = when.condition() {
-                                match eval_merge_expression(
-                                    cond,
-                                    storage,
-                                    txn.txid,
-                                    seq_session,
-                                    arena,
-                                    params,
-                                    &ProceduralMergeScope {
-                                        row: &source_ctx,
-                                        outer,
-                                    },
-                                    None,
-                                ) {
-                                    Ok(Datum::Bool(true)) => {}
-                                    Ok(_) => continue,
-                                    Err(e) => return sql_fail(e),
-                                }
+                            match merge_condition_holds(
+                                when,
+                                storage,
+                                txn.txid,
+                                seq_session,
+                                arena,
+                                params,
+                                &ProceduralMergeScope {
+                                    row: &source_ctx,
+                                    outer,
+                                },
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => continue,
+                                Err(error) => return sql_fail(error),
                             }
                             match when.action() {
                                 MergeAction::DoNothing => {}
@@ -78557,13 +78742,16 @@ fn merge_target<'a>(
                         };
                     }
                     // First satisfied clause for this candidate state.
-                    for when in statement.whens.iter().filter(|when| {
-                        matches!(
-                            (by_source_actions, when.kind()),
-                            (false, crate::sql::ast::MergeMatchKind::Matched)
-                                | (true, crate::sql::ast::MergeMatchKind::NotMatchedBySource)
-                        )
-                    }) {
+                    let candidate = if by_source_actions {
+                        crate::sql::ast::MergeMatchKind::NotMatchedBySource
+                    } else {
+                        crate::sql::ast::MergeMatchKind::Matched
+                    };
+                    for when in statement
+                        .whens
+                        .iter()
+                        .filter(|when| when.kind() == candidate)
+                    {
                         let action_security = match when.action() {
                             MergeAction::Update(_) => update_security,
                             MergeAction::Delete => delete_security,
@@ -78597,24 +78785,21 @@ fn merge_target<'a>(
                                 Err(error) => return sql_fail(error),
                             }
                         }
-                        if let Some(cond) = when.condition() {
-                            match eval_merge_expression(
-                                cond,
-                                storage,
-                                txn.txid,
-                                seq_session,
-                                arena,
-                                params,
-                                &ProceduralMergeScope {
-                                    row: &lookup,
-                                    outer,
-                                },
-                                None,
-                            ) {
-                                Ok(Datum::Bool(true)) => {}
-                                Ok(_) => continue,
-                                Err(e) => return sql_fail(e),
-                            }
+                        match merge_condition_holds(
+                            when,
+                            storage,
+                            txn.txid,
+                            seq_session,
+                            arena,
+                            params,
+                            &ProceduralMergeScope {
+                                row: &lookup,
+                                outer,
+                            },
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(error) => return sql_fail(error),
                         }
                         let (row_target, row_definition) =
                             match definitions.selection(storage, target_tables[j], txn.txid) {
@@ -79684,6 +79869,90 @@ fn merge_cardinality() -> SqlError {
 /// Applies a MERGE `WHEN NOT MATCHED THEN INSERT`: builds the row from the
 /// clause (values evaluated with the source row in scope), fills defaults and
 /// generated columns, and stores it.
+/// The values a MERGE `INSERT` action writes explicitly, with the columns
+/// it writes; `DEFAULT` entries and unlisted columns stay unset.
+#[expect(clippy::too_many_arguments, reason = "MERGE expression context")]
+fn merge_insert_values<
+    'a,
+    Definition0: crate::storage::DefinitionBacking,
+    Scope: ColumnLookup<'a>,
+>(
+    def: &crate::storage::TableDefinition<Definition0>,
+    columns: &[&str],
+    values: &[&'a Expr<'a>],
+    default_values: bool,
+    overriding: Overriding,
+    source_ctx: &Scope,
+    assignment_casts: AssignmentCasts<'a>,
+    storage: &Storage,
+    txid: u32,
+    seq_session: &crate::sql::guc::SeqSession,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+) -> Result<([Datum<'a>; MAX_COLUMNS], [bool; MAX_COLUMNS]), SqlError> {
+    // Target columns for the supplied values: the named list, or all columns.
+    let mut targets = [0usize; MAX_COLUMNS];
+    // Without a column list the values fill the leading columns, as in
+    // `INSERT`; analysis has rejected more values than columns.
+    let n_targets = if columns.is_empty() {
+        for (i, t) in targets.iter_mut().enumerate().take(def.n_columns) {
+            *t = i;
+        }
+        values.len().min(def.n_columns)
+    } else {
+        for (i, name) in columns.iter().enumerate() {
+            let Some(ci) = def.column_index(name) else {
+                return Err(undefined_column(name));
+            };
+            targets[i] = ci;
+        }
+        columns.len()
+    };
+    let mut row = [Datum::Null; MAX_COLUMNS];
+    let mut explicit = [false; MAX_COLUMNS];
+    if !default_values {
+        if values.len() != n_targets {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "MERGE INSERT has {} expressions but {} target columns",
+                values.len(),
+                n_targets
+            ));
+        }
+        let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
+        let catalog = super::query::storage_catalog(storage, arena, txid);
+        let hooks = super::eval::EvalHooks {
+            catalog: Some(&catalog),
+            sequences: Some(&seq),
+            ..super::eval::NO_HOOKS
+        };
+        for (i, expression) in values.iter().enumerate() {
+            if matches!(expression, Expr::DefaultMarker) {
+                continue;
+            }
+            reject_generated_write(def, targets[i])?;
+            match identity_action(def, targets[i], overriding) {
+                IdentityAction::Reject => return Err(reject_identity_write(def, targets[i])),
+                IdentityAction::UseSequence => continue,
+                IdentityAction::Accept => {}
+            }
+            row[targets[i]] = eval_prepared_assignment(
+                assignment_casts,
+                expression,
+                &def.columns()[targets[i]],
+                storage,
+                txid,
+                arena,
+                params,
+                source_ctx,
+                &hooks,
+            )?;
+            explicit[targets[i]] = true;
+        }
+    }
+    Ok((row, explicit))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: ColumnLookup<'a>>(
     storage: &mut Storage,
@@ -79711,64 +79980,20 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
     let seq_session = services.seq_session;
     let coercion_txid = txn.txid;
     let table_index = logical_target.table();
-    // Target columns for the supplied values: the named list, or all columns.
-    let mut targets = [0usize; MAX_COLUMNS];
-    let n_targets = if columns.is_empty() {
-        for (i, t) in targets.iter_mut().enumerate().take(def.n_columns) {
-            *t = i;
-        }
-        def.n_columns
-    } else {
-        for (i, name) in columns.iter().enumerate() {
-            let Some(ci) = def.column_index(name) else {
-                return Err(undefined_column(name));
-            };
-            targets[i] = ci;
-        }
-        columns.len()
-    };
-    let mut row = [Datum::Null; MAX_COLUMNS];
-    let mut explicit = [false; MAX_COLUMNS];
-    if !default_values {
-        if values.len() != n_targets {
-            return Err(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "MERGE INSERT has {} expressions but {} target columns",
-                values.len(),
-                n_targets
-            ));
-        }
-        let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
-        let hooks = super::eval::EvalHooks {
-            catalog: Some(&catalog),
-            sequences: Some(&seq),
-            ..super::eval::NO_HOOKS
-        };
-        for (i, expression) in values.iter().enumerate() {
-            if matches!(expression, Expr::DefaultMarker) {
-                continue;
-            }
-            reject_generated_write(def, targets[i])?;
-            match identity_action(def, targets[i], overriding) {
-                IdentityAction::Reject => return Err(reject_identity_write(def, targets[i])),
-                IdentityAction::UseSequence => continue,
-                IdentityAction::Accept => {}
-            }
-            row[targets[i]] = eval_prepared_assignment(
-                assignment_casts,
-                expression,
-                &def.columns()[targets[i]],
-                storage,
-                txn.txid,
-                arena,
-                params,
-                source_ctx,
-                &hooks,
-            )?;
-            explicit[targets[i]] = true;
-        }
-    }
+    let (mut row, explicit) = merge_insert_values(
+        def,
+        columns,
+        values,
+        default_values,
+        overriding,
+        source_ctx,
+        assignment_casts,
+        storage,
+        txn.txid,
+        seq_session,
+        arena,
+        params,
+    )?;
     // Defaults + auto-increment + generated for the unset columns.
     {
         let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
@@ -81721,6 +81946,44 @@ fn materialize_view_rows<'a>(
     execution: TriggerQueryExecution<'_, '_, 'a>,
     pool: &std::sync::Arc<LeasePool>,
 ) -> Result<(MutableSlice<&'a [u8]>, Option<&'a Expr<'a>>), SqlError> {
+    let mut rows = pool.lease::<&[u8]>(0).map_err(|error| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "view row staging: {}",
+            error
+        )
+    })?;
+    let predicate = select_view_rows(
+        storage,
+        txid,
+        view_slot,
+        selection,
+        arena,
+        execution,
+        &mut |encoded| {
+            rows.push(encoded).map_err(|error| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "view row staging: {}",
+                    error
+                )
+            })
+        },
+    )?;
+    Ok((rows, predicate))
+}
+
+/// Runs the view's query as of `txid` and hands each encoded row to `sink`.
+/// Returns the part of the selection's predicate left to evaluate per row.
+fn select_view_rows<'a>(
+    storage: &Storage,
+    txid: u32,
+    view_slot: usize,
+    selection: ViewRowSelection<'_, 'a>,
+    arena: &'a Arena,
+    execution: TriggerQueryExecution<'_, '_, 'a>,
+    sink: &mut dyn FnMut(&'a [u8]) -> Result<(), SqlError>,
+) -> Result<Option<&'a Expr<'a>>, SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
     let query = storage.snapshot_view_query(view_slot, txid, arena)?;
     let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
@@ -81748,13 +82011,6 @@ fn materialize_view_rows<'a>(
         txid,
         arena,
     )?;
-    let mut rows = pool.lease::<&[u8]>(0).map_err(|error| {
-        sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "view row staging: {}",
-            error
-        )
-    })?;
     super::query::select_into_rows(
         storage,
         txid,
@@ -81778,16 +82034,10 @@ fn materialize_view_rows<'a>(
                 .alloc_slice_with(rowenc::encoded_len(values), |_| 0u8)
                 .map_err(|_| super::query::arena_full_pub())?;
             rowenc::encode(values, encoded);
-            rows.push(&*encoded).map_err(|error| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "view row staging: {}",
-                    error
-                )
-            })
+            sink(&*encoded)
         },
     )?;
-    Ok((rows, predicate))
+    Ok(predicate)
 }
 
 #[allow(clippy::too_many_arguments)]

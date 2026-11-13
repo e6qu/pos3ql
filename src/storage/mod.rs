@@ -8128,6 +8128,8 @@ impl PolymorphicBinding {
         let inputs = &self.compatible_inputs[..self.compatible_count];
         let compatible = match inputs {
             [] => None,
+            // Identical inputs are the common type whatever their category.
+            [first, rest @ ..] if rest.iter().all(|input| input == first) => Some(*first),
             inputs => {
                 if inputs.iter().any(|input| category(base(*input)).is_none()) {
                     return None;

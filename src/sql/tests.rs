@@ -47052,8 +47052,9 @@ fn trigger_program_for_loop_validates_control_and_query_shape() {
            FOR EACH ROW EXECUTE FUNCTION trigger_for_width_program();
          INSERT INTO trigger_for_width_target VALUES (1, 2);",
     );
+    // A scalar loop variable takes the first column, as in PostgreSQL.
     assert!(
-        String::from_utf8_lossy(&wrong_width).contains("FOR query must return exactly one column"),
+        String::from_utf8_lossy(&wrong_width).contains("INSERT 0 1"),
         "{}",
         String::from_utf8_lossy(&wrong_width)
     );

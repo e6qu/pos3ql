@@ -1082,6 +1082,45 @@ fn rule_relation_ref<'a>(
     }
 }
 
+/// PostgreSQL's aggregate placement check of a rule's `WHERE` condition: an
+/// aggregate whose arguments read only the rule's OLD or NEW row, even one
+/// written inside a subquery (`(SELECT sum(new.a))`), belongs to the
+/// condition's level, where aggregates are not allowed.
+pub(crate) fn check_rule_condition_aggregates<'a>(
+    relation: crate::sql::ast::QualName<'a>,
+    condition: &'a Expr<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let mark = arena.mark();
+    let result = (|| {
+        let joins = arena
+            .alloc_slice_with(1, |_| Join {
+                table: rule_relation_ref(relation, Some("new")),
+                kind: JoinKind::Comma,
+                on: None,
+                using: None,
+                natural: false,
+            })
+            .map_err(|_| arena_full())?;
+        let select = arena
+            .alloc(rule_select(
+                &[],
+                Some(FromClause {
+                    base: rule_relation_ref(relation, Some("old")),
+                    joins,
+                }),
+                Some(condition),
+            ))
+            .map_err(|_| arena_full())?;
+        super::aggregate_levels::assign_aggregate_levels(select, storage, txid, arena).map(|_| ())
+    })();
+    // Only the verdict leaves; the analysis query is discarded.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
+
 fn append_rule_input_from<'a>(
     base: TableRef<'a>,
     existing: Option<&FromClause<'a>>,

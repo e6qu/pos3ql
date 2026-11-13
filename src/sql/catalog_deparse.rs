@@ -50,6 +50,9 @@ pub(crate) struct Joined<'s> {
     pub name: &'s str,
     pub printed: &'s str,
     pub table: &'s TableDef,
+    /// Whether an unqualified column can name this item; a rule's `OLD` and
+    /// `NEW` are reached only by their names.
+    pub unqualified: bool,
 }
 
 impl<'s> Joined<'s> {
@@ -58,6 +61,15 @@ impl<'s> Joined<'s> {
             name,
             printed: name,
             table,
+            unqualified: true,
+        }
+    }
+
+    /// A rule's `OLD` or `NEW` row in a rule action.
+    pub(crate) fn rule_row(name: &'s str, table: &'s TableDef) -> Self {
+        Self {
+            unqualified: false,
+            ..Self::new(name, table)
         }
     }
 }
@@ -187,6 +199,7 @@ impl Context<'_> {
         let mut found = None;
         for joined in self.joined {
             if qualifier.is_some_and(|qualifier| qualifier != joined.name)
+                || qualifier.is_none() && !joined.unqualified
                 || !joined
                     .table
                     .columns()
@@ -1511,6 +1524,7 @@ pub(crate) fn view_definition<'a>(
             name: source.alias.unwrap_or(source.table),
             printed: source.alias.unwrap_or(read.name.as_str()),
             table: read,
+            unqualified: true,
         };
     }
     let context = Context {
@@ -1712,5 +1726,187 @@ pub(crate) fn view_definition<'a>(
         }
     }
     output.push(";")?;
+    Ok(output.supported.then(|| output.text.as_str()))
+}
+
+/// One action of a rewrite rule as `make_ruledef` prints it with
+/// `PRETTYFLAG_INDENT` (both of `pg_get_ruledef`'s modes): a leading space
+/// or line break, then the statement without its terminating semicolon.
+/// `rule_table` is the relation the rule is defined on, whose `OLD` and
+/// `NEW` rows the action reads. `None` when the action's shape is outside
+/// this module's typed coverage.
+pub(crate) fn rule_action_definition<'a>(
+    storage: &Storage,
+    txid: u32,
+    rule_table: &TableDef,
+    action: &str,
+    pretty: bool,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    use crate::sql::ast::Stmt;
+    let Ok(statement) = crate::sql::parser::parse_stored_statement(action, arena) else {
+        return Ok(None);
+    };
+    let mut output = Output {
+        arena,
+        text: ArenaString::new(arena),
+        supported: true,
+    };
+    if let Stmt::Notify { channel, payload } = statement {
+        // `get_utility_query_def` starts the command on its own line.
+        output.push("\n NOTIFY ")?;
+        let mut identifier = crate::util::StackStr::<130>::new();
+        write_identifier(&mut identifier, channel);
+        output.push(identifier.as_str())?;
+        if let Some(payload) = payload {
+            output.push(", '")?;
+            for character in payload.chars() {
+                if character == '\'' {
+                    output.push("''")?;
+                } else {
+                    let mut encoded = [0u8; 4];
+                    output.push(character.encode_utf8(&mut encoded))?;
+                }
+            }
+            output.push("'")?;
+        }
+        return Ok(Some(output.text.as_str()));
+    }
+    let (table, alias, returning) = match statement {
+        Stmt::Insert(insert) => (insert.table, insert.alias, insert.returning),
+        Stmt::Update(update) => (update.table, update.alias, update.returning),
+        Stmt::Delete(delete) => (delete.table, delete.alias, delete.returning),
+        _ => return Ok(None),
+    };
+    if alias.is_some() || !returning.is_empty() {
+        return Ok(None);
+    }
+    let Some(crate::storage::ResolvedRelation::Table(slot)) =
+        storage.resolve_relation(table.schema, table.name, txid)
+    else {
+        return Ok(None);
+    };
+    let target = storage.table_def(slot, txid);
+    let joined = [
+        Joined::rule_row("old", rule_table),
+        Joined::rule_row("new", rule_table),
+        Joined::new(target.name.as_str(), &target),
+    ];
+    let context = Context {
+        storage,
+        txid,
+        table: Some(&target),
+        parameters: &[],
+        joined: &joined,
+        pretty,
+    };
+    let mut relation = crate::util::StackStr::<264>::new();
+    if !storage.schema_is_on_path(target.schema, txid) {
+        write_identifier(&mut relation, target.schema.as_str());
+        let _ = relation.write_char('.');
+    }
+    write_identifier(&mut relation, target.name.as_str());
+    let column_type = |name: &str| -> Result<Option<i32>, SqlError> {
+        match target
+            .columns()
+            .iter()
+            .find(|column| column.name.as_str() == name)
+        {
+            Some(column) => super::catalog_column_type_oid(storage, column, txid).map(Some),
+            None => Ok(None),
+        }
+    };
+    let write_name = |output: &mut Output<'_>, name: &str| {
+        let mut identifier = crate::util::StackStr::<130>::new();
+        write_identifier(&mut identifier, name);
+        output.push(identifier.as_str())
+    };
+    let condition = |output: &mut Output<'_>, condition: Option<&Expr<'_>>| {
+        if let Some(condition) = condition {
+            output.push("\n  WHERE ")?;
+            context.write(condition, Some(oid::BOOL), output)?;
+        }
+        Ok::<(), SqlError>(())
+    };
+    match statement {
+        Stmt::Insert(insert) => {
+            let [row] = insert.rows else {
+                return Ok(None);
+            };
+            if insert.select.is_some()
+                || insert.on_conflict.is_some()
+                || insert.overriding != crate::sql::ast::Overriding::None
+                || row.len() > target.columns().len()
+                || (!insert.columns.is_empty() && insert.columns.len() != row.len())
+            {
+                return Ok(None);
+            }
+            output.push(" INSERT INTO ")?;
+            output.push(relation.as_str())?;
+            output.push(" (")?;
+            for index in 0..row.len() {
+                let name = match insert.columns.get(index) {
+                    Some(name) => *name,
+                    None => target.columns()[index].name.as_str(),
+                };
+                if index != 0 {
+                    output.push(", ")?;
+                }
+                write_name(&mut output, name)?;
+            }
+            output.push(")\n  VALUES (")?;
+            for (index, value) in row.iter().enumerate() {
+                let name = match insert.columns.get(index) {
+                    Some(name) => *name,
+                    None => target.columns()[index].name.as_str(),
+                };
+                let Some(type_oid) = column_type(name)? else {
+                    return Ok(None);
+                };
+                if index != 0 {
+                    output.push(", ")?;
+                }
+                if matches!(value, Expr::DefaultMarker) {
+                    output.push("DEFAULT")?;
+                } else {
+                    context.assigned(value, type_oid, &mut output)?;
+                }
+            }
+            output.push(")")?;
+        }
+        Stmt::Update(update) => {
+            if update.from.is_some() {
+                return Ok(None);
+            }
+            output.push(" UPDATE ")?;
+            output.push(relation.as_str())?;
+            output.push(" SET ")?;
+            for (index, (name, value)) in update.assignments.iter().enumerate() {
+                let Some(type_oid) = column_type(name)? else {
+                    return Ok(None);
+                };
+                if index != 0 {
+                    output.push(", ")?;
+                }
+                write_name(&mut output, name)?;
+                output.push(" = ")?;
+                if matches!(value, Expr::DefaultMarker) {
+                    output.push("DEFAULT")?;
+                } else {
+                    context.assigned(value, type_oid, &mut output)?;
+                }
+            }
+            condition(&mut output, update.where_clause)?;
+        }
+        Stmt::Delete(delete) => {
+            if delete.using.is_some() {
+                return Ok(None);
+            }
+            output.push(" DELETE FROM ")?;
+            output.push(relation.as_str())?;
+            condition(&mut output, delete.where_clause)?;
+        }
+        _ => return Ok(None),
+    }
     Ok(output.supported.then(|| output.text.as_str()))
 }

@@ -1728,7 +1728,14 @@ where
                 identical_mods[c] = false;
             }
             if unknown {
-                continue; // an untyped NULL column adopts the running type
+                // An untyped column adopts the running type. A set operation
+                // resolves each pair of inputs as it combines them, so two
+                // untyped inputs become text before a later input is seen;
+                // a VALUES list resolves all its rows at once.
+                if target[c].is_none() && !matches!(join, Some(SetJoin::Values)) {
+                    target[c] = Some(ColType::Text);
+                }
+                continue;
             }
             leaf_collations[(leaf_index + 1) * n_cols + c] = SetColumnCollation {
                 value: lc[c].collation,
@@ -1764,6 +1771,27 @@ where
     }
     // A column that stayed unknown across every branch (all NULL) is text.
     let target: [ColType; MAX_PROJ] = core::array::from_fn(|c| target[c].unwrap_or(ColType::Text));
+    // PostgreSQL coerces each branch's unknown literal to the column's type
+    // while analysing the query, positioned at the literal.
+    for leaf in leaves {
+        if leaf.set_body.is_some()
+            || leaf
+                .items
+                .iter()
+                .any(|item| !matches!(item, SelectItem::Expr { .. }))
+        {
+            continue;
+        }
+        for (item, ctype) in leaf.items.iter().zip(&target[..n_cols]) {
+            if let SelectItem::Expr {
+                expression: Expr::Str(literal),
+                ..
+            } = item
+            {
+                super::convert_literal(literal, Some(*ctype), arena)?;
+            }
+        }
+    }
     if set_tree_requires_equality(tree) {
         for ctype in &target[..n_cols] {
             if missing_equality(*ctype) {

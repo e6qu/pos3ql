@@ -516,8 +516,10 @@ query text. In a `BEGIN ATOMIC` body only a `SELECT` of expressions
 without `FROM` is deparsed (`SELECT (x + 1);`, under the current names of
 the routines and types it named); other statements are printed one per line
 as written, keeping names that were since renamed, where PostgreSQL prints its analyzed form (`INSERT
-INTO t (a, b) VALUES (f.x, 'q'::text);`); rule actions (`DO INSERT ...`) are printed as written, and their pretty
-form fails with `0A000`; policy expressions are not deparsed. `EXPLAIN` of a
+INTO t (a, b) VALUES (f.x, 'q'::text);`); a rule action other than `NOTIFY` and a single-table `INSERT ... VALUES`
+of one row, `UPDATE` or `DELETE` (`DO ALSO INSERT INTO log SELECT ...`) is
+printed as written, and its pretty form fails with `0A000`; policy
+expressions are not deparsed. `EXPLAIN` of a
 statement a rewrite rule changes shows only the original statement's plan,
 where PostgreSQL plans each statement the rule produces. Notices carry
 no position (`''::tsquery` points at the literal in PostgreSQL). Built-in
@@ -549,18 +551,16 @@ IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 set, and omits an explicit `security_invoker=false`. A `CHECK` constraint
 marked `NO INHERIT` fails with `0A000`, and exclusion constraints support only
 GiST over range columns (`EXCLUDE USING btree (a WITH =)` fails with `0A000`).
-`pg_constraint` omits the system catalogs' own not-null constraints.
-`CREATE OR REPLACE RULE "_RETURN"` replaces a view's query only when every
-column keeps its type modifier; PostgreSQL also accepts an unmodified type
-(`numeric` for a `numeric(5,2)` column). A missing column's spelling
-suggestion (`Perhaps you meant to reference the column "t.v".`) is missing in
-`COPY ... WHERE`, and a set operation's later branch does not offer the
-earlier branches' columns (`*SELECT* 1`); an index expression's missing
-column has the suggestion but no cursor position. Virtual generated columns,
-PostgreSQL 18's default when `STORED` is not written, fail with `0A000`. A
-rule condition containing an aggregate of the rule's `OLD` or `NEW` row inside
-a subquery (`WHERE (SELECT sum(new.a)) > 0`) is accepted where PostgreSQL
-reports `aggregate functions are not allowed in WHERE`. A derived table computes output
+`pg_constraint` omits the system catalogs' own not-null constraints. After
+`CREATE OR REPLACE RULE "_RETURN"`, `pg_get_viewdef` prints the view's
+columns unqualified (`SELECT (a)::numeric AS a`) where PostgreSQL, whose
+rule query also holds the rule's `OLD` and `NEW` entries, qualifies them
+(`(rt.a)::numeric`). A missing column's spelling suggestion (`Perhaps you
+meant to reference the column "t.v".`) in a set operation's later branch does
+not offer the earlier branches' columns (`*SELECT* 1.x`). Virtual generated
+columns, PostgreSQL 18's default when `STORED` is not written, fail with
+`0A000`: every read path would compute them from the stored row, and the
+durable table format has no virtual column kind yet. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1
 FROM (SELECT 10 / t.x) s)` fails with division by zero on a zero `x` where
 PostgreSQL, which drops unread subquery outputs, returns the row. A
@@ -580,13 +580,11 @@ run (`0A000`). A protocol-level `Parse` message checks only
 syntax and parameter types, so analysis errors (`SELECT current_date + $1`,
 `SELECT 1 WHERE 'x'`) arrive at `Bind` or `Execute` where PostgreSQL reports
 them at `Parse`, and `pg_prepared_statements` lists only SQL `PREPARE`
-statements, not protocol ones. An unknown-type literal passed to an
-overloaded builtin function (`substr('abc', 'x')`) converts only when the
-function runs, and one whose candidates PostgreSQL resolves by preferred type
-can fail as an unknown function (`round('1.5')` reports `function round(text)
-does not exist` where PostgreSQL converts `'1.5'` to `double precision`).
-Without `FROM` (`SELECT int4pl(1, 'p')`), in `VALUES` lists and in set
-operations, a failed unknown-literal conversion has no cursor position.
+statements, not protocol ones. An unknown-type literal argument of a
+builtin function converts to the selected candidate's parameter type when the
+statement is analysed only for numeric, boolean and date and time
+parameters; other parameter types read the literal's text when the function
+runs.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,
 SQL/JSON result types) are reported when the statement would run. In a

@@ -15,7 +15,7 @@ fn rule_definition_flags_preserve_formats_nulls_and_argument_effects() {
             "CREATE TABLE rule_format_source(id integer); CREATE TABLE rule_format_sink(id integer); \
              CREATE RULE diag_nothing AS ON INSERT TO rule_format_source DO NOTHING; \
              CREATE RULE diag_instead AS ON DELETE TO rule_format_source DO INSTEAD NOTHING; \
-             CREATE RULE diag_action AS ON UPDATE TO rule_format_source DO ALSO INSERT INTO rule_format_sink VALUES(NEW.id); \
+             CREATE RULE diag_action AS ON UPDATE TO rule_format_source DO ALSO INSERT INTO rule_format_sink SELECT NEW.id; \
              CREATE SEQUENCE rule_argument_effects", true);
         let plain =
             "CREATE RULE diag_nothing AS\n    ON INSERT TO public.rule_format_source DO NOTHING;";

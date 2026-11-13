@@ -137,6 +137,39 @@ pub(crate) fn from_relation(
     crate::sql::error_position::with_column_suggestion(error, &suggestion)
 }
 
+/// PostgreSQL's error for `qualifier.name` (or `name`) missing from the one
+/// relation an expression can read, such as a CHECK constraint's table or
+/// COPY's target: positioned at the reference during analysis, with the
+/// relation's closest column as the hint.
+pub(crate) fn missing_relation_column(
+    qualifier: Option<&str>,
+    name: &str,
+    relation: &str,
+    columns: &[crate::storage::ColumnMeta],
+) -> crate::sql::eval::SqlError {
+    use crate::sql::eval::sqlstate;
+    let error = match qualifier {
+        Some(qualifier) => crate::sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column {}.{} does not exist",
+            qualifier,
+            name
+        ),
+        None => crate::sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" does not exist",
+            name
+        ),
+    };
+    from_relation(
+        crate::sql::error_position::at_reference(error, qualifier.unwrap_or(name)),
+        qualifier,
+        name,
+        relation,
+        columns,
+    )
+}
+
 /// Levenshtein distance in characters with unit costs, as PostgreSQL's
 /// `varstr_levenshtein`. Names beyond the identifier limit never match.
 fn levenshtein(source: &str, target: &str) -> usize {

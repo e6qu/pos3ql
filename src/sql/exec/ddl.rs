@@ -104,6 +104,8 @@ pub(super) fn validate_generated_refs<Definition0: crate::storage::DefinitionBac
                     .ok()
                     .and_then(|(oid, _)| ColType::from_oid(oid))
             },
+            storage,
+            txid,
             arena,
         )?;
         let mut offending: Option<SqlError> = None;
@@ -1223,21 +1225,7 @@ fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
                     variables.add_whole_row()
                 }
                 None => {
-                    let error = match qualifier {
-                        Some(qualifier) => sql_err!(
-                            sqlstate::UNDEFINED_COLUMN,
-                            "column {}.{} does not exist",
-                            qualifier,
-                            name
-                        ),
-                        None => sql_err!(
-                            sqlstate::UNDEFINED_COLUMN,
-                            "column \"{}\" does not exist",
-                            name
-                        ),
-                    };
-                    return Err(crate::sql::column_suggestion::from_relation(
-                        crate::sql::error_position::at_reference(error, qualifier.unwrap_or(name)),
+                    return Err(crate::sql::column_suggestion::missing_relation_column(
                         *qualifier,
                         name,
                         def.name.as_str(),

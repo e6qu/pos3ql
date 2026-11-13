@@ -9288,6 +9288,66 @@ pub(crate) fn undefined_function<'a, T>(
 
 /// Normalize only a catalog-selected builtin. Written arguments stay as AST
 /// nodes so each implementation retains its strictness and short-circuit rules.
+/// PostgreSQL coerces an unknown-type literal argument of the selected
+/// builtin to the parameter's declared type when it parses the call
+/// (`round('1.5')` reads `'1.5'` as `double precision`). Numeric and boolean
+/// parameters take that conversion here; the handlers of other parameter
+/// types read the literal's text themselves.
+fn coerce_unknown_builtin_arguments<'a, 'b>(
+    oid: i32,
+    args: &'b [&'a Expr<'a>],
+    variadic: bool,
+    arena: &'a Arena,
+) -> Result<&'b [&'a Expr<'a>], SqlError>
+where
+    'a: 'b,
+{
+    let Some(declaration) = super::catalog::builtin_callable_by_oid(oid) else {
+        return Ok(args);
+    };
+    // An expanded variadic call passes its trailing arguments as elements.
+    let declared = |position: usize| -> Option<ColType> {
+        let oid = match declaration.variadic_element {
+            Some(element) if !variadic && position + 1 >= declaration.arguments.len() => element,
+            _ => *declaration.arguments.get(position)?,
+        };
+        ColType::from_oid(oid).filter(|ctype| {
+            matches!(
+                ctype,
+                ColType::Int2
+                    | ColType::Int4
+                    | ColType::Int8
+                    | ColType::Float4
+                    | ColType::Float8
+                    | ColType::Numeric
+                    | ColType::Bool
+            )
+        })
+    };
+    if !args.iter().enumerate().any(|(position, argument)| {
+        matches!(argument, Expr::Str(_)) && declared(position).is_some()
+    }) {
+        return Ok(args);
+    }
+    let coerced = arena
+        .alloc_slice_with(args.len(), |position| args[position])
+        .map_err(|_| arena_full())?;
+    for (position, argument) in coerced.iter_mut().enumerate() {
+        if let (Expr::Str(_), Some(ctype)) = (*argument, declared(position)) {
+            *argument = arena
+                .alloc(Expr::Cast {
+                    source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                    operand: argument,
+                    type_name: ctype.name(),
+                    type_mod: -1,
+                    binding: crate::sql::ast::CastBinding::Resolve,
+                })
+                .map_err(|_| arena_full())?;
+        }
+    }
+    Ok(coerced)
+}
+
 pub(crate) fn bind_builtin_arguments<'a, 'b>(
     oid: i32,
     args: &'b [&'a Expr<'a>],
@@ -9630,7 +9690,8 @@ fn call<'a>(
         if let Some(catalog) = hooks.catalog {
             catalog.require_builtin_routine_execute(oid)?;
         }
-        bind_builtin_arguments(oid, args, argument_names, variadic, arena)?
+        let bound = bind_builtin_arguments(oid, args, argument_names, variadic, arena)?;
+        coerce_unknown_builtin_arguments(oid, bound, variadic, arena)?
     } else {
         args
     };

@@ -738,11 +738,18 @@ Rewrite rules take the target table's exclusive lock, so a rule that redirects
 an insert conflicts with ordinary reads of that table. A rule condition may
 use subqueries over other tables and the event's `OLD` and `NEW` rows
 (`WHERE EXISTS (SELECT 1 FROM allowed WHERE allowed.id = new.id)`). `_RETURN`
-cannot be renamed or dropped apart from its view. `pg_get_ruledef` supports both
-formatting modes for unconditional `DO NOTHING` rules and for `_RETURN` rules,
-whose action is printed as `pg_get_viewdef` prints the view; other rules
-return their saved SQL, and pretty formatting of a condition or action returns
-`0A000`. A missing rule returns NULL.
+cannot be renamed or dropped apart from its view. `CREATE OR REPLACE RULE
+"_RETURN"` replaces a view's query when it returns the view's column names
+and types; a column written without the view column's type modifier
+(`numeric` for `numeric(5,2)`) keeps the view's declared type, as in
+PostgreSQL. `pg_get_ruledef` and `pg_rules` print a rule as PostgreSQL
+deparses it, in both formatting modes, when its condition is an expression
+over `OLD`, `NEW` and constants and each action is `NOTIFY` or a single-table
+`INSERT ... VALUES` (one row), `UPDATE ... SET ... WHERE` or `DELETE ... WHERE`
+(for example `DO INSTEAD ( UPDATE log SET b = new.b WHERE (log.a = old.a); ...)`);
+`_RETURN` rules print their query as `pg_get_viewdef` does. Other rules
+return their saved SQL, and their pretty form fails with `0A000`. A missing
+rule returns NULL.
 
 ## Catalog listings and current lookups
 

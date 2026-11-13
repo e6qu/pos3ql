@@ -105,10 +105,11 @@ use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
 pub(crate) use cte::{
     RuleInsertTarget, RuleReturningRelation, RuleTransitionType, attach_rule_source,
-    check_rule_insert_values, describe_stored_set_query, dml_parameter_scope_query,
-    expand_set_tree, expand_stored_query, expand_stored_query_exec, expand_stored_rule_action_exec,
-    expand_stored_rule_expression_exec, expand_stored_statement_exec, restrict_rule_original,
-    rule_original_transition, rule_returning_entries, rule_returning_items, rule_transition_source,
+    check_rule_condition_aggregates, check_rule_insert_values, describe_stored_set_query,
+    dml_parameter_scope_query, expand_set_tree, expand_stored_query, expand_stored_query_exec,
+    expand_stored_rule_action_exec, expand_stored_rule_expression_exec,
+    expand_stored_statement_exec, restrict_rule_original, rule_original_transition,
+    rule_returning_entries, rule_returning_items, rule_transition_source,
 };
 pub use cte::{
     describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under, expand_dml_ctes,
@@ -8609,7 +8610,7 @@ pub(crate) fn analyse_dml_condition<'a>(
     };
     super::exec::infer_type_res(condition, &columns)?;
     check_condition_type("WHERE", condition, &columns, storage, txid, arena)?;
-    check_literal_operands(condition, &scope, arena)?;
+    check_literal_operands(condition, &scope, storage, txid, arena)?;
     let schema = ScopeSchema(&scope);
     let row = Chained {
         inner: &schema,
@@ -8710,6 +8711,8 @@ pub(crate) fn analyse_rule_action<'a>(
                                         .ok()
                                         .and_then(|(oid, _)| ColType::from_oid(oid))
                                 },
+                                storage,
+                                txid,
                                 arena,
                             )?;
                         }
@@ -8825,6 +8828,8 @@ pub(crate) fn analyse_routine_program<'a>(
 fn check_literal_operands<'a>(
     expression: &'a Expr<'a>,
     scope: &QueryScope<'a>,
+    storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     check_literal_operands_typed(
@@ -8834,6 +8839,8 @@ fn check_literal_operands<'a>(
                 .ok()
                 .and_then(|(oid, _)| ColType::from_oid(oid))
         },
+        storage,
+        txid,
         arena,
     )
 }
@@ -8842,6 +8849,8 @@ fn check_literal_operands<'a>(
 pub(crate) fn check_literal_operands_typed<'a>(
     expression: &'a Expr<'a>,
     infer: &dyn Fn(&'a Expr<'a>) -> Option<ColType>,
+    storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     use crate::sql::ast::BinaryOp;
@@ -8871,8 +8880,8 @@ pub(crate) fn check_literal_operands_typed<'a>(
             right,
             ..
         } => {
-            check_literal_operands_typed(left, infer, arena)?;
-            check_literal_operands_typed(right, infer, arena)?;
+            check_literal_operands_typed(left, infer, storage, txid, arena)?;
+            check_literal_operands_typed(right, infer, storage, txid, arena)?;
             match (left, right) {
                 (Expr::Str(_), Expr::Str(_)) => Ok(()),
                 (Expr::Str(literal), other) => convert_operand(literal, other, operator, true),
@@ -8881,13 +8890,13 @@ pub(crate) fn check_literal_operands_typed<'a>(
             }
         }
         Expr::InList { operand, list, .. } => {
-            check_literal_operands_typed(operand, infer, arena)?;
+            check_literal_operands_typed(operand, infer, storage, txid, arena)?;
             for item in *list {
                 match item {
                     Expr::Str(literal) if !matches!(operand, Expr::Str(_)) => {
                         convert_operand(literal, operand, &BinaryOp::Eq, false)?
                     }
-                    item => check_literal_operands_typed(item, infer, arena)?,
+                    item => check_literal_operands_typed(item, infer, storage, txid, arena)?,
                 }
             }
             Ok(())
@@ -8907,7 +8916,9 @@ pub(crate) fn check_literal_operands_typed<'a>(
             for argument in *args {
                 match argument {
                     Expr::Str(literal) => convert_literal(literal, common, arena)?,
-                    argument => check_literal_operands_typed(argument, infer, arena)?,
+                    argument => {
+                        check_literal_operands_typed(argument, infer, storage, txid, arena)?
+                    }
                 }
             }
             Ok(())
@@ -8918,8 +8929,8 @@ pub(crate) fn check_literal_operands_typed<'a>(
             over: None,
             ..
         } => {
-            check_literal_operands_typed(left, infer, arena)?;
-            check_literal_operands_typed(right, infer, arena)?;
+            check_literal_operands_typed(left, infer, storage, txid, arena)?;
+            check_literal_operands_typed(right, infer, storage, txid, arena)?;
             match (left, right) {
                 (Expr::Str(_), Expr::Str(_)) => Ok(()),
                 (Expr::Str(literal), other) => convert_operand(literal, other, &BinaryOp::Eq, true),
@@ -8935,11 +8946,16 @@ pub(crate) fn check_literal_operands_typed<'a>(
                 && items.iter().any(|item| !matches!(item, Expr::Str(_))) =>
         {
             match infer(expression) {
-                Some(ColType::Array(element)) => {
-                    convert_array_elements(expression, element.to_coltype(), infer, arena)
-                }
+                Some(ColType::Array(element)) => convert_array_elements(
+                    expression,
+                    element.to_coltype(),
+                    infer,
+                    storage,
+                    txid,
+                    arena,
+                ),
                 _ => walk_children(expression, &mut |child| {
-                    check_literal_operands_typed(child, infer, arena)
+                    check_literal_operands_typed(child, infer, storage, txid, arena)
                 }),
             }
         }
@@ -8951,13 +8967,13 @@ pub(crate) fn check_literal_operands_typed<'a>(
             ..
         } => match ColType::from_sql_name(type_name) {
             Some(ColType::Array(element)) => {
-                convert_array_elements(operand, element.to_coltype(), infer, arena)
+                convert_array_elements(operand, element.to_coltype(), infer, storage, txid, arena)
             }
-            _ => check_literal_operands_typed(operand, infer, arena),
+            _ => check_literal_operands_typed(operand, infer, storage, txid, arena),
         },
-        // An unknown literal passed to a builtin function with one signature
-        // of that arity converts to its parameter's type, once the other
-        // arguments have that signature's types.
+        // An unknown literal passed to a builtin function converts to the
+        // parameter type of the candidate PostgreSQL's function resolution
+        // selects, given the other arguments' types.
         Expr::Call {
             kind: crate::sql::ast::CallKind::Routine,
             name,
@@ -8968,28 +8984,40 @@ pub(crate) fn check_literal_operands_typed<'a>(
             over: None,
             ..
         } if args.iter().any(|argument| matches!(argument, Expr::Str(_))) => {
-            for argument in *args {
-                if !matches!(argument, Expr::Str(_)) {
-                    check_literal_operands_typed(argument, infer, arena)?;
-                }
+            let mut oids = [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            if args.len() > oids.len() {
+                return Ok(());
             }
-            let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
-            let mut candidates = super::catalog::builtin_callable_signatures(name)
-                .filter(|signature| signature.arguments.len() == args.len());
-            let (Some(signature), None) = (candidates.next(), candidates.next()) else {
+            for (oid, argument) in oids.iter_mut().zip(*args) {
+                if matches!(argument, Expr::Str(_) | Expr::Null) {
+                    continue;
+                }
+                check_literal_operands_typed(argument, infer, storage, txid, arena)?;
+                let Some(ctype) = infer(argument) else {
+                    return Ok(());
+                };
+                *oid = ctype.oid();
+            }
+            let oids = &oids[..args.len()];
+            let crate::storage::RoutineCallSelection::Builtin { oid, .. } = storage
+                .select_routine_call(
+                    name,
+                    &[],
+                    oids,
+                    false,
+                    txid,
+                    crate::storage::RoutineCallKind::Function,
+                )
+            else {
                 return Ok(());
             };
-            if signature.variadic_element.is_some()
-                || args.iter().zip(signature.arguments).any(|(argument, oid)| {
-                    !matches!(argument, Expr::Str(_))
-                        && infer(argument).map(ColType::oid) != Some(*oid)
-                })
-            {
+            let Some(parameters) = storage.builtin_call_input_oids(oid, &[], oids, false, txid)
+            else {
                 return Ok(());
-            }
-            for (argument, oid) in args.iter().zip(signature.arguments) {
+            };
+            for (argument, parameter) in args.iter().zip(parameters) {
                 if let Expr::Str(literal) = argument {
-                    convert_literal(literal, ColType::from_oid(*oid), arena)?;
+                    convert_literal(literal, ColType::from_oid(parameter), arena)?;
                 }
             }
             Ok(())
@@ -9002,15 +9030,15 @@ pub(crate) fn check_literal_operands_typed<'a>(
         } => {
             let common = infer(expression);
             for (condition, result) in *whens {
-                check_literal_operands_typed(condition, infer, arena)?;
+                check_literal_operands_typed(condition, infer, storage, txid, arena)?;
                 match result {
                     Expr::Str(literal) => convert_literal(literal, common, arena)?,
-                    result => check_literal_operands_typed(result, infer, arena)?,
+                    result => check_literal_operands_typed(result, infer, storage, txid, arena)?,
                 }
             }
             match otherwise {
                 Some(Expr::Str(literal)) => convert_literal(literal, common, arena),
-                Some(result) => check_literal_operands_typed(result, infer, arena),
+                Some(result) => check_literal_operands_typed(result, infer, storage, txid, arena),
                 None => Ok(()),
             }
         }
@@ -9021,7 +9049,7 @@ pub(crate) fn check_literal_operands_typed<'a>(
         | Expr::InSubquery { .. }
         | Expr::QuantifiedSubquery { .. } => Ok(()),
         _ => walk_children(expression, &mut |child| {
-            check_literal_operands_typed(child, infer, arena)
+            check_literal_operands_typed(child, infer, storage, txid, arena)
         }),
     }
 }
@@ -9032,16 +9060,18 @@ fn convert_array_elements<'a>(
     constructor: &'a Expr<'a>,
     element: ColType,
     infer: &dyn Fn(&'a Expr<'a>) -> Option<ColType>,
+    storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     let Expr::Array(items) = constructor else {
-        return check_literal_operands_typed(constructor, infer, arena);
+        return check_literal_operands_typed(constructor, infer, storage, txid, arena);
     };
     for item in *items {
         match item {
             Expr::Str(literal) => convert_literal(literal, Some(element), arena)?,
-            Expr::Array(_) => convert_array_elements(item, element, infer, arena)?,
-            item => check_literal_operands_typed(item, infer, arena)?,
+            Expr::Array(_) => convert_array_elements(item, element, infer, storage, txid, arena)?,
+            item => check_literal_operands_typed(item, infer, storage, txid, arena)?,
         }
     }
     Ok(())
@@ -9050,7 +9080,7 @@ fn convert_array_elements<'a>(
 /// Converts an unknown-type literal to the builtin type analysis gave it,
 /// positioned at the literal when its input fails. Text-like and
 /// unresolved targets accept any string.
-fn convert_literal<'a>(
+pub(super) fn convert_literal<'a>(
     literal: &'a str,
     target: Option<ColType>,
     arena: &'a Arena,
@@ -9097,7 +9127,7 @@ fn check_key_types<'a>(
 ) -> Result<(), SqlError> {
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } = item {
-            check_literal_operands(expression, scope, arena)?;
+            check_literal_operands(expression, scope, storage, txid, arena)?;
         }
     }
     for expression in statement
@@ -9123,10 +9153,10 @@ fn check_key_types<'a>(
                 .flat_map(|from| from.joins.iter().filter_map(|join| join.on)),
         )
     {
-        check_literal_operands(expression, scope, arena)?;
+        check_literal_operands(expression, scope, storage, txid, arena)?;
     }
     for key in statement.distinct_on {
-        check_literal_operands(key, scope, arena)?;
+        check_literal_operands(key, scope, storage, txid, arena)?;
     }
     let mut window_literals = |spec: &'a crate::sql::ast::WindowSpec<'a>| {
         for key in spec
@@ -9135,7 +9165,7 @@ fn check_key_types<'a>(
             .copied()
             .chain(spec.order_by.iter().map(|key| key.expression))
         {
-            check_literal_operands(key, scope, arena)?;
+            check_literal_operands(key, scope, storage, txid, arena)?;
         }
         Ok(())
     };
@@ -11183,6 +11213,8 @@ fn check_select_constants_in<'a>(
                             .ok()
                             .and_then(|(oid, _)| ColType::from_oid(oid))
                     },
+                    storage,
+                    txid,
                     arena,
                 )?;
             }
@@ -12321,6 +12353,8 @@ pub(crate) fn check_rule_condition_type<'a>(
                 .ok()
                 .and_then(|(oid, _)| ColType::from_oid(oid))
         },
+        storage,
+        txid,
         arena,
     )?;
     check_condition_type("WHERE", condition, columns, storage, txid, arena)
@@ -12361,7 +12395,61 @@ pub(crate) fn analyse_fromless_select<'a>(
     if let Some(condition) = statement.where_clause {
         check_condition_type("WHERE", condition, &columns, storage, txid, arena)?;
     }
+    check_fromless_keys(statement, &columns, storage, txid, arena)?;
     check_select_constants(statement, arena, storage, txid)
+}
+
+/// The ORDER BY and DISTINCT ON keys of a query without FROM: output
+/// positions or expressions over no columns, checked as PostgreSQL's
+/// analysis checks them.
+fn check_fromless_keys<'a>(
+    statement: &'a Select<'a>,
+    columns: &dyn super::exec::ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let mut order = [&Expr::Null; MAX_PROJ];
+    let mut on = [&Expr::Null; MAX_PROJ];
+    if statement.order_by.len() > MAX_PROJ || statement.distinct_on.len() > MAX_PROJ {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "a query without FROM can have at most {} ORDER BY or DISTINCT ON keys",
+            MAX_PROJ
+        ));
+    }
+    for (slot, key) in order.iter_mut().zip(statement.order_by) {
+        *slot = resolve_position_target(
+            key.expression,
+            statement.items,
+            None,
+            arena,
+            storage,
+            txid,
+            "ORDER BY",
+        )?;
+        super::exec::infer_type_res(slot, columns)?;
+    }
+    for (slot, key) in on.iter_mut().zip(statement.distinct_on) {
+        *slot = resolve_position_target(
+            key,
+            statement.items,
+            None,
+            arena,
+            storage,
+            txid,
+            "DISTINCT ON",
+        )?;
+        super::exec::infer_type_res(slot, columns)?;
+    }
+    if !statement.order_by.is_empty() && !statement.distinct_on.is_empty() {
+        materialize::check_distinct_on_order(
+            &order[..statement.order_by.len()],
+            &on[..statement.distinct_on.len()],
+            statement.distinct_on,
+        )?;
+    }
+    Ok(())
 }
 
 /// Admit the virtual input row once before scalar projection or set expansion.
@@ -12461,6 +12549,9 @@ pub(crate) fn constant_select_resumable<'a>(
         && let Err(error) =
             check_condition_type("WHERE", w, &resolved_columns, storage, txid, arena)
     {
+        return sql_fail(error);
+    }
+    if let Err(error) = check_fromless_keys(statement, &resolved_columns, storage, txid, arena) {
         return sql_fail(error);
     }
     if let Err(e) = check_select_constants(statement, arena, storage, txid) {

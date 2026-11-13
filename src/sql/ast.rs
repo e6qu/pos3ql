@@ -897,7 +897,7 @@ pub enum Stmt<'a> {
     },
     DropTextSearch {
         kind: TextSearchObjectKind,
-        name: QualName<'a>,
+        names: &'a [QualName<'a>],
         if_exists: bool,
         cascade: bool,
     },

@@ -31697,7 +31697,7 @@ fn execute_bound_plpgsql_utility<'a>(
                 ),
                 Stmt::DropTextSearch {
                     kind,
-                    name,
+                    names,
                     if_exists,
                     cascade,
                 } => super::exec::drop_text_search(
@@ -31707,7 +31707,7 @@ fn execute_bound_plpgsql_utility<'a>(
                     &mut engine.dml_scratch,
                     guc.seq_session(),
                     *kind,
-                    name,
+                    names,
                     *if_exists,
                     *cascade,
                     context.arena,
@@ -44063,6 +44063,62 @@ fn resolve_text_search_dictionary(
     Ok(storage.text_search_object(slot).definition_for(txid).oid())
 }
 
+/// `NameListToString`: a text search object's name as the statement wrote it.
+fn written_name(name: &QualName<'_>) -> StackStr<256> {
+    match name.schema {
+        Some(schema) => stack_format!(256, "{}.{}", schema, name.name),
+        None => stack_format!(256, "{}", name.name),
+    }
+}
+
+/// The text search object `name` names, or PostgreSQL's error for a missing
+/// schema or object.
+fn text_search_slot_named(
+    storage: &Storage,
+    kind: crate::sql::ast::TextSearchObjectKind,
+    name: &QualName<'_>,
+    txid: u32,
+) -> Result<usize, SqlError> {
+    if let Some(slot) = storage.text_search_slot_on_path(kind, name.schema, name.name, txid) {
+        return Ok(slot);
+    }
+    if let Some(schema) = name.schema
+        && !storage.namespace_exists(schema, txid)
+    {
+        return Err(sql_err!(
+            sqlstate::INVALID_SCHEMA_NAME,
+            "schema \"{}\" does not exist",
+            schema
+        ));
+    }
+    Err(sql_err!(
+        sqlstate::UNDEFINED_OBJECT,
+        "{} \"{}\" does not exist",
+        kind.noun(),
+        written_name(name).as_str()
+    ))
+}
+
+/// Ownership of a text search object; built-in parsers and templates, which
+/// have no owner, need a superuser.
+fn require_text_search_owner(
+    storage: &Storage,
+    txid: u32,
+    definition: &crate::storage::TextSearchDefinition,
+    kind: crate::sql::ast::TextSearchObjectKind,
+    name: &QualName<'_>,
+) -> Result<(), SqlError> {
+    match definition.owner() {
+        Some(owner) => require_definition_owner(
+            storage,
+            txid,
+            owner,
+            stack_format!(256, "{} {}", kind.noun(), written_name(name).as_str()).as_str(),
+        ),
+        None => text_search_superuser(storage, txid),
+    }
+}
+
 pub fn alter_text_search(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -44072,20 +44128,12 @@ pub fn alter_text_search(
     action: crate::sql::ast::AlterTextSearchAction<'_>,
     responder: &mut Responder<'_>,
 ) -> Outcome {
-    let Some(slot) = storage.text_search_slot_on_path(kind, name.schema, name.name, txn.txid)
-    else {
-        return sql_fail(sql_err!(
-            sqlstate::UNDEFINED_OBJECT,
-            "{} \"{}\" does not exist",
-            kind.noun(),
-            name.name
-        ));
+    let slot = match text_search_slot_named(storage, kind, name, txn.txid) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
     };
     let mut definition = storage.text_search_object(slot).definition_for(txn.txid);
-    let authority = match definition.owner() {
-        Some(owner) => require_definition_owner(storage, txn.txid, owner, kind.noun()),
-        None => text_search_superuser(storage, txn.txid),
-    };
+    let authority = require_text_search_owner(storage, txn.txid, &definition, kind, name);
     if let Err(error) = authority {
         return sql_fail(error);
     }
@@ -44442,6 +44490,9 @@ fn drop_text_search_slot(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `DROP TEXT SEARCH {PARSER|TEMPLATE|DICTIONARY|CONFIGURATION} name [, ...]`:
+/// resolves and checks every name in order (`RemoveObjects`), then drops them
+/// together under one dependency check, as `performMultipleDeletions` does.
 pub(crate) fn drop_text_search(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -44449,86 +44500,79 @@ pub(crate) fn drop_text_search(
     scratch: &mut DmlScratch,
     seq_session: &crate::sql::guc::SeqSession,
     kind: crate::sql::ast::TextSearchObjectKind,
-    name: &QualName<'_>,
+    names: &[QualName<'_>],
     if_exists: bool,
     cascade: bool,
     arena: &Arena,
     responder: &mut Responder<'_>,
 ) -> Outcome {
-    let Some(slot) = storage.text_search_slot_on_path(kind, name.schema, name.name, txn.txid)
-    else {
-        if if_exists {
-            responder.notice(
-                sqlstate::SUCCESSFUL_COMPLETION,
-                stack_format!(
-                    128,
-                    "{} \"{}\" does not exist, skipping",
-                    kind.noun(),
-                    name.name
-                )
-                .as_str(),
-            )?;
-            responder.command_complete(match kind {
-                crate::sql::ast::TextSearchObjectKind::Parser => "DROP TEXT SEARCH PARSER",
-                crate::sql::ast::TextSearchObjectKind::Template => "DROP TEXT SEARCH TEMPLATE",
-                crate::sql::ast::TextSearchObjectKind::Dictionary => "DROP TEXT SEARCH DICTIONARY",
-                crate::sql::ast::TextSearchObjectKind::Configuration => {
-                    "DROP TEXT SEARCH CONFIGURATION"
-                }
-            })?;
-            return sql_ok();
-        }
-        return sql_fail(sql_err!(
-            sqlstate::UNDEFINED_OBJECT,
-            "{} \"{}\" does not exist",
-            kind.noun(),
-            name.name
-        ));
+    let tag = match kind {
+        crate::sql::ast::TextSearchObjectKind::Parser => "DROP TEXT SEARCH PARSER",
+        crate::sql::ast::TextSearchObjectKind::Template => "DROP TEXT SEARCH TEMPLATE",
+        crate::sql::ast::TextSearchObjectKind::Dictionary => "DROP TEXT SEARCH DICTIONARY",
+        crate::sql::ast::TextSearchObjectKind::Configuration => "DROP TEXT SEARCH CONFIGURATION",
     };
-    let definition = storage.text_search_object(slot).definition_for(txn.txid);
-    let authority = match definition.owner() {
-        Some(owner) => require_definition_owner(storage, txn.txid, owner, kind.noun()),
-        None => text_search_superuser(storage, txn.txid),
-    };
-    if let Err(error) = authority {
-        return sql_fail(error);
-    }
     let class = match kind {
         crate::sql::ast::TextSearchObjectKind::Parser => super::catalog::PG_TS_PARSER_OID,
         crate::sql::ast::TextSearchObjectKind::Template => super::catalog::PG_TS_TEMPLATE_OID,
         crate::sql::ast::TextSearchObjectKind::Dictionary => super::catalog::PG_TS_DICT_OID,
         crate::sql::ast::TextSearchObjectKind::Configuration => super::catalog::PG_TS_CONFIG_OID,
     };
+    let mut slots = ArenaList::new(arena);
+    let mut originals = ArenaList::new(arena);
+    for name in names {
+        let slot = match text_search_slot_named(storage, kind, name, txn.txid) {
+            Ok(slot) => slot,
+            Err(error) if if_exists => {
+                // `does_not_exist_skipping`: the missing schema or object.
+                let notice = stack_format!(256, "{}, skipping", error.message.as_str());
+                responder.notice(sqlstate::SUCCESSFUL_COMPLETION, notice.as_str())?;
+                continue;
+            }
+            Err(error) => return sql_fail(error),
+        };
+        let definition = storage.text_search_object(slot).definition_for(txn.txid);
+        if let Err(error) = require_text_search_owner(storage, txn.txid, &definition, kind, name) {
+            return sql_fail(error);
+        }
+        if !slots.borrowed_slice().contains(&slot)
+            && (slots.push(slot).is_err()
+                || originals
+                    .push(ObjectAddress::new(class, definition.oid(), 0))
+                    .is_err())
+        {
+            return sql_fail(arena_full());
+        }
+    }
+    if slots.is_empty() {
+        responder.command_complete(tag)?;
+        return sql_ok();
+    }
     let report = dependency_report::report_drop(
         storage,
         txn.txid,
-        &[ObjectAddress::new(class, definition.oid(), 0)],
+        originals.borrowed_slice(),
         cascade,
         arena,
         responder,
     );
     let outcome = run_reported_drop(report, responder, |responder| {
-        if let Err(error) = drop_text_search_slot(
-            storage,
-            wal,
-            txn,
-            &mut *scratch,
-            seq_session,
-            &mut *responder,
-            slot,
-            cascade,
-            arena,
-        ) {
-            return sql_fail(error);
-        }
-        responder.command_complete(match kind {
-            crate::sql::ast::TextSearchObjectKind::Parser => "DROP TEXT SEARCH PARSER",
-            crate::sql::ast::TextSearchObjectKind::Template => "DROP TEXT SEARCH TEMPLATE",
-            crate::sql::ast::TextSearchObjectKind::Dictionary => "DROP TEXT SEARCH DICTIONARY",
-            crate::sql::ast::TextSearchObjectKind::Configuration => {
-                "DROP TEXT SEARCH CONFIGURATION"
+        for &slot in slots.borrowed_slice() {
+            if let Err(error) = drop_text_search_slot(
+                storage,
+                wal,
+                txn,
+                &mut *scratch,
+                seq_session,
+                &mut *responder,
+                slot,
+                cascade,
+                arena,
+            ) {
+                return sql_fail(error);
             }
-        })?;
+        }
+        responder.command_complete(tag)?;
         sql_ok()
     });
     finish_expression_cascade(
@@ -54207,21 +54251,13 @@ pub fn comment(
             kind,
             name: object_name,
         } => {
-            let Some(slot) =
-                storage.text_search_slot_on_path(kind, object_name.schema, object_name.name, txid)
-            else {
-                return sql_fail(sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "{} \"{}\" does not exist",
-                    kind.noun(),
-                    object_name.name
-                ));
+            let slot = match text_search_slot_named(storage, kind, &object_name, txid) {
+                Ok(slot) => slot,
+                Err(error) => return sql_fail(error),
             };
             let definition = storage.text_search_object(slot).definition_for(txid);
-            let authority = match definition.owner() {
-                Some(owner) => require_definition_owner(storage, txid, owner, kind.noun()),
-                None => text_search_superuser(storage, txid),
-            };
+            let authority =
+                require_text_search_owner(storage, txid, &definition, kind, &object_name);
             if let Err(error) = authority {
                 return sql_fail(error);
             }
@@ -71933,7 +71969,21 @@ pub(crate) fn copy_statement_end(
 /// Validates a `HEADER MATCH` line against COPY's resolved target columns.
 /// This runs before any row mutation, so a mismatched header cannot leave a
 /// partially loaded statement behind.
-pub fn copy_match_header(
+pub(crate) fn copy_match_header<'a>(
+    storage: &Storage,
+    setup: &CopySetup,
+    line: &'a [u8],
+    frame: &crate::sql::error_context::CopyFrame<'a>,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    name_copy_frame(frame, storage, setup, setup.txid);
+    frame.text.set(core::str::from_utf8(line).ok());
+    crate::sql::error_context::within(frame, || {
+        copy_match_header_in_frame(storage, setup, line, arena)
+    })
+}
+
+fn copy_match_header_in_frame(
     storage: &Storage,
     setup: &CopySetup,
     line: &[u8],
@@ -71946,7 +71996,7 @@ pub fn copy_match_header(
         crate::sql::copy::decode_row_csv(
             line,
             arena,
-            &mut fields[..setup.n_targets],
+            &mut fields,
             setup.fmt.delimiter,
             setup.fmt.quote,
             setup.fmt.escape,
@@ -71958,7 +72008,7 @@ pub fn copy_match_header(
         crate::sql::copy::decode_row_text(
             line,
             arena,
-            &mut fields[..setup.n_targets],
+            &mut fields,
             setup.fmt.delimiter,
             setup.fmt.null.as_str(),
         )?
@@ -71966,20 +72016,26 @@ pub fn copy_match_header(
     if count != setup.n_targets {
         return Err(sql_err!(
             sqlstate::BAD_COPY_FILE_FORMAT,
-            "COPY header has {} columns, expected {}",
+            "wrong number of fields in header line: got {}, expected {}",
             count,
             setup.n_targets
         ));
     }
     for (index, field) in fields.iter().enumerate().take(count) {
-        let actual = field.ok_or_else(|| {
-            sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "COPY header column is NULL")
-        })?;
         let expected = def.columns()[setup.targets[index]].name.as_str();
-        if actual != expected {
+        let Some(actual) = field else {
             return Err(sql_err!(
                 sqlstate::BAD_COPY_FILE_FORMAT,
-                "COPY header column {} is \"{}\", expected \"{}\"",
+                "column name mismatch in header line field {}: got null value (\"{}\"), expected \"{}\"",
+                index + 1,
+                setup.fmt.null.as_str(),
+                expected
+            ));
+        };
+        if *actual != expected {
+            return Err(sql_err!(
+                sqlstate::BAD_COPY_FILE_FORMAT,
+                "column name mismatch in header line field {}: got \"{}\", expected \"{}\"",
                 index + 1,
                 actual,
                 expected
@@ -71991,9 +72047,6 @@ pub fn copy_match_header(
 
 /// `ON_ERROR ignore` only discards data-conversion failures. Constraint,
 /// transaction, storage, and protocol errors remain statement failures.
-pub fn copy_ignorable_error(error: &SqlError) -> bool {
-    error.sqlstate.starts_with("22") && error.sqlstate != sqlstate::BAD_COPY_FILE_FORMAT
-}
 
 /// One COPY FROM data line: text fields decode, coerce through each column's
 /// input semantics, and store through the same row core INSERT uses —
@@ -72003,15 +72056,51 @@ pub fn copy_ignorable_error(error: &SqlError) -> bool {
     clippy::too_many_arguments,
     reason = "COPY rows share the bounded statement trigger capture with INSERT execution"
 )]
-pub(crate) fn copy_row(
+pub(crate) fn copy_row<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
     services: &mut TriggerServices<'_>,
     setup: &CopySetup,
-    line: &[u8],
-    arena: &Arena,
+    line: &'a [u8],
+    frame: &crate::sql::error_context::CopyFrame<'a>,
+    arena: &'a Arena,
     responder: &mut Responder,
     inserted: &mut CopyTransitionRows,
+) -> Result<CopyRowOutcome, SqlError> {
+    name_copy_frame(frame, storage, setup, txn.txid);
+    frame.text.set(core::str::from_utf8(line).ok());
+    crate::sql::error_context::within(frame, || {
+        copy_row_in_frame(
+            storage, txn, services, setup, line, arena, responder, inserted, frame,
+        )
+    })
+}
+
+fn name_copy_frame(
+    frame: &crate::sql::error_context::CopyFrame<'_>,
+    storage: &Storage,
+    setup: &CopySetup,
+    txid: u32,
+) {
+    frame.relation.set(StackStr::from_str(
+        storage.table_def(setup.table_index, txid).name.as_str(),
+    ));
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "COPY rows share the bounded statement trigger capture with INSERT execution"
+)]
+fn copy_row_in_frame<'a>(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    services: &mut TriggerServices<'_>,
+    setup: &CopySetup,
+    line: &'a [u8],
+    arena: &'a Arena,
+    responder: &mut Responder,
+    inserted: &mut CopyTransitionRows,
+    frame: &crate::sql::error_context::CopyFrame<'a>,
 ) -> Result<CopyRowOutcome, SqlError> {
     let seq_session = services.seq_session;
     let coercion_txid = txn.txid;
@@ -72042,13 +72131,6 @@ pub(crate) fn copy_row(
             fmt.null.as_str(),
         )?
     };
-    if n_fields < setup.n_targets {
-        return Err(sql_err!(
-            sqlstate::BAD_COPY_FILE_FORMAT,
-            "missing data for column \"{}\"",
-            def.columns()[setup.targets[n_fields]].name.as_str()
-        ));
-    }
     let checks = parse_checks(def, storage, txn.txid, arena)?;
     let default_exprs = parse_defaults(def, arena, storage, txn.txid)?;
     let generated_exprs = parse_generated(def, arena, storage, txn.txid)?;
@@ -72057,6 +72139,17 @@ pub(crate) fn copy_row(
     for (i, field) in fields.iter().enumerate().take(setup.n_targets) {
         let col_index = setup.targets[i];
         let col = &def.columns()[col_index];
+        // PostgreSQL converts the columns before a missing one.
+        if i >= n_fields {
+            return Err(sql_err!(
+                sqlstate::BAD_COPY_FILE_FORMAT,
+                "missing data for column \"{}\"",
+                col.name.as_str()
+            ));
+        }
+        frame
+            .column
+            .set(Some((StackStr::from_str(col.name.as_str()), *field)));
         let use_default = field.is_some_and(|text| {
             fmt.default
                 .as_ref()
@@ -72076,17 +72169,9 @@ pub(crate) fn copy_row(
                     seq_session,
                     coercion_txid,
                 )),
-            )
-            .map_err(|error| SqlError {
-                sqlstate: error.sqlstate,
-                message: stack_format!(
-                    192,
-                    "COPY column \"{}\": {}",
-                    col.name.as_str(),
-                    error.message.as_str()
-                ),
-            })?,
+            )?,
         };
+        frame.column.set(None);
         explicit[col_index] = !use_default;
     }
     fill_omitted_defaults(
@@ -72119,6 +72204,7 @@ pub(crate) fn copy_row(
         return Ok(CopyRowOutcome::Filtered);
     }
     finish_copy_row(
+        frame,
         storage,
         txn,
         services,
@@ -72142,15 +72228,39 @@ pub(crate) fn copy_row(
     clippy::too_many_arguments,
     reason = "COPY rows share the bounded statement trigger capture with INSERT execution"
 )]
-pub(crate) fn copy_row_binary(
+pub(crate) fn copy_row_binary<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
     services: &mut TriggerServices<'_>,
     setup: &CopySetup,
-    row: &[u8],
-    arena: &Arena,
+    row: &'a [u8],
+    frame: &crate::sql::error_context::CopyFrame<'a>,
+    arena: &'a Arena,
     responder: &mut Responder,
     inserted: &mut CopyTransitionRows,
+) -> Result<CopyRowOutcome, SqlError> {
+    name_copy_frame(frame, storage, setup, txn.txid);
+    crate::sql::error_context::within(frame, || {
+        copy_row_binary_in_frame(
+            storage, txn, services, setup, row, arena, responder, inserted, frame,
+        )
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "COPY rows share the bounded statement trigger capture with INSERT execution"
+)]
+fn copy_row_binary_in_frame<'a>(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    services: &mut TriggerServices<'_>,
+    setup: &CopySetup,
+    row: &'a [u8],
+    arena: &'a Arena,
+    responder: &mut Responder,
+    inserted: &mut CopyTransitionRows,
+    frame: &crate::sql::error_context::CopyFrame<'a>,
 ) -> Result<CopyRowOutcome, SqlError> {
     let seq_session = services.seq_session;
     let coercion_txid = txn.txid;
@@ -72180,6 +72290,9 @@ pub(crate) fn copy_row_binary(
             return Err(malformed());
         }
         let col = def.columns()[col_index];
+        frame
+            .column
+            .set(Some((StackStr::from_str(col.name.as_str()), None)));
         values[col_index] = if field_len == -1 {
             Datum::Null
         } else {
@@ -72209,6 +72322,7 @@ pub(crate) fn copy_row_binary(
                 )),
             )?
         };
+        frame.column.set(None);
         explicit[col_index] = true;
     }
     if !reader.done() {
@@ -72244,6 +72358,7 @@ pub(crate) fn copy_row_binary(
         return Ok(CopyRowOutcome::Filtered);
     }
     finish_copy_row(
+        frame,
         storage,
         txn,
         services,
@@ -72263,7 +72378,30 @@ pub(crate) fn copy_row_binary(
     clippy::too_many_arguments,
     reason = "COPY shares the bounded INSERT trigger and constraint context"
 )]
+/// Whether PostgreSQL's COPY FROM buffers rows for `table` (`CIM_MULTI`):
+/// no BEFORE or INSTEAD OF row INSERT trigger on it or a partition ancestor.
+fn copy_buffers_rows(storage: &Storage, table: usize, txid: u32) -> bool {
+    let mut target = table;
+    loop {
+        if storage
+            .triggers_for_table(target, txid)
+            .any(|(_, trigger)| {
+                matches!(trigger.level, TriggerLevel::Row)
+                    && trigger.events.contains(TriggerEvents::INSERT)
+                    && !matches!(trigger.timing, crate::sql::ast::TriggerTiming::After)
+            })
+        {
+            return false;
+        }
+        let Some(attachment) = storage.table_def(target, txid).partition.attachment else {
+            return true;
+        };
+        target = usize::from(attachment.parent);
+    }
+}
+
 fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
+    frame: &crate::sql::error_context::CopyFrame<'_>,
     storage: &mut Storage,
     txn: &mut TxnState,
     services: &mut TriggerServices<'_>,
@@ -72382,6 +72520,20 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
             } else {
                 ConstraintRow::insert(storage.next_rowid()?)
             };
+            let buffered = copy_buffers_rows(storage, target, txn.txid);
+            let index_error = |error: SqlError| {
+                // PostgreSQL inserts a buffered row's index entries when it
+                // flushes the buffer, after the input line has moved on.
+                if buffered
+                    && matches!(
+                        error.sqlstate.as_str(),
+                        sqlstate::UNIQUE_VIOLATION | sqlstate::EXCLUSION_VIOLATION
+                    )
+                {
+                    frame.text.set(None);
+                }
+                error
+            };
             enforce_row_constraints(
                 storage,
                 target,
@@ -72399,7 +72551,8 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                     seq_session,
                     coercion_txid,
                 )),
-            )?;
+            )
+            .map_err(index_error)?;
             if physical.kind == crate::storage::TableKind::Foreign {
                 crate::sql::foreign::insert_row(
                     storage,

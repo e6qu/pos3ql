@@ -1602,6 +1602,17 @@ impl<'a> Parser<'a> {
         Ok((second, third))
     }
 
+    /// PostgreSQL's `any_name`: a `ColId` optionally followed by dotted
+    /// `ColLabel`s, so an unquoted reserved keyword cannot start it.
+    fn any_name(&mut self, what: &str) -> Result<QualName<'a>, ParseError> {
+        if let Tok::Ident(word) = self.peeked
+            && is_column_name_keyword(word)
+        {
+            return Err(self.syntax_error_here());
+        }
+        self.any_qual_name(what)
+    }
+
     fn any_qual_name(&mut self, what: &str) -> Result<QualName<'a>, ParseError> {
         let source = NamespaceSource {
             start: self.peek_at,
@@ -7024,7 +7035,7 @@ impl<'a> Parser<'a> {
             if count == values.len() {
                 return Err(self.err_here("too many text search dictionaries"));
             }
-            values[count] = self.any_qual_name("text search dictionary")?;
+            values[count] = self.any_name("text search dictionary")?;
             count += 1;
             if !self.eat_op(",")? {
                 break;
@@ -7045,7 +7056,7 @@ impl<'a> Parser<'a> {
         } else {
             return Err(self.syntax_error_here());
         };
-        let name = self.any_qual_name(kind.noun())?;
+        let name = self.any_name(kind.noun())?;
         let action = if self.eat_ident("rename")? {
             self.expect_ident("to")?;
             AlterTextSearchAction::Rename(self.any_ident("new text search object name")?)
@@ -7084,12 +7095,12 @@ impl<'a> Parser<'a> {
                     None
                 };
                 if self.eat_ident("replace")? {
-                    let old = self.any_qual_name("old text search dictionary")?;
+                    let old = self.any_name("old text search dictionary")?;
                     self.expect_ident("with")?;
                     TextSearchMappingAction::Replace {
                         token_types,
                         old,
-                        new: self.any_qual_name("new text search dictionary")?,
+                        new: self.any_name("new text search dictionary")?,
                     }
                 } else {
                     let Some(token_types) = token_types else {
@@ -9164,7 +9175,7 @@ impl<'a> Parser<'a> {
             };
             CommentTarget::TextSearch {
                 kind,
-                name: self.any_qual_name("text search object name")?,
+                name: self.any_name("text search object name")?,
             }
         } else if self.eat_ident("event")? {
             self.expect_ident("trigger")?;

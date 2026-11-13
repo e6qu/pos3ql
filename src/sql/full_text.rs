@@ -9,6 +9,7 @@ use core::fmt::Write as _;
 
 use crate::mem::arena::{Arena, ArenaList};
 use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql::text_parser::{self, MAX_PARSED_WORD_BYTES};
 use crate::sql::types::Datum;
 use crate::sql_err;
 use crate::util::StackStr;
@@ -73,12 +74,10 @@ const MAX_QUERY_DEPTH: usize = 64;
 // Text input reserves one byte for PostgreSQL's internal terminator. Binary
 // input carries that terminator separately and can fill the 11-bit field.
 const MAX_TEXT_LEXEME_BYTES: usize = 2_046;
-/// PostgreSQL's parser skips, with a NOTICE, a document word this long.
-const MAX_PARSED_WORD_BYTES: usize = 2_048;
 const MAX_WIRE_LEXEME_BYTES: usize = 2_047;
-/// A parsed word below `MAX_PARSED_WORD_BYTES` becomes a lexeme of up to
-/// 2,047 bytes, which the binary `tsvector` PostgreSQL builds can hold.
-const PARSED_LEXEME_BYTES: usize = MAX_PARSED_WORD_BYTES - 1;
+/// A dictionary may return a lexeme of up to `MAXSTRLEN` (2,047) bytes, which
+/// the binary `tsvector` PostgreSQL builds can hold.
+const PARSED_LEXEME_BYTES: usize = MAX_PARSED_WORD_BYTES;
 const MAX_LEXEME_POSITIONS: usize = 256;
 const MAX_TEXT_SEARCH_STORAGE_BYTES: usize = (1 << 20) - 1;
 
@@ -1581,16 +1580,6 @@ pub fn matches(vector_text: &str, query_text: &str, arena: &Arena) -> Result<boo
     }
 }
 
-/// PostgreSQL's parser under the C ctype treats every non-ASCII character as
-/// a letter (`p_iswhat` in `wparser_def.c`).
-fn parser_alpha(character: char) -> bool {
-    character.is_ascii_alphabetic() || !character.is_ascii()
-}
-
-fn token_char(character: char) -> bool {
-    parser_alpha(character) || character.is_ascii_digit() || character == '_'
-}
-
 /// `str_tolower` under the default collation: pos3ql databases use the C
 /// ctype, which lower-cases ASCII letters only.
 fn lower_token<'a>(token: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
@@ -1738,60 +1727,6 @@ pub(crate) fn normalize_builtin<'a>(
     )
 }
 
-fn token_type(token: &str) -> u8 {
-    if numeric_token(token) {
-        let unsigned = token.trim_start_matches(['+', '-']);
-        let dots = unsigned.bytes().filter(|byte| *byte == b'.').count();
-        if unsigned.bytes().any(|byte| matches!(byte, b'e' | b'E')) {
-            7 // sfloat
-        } else if dots > 1 {
-            8 // version
-        } else if dots == 1 {
-            20 // float
-        } else if token
-            .as_bytes()
-            .first()
-            .is_some_and(|byte| matches!(byte, b'+' | b'-'))
-        {
-            21 // int
-        } else {
-            22 // uint
-        }
-    } else if token.contains('.') && token.chars().any(parser_alpha) {
-        6 // host
-    } else if token.bytes().all(|byte| byte.is_ascii_alphabetic()) {
-        1 // asciiword
-    } else if token.chars().all(parser_alpha) {
-        2 // word
-    } else if token.bytes().all(|byte| byte.is_ascii_digit()) {
-        22 // uint
-    } else {
-        3 // numword
-    }
-}
-
-fn numeric_token(token: &str) -> bool {
-    let unsigned = token.strip_prefix(['+', '-']).unwrap_or(token);
-    if unsigned.is_empty() {
-        return false;
-    }
-    if let Some((mantissa, exponent)) = unsigned.split_once(['e', 'E']) {
-        if exponent.contains(['e', 'E']) {
-            return false;
-        }
-        let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
-        return !exponent.is_empty()
-            && exponent.bytes().all(|byte| byte.is_ascii_digit())
-            && mantissa
-                .split('.')
-                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-            && mantissa.bytes().filter(|byte| *byte == b'.').count() <= 1;
-    }
-    unsigned
-        .split('.')
-        .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-}
-
 #[derive(Clone, Copy)]
 struct DocumentLexeme<'a> {
     token: &'a str,
@@ -1807,17 +1742,11 @@ fn document_tokens_with<'a>(
 ) -> Result<DocumentLexemes<'a>, SqlError> {
     let mut tokens = ArenaList::new(arena);
     let mut position = 0u32;
-    let mut emit = |kind: u8, source: &str| -> Result<(), SqlError> {
-        if source.is_empty() {
-            return Ok(());
-        }
+    let mut parser = text_parser::TextParser::new(document, arena);
+    while let Some((kind, source)) = parser.next_token()? {
         if source.len() >= MAX_PARSED_WORD_BYTES {
-            return crate::sql::eval::raise_eval_message_with_detail(
-                crate::sql::eval::EvalMessageLevel::Notice,
-                crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                format_args!("word is too long to be indexed"),
-                "Words longer than 2047 characters are ignored.",
-            );
+            text_parser::long_word_notice()?;
+            continue;
         }
         match normalize(kind, source, arena)? {
             TextSearchLexeme::Unmapped => {}
@@ -1832,155 +1761,6 @@ fn document_tokens_with<'a>(
                     .map_err(|_| arena_full("text-search document"))?;
             }
         }
-        Ok(())
-    };
-    let bytes = document.as_bytes();
-    let mut at = 0usize;
-    while at < bytes.len() {
-        if bytes[at].is_ascii_whitespace() {
-            let begin = at;
-            while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
-                at += 1;
-            }
-            emit(12, &document[begin..at])?;
-            continue;
-        }
-        if bytes[at] == b'<'
-            && let Some(relative) = bytes[at..].iter().position(|byte| *byte == b'>')
-        {
-            let end = at + relative + 1;
-            emit(13, &document[at..end])?;
-            at = end;
-            continue;
-        }
-        if bytes[at] == b'&'
-            && let Some(relative) = bytes[at..].iter().position(|byte| *byte == b';')
-        {
-            let end = at + relative + 1;
-            emit(23, &document[at..end])?;
-            at = end;
-            continue;
-        }
-        if !bytes[at].is_ascii_alphanumeric()
-            && bytes[at] < 0x80
-            && !(matches!(bytes[at], b'/' | b'-' | b'+')
-                && bytes.get(at + 1).is_some_and(u8::is_ascii_alphanumeric))
-        {
-            let begin = at;
-            at += 1;
-            while at < bytes.len()
-                && !bytes[at].is_ascii_alphanumeric()
-                && !bytes[at].is_ascii_whitespace()
-                && !matches!(bytes[at], b'<' | b'&')
-            {
-                at += 1;
-            }
-            emit(12, &document[begin..at])?;
-            continue;
-        }
-        let begin = at;
-        // Quotes, brackets and most punctuation separate words; a colon does
-        // too unless it opens a URL (`http://`).
-        while at < bytes.len()
-            && !bytes[at].is_ascii_whitespace()
-            && !matches!(
-                bytes[at],
-                b'<' | b'>'
-                    | b'&'
-                    | b'\''
-                    | b'"'
-                    | b'`'
-                    | b','
-                    | b';'
-                    | b'!'
-                    | b'*'
-                    | b'^'
-                    | b'$'
-                    | b'|'
-                    | b'\\'
-                    | b'('
-                    | b')'
-                    | b'['
-                    | b']'
-                    | b'{'
-                    | b'}'
-            )
-            && !(bytes[at] == b':' && !bytes[at + 1..].starts_with(b"//"))
-        {
-            at += 1;
-        }
-        let mut end = at;
-        while end > begin
-            && matches!(
-                bytes[end - 1],
-                b',' | b';' | b'!' | b'?' | b')' | b']' | b'}' | b'.'
-            )
-        {
-            end -= 1;
-        }
-        let source = &document[begin..end];
-        if let Some(protocol_end) = source.find("://") {
-            let protocol_end = protocol_end + 3;
-            emit(14, &source[..protocol_end])?;
-            let url = &source[protocol_end..];
-            if !url.is_empty() {
-                emit(5, url)?;
-                let host_end = url.find('/').unwrap_or(url.len());
-                emit(6, &url[..host_end])?;
-                if host_end < url.len() {
-                    emit(18, &url[host_end..])?;
-                }
-            }
-        } else if source.contains('@')
-            && source
-                .split_once('@')
-                .is_some_and(|(left, right)| !left.is_empty() && right.contains('.'))
-        {
-            emit(4, source)?;
-        } else if source.starts_with('/') {
-            emit(19, source)?;
-        } else if source.contains('/') {
-            emit(5, source)?;
-            let host_end = source.find('/').expect("contains slash");
-            emit(6, &source[..host_end])?;
-            emit(18, &source[host_end..])?;
-        } else if numeric_token(source) {
-            emit(token_type(source), source)?;
-        } else if source.contains('-')
-            && source
-                .split('-')
-                .all(|part| !part.is_empty() && part.chars().all(parser_alpha))
-        {
-            let unicode = source.bytes().any(|byte| !byte.is_ascii());
-            emit(if unicode { 17 } else { 16 }, source)?;
-            for part in source.split('-') {
-                emit(if unicode { 10 } else { 11 }, part)?;
-            }
-        } else if source.split_once('-').is_some_and(|(left, right)| {
-            left.chars().all(parser_alpha) && right.bytes().all(|byte| byte.is_ascii_digit())
-        }) {
-            let (left, _) = source.split_once('-').expect("checked hyphen");
-            emit(token_type(left), left)?;
-            emit(21, &source[left.len()..])?;
-        } else if source.contains('-') {
-            let mut piece_start = 0usize;
-            for (separator, _) in source
-                .match_indices('-')
-                .chain(core::iter::once((source.len(), "")))
-            {
-                if separator > piece_start {
-                    let part = &source[piece_start..separator];
-                    emit(token_type(part), part)?;
-                }
-                piece_start = separator + 1;
-            }
-        } else {
-            emit(token_type(source), source)?;
-        }
-        if end < at {
-            emit(12, &document[end..at])?;
-        }
-        at = at.max(end);
     }
     Ok(tokens.as_slice())
 }
@@ -1991,12 +1771,14 @@ pub(crate) struct ParserToken<'a> {
     pub text: &'a str,
 }
 
+/// The default parser's tokens (`ts_parse`), long ones included.
 pub(crate) fn parse_document<'a>(
     document: &str,
     arena: &'a Arena,
 ) -> Result<&'a [ParserToken<'a>], SqlError> {
     let mut tokens = ArenaList::new(arena);
-    let _ = document_tokens_with(document, arena, |kind, text, arena| {
+    let mut parser = text_parser::TextParser::new(document, arena);
+    while let Some((kind, text)) = parser.next_token()? {
         tokens
             .push(ParserToken {
                 kind,
@@ -2005,36 +1787,11 @@ pub(crate) fn parse_document<'a>(
                     .map_err(|_| arena_full("text-search parser output"))?,
             })
             .map_err(|_| arena_full("text-search parser output"))?;
-        Ok(TextSearchLexeme::Unmapped)
-    })?;
+    }
     Ok(tokens.as_slice())
 }
 
-pub(crate) const TOKEN_TYPES: [(&str, &str); 23] = [
-    ("asciiword", "Word, all ASCII"),
-    ("word", "Word, all letters"),
-    ("numword", "Word, letters and digits"),
-    ("email", "Email address"),
-    ("url", "URL"),
-    ("host", "Host"),
-    ("sfloat", "Scientific notation"),
-    ("version", "Version number"),
-    ("hword_numpart", "Hyphenated word part, letters and digits"),
-    ("hword_part", "Hyphenated word part, all letters"),
-    ("hword_asciipart", "Hyphenated word part, all ASCII"),
-    ("blank", "Space symbols"),
-    ("tag", "XML tag"),
-    ("protocol", "Protocol head"),
-    ("numhword", "Hyphenated word, letters and digits"),
-    ("asciihword", "Hyphenated word, all ASCII"),
-    ("hword", "Hyphenated word, all letters"),
-    ("url_path", "URL path"),
-    ("file", "File or path name"),
-    ("float", "Decimal notation"),
-    ("int", "Signed integer"),
-    ("uint", "Unsigned integer"),
-    ("entity", "XML entity"),
-];
+pub(crate) use text_parser::TOKEN_TYPES;
 
 fn document_tokens<'a>(
     config: TextSearchConfig,
@@ -3277,186 +3034,6 @@ impl<'a> QueryRewriter<'a> {
             None => self.tree.format(self.root),
         }
     }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct HeadlineOptions<'a> {
-    pub start: &'a str,
-    pub stop: &'a str,
-    pub fragment_delimiter: &'a str,
-    pub min_words: usize,
-    pub max_words: usize,
-    pub short_word: usize,
-    pub max_fragments: usize,
-    pub highlight_all: bool,
-}
-
-#[derive(Clone, Copy)]
-struct HeadlineWord {
-    start: usize,
-    end: usize,
-    hit: bool,
-}
-
-pub(crate) fn headline_with<'a>(
-    document: &str,
-    query_text: &str,
-    options: HeadlineOptions<'_>,
-    arena: &'a Arena,
-    mut normalize: impl FnMut(u8, &str, &'a Arena) -> Result<TextSearchLexeme<'a>, SqlError>,
-) -> Result<&'a str, SqlError> {
-    let query = parse_query(query_text, arena)?;
-    let mut terms = ArenaList::new(arena);
-    for node in query.nodes() {
-        if let QueryNode::Lexeme { text, prefix, .. } = *node {
-            terms
-                .push((text, prefix))
-                .map_err(|_| arena_full("ts_headline"))?;
-        }
-    }
-    let mut words = ArenaList::new(arena);
-    let mut begin = None;
-    for (offset, character) in document
-        .char_indices()
-        .chain(core::iter::once((document.len(), ' ')))
-    {
-        if token_char(character) {
-            begin.get_or_insert(offset);
-            continue;
-        }
-        let Some(start) = begin.take() else { continue };
-        let word = &document[start..offset];
-        let hit = match normalize(token_type(word), word, arena)? {
-            TextSearchLexeme::Lexeme(lexeme) => terms
-                .as_slice()
-                .iter()
-                .any(|(term, prefix)| lexeme == *term || *prefix && lexeme.starts_with(term)),
-            TextSearchLexeme::Unmapped | TextSearchLexeme::StopWord => false,
-        };
-        words
-            .push(HeadlineWord {
-                start,
-                end: offset,
-                hit,
-            })
-            .map_err(|_| arena_full("ts_headline"))?;
-    }
-    if words.is_empty() {
-        return arena
-            .alloc_str(document)
-            .map_err(|_| arena_full("ts_headline"));
-    }
-
-    let mut fragments = ArenaList::new(arena);
-    if options.highlight_all {
-        fragments
-            .push((0, words.len() - 1))
-            .map_err(|_| arena_full("ts_headline"))?;
-    } else if options.max_fragments == 0 {
-        let first_hit = words.as_slice().iter().position(|word| word.hit);
-        let start = first_hit.unwrap_or(0);
-        let mut end = (start + options.min_words.saturating_sub(1)).min(words.len() - 1);
-        let mut begin = start;
-        if end + 1 - begin < options.min_words {
-            begin = end.saturating_add(1).saturating_sub(options.min_words);
-        }
-        if end + 1 - begin > options.max_words {
-            end = begin + options.max_words - 1;
-        }
-        fragments
-            .push((begin, end))
-            .map_err(|_| arena_full("ts_headline"))?;
-    } else {
-        for (hit, word) in words.as_slice().iter().enumerate() {
-            if !word.hit || fragments.len() == options.max_fragments {
-                continue;
-            }
-            let before = options.max_words.saturating_sub(1) / 2;
-            let mut begin = hit.saturating_sub(before);
-            let mut end = (begin + options.max_words.saturating_sub(1)).min(words.len() - 1);
-            begin = end
-                .saturating_add(1)
-                .saturating_sub(options.max_words)
-                .min(begin);
-            if let Some(previous) = fragments
-                .as_mut_slice()
-                .map_err(|_| arena_full("ts_headline"))?
-                .last_mut()
-                && begin <= previous.1
-            {
-                previous.1 = previous.1.max(end);
-                continue;
-            }
-            if end + 1 - begin < options.min_words {
-                end = (begin + options.min_words - 1).min(words.len() - 1);
-            }
-            fragments
-                .push((begin, end))
-                .map_err(|_| arena_full("ts_headline"))?;
-        }
-        if fragments.is_empty() {
-            fragments
-                .push((0, options.min_words.saturating_sub(1).min(words.len() - 1)))
-                .map_err(|_| arena_full("ts_headline"))?;
-        }
-    }
-
-    let mut out = ArenaText::new(
-        arena,
-        document
-            .len()
-            .saturating_add(
-                document
-                    .len()
-                    .saturating_mul(options.start.len().saturating_add(options.stop.len())),
-            )
-            .saturating_add(
-                fragments
-                    .len()
-                    .saturating_mul(options.fragment_delimiter.len()),
-            )
-            .saturating_add(1),
-        "ts_headline",
-    )?;
-    for (begin, end) in fragments
-        .as_mut_slice()
-        .map_err(|_| arena_full("ts_headline"))?
-    {
-        while *end > *begin
-            && *end + 1 - *begin > options.min_words
-            && !words.as_slice()[*end].hit
-            && words.as_slice()[*end].end - words.as_slice()[*end].start <= options.short_word
-        {
-            *end -= 1;
-        }
-    }
-    for (fragment, (begin, end)) in fragments.as_slice().iter().copied().enumerate() {
-        if fragment > 0 {
-            out.push_str(options.fragment_delimiter)?;
-        }
-        let byte_start = words.as_slice()[begin].start;
-        let mut byte_end = words.as_slice()[end].end;
-        for character in document[byte_end..].chars() {
-            if token_char(character) || character.is_whitespace() {
-                break;
-            }
-            byte_end += character.len_utf8();
-        }
-        let mut at = byte_start;
-        for word in &words.as_slice()[begin..=end] {
-            out.push_str(&document[at..word.start])?;
-            if word.hit {
-                out.push_str(options.start)?;
-            }
-            out.push_str(&document[word.start..word.end])?;
-            if word.hit {
-                out.push_str(options.stop)?;
-            }
-            at = word.end;
-        }
-        out.push_str(&document[at..byte_end])?;
-    }
-    Ok(out.finish())
 }
 
 pub fn vector_length(source: &str, arena: &Arena) -> Result<i32, SqlError> {

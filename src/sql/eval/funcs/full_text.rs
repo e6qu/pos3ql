@@ -2,6 +2,7 @@
 
 use crate::sql::ast::Expr;
 use crate::sql::full_text::{self, QueryInput, TextSearchConfig};
+use crate::sql::text_parser;
 use crate::sql::types::{ArrElem, Datum};
 use crate::sql_err;
 
@@ -123,6 +124,34 @@ fn dictionary(
             "text search dictionary \"{}\" does not exist",
             name
         )
+    })
+}
+
+#[derive(Clone, Copy)]
+enum Literal {
+    Vector,
+    Query,
+}
+
+/// An unknown-typed string literal argument takes its parameter's type, as
+/// PostgreSQL's function resolution coerces it; a typed argument is left for
+/// the caller's type check.
+fn unknown_literal<'a>(
+    expression: &Expr<'_>,
+    value: Datum<'a>,
+    kind: Literal,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let (Expr::Str(_), Datum::Text(text)) = (expression, value) else {
+        return Ok(value);
+    };
+    Ok(match kind {
+        Literal::Vector => Datum::TsVector(full_text::restore_vector(full_text::canonical_vector(
+            text, arena,
+        )?)),
+        Literal::Query => Datum::TsQuery(full_text::restore_query(full_text::canonical_query(
+            text, arena,
+        )?)),
     })
 }
 
@@ -658,6 +687,10 @@ pub(crate) fn dispatch<'a>(
             "ts_rank" | "ts_rank_cd" => {
                 arity(name, args.len(), 2..=4)?;
                 let first = eval_full(args[0], arena, params, row, hooks)?;
+                let vector_index = usize::from(
+                    args.len() == 4
+                        || args.len() == 3 && matches!(first, Datum::Array { .. } | Datum::Null),
+                );
                 let (weights, vector, query, normalization) = match args.len() {
                     2 => (
                         [0.1, 0.2, 0.4, 1.0],
@@ -700,6 +733,8 @@ pub(crate) fn dispatch<'a>(
                     }
                     _ => unreachable!("rank arity guard"),
                 };
+                let vector = unknown_literal(args[vector_index], vector, Literal::Vector, arena)?;
+                let query = unknown_literal(args[vector_index + 1], query, Literal::Query, arena)?;
                 let (Datum::TsVector(vector), Datum::TsQuery(query)) = (vector, query) else {
                     if vector.is_null() || query.is_null() {
                         return Ok(Datum::Null);
@@ -743,6 +778,13 @@ pub(crate) fn dispatch<'a>(
                         };
                         (configuration, second, query, options)
                     };
+                let query_index = if args.len() == 2 || matches!(second, Datum::TsQuery(_)) {
+                    1
+                } else {
+                    2
+                };
+                let query_value =
+                    unknown_literal(args[query_index], query_value, Literal::Query, arena)?;
                 let document = match document_value {
                     Datum::Null => return Ok(Datum::Null),
                     Datum::Text(document) | Datum::Bpchar(document) => (document, None),
@@ -764,122 +806,35 @@ pub(crate) fn dispatch<'a>(
                         "ts_headline requires tsquery"
                     ));
                 };
-                let mut start = "<b>";
-                let mut stop = "</b>";
-                let mut fragment_delimiter = " ... ";
-                let mut min_words = 15i32;
-                let mut max_words = 35i32;
-                let mut short_word = 3i32;
-                let mut max_fragments = 0i32;
-                let mut highlight_all = false;
-                if let Some(option_text) = options {
-                    for option in option_text.split(',') {
-                        let (key, value) = option.split_once('=').ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::INVALID_PARAMETER_VALUE,
-                                "invalid ts_headline option: {}",
-                                option.trim()
-                            )
-                        })?;
-                        let key = key.trim();
-                        let value = value.trim();
-                        if key.eq_ignore_ascii_case("StartSel") {
-                            start = value;
-                        } else if key.eq_ignore_ascii_case("StopSel") {
-                            stop = value;
-                        } else if key.eq_ignore_ascii_case("FragmentDelimiter") {
-                            fragment_delimiter = value;
-                        } else if key.eq_ignore_ascii_case("HighlightAll") {
-                            highlight_all = value == "1"
-                                || value.eq_ignore_ascii_case("on")
-                                || value.eq_ignore_ascii_case("true")
-                                || value.eq_ignore_ascii_case("t")
-                                || value.eq_ignore_ascii_case("y")
-                                || value.eq_ignore_ascii_case("yes");
-                        } else {
-                            let parsed = value.parse::<i32>().map_err(|_| {
-                                sql_err!(
-                                    sqlstate::INVALID_TEXT_REPRESENTATION,
-                                    "invalid input syntax for type integer: \"{}\"",
-                                    value
-                                )
-                            })?;
-                            if key.eq_ignore_ascii_case("MinWords") {
-                                min_words = parsed;
-                            } else if key.eq_ignore_ascii_case("MaxWords") {
-                                max_words = parsed;
-                            } else if key.eq_ignore_ascii_case("ShortWord") {
-                                short_word = parsed;
-                            } else if key.eq_ignore_ascii_case("MaxFragments") {
-                                max_fragments = parsed;
-                            } else {
-                                return Err(sql_err!(
-                                    sqlstate::INVALID_PARAMETER_VALUE,
-                                    "unrecognized headline parameter: \"{}\"",
-                                    key
-                                ));
-                            }
-                        }
-                    }
-                }
-                if start.len() > i16::MAX as usize
-                    || stop.len() > i16::MAX as usize
-                    || fragment_delimiter.len() > i16::MAX as usize
-                {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "headline selection marker is too long"
-                    ));
-                }
-                if !highlight_all {
-                    if min_words >= max_words {
-                        return Err(sql_err!(
-                            sqlstate::INVALID_PARAMETER_VALUE,
-                            "MinWords must be less than MaxWords"
-                        ));
-                    }
-                    if min_words <= 0 {
-                        return Err(sql_err!(
-                            sqlstate::INVALID_PARAMETER_VALUE,
-                            "MinWords must be positive"
-                        ));
-                    }
-                    if short_word < 0 {
-                        return Err(sql_err!(
-                            sqlstate::INVALID_PARAMETER_VALUE,
-                            "ShortWord must be >= 0"
-                        ));
-                    }
-                    if max_fragments < 0 {
-                        return Err(sql_err!(
-                            sqlstate::INVALID_PARAMETER_VALUE,
-                            "MaxFragments must be >= 0"
-                        ));
-                    }
-                }
-                let headline_options = full_text::HeadlineOptions {
-                    start,
-                    stop,
-                    fragment_delimiter,
-                    min_words: min_words.max(1) as usize,
-                    max_words: max_words.max(1) as usize,
-                    short_word: short_word.max(0) as usize,
-                    max_fragments: max_fragments.max(0) as usize,
-                    highlight_all,
-                };
-                let mut headline = |document, arena| {
-                    full_text::headline_with(
-                        document,
-                        query.as_str(),
-                        headline_options,
-                        arena,
-                        |token_type, token, arena| {
-                            normalize(configuration, token_type, token, arena, hooks)
-                        },
-                    )
+                let configuration_normalize = |token_type, token: &str, arena| {
+                    normalize(configuration, token_type, token, arena, hooks)
                 };
                 let Some(jsonb) = document.1 else {
-                    return Ok(Datum::Text(headline(document.0, arena)?));
+                    return Ok(Datum::Text(text_parser::headline(
+                        document.0,
+                        query.as_str(),
+                        text_parser::HeadlineOptions::Text(options),
+                        &mut text_parser::HeadlineState::default(),
+                        arena,
+                        configuration_normalize,
+                    )?));
+                };
+                // The JSON variants parse the options before visiting any
+                // string and count lexeme positions across strings.
+                let options = text_parser::HeadlineOptions::Parsed(match options {
+                    Some(text) => text_parser::parse_headline_options(text, arena)?,
+                    None => &[],
+                });
+                let mut state = text_parser::HeadlineState::default();
+                let mut headline = |document, arena| {
+                    text_parser::headline(
+                        document,
+                        query.as_str(),
+                        options,
+                        &mut state,
+                        arena,
+                        configuration_normalize,
+                    )
                 };
                 let value = if jsonb {
                     crate::sql::json::parse(document.0, arena)?

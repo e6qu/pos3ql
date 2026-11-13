@@ -78,6 +78,7 @@ pub mod snapshot;
 pub(crate) mod snowball;
 mod spgist_catalog;
 pub(crate) mod statistics;
+pub(crate) mod text_parser;
 pub mod timezone;
 mod timezone_abbreviation_data;
 pub mod to_char;
@@ -11850,11 +11851,12 @@ impl Engine {
     }
 
     /// One complete COPY data line (no trailing newline).
-    pub fn copy_row_line(
+    pub(crate) fn copy_row_line<'a>(
         &mut self,
         setup: &exec::CopySetup,
-        line: &[u8],
-        context: CopyRowContext<'_, '_>,
+        line: &'a [u8],
+        frame: &error_context::CopyFrame<'a>,
+        context: CopyRowContext<'a, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
         let _settings =
             self.enter_copy_session(setup, context.txn, context.guc, context.responder)?;
@@ -11871,6 +11873,7 @@ impl Engine {
             ),
             setup,
             line,
+            frame,
             context.arena,
             context.responder,
             context.transition_rows,
@@ -11879,21 +11882,23 @@ impl Engine {
 
     /// Checks a `COPY ... HEADER MATCH` line through the same decoded field
     /// grammar as the following data rows.
-    pub fn copy_match_header(
+    pub(crate) fn copy_match_header<'a>(
         &self,
         setup: &exec::CopySetup,
-        line: &[u8],
+        line: &'a [u8],
+        frame: &error_context::CopyFrame<'a>,
         arena: &Arena,
     ) -> Result<(), SqlError> {
-        exec::copy_match_header(&self.storage, setup, line, arena)
+        exec::copy_match_header(&self.storage, setup, line, frame, arena)
     }
 
     /// One complete COPY FROM binary row (int16 field count + fields).
-    pub fn copy_row_binary(
+    pub(crate) fn copy_row_binary<'a>(
         &mut self,
         setup: &exec::CopySetup,
-        row: &[u8],
-        context: CopyRowContext<'_, '_>,
+        row: &'a [u8],
+        frame: &error_context::CopyFrame<'a>,
+        context: CopyRowContext<'a, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
         let _settings =
             self.enter_copy_session(setup, context.txn, context.guc, context.responder)?;
@@ -11910,6 +11915,7 @@ impl Engine {
             ),
             setup,
             row,
+            frame,
             context.arena,
             context.responder,
             context.transition_rows,
@@ -22668,7 +22674,7 @@ impl Engine {
             ),
             Stmt::DropTextSearch {
                 kind,
-                name,
+                names,
                 if_exists,
                 cascade,
             } => exec::drop_text_search(
@@ -22678,7 +22684,7 @@ impl Engine {
                 &mut self.dml_scratch,
                 guc.seq_session(),
                 *kind,
-                name,
+                names,
                 *if_exists,
                 *cascade,
                 arena,

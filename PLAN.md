@@ -586,7 +586,6 @@ the expression in `CONTEXT`. Selecting a field of a named composite cast to
 `record` (`(ROW(1, 2)::t::record).id`) fails as an unknown field. Reading a
 field of a NULL `record` parameter names the expression in `CONTEXT`, which
 PostgreSQL omits because it raises the error while evaluating, not planning.
-PostgreSQL evaluates them.
 A foreign key between two different composite types fails with `0A000`
 where PostgreSQL compares them field by field.
 A user table's `tableoid` system column fails with `0A000`
@@ -594,14 +593,16 @@ A user table's `tableoid` system column fails with `0A000`
 expose it. COPY to or from a server file or program,
 `COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
 RETURNING` a non-JSON, non-string type are rejected with `0A000`.
-A `COPY FROM` row error carries no `CONTEXT` line (PostgreSQL adds
-`COPY t, line 3: "..."` or `COPY t, line 3, column c: "..."`), and
-`DROP TEXT SEARCH ... a, b` with several names fails with `42601` where
-PostgreSQL drops them together. The text search parser tokenizes common
-words, numbers, hosts, URLs, e-mail addresses, files and hyphenated words as
-PostgreSQL's `default` parser does, but is a reimplementation rather than a
-port of its state machine (`wparser_def.c`), so rarer token shapes can split
-differently.
+`COPY FROM` checks a row's unique and exclusion constraints as it stores
+the row, while PostgreSQL buffers up to 1,000 rows of a table without
+`BEFORE` row triggers and inserts their index entries when it flushes the
+buffer. A later row's conversion or `CHECK` error in the same buffer
+therefore wins over an earlier row's duplicate key in PostgreSQL; pos3ql
+reports the duplicate first. `COPY FROM` rows into a table whose omitted
+columns default to a volatile function other than `nextval`, or whose
+`WHERE` clause is volatile, name the duplicate's input line in `CONTEXT`
+where PostgreSQL, inserting such rows one at a time, names only the line
+number.
 A view
 dropped by the cascade of a function, sequence, collation, operator, text
 search object or type (`DROP FUNCTION f CASCADE` where view `v` calls `f`)

@@ -223,6 +223,134 @@ impl Frame for SqlFunctionValidationFrame<'_> {
     }
 }
 
+/// One COPY FROM input row: `CopyFromErrorCallback`'s context line.
+/// The connection creates one per input row and reads it after an error:
+/// a column still set names the input conversion that failed, the only error
+/// `ON_ERROR ignore` skips.
+pub(crate) struct CopyFrame<'a> {
+    pub(crate) relation: Cell<StackStr<64>>,
+    pub(crate) line: u64,
+    pub(crate) binary: bool,
+    /// The input row while it still describes the error (`line_buf_valid`).
+    pub(crate) text: Cell<Option<&'a str>>,
+    /// The column being converted and its input, `None` for NULL.
+    pub(crate) column: Cell<Option<(StackStr<64>, Option<&'a str>)>>,
+}
+
+impl CopyFrame<'_> {
+    pub(crate) const fn new(line: u64, binary: bool) -> Self {
+        Self {
+            relation: Cell::new(StackStr::new()),
+            line,
+            binary,
+            text: Cell::new(None),
+            column: Cell::new(None),
+        }
+    }
+}
+
+/// The input conversion a COPY row failed in, kept past the row's input.
+#[derive(Clone, Copy)]
+pub(crate) struct CopyConversion {
+    relation: StackStr<64>,
+    line: u64,
+    column: StackStr<64>,
+    /// The input as `CopyLimitPrintoutLength` shows it; `None` for NULL.
+    value: Option<StackStr<128>>,
+}
+
+impl CopyFrame<'_> {
+    /// The failed conversion, when the row's error came from one.
+    pub(crate) fn conversion(&self) -> Option<CopyConversion> {
+        let (column, value) = self.column.get()?;
+        Some(CopyConversion {
+            relation: self.relation.get(),
+            line: self.line,
+            column,
+            value: value.map(|value| {
+                let mut shown = StackStr::new();
+                let _ = write!(shown, "{}", CopyData(value));
+                shown
+            }),
+        })
+    }
+}
+
+impl CopyConversion {
+    /// The row's `CONTEXT` line.
+    pub(crate) fn context(&self) -> StackStr<512> {
+        let mut line = StackStr::new();
+        let _ = write!(
+            line,
+            "COPY {}, line {}, column {}",
+            self.relation.as_str(),
+            self.line,
+            self.column.as_str()
+        );
+        let _ = match &self.value {
+            Some(value) => write!(line, ": \"{}\"", value.as_str()),
+            None => line.write_str(": null input"),
+        };
+        line
+    }
+
+    /// `ON_ERROR ignore`'s verbose notice for the skipped row.
+    pub(crate) fn skipped_notice(&self) -> StackStr<512> {
+        let mut notice = StackStr::new();
+        let _ = write!(
+            notice,
+            "skipping row due to data type incompatibility at line {} for column \"{}\": ",
+            self.line,
+            self.column.as_str()
+        );
+        let _ = match &self.value {
+            Some(value) => write!(notice, "\"{}\"", value.as_str()),
+            None => notice.write_str("null input"),
+        };
+        notice
+    }
+}
+
+/// `CopyLimitPrintoutLength`: at most 100 bytes of COPY data, cut at a
+/// character boundary and marked with `...`.
+struct CopyData<'a>(&'a str);
+
+impl fmt::Display for CopyData<'_> {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const MAX_COPY_DATA_DISPLAY: usize = 100;
+        if self.0.len() <= MAX_COPY_DATA_DISPLAY {
+            return out.write_str(self.0);
+        }
+        let mut end = MAX_COPY_DATA_DISPLAY;
+        while !self.0.is_char_boundary(end) {
+            end -= 1;
+        }
+        write!(out, "{}...", &self.0[..end])
+    }
+}
+
+impl Frame for CopyFrame<'_> {
+    fn write_line(&self, out: &mut dyn Write, _positioned: bool) -> fmt::Result {
+        write!(
+            out,
+            "COPY {}, line {}",
+            self.relation.get().as_str(),
+            self.line
+        )?;
+        match (self.binary, self.column.get(), self.text.get()) {
+            (true, Some((column, _)), _) => write!(out, ", column {}", column.as_str()),
+            (true, None, _) | (false, None, None) => Ok(()),
+            (false, Some((column, Some(value))), _) => {
+                write!(out, ", column {}: \"{}\"", column.as_str(), CopyData(value))
+            }
+            (false, Some((column, None)), _) => {
+                write!(out, ", column {}: null input", column.as_str())
+            }
+            (false, None, Some(text)) => write!(out, ": \"{}\"", CopyData(text)),
+        }
+    }
+}
+
 struct Node {
     frame: *const (dyn Frame + 'static),
     previous: *const Node,

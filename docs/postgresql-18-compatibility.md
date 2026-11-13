@@ -836,6 +836,35 @@ python3 -I tools/generate-snowball-stemmers.py \
   --output src/sql/snowball
 ```
 
+### Default text search parser provenance
+
+The `default` parser (`ts_parse`, `ts_debug`, `to_tsvector`, `ts_headline`)
+is a port of PostgreSQL 18.6's
+[`src/backend/tsearch/wparser_def.c`](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/tsearch/wparser_def.c).
+`tools/generate-text-parser-tables.py` reads that file and
+[`src/include/common/unicode_nonspacing_table.h`](https://github.com/postgres/postgres/blob/REL_18_6/src/include/common/unicode_nonspacing_table.h)
+from the same `REL_18_6` archive and writes the token types, per-state action
+lists and character tables to `src/sql/text_parser/tables.rs` (each input's
+SHA-256 is in its header). `src/sql/text_parser/mod.rs` ports the interpreter
+(`TParserGet`) and its character tests for a UTF-8 database with the C ctype,
+where every non-ASCII character is a letter. `src/sql/text_parser/headline.rs`
+ports `ts_headline`: `hlparsetext` and `generateHeadline` from `ts_parse.c`,
+`prsd_headline` and its cover selection from `wparser_def.c`, the
+position-reporting query executor from `tsvector_op.c` and the option list
+parser from `tsearchcmds.c`. Regenerate the tables with:
+
+```sh
+python3 -I tools/generate-text-parser-tables.py \
+  --source /path/to/postgres-REL_18_6 \
+  --output src/sql/text_parser/tables.rs
+```
+
+Differential fixture
+`tests/external/differential_exact/391_text_search_parser.sql` compares
+`ts_parse`, `ts_debug`, `to_tsvector` and `ts_headline` on URLs, e-mail
+addresses, hosts, file paths, numbers, versions, XML tags and entities,
+hyphenated words, mixed scripts and long tokens with PostgreSQL 18.6.
+
 Differential fixture
 `tests/external/differential_exact/390_snowball_text_search.sql` compares
 sample words of every language, configurations, dictionary DDL and psql's

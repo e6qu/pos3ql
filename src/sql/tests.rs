@@ -18357,6 +18357,7 @@ fn copy_line(
     engine.copy_row_line(
         setup,
         line,
+        &crate::sql::error_context::CopyFrame::new(1, false),
         super::CopyRowContext::new(
             txn,
             guc,
@@ -18387,6 +18388,7 @@ fn copy_binary_row(
     engine.copy_row_binary(
         setup,
         row,
+        &crate::sql::error_context::CopyFrame::new(1, true),
         super::CopyRowContext::new(
             txn,
             guc,
@@ -90474,13 +90476,27 @@ fn copy_from_postgresql18_controls_preserve_typed_input_boundaries() {
     ));
     arena.reset();
     engine
-        .copy_match_header(&setup, b"id,note", &arena)
+        .copy_match_header(
+            &setup,
+            b"id,note",
+            &crate::sql::error_context::CopyFrame::new(1, false),
+            &arena,
+        )
         .expect("matching header");
     arena.reset();
     let bad_header = engine
-        .copy_match_header(&setup, b"note,id", &arena)
+        .copy_match_header(
+            &setup,
+            b"note,id",
+            &crate::sql::error_context::CopyFrame::new(1, false),
+            &arena,
+        )
         .expect_err("reordered header must fail");
     assert_eq!(bad_header.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
+    assert_eq!(
+        bad_header.message.as_str(),
+        "column name mismatch in header line field 1: got \"note\", expected \"id\""
+    );
     arena.reset();
     copy_line(
         &mut engine,
@@ -90505,8 +90521,10 @@ fn copy_from_postgresql18_controls_preserve_typed_input_boundaries() {
         &mut copy_transition,
     )
     .expect_err("bad integer must remain a typed conversion error");
-    assert!(crate::sql::exec::copy_ignorable_error(&conversion));
-    assert!(conversion.message.as_str().contains("COPY column \"id\""));
+    assert_eq!(
+        conversion.message.as_str(),
+        "invalid input syntax for type integer: \"not-an-integer\""
+    );
     finish_copy(
         &mut engine,
         &mut budget,
@@ -93928,12 +93946,12 @@ fn subscription_copy_transition_values_survive_worker_rewinds_and_abort() {
         let setup = apply
             .start_copy_table(&mut engine, schema, table, &columns)
             .unwrap();
-        apply.copy_line(&mut engine, &setup, b"1\tone").unwrap();
+        apply.copy_line(&mut engine, &setup, b"1\tone", 1).unwrap();
         let oversized = [b'x'; 80];
         let mut line = [b'0'; 82];
         line[..2].copy_from_slice(b"2\t");
         line[2..].copy_from_slice(&oversized);
-        let error = apply.copy_line(&mut engine, &setup, &line).unwrap_err();
+        let error = apply.copy_line(&mut engine, &setup, &line, 1).unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert!(error.message.as_str().contains("copy_transition_bytes"));
         apply.stop(&mut engine);
@@ -93949,8 +93967,8 @@ fn subscription_copy_transition_values_survive_worker_rewinds_and_abort() {
         let setup = apply
             .start_copy_table(&mut engine, schema, table, &columns)
             .unwrap();
-        apply.copy_line(&mut engine, &setup, b"1\tone").unwrap();
-        apply.copy_line(&mut engine, &setup, b"2\ttwo").unwrap();
+        apply.copy_line(&mut engine, &setup, b"1\tone", 1).unwrap();
+        apply.copy_line(&mut engine, &setup, b"2\ttwo", 1).unwrap();
         apply.finish_copy_table(&mut engine, &setup).unwrap();
         apply.finish_bootstrap(&mut engine, 41).unwrap();
     });
@@ -93975,7 +93993,7 @@ fn subscription_copy_transition_values_survive_worker_rewinds_and_abort() {
         let setup = apply
             .start_copy_table(&mut engine, schema, table, &columns)
             .unwrap();
-        apply.copy_line(&mut engine, &setup, b"3\tnew").unwrap();
+        apply.copy_line(&mut engine, &setup, b"3\tnew", 1).unwrap();
         apply.finish_copy_table(&mut engine, &setup).unwrap();
         apply.stop(&mut engine);
         apply.unbind();
@@ -97169,11 +97187,21 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                 );
                 if binary {
                     engine
-                        .copy_row_binary(&setup, &[0, 1, 0, 0, 0, 4, 0, 0, 0, id], context)
+                        .copy_row_binary(
+                            &setup,
+                            &[0, 1, 0, 0, 0, 4, 0, 0, 0, id],
+                            &crate::sql::error_context::CopyFrame::new(1, true),
+                            context,
+                        )
                         .unwrap();
                 } else {
                     engine
-                        .copy_row_line(&setup, if id == 7 { b"7" } else { b"8" }, context)
+                        .copy_row_line(
+                            &setup,
+                            if id == 7 { b"7" } else { b"8" },
+                            &crate::sql::error_context::CopyFrame::new(1, false),
+                            context,
+                        )
                         .unwrap();
                 }
             });

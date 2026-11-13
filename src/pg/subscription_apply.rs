@@ -570,15 +570,18 @@ impl SubscriptionApply {
         engine: &mut crate::sql::Engine,
         setup: &crate::sql::exec::CopySetup,
         line: &[u8],
+        line_number: u64,
     ) -> Result<(), SqlError> {
         self.with_context(engine, |worker, engine| {
             let mark = worker.arena.mark();
             worker.trigger_response.clear();
             let mut responder = Responder::new(&mut worker.trigger_response);
+            let frame = crate::sql::error_context::CopyFrame::new(line_number, false);
             let result = engine
                 .copy_row_line(
                     setup,
                     line,
+                    &frame,
                     crate::sql::CopyRowContext::new(
                         &mut worker.txn,
                         &worker.guc,
@@ -599,15 +602,18 @@ impl SubscriptionApply {
         engine: &mut crate::sql::Engine,
         setup: &crate::sql::exec::CopySetup,
         row: &[u8],
+        line_number: u64,
     ) -> Result<(), SqlError> {
         self.with_context(engine, |worker, engine| {
             let mark = worker.arena.mark();
             worker.trigger_response.clear();
             let mut responder = Responder::new(&mut worker.trigger_response);
+            let frame = crate::sql::error_context::CopyFrame::new(line_number, true);
             let result = engine
                 .copy_row_binary(
                     setup,
                     row,
+                    &frame,
                     crate::sql::CopyRowContext::new(
                         &mut worker.txn,
                         &worker.guc,

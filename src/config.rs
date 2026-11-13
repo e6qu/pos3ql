@@ -2203,6 +2203,7 @@ impl Config {
             // Send buffer plus the equally sized private output reserve.
             self.conn_send_buffer_bytes.saturating_mul(2),
             crate::pg::conn::HELD_NOTIFICATION_BYTES,
+            crate::pg::conn::COPY_ERROR_CONTEXT_BYTES,
             crate::sql::cursor::ResultStreams::budget_bytes(self),
             self.sql_arena_bytes,
             crate::sql::exec::CopyTransitionRows::budget_bytes(self),
@@ -3691,6 +3692,7 @@ sql_arena_bytes = 4096
         // Includes the private output reserve sized like the send buffer.
         let per_connection = 1030
             + crate::pg::conn::HELD_NOTIFICATION_BYTES
+            + crate::pg::conn::COPY_ERROR_CONTEXT_BYTES
             + crate::sql::cursor::ResultStreams::budget_bytes(&c)
             + crate::sql::prep::SqlPreparedPool::budget_bytes(&c)
             + copy_transition

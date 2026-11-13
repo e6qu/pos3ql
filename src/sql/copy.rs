@@ -495,6 +495,32 @@ fn parse_quoted_csv<'a>(
 /// terminating newline), or `None` if the buffer holds no complete row yet — a
 /// newline inside a quoted field is not a row terminator, so a row can span
 /// several CopyData chunks.
+/// Newlines inside quoted CSV fields of one row: PostgreSQL counts each as
+/// an input line (`CopyReadLineText`), so later errors name the row's last
+/// physical line.
+pub fn csv_quoted_newlines(row: &[u8], quote: u8, escape: u8) -> u64 {
+    // An escape equal to the quote is no separate escape.
+    let escape = (escape != quote).then_some(escape);
+    let mut in_quote = false;
+    let mut last_was_escape = false;
+    let mut newlines = 0;
+    for &byte in row {
+        if in_quote && Some(byte) == escape {
+            last_was_escape = !last_was_escape;
+        }
+        if byte == quote && !last_was_escape {
+            in_quote = !in_quote;
+        }
+        if Some(byte) != escape {
+            last_was_escape = false;
+        }
+        if in_quote && byte == b'\n' {
+            newlines += 1;
+        }
+    }
+    newlines
+}
+
 pub fn csv_row_len(buf: &[u8], quote: u8, escape: u8) -> Option<usize> {
     let mut i = 0usize;
     let mut in_quote = false;
@@ -549,6 +575,15 @@ mod tests {
 
     fn arena() -> Arena {
         Arena::new(&mut Budget::new(1 << 22), "copy test", 1 << 20).unwrap()
+    }
+
+    #[test]
+    fn csv_quoted_newlines_count_line_feeds_inside_quotes_only() {
+        assert_eq!(csv_quoted_newlines(b"1,\"a\nb\",\"c\n\nd\"", b'"', b'"'), 3);
+        assert_eq!(csv_quoted_newlines(b"1,\"a\"\"\nb\"", b'"', b'"'), 1);
+        // A backslash escape keeps an escaped quote inside the field.
+        assert_eq!(csv_quoted_newlines(b"\"a\\\"\nb\"", b'"', b'\\'), 1);
+        assert_eq!(csv_quoted_newlines(b"plain,row", b'"', b'"'), 0);
     }
 
     fn decode(line: &[u8]) -> Vec<Option<String>> {

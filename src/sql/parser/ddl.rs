@@ -1097,7 +1097,7 @@ impl<'a> Parser<'a> {
 
     fn create_text_search(&mut self) -> Result<Stmt<'a>, ParseError> {
         if self.eat_ident("parser")? {
-            let name = self.any_qual_name("text search parser name")?;
+            let name = self.any_name("text search parser name")?;
             self.expect_op("(")?;
             let mut start = None;
             let mut gettoken = None;
@@ -1139,7 +1139,7 @@ impl<'a> Parser<'a> {
             }));
         }
         if self.eat_ident("template")? {
-            let name = self.any_qual_name("text search template name")?;
+            let name = self.any_name("text search template name")?;
             self.expect_op("(")?;
             let mut init = None;
             let mut lexize = None;
@@ -1170,7 +1170,7 @@ impl<'a> Parser<'a> {
             }));
         }
         if self.eat_ident("dictionary")? {
-            let name = self.any_qual_name("text search dictionary name")?;
+            let name = self.any_name("text search dictionary name")?;
             self.expect_op("(")?;
             self.expect_ident("template")?;
             self.expect_op("=")?;
@@ -1190,7 +1190,7 @@ impl<'a> Parser<'a> {
             ));
         }
         if self.eat_ident("configuration")? {
-            let name = self.any_qual_name("text search configuration name")?;
+            let name = self.any_name("text search configuration name")?;
             self.expect_op("(")?;
             let source = if self.eat_ident("parser")? {
                 self.expect_op("=")?;
@@ -7336,7 +7336,14 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
-            let name = self.any_qual_name(kind.noun())?;
+            let mut names = ArenaList::new(self.arena);
+            loop {
+                let name = self.any_name(kind.noun())?;
+                self.push(&mut names, name)?;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
             let cascade = if self.eat_ident("cascade")? {
                 true
             } else {
@@ -7345,7 +7352,7 @@ impl<'a> Parser<'a> {
             };
             return Ok(Stmt::DropTextSearch {
                 kind,
-                name,
+                names: names.as_slice(),
                 if_exists,
                 cascade,
             });

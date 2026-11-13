@@ -4889,41 +4889,54 @@ fn materialize_lateral<'a, C: ColumnLookup<'a>>(
         });
     }
     if tref.is_function_source() {
-        // A lateral SRF (`LATERAL generate_series(1, t.n)`) evaluates its
-        // arguments against the outer row. An uncorrelated subquery among
-        // them runs once for the statement, in its slot; a correlated one
-        // for each outer row.
-        let slots = outer.statement_subqueries();
-        let arguments = crate::sql::eval::SubqueryValues {
-            scalars: &[],
-            lists: &[],
-            deferred: slots,
-            statement: slots,
-            bindings: &[],
-            correlated: None,
-        };
-        let correlated = super::ProceduralSubqueries { storage, txid };
-        let hooks = EvalHooks {
-            subs: Some(&arguments),
-            subquery_executor: Some(base_hooks.subquery_executor.unwrap_or(&correlated)),
-            ..*base_hooks
-        };
-        return super::table_func_rows_outer(
-            tref,
-            storage,
-            txid,
-            arena,
-            params,
-            outer,
-            Some(&hooks),
-            None,
-            None,
-        );
+        return with_lateral_argument_hooks(storage, txid, outer, base_hooks, |hooks| {
+            super::table_func_rows_outer(
+                tref,
+                storage,
+                txid,
+                arena,
+                params,
+                outer,
+                Some(hooks),
+                None,
+                None,
+            )
+        });
     }
     Err(sql_err!(
         sqlstate::FEATURE_NOT_SUPPORTED,
         "LATERAL is supported only for a subquery or a set-returning function"
     ))
+}
+
+/// Runs `evaluate` with the hooks a lateral set-returning function's
+/// arguments (`LATERAL generate_series(1, t.n)`) evaluate under, whether its
+/// rows stay local or go to an external run. An uncorrelated subquery among
+/// the arguments runs once for the statement, in its slot; a correlated one
+/// runs for each outer row.
+fn with_lateral_argument_hooks<'a, C: ColumnLookup<'a>, R>(
+    storage: &'a Storage,
+    txid: u32,
+    outer: &C,
+    base_hooks: &EvalHooks<'_, 'a>,
+    evaluate: impl FnOnce(&EvalHooks<'_, 'a>) -> R,
+) -> R {
+    let slots = outer.statement_subqueries();
+    let arguments = crate::sql::eval::SubqueryValues {
+        scalars: &[],
+        lists: &[],
+        deferred: slots,
+        statement: slots,
+        bindings: &[],
+        correlated: None,
+    };
+    let correlated = super::ProceduralSubqueries { storage, txid };
+    let hooks = EvalHooks {
+        subs: Some(&arguments),
+        subquery_executor: Some(base_hooks.subquery_executor.unwrap_or(&correlated)),
+        ..*base_hooks
+    };
+    evaluate(&hooks)
 }
 
 #[expect(
@@ -5155,9 +5168,10 @@ fn materialize_lateral_source<'a, C: ColumnLookup<'a>>(
         )?));
     }
     if tref.subquery.is_none() {
-        return Ok(LateralRows::External(external_lateral_function_run(
-            storage, txid, tref, width, arena, params, outer, base_hooks,
-        )?));
+        let run = with_lateral_argument_hooks(storage, txid, outer, base_hooks, |hooks| {
+            external_lateral_function_run(storage, txid, tref, width, arena, params, outer, hooks)
+        })?;
+        return Ok(LateralRows::External(run));
     }
     let mut sorter = storage.external_sorter()?;
     sorter.reset();

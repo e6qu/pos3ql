@@ -1,5 +1,22 @@
-use super::aggregate_levels::rows;
+use super::aggregate_levels::{error_message, rows};
 use super::*;
+
+/// The statement arena the scratch-reclaim tests run in. Each runs at least
+/// 2000 rows, so per-row scratch that is not reclaimed exhausts it quickly.
+const SMALL_STATEMENT_ARENA: usize = 256 << 10;
+
+fn rows_in_small_arena(
+    engine: &mut Engine,
+    budget: &mut Budget,
+    txn: &mut TxnState,
+    sql: &str,
+) -> Vec<String> {
+    let bytes = run_txn_bytes_in_arena(engine, budget, txn, sql, SMALL_STATEMENT_ARENA);
+    match error_message(&bytes) {
+        Some(error) => vec![format!("ERROR {error}")],
+        None => data_rows(&bytes),
+    }
+}
 
 /// Expected values were read from PostgreSQL 18.6 (`initdb --locale=C`).
 #[test]
@@ -246,9 +263,9 @@ fn rows_compare_with_row_subqueries_and_literal_fields() {
     );
 }
 
-/// A correlated subquery run for each of 100000 input rows reclaims its
+/// A correlated subquery run for each of 10000 input rows reclaims its
 /// allocations after each row folds into a plain-data aggregate or passes the
-/// condition, so a 2 MiB statement arena holds the whole statement.
+/// condition, so a 256 KiB statement arena holds the whole statement.
 #[test]
 fn per_row_correlated_subqueries_reclaim_their_allocations() {
     let (mut e, mut b) = test_engine();
@@ -262,22 +279,23 @@ fn per_row_correlated_subqueries_reclaim_their_allocations() {
         run_txn(&mut e, &mut b, &mut t, sql);
     }
     let subquery = "(SELECT x FROM pr_z WHERE x <= pr_big.id)";
-    let from = "pr_big, generate_series(1, 1000) g";
+    let from = "pr_big, generate_series(1, 100) g";
     for (sql, expected) in [
-        (
-            format!("SELECT sum({subquery}) FROM {from}"),
-            vec!["100000"],
-        ),
+        (format!("SELECT sum({subquery}) FROM {from}"), vec!["10000"]),
         (
             format!("SELECT max({subquery}) FROM {from} GROUP BY g % 2 ORDER BY 1"),
             vec!["1", "1"],
         ),
         (
             format!("SELECT count(*) FROM {from} WHERE {subquery} = 1 GROUP BY g % 2"),
-            vec!["50000", "50000"],
+            vec!["5000", "5000"],
         ),
     ] {
-        assert_eq!(rows(&mut e, &mut b, &mut t, &sql), expected, "{sql}");
+        assert_eq!(
+            rows_in_small_arena(&mut e, &mut b, &mut t, &sql),
+            expected,
+            "{sql}"
+        );
     }
 }
 
@@ -345,8 +363,8 @@ fn dml_subqueries_run_when_first_read_as_of_the_statement() {
 
 /// An uncorrelated subquery nested in a correlated one runs once for the
 /// statement, as PostgreSQL's initPlan does, rather than once per outer row:
-/// the value is kept in one slot, so 100000 outer rows fit the statement
-/// arena. Expected values were read from PostgreSQL 18.6 (`initdb --locale=C`).
+/// the value is kept in one slot, so 10000 outer rows (2000 under two
+/// correlated levels) fit a 256 KiB statement arena. Expected values were read from PostgreSQL 18.6 (`initdb --locale=C`).
 #[test]
 fn nested_uncorrelated_subqueries_run_once_per_statement() {
     let (mut e, mut b) = test_engine();
@@ -360,27 +378,28 @@ fn nested_uncorrelated_subqueries_run_once_per_statement() {
     ] {
         run_txn(&mut e, &mut b, &mut t, sql);
     }
-    let from = "nu_big, generate_series(1, 1000) g";
+    let from = "nu_big, generate_series(1, 100) g";
+    let two_levels = "nu_big, generate_series(1, 20) g";
     for (sql, expected) in [
         (
             format!(
                 "SELECT sum((SELECT x + (SELECT max(x) FROM nu_z) FROM nu_z WHERE x <= nu_big.id)) FROM {from}"
             ),
-            vec!["200000"],
+            vec!["20000"],
         ),
         (
             format!("SELECT sum((SELECT nu_big.id + (SELECT max(x) FROM nu_z))) FROM {from}"),
-            vec!["5150000"],
+            vec!["515000"],
         ),
         (
             format!(
                 "SELECT count(*) FROM {from} WHERE EXISTS (SELECT 1 FROM nu_z WHERE x <= nu_big.id AND x IN (SELECT x FROM nu_z))"
             ),
-            vec!["100000"],
+            vec!["10000"],
         ),
         (
             format!(
-                "SELECT max((SELECT x + (SELECT (SELECT max(x) FROM nu_z) FROM nu_z WHERE x < g) FROM nu_z WHERE x <= nu_big.id)) FROM {from}"
+                "SELECT max((SELECT x + (SELECT (SELECT max(x) FROM nu_z) FROM nu_z WHERE x < g) FROM nu_z WHERE x <= nu_big.id)) FROM {two_levels}"
             ),
             vec!["2"],
         ),
@@ -389,49 +408,57 @@ fn nested_uncorrelated_subqueries_run_once_per_statement() {
             vec!["1|2", "2|2", "3|2"],
         ),
     ] {
-        assert_eq!(rows(&mut e, &mut b, &mut t, &sql), expected, "{sql}");
+        assert_eq!(
+            rows_in_small_arena(&mut e, &mut b, &mut t, &sql),
+            expected,
+            "{sql}"
+        );
     }
 }
 
 /// Aggregates whose running values are text or numeric, and derived tables
-/// kept in local mode, reclaim each input row's evaluation scratch: 20000
-/// rows of 1 KiB scratch each fit the 2 MiB statement arena. Expected values
+/// kept in local mode, reclaim each input row's evaluation scratch: 2000
+/// rows of 1 KiB scratch each fit a 256 KiB statement arena. Expected values
 /// were read from PostgreSQL 18.6 (`initdb --locale=C`).
 #[test]
 fn held_aggregate_values_and_derived_tables_reclaim_row_scratch() {
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();
-    let rows_of = "generate_series(1, 20000) g";
+    let rows_of = "generate_series(1, 2000) g";
     for (sql, expected) in [
         (
             format!(
                 "SELECT length(max(repeat('x', 1000) || g)), right(max(repeat('x', 1000) || g), 4), min(g::text) FROM {rows_of}"
             ),
-            vec!["1004|9999|1"],
+            vec!["1003|x999|1"],
         ),
         (
             format!(
                 "SELECT sum(length(repeat('x', 1000))::numeric + g / 3.0), avg(length(repeat('y', 1000) || g)) FROM {rows_of}"
             ),
-            vec!["86670000.00000000000000000000|1004.4447000000000000"],
+            vec!["2667000.00000000000000000000|1003.4465000000000000"],
         ),
         (
             format!(
                 "SELECT g % 2, right(max(repeat('z', 1000) || g), 5), variance(length(repeat('v', 1000) || g)) FROM {rows_of} GROUP BY 1 ORDER BY 1"
             ),
             vec![
-                "0|z9998|0.36880087008700870087",
-                "1|z9999|0.36995674567456745675",
+                "0|zz998|0.36165765765765765766",
+                "1|zz999|0.36734234234234234234",
             ],
         ),
         (
             format!(
-                "SELECT count(*), max(v) FROM (SELECT length(repeat('x', 1000) || g) AS v FROM {rows_of} LIMIT 30000) d"
+                "SELECT count(*), max(v) FROM (SELECT length(repeat('x', 1000) || g) AS v FROM {rows_of} LIMIT 3000) d"
             ),
-            vec!["20000|1005"],
+            vec!["2000|1004"],
         ),
     ] {
-        assert_eq!(rows(&mut e, &mut b, &mut t, &sql), expected, "{sql}");
+        assert_eq!(
+            rows_in_small_arena(&mut e, &mut b, &mut t, &sql),
+            expected,
+            "{sql}"
+        );
     }
 }
 
@@ -530,15 +557,15 @@ fn subquery_columns_are_described_with_their_declared_types() {
 
 /// Buffering aggregates (`DISTINCT`, aggregate `ORDER BY`, collecting,
 /// ordered-set and range aggregates) keep their buffers apart from each input
-/// row's evaluation scratch: 5000 to 20000 rows of 1 KiB scratch each fit
-/// the 2 MiB statement arena. Expected values were read from PostgreSQL 18.6
+/// row's evaluation scratch: 500 to 2000 rows of 1 KiB scratch each fit a
+/// 256 KiB statement arena. Expected values were read from PostgreSQL 18.6
 /// (`initdb --locale=C`).
 #[test]
 fn buffering_aggregates_reclaim_row_scratch() {
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();
-    let rows_of = "generate_series(1, 20000) g";
-    let few = "generate_series(1, 5000) g";
+    let rows_of = "generate_series(1, 2000) g";
+    let few = "generate_series(1, 500) g";
     for (sql, expected) in [
         (
             format!(
@@ -546,7 +573,7 @@ fn buffering_aggregates_reclaim_row_scratch() {
                  count(DISTINCT length(repeat('z', 1000) || g)), \
                  sum(DISTINCT length(repeat('s', 1000) || g) % 10) FROM {rows_of}"
             ),
-            vec!["20000|5|15"],
+            vec!["2000|4|10"],
         ),
         (
             format!(
@@ -554,7 +581,7 @@ fn buffering_aggregates_reclaim_row_scratch() {
                  length(jsonb_agg(length(repeat('j', 1000) || g) % 2)::text) \
                  FROM {few}"
             ),
-            vec!["5000|15000"],
+            vec!["500|1500"],
         ),
         (
             format!(
@@ -562,7 +589,7 @@ fn buffering_aggregates_reclaim_row_scratch() {
                  range_agg(int4range(length(repeat('r', 1000) || g), length(repeat('r', 1000) || g) + 1)) \
                  FROM {few}"
             ),
-            vec!["1004|{[1001,1005)}"],
+            vec!["1003|{[1001,1004)}"],
         ),
         (
             format!(
@@ -570,7 +597,7 @@ fn buffering_aggregates_reclaim_row_scratch() {
                  cardinality(array_agg(DISTINCT length(repeat('y', 1000) || g) % 5)) \
                  FROM {rows_of} GROUP BY 1 ORDER BY 1"
             ),
-            vec!["0|5|5", "1|5|5"],
+            vec!["0|4|4", "1|4|4"],
         ),
         (
             "SELECT array_agg(DISTINCT x), json_agg(DISTINCT x) FROM (VALUES (2), (NULL), (1), (NULL), (2)) v(x)".to_owned(),
@@ -585,7 +612,11 @@ fn buffering_aggregates_reclaim_row_scratch() {
             vec![r#"<e/>|<e x="1"/>"#],
         ),
     ] {
-        assert_eq!(rows(&mut e, &mut b, &mut t, &sql), expected, "{sql}");
+        assert_eq!(
+            rows_in_small_arena(&mut e, &mut b, &mut t, &sql),
+            expected,
+            "{sql}"
+        );
     }
 }
 

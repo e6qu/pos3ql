@@ -76,6 +76,9 @@ const MAX_TEXT_LEXEME_BYTES: usize = 2_046;
 /// PostgreSQL's parser skips, with a NOTICE, a document word this long.
 const MAX_PARSED_WORD_BYTES: usize = 2_048;
 const MAX_WIRE_LEXEME_BYTES: usize = 2_047;
+/// A parsed word below `MAX_PARSED_WORD_BYTES` becomes a lexeme of up to
+/// 2,047 bytes, which the binary `tsvector` PostgreSQL builds can hold.
+const PARSED_LEXEME_BYTES: usize = MAX_PARSED_WORD_BYTES - 1;
 const MAX_LEXEME_POSITIONS: usize = 256;
 const MAX_TEXT_SEARCH_STORAGE_BYTES: usize = (1 << 20) - 1;
 
@@ -2065,7 +2068,7 @@ pub fn to_tsvector<'a>(
         raw.push_byte(b':')?;
         write_u16(&mut raw, token.position)?;
     }
-    canonical_vector(raw.finish(), arena)
+    canonical_vector_with_limit(raw.finish(), PARSED_LEXEME_BYTES, arena)
 }
 
 pub(crate) fn to_tsvector_with<'a>(
@@ -2239,7 +2242,7 @@ pub(crate) fn json_to_tsvector_with<'a>(
             .saturating_add(1)
             .min(16_383);
     }
-    canonical_vector(raw.finish(), arena)
+    canonical_vector_with_limit(raw.finish(), PARSED_LEXEME_BYTES, arena)
 }
 
 fn vector_from_document_tokens<'a>(
@@ -2262,7 +2265,7 @@ fn vector_from_document_tokens<'a>(
         raw.push_byte(b':')?;
         write_u16(&mut raw, token.position)?;
     }
-    canonical_vector(raw.finish(), arena)
+    canonical_vector_with_limit(raw.finish(), PARSED_LEXEME_BYTES, arena)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

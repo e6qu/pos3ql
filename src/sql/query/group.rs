@@ -19,9 +19,9 @@ use crate::sql::exec::MAX_PROJ;
 use super::aggregate::AggState;
 use super::subquery::{correlated_in_expression, correlated_scan_conjuncts};
 use super::{
-    JoinRow, Outcome, QueryScope, ScopeSchema, arena_full, expr_contains_node,
-    pax_column_demand, resolve_order_target, scan_source_recycling_with_pax_columns,
-    scan_source_with_pax_columns, sql_fail, sql_ok,
+    JoinRow, Outcome, QueryScope, ScopeSchema, arena_full, expr_contains_node, pax_column_demand,
+    resolve_order_target, scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
+    sql_fail, sql_ok,
 };
 use crate::storage::Storage;
 

@@ -186,6 +186,13 @@ pub(crate) fn keyword_category(word: &str) -> Option<Keyword> {
     })
 }
 
+/// A function source's parenthesized list after its alias.
+enum FunctionColumnList<'a> {
+    Aliases(&'a [&'a str]),
+    /// The call's arguments followed by its column definition list.
+    Definitions(&'a [&'a Expr<'a>]),
+}
+
 /// Whether `word` is a keyword PostgreSQL refuses in a `ColId` position — a
 /// column name, a table name, or a FROM-item alias. Its two reserved categories
 /// are rejected there; the unreserved ones are accepted — `begin`, `values` and
@@ -4207,8 +4214,10 @@ impl<'a> Parser<'a> {
             table,
             "json_to_record" | "jsonb_to_record" | "json_to_recordset" | "jsonb_to_recordset"
         ) && func_args.is_some();
+        let mut bare_as = false;
         let alias = if self.eat_ident("as")? {
-            if json_to_record && self.peeked == Tok::Op("(") {
+            if func_args.is_some() && self.peeked == Tok::Op("(") {
+                bare_as = true;
                 None
             } else {
                 Some(self.col_ident("alias")?)
@@ -4223,13 +4232,19 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let col_alias = if json_to_record && self.peeked == Tok::Op("(") {
-            func_args = Some(self.json_record_column_definitions(
-                func_args.expect("record function has arguments"),
-            )?);
-            None
-        } else {
-            self.column_alias_list()?
+        // A function's list names its columns, or defines them with types
+        // (a column definition list, kept as the call's last argument).
+        let col_alias = match func_args {
+            Some(args) if self.peeked == Tok::Op("(") => {
+                match self.function_column_list(args, json_to_record, bare_as)? {
+                    FunctionColumnList::Aliases(names) => Some(names),
+                    FunctionColumnList::Definitions(args) => {
+                        func_args = Some(args);
+                        None
+                    }
+                }
+            }
+            _ => self.column_alias_list()?,
         };
         let sample = if func_args.is_none() && self.eat_ident("tablesample")? {
             Some(self.table_sample()?)
@@ -4444,31 +4459,63 @@ impl<'a> Parser<'a> {
         self.plain_call("__xml_table_columns", columns.as_slice())
     }
 
-    fn json_record_column_definitions(
+    /// A function's parenthesized column list: aliases (`f() AS t(a, b)`),
+    /// or a column definition list (`f() AS t(a int, b text)`), which
+    /// returns the call's arguments followed by `__json_record_columns`
+    /// holding one `__json_record_column(name, type, type modifier)` per
+    /// column.
+    fn function_column_list(
         &mut self,
         function_args: &'a [&'a Expr<'a>],
-    ) -> Result<&'a [&'a Expr<'a>], ParseError> {
-        if function_args.len() != 1 {
+        json_to_record: bool,
+        definitions_only: bool,
+    ) -> Result<FunctionColumnList<'a>, ParseError> {
+        self.expect_op("(")?;
+        let list_at = self.peek_at;
+        let first = self.col_ident("column alias")?;
+        if matches!(self.peeked, Tok::Op(",") | Tok::Op(")")) {
+            // `AS (...)` without a name is only a column definition list.
+            if definitions_only {
+                return Err(self.syntax_error_here());
+            }
+            let mut columns = ArenaList::new(self.arena);
+            self.push(&mut columns, first)?;
+            while self.eat_op(",")? {
+                let column = self.col_ident("column alias")?;
+                self.push(&mut columns, column)?;
+            }
+            self.expect_op(")")?;
+            return Ok(FunctionColumnList::Aliases(columns.as_slice()));
+        }
+        if json_to_record && function_args.len() != 1 {
             return Err(self.err_here("JSON record conversion takes one JSON argument"));
         }
-        self.expect_op("(")?;
         let mut definitions = ArenaList::new(self.arena);
+        let mut name = first;
         loop {
-            let name = self.col_ident("record column name")?;
             let (type_name, type_mod) = self.type_name_mod()?;
-            let name = self.arena_expr(Expr::Str(name))?;
+            let name_expr = self.arena_expr(Expr::Str(name))?;
             let type_name = self.arena_expr(Expr::Str(type_name))?;
             let type_mod = self.arena_expr(Expr::Int(i64::from(type_mod)))?;
             let definition =
-                self.plain_call("__json_record_column", &[name, type_name, type_mod])?;
+                self.plain_call("__json_record_column", &[name_expr, type_name, type_mod])?;
             self.push(&mut definitions, definition)?;
             if !self.eat_op(",")? {
                 break;
             }
+            name = self.col_ident("record column name")?;
         }
         self.expect_op(")")?;
-        let definitions = self.plain_call("__json_record_columns", definitions.as_slice())?;
-        self.arena_slice(&[function_args[0], definitions])
+        // Positioned at the list's first column, where PostgreSQL reports
+        // a list the function does not take.
+        let definitions =
+            self.plain_call_at("__json_record_columns", definitions.as_slice(), list_at)?;
+        let mut args = ArenaList::new(self.arena);
+        for argument in function_args {
+            self.push(&mut args, *argument)?;
+        }
+        self.push(&mut args, definitions)?;
+        Ok(FunctionColumnList::Definitions(args.as_slice()))
     }
 
     fn json_table_columns(&mut self, depth: u16) -> Result<&'a Expr<'a>, ParseError> {

@@ -767,11 +767,12 @@ pub(crate) fn execute<'a>(
     let mut count = declare_routine_parameters(routine, declarations)?;
     let seeded_count = seed_routine_parameters(routine.parameters(), inputs, &mut seeded)?;
     // A `RETURNS TABLE` function's columns are variables too; output
-    // parameters already are.
+    // parameters already are, and a column definition list's are not.
     let table_columns = if routine
         .parameters()
         .iter()
         .any(|parameter| parameter.mode.is_output())
+        || !matches!(routine.kind, crate::storage::RoutineKind::TableFunction)
     {
         0
     } else {
@@ -833,11 +834,23 @@ pub(crate) fn execute<'a>(
         arena,
     )?
     .with_input_sites(program.input_sites);
+    // A column definition list's columns are no variables, so a bare
+    // `RETURN NEXT` has no output variables to read.
+    let variable_outputs = if routine
+        .parameters()
+        .iter()
+        .any(|parameter| parameter.mode.is_output())
+        || matches!(routine.kind, crate::storage::RoutineKind::TableFunction)
+    {
+        output_count
+    } else {
+        0
+    };
     let mut execution = execution_frame::ExecutionFrame::new(
         arena,
         &code,
         locals,
-        output_count,
+        variable_outputs,
         &engine.storage.execution_control,
         &engine.storage.row_work,
     )?;
@@ -848,6 +861,7 @@ pub(crate) fn execute<'a>(
                 routine,
                 &engine.storage.row_work,
             )?);
+        let output_count = variable_outputs;
         let indices = arena
             .alloc_slice_with(output_count, |_| 0)
             .map_err(|_| super::super::query::arena_full_pub())?;

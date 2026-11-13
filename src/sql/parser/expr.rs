@@ -2419,7 +2419,17 @@ impl<'a> Parser<'a> {
         name: &'a str,
         args: &[&'a Expr<'a>],
     ) -> Result<&'a Expr<'a>, ParseError> {
-        let source_position = SourcePosition::new(Some(self.peek_at));
+        self.plain_call_at(name, args, self.peek_at)
+    }
+
+    /// [`Self::plain_call`] positioned at byte `at`.
+    pub(super) fn plain_call_at(
+        &self,
+        name: &'a str,
+        args: &[&'a Expr<'a>],
+        at: usize,
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        let source_position = SourcePosition::new(Some(at));
         let args = self.arena_slice(args)?;
         self.arena_expr(Expr::Call {
             kind: if crate::sql::eval::sql_syntax_call_name(name) {

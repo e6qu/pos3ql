@@ -36197,6 +36197,25 @@ fn execute_trigger_step_in<'a>(
                 let arena = context.arena;
                 let params = context.params;
                 let txid = context.txn.txid;
+                if let Some(result) = status.set_result.as_ref() {
+                    let mark = arena.mark();
+                    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+                    let checked = super::query::describe_select(
+                        query,
+                        context.storage(),
+                        txid,
+                        arena,
+                        &mut columns,
+                        crate::sql::exec::DescriptionTarget::Sql,
+                        Some(&scope),
+                    )
+                    .and_then(|count| {
+                        result.check_query_structure(&columns[..count], context.storage(), txid)
+                    });
+                    // SAFETY: the descriptions are only compared here.
+                    unsafe { arena.rewind_to(mark) };
+                    checked?;
+                }
                 let rows = execute_procedural_query(
                     context,
                     invocation.fresh_snapshots && dml_ctes.is_empty(),

@@ -556,7 +556,13 @@ Column-not-found errors carry no `Perhaps you meant` hint.
 An error inside a statement or expression of a PL/pgSQL body is positioned
 in it (`QUERY` and `LINE`), except at a name the lexer folded (`OLD.n`,
 `NOSUCH`) or a `$n` beyond the routine's parameters, which report no
-position: the statement's parsed names keep no map to the text.
+position: the statement's parsed names keep no map to the text. A rule
+created inside one (`CREATE RULE ... WHERE OLD.nosuch > 0`) also words its
+error `column "nosuch" does not exist` where PostgreSQL says `column
+old.nosuch does not exist`. A `$n` beyond the routine's parameters in a
+statement that reads no rows (`PERFORM $1 FROM empty_table` in a `DO`
+body) is accepted: it fails only when evaluated, where PostgreSQL's
+analysis rejects it.
 A field of an anonymous row passed to a PL/pgSQL `record` parameter that the
 row lacks (`f((1, 'y'))` reading `r.a`) fails with `42P01` (`missing
 FROM-clause entry for table "r"`) where PostgreSQL reports `record "r" has no

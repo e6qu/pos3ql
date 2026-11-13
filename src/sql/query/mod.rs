@@ -1388,7 +1388,11 @@ impl RoutineCallContract<'_> {
         if crate::storage::routine_oid(routine) != self.oid
             || routine.argument_count != self.arguments.len()
             || routine.parameter_count != self.parameters.len()
-            || routine.result_column_count != self.result_columns.len()
+            || (routine.result_column_count != self.result_columns.len()
+                // A column definition list gives a `record` function its
+                // result columns.
+                && !(routine.result_column_count == 0
+                    && matches!(self.result, RoutineCallResult::Record { .. })))
         {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -1409,6 +1413,7 @@ impl RoutineCallContract<'_> {
             RoutineCallResult::Table => crate::storage::RoutineKind::TableFunction,
         };
         routine.result_columns[..self.result_columns.len()].copy_from_slice(self.result_columns);
+        routine.result_column_count = self.result_columns.len();
         Ok(())
     }
 }

@@ -263,8 +263,9 @@ first, below), CTEs that run once, row locking
 or row security, whose read position (one
 record per resident row of each table plus the query text) fits
 `result_stream_bytes`. A retained join uses inner, cross and `LEFT` joins,
-or one `RIGHT` or `FULL` join of two items whose right item is a table or
-`VALUES` list, whose `ON`/`USING` conditions are scalar, non-volatile and call no
+or one `RIGHT` or `FULL` join of two items, read as the general executor's
+hash join or, where it would not hash, as a nested loop whose right item is
+a table or `VALUES` list, whose `ON`/`USING` conditions are scalar, non-volatile and call no
 SQL-language routine; a join whose inner table the general executor would
 probe through an index for each outer row spools for `shape` instead. A
 sorted stream's keys and filter must be non-volatile and call no
@@ -533,8 +534,9 @@ indexed join into a full nested loop: a two-table equality join the general
 executor would hash is read as a hash join that builds the same side, and a
 join it would probe through an index per outer row is not retained.
 
-**Built: `RIGHT` and `FULL` joins.** As in the general executor, a `RIGHT`
-or `FULL` join of two items is a nested loop over the left item that keeps
+**Built: `RIGHT` and `FULL` joins.** A `RIGHT` or `FULL` join of two items
+the general executor hashes is read as that hash join (below). Otherwise, as
+in the general executor, it is a nested loop over the left item that keeps
 one flag per row of the right item, in a `plan_build_bytes` lease that
 grows as the first left row's pass reads the right item. Each right row that
 passes `ON` sets its flag; a `FULL JOIN` also returns each unmatched left
@@ -552,7 +554,13 @@ bucket heads sized from the planner's row estimate, one entry per row, and
 the rows' columns in projected encoding. A wait during the build keeps the
 rows inserted so far and the table position. Each outer row hashes its keys
 and walks its bucket; equal keys are compared, then the `ON` condition runs,
-and a `LEFT JOIN` returns a NULL-extended row when nothing matched. A cursor
+and a preserved outer row returns NULL-extended when nothing matched. When
+the build side is preserved (a `FULL JOIN`, or a `RIGHT` or `LEFT JOIN`
+hashing its preserved side), the build also keeps rows whose key has a NULL,
+outside every bucket, and a flag per entry in a growing `plan_build_bytes`
+lease records a match once the whole `ON` condition holds; after the last
+outer row, the entries are read in build order and each unflagged row returns
+with the outer columns NULL. A cursor
 moving back rereads only its outer table: the build stays. A build that does
 not fit the free `plan_build_bytes` runs the statement the general executor's
 way instead (below), which builds the same table in statement memory
@@ -616,7 +624,7 @@ being built and are released when it is delivered.
 | Scan (built: table, literal list, generator calls, FROM-less row) | The read position and current row | Stream or cursor allocation |
 | Filter, projection, `LIMIT`/`OFFSET` (built) | The condition, items, and remaining counts | Node record |
 | Nested-loop join (built: inner, cross and `LEFT`; `RIGHT` and `FULL` of two items) | Each level's row bytes, position and matched flag; a flag per right row for `RIGHT`/`FULL` | The stream or cursor allocation, the right-row flags in `plan_build_bytes`; the inner source rewinds as scrollable cursors do |
-| Hash join (built: two tables, inner, cross and `LEFT`) | Build-side rows, entries and bucket heads | `plan_build_bytes` / `plan_build_leases`; exhaustion is `54000` naming them |
+| Hash join (built: two tables, inner, cross, `LEFT`, `RIGHT` and `FULL`) | Build-side rows, entries and bucket heads; a match flag per entry when the build side is preserved | `plan_build_bytes` / `plan_build_leases`; exhaustion is `54000` naming them |
 | Grouping (built: `GROUP BY`, `HAVING`, aggregates) | Each group's key, states and held values; or every input row's keys and aggregated columns, then each group's keys and results | `plan_build_bytes` |
 | `DISTINCT` (built: plain, as a grouping by the output list) | Each distinct output row | `plan_build_bytes` |
 | Sort (built: local mode, also for `DISTINCT ON`) | Sort keys, saved output and input columns of every row | `plan_build_bytes`; object-store mode: the external sorter's runs on the block grid (not built) |
@@ -857,10 +865,15 @@ reading one row is therefore not a fixed number of GET requests.
 
 Eligible two-source equality joins use a bounded hash build over tables,
 catalogs, derived results and external sort runs. Up to eight equality keys,
-NULL keys, duplicate matches, extra `ON` conditions and `LEFT JOIN` share that
-path. A build estimated beyond its fixed 32,768-entry ceiling, a lateral or
-partitioned source, or incompatible key types selects a nested-loop plan before
-execution; `EXPLAIN` reports the same choice.
+NULL keys, duplicate matches, extra `ON` conditions and `LEFT`, `RIGHT` and
+`FULL` joins share that path. An outer join hashes its nullable side when it
+fits, else its preserved side; a preserved build side keeps its NULL-key rows
+and one match flag per row, set when the whole join condition holds, and its
+unmatched rows return NULL-extended after the probe, in the build source's
+row order. A join whose fitting sides leave no build estimated within its fixed
+32,768-entry ceiling, a lateral or partitioned source, or incompatible key
+types selects a nested-loop plan before execution; `EXPLAIN` reports the same
+choice.
 
 See [index navigation](index-navigation.md) for searchable summaries and exact
 checks, and [durable formats](durable-format.md) for encodings and accepted

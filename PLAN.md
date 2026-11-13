@@ -506,8 +506,13 @@ INTO t (a, b) VALUES (f.x, 'q'::text);`); policy
 expressions are not deparsed. `EXPLAIN` prints
 the left-deep join tree pos3ql runs, with scan filters, a hash join's
 condition and each nested loop's join filter, for relations joined by
-commas, `CROSS JOIN` or inner `ON` conditions; outer joins print the tree
-without their conditions, and index scans omit `Index Cond`. The join order
+commas, `CROSS JOIN` or inner `ON` conditions, and for a two-relation outer
+hash join without `WHERE`; other outer joins print the tree without their
+conditions, and index scans omit `Index Cond`. An outer hash join hashes its
+nullable side (a `RIGHT JOIN` shows as `Hash Left Join` probing its right
+item, as PostgreSQL plans tables of similar size), or its preserved side
+(`Hash Right Join`) when only that side fits the build; a `FULL JOIN` shows
+as `Hash Full Join`. The join order
 is pos3ql's (FROM order, or its selectivity order for comma lists), which
 can differ from PostgreSQL's cost-based order. The executor has no merge
 join, so where PostgreSQL's costs pick `Merge Join` over sorted inputs

@@ -32942,6 +32942,7 @@ fn execute_static_rewritten_write<'a>(
         );
         match result {
             Ok(rows) => {
+                let width = returning.width;
                 let selected = returning.values(arena)?;
                 finish_static_returning(
                     context,
@@ -32951,6 +32952,7 @@ fn execute_static_rewritten_write<'a>(
                     into,
                     returns,
                     selected,
+                    width,
                     rows,
                     status,
                 )
@@ -32958,6 +32960,7 @@ fn execute_static_rewritten_write<'a>(
             Err(_) if status.pending_write.is_some() => {
                 if into.is_some() && returns {
                     let returned = returning.rows;
+                    let width = returning.width;
                     let values = returning.values(arena)?;
                     status
                         .pending_write
@@ -32965,7 +32968,7 @@ fn execute_static_rewritten_write<'a>(
                         .expect("pending nested write")
                         .save_output(
                             Some(values),
-                            values.len(),
+                            width,
                             returned,
                             &[],
                             &context.storage().row_work,
@@ -38061,10 +38064,11 @@ fn execute_trigger_step_in<'a>(
                         write_completion::PendingNestedWrite::new(command.suspend(), completion);
                     if into.is_some() && returns {
                         let returned = returning.rows;
+                        let width = returning.width;
                         let values = returning.values(context.arena)?;
                         pending.save_output(
                             Some(values),
-                            values.len(),
+                            width,
                             returned,
                             &[],
                             &context.storage().row_work,
@@ -38095,6 +38099,7 @@ fn execute_trigger_step_in<'a>(
                             .responder
                             .take_affected_rows()
                             .expect("trigger INSERT publishes an affected-row count");
+                        let width = returning.width;
                         let selected = returning.values(context.arena)?;
                         finish_static_returning(
                             context,
@@ -38107,6 +38112,7 @@ fn execute_trigger_step_in<'a>(
                             into,
                             returns,
                             selected,
+                            width,
                             rows,
                             status,
                         )?;
@@ -38277,10 +38283,11 @@ fn execute_trigger_step_in<'a>(
                         write_completion::PendingNestedWrite::new(command.suspend(), completion);
                     if into.is_some() && returns {
                         let returned = returning.rows;
+                        let width = returning.width;
                         let values = returning.values(context.arena)?;
                         pending.save_output(
                             Some(values),
-                            values.len(),
+                            width,
                             returned,
                             &[],
                             &context.storage().row_work,
@@ -38311,6 +38318,7 @@ fn execute_trigger_step_in<'a>(
                             .responder
                             .take_affected_rows()
                             .expect("trigger UPDATE publishes an affected-row count");
+                        let width = returning.width;
                         let selected = returning.values(context.arena)?;
                         finish_static_returning(
                             context,
@@ -38323,6 +38331,7 @@ fn execute_trigger_step_in<'a>(
                             into,
                             returns,
                             selected,
+                            width,
                             rows,
                             status,
                         )?;
@@ -38484,10 +38493,11 @@ fn execute_trigger_step_in<'a>(
                         write_completion::PendingNestedWrite::new(command.suspend(), completion);
                     if into.is_some() && returns {
                         let returned = returning.rows;
+                        let width = returning.width;
                         let values = returning.values(context.arena)?;
                         pending.save_output(
                             Some(values),
-                            values.len(),
+                            width,
                             returned,
                             &[],
                             &context.storage().row_work,
@@ -38518,6 +38528,7 @@ fn execute_trigger_step_in<'a>(
                             .responder
                             .take_affected_rows()
                             .expect("trigger DELETE publishes an affected-row count");
+                        let width = returning.width;
                         let selected = returning.values(context.arena)?;
                         finish_static_returning(
                             context,
@@ -38530,6 +38541,7 @@ fn execute_trigger_step_in<'a>(
                             into,
                             returns,
                             selected,
+                            width,
                             rows,
                             status,
                         )?;
@@ -38653,10 +38665,11 @@ fn execute_trigger_step_in<'a>(
                         write_completion::PendingNestedWrite::new(command.suspend(), completion);
                     if into.is_some() && returns {
                         let returned = returning.rows;
+                        let width = returning.width;
                         let values = returning.values(context.arena)?;
                         pending.save_output(
                             Some(values),
-                            values.len(),
+                            width,
                             returned,
                             &[],
                             &context.storage().row_work,
@@ -38687,6 +38700,7 @@ fn execute_trigger_step_in<'a>(
                             .responder
                             .take_affected_rows()
                             .expect("trigger MERGE publishes an affected-row count");
+                        let width = returning.width;
                         let selected = returning.values(context.arena)?;
                         finish_static_returning(
                             context,
@@ -38699,6 +38713,7 @@ fn execute_trigger_step_in<'a>(
                             into,
                             returns,
                             selected,
+                            width,
                             rows,
                             status,
                         )?;
@@ -39794,6 +39809,8 @@ struct StaticReturning<'a> {
     record: Option<&'a [(&'a str, i32, i32)]>,
     selected: [Datum<'a>; MAX_COLUMNS],
     rows: u64,
+    /// The columns of the first returned row.
+    width: usize,
 }
 
 impl<'a> StaticReturning<'a> {
@@ -39840,11 +39857,13 @@ impl<'a> StaticReturning<'a> {
             record,
             selected: [Datum::Null; MAX_COLUMNS],
             rows: 0,
+            width: 0,
         })
     }
 
     fn capture(&mut self, values: &[Datum<'_>], arena: &'a Arena) -> Result<(), SqlError> {
         if self.rows == 0 && self.into.is_some() {
+            self.width = values.len();
             match self.record {
                 Some(fields) => {
                     let row = arena
@@ -39909,6 +39928,7 @@ fn finish_static_returning<'a>(
     into: Option<PlpgsqlInto<'a>>,
     returns: bool,
     selected: &[Datum<'a>],
+    source_width: usize,
     rows: u64,
     status: &mut TriggerExecutionStatus<'a>,
 ) -> Result<(), SqlError> {
@@ -39924,6 +39944,7 @@ fn finish_static_returning<'a>(
             into,
             returns,
             selected,
+            source_width,
             rows,
         )
     })
@@ -39941,6 +39962,7 @@ fn store_static_returning<'a>(
     into: Option<PlpgsqlInto<'a>>,
     returns: bool,
     selected: &[Datum<'a>],
+    source_width: usize,
     rows: u64,
 ) -> Result<(), SqlError> {
     let into = match (into, returns) {
@@ -39976,7 +39998,7 @@ fn store_static_returning<'a>(
             context.storage(),
             context.txn.txid,
         )? {
-            check_multi_assignment(context.responder, target_width, selected.len())?;
+            check_multi_assignment(context.responder, target_width, source_width)?;
         }
     }
     for (target, value) in into.targets.iter().copied().zip(selected.iter().copied()) {
@@ -40012,13 +40034,14 @@ fn finish_resumed_static_write<'a>(
     output: Option<write_completion::NestedWriteOutput>,
     status: &mut TriggerExecutionStatus<'a>,
 ) -> Result<(), SqlError> {
-    let selected = match output {
-        None if into.is_none() || !returns => &[][..],
+    let (selected, source_width) = match output {
+        None if into.is_none() || !returns => (&[][..], 0),
         Some(write_completion::NestedWriteOutput::Rows {
             values,
             rows: returned,
+            source_width,
             ..
-        }) if returned == rows => values.decode(context.arena)?,
+        }) if returned == rows => (&*values.decode(context.arena)?, source_width),
         _ => {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -40034,6 +40057,7 @@ fn finish_resumed_static_write<'a>(
         into,
         returns,
         selected,
+        source_width,
         rows,
         status,
     )

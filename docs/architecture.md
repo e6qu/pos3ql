@@ -665,13 +665,31 @@ source as plan nodes the consuming statement pulls rows from. pos3ql runs
 each of them to completion first, which orders their `AFTER` events before
 the consumer's and keeps a materialized copy of every source row.
 
+Every `AFTER` event of the statement, its sub-statements' included, already
+fires at the statement's end in the order the events were queued, as
+PostgreSQL's `AfterTriggerEndQuery` fires them. What differs is the queue
+order and the order of volatile calls. For example, `WITH w AS (INSERT INTO
+a ... RETURNING x) INSERT INTO b SELECT x FROM w` queues `a`'s row 1, `b`'s
+row 1, `a`'s row 2 and so on in PostgreSQL, and `a`'s statement event before
+`b`'s; pos3ql queues all of `a`'s events first. A data-modifying query that
+nothing reads already runs after the main statement, last one first, and
+its events already follow the main statement's.
+
 - **Producer nodes.** A data-modifying `WITH` query becomes a retained plan
   node (see [retained plan tree](#retained-plan-tree)) whose step writes one
   source row and yields its `RETURNING` row. The consumer pulls it like a
   scan; an unreferenced query is drained after the main statement, last one
   first, as PostgreSQL's `ExecPostprocessPlan` does. `INSERT ... SELECT`
   reads its source through the same node interface instead of materializing
-  it, so the source holds one row in the statement workspace at a time.
+  it, so the source holds one row in the statement workspace at a time. The
+  two go together: a write that consumes a producer only interleaves with
+  it once it pulls one source row per row it writes.
+- **Retained selections.** A producer's step cannot select its rows again
+  for every row it yields: under the restart model that costs one full
+  selection per produced row. Its scan is itself a retained node (the same
+  cursor-mode reader result streams use), and the write keeps the node's
+  position with its row progress, as a foreign table's write already keeps
+  its selected remote rows.
 - **Event order.** Each producer queues its `AFTER ROW` events in the
   existing spilling event log as its rows are written, tagged with the
   statement's depth and command, so they interleave with the consumer's in

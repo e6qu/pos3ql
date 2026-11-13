@@ -143,13 +143,16 @@ is owned.
   synchronously: a step's foreign key check that waited resumed the step at a
   completion position past its last row and then waited again without a new
   GET, a loop the download bound does not see. A data-modifying `WITH`
-  sub-statement's `AFTER` events fire at the end of the whole statement,
-  before the main statement's own because the sub-statement runs first;
-  PostgreSQL runs a referenced
-  sub-statement as the main statement reads its rows (their events
-  interleave) and an unreferenced one after the main statement, last one
-  first. Matching that order needs sub-statements that run as their rows are
-  read.
+  sub-statement that the main statement reads runs to completion when first
+  read, so its `AFTER` events queue before the main statement's own, and
+  its volatile calls run before the main statement's later ones; PostgreSQL
+  runs it as the main statement reads its rows, so both interleave (one
+  that nothing reads already runs after the main statement, last one first,
+  as in PostgreSQL). Matching that order needs sub-statements that run as
+  their rows are read, by the
+  [design](docs/architecture.md#write-sub-statements-that-run-as-their-rows-are-read):
+  producer nodes over retained selections, and a streaming
+  `INSERT ... SELECT` source.
   `INSTEAD OF` view rows, DDL, COPY, replication apply and deferred
   triggers read synchronously. A routine call inside the rows
   keeps the changed rows (row progress), also for views and rules written

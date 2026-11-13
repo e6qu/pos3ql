@@ -572,23 +572,23 @@ SQL/JSON result types) are reported when the statement would run. In a
 `SELECT`, an unknown relation, a modifier's unknown type and an output column
 written before the failing modifier are reported first, as PostgreSQL's
 analysis order finds them; in other statements the modifier error comes first.
-Before a session first runs PL/pgSQL, PostgreSQL does not know the
-`plpgsql.*` parameters (`SHOW plpgsql.variable_conflict` fails with `42704`,
-`SET` stores a placeholder that loading converts and `pg_settings` lists only
-placeholders); pos3ql knows them from startup. PL/pgSQL's extra checks
-(`shadowed_variables`, `too_many_rows`, `strict_multi_assignment` in
-`plpgsql.extra_warnings` and `plpgsql.extra_errors`) fail with `0A000`.
+PL/pgSQL's parameters are placeholders until PL/pgSQL loads in a session, as
+in PostgreSQL, but `ALTER ROLE`, `ALTER DATABASE`, `ALTER SYSTEM` and a
+routine's `SET` clause still check a `plpgsql.*` value as the loaded
+parameter would (PostgreSQL stores a placeholder's value unchecked), and
+loading warns once for an invalid value that several transaction levels hold
+where PostgreSQL warns for each level.
 Writes to catalog views other than `pg_settings`, and to system catalogs,
-fail with `42P01`. A write through a view on another view that writes the
-lower view with its own `INSTEAD OF` trigger or rewrite rule fails with
-`0A000` (`writing through view "v2" into view "v1", which has INSTEAD OF
-triggers or rewrite rules, is not supported`); PostgreSQL rewrites onto the
-lower view and fires its trigger or rule.
-A constant assigned to a PL/pgSQL variable (`v := 'abcdefgh'` for
-`varchar(5)`) that fails the variable's modifier reports `LINE`/`QUERY`
-instead of PostgreSQL's `PL/pgSQL assignment` context; an immutable call
-(`upper('abcdefgh')`) misses that context for variables and `NEW` fields; and
-`NEW.n := 'zz'` for an `integer` field lacks PostgreSQL's `LINE`/`QUERY`.
+fail with `42P01`. `MERGE` into a view whose every action has an `INSTEAD OF`
+trigger, directly or through views above it, fails with `0A000` (`MERGE into
+view "v" through its INSTEAD OF triggers is not supported`); PostgreSQL fires
+the triggers.
+PL/pgSQL `ALIAS FOR` declarations (`a ALIAS FOR $1`) fail with `42601`, and a
+`FOR` loop over a query into several variables (`FOR a, b IN SELECT ...`)
+fails with `expected one PL/pgSQL identifier`; PostgreSQL supports both.
+A string literal that fails its input as an operator's operand in a query
+without `FROM` (`SELECT 1 + 'x'`, PL/pgSQL `v := v + 'x'`) has no cursor
+position; PostgreSQL positions it at the literal.
 `ROW(...)::t` for a table's row type fails
 with `42846`, and `COALESCE` of two different tables' rows is accepted where
 PostgreSQL fails with `42846` (`COALESCE could not convert type b to a`).

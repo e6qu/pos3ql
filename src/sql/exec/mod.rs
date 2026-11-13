@@ -39762,16 +39762,16 @@ fn finish_dynamic_into<'a>(
                 }
             }
         }
-        if rows > 0 {
-            if let Some(target_width) = into_target_width(
+        if rows > 0
+            && let Some(target_width) = into_target_width(
                 statement.targets,
                 locals,
                 new_row.definition,
                 context.storage(),
                 context.txn.txid,
-            )? {
-                check_multi_assignment(context.responder, target_width, source_width)?;
-            }
+            )?
+        {
+            check_multi_assignment(context.responder, target_width, source_width)?;
         }
         for (target, value) in statement
             .targets
@@ -39990,16 +39990,16 @@ fn store_static_returning<'a>(
         0 | 1 => {}
         _ => return Err(too_many_rows_returned(parameters, context.arena)),
     }
-    if rows > 0 {
-        if let Some(target_width) = into_target_width(
+    if rows > 0
+        && let Some(target_width) = into_target_width(
             into.targets,
             locals,
             targets.definition,
             context.storage(),
             context.txn.txid,
-        )? {
-            check_multi_assignment(context.responder, target_width, source_width)?;
-        }
+        )?
+    {
+        check_multi_assignment(context.responder, target_width, source_width)?;
     }
     for (target, value) in into.targets.iter().copied().zip(selected.iter().copied()) {
         let resolved = plpgsql_into_target(locals, targets.definition, target)?;

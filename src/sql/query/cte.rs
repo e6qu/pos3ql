@@ -1496,6 +1496,10 @@ pub(crate) fn restrict_rule_original<'a>(
 /// Turns the original DML input into one derived relation. Rule actions scan
 /// that relation once, preserving statement-level behavior while OLD/NEW are
 /// ordinary typed column references rather than magic evaluator states.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the transition reads the statement's input against the target's columns"
+)]
 pub(crate) fn rule_transition_source<'a>(
     storage: &Storage,
     txid: u32,

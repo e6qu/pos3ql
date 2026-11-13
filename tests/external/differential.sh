@@ -16,6 +16,14 @@ REFERENCE_EXTENSION_CONTROL_ROOT=${POS3QL_REFERENCE_EXTENSION_CONTROL_PATH:-$PWD
 # contrib's postgres_fdw is installed), then the test packages.
 EXTENSION_CONTROL_PATH="\$system:$EXTENSION_CONTROL_ROOT"
 REFERENCE_EXTENSION_CONTROL_PATH="\$system:$REFERENCE_EXTENSION_CONTROL_ROOT"
+# The server splits PGOPTIONS on whitespace and honours only backslash
+# escapes, so quotes would become part of a value.
+pgoptions_value() {
+  local value=${1//\\/\\\\}
+  value=${value// /\\ }
+  printf '%s' "${value//$'\t'/\\$'\t'}"
+}
+REFERENCE_PGOPTIONS="-c timezone=UTC -c extension_control_path=$(pgoptions_value "$REFERENCE_EXTENSION_CONTROL_PATH")"
 KEEP=${1:-}
 
 PGBIN=${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}
@@ -272,7 +280,7 @@ run_corpus() { # port name file diagnostics
   esac
   printf 'RUN: differential: %s\n' "$2"
   if [[ "$1" == "$PG_PORT" ]]; then
-    PGOPTIONS="-c timezone=UTC -c extension_control_path='$REFERENCE_EXTENSION_CONTROL_PATH'" \
+    PGOPTIONS="$REFERENCE_PGOPTIONS" \
       "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$REFERENCE_DATABASE" -X -e -P pager=off \
         -v VERBOSITY=verbose -f "$3" > "$WORK/$2.stdout" 2> "$WORK/$2.stderr" || status=$?
   else

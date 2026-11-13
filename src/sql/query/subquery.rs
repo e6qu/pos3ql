@@ -1786,6 +1786,7 @@ fn eval_subquery_nodes<'a>(
                         outer,
                         *arity as usize,
                         sequences,
+                        SubqueryBinding::of(bindings, select),
                     )?;
                     if values.len() > 1 {
                         return Err(sql_err!(
@@ -1841,7 +1842,15 @@ fn eval_subquery_nodes<'a>(
                 }
                 Expr::Exists(select) => {
                     let found = subquery_exists(
-                        select, storage, txid, arena, params, depth, outer, sequences,
+                        select,
+                        storage,
+                        txid,
+                        arena,
+                        params,
+                        depth,
+                        outer,
+                        sequences,
+                        SubqueryBinding::of(bindings, select),
                     )?;
                     scalars[n_scalars] =
                         (*node as *const _, Datum::Bool(found), Datum::Bool(false));
@@ -1881,19 +1890,53 @@ fn eval_subquery_nodes<'a>(
                 } => {
                     let original_select = *select;
                     let (select, arity) = row_projected(operand, original_select, arena)?;
-                    let collations =
-                        subquery_collations(original_select, storage, txid, arena, outer)?;
-                    let row_witness = (arity > 1)
-                        .then(|| row_subquery_witness(original_select, storage, txid, arena, outer))
-                        .transpose()?;
-                    let column_types = list_column_types(
-                        original_select,
-                        row_witness,
-                        storage,
-                        txid,
-                        arena,
-                        outer,
-                    )?;
+                    // A list the statement bound keeps its analysis.
+                    let binding =
+                        SubqueryBinding::of(bindings, original_select).filter(|binding| {
+                            core::ptr::eq(
+                                binding.select,
+                                super::pullup::pull_up_subqueries(
+                                    original_select,
+                                    storage,
+                                    txid,
+                                    arena,
+                                    outer,
+                                )
+                                .unwrap_or(original_select),
+                            )
+                        });
+                    let (collations, row_witness, column_types) = match binding {
+                        Some(binding) => (
+                            binding.collations,
+                            binding.row_witness,
+                            binding.column_types,
+                        ),
+                        None => {
+                            count_subquery_analysis();
+                            let collations =
+                                subquery_collations(original_select, storage, txid, arena, outer)?;
+                            let row_witness = (arity > 1)
+                                .then(|| {
+                                    row_subquery_witness(
+                                        original_select,
+                                        storage,
+                                        txid,
+                                        arena,
+                                        outer,
+                                    )
+                                })
+                                .transpose()?;
+                            let column_types = list_column_types(
+                                original_select,
+                                row_witness,
+                                storage,
+                                txid,
+                                arena,
+                                outer,
+                            )?;
+                            (collations, row_witness, column_types)
+                        }
+                    };
                     if storage.spill_attached() {
                         lists[n_lists] = external_list_subquery(
                             node,
@@ -1914,7 +1957,16 @@ fn eval_subquery_nodes<'a>(
                         return Ok(());
                     }
                     let (values, saw_null, witness) = run_subquery(
-                        select, storage, txid, arena, params, depth, outer, arity, sequences, None,
+                        select,
+                        storage,
+                        txid,
+                        arena,
+                        params,
+                        depth,
+                        outer,
+                        arity,
+                        sequences,
+                        binding.filter(|_| arity == 1),
                     )?;
                     lists[n_lists] = SubqueryList {
                         node: (*node as *const Expr).cast(),
@@ -1988,8 +2040,12 @@ fn subquery_exists<'a>(
     depth: u32,
     outer: Option<&dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    binding: Option<&SubqueryBinding<'a>>,
 ) -> Result<bool, SqlError> {
     let select = super::pullup::pull_up_subqueries(select, storage, txid, arena, outer)?;
+    // A binding describes the query as written; one rewritten for this row
+    // is analysed again.
+    let binding = binding.filter(|binding| core::ptr::eq(binding.select, select));
     if depth == 0 {
         return Err(sql_err!(
             sqlstate::STATEMENT_TOO_COMPLEX,
@@ -2002,7 +2058,14 @@ fn subquery_exists<'a>(
         )?;
         return Ok(!vals.is_empty());
     }
-    if needs_row_source(select, storage, txid, arena)? {
+    let row_source = match binding {
+        Some(binding) => binding.row_source,
+        None => {
+            count_subquery_analysis();
+            needs_row_source(select, storage, txid, arena)?
+        }
+    };
+    if row_source {
         // Grouped/DISTINCT EXISTS: the row-source executor already handles
         // grouping, HAVING, and DISTINCT — existence is whether it emits. It
         // also evaluates a nested subquery that reads this query's rows once
@@ -3901,8 +3964,16 @@ fn run_scalar_record_subquery<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     row_arity: usize,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    // The row type the statement bound, when it did.
+    bound_witness: Option<Datum<'a>>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
-    let witness = row_subquery_witness(select, storage, txid, arena, outer)?;
+    let witness = match bound_witness {
+        Some(witness) => witness,
+        None => {
+            count_subquery_analysis();
+            row_subquery_witness(select, storage, txid, arena, outer)?
+        }
+    };
     let Datum::Record(witness_fields) = witness else {
         unreachable!("row subquery witness is a record")
     };
@@ -3976,8 +4047,16 @@ fn run_record_subquery<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     row_arity: usize,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    // The row type the statement bound, when it did.
+    bound_witness: Option<Datum<'a>>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
-    let witness = row_subquery_witness(select, storage, txid, arena, outer)?;
+    let witness = match bound_witness {
+        Some(witness) => witness,
+        None => {
+            count_subquery_analysis();
+            row_subquery_witness(select, storage, txid, arena, outer)?
+        }
+    };
     let Datum::Record(witness_fields) = witness else {
         unreachable!("row subquery witness is a record")
     };
@@ -4045,8 +4124,12 @@ fn run_row_subquery<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     row_arity: usize,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    binding: Option<&SubqueryBinding<'a>>,
 ) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
     let select = super::pullup::pull_up_subqueries(select, storage, txid, arena, outer)?;
+    // A binding describes the query as written; one rewritten for this row
+    // is analysed again.
+    let binding = binding.filter(|binding| core::ptr::eq(binding.select, select));
     if depth == 0 {
         return Err(sql_err!(
             sqlstate::STATEMENT_TOO_COMPLEX,
@@ -4066,7 +4149,15 @@ fn run_row_subquery<'a>(
         return Ok((values, saw_null, witness));
     }
     run_scalar_record_subquery(
-        select, storage, txid, arena, params, outer, row_arity, sequences,
+        select,
+        storage,
+        txid,
+        arena,
+        params,
+        outer,
+        row_arity,
+        sequences,
+        binding.and_then(|binding| binding.row_witness),
     )
 }
 
@@ -4104,7 +4195,15 @@ fn run_subquery<'a>(
     }
     if row_arity > 1 {
         return run_record_subquery(
-            select, storage, txid, arena, params, outer, row_arity, sequences,
+            select,
+            storage,
+            txid,
+            arena,
+            params,
+            outer,
+            row_arity,
+            sequences,
+            binding.and_then(|binding| binding.row_witness),
         );
     }
     if select.items.len() != 1 {
@@ -5070,6 +5169,11 @@ pub(crate) struct SubqueryBinding<'a> {
     row_source: bool,
     witness: Datum<'a>,
     aggregates: Option<BoundAggregates<'a>>,
+    /// A row subquery's, or a list compared field by field, its row type.
+    row_witness: Option<Datum<'a>>,
+    /// An `IN`/`ANY`/`ALL` list's comparison collations and column types.
+    collations: &'a [Collation],
+    column_types: &'a [i32],
 }
 
 impl<'a> SubqueryBinding<'a> {
@@ -5132,7 +5236,7 @@ fn bound_witness<'a>(
     }
 }
 
-/// Binds the correlated scalar and `ARRAY` subqueries among `nodes` against
+/// Binds the correlated subqueries among `nodes` against
 /// `outer`, the declared types of the rows they will read. A subquery this
 /// cannot bind ahead of its rows (one whose analysis fails before any row
 /// exists) is analysed for each row as before, so its errors still surface
@@ -5146,11 +5250,24 @@ pub(super) fn bind_correlated_subqueries<'a>(
 ) -> Result<&'a [SubqueryBinding<'a>], SqlError> {
     let mut bindings = ArenaList::new(arena);
     for node in nodes {
-        let (Expr::Subquery(select) | Expr::ArraySubquery(select)) = node else {
-            continue;
-        };
         let mark = arena.mark();
-        match bind_scalar_subquery(select, storage, txid, arena, outer) {
+        let bound = match node {
+            Expr::Subquery(select) | Expr::ArraySubquery(select) => {
+                bind_scalar_subquery(select, storage, txid, arena, outer)
+            }
+            Expr::Exists(select) => bind_exists_subquery(select, storage, txid, arena, outer),
+            Expr::RowSubquery { select, .. } => {
+                bind_row_subquery(select, storage, txid, arena, outer)
+            }
+            Expr::InSubquery {
+                operand, select, ..
+            }
+            | Expr::QuantifiedSubquery {
+                operand, select, ..
+            } => bind_list_subquery(operand, select, storage, txid, arena, outer),
+            _ => Ok(None),
+        };
+        match bound {
             Ok(Some(binding)) => bindings.push(binding).map_err(|_| arena_full())?,
             Ok(None) | Err(_) => {
                 // SAFETY: nothing allocated by the failed analysis escapes.
@@ -5159,6 +5276,119 @@ pub(super) fn bind_correlated_subqueries<'a>(
         }
     }
     Ok(bindings.as_slice())
+}
+
+/// Binds an `EXISTS` subquery: which executor runs it.
+fn bind_exists_subquery<'a>(
+    select: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    outer: &dyn ColumnLookup<'a>,
+) -> Result<Option<SubqueryBinding<'a>>, SqlError> {
+    if select.set_body.is_some()
+        || !core::ptr::eq(
+            super::pullup::pull_up_subqueries(select, storage, txid, arena, Some(outer))?,
+            select,
+        )
+    {
+        return Ok(None);
+    }
+    count_subquery_analysis();
+    Ok(Some(SubqueryBinding {
+        select,
+        row_source: needs_row_source(select, storage, txid, arena)?,
+        witness: Datum::Null,
+        aggregates: None,
+        row_witness: None,
+        collations: &[],
+        column_types: &[],
+    }))
+}
+
+/// Binds a row subquery: its row type.
+fn bind_row_subquery<'a>(
+    select: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    outer: &dyn ColumnLookup<'a>,
+) -> Result<Option<SubqueryBinding<'a>>, SqlError> {
+    if select.set_body.is_some()
+        || !core::ptr::eq(
+            super::pullup::pull_up_subqueries(select, storage, txid, arena, Some(outer))?,
+            select,
+        )
+    {
+        return Ok(None);
+    }
+    count_subquery_analysis();
+    let witness = row_subquery_witness(select, storage, txid, arena, Some(outer))?;
+    Ok(Some(SubqueryBinding {
+        select,
+        row_source: false,
+        witness,
+        aggregates: None,
+        row_witness: Some(witness),
+        collations: &[],
+        column_types: &[],
+    }))
+}
+
+/// Binds an `IN`/`ANY`/`ALL` subquery: its comparison collations, column
+/// types and, compared with a single value, what a scalar subquery binds.
+fn bind_list_subquery<'a>(
+    operand: &'a Expr<'a>,
+    select: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    outer: &dyn ColumnLookup<'a>,
+) -> Result<Option<SubqueryBinding<'a>>, SqlError> {
+    if select.set_body.is_some()
+        || !core::ptr::eq(
+            super::pullup::pull_up_subqueries(select, storage, txid, arena, Some(outer))?,
+            select,
+        )
+    {
+        return Ok(None);
+    }
+    let arity = sublink_arity(operand, select)?;
+    let binding = if arity == 1 {
+        match bind_scalar_subquery(select, storage, txid, arena, outer)? {
+            Some(binding) => binding,
+            None => return Ok(None),
+        }
+    } else {
+        count_subquery_analysis();
+        SubqueryBinding {
+            select,
+            row_source: false,
+            witness: Datum::Null,
+            aggregates: None,
+            row_witness: Some(row_subquery_witness(
+                select,
+                storage,
+                txid,
+                arena,
+                Some(outer),
+            )?),
+            collations: &[],
+            column_types: &[],
+        }
+    };
+    Ok(Some(SubqueryBinding {
+        collations: subquery_collations(select, storage, txid, arena, Some(outer))?,
+        column_types: list_column_types(
+            select,
+            binding.row_witness,
+            storage,
+            txid,
+            arena,
+            Some(outer),
+        )?,
+        ..binding
+    }))
 }
 
 fn bind_scalar_subquery<'a>(
@@ -5208,6 +5438,9 @@ fn bind_scalar_subquery<'a>(
             row_source: true,
             witness,
             aggregates: None,
+            row_witness: None,
+            collations: &[],
+            column_types: &[],
         }));
     }
     let Some(from) = &select.from else {
@@ -5217,6 +5450,9 @@ fn bind_scalar_subquery<'a>(
             row_source: false,
             witness,
             aggregates: None,
+            row_witness: None,
+            collations: &[],
+            column_types: &[],
         }));
     };
     let scope = QueryScope::resolve_schema(storage, from, txid, arena, Some(outer))?;
@@ -5252,5 +5488,8 @@ fn bind_scalar_subquery<'a>(
         row_source: false,
         witness,
         aggregates,
+        row_witness: None,
+        collations: &[],
+        column_types: &[],
     }))
 }

@@ -625,4 +625,31 @@ fn correlated_scalar_subquery_analyses_once_per_statement() {
     let many = analyses(&mut e, &mut b, 200);
     assert_eq!(few, 3);
     assert_eq!(many, few);
+    // `EXISTS`, `IN` and row subqueries bind once per statement too.
+    let analyses = |e: &mut Engine, b: &mut Budget, rows: i32| {
+        run_with(e, b, "DELETE FROM outer_rows");
+        run_with(
+            e,
+            b,
+            &format!("INSERT INTO outer_rows SELECT g FROM generate_series(1, {rows}) g"),
+        );
+        let before = crate::sql::query::subquery_analyses();
+        let bytes = run_with(
+            e,
+            b,
+            "SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM inner_rows WHERE v = outer_rows.id)), \
+             count(*) FILTER (WHERE outer_rows.id IN (SELECT v FROM inner_rows WHERE v <= outer_rows.id)), \
+             count(*) FILTER (WHERE (outer_rows.id, 1) = (SELECT v, 1 FROM inner_rows WHERE v = outer_rows.id)) \
+             FROM outer_rows",
+        );
+        let expected = rows.min(50);
+        assert_eq!(
+            data_rows(&bytes),
+            [format!("{expected}|{expected}|{expected}")]
+        );
+        crate::sql::query::subquery_analyses() - before
+    };
+    let few = analyses(&mut e, &mut b, 3);
+    let many = analyses(&mut e, &mut b, 200);
+    assert_eq!(many, few);
 }

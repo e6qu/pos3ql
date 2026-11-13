@@ -1,0 +1,17 @@
+CREATE TABLE ss_t(id int, s text);
+CREATE TABLE ss_z(x int);
+INSERT INTO ss_t SELECT g, 'r' || g FROM generate_series(1, 6) g;
+INSERT INTO ss_z VALUES (0), (2);
+SELECT id, s, (SELECT max(x) FROM ss_z) FROM ss_t ORDER BY -id DESC;
+SELECT id FROM ss_t WHERE id % 3 IN (SELECT x FROM ss_z) ORDER BY id DESC;
+SELECT id FROM ss_t WHERE id > (SELECT min(x) FROM ss_z) ORDER BY s DESC LIMIT 3;
+SELECT id FROM ss_t WHERE id > 60 AND id IN (SELECT 1/x FROM ss_z) ORDER BY id;
+SELECT id FROM ss_t WHERE id > 60 AND id > ALL (SELECT 1/x FROM ss_z) ORDER BY id;
+SELECT id, max(s), (SELECT count(*) FROM ss_z) FROM ss_t GROUP BY id ORDER BY id;
+SELECT id % 2, count(*) FROM ss_t WHERE id IN (SELECT x FROM ss_z) OR id > 4 GROUP BY id % 2 ORDER BY 1;
+SELECT DISTINCT ON (id % 2) id, id = ANY (SELECT x FROM ss_z) FROM ss_t ORDER BY id % 2, id DESC;
+SELECT id FROM ss_t WHERE id IN (SELECT g FROM generate_series(2, 3) g) ORDER BY id DESC;
+SELECT id, (SELECT max(g) FROM generate_series(1, id) g) FROM ss_t ORDER BY id DESC;
+SELECT id, EXISTS (SELECT 1 FROM generate_series(1, 3) g WHERE g = ss_t.id) FROM ss_t ORDER BY id;
+SELECT id FROM ss_t WHERE EXISTS (SELECT 1/x FROM ss_z WHERE x > 5) ORDER BY id;
+SELECT id FROM ss_t WHERE id = 1 OR id IN (SELECT 1/x FROM ss_z) ORDER BY id;

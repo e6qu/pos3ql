@@ -29761,11 +29761,24 @@ fn run_txn_bytes(
     txn: &mut TxnState,
     sql_text: &str,
 ) -> Vec<u8> {
+    run_txn_bytes_in_arena(engine, budget, txn, sql_text, 1 << 21)
+}
+
+/// Runs `sql_text` in a statement arena of `arena_bytes`, so a test can prove
+/// per-row scratch is reclaimed with a few thousand rows instead of a
+/// hundred thousand.
+fn run_txn_bytes_in_arena(
+    engine: &mut Engine,
+    budget: &mut Budget,
+    txn: &mut TxnState,
+    sql_text: &str,
+    arena_bytes: usize,
+) -> Vec<u8> {
     let mut request_budget = Budget::new(budget.remaining());
     let budget = &mut request_budget;
     let connection_id = test_connection_id(txn);
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
-    let arena = Arena::new(budget, "sql", 1 << 21).unwrap();
+    let arena = Arena::new(budget, "sql", arena_bytes).unwrap();
     let mut pool = test_pool(budget);
     // These helpers keep temporary caches but share the retained backend control.
     if let Some(owner) = txn.plan_invalidation_owner() {

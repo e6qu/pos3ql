@@ -85437,9 +85437,12 @@ where
         let source_command = txn.command_id();
         let stream_mark = arena.mark();
         let mut stream = None;
+        // EXPLAIN ANALYZE counts the source's operators in the general
+        // executor, which materializes it.
         if matches!(source, InsertSource::Statement)
             && transition_relations.is_none()
             && !capturing
+            && !crate::sql::query::instrument::active()
             && arena.remaining() >= 2 * STREAMED_SOURCE_BLOCK
             && super::query::select_reads_repeatably(sel, storage, txn.txid)
         {
@@ -85529,6 +85532,9 @@ where
                 // without the rows earlier attempts inserted.
                 let _snapshot = storage.dml_expression_snapshot(txn.command_id());
                 let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                let _source = crate::sql::query::instrument::enter(
+                    crate::sql::query::instrument::Segment::Source,
+                );
                 if let Err(e) = super::query::select_into_rows_recycling(
                     storage,
                     txn.txid,

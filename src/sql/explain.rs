@@ -1281,6 +1281,131 @@ struct OuterJoinQuals<'a> {
 /// The index condition and filter of a scan of one relation reading
 /// `condition`, when every conjunct reads only that relation; the conjuncts
 /// `index` consumes form the index condition instead of the filter.
+/// The `Filter` of a grouped query's aggregation: its `HAVING`, over stored
+/// relations, qualified when the query reads several.
+fn having_filter<'a>(
+    storage: &Storage,
+    txid: u32,
+    scope: Option<&QueryScope<'_>>,
+    having: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+) -> Result<Option<StackStr<512>>, SqlError> {
+    let (Some(scope), Some(having)) = (scope, having) else {
+        return Ok(None);
+    };
+    if (0..scope.n).any(|table| scope.defs.stored(table).is_none()) {
+        return Ok(None);
+    }
+    let joined = arena
+        .alloc_slice_with(scope.n, |table| {
+            crate::sql::catalog::deparse::Joined::new(
+                scope.names[table],
+                scope.defs.stored(table).expect("stored relation"),
+            )
+        })
+        .map_err(|_| arena_full())?;
+    let context = crate::sql::catalog::deparse::Context {
+        storage,
+        txid,
+        arena,
+        dependencies: None,
+        table: None,
+        parameters: &[],
+        joined,
+        pretty: false,
+        qualify: scope.n > 1,
+        domain_value: None,
+        bare: None,
+    };
+    let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
+    let mut count = 0;
+    if split_conjuncts(having, &mut conjuncts, &mut count).is_none() {
+        return Ok(None);
+    }
+    deparse_qual(&context, &conjuncts[..count], arena)
+}
+
+/// How PostgreSQL names a derived relation's columns in its scan's quals.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DerivedNames {
+    /// A function's: bare, as the only range table entry.
+    Bare,
+    /// A subquery's, whose query adds range table entries of its own.
+    Qualified,
+    /// A pulled-up `VALUES` list's: `"*VALUES*".column1`, ...
+    Values,
+}
+
+/// The `Filter` of the scan of a derived relation (a subquery, function or
+/// `VALUES` list) read alone: `condition`, when it reads only that relation.
+fn derived_relation_filter<'a>(
+    storage: &Storage,
+    txid: u32,
+    exposed: &'a str,
+    definition: crate::storage::RelationDefinition<'_>,
+    names: DerivedNames,
+    condition: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+) -> Result<Option<StackStr<512>>, SqlError> {
+    let Some(condition) = condition else {
+        return Ok(None);
+    };
+    let columns = arena
+        .alloc_slice_with(definition.n_columns, |index| {
+            crate::sql::catalog::deparse::Column {
+                name: definition.columns[index].name.as_str(),
+                type_oid: None,
+                merged: None,
+            }
+        })
+        .map_err(|_| arena_full())?;
+    if names == DerivedNames::Values {
+        for (index, column) in columns.iter_mut().enumerate() {
+            let printed = arena
+                .alloc_str_display(format_args!("column{}", index + 1))
+                .map_err(|_| arena_full())?;
+            column.merged = Some((Some("*VALUES*"), printed));
+        }
+    }
+    let resolve = |qualifier: Option<&str>, name: &str| -> Option<usize> {
+        (qualifier.is_none_or(|qualifier| qualifier == exposed)
+            && columns.iter().any(|column| column.name == name))
+        .then_some(0)
+    };
+    let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
+    let mut count = 0;
+    if split_conjuncts(condition, &mut conjuncts, &mut count).is_none()
+        || conjuncts[..count]
+            .iter()
+            .any(|conjunct| relation_mask(conjunct, &resolve).is_none())
+    {
+        return Ok(None);
+    }
+    order_restrictions(&mut conjuncts[..count]);
+    let joined = [crate::sql::catalog::deparse::Joined::rule_columns(
+        exposed,
+        crate::sql::catalog::deparse::Columns::Derived(columns),
+    )];
+    let joined = [crate::sql::catalog::deparse::Joined {
+        unqualified: true,
+        ..joined[0]
+    }];
+    let context = crate::sql::catalog::deparse::Context {
+        storage,
+        txid,
+        arena,
+        dependencies: None,
+        table: None,
+        parameters: &[],
+        joined: &joined,
+        pretty: false,
+        qualify: names == DerivedNames::Qualified,
+        domain_value: None,
+        bare: None,
+    };
+    deparse_qual(&context, &conjuncts[..count], arena)
+}
+
 fn single_relation_quals<'a>(
     storage: &Storage,
     txid: u32,
@@ -2459,7 +2584,11 @@ pub(super) fn plan_select<'a>(
                 object_requests,
                 cache_blocks,
                 ..PlanNode::EMPTY
-            },
+            }
+            .with_qual(
+                QualLabel::Filter,
+                having_filter(storage, txid, scope.as_ref(), statement.having, arena)?,
+            ),
         )?;
     }
     if has_window(statement) {
@@ -2641,6 +2770,25 @@ pub(super) fn plan_select<'a>(
                 scan_indexes[0].as_ref(),
                 arena,
             )?;
+        } else if scope.n == 1
+            && let Some(definition) = scope.defs.get(0)
+            && let Some(from) = statement.from.as_ref()
+        {
+            filters[0] = derived_relation_filter(
+                storage,
+                txid,
+                scope.names[0],
+                definition,
+                match from.base.subquery {
+                    // PostgreSQL scans a pulled-up `VALUES` list as
+                    // `*VALUES*`, its columns named `column1`, ...
+                    Some(body) if values_list(body).is_some() => DerivedNames::Values,
+                    Some(_) => DerivedNames::Qualified,
+                    None => DerivedNames::Bare,
+                },
+                statement.where_clause,
+                arena,
+            )?;
         } else if inner_joins && (0..scope.n).all(|table| relation(table).is_some()) {
             let relations = arena
                 .alloc_slice_with(scope.n, |table| relation(table).expect("stored relation"))
@@ -2777,6 +2925,22 @@ pub(super) fn plan_select<'a>(
                 ordered_index_only,
             )?;
             scan.output = output;
+            // PostgreSQL scans a function in FROM with a `Function Scan`.
+            if let Some(source) = statement.from.as_ref().and_then(|from| {
+                core::iter::once(&from.base)
+                    .chain(from.joins.iter().map(|join| &join.table))
+                    .nth(table)
+            }) && source.is_function_source()
+                && source.rows_from.is_none()
+            {
+                scan.name = StackStr::from_str("Function Scan");
+                scan.relation = StackStr::from_str(source.table);
+                scan.alias = if scope.names[table] == source.table {
+                    StackStr::new()
+                } else {
+                    StackStr::from_str(scope.names[table])
+                };
+            }
             let position_role = u16::try_from(table).map_err(|_| arena_full())?;
             scan.key = key(Role::Scan(position_role));
             let sequential =
@@ -3241,7 +3405,9 @@ fn physical_scan_node(
 
 /// Pushes the plan of `tree` at `depth`. Its set operations are numbered in
 /// pre-order from `numbers.0` and its leaves left to right from `numbers.1`,
-/// as execution numbers them.
+/// as execution numbers them. With `flatten`, a `UNION ALL` joins the
+/// `Append` it is an input of.
+#[allow(clippy::too_many_arguments)]
 fn push_set_tree(
     plan: &mut Plan<'_>,
     storage: &Storage,
@@ -3251,6 +3417,7 @@ fn push_set_tree(
     depth: u8,
     block: BlockId,
     numbers: &mut (u16, u16),
+    flatten: bool,
 ) -> Result<PlanNode, SqlError> {
     match tree {
         SetTree::Op {
@@ -3274,6 +3441,32 @@ fn push_set_tree(
             Ok(root)
         }
         SetTree::Op {
+            operator: SetOp::Union,
+            all: true,
+            ..
+        } if flatten => {
+            // An input that is itself a `UNION ALL` joins its parent's
+            // `Append`, as PostgreSQL flattens one.
+            numbers.0 = numbers.0.saturating_add(1);
+            let SetTree::Op { left, right, .. } = tree else {
+                unreachable!("matched a set operation");
+            };
+            let left = push_set_tree(
+                plan, storage, txid, left, arena, depth, block, numbers, true,
+            )?;
+            let right = push_set_tree(
+                plan, storage, txid, right, arena, depth, block, numbers, true,
+            )?;
+            Ok(PlanNode {
+                rows: left.rows.saturating_add(right.rows),
+                total_cost: left.total_cost + right.total_cost,
+                width: left.width.max(right.width),
+                object_requests: left.object_requests.saturating_add(right.object_requests),
+                cache_blocks: left.cache_blocks.saturating_add(right.cache_blocks),
+                ..left
+            })
+        }
+        SetTree::Op {
             operator,
             all,
             left,
@@ -3282,17 +3475,35 @@ fn push_set_tree(
         } => {
             let at = plan.count;
             plan.push(PlanNode::EMPTY)?;
-            let role = Role::SetOperation(numbers.0);
+            let index = numbers.0;
+            let role = Role::SetOperation(index);
             numbers.0 = numbers.0.saturating_add(1);
+            // PostgreSQL hashes a distinct union's rows from one `Append`
+            // of its inputs.
+            let hashed_union = *operator == SetOp::Union && !*all;
+            let input_depth = if hashed_union {
+                plan.push(PlanNode {
+                    name: StackStr::from_str("Append"),
+                    depth: depth.saturating_add(1),
+                    key: Some(NodeKey::new(block, Role::SetInput(index))),
+                    ..PlanNode::EMPTY
+                })?;
+                depth.saturating_add(2)
+            } else {
+                depth.saturating_add(1)
+            };
+            let left_tree = left;
+            let appended = *operator == SetOp::Union && *all;
             let left = push_set_tree(
                 plan,
                 storage,
                 txid,
                 left,
                 arena,
-                depth.saturating_add(1),
+                input_depth,
                 block,
                 numbers,
+                appended,
             )?;
             let right = push_set_tree(
                 plan,
@@ -3300,9 +3511,10 @@ fn push_set_tree(
                 txid,
                 right,
                 arena,
-                depth.saturating_add(1),
+                input_depth,
                 block,
                 numbers,
+                appended,
             )?;
             let rows = match (operator, all) {
                 (SetOp::Union, true) => left.rows.saturating_add(right.rows),
@@ -3333,13 +3545,70 @@ fn push_set_tree(
                 cache_blocks: left.cache_blocks.saturating_add(right.cache_blocks),
                 constant_false: false,
                 quals: NO_QUALS,
-                keys: PlanKeys::NONE,
+                keys: if hashed_union {
+                    union_group_keys(left_tree)
+                } else {
+                    PlanKeys::NONE
+                },
                 key: Some(NodeKey::new(block, role)),
             };
             plan.nodes[at] = node;
+            if hashed_union {
+                let input = &mut plan.nodes[at + 1];
+                input.rows = left.rows.saturating_add(right.rows);
+                input.width = node.width;
+                input.output = node.output;
+                input.total_cost = left.total_cost + right.total_cost;
+            }
             Ok(node)
         }
     }
+}
+
+/// A distinct union's `Group Key`: the columns of its first branch, which
+/// PostgreSQL names by that branch's relation. No keys unless that branch
+/// selects only columns of one relation.
+fn union_group_keys(tree: &SetTree<'_>) -> PlanKeys {
+    let mut first = tree;
+    while let SetTree::Op { left, .. } = first {
+        first = left;
+    }
+    let SetTree::Select(branch) = first else {
+        return PlanKeys::NONE;
+    };
+    let Some(from) = branch.from.as_ref().filter(|from| {
+        from.joins.is_empty() && from.base.subquery.is_none() && !from.base.is_function_source()
+    }) else {
+        return PlanKeys::NONE;
+    };
+    let relation = from.base.alias.unwrap_or(from.base.table);
+    let mut keys = PlanKeys {
+        label: KeyLabel::Group,
+        ..PlanKeys::NONE
+    };
+    for (index, item) in branch.items.iter().enumerate() {
+        let SelectItem::Expr {
+            expression: Expr::Column { qualifier, name },
+            ..
+        } = item
+        else {
+            return PlanKeys::NONE;
+        };
+        if qualifier.is_some_and(|qualifier| qualifier != relation) {
+            return PlanKeys::NONE;
+        }
+        if index != 0 {
+            let _ = keys.plain.write_char(KEY_SEPARATOR);
+        }
+        crate::sql::catalog::write_identifier(&mut keys.plain, relation);
+        let _ = keys.plain.write_char('.');
+        crate::sql::catalog::write_identifier(&mut keys.plain, name);
+    }
+    keys.verbose = keys.plain;
+    if keys.plain.is_truncated() {
+        return PlanKeys::NONE;
+    }
+    keys
 }
 
 /// The rows of a `VALUES` list of several rows, which the parser keeps as a
@@ -3500,6 +3769,7 @@ pub(super) fn plan_set_query<'a>(
         wrapper_count as u8,
         block,
         &mut (0, 0),
+        false,
     )?;
     let mut child = root;
     for at in (0..wrapper_count).rev() {
@@ -4768,7 +5038,14 @@ fn structured_node(
         document.text("Index Name", node.bitmap_index.as_str());
     }
     if !node.relation.as_str().is_empty() {
-        document.text("Relation Name", node.relation.as_str());
+        document.text(
+            if node.name.as_str() == "Function Scan" {
+                "Function Name"
+            } else {
+                "Relation Name"
+            },
+            node.relation.as_str(),
+        );
     }
     if !node.exposed_name().is_empty() {
         document.text("Alias", node.exposed_name());
@@ -4785,6 +5062,7 @@ fn structured_node(
         document.number("Plan Rows", node.rows);
         document.number("Plan Width", node.width);
     }
+    let full_actual = actual;
     let node_actual = plan.actual(at, actual);
     match node_actual {
         NodeActual::Unmeasured => {}
@@ -4853,7 +5131,14 @@ fn structured_node(
             document.open_group("Plans", Some("Plans"), false);
         }
         let relationship = if children == 0 { "Outer" } else { "Inner" };
-        next = structured_node(document, plan, next, Some(relationship), options, None);
+        next = structured_node(
+            document,
+            plan,
+            next,
+            Some(relationship),
+            options,
+            full_actual,
+        );
         children += 1;
     }
     if children != 0 {

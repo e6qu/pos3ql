@@ -1725,14 +1725,18 @@ fn eval_set_tree<'a>(
             ..
         } => {
             let node = instrument::node(instrument::Role::SetOperation(numbers.0));
+            let input = instrument::node(instrument::Role::SetInput(numbers.0));
             numbers.0 = numbers.0.saturating_add(1);
             let _loop = node.start();
+            let input_loop = input.start();
             let l = eval_set_tree(
                 left, storage, txid, arena, params, sequences, target, collations, outer, numbers,
             )?;
             let r = eval_set_tree(
                 right, storage, txid, arena, params, sequences, target, collations, outer, numbers,
             )?;
+            input.rows((l.len() + r.len()) as u64);
+            drop(input_loop);
             let combined = combine_sets(storage, txid, collations, *operator, *all, l, r, arena)?;
             node.rows(combined.len() as u64);
             Ok(combined)

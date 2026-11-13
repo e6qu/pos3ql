@@ -95,6 +95,8 @@ pub(crate) enum Role {
     Result,
     /// The set operation at this pre-order position of its tree.
     SetOperation(u16),
+    /// The `Append` of a hashed set operation's inputs.
+    SetInput(u16),
     /// A write's target.
     Modify,
 }

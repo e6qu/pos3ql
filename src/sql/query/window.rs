@@ -1818,8 +1818,10 @@ pub(crate) fn project_window_rows<'a>(
         total += scope.stored_width(t);
     }
 
-    // Pass 1: count source rows.
+    // Pass 1: count source rows. Sizing the rows is not one of the plan's
+    // scans; the materializing pass is.
     let mut count = 0usize;
+    let sizing = instrument::suspend();
     scan_source_with_pax_columns(
         storage,
         scope,
@@ -1847,6 +1849,7 @@ pub(crate) fn project_window_rows<'a>(
             Ok(true)
         },
     )?;
+    drop(sizing);
     // Pass 2: materialize each row's columns flat in the arena.
     let empty: &[Datum] = &[];
     let rows: &mut [&[Datum]] = arena

@@ -218,6 +218,8 @@ pub(super) fn groups_for_mask<'a>(
                 .map(|ordering| ordering.then_with(|| input_position(a).cmp(&input_position(b))))
         };
         let mut at = 0u32;
+        // Keying the rows is not one of the plan's scans; the update pass is.
+        let _keying = instrument::suspend();
         scan_source_recycling_with_pax_columns(
             storage,
             scope,
@@ -331,6 +333,9 @@ pub(super) fn groups_for_mask<'a>(
             .map_err(|_| arena_full())?;
         if n_keys > 0 {
             let mut at = 0usize;
+            // Keying the rows is not one of the plan's scans; the update
+            // pass is.
+            let _keying = instrument::suspend();
             scan_source_with_pax_columns(
                 storage,
                 scope,
@@ -735,7 +740,6 @@ pub(super) fn groups_for_mask<'a>(
                 }
             }
         }
-        aggregate.row();
         let _merged_subs_binding = super::subquery::bind_correlated_row(
             hooks.subs.expect("outer subqueries prepared"),
             &group_row,
@@ -1049,9 +1053,13 @@ pub(super) fn grouped_rows<'a>(
         }
         live = crate::sql::exec::sort_dedup_projected(storage, txid, out_rows, width)?;
     }
-    // A sort under a DISTINCT returns every row it sorted.
+    // A sort under a DISTINCT returns every row it sorted, and a sort or
+    // DISTINCT reads every group.
     if stages.unique.measured() {
         stages.sort.rows(out_rows.len() as u64);
+    }
+    if stages.sort.measured() || stages.unique.measured() {
+        stages.aggregate.rows(out_rows.len() as u64);
     }
     let out_rows = &mut out_rows[..live];
 

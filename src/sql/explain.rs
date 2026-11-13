@@ -620,6 +620,8 @@ fn join_quals<'a>(
         let context = crate::sql::catalog::deparse::Context {
             storage,
             txid,
+            arena,
+            dependencies: None,
             table: Some(table),
             parameters: &[],
             joined: &joined,
@@ -639,6 +641,8 @@ fn join_quals<'a>(
     let context = crate::sql::catalog::deparse::Context {
         storage,
         txid,
+        arena,
+        dependencies: None,
         table: None,
         parameters: &[],
         joined,
@@ -694,6 +698,8 @@ fn single_relation_filter<'a>(
     let context = crate::sql::catalog::deparse::Context {
         storage,
         txid,
+        arena,
+        dependencies: None,
         table: Some(table),
         parameters: &[],
         joined: &joined,

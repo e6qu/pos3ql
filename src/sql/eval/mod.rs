@@ -25,8 +25,8 @@ mod cast;
 pub mod funcs;
 pub use cast::{cast, cast_to, fit_bits, int_to_bits};
 pub(crate) use cast::{
-    cast_to_text, parse_bytea, parse_int_bounded, parse_int_literal, parse_oid, parse_uuid,
-    validate_bits, validate_catalog_reference_cast, validate_geometry_cast,
+    cast_to_text, parse_bits_text, parse_bytea, parse_int_bounded, parse_int_literal, parse_oid,
+    parse_uuid, validate_bits, validate_catalog_reference_cast, validate_geometry_cast,
     validate_geometry_type_cast,
 };
 

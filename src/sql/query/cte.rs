@@ -101,6 +101,36 @@ pub(crate) fn expand_stored_query_exec<'a>(
     )
 }
 
+/// [`expand_stored_expression`] of one query level: subqueries keep their
+/// written names, for a caller that binds each level as it reads it.
+pub(crate) fn bind_stored_level_expression<'a>(
+    expression: &'a Expr<'a>,
+    storage: &Storage,
+    txid: u32,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    subst_expr(
+        expression,
+        Subst {
+            ctes: &[],
+            materialized: &[],
+            storage,
+            txid,
+            depth: 0,
+            path: Some(storage.path()),
+            dependencies: Some(dependencies),
+            authorization_role: None,
+            qualifier: None,
+            rule_transition: None,
+            recursive_state: None,
+            execution: None,
+            shallow: true,
+        },
+        arena,
+    )
+}
+
 pub(crate) fn expand_stored_expression<'a>(
     expression: &'a Expr<'a>,
     storage: &Storage,
@@ -123,6 +153,7 @@ pub(crate) fn expand_stored_expression<'a>(
             rule_transition: None,
             recursive_state: None,
             execution: None,
+            shallow: false,
         },
         arena,
     )
@@ -283,6 +314,7 @@ fn with_schema_context<'a, 's, R>(
             rule_transition: None,
             recursive_state: None,
             execution: None,
+            shallow: false,
         };
         let self_references = select_references(cte.query, cte.name);
         if (cte.search.is_some() || cte.cycle.is_some()) && (!cte.recursive || self_references == 0)
@@ -333,6 +365,7 @@ fn with_schema_context<'a, 's, R>(
                     rule_transition: None,
                     recursive_state: None,
                     execution: None,
+                    shallow: false,
                 };
                 visit(ScopedCte::Select(subst_select(cte.query, context, arena)?))?;
             }
@@ -362,6 +395,7 @@ fn with_schema_context<'a, 's, R>(
         rule_transition: None,
         recursive_state: None,
         execution: None,
+        shallow: false,
     };
     build(context)
 }
@@ -708,6 +742,7 @@ fn materialized_input_context<'a, 's>(
         rule_transition: None,
         recursive_state: None,
         execution: None,
+        shallow: false,
     }
 }
 
@@ -1833,6 +1868,7 @@ pub(crate) fn rule_returning_items<'a>(
         rule_transition: None,
         recursive_state: None,
         execution: None,
+        shallow: false,
     };
     let mut items: ArenaList<'a, SelectItem<'a>> = ArenaList::new(arena);
     let expand = |items: &mut ArenaList<'a, SelectItem<'a>>| -> Result<(), SqlError> {
@@ -2695,6 +2731,7 @@ pub(crate) fn filter_view_rows<'a>(
         rule_transition: None,
         recursive_state: None,
         execution: None,
+        shallow: false,
     };
     let outer_columns = crate::sql::exec::CatalogCols {
         definition: Some(definition),
@@ -3116,6 +3153,7 @@ pub fn rewrite_view_dml<'a>(
         rule_transition: None,
         recursive_state: None,
         execution: None,
+        shallow: false,
     };
     // `*` also covers the FROM items of `UPDATE ... FROM` and `DELETE ... USING`.
     let (returning, from) = match statement {
@@ -3431,6 +3469,7 @@ fn with_exec_context<'a, 's, 'e, R>(
             rule_transition: None,
             recursive_state: None,
             execution: Some(execution),
+            shallow: false,
         };
         let self_references = select_references(cte.query, cte.name);
         if (cte.search.is_some() || cte.cycle.is_some())
@@ -3552,6 +3591,7 @@ fn with_exec_context<'a, 's, 'e, R>(
         rule_transition: None,
         recursive_state: None,
         execution: Some(execution),
+        shallow: false,
     };
     build(context)
 }
@@ -3916,6 +3956,9 @@ struct Subst<'c, 'a, 's, 'e> {
     rule_transition: Option<RuleTransition<'a>>,
     recursive_state: Option<RecursiveStateSubst<'a>>,
     execution: Option<ExecutionSubst<'e, 'a>>,
+    /// Leave subqueries as they are, for a caller that binds each query
+    /// level itself (the deparser, which prints each level's own FROM).
+    shallow: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -5018,6 +5061,7 @@ fn reject_recursive_name_collision<'a>(
             rule_transition: None,
             recursive_state: None,
             execution: None,
+            shallow: false,
         },
         arena,
     )?;
@@ -5295,6 +5339,7 @@ fn append_recursive_state<'a>(
                 types: decoration.state_types,
             }),
             execution: None,
+            shallow: false,
         },
         arena,
     )?;
@@ -5968,6 +6013,7 @@ fn materialize_recursive<'a>(
             rule_transition: None,
             recursive_state: None,
             execution: outer.execution,
+            shallow: false,
         };
         let step_tree = subst_set_tree(recursive_tree, context, arena)?;
         let mut step_desc = [ColDesc::new("", 0, 0); MAX_PROJ];
@@ -6117,6 +6163,7 @@ fn materialize_recursive<'a>(
         rule_transition: None,
         recursive_state: None,
         execution: outer.execution,
+        shallow: false,
     };
     let step_tree = subst_set_tree(recursive_tree, context, arena)?;
     let mut step_desc = [ColDesc::new("", 0, 0); MAX_PROJ];
@@ -7705,6 +7752,45 @@ fn subst_expr<'a>(
         && !e.contains_subquery()
     {
         return Ok(e);
+    }
+    if context.shallow {
+        match e {
+            Expr::Subquery(_)
+            | Expr::RowSubquery { .. }
+            | Expr::ArraySubquery(_)
+            | Expr::Exists(_) => return Ok(e),
+            Expr::InSubquery {
+                operand,
+                select,
+                negated,
+            } => {
+                return arena
+                    .alloc(Expr::InSubquery {
+                        operand: subst_expr(operand, context, arena)?,
+                        select,
+                        negated: *negated,
+                    })
+                    .map(|expression| &*expression)
+                    .map_err(|_| arena_full());
+            }
+            Expr::QuantifiedSubquery {
+                operand,
+                operator,
+                select,
+                all,
+            } => {
+                return arena
+                    .alloc(Expr::QuantifiedSubquery {
+                        operand: subst_expr(operand, context, arena)?,
+                        operator: *operator,
+                        select,
+                        all: *all,
+                    })
+                    .map(|expression| &*expression)
+                    .map_err(|_| arena_full());
+            }
+            _ => {}
+        }
     }
     let rebuilt = match e {
         Expr::Subquery(s) => {

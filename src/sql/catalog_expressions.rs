@@ -554,6 +554,8 @@ pub(super) fn deparse<'a>(
                         &super::deparse::Context {
                             storage,
                             txid: transaction,
+                            arena,
+                            dependencies: None,
                             table: None,
                             parameters: &[],
                             joined: &[],
@@ -587,6 +589,8 @@ pub(super) fn deparse<'a>(
         let context = super::deparse::Context {
             storage,
             txid: transaction,
+            arena,
+            dependencies: None,
             table: table.as_deref(),
             parameters: &[],
             joined: &[],

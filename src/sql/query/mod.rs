@@ -87,8 +87,8 @@ pub(crate) use scope::unreachable_entry;
 pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 
 mod cte;
-pub(crate) use cte::captured_type_oid;
 pub(crate) use cte::{CteReader, dml_cte_runs_after, select_relations, set_query_relations};
+pub(crate) use cte::{bind_stored_level_expression, captured_type_oid};
 mod dependencies;
 mod procedural_names;
 pub(crate) use procedural_names::{
@@ -9531,6 +9531,17 @@ pub(super) fn resolve_position_target<'a>(
     txid: u32,
     clause: &str,
 ) -> Result<&'a Expr<'a>, SqlError> {
+    // `findTargetlistEntrySQL92`: any other constant is neither a position
+    // nor a useful key.
+    if matches!(
+        expression,
+        Expr::Str(_) | Expr::NumericLit(_) | Expr::Bool(_) | Expr::Null | Expr::BitLit(_)
+    ) {
+        return Err(crate::sql::error_position::at_expression(
+            sql_err!(sqlstate::SYNTAX_ERROR, "non-integer constant in {}", clause),
+            expression,
+        ));
+    }
     let Expr::Int(n) = expression else {
         return super::exec::resolve_order_expr_pub(expression, items);
     };

@@ -26,6 +26,8 @@ const STD: i32 = 8;
 const JOIN: i32 = 4;
 const VAR: i32 = 4;
 const LIMIT: i32 = 40;
+/// `record[]`, a `SEARCH DEPTH FIRST` sequence and a `CYCLE` path.
+const RECORD_ARRAY: i32 = 2287;
 /// The most items one query level's merged `USING` columns can hide.
 const MAX_LEVEL_ITEMS: usize = 64;
 
@@ -78,7 +80,7 @@ impl Output<'_> {
     }
 
     /// A buffer for one piece whose placement depends on its length.
-    fn piece(&self) -> Self {
+    pub(super) fn piece(&self) -> Self {
         Output {
             arena: self.arena,
             text: ArenaString::new(self.arena),
@@ -214,13 +216,21 @@ struct Level<'x> {
 }
 
 impl<'r> Writer<'r> {
-    fn context<'x>(&self, scope: &'x [Joined<'x>], nested: bool, own: usize) -> Context<'x>
+    fn context<'x>(
+        &self,
+        scope: &'x [Joined<'x>],
+        nested: bool,
+        own: usize,
+        arena: &'x Arena,
+    ) -> Context<'x>
     where
         'r: 'x,
     {
         Context {
             storage: self.storage,
             txid: self.txid,
+            arena,
+            dependencies: self.dependencies,
             table: None,
             parameters: &[],
             joined: scope,
@@ -229,24 +239,22 @@ impl<'r> Writer<'r> {
         }
     }
 
-    /// Binds a top-level expression's routines and types to the identities
-    /// the view captured.
+    /// Binds one query level's expression (its subqueries are bound as
+    /// their own levels) to the routines and types the view captured.
     fn bind<'x>(
         &self,
         expression: &'x Expr<'x>,
         arena: &'x Arena,
     ) -> Result<&'x Expr<'x>, SqlError> {
         match self.dependencies {
-            Some(dependencies) if !expression.contains_subquery() => {
-                crate::sql::query::bind_stored_expression(
-                    expression,
-                    self.storage,
-                    self.txid,
-                    dependencies,
-                    arena,
-                )
-            }
-            _ => Ok(expression),
+            Some(dependencies) => crate::sql::query::bind_stored_level_expression(
+                expression,
+                self.storage,
+                self.txid,
+                dependencies,
+                arena,
+            ),
+            None => Ok(expression),
         }
     }
 
@@ -263,7 +271,7 @@ impl<'r> Writer<'r> {
         let mut rows = ArenaList::new(arena);
         if values_rows(select, &mut rows)? {
             let rows = rows.as_slice();
-            let context = self.context(scope, true, 0);
+            let context = self.context(scope, true, 0, arena);
             let width = rows[0].items.len();
             let mut columns = ArenaList::new(arena);
             for column in 0..width {
@@ -295,7 +303,7 @@ impl<'r> Writer<'r> {
         let Some(level) = self.level(scope, select, true, arena)? else {
             return Ok(None);
         };
-        let context = self.context(level.scope, true, level.own);
+        let context = self.context(level.scope, true, level.own, arena);
         let mut columns = ArenaList::new(arena);
         for target in level.targets {
             columns
@@ -379,6 +387,9 @@ impl<'r> Writer<'r> {
         for item in select.items {
             match item {
                 SelectItem::Expr { expression, alias } => {
+                    // The column is named as written, before its names are
+                    // bound to their current spellings.
+                    let written = *expression;
                     let expression = if bind {
                         self.bind(expression, arena)?
                     } else {
@@ -391,7 +402,6 @@ impl<'r> Writer<'r> {
                     let case_block = matches!(
                         expression,
                         Expr::Case {
-                            operand: None,
                             origin: crate::sql::ast::CaseOrigin::Written,
                             ..
                         }
@@ -399,8 +409,7 @@ impl<'r> Writer<'r> {
                     targets
                         .push(Target {
                             expression,
-                            name: alias
-                                .unwrap_or_else(|| crate::sql::exec::derived_name(expression)),
+                            name: alias.unwrap_or_else(|| crate::sql::exec::derived_name(written)),
                             column,
                             case_block,
                         })
@@ -470,7 +479,7 @@ impl<'r> Writer<'r> {
         }
         let scope = entries.into_mut_slice().map_err(full)?;
         for (index, cte) in select.with.iter().enumerate() {
-            if cte.dml.is_some() || cte.search.is_some() || cte.cycle.is_some() {
+            if cte.dml.is_some() {
                 return Ok(None);
             }
             // A query sees the earlier queries; a recursive one, itself.
@@ -487,9 +496,50 @@ impl<'r> Writer<'r> {
                 return Ok(None);
             };
             let columns = rename(columns, cte.columns, arena)?;
-            let Some(columns) = columns else {
+            let Some(mut columns) = columns else {
                 return Ok(None);
             };
+            // `SEARCH` and `CYCLE` add their sequence, mark and path columns.
+            if cte.search.is_some() || cte.cycle.is_some() {
+                let context = self.context(visible, true, 0, arena);
+                let mut extended = ArenaList::new(arena);
+                for column in columns {
+                    extended.push(*column).map_err(full)?;
+                }
+                if let Some(search) = cte.search {
+                    extended
+                        .push(Column {
+                            name: search.sequence_column,
+                            type_oid: Some(match search.order {
+                                crate::sql::ast::CteSearchOrder::DepthFirst => RECORD_ARRAY,
+                                crate::sql::ast::CteSearchOrder::BreadthFirst => oid::RECORD,
+                            }),
+                            merged: None,
+                        })
+                        .map_err(full)?;
+                }
+                if let Some(cycle) = cte.cycle {
+                    let mark = match cycle.mark {
+                        crate::sql::ast::CteCycleMark::Boolean => oid::BOOL,
+                        crate::sql::ast::CteCycleMark::Custom { value, default } => context
+                            .type_of(value)?
+                            .or(context.type_of(default)?)
+                            .unwrap_or(oid::TEXT),
+                    };
+                    for (name, type_oid) in
+                        [(cycle.mark_column, mark), (cycle.path_column, RECORD_ARRAY)]
+                    {
+                        extended
+                            .push(Column {
+                                name,
+                                type_oid: Some(type_oid),
+                                merged: None,
+                            })
+                            .map_err(full)?;
+                    }
+                }
+                columns = extended.as_slice();
+            }
             scope[index].columns = Columns::Derived(columns);
         }
         Ok(Some(scope))
@@ -531,11 +581,11 @@ impl<'r> Writer<'r> {
         if values_rows(select, &mut rows)? {
             output.indent += STD;
             output.push(" ")?;
-            let context = self.context(around, nested, 0);
+            let context = self.context(around, nested, 0, arena);
             return values_list(&context, rows.as_slice(), output);
         }
         if select.set_body.is_none() {
-            let Some(level) = self.level(around, select, !nested, arena)? else {
+            let Some(level) = self.level(around, select, true, arena)? else {
                 return output.unsupported();
             };
             self.with_clause(&level, select, arena, output)?;
@@ -595,7 +645,7 @@ impl<'r> Writer<'r> {
                 order_direction(order, output)?;
             }
         }
-        let context = self.context(ctes, true, 0);
+        let context = self.context(ctes, true, 0, arena);
         self.limits(&context, select, output)
     }
 
@@ -657,10 +707,64 @@ impl<'r> Writer<'r> {
             )?;
             output.keyword("", 0, 0, 0)?;
             output.push(")")?;
+            self.search_cycle(level, cte, arena, output)?;
             separator = ", ";
         }
         output.indent -= STD;
         output.keyword("", 0, 0, 0)
+    }
+
+    /// A `WITH` query's `SEARCH` and `CYCLE` clauses (`get_with_clause`).
+    fn search_cycle<'x>(
+        &self,
+        level: &Level<'x>,
+        cte: &'x crate::sql::ast::Cte<'x>,
+        arena: &'x Arena,
+        output: &mut Output<'_>,
+    ) -> Result<(), SqlError>
+    where
+        'r: 'x,
+    {
+        let names = |output: &mut Output<'_>, columns: &[&str]| -> Result<(), SqlError> {
+            for (index, column) in columns.iter().enumerate() {
+                if index != 0 {
+                    output.push(", ")?;
+                }
+                push_name(output, column)?;
+            }
+            Ok(())
+        };
+        if let Some(search) = cte.search {
+            output.push(match search.order {
+                crate::sql::ast::CteSearchOrder::DepthFirst => " SEARCH DEPTH FIRST BY ",
+                crate::sql::ast::CteSearchOrder::BreadthFirst => " SEARCH BREADTH FIRST BY ",
+            })?;
+            names(output, search.columns)?;
+            output.push(" SET ")?;
+            push_name(output, search.sequence_column)?;
+        }
+        if let Some(cycle) = cte.cycle {
+            output.push(" CYCLE ")?;
+            names(output, cycle.columns)?;
+            output.push(" SET ")?;
+            push_name(output, cycle.mark_column)?;
+            if let crate::sql::ast::CteCycleMark::Custom { value, default } = cycle.mark
+                && !(matches!(value, Expr::Bool(true)) && matches!(default, Expr::Bool(false)))
+            {
+                let context = self.context(level.scope, true, 0, arena);
+                let mark = context
+                    .type_of(value)?
+                    .or(context.type_of(default)?)
+                    .unwrap_or(oid::TEXT);
+                output.push(" TO ")?;
+                context.write(value, Some(mark), output)?;
+                output.push(" DEFAULT ")?;
+                context.write(default, Some(mark), output)?;
+            }
+            output.push(" USING ")?;
+            push_name(output, cycle.path_column)?;
+        }
+        Ok(())
     }
 
     /// `get_setop_query`.
@@ -736,12 +840,13 @@ impl<'r> Writer<'r> {
                     0
                 };
                 output.keyword("", indent, 0, 0)?;
-                // A later leaf's columns take the operation's names.
+                // A later leaf's columns take the view's names, or else
+                // keep their own (`get_setop_query`'s `resultDesc`).
                 self.set_operation(
                     scope,
                     right,
                     Naming {
-                        names: Some(names),
+                        names: naming.names,
                         visible: false,
                         unknown: naming.unknown,
                     },
@@ -778,13 +883,9 @@ impl<'r> Writer<'r> {
         {
             return output.unsupported();
         }
-        let context = self.context(level.scope, nested, level.own);
+        let context = self.context(level.scope, nested, level.own, arena);
         let bind = |expression: &'x Expr<'x>| -> Result<&'x Expr<'x>, SqlError> {
-            if nested {
-                Ok(expression)
-            } else {
-                self.bind(expression, arena)
-            }
+            self.bind(expression, arena)
         };
         output.indent += STD;
         output.push(" SELECT")?;
@@ -840,10 +941,16 @@ impl<'r> Writer<'r> {
             }
             let items = items.as_slice();
             if select.grouping_sets.is_empty() {
+                // `addTargetToGroupList` keeps one entry per target.
+                let mut first = true;
                 for (index, expression) in items.iter().enumerate() {
-                    if index != 0 {
+                    if items[..index].contains(expression) {
+                        continue;
+                    }
+                    if !first {
                         output.push(", ")?;
                     }
+                    first = false;
                     sort_group(&context, expression, output)?;
                 }
             } else {
@@ -875,11 +982,25 @@ impl<'r> Writer<'r> {
         }
         if !select.order_by.is_empty() {
             output.keyword(" ORDER BY ", -STD, STD, 1)?;
-            for (index, order) in select.order_by.iter().enumerate() {
-                if index != 0 {
+            let mut keys = ArenaList::new(arena);
+            for order in select.order_by {
+                let expression = target(bind(order.expression)?, false);
+                // `addTargetToSortList` drops a repeated key and ordering.
+                if keys
+                    .as_slice()
+                    .iter()
+                    .any(|(key, earlier): &(&Expr<'_>, &OrderBy<'_>)| {
+                        *key == expression
+                            && earlier.descending == order.descending
+                            && earlier.nulls_first == order.nulls_first
+                    })
+                {
+                    continue;
+                }
+                if !keys.is_empty() {
                     output.push(", ")?;
                 }
-                let expression = target(bind(order.expression)?, false);
+                keys.push((expression, order)).map_err(full)?;
                 sort_group(&context, expression, output)?;
                 order_direction(order, output)?;
             }
@@ -1523,12 +1644,49 @@ impl<'r: 'x, 'x> Builder<'r, 'x> {
             })
             .map(|dependency| storage.resolve_stored_query_relation(dependency, txid))
             .transpose()?;
+        let arena = self.arena;
+        let alloc = |text: &str| arena.alloc_str(text).map_err(full);
+        // A system catalog or information schema relation; `pg_catalog`
+        // precedes the search path for an unqualified name.
+        let information = item.schema == Some("information_schema");
+        if captured.is_none()
+            && (information
+                || item.schema == Some("pg_catalog")
+                || (item.schema.is_none()
+                    && crate::sql::catalog::catalog_relation(item.table).is_some()))
+            && let Ok(synthesized) =
+                crate::sql::catalog::synthesize_definition(item.schema, item.table, arena)
+        {
+            let definition = synthesized.def;
+            let mut columns = ArenaList::new(arena);
+            for column in definition.columns() {
+                columns
+                    .push(Column {
+                        name: alloc(column.name.as_str())?,
+                        type_oid: Some(column.ctype.oid()),
+                        merged: None,
+                    })
+                    .map_err(full)?;
+            }
+            let schema = if information {
+                "information_schema"
+            } else {
+                "pg_catalog"
+            };
+            return Ok(Some(Relation {
+                schema,
+                name: alloc(item.table)?,
+                columns: columns.as_slice(),
+                row_type: oid::RECORD,
+                schema_visible: !information
+                    || crate::storage::SqlName::parse(schema)
+                        .is_ok_and(|name| storage.schema_is_on_path(name, txid)),
+            }));
+        }
         let resolved = match captured {
             Some(resolved) => Some(resolved),
             None => storage.resolve_relation(item.schema, item.table, txid),
         };
-        let arena = self.arena;
-        let alloc = |text: &str| arena.alloc_str(text).map_err(full);
         Ok(match resolved {
             Some(crate::storage::ResolvedRelation::Table(slot)) => {
                 let definition = storage.table_def(slot, txid);
@@ -1582,21 +1740,57 @@ impl<'r: 'x, 'x> Builder<'r, 'x> {
     /// A function in FROM whose result is one scalar column per function.
     fn function(&mut self, item: &'x TableRef<'x>) -> Result<Option<Part<'x>>, SqlError> {
         let scope = self.inner_scope()?;
-        let context = self.writer.context(scope, true, 0);
+        let context = self.writer.context(scope, true, 0, self.arena);
         let mut columns = ArenaList::new(self.arena);
         let functions: &[TableRef<'x>] = match item.rows_from {
             Some(functions) => functions,
             None => core::slice::from_ref(item),
         };
         for function in functions {
-            let call = function_call(function, self.arena)?;
+            // A record function's column definition list.
+            if let Some(definitions) = column_definitions(function) {
+                for definition in definitions {
+                    let Some((name, type_oid, _)) = column_definition(&context, definition) else {
+                        return Ok(None);
+                    };
+                    columns
+                        .push(Column {
+                            name,
+                            type_oid: Some(type_oid),
+                            merged: None,
+                        })
+                        .map_err(full)?;
+                }
+                continue;
+            }
+            let call = self
+                .writer
+                .bind(function_call(function, self.arena)?, self.arena)?;
             let type_oid = context.type_of(call)?;
-            if type_oid.is_none_or(|type_oid| {
-                type_oid == oid::RECORD
-                    || crate::storage::NamedTypeKind::from_oid(type_oid)
-                        .is_some_and(|(kind, ..)| kind == crate::storage::NamedTypeKind::Composite)
-            }) {
+            let Some(type_oid) = type_oid else {
                 return Ok(None);
+            };
+            if type_oid == oid::RECORD
+                || crate::storage::NamedTypeKind::from_oid(type_oid)
+                    .is_some_and(|(kind, ..)| kind == crate::storage::NamedTypeKind::Composite)
+                // A relation's row type.
+                || (crate::sql::types::ColType::from_oid(type_oid).is_none()
+                    && crate::storage::NamedTypeKind::from_oid(type_oid).is_none())
+            {
+                let arena = self.arena;
+                let found = context.record_fields(call, type_oid, &mut |name, field_type| {
+                    columns
+                        .push(Column {
+                            name: arena.alloc_str(name).map_err(full)?,
+                            type_oid: Some(field_type),
+                            merged: None,
+                        })
+                        .map_err(full)
+                })?;
+                if found.is_none_or(|count| count == 0) {
+                    return Ok(None);
+                }
+                continue;
             }
             let name = if item.rows_from.is_none() {
                 item.alias.unwrap_or(function.table)
@@ -1606,7 +1800,7 @@ impl<'r: 'x, 'x> Builder<'r, 'x> {
             columns
                 .push(Column {
                     name: unqualified_name(name),
-                    type_oid,
+                    type_oid: Some(type_oid),
                     merged: None,
                 })
                 .map_err(full)?;
@@ -1634,6 +1828,39 @@ impl<'r: 'x, 'x> Builder<'r, 'x> {
         };
         self.derived(item.alias, name, columns)
     }
+}
+
+/// The column definition list the parser keeps as a record function's
+/// last argument (`json_to_record(...) AS r(a int, b text)`).
+fn column_definitions<'x>(function: &TableRef<'x>) -> Option<&'x [&'x Expr<'x>]> {
+    match function.func_args?.last()? {
+        Expr::Call {
+            name: "__json_record_columns",
+            args,
+            ..
+        } => Some(args),
+        _ => None,
+    }
+}
+
+/// One column definition: its name, type and type modifier.
+fn column_definition<'x>(
+    context: &Context<'_>,
+    definition: &Expr<'x>,
+) -> Option<(&'x str, i32, i32)> {
+    let Expr::Call {
+        name: "__json_record_column",
+        args: [Expr::Str(name), Expr::Str(type_name), Expr::Int(type_mod)],
+        ..
+    } = definition
+    else {
+        return None;
+    };
+    Some((
+        name,
+        context.named_type(type_name)?,
+        i32::try_from(*type_mod).ok()?,
+    ))
 }
 
 fn unqualified_name(name: &str) -> &str {
@@ -1902,13 +2129,28 @@ impl<'r: 'x, 'c, 'x> Printer<'r, 'c, 'x> {
                         if index != 0 {
                             output.push(", ")?;
                         }
-                        let call = function_call(function, self.arena)?;
+                        let call = self
+                            .writer
+                            .bind(function_call(function, self.arena)?, self.arena)?;
                         self.context.write(call, None, output)?;
                     }
                     output.push(")")?;
                 }
                 None => {
-                    let call = function_call(item, self.arena)?;
+                    let call = self
+                        .writer
+                        .bind(function_call(item, self.arena)?, self.arena)?;
+                    let call = match (call, column_definitions(item)) {
+                        // The definition list is not an argument.
+                        (Expr::Call { args, .. }, Some(_)) => {
+                            let mut copy = *call;
+                            if let Expr::Call { args: written, .. } = &mut copy {
+                                *written = &args[..args.len() - 1];
+                            }
+                            &*self.arena.alloc(copy).map_err(full)?
+                        }
+                        _ => call,
+                    };
                     self.context.write(call, None, output)?;
                 }
             }
@@ -1917,6 +2159,23 @@ impl<'r: 'x, 'c, 'x> Printer<'r, 'c, 'x> {
             }
             output.push(" ")?;
             push_name(output, entry.printed)?;
+            if let (None, Some(definitions)) = (item.rows_from, column_definitions(item)) {
+                output.push("(")?;
+                for (index, definition) in definitions.iter().enumerate() {
+                    let Some((name, type_oid, type_mod)) =
+                        column_definition(self.context, definition)
+                    else {
+                        return output.unsupported();
+                    };
+                    if index != 0 {
+                        output.push(", ")?;
+                    }
+                    push_name(output, name)?;
+                    output.push(" ")?;
+                    self.context.type_name_mod(type_oid, type_mod, output)?;
+                }
+                return output.push(")");
+            }
             // A function's column list is always printed.
             return self.column_aliases(&entry, output);
         }
@@ -2047,35 +2306,51 @@ fn sort_group(
     expression: &Expr<'_>,
     output: &mut Output<'_>,
 ) -> Result<(), SqlError> {
-    match expression {
-        Expr::Int(_) | Expr::Str(_) | Expr::Null | Expr::NumericLit(_) | Expr::Float(_) => {
-            output.unsupported()
-        }
-        Expr::Column { .. } => context.write(expression, None, output),
-        _ => {
-            let paren = context.pretty
-                || matches!(
-                    expression,
-                    Expr::Call {
-                        kind: crate::sql::ast::CallKind::Routine,
-                        ..
-                    }
-                );
-            if paren {
-                output.push("(")?;
-            }
-            let natural = context.type_of(expression)?;
-            context.write(expression, natural, output)?;
-            if paren {
-                output.push(")")?;
-            }
-            Ok(())
-        }
+    let natural = context.type_of(expression)?;
+    sort_group_typed(context, expression, natural, output)
+}
+
+/// `get_rule_sortgroupclause` of a key coerced to `expected`: a constant
+/// always shows its type, so that it is not read back as a position.
+pub(super) fn sort_group_typed(
+    context: &Context<'_>,
+    expression: &Expr<'_>,
+    expected: Option<i32>,
+    output: &mut Output<'_>,
+) -> Result<(), SqlError> {
+    if context.is_constant(expression) {
+        return context.labeled_constant(expression, expected, output);
     }
+    let natural = context.type_of(expression)?;
+    let coerced =
+        matches!((natural, expected), (Some(natural), Some(expected)) if natural != expected);
+    if matches!(expression, Expr::Column { .. } | Expr::WholeRow(_)) && !coerced {
+        return context.write(expression, None, output);
+    }
+    let paren = context.pretty
+        || coerced
+        || matches!(
+            expression,
+            Expr::Call {
+                kind: crate::sql::ast::CallKind::Routine,
+                ..
+            }
+        );
+    if paren {
+        output.push("(")?;
+    }
+    context.write(expression, expected.or(natural), output)?;
+    if paren {
+        output.push(")")?;
+    }
+    Ok(())
 }
 
 /// `get_rule_orderby`'s direction: the default `<` ordering prints nothing.
-fn order_direction(order: &OrderBy<'_>, output: &mut Output<'_>) -> Result<(), SqlError> {
+pub(super) fn order_direction(
+    order: &OrderBy<'_>,
+    output: &mut Output<'_>,
+) -> Result<(), SqlError> {
     if order.descending {
         output.push(" DESC")?;
         if !order.nulls_first {
@@ -2210,6 +2485,26 @@ pub(super) fn window_spec(
     output.push(")")
 }
 
+/// The type of a sublink query's first output column, read under the
+/// scope of the expression that holds it.
+pub(super) fn sublink_type<'x>(
+    context: &Context<'x>,
+    select: &'x Select<'x>,
+) -> Result<Option<i32>, SqlError> {
+    let writer = Writer {
+        storage: context.storage,
+        txid: context.txid,
+        pretty: context.pretty,
+        dependencies: context.dependencies,
+        qualify: false,
+    };
+    let scope = outward(context.joined, context.arena)?;
+    Ok(writer
+        .output_columns(scope, select, context.arena)?
+        .and_then(|columns| columns.first())
+        .and_then(|column| column.type_oid))
+}
+
 /// A sublink's query (`get_sublink_expr`): printed under the scope of the
 /// expression that holds it, its columns named only by their own names.
 pub(super) fn sublink<'x>(
@@ -2222,7 +2517,7 @@ pub(super) fn sublink<'x>(
         storage: context.storage,
         txid: context.txid,
         pretty: context.pretty,
-        dependencies: None,
+        dependencies: context.dependencies,
         qualify: false,
     };
     // Expressions outside a query layout start the query at no indentation.

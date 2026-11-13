@@ -9706,7 +9706,9 @@ pub(super) const CATALOG_RELATIONS: &[&str] = &[
     "pg_wait_events",
 ];
 
-fn catalog_relation(name: &str) -> Option<crate::sql::catalog_metadata::CatalogRelation> {
+pub(crate) fn catalog_relation(
+    name: &str,
+) -> Option<crate::sql::catalog_metadata::CatalogRelation> {
     let relation = crate::sql::catalog_metadata::RELATIONS
         .iter()
         .copied()
@@ -12255,6 +12257,8 @@ fn write_statistics_keys<const N: usize>(
             &deparse::Context {
                 storage,
                 txid,
+                arena,
+                dependencies: None,
                 table: Some(table),
                 parameters: &[],
                 joined: &[],
@@ -12379,6 +12383,8 @@ pub(crate) fn extended_statistics_expressions_by_oid<'a>(
                 &deparse::Context {
                     storage,
                     txid,
+                    arena,
+                    dependencies: None,
                     table: Some(&table),
                     parameters: &[],
                     joined: &[],
@@ -15379,6 +15385,8 @@ fn write_sql_body(
     let context = deparse::Context {
         storage,
         txid,
+        arena,
+        dependencies: None,
         table: None,
         parameters: routine.parameters(),
         joined: &[],
@@ -15957,6 +15965,8 @@ pub fn trigger_def_text<'a>(
                     &deparse::Context {
                         storage,
                         txid,
+                        arena,
+                        dependencies: None,
                         table: Some(&definition),
                         parameters: &[],
                         joined: &joined,
@@ -16076,6 +16086,8 @@ fn write_routine_arguments(
             let context = deparse::Context {
                 storage,
                 txid,
+                arena,
+                dependencies: None,
                 table: None,
                 parameters: &[],
                 joined: &[],
@@ -16530,24 +16542,20 @@ pub(crate) fn view_def_text_pretty<'a>(
         let query = arena
             .alloc_str(view.sql.as_str().trim().trim_end_matches(';'))
             .map_err(|_| arena_full())?;
-        if let Ok(select) = crate::sql::parser::parse_query(query, arena)
-            && let Some(deparsed) = deparse::view_definition(
-                storage,
-                txid,
-                select,
-                None,
-                names,
-                layout,
-                crate::storage::ViewQueryOrigin::View,
-                arena,
-            )?
-        {
-            return Ok(Some(deparsed));
-        }
-        return arena
-            .alloc_str_display(format_args!("{};", view.sql.as_str()))
-            .map(Some)
-            .map_err(|_| arena_full());
+        let select = crate::sql::parser::parse_query(query, arena)
+            .map_err(|_| undeparsable_view(name.as_str()))?;
+        return deparse::view_definition(
+            storage,
+            txid,
+            select,
+            None,
+            names,
+            layout,
+            crate::storage::ViewQueryOrigin::View,
+            arena,
+        )?
+        .map(Some)
+        .ok_or_else(|| undeparsable_view(name.as_str()));
     }
     let stored = rewrite::view_definition(storage, txid, oid, arena)?;
     if stored.is_some()
@@ -16569,34 +16577,35 @@ pub(crate) fn view_def_text_pretty<'a>(
         // A transaction whose catalog snapshot predates the view's current
         // query reads its own version's text, deparsed under current names.
         let text = stored.expect("checked stored text");
+        let view_name = view.name_for(txid);
         if text.strip_suffix(';') != Some(sql) {
             let text = arena
                 .alloc_str(text.trim().trim_end_matches(';'))
                 .map_err(|_| arena_full())?;
-            if let Ok(select) = crate::sql::parser::parse_query(text, arena)
-                && let Some(deparsed) = deparse::view_definition(
-                    storage,
-                    txid,
-                    select,
-                    None,
-                    names,
-                    layout,
-                    view.options_for(txid).query_origin,
-                    arena,
-                )?
-            {
-                return Ok(Some(deparsed));
-            }
-            return Ok(stored);
+            let select = crate::sql::parser::parse_query(text, arena)
+                .map_err(|_| undeparsable_view(view_name.as_str()))?;
+            return deparse::view_definition(
+                storage,
+                txid,
+                select,
+                None,
+                names,
+                layout,
+                view.options_for(txid).query_origin,
+                arena,
+            )?
+            .map(Some)
+            .ok_or_else(|| undeparsable_view(view_name.as_str()));
         }
-        if let Ok(select) = crate::sql::query::parse_stored_query(
+        let select = crate::sql::query::parse_stored_query(
             sql,
             query.input_source.unwrap_or(sql),
             storage,
             txid,
             dependencies,
             arena,
-        ) && let Some(deparsed) = deparse::view_definition(
+        )?;
+        return deparse::view_definition(
             storage,
             txid,
             select,
@@ -16605,11 +16614,21 @@ pub(crate) fn view_def_text_pretty<'a>(
             layout,
             view.options_for(txid).query_origin,
             arena,
-        )? {
-            return Ok(Some(deparsed));
-        }
+        )?
+        .map(Some)
+        .ok_or_else(|| undeparsable_view(view_name.as_str()));
     }
     Ok(stored)
+}
+
+/// A view whose query shape the deparser cannot print. Printing its stored
+/// text instead would show names and forms PostgreSQL does not.
+fn undeparsable_view(name: &str) -> SqlError {
+    sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "deparsing the query of view \"{}\" is not supported",
+        name
+    )
 }
 
 pub fn rule_def_text<'a>(
@@ -18266,6 +18285,8 @@ pub fn constraint_def_text<'a>(
             let context = deparse::Context {
                 storage,
                 txid,
+                arena,
+                dependencies: None,
                 table: Some(&table),
                 parameters: &[],
                 joined: &[],
@@ -19111,6 +19132,8 @@ pub fn index_def_text<'a>(
                 &deparse::Context {
                     storage,
                     txid,
+                    arena,
+                    dependencies: None,
                     table: Some(&def),
                     parameters: &[],
                     joined: &[],
@@ -19183,6 +19206,8 @@ fn index_expression_display<'a>(
         &deparse::Context {
             storage,
             txid,
+            arena,
+            dependencies: None,
             table: Some(table),
             parameters: &[],
             joined: &[],

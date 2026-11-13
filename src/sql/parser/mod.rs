@@ -3088,7 +3088,7 @@ impl<'a> Parser<'a> {
         if self.eat_ident("order")? {
             self.expect_ident("by")?;
             loop {
-                let expression = self.expression(0)?;
+                let expression = self.sort_group_key("ORDER BY")?;
                 let descending = self.order_direction()?;
                 // Optional NULLS FIRST/LAST; PostgreSQL defaults NULLS LAST
                 // for ASC and NULLS FIRST for DESC.
@@ -10703,7 +10703,7 @@ impl<'a> Parser<'a> {
             let mut members = ArenaList::new(self.arena);
             if self.peeked != Tok::Op(")") {
                 loop {
-                    let expression = self.expression(0)?;
+                    let expression = self.sort_group_key("GROUP BY")?;
                     let index = self.intern_group(flat, expression)?;
                     words[index / 64] |= 1u64 << (index % 64);
                     self.push(&mut members, index as u16)?;
@@ -10715,7 +10715,7 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
             crate::sql::ast::GroupingElement::List(members.as_slice())
         } else {
-            let expression = self.expression(0)?;
+            let expression = self.sort_group_key("GROUP BY")?;
             let index = self.intern_group(flat, expression)?;
             words[index / 64] |= 1u64 << (index % 64);
             crate::sql::ast::GroupingElement::Expression(index as u16)
@@ -10980,6 +10980,28 @@ impl<'a> Parser<'a> {
 
     fn err_here(&self, message: &'static str) -> ParseError {
         ParseError::new(self.peek_at, message)
+    }
+
+    /// A statement's `ORDER BY` or `GROUP BY` key. `findTargetlistEntrySQL92`
+    /// reads an integer constant as a select-list position and rejects any
+    /// other constant.
+    fn sort_group_key(&mut self, clause: &'static str) -> Result<&'a Expr<'a>, ParseError> {
+        let at = self.peek_at;
+        let expression = self.expression(0)?;
+        if matches!(
+            expression,
+            Expr::Str(_) | Expr::NumericLit(_) | Expr::Bool(_) | Expr::Null | Expr::BitLit(_)
+        ) {
+            return Err(ParseError::new(
+                at,
+                if clause == "GROUP BY" {
+                    "non-integer constant in GROUP BY"
+                } else {
+                    "non-integer constant in ORDER BY"
+                },
+            ));
+        }
+        Ok(expression)
     }
 
     /// A CREATE FUNCTION definition error that PostgreSQL raises after

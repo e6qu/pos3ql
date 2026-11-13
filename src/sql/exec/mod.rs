@@ -1413,7 +1413,7 @@ pub(crate) use describe::{
     builtin_type_name_fixed, catalog_builtin_call_result_metadata, catalog_composite_field,
     catalog_operator_first_argument_type, catalog_routine_record_field, expand_record_call_items,
     function_lookup_error, numeric_log_type, procedure_lookup_error, resolved_set_call,
-    visit_catalog_composite_fields, visit_catalog_rowtype_fields,
+    static_meta_for_column, visit_catalog_composite_fields, visit_catalog_rowtype_fields,
 };
 pub use describe::{
     ColTypeResolver, DefCols, DescriptionTarget, NoCols, RECORD_FIELD_NAMES, check_row_field_types,

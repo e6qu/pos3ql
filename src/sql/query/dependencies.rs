@@ -1364,12 +1364,9 @@ fn collect_dml_routine_calls_with_output<'a>(
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "RETURNING dependency collection needs the explicit DML analysis boundary"
-)]
 /// Collects a data-modifying statement's expression, whose subqueries'
 /// outer references name the statement's own relations (`scope`).
+#[expect(clippy::too_many_arguments, reason = "dependency collection context")]
 fn collect_dml_expression<'a>(
     expression: &'a Expr<'a>,
     scope: Option<&super::QueryScope<'_>>,
@@ -1407,6 +1404,10 @@ fn collect_dml_expression<'a>(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "RETURNING dependency collection needs the explicit DML analysis boundary"
+)]
 fn collect_returning_expression<'a>(
     expression: &Expr<'a>,
     returning: crate::sql::ast::Returning<'a>,

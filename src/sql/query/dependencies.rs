@@ -2891,6 +2891,10 @@ pub(crate) fn dml_dependency_scope<'a>(
         .alloc(FromClause { base, joins })
         .map_err(|_| super::arena_full())?;
     let from = super::cte::expand_from_schema(from, storage, txid, arena)?;
+    if crate::sql::is_pg_settings(target) {
+        // Its rule reads the view, which no write can target directly.
+        return super::QueryScope::resolve_schema(storage, from, txid, arena, outer);
+    }
     super::QueryScope::resolve_dml_schema(storage, from, txid, arena, outer)
 }
 

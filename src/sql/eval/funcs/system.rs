@@ -1979,7 +1979,9 @@ pub(crate) fn dispatch<'a>(
                         eval_full(args[1], arena, params, row, hooks)?,
                         Datum::Bool(true)
                     );
-                match session_setting(name_value) {
+                match session_setting(name_value)
+                    .or_else(|| crate::sql::guc::active_custom_setting(name_value))
+                {
                     Some(v) => Ok(Datum::Text(
                         arena.alloc_str(v.as_str()).map_err(|_| arena_full())?,
                     )),

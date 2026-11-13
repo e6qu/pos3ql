@@ -19,3 +19,22 @@ DELETE FROM pg_settings;
 INSERT INTO pg_settings (name) VALUES ('x');
 RESET extra_float_digits;
 RESET application_name;
+-- Inside routine bodies the rule's set_config rows go nowhere and the
+-- statement reports no rows.
+DO $$ DECLARE n int; BEGIN
+  UPDATE pg_settings SET setting = '2' WHERE name = 'extra_float_digits';
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RAISE NOTICE '% %', current_setting('extra_float_digits'), n;
+END $$;
+CREATE FUNCTION settings_in_sql() RETURNS text LANGUAGE sql AS $$
+  UPDATE pg_settings SET setting = '3' WHERE name = 'extra_float_digits';
+  SELECT current_setting('extra_float_digits') $$;
+SELECT settings_in_sql();
+DO $$ BEGIN
+  EXECUTE 'UPDATE pg_settings SET setting = ''0'' WHERE name = ''extra_float_digits''';
+  RAISE NOTICE '%', current_setting('extra_float_digits');
+END $$;
+DO $$ BEGIN DELETE FROM pg_settings; END $$;
+DO $$ BEGIN INSERT INTO pg_settings (name) VALUES ('x'); END $$;
+DROP FUNCTION settings_in_sql();
+RESET extra_float_digits;

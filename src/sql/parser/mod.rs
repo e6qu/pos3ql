@@ -10016,7 +10016,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(
                         PARSE_MESSAGE_BYTES,
-                        "parameter \"{}\" requires a single value",
+                        "SET {} takes only one argument",
                         name
                     ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,

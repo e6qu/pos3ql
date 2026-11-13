@@ -572,12 +572,8 @@ SQL/JSON result types) are reported when the statement would run. In a
 `SELECT`, an unknown relation, a modifier's unknown type and an output column
 written before the failing modifier are reported first, as PostgreSQL's
 analysis order finds them; in other statements the modifier error comes first.
-Custom parameters with a dotted name (`SET myapp.tenant = '7'`,
-`current_setting('myapp.tenant')`) fail with `42704` where PostgreSQL stores
-them as placeholders. `UPDATE pg_settings` runs PostgreSQL's rule
-(`set_config` per selected row, then `UPDATE 0`) from a top-level statement
-only; inside a routine body, and for other catalog views and system
-catalogs, writes fail with `42P01`. Writing through a view whose query reads
+Writes to catalog views other than `pg_settings`, and to system catalogs,
+fail with `42P01`. Writing through a view whose query reads
 another view, or that computes a column, fails with `0A000` (`writing through
 view "v" is not supported`) where PostgreSQL writes the base relation and
 rejects only an assignment to a computed column; `MERGE` into an

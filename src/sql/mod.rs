@@ -27009,7 +27009,7 @@ impl Engine {
             Ok(value) => value,
             Err(error) => return Ok(Err(error)),
         };
-        let title = match guc::canonical_setting_name(name) {
+        let title = match guc.show_title(name) {
             Ok(title) => title,
             Err(error) => return Ok(Err(error)),
         };
@@ -27131,14 +27131,14 @@ type StatementServices<'s> = (&'s mut SqlPreparedPool, &'s mut cursor::CursorPoo
 
 /// Whether an `UPDATE` targets the built-in `pg_settings` view, which the
 /// search path always finds in `pg_catalog` first.
-fn is_pg_settings(table: ast::QualName<'_>) -> bool {
+pub(crate) fn is_pg_settings(table: ast::QualName<'_>) -> bool {
     table.name == "pg_settings" && matches!(table.schema, None | Some("pg_catalog"))
 }
 
 /// The query of `pg_settings_u` for one `UPDATE pg_settings`: the updated
 /// `setting` (or the old one) is applied to each row the `WHERE` selects
 /// whose updated `name` still equals its old one.
-fn pg_settings_rule_query<'a>(
+pub(crate) fn pg_settings_rule_query<'a>(
     update: &ast::Update<'a>,
     arena: &'a Arena,
 ) -> Result<&'a ast::Select<'a>, SqlError> {

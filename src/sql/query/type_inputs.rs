@@ -1623,6 +1623,16 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
     where
         'storage: 'a,
     {
+        match statement {
+            // `pg_settings`'s rule runs a query instead of a write.
+            Stmt::Update(update) if crate::sql::is_pg_settings(update.table) => {
+                let select = crate::sql::pg_settings_rule_query(update, self.arena)?;
+                return self.select(select, outer, None);
+            }
+            Stmt::Insert(insert) if crate::sql::is_pg_settings(insert.table) => return Ok(()),
+            Stmt::Delete(delete) if crate::sql::is_pg_settings(delete.table) => return Ok(()),
+            _ => {}
+        }
         let storage = self.storage;
         let txid = self.txid;
         let arena = self.arena;

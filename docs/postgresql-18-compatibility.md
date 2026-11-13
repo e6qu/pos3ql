@@ -877,6 +877,7 @@ why none of these numbers is a throughput rate.
 | `search_path` | 128 bytes | `22023` |
 | `application_name` after PostgreSQL's [ASCII cleaning](https://github.com/postgres/postgres/blob/REL_18_6/src/common/string.c#L81) (`\xhh` escapes) | 64 bytes | `22023`, prior value kept |
 | Connection startup option word | 256 bytes | `54000` |
+| Custom parameters (`SET myapp.tenant = '7'`) a session defines; name; value | 8; 63 bytes; 128 bytes | `54000` |
 | Timeout settings | 2,147,483,647 ms | `22023`; enabling a disabled-only timeout is `0A000` |
 | Simultaneously tracked function calls (`track_functions`) per SQL worker | 1,024 | `54000` |
 | Error message text, including a `RAISE` message | 27,824 bytes | `54000` |

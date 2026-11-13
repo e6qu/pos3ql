@@ -15100,7 +15100,9 @@ fn parameter_acl_grantor(
 }
 
 fn ensure_parameter_acl_target(parameter: crate::sql::ast::ParameterName) -> Result<(), SqlError> {
-    if crate::sql::guc::knows_parameter(parameter.as_str()) {
+    if crate::sql::guc::knows_parameter(parameter.as_str())
+        || crate::sql::guc::is_valid_custom_parameter(parameter.as_str())
+    {
         Ok(())
     } else {
         Err(sql_err!(
@@ -30171,6 +30173,40 @@ fn execute_nested_write<'a>(
         )?,
         None => statement,
     };
+    // `pg_settings` is a view over a function: its rules run `set_config`
+    // for an UPDATE, which reports no rows, and nothing else can write it.
+    match statement {
+        Stmt::Update(update) if super::is_pg_settings(update.table) => {
+            let select = super::pg_settings_rule_query(update, context.arena)?;
+            let (arena, txid) = (context.arena, context.txn.txid);
+            execute_procedural_query(context, false, None, |storage, sequence| {
+                super::query::select_into_rows(
+                    storage,
+                    txid,
+                    select,
+                    arena,
+                    arguments,
+                    None,
+                    Some(sequence),
+                    &mut |_| Ok(()),
+                )
+            })?;
+            return Ok(0);
+        }
+        Stmt::Insert(insert) if super::is_pg_settings(insert.table) => {
+            return Err(super::query::function_view_write_error(
+                "pg_settings",
+                super::query::ViewWrite::Insert,
+            ));
+        }
+        Stmt::Delete(delete) if super::is_pg_settings(delete.table) => {
+            return Err(super::query::function_view_write_error(
+                "pg_settings",
+                super::query::ViewWrite::Delete,
+            ));
+        }
+        _ => {}
+    }
     super::query::validate_dml_assignment_casts(
         statement,
         context.storage(),
@@ -32460,6 +32496,29 @@ fn rewritten_into_steps(
 
 /// The command of a routine's `INSERT`, `UPDATE` or `DELETE` whose target
 /// is a view or a table with rules for it: the engine rewrites those.
+/// `UPDATE pg_settings` in a PL/pgSQL body: the rule's query runs with
+/// the body's variables, its rows go nowhere.
+fn run_pg_settings_rule<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    update: &crate::sql::ast::Update<'a>,
+    scope: &TriggerLocalScope<'_, '_>,
+) -> Result<(), SqlError> {
+    let select = super::pg_settings_rule_query(update, context.arena)?;
+    let (arena, txid) = (context.arena, context.txn.txid);
+    execute_procedural_query(context, false, None, |storage, sequence| {
+        super::query::select_into_rows(
+            storage,
+            txid,
+            select,
+            arena,
+            crate::sql::eval::NO_PARAMS,
+            Some(scope),
+            Some(sequence),
+            &mut |_| Ok(()),
+        )
+    })
+}
+
 fn rewritten_write_target(
     storage: &Storage,
     statement: &Stmt<'_>,
@@ -37291,6 +37350,12 @@ fn execute_trigger_step_in<'a>(
                 statement: TriggerDml::Insert(statement),
                 into,
             } => execute_trigger_statement(|| {
+                if super::is_pg_settings(statement.table) {
+                    return Err(super::query::function_view_write_error(
+                        "pg_settings",
+                        super::query::ViewWrite::Insert,
+                    ));
+                }
                 if rewritten_write_target(context.storage(), &Stmt::Insert(statement), context.txn)?
                     .is_some()
                 {
@@ -37538,6 +37603,20 @@ fn execute_trigger_step_in<'a>(
                 statement: TriggerDml::Update(statement),
                 into,
             } => execute_trigger_statement(|| {
+                if super::is_pg_settings(statement.table) {
+                    let transition = records.transition(definition);
+                    let scope = TriggerLocalScope {
+                        locals,
+                        values: &local_values[..locals.len()],
+                        found: status.found,
+                        invocation,
+                        transition: &transition,
+                    };
+                    run_pg_settings_rule(context, &statement, &scope)?;
+                    status.found = Some(false);
+                    status.row_count = 0;
+                    return Ok(None);
+                }
                 if rewritten_write_target(context.storage(), &Stmt::Update(statement), context.txn)?
                     .is_some()
                 {
@@ -37738,6 +37817,12 @@ fn execute_trigger_step_in<'a>(
                 statement: TriggerDml::Delete(statement),
                 into,
             } => execute_trigger_statement(|| {
+                if super::is_pg_settings(statement.table) {
+                    return Err(super::query::function_view_write_error(
+                        "pg_settings",
+                        super::query::ViewWrite::Delete,
+                    ));
+                }
                 if rewritten_write_target(context.storage(), &Stmt::Delete(statement), context.txn)?
                     .is_some()
                 {

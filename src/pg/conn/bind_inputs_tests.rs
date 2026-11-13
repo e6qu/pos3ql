@@ -1024,8 +1024,9 @@ fn generic_bind_inputs_are_shared_and_pinned_by_old_portals_after_statement_clos
             "CREATE SEQUENCE bind_generic_checks; CREATE TYPE bind_generic_choice AS ENUM('a'); \
              CREATE DOMAIN bind_generic_checked AS bind_generic_choice CHECK(nextval('bind_generic_checks')>0); \
              CREATE FUNCTION bind_generic() RETURNS bind_generic_checked[] LANGUAGE sql AS \
-             $$SELECT '{a}'::bind_generic_checked[]$$; ALTER SEQUENCE bind_generic_checks RESTART WITH 1; BEGIN",
+             $$SELECT '{a}'::bind_generic_checked[]$$; ALTER SEQUENCE bind_generic_checks RESTART WITH 1",
         );
+        query(&mut conn, &mut engine, "BEGIN");
         parse(&mut conn, &mut engine, "SELECT bind_generic()", &[]);
         for portal in ["first", "second"] {
             assert!(has_message(

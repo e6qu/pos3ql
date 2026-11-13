@@ -13,6 +13,7 @@ fn loop_values_keep_names_types_arrays_and_null_rows_after_source_reset() {
         .alloc_slice_copy(&[RecordField {
             name: source.alloc_str("amount").unwrap(),
             type_oid: crate::sql::types::oid::INT4,
+            type_mod: -1,
             value: Datum::Null,
         }])
         .unwrap();
@@ -36,6 +37,7 @@ fn loop_values_keep_names_types_arrays_and_null_rows_after_source_reset() {
                     },
                 ],
                 empty: Datum::Record(fields),
+                width: 1,
             },
         )
         .unwrap()
@@ -95,6 +97,7 @@ fn loop_value_capacity_errors_name_the_shared_pool_and_release_reservations() {
                     "a value which cannot fit inside the sixty-four byte pool",
                 )],
                 empty: Datum::Null,
+                width: 1,
             },
         )
         .err()

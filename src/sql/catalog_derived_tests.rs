@@ -430,8 +430,12 @@ fn schema_rename_preserves_bound_sequence_literals_through_commit_and_rollback()
         CREATE VIEW bound_sequence_view AS SELECT nextval('sequence_before.ticket') AS id;
         CREATE FUNCTION bound_sequence() RETURNS bigint LANGUAGE SQL
           BEGIN ATOMIC SELECT nextval('sequence_before.ticket'); END;
-        CREATE VIEW late_sequence_view AS SELECT nextval('sequence_before.ticket'::text) AS id;
-        BEGIN; ALTER SCHEMA sequence_before RENAME TO sequence_after",
+        CREATE VIEW late_sequence_view AS SELECT nextval('sequence_before.ticket'::text) AS id",
+        true,
+    );
+    session.success(
+        &mut engine,
+        "BEGIN; ALTER SCHEMA sequence_before RENAME TO sequence_after",
         true,
     );
     assert_eq!(
@@ -1530,11 +1534,8 @@ fn catalog_snapshot_schemata_joins_selected_owner_names_and_current_permissions(
     ",
         true,
     );
-    reader.success(
-        &mut engine,
-        "SET ROLE snapshot_schema_reader; BEGIN ISOLATION LEVEL REPEATABLE READ",
-        true,
-    );
+    reader.success(&mut engine, "SET ROLE snapshot_schema_reader", true);
+    reader.success(&mut engine, "BEGIN ISOLATION LEVEL REPEATABLE READ", true);
     assert_eq!(
         data_rows(&reader.success(&mut engine, report, true)),
         [
@@ -2194,11 +2195,8 @@ fn catalog_snapshot_index_hints_follow_existing_or_private_catalog_tuples() {
                 ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(1);
             let mut observer =
                 ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
-            owner.success(
-                &mut engine,
-                "CREATE TABLE private_hint(id integer); BEGIN; SAVEPOINT hint_start",
-                true,
-            );
+            owner.success(&mut engine, "CREATE TABLE private_hint(id integer)", true);
+            owner.success(&mut engine, "BEGIN; SAVEPOINT hint_start", true);
             let query = "SELECT relhasindex FROM pg_class WHERE relname='private_hint'";
             for rolled_back in [true, false] {
                 if forked {

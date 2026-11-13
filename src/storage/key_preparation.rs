@@ -605,6 +605,7 @@ mod tests {
                 8,
                 BindingChange::IndexCreate {
                     created_at: storage.index(first).created_at,
+                    slot: first as u32,
                 },
             )
             .unwrap();
@@ -616,6 +617,7 @@ mod tests {
                 8,
                 BindingChange::IndexCreate {
                     created_at: storage.index(second).created_at,
+                    slot: second as u32,
                 },
             )
             .unwrap();
@@ -1011,6 +1013,7 @@ mod tests {
                     8,
                     BindingChange::IndexCreate {
                         created_at: storage.index(slot).created_at,
+                        slot: slot as u32,
                     },
                 )
                 .unwrap();
@@ -1058,6 +1061,7 @@ mod tests {
                     8,
                     BindingChange::IndexCreate {
                         created_at: storage.index(slot).created_at,
+                        slot: slot as u32,
                     },
                 )
                 .unwrap();
@@ -1080,6 +1084,7 @@ mod tests {
                     8,
                     BindingChange::IndexDrop {
                         created_at: storage.index(slot).created_at,
+                        slot: slot as u32,
                     },
                 )
                 .unwrap();

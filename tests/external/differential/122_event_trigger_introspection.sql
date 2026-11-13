@@ -86,3 +86,5 @@ DROP TABLE introspection_ddl_log, introspection_drop_log;
 DROP FUNCTION introspection_capture_ddl(), introspection_capture_drop();
 DROP SERVER introspection_server;
 DROP FOREIGN DATA WRAPPER introspection_wrapper;
+-- Later corpora and the exact-error phase share this reference server.
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE SELECT ON TABLES FROM PUBLIC;

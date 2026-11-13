@@ -74,6 +74,7 @@ fn real_lock_waits_resume_nested_procedural_work_without_repeating_prior_stateme
             let (program, code) = compile_plpgsql_execution(
                 SOURCE,
                 PlpgsqlProgramKind::Anonymous,
+                0,
                 &storage,
                 command.txid,
                 &original,

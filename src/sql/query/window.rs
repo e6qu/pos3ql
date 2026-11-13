@@ -188,6 +188,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         with: &[],
         set_body: None,
         locking: &[],
+        written: crate::sql::ast::WrittenQuery::PLAIN,
     };
     let inner = arena.alloc(inner).map_err(|_| arena_full())?;
 
@@ -237,7 +238,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         base: TableRef {
             schema: None,
             table: "",
-            alias: Some("?grouped"),
+            alias: Some(super::GROUPED_WINDOW_SOURCE),
             subquery: Some(inner),
             func_args: None,
             func_argument_names: &[],
@@ -279,6 +280,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         with: &[],
         set_body: None,
         locking: &[],
+        written: crate::sql::ast::WrittenQuery::PLAIN,
     };
     Ok(&*arena.alloc(outer).map_err(|_| arena_full())?)
 }
@@ -1875,7 +1877,7 @@ pub(crate) fn project_window_rows<'a>(
                 return Ok(true);
             }
             let flat = arena
-                .alloc_slice_with(total.max(1), |_| Datum::Null)
+                .alloc_slice_with(total + scope.n, |_| Datum::Null)
                 .map_err(|_| arena_full())?;
             for (t, offset) in offs.iter().enumerate().take(scope.n) {
                 let def = scope.defs.get(t).expect("resolved");
@@ -1887,8 +1889,9 @@ pub(crate) fn project_window_rows<'a>(
                         vals[c]
                     };
                 }
+                flat[total + t] = flat_table_oid(scope, row, t)?;
             }
-            rows[at] = &flat[..total];
+            rows[at] = &flat[..total + scope.n];
             at += 1;
             Ok(true)
         },
@@ -2365,11 +2368,17 @@ pub(crate) fn external_window_into<'a>(
                         eval_full(ob.expression, arena, params, row, hooks)?;
                 }
                 let row_position = position;
+                let oids = arena
+                    .alloc_slice_with(scope.n, |_| Datum::Null)
+                    .map_err(|_| arena_full())?;
+                for (t, oid) in oids.iter_mut().enumerate() {
+                    *oid = flat_table_oid(scope, row, t)?;
+                }
                 storage
                     .with_block_store(|blocks| {
                         spec_sorter.push_projected_by(
                             blocks,
-                            n_keys + total + 1,
+                            n_keys + total + scope.n + 1,
                             |index| {
                                 if index < n_keys {
                                     key_vals[index]
@@ -2387,6 +2396,8 @@ pub(crate) fn external_window_into<'a>(
                                         }
                                     }
                                     unreachable!("flat window column is in scope")
+                                } else if index < n_keys + total + scope.n {
+                                    oids[index - n_keys - total]
                                 } else {
                                     Datum::Int8(row_position)
                                 }
@@ -2518,7 +2529,7 @@ pub(crate) fn external_window_into<'a>(
                     // columns survive the reader's next advance.
                     let copied = arena.alloc_slice_copy(row).map_err(|_| arena_full())?;
                     let flat = arena
-                        .alloc_slice_with(total.max(1), |_| Datum::Null)
+                        .alloc_slice_with(total + scope.n, |_| Datum::Null)
                         .map_err(|_| arena_full())?;
                     for (f, slot) in flat.iter_mut().enumerate() {
                         *slot = crate::sql::exec::decode_projected_col_record(
@@ -2527,17 +2538,19 @@ pub(crate) fn external_window_into<'a>(
                             arena,
                         )?;
                     }
-                    rows[count] = &flat[..total];
-                    pos_of[count] =
-                        match crate::sql::exec::decode_projected_pub(copied, n_keys + total) {
-                            Datum::Int8(v) => v,
-                            _ => {
-                                return Err(sql_err!(
-                                    sqlstate::INTERNAL_ERROR,
-                                    "window partition position is corrupt"
-                                ));
-                            }
-                        };
+                    rows[count] = &flat[..total + scope.n];
+                    pos_of[count] = match crate::sql::exec::decode_projected_pub(
+                        copied,
+                        n_keys + total + scope.n,
+                    ) {
+                        Datum::Int8(v) => v,
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "window partition position is corrupt"
+                            ));
+                        }
+                    };
                     count += 1;
                     true
                 };
@@ -2970,4 +2983,18 @@ pub(crate) fn cmp_key_rows(
         }
     }
     Ok(core::cmp::Ordering::Equal)
+}
+
+/// The `tableoid` a flat window row keeps for each FROM item, after its
+/// columns: the leaf table a stored item's row came from, null otherwise.
+fn flat_table_oid<'v>(
+    scope: &QueryScope<'_>,
+    row: &super::scan::JoinRow<'_, 'v, '_>,
+    table: usize,
+) -> Result<Datum<'v>, SqlError> {
+    if scope.stores_rows(table) {
+        row.table_oid(table)
+    } else {
+        Ok(Datum::Null)
+    }
 }

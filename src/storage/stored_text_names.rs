@@ -1,8 +1,11 @@
-//! Table-level stored expressions (defaults, generated columns, CHECK and
-//! exclusion predicates, index keys and predicates, statistics expressions,
-//! trigger conditions and domain constraints) keep routine and type names as
-//! SQL text. Renaming or moving a routine or type those texts name would leave
-//! them unresolvable, so the rename is refused until they are stored bound.
+//! Stored expressions that keep routine and type names as SQL text without a
+//! captured binding (exclusion elements and predicates, statistics
+//! expressions, trigger conditions and domain constraints) would be left
+//! unresolvable by renaming or moving a routine or type they name, so the
+//! rename is refused. CHECK
+//! constraints, column defaults and generation expressions, and index keys
+//! and predicates are bound to what they name and refuse only enum label
+//! renames, whose spellings stay text.
 
 use super::{CatalogDdlState, ExtendedStatisticsKey, SqlName, Storage, current_database};
 use crate::sql::eval::{SqlError, sqlstate};
@@ -142,24 +145,33 @@ impl Storage {
                 continue;
             }
             let definition = self.table_def(slot, txid);
-            let defaults = definition
+            // CHECK constraints and column expressions are bound to the
+            // routines and types they name, so only their enum labels, which
+            // stay text, block a rename here.
+            let bound = definition
                 .columns()
                 .iter()
-                .filter_map(|column| column.default.expression().map(|text| text.as_str()));
-            let named =
-                defaults
-                    .chain(
-                        definition
-                            .checks()
-                            .iter()
-                            .map(|check| check.expression.as_str()),
-                    )
-                    .chain(definition.exclusions().iter().filter_map(|exclusion| {
-                        exclusion.predicate.as_ref().map(|text| text.as_str())
-                    }))
-                    .try_fold(false, |found, text| {
-                        Ok::<_, SqlError>(found || target.named_by(text, arena)?)
-                    })?;
+                .filter_map(|column| column.default.expression().map(|text| text.as_str()))
+                .chain(
+                    definition
+                        .checks()
+                        .iter()
+                        .map(|check| check.expression.as_str()),
+                )
+                .filter(|_| matches!(target, StoredTextName::EnumLabels { .. }));
+            let named = bound
+                .chain(definition.exclusions().iter().flat_map(|exclusion| {
+                    exclusion
+                        .elements()
+                        .filter_map(|element| match element {
+                            super::ExclusionElement::Expression(text) => Some(text),
+                            super::ExclusionElement::Column(_) => None,
+                        })
+                        .chain(exclusion.predicate.as_ref().map(|text| text.as_str()))
+                }))
+                .try_fold(false, |found, text| {
+                    Ok::<_, SqlError>(found || target.named_by(text, arena)?)
+                })?;
             if named {
                 return refuse("table", definition.name.as_str());
             }
@@ -169,6 +181,11 @@ impl Storage {
                 continue;
             };
             let index = index.definition_for(txid);
+            // Key expressions and predicates are bound like CHECK
+            // constraints; only enum labels stay text.
+            if !matches!(target, StoredTextName::EnumLabels { .. }) {
+                continue;
+            }
             for text in index
                 .expressions
                 .iter()

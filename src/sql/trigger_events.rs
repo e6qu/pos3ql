@@ -194,6 +194,8 @@ const FLAG_COLUMNS: u8 = 4;
 const KIND_AFTER_ROW: u8 = 0;
 const KIND_CONSTRAINT: u8 = 1;
 const KIND_FOREIGN_KEY: u8 = 2;
+const KIND_AFTER_STATEMENT: u8 = 3;
+const KIND_TRANSITION: u8 = 4;
 
 fn queue_full() -> SqlError {
     sql_err!(
@@ -684,6 +686,23 @@ fn encode_header(
             effective_table,
             command,
         ),
+        DeferredTriggerKind::AfterStatement {
+            effective_table,
+            trigger_depth,
+            command,
+            ..
+        } => (
+            KIND_AFTER_STATEMENT,
+            0,
+            trigger_depth,
+            effective_table,
+            command,
+        ),
+        DeferredTriggerKind::Transition {
+            effective_table,
+            trigger_depth,
+            command,
+        } => (KIND_TRANSITION, 0, trigger_depth, effective_table, command),
     };
     let columns = !event.updated_columns.is_empty();
     let flags = (u8::from(old.is_some()) * FLAG_OLD)
@@ -695,9 +714,11 @@ fn encode_header(
     put(header, &mut at, &table.to_le_bytes())?;
     put(header, &mut at, &command.to_le_bytes())?;
     match event.kind {
-        DeferredTriggerKind::AfterRow { trigger_slot, .. } => {
+        DeferredTriggerKind::AfterRow { trigger_slot, .. }
+        | DeferredTriggerKind::AfterStatement { trigger_slot, .. } => {
             put(header, &mut at, &trigger_slot.to_le_bytes())?;
         }
+        DeferredTriggerKind::Transition { .. } => {}
         DeferredTriggerKind::Constraint { identity, .. } => {
             encode_identity(identity, header, &mut at)?;
         }
@@ -738,6 +759,17 @@ fn decode_header(id: u64, header: &[u8]) -> Result<(DeferredTriggerEvent, u32, b
         },
         KIND_CONSTRAINT => DeferredTriggerKind::Constraint {
             identity: decode_identity(header, &mut at)?,
+            effective_table,
+            trigger_depth,
+            command,
+        },
+        KIND_AFTER_STATEMENT => DeferredTriggerKind::AfterStatement {
+            trigger_slot: take_u16(header, &mut at)?,
+            effective_table,
+            trigger_depth,
+            command,
+        },
+        KIND_TRANSITION => DeferredTriggerKind::Transition {
             effective_table,
             trigger_depth,
             command,
@@ -815,6 +847,51 @@ mod tests {
             old: None,
             new: None,
         }
+    }
+
+    #[test]
+    fn statement_and_transition_events_round_trip() {
+        let mut budget = Budget::new(TriggerEventQueue::budget_bytes(TRIGGER_EVENT_PAGE_BYTES, 0));
+        let mut queue = TriggerEventQueue::new(&mut budget, TRIGGER_EVENT_PAGE_BYTES, 0).unwrap();
+        let statement = DeferredTriggerEvent {
+            kind: DeferredTriggerKind::AfterStatement {
+                trigger_slot: 9,
+                effective_table: 4,
+                trigger_depth: 2,
+                command: 11,
+            },
+            event: 8,
+            updated_columns: ColumnSet::from_column(3),
+            old: None,
+            new: None,
+        };
+        let transition = DeferredTriggerEvent {
+            kind: DeferredTriggerKind::Transition {
+                effective_table: 4,
+                trigger_depth: 2,
+                command: 11,
+            },
+            event: 4,
+            updated_columns: ColumnSet::EMPTY,
+            old: None,
+            new: None,
+        };
+        let first = queue.push(&statement, None, None).unwrap();
+        let second = queue
+            .push(&transition, Some(b"old"), Some(b"newer"))
+            .unwrap();
+        let (decoded, next, fired) = queue.event(first).unwrap();
+        assert_eq!(decoded.kind, statement.kind);
+        assert_eq!(decoded.updated_columns, statement.updated_columns);
+        assert_eq!((decoded.event, next, fired), (8, second, false));
+        let (decoded, next, _) = queue.event(second).unwrap();
+        assert_eq!(decoded.kind, transition.kind);
+        assert_eq!(next, queue.end());
+        let mut old = [0u8; 3];
+        let mut new = [0u8; 5];
+        queue.tuple(decoded.old.unwrap(), &mut old).unwrap();
+        queue.tuple(decoded.new.unwrap(), &mut new).unwrap();
+        assert_eq!((&old, &new), (b"old", b"newer"));
     }
 
     #[test]

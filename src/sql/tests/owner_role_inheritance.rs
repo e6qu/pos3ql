@@ -95,8 +95,12 @@ fn foreign_owner_changes_check_wrapper_superusers_and_destination_usage() {
              ALTER FOREIGN DATA WRAPPER permission_wrapper OWNER TO postgres; \
              GRANT USAGE ON FOREIGN DATA WRAPPER permission_wrapper TO fdw_usage; \
              GRANT fdw_usage TO fdw_new WITH INHERIT TRUE, SET FALSE; \
-             SET SESSION AUTHORIZATION fdw_old; BEGIN; \
-             ALTER SERVER permission_server OWNER TO fdw_new",
+             SET SESSION AUTHORIZATION fdw_old",
+            true,
+        );
+        session.success(
+            &mut engine,
+            "BEGIN; ALTER SERVER permission_server OWNER TO fdw_new",
             true,
         );
         assert_eq!(data_rows(&session.success(&mut engine, "SELECT pg_get_userbyid(srvowner) FROM pg_foreign_server WHERE srvname='permission_server'", true)), ["fdw_new"]);

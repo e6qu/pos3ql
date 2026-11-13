@@ -17,7 +17,7 @@ fn cold_prepared_object_and_foreign_catalogs_install_or_roll_back_private_images
         std::fs::write(package.join("extension/resource_ext--1.0.sql"),
             "CREATE TABLE extension_values(id integer); SELECT pg_catalog.pg_extension_config_dump('extension_values','');").unwrap();
         let mut config = test_config(&name);
-        config.extension_control_path = package.to_string_lossy().into_owned();
+        config.extension_control_path = format!("$system:{}", package.to_string_lossy());
         config.object_store_on = true;
         config.object_store_sim = true;
         config.wal_upload = true;
@@ -28,7 +28,8 @@ fn cold_prepared_object_and_foreign_catalogs_install_or_roll_back_private_images
         config.txn_rows = 8;
         config.max_ddl_per_transaction = 32;
         config.max_prepared_transactions = 1;
-        config.max_foreign_data_wrappers = 3;
+        // The extension's own postgres_fdw wrapper takes one.
+        config.max_foreign_data_wrappers = 4;
         config.max_foreign_servers = 1;
         config.max_user_mappings = 1;
         config.work_arena_bytes = 4 << 20;
@@ -46,7 +47,8 @@ fn cold_prepared_object_and_foreign_catalogs_install_or_roll_back_private_images
         );
         session.success(
             &mut engine,
-            "CREATE FOREIGN DATA WRAPPER cycle_left HANDLER postgres_fdw_handler; \
+            "CREATE EXTENSION postgres_fdw; \
+             CREATE FOREIGN DATA WRAPPER cycle_left HANDLER postgres_fdw_handler; \
              CREATE FOREIGN DATA WRAPPER cycle_right",
             false,
         );

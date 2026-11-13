@@ -1554,6 +1554,12 @@ impl Storage {
         options: super::ViewOptions,
         transaction: u32,
     ) -> Result<ViewAlterUndo, SqlError> {
+        if !options.is_consistent() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view options do not match their reloptions order"
+            ));
+        }
         self.stage_view_metadata(target, transaction, |definition| {
             definition.options = options
         })

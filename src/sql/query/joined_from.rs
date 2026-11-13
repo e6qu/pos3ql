@@ -28,17 +28,39 @@ use super::{
 /// arena's persistent tail so per-row rewinds and later storage changes leave
 /// it intact. The encoding holds every source's columns in FROM order, then
 /// whether each source joined (an outer join's null-extended side did not),
-/// then each base-table source's row identity.
+/// then each base-table source's row identity, then each source's
+/// `tableoid` (the leaf table its row came from).
 #[derive(Clone, Copy)]
 pub(crate) struct JoinedFromRow<'a>(&'a [u8]);
 
 impl<'a> JoinedFromRow<'a> {
+    /// A joined row saved with a write's progress, as [`Self::bytes`] gave it.
+    pub(crate) fn from_bytes(bytes: &'a [u8]) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) fn bytes(self) -> &'a [u8] {
+        self.0
+    }
+
     fn encode(row: &JoinRow<'_, '_, '_>, arena: &'a Arena) -> Result<Self, SqlError> {
         let scope = row.scope;
         // Every stored column, a parenthesized join's members included.
         let columns = scope.stored_columns();
-        let width = columns + 2 * scope.n;
+        let width = columns + 3 * scope.n;
+        for table in (0..scope.n).filter(|&table| scope.stores_rows(table)) {
+            row.table_oid(table)?;
+        }
         let value = |index: usize| {
+            if index >= columns + 2 * scope.n {
+                let table = index - columns - 2 * scope.n;
+                // Checked above: a stored source's oid reads without error.
+                return if scope.stores_rows(table) {
+                    row.table_oid(table).unwrap_or(Datum::Null)
+                } else {
+                    Datum::Null
+                };
+            }
             if index >= columns + scope.n {
                 let table = index - columns - scope.n;
                 return row
@@ -77,7 +99,7 @@ impl<'a> JoinedFromRow<'a> {
     /// clause: `None` for a null-extended source.
     fn bind(self, scope: &QueryScope<'_>, arena: &'a Arena) -> Result<BoundSources<'a>, SqlError> {
         let columns = scope.stored_columns();
-        let width = columns + 2 * scope.n;
+        let width = columns + 3 * scope.n;
         let decoded = arena
             .alloc_slice_with(width, |_| Datum::Null)
             .map_err(|_| arena_full())?;
@@ -90,14 +112,32 @@ impl<'a> JoinedFromRow<'a> {
         let decoded: &'a [Datum<'a>] = decoded;
         let mut offset = 0;
         let bound = arena
-            .alloc_slice_with(scope.n, |table| {
-                let n_columns = scope.stored_width(table);
-                let values = &decoded[offset..offset + n_columns];
-                offset += n_columns;
-                matches!(decoded[columns + table], Datum::Bool(true))
-                    .then_some(BoundRow::Values(values))
-            })
+            .alloc_slice_with(scope.n, |_| None)
             .map_err(|_| arena_full())?;
+        for (table, slot) in bound.iter_mut().enumerate() {
+            let n_columns = scope.stored_width(table);
+            let start = offset;
+            offset += n_columns;
+            if !matches!(decoded[columns + table], Datum::Bool(true)) {
+                continue;
+            }
+            // A bound row's `tableoid` follows its columns.
+            let values = arena
+                .alloc_slice_with(n_columns + 1, |index| {
+                    if index < n_columns {
+                        decoded[start + index]
+                    } else {
+                        decoded[columns + 2 * scope.n + table]
+                    }
+                })
+                .map_err(|_| arena_full())?;
+            let values: &'a [Datum<'a>] = values;
+            *slot = Some(BoundRow::Values(if values[n_columns].is_null() {
+                &values[..n_columns]
+            } else {
+                values
+            }));
+        }
         let rowids = arena
             .alloc_slice_with(scope.n, |table| match decoded[columns + scope.n + table] {
                 Datum::Int8(rowid) => u64::try_from(rowid).ok(),
@@ -503,6 +543,7 @@ fn project_items<'a>(
                 .and_then(|values| values.get(column).copied())
                 .unwrap_or(Datum::Null)),
             ResolvedColumn::Merged(merged) => lookup.lookup(None, scope.merged[merged].name),
+            ResolvedColumn::TableOid(table) => row.table_oid(table),
         }
     };
     let mut width = 0;

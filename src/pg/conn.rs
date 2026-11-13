@@ -35,6 +35,8 @@ use super::wire::{self, MsgIn, WireFull};
 /// Eight maximum-size frames; a listener that falls further behind is closed
 /// rather than sent a truncated stream.
 pub const HELD_NOTIFICATION_BYTES: usize = 8 * 8192;
+/// Per-connection space for a failed COPY FROM's error context.
+pub const COPY_ERROR_CONTEXT_BYTES: usize = crate::sql::error_context::CONTEXT_BYTES;
 
 /// A responder whose output queues after the connection's overflow, so a
 /// message never overtakes earlier queued output.
@@ -127,7 +129,13 @@ fn startup_option_word(
     Ok(Some(word))
 }
 
-fn apply_startup_options(guc: &GucState, options: &str, superuser: bool) -> Result<(), SqlError> {
+/// Applies `-c name=value` startup options. `may_set` answers whether the
+/// login role may set a superuser-only parameter.
+fn apply_startup_options(
+    guc: &GucState,
+    options: &str,
+    may_set: &dyn Fn(&str) -> bool,
+) -> Result<(), SqlError> {
     let mut words = options.chars().peekable();
     while let Some(word) = startup_option_word(&mut words)? {
         let separate;
@@ -163,15 +171,27 @@ fn apply_startup_options(guc: &GucState, options: &str, superuser: bool) -> Resu
                 "startup configuration parameter name is empty"
             ));
         }
-        if name.eq_ignore_ascii_case("event_triggers") && !superuser {
-            return Err(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "permission denied to set parameter \"event_triggers\""
-            ));
-        }
-        guc.set_config(name, Some(value), false)?;
+        set_startup_parameter(guc, name, value, may_set)?;
     }
     Ok(())
+}
+
+/// Sets one startup parameter, rejecting a superuser-only one the login role
+/// may not set, as PostgreSQL does for both `options` and packet keys.
+fn set_startup_parameter(
+    guc: &GucState,
+    name: &str,
+    value: &str,
+    may_set: &dyn Fn(&str) -> bool,
+) -> Result<(), SqlError> {
+    if crate::sql::guc::requires_set_privilege(name) && !may_set(name) {
+        return Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied to set parameter \"{}\"",
+            name
+        ));
+    }
+    guc.set_config(name, Some(value), false).map(|_| ())
 }
 
 struct Prepared {
@@ -229,7 +249,7 @@ struct Portal {
     /// Buffered result messages for max_rows paging (Execute suspension).
     result: FixedBuf,
     execution: PortalExecution,
-    completion: crate::util::StackStr<64>,
+    completion: crate::util::StackStr<{ crate::pg::respond::COMMAND_TAG_MAX }>,
     returned_rows: bool,
 }
 
@@ -469,8 +489,14 @@ pub struct Conn {
     /// A COPY FROM STDIN in flight: the connection is in copy-in mode, and
     /// frontend messages are CopyData/CopyDone/CopyFail until it ends.
     copy: Option<CopyInProgress>,
+    /// A COPY FROM STDIN refused in copy-in mode: its data is discarded and
+    /// the refusal answers CopyDone or CopyFail, as PostgreSQL's does.
+    copy_refused: Option<RefusedCopy>,
     /// Staging for one COPY data row (rows split across CopyData messages).
     copy_buf: FixedBuf,
+    /// The `CONTEXT` of the error that failed the current COPY FROM, kept
+    /// until the error is reported at the end of the copy.
+    copy_error_context: FixedBuf,
     /// Rows inserted by this connection's active COPY statement. Statement
     /// transition tables retain this state across interleaved reactor turns.
     copy_transition_scratch: crate::sql::exec::CopyTransitionRows,
@@ -662,7 +688,13 @@ impl Conn {
                 config.max_tables,
             )?,
             copy: None,
+            copy_refused: None,
             copy_buf: FixedBuf::new(budget, "copy_line", config.copy_line_bytes)?,
+            copy_error_context: FixedBuf::new(
+                budget,
+                "copy_error_context",
+                COPY_ERROR_CONTEXT_BYTES,
+            )?,
             copy_transition_scratch: crate::sql::exec::CopyTransitionRows::new(
                 budget,
                 config.txn_rows,
@@ -738,6 +770,7 @@ impl Conn {
         self.replication_completion_pending = false;
         self.replication_publications.clear();
         self.copy = None;
+        self.copy_refused = None;
         self.copy_buf.clear();
         self.copy_transition_scratch.clear();
         self.phase = Phase::Startup;
@@ -765,6 +798,7 @@ impl Conn {
         self.held_notifications.clear();
         self.publication_hold = None;
         self.copy = None;
+        self.copy_refused = None;
         self.copy_buf.clear();
         self.copy_transition_scratch.clear();
         // Drop the TLS session (inside its scope, so the pool is credited)
@@ -971,15 +1005,14 @@ impl Conn {
         // The next Query starts at its first statement.
         self.resume_statement = 0;
         self.respool_statement = None;
-        let extended = self.copy.as_ref().map_or_else(
-            || {
-                !matches!(
-                    self.recv.readable().first().copied(),
-                    Some(wire::FMSG_QUERY | wire::FMSG_FUNCTION_CALL)
-                )
-            },
-            |copy| copy.extended,
-        );
+        let extended = match (&self.copy, &self.copy_refused) {
+            (Some(copy), _) => copy.extended,
+            (None, Some(refused)) => refused.extended,
+            (None, None) => !matches!(
+                self.recv.readable().first().copied(),
+                Some(wire::FMSG_QUERY | wire::FMSG_FUNCTION_CALL)
+            ),
+        };
         let parked_sync = self.recv.readable().first() == Some(&wire::FMSG_SYNC);
         // The parked Query/Execute remains at the front of `recv`. Consume
         // only that message: an extended client commonly pipelines Sync
@@ -1002,7 +1035,7 @@ impl Conn {
         crate::sql::sequence::finish_statement(self.guc.seq_session());
         self.txn.release_retained_write();
         engine.cancel_backend_wait(self.id);
-        if self.copy.take().is_some() {
+        if self.copy.take().is_some() || self.copy_refused.take().is_some() {
             engine.copy_abort(&mut self.txn, &self.guc);
             self.copy_transition_scratch.clear();
         } else if self.txn.commit_admission().is_some() {
@@ -1678,7 +1711,6 @@ impl Conn {
 
         let session_user = self.guc.session_user();
         let startup_login = engine.role_login(session_user.as_str());
-        let startup_superuser = startup_login.is_some_and(|role| role.superuser);
         self.auth_database = engine.database_login(self.database.as_str());
         if let Some(database) = self.auth_database {
             if engine.select_database(database.oid).is_err() {
@@ -1697,6 +1729,9 @@ impl Conn {
                 return Step::Close;
             }
         }
+        let may_set = |name: &str| {
+            startup_login.is_some_and(|role| engine.login_may_set_parameter(&role, name))
+        };
         let mut msg = MsgIn::new(payload);
         loop {
             let Ok(key) = msg.cstr() else {
@@ -1709,16 +1744,10 @@ impl Conn {
                 return Step::Close;
             };
             let result = match key {
-                "options" => apply_startup_options(&self.guc, value, startup_superuser),
+                "options" => apply_startup_options(&self.guc, value, &may_set),
                 "user" | "database" | "replication" => Ok(()),
                 _ if key.starts_with("_pq_.") => Ok(()),
-                _ if key.eq_ignore_ascii_case("event_triggers") && !startup_superuser => {
-                    Err(sql_err!(
-                        sqlstate::INSUFFICIENT_PRIVILEGE,
-                        "permission denied to set parameter \"event_triggers\""
-                    ))
-                }
-                _ => self.guc.set_config(key, Some(value), false).map(|_| ()),
+                _ => set_startup_parameter(&self.guc, key, value, &may_set),
             };
             if let Err(error) = result {
                 let mut responder = output(&mut self.send, &mut self.overflow);
@@ -2271,6 +2300,17 @@ impl Conn {
             return step;
         }
 
+        if let Some(refused) = &self.copy_refused {
+            engine.bind_query_connection(self.id);
+            let _deadline_scope = crate::sql::query::enter_deadline_scope();
+            self.txn.restore_statement_deadline(refused.deadline);
+            let step = self.process_refused_copy_message(engine, msg_type);
+            if !matches!(step, Step::Close) {
+                self.recv.consume(total);
+            }
+            return step;
+        }
+
         if let Some(copy) = &self.copy {
             engine.bind_query_connection(self.id);
             let _deadline_scope = crate::sql::query::enter_deadline_scope();
@@ -2683,6 +2723,13 @@ impl Conn {
                 Step::Continue
             }
             wire::FMSG_COPY_DONE => self.copy_finish(engine),
+            // PostgreSQL has already reported a failed COPY's error, so the
+            // client's CopyFail ends it without another.
+            wire::FMSG_COPY_FAIL
+                if self.copy.as_ref().is_some_and(|copy| copy.failed.is_some()) =>
+            {
+                self.copy_finish(engine)
+            }
             wire::FMSG_COPY_FAIL => {
                 let message = MsgIn::new(&self.recv.readable()[5..total])
                     .cstr()
@@ -2728,6 +2775,40 @@ impl Conn {
                     self.phase = Phase::SkipToSync;
                 }
                 let sent = if extended {
+                    sent
+                } else {
+                    sent.and_then(|()| responder.ready_for_query(self.txn.status_byte()))
+                };
+                if sent.is_err() {
+                    Step::Close
+                } else {
+                    Step::Continue
+                }
+            }
+        }
+    }
+
+    /// Frontend traffic for a refused COPY FROM STDIN: data is discarded and
+    /// the end of the copy reports the refusal.
+    fn process_refused_copy_message(&mut self, engine: &mut Engine, msg_type: u8) -> Step {
+        match msg_type {
+            wire::FMSG_COPY_DATA | wire::FMSG_SYNC | wire::FMSG_FLUSH => Step::Continue,
+            wire::FMSG_TERMINATE => Step::Close,
+            _ => {
+                let refused = self.copy_refused.take().expect("in refused copy-in mode");
+                engine.copy_abort(&mut self.txn, &self.guc);
+                self.finish_lock_wait();
+                if !self.txn.is_active() {
+                    self.cursors.on_rollback();
+                }
+                engine.finish_backend_statement(&self.txn, self.id);
+                let error = refused.refusal.error();
+                let mut responder = output(&mut self.send, &mut self.overflow);
+                let sent = responder.error(error.sqlstate, error.message.as_str());
+                if refused.extended {
+                    self.phase = Phase::SkipToSync;
+                }
+                let sent = if refused.extended {
                     sent
                 } else {
                     sent.and_then(|()| responder.ready_for_query(self.txn.status_byte()))
@@ -3041,10 +3122,12 @@ impl Conn {
                 let line = &self.copy_buf.readable()[..line_end];
                 if copy.header_pending {
                     copy.line = copy.line.saturating_add(1);
+                    let frame = crate::sql::error_context::CopyFrame::new(copy.line, false);
                     if matches!(copy.setup.fmt.header, crate::sql::ast::CopyHeader::Match)
-                        && let Err(error) = engine.copy_match_header(&copy.setup, line, &self.arena)
+                        && let Err(error) =
+                            engine.copy_match_header(&copy.setup, line, &frame, &self.arena)
                     {
-                        copy.failed = Some(error);
+                        fail_copy(copy, &mut self.copy_error_context, error);
                     }
                     copy.header_pending = false;
                 } else if copy.end_seen || copy.failed.is_some() {
@@ -3053,12 +3136,18 @@ impl Conn {
                 } else if crate::sql::copy::is_end_marker(line) {
                     copy.end_seen = true;
                 } else {
-                    copy.line = copy.line.saturating_add(1);
-                    let outcome = {
+                    copy.line = copy.line.saturating_add(1).saturating_add(if csv {
+                        crate::sql::copy::csv_quoted_newlines(line, quote, escape)
+                    } else {
+                        0
+                    });
+                    let frame = crate::sql::error_context::CopyFrame::new(copy.line, false);
+                    let (outcome, conversion) = {
                         let mut responder = output(&mut self.send, &mut self.overflow);
-                        engine.copy_row_line(
+                        let outcome = engine.copy_row_line(
                             &copy.setup,
                             line,
+                            &frame,
                             crate::sql::CopyRowContext::new(
                                 &mut self.txn,
                                 &self.guc,
@@ -3067,12 +3156,19 @@ impl Conn {
                                 &mut responder,
                                 &mut self.copy_transition_scratch,
                             ),
-                        )
+                        );
+                        (outcome, frame.conversion())
                     };
                     match outcome {
                         Ok(crate::sql::exec::CopyRowOutcome::Stored) => copy.count += 1,
                         Ok(crate::sql::exec::CopyRowOutcome::Filtered) => {}
-                        Err(error) => record_copy_input_error(&mut self.send, copy, error),
+                        Err(error) => record_copy_input_error(
+                            &mut self.send,
+                            copy,
+                            &mut self.copy_error_context,
+                            error,
+                            conversion,
+                        ),
                     }
                 }
             }
@@ -3143,12 +3239,15 @@ impl Conn {
                 BinaryFrame::Row(len) => {
                     self.arena.reset();
                     if !copy.end_seen && copy.failed.is_none() {
+                        copy.line = copy.line.saturating_add(1);
                         let row = &self.copy_buf.readable()[..len];
+                        let frame = crate::sql::error_context::CopyFrame::new(copy.line, true);
                         let outcome = {
                             let mut responder = output(&mut self.send, &mut self.overflow);
                             engine.copy_row_binary(
                                 &copy.setup,
                                 row,
+                                &frame,
                                 crate::sql::CopyRowContext::new(
                                     &mut self.txn,
                                     &self.guc,
@@ -3162,7 +3261,7 @@ impl Conn {
                         match outcome {
                             Ok(crate::sql::exec::CopyRowOutcome::Stored) => copy.count += 1,
                             Ok(crate::sql::exec::CopyRowOutcome::Filtered) => {}
-                            Err(e) => copy.failed = Some(e),
+                            Err(e) => fail_copy(copy, &mut self.copy_error_context, e),
                         }
                     }
                     self.copy_buf.consume(len);
@@ -3195,10 +3294,12 @@ impl Conn {
             let line = self.copy_buf.readable();
             if copy.header_pending {
                 copy.line = copy.line.saturating_add(1);
+                let frame = crate::sql::error_context::CopyFrame::new(copy.line, false);
                 if matches!(copy.setup.fmt.header, crate::sql::ast::CopyHeader::Match)
-                    && let Err(error) = engine.copy_match_header(&copy.setup, line, &self.arena)
+                    && let Err(error) =
+                        engine.copy_match_header(&copy.setup, line, &frame, &self.arena)
                 {
-                    copy.failed = Some(error);
+                    fail_copy(copy, &mut self.copy_error_context, error);
                 }
                 copy.header_pending = false;
             } else if !copy.end_seen
@@ -3206,11 +3307,13 @@ impl Conn {
                 && !crate::sql::copy::is_end_marker(line)
             {
                 copy.line = copy.line.saturating_add(1);
-                let outcome = {
+                let frame = crate::sql::error_context::CopyFrame::new(copy.line, false);
+                let (outcome, conversion) = {
                     let mut responder = output(&mut self.send, &mut self.overflow);
-                    engine.copy_row_line(
+                    let outcome = engine.copy_row_line(
                         &copy.setup,
                         line,
+                        &frame,
                         crate::sql::CopyRowContext::new(
                             &mut self.txn,
                             &self.guc,
@@ -3219,12 +3322,19 @@ impl Conn {
                             &mut responder,
                             &mut self.copy_transition_scratch,
                         ),
-                    )
+                    );
+                    (outcome, frame.conversion())
                 };
                 match outcome {
                     Ok(crate::sql::exec::CopyRowOutcome::Stored) => copy.count += 1,
                     Ok(crate::sql::exec::CopyRowOutcome::Filtered) => {}
-                    Err(error) => record_copy_input_error(&mut self.send, copy, error),
+                    Err(error) => record_copy_input_error(
+                        &mut self.send,
+                        copy,
+                        &mut self.copy_error_context,
+                        error,
+                        conversion,
+                    ),
                 }
             }
             self.copy_buf.clear();
@@ -3295,7 +3405,20 @@ impl Conn {
                     responder
                         .notice(
                             sqlstate::SUCCESSFUL_COMPLETION,
-                            crate::stack_format!(96, "COPY ignored {} rows", copy.ignored).as_str(),
+                            if copy.ignored == 1 {
+                                crate::stack_format!(
+                                    96,
+                                    "{} row was skipped due to data type incompatibility",
+                                    copy.ignored
+                                )
+                            } else {
+                                crate::stack_format!(
+                                    96,
+                                    "{} rows were skipped due to data type incompatibility",
+                                    copy.ignored
+                                )
+                            }
+                            .as_str(),
                         )
                         .and_then(|()| {
                             responder
@@ -3305,7 +3428,18 @@ impl Conn {
                     responder.command_complete(crate::stack_format!(32, "COPY {count}").as_str())
                 }
             }
-            Err(e) => responder.error(e.sqlstate, e.message.as_str()),
+            Err(e) => {
+                if let Ok(context) = core::str::from_utf8(self.copy_error_context.readable())
+                    && !context.is_empty()
+                {
+                    crate::sql::error_context::restore(&e, context, None);
+                }
+                self.copy_error_context.clear();
+                if let Some(diagnostic) = copy.failed_diagnostic.take() {
+                    crate::sql::eval::stash_full_diagnostic(diagnostic);
+                }
+                responder.error(e.sqlstate, e.message.as_str())
+            }
         };
         if extended && failed {
             self.phase = Phase::SkipToSync;
@@ -3794,6 +3928,7 @@ impl Conn {
                         &self.arena,
                         &self.txn,
                         Some(&self.cursors),
+                        &self.guc,
                         &mut responder,
                         self.prepared[stmt_slot].type_inputs(),
                     )
@@ -4105,6 +4240,7 @@ impl Conn {
                 &self.arena,
                 &self.txn,
                 Some(&self.cursors),
+                &self.guc,
                 &mut responder,
                 self.prepared[slot].type_inputs(),
             ) {
@@ -4279,7 +4415,9 @@ impl Conn {
                 }
             });
             if transport_failed {
-                if engine.take_pending_copy().is_some() {
+                if engine.take_pending_copy().is_some()
+                    | engine.take_pending_copy_refusal().is_some()
+                {
                     engine.copy_abort(&mut self.txn, &self.guc);
                 }
                 return Step::Close;
@@ -4371,6 +4509,7 @@ impl Conn {
                 };
             }
             let pending_copy = engine.take_pending_copy();
+            let pending_refusal = engine.take_pending_copy_refusal();
             if !matches!(
                 result,
                 Ok(crate::sql::ExtendedExecutionStatus::Blocked { .. })
@@ -4388,14 +4527,14 @@ impl Conn {
             match result {
                 Ok(crate::sql::ExtendedExecutionStatus::Complete(true)) => {
                     self.finish_lock_wait();
-                    if pending_copy.is_none() {
+                    if pending_copy.is_none() && pending_refusal.is_none() {
                         engine.finish_backend_statement(&self.txn, self.id);
                     }
                 }
                 Ok(crate::sql::ExtendedExecutionStatus::Complete(false)) => {
                     self.finish_lock_wait();
                     engine.finish_backend_statement(&self.txn, self.id);
-                    if pending_copy.is_some() {
+                    if pending_copy.is_some() || pending_refusal.is_some() {
                         engine.copy_abort(&mut self.txn, &self.guc);
                         self.copy_transition_scratch.clear();
                     }
@@ -4439,12 +4578,33 @@ impl Conn {
                     return Step::Parked;
                 }
                 Err(WireFull) => {
-                    if pending_copy.is_some() {
+                    if pending_copy.is_some() || pending_refusal.is_some() {
                         engine.copy_abort(&mut self.txn, &self.guc);
                         self.copy_transition_scratch.clear();
                     }
                     return Step::Close;
                 }
+            }
+            if let Some((refusal, deadline)) = pending_refusal {
+                if paged {
+                    let portal = &mut self.portals[portal_slot];
+                    let bytes_ok =
+                        spooled_output(&mut self.send, &mut self.overflow, engine.result_spool())
+                            .raw(portal.result.readable())
+                            .is_ok();
+                    portal.result.clear();
+                    if !bytes_ok {
+                        engine.copy_abort(&mut self.txn, &self.guc);
+                        return Step::Close;
+                    }
+                }
+                self.copy_refused = Some(RefusedCopy {
+                    refusal,
+                    deadline,
+                    extended: true,
+                });
+                self.copy_buf.clear();
+                return Step::Continue;
             }
             if let Some((setup, deadline)) = pending_copy {
                 if paged {
@@ -4463,6 +4623,7 @@ impl Conn {
                 let header_pending = !matches!(setup.fmt.header, crate::sql::ast::CopyHeader::None);
                 let binary_header_pending = setup.fmt.binary;
                 self.copy_transition_scratch.clear();
+                self.copy_error_context.clear();
                 self.copy = Some(CopyInProgress {
                     setup,
                     deadline,
@@ -4470,6 +4631,7 @@ impl Conn {
                     ignored: 0,
                     line: 0,
                     failed: None,
+                    failed_diagnostic: None,
                     end_seen: false,
                     header_pending,
                     binary_header_pending,
@@ -4711,11 +4873,22 @@ impl Conn {
                 // A COPY FROM STDIN holds its query cycle open: the
                 // connection enters copy-in mode and ReadyForQuery waits
                 // for CopyDone.
+                if let Some((refusal, deadline)) = engine.take_pending_copy_refusal() {
+                    self.copy_refused = Some(RefusedCopy {
+                        refusal,
+                        deadline,
+                        extended: false,
+                    });
+                    self.copy_buf.clear();
+                    self.recv.consume(total);
+                    return Step::Continue;
+                }
                 if let Some((setup, deadline)) = engine.take_pending_copy() {
                     let header_pending =
                         !matches!(setup.fmt.header, crate::sql::ast::CopyHeader::None);
                     let binary_header_pending = setup.fmt.binary;
                     self.copy_transition_scratch.clear();
+                    self.copy_error_context.clear();
                     self.copy = Some(CopyInProgress {
                         setup,
                         deadline,
@@ -4723,6 +4896,7 @@ impl Conn {
                         ignored: 0,
                         line: 0,
                         failed: None,
+                        failed_diagnostic: None,
                         end_seen: false,
                         header_pending,
                         binary_header_pending,
@@ -4765,7 +4939,9 @@ impl Conn {
                 // Even the private output reserve is full: end the statement
                 // with an explicit error after the queued output.
                 self.sqlprep.clear_request_type_inputs();
-                if engine.take_pending_copy().is_some() {
+                if engine.take_pending_copy().is_some()
+                    | engine.take_pending_copy_refusal().is_some()
+                {
                     engine.copy_abort(&mut self.txn, &self.guc);
                     self.copy_transition_scratch.clear();
                 }
@@ -5021,7 +5197,7 @@ impl Conn {
         let Some(stream) = self.result_streams.active_mut() else {
             return Some(self.finish_failed_query_stream(engine, total));
         };
-        let (step, transport_failed) = {
+        let (step, transport_failed, held) = {
             let writer = match (stream_early, self.tls.as_mut(), self.stream.as_mut()) {
                 (false, _, _) | (true, _, None) => ClientWriter::None,
                 (true, Some(session), Some(socket)) => ClientWriter::Tls { session, socket },
@@ -5032,6 +5208,9 @@ impl Conn {
                     .for_stream()
                     .guard_publication(engine.publication_required()),
             );
+            // The statement's tag waits for the Query's later statements or
+            // its commit, like any other simple-query statement's.
+            responder.hold_command_complete();
             let step = engine.continue_result_stream(
                 stream,
                 &mut self.arena,
@@ -5043,7 +5222,11 @@ impl Conn {
                 self.id,
                 lock_timeout_expired,
             );
-            (step, responder.transport_failed())
+            (
+                step,
+                responder.transport_failed(),
+                responder.take_held_command_complete(),
+            )
         };
         if transport_failed {
             return Some(Step::Close);
@@ -5051,6 +5234,7 @@ impl Conn {
         match step {
             Err(WireFull) => Some(Step::Close),
             Ok(crate::sql::StreamStep::Complete) => {
+                self.txn.held_command_complete = held.map(|tag| (statement, tag));
                 self.resume_statement = statement + 1;
                 None
             }
@@ -6430,6 +6614,12 @@ enum Step {
 /// The connection half of a COPY FROM STDIN: the engine's setup, the rows
 /// stored so far, the first error (data after it drains unparsed, as
 /// PostgreSQL does), and whether the classic `\.` end marker was seen.
+struct RefusedCopy {
+    refusal: crate::sql::exec::CopyRefusal,
+    deadline: i64,
+    extended: bool,
+}
+
 struct CopyInProgress {
     setup: crate::sql::exec::CopySetup,
     deadline: i64,
@@ -6437,6 +6627,8 @@ struct CopyInProgress {
     ignored: u64,
     line: u64,
     failed: Option<crate::sql::eval::SqlError>,
+    /// `failed`'s DETAIL and HINT, kept until it is reported.
+    failed_diagnostic: Option<crate::sql::eval::Diagnostic>,
     end_seen: bool,
     /// CSV/text HEADER: the first data line is column names to skip, not a row.
     header_pending: bool,
@@ -6447,47 +6639,70 @@ struct CopyInProgress {
     extended: bool,
 }
 
-fn record_copy_input_error(send: &mut FixedBuf, copy: &mut CopyInProgress, error: SqlError) {
-    if !matches!(
-        copy.setup.on_error,
-        crate::sql::ast::CopyErrorAction::Ignore
-    ) || !crate::sql::exec::copy_ignorable_error(&error)
-    {
-        copy.failed = Some(error);
+/// Fails the COPY with `error`, keeping its context for the report at the
+/// end of the copy: the worker-local context snapshot does not outlive the
+/// input message that raised it.
+fn fail_copy(copy: &mut CopyInProgress, context: &mut FixedBuf, error: SqlError) {
+    context.clear();
+    crate::sql::error_context::take(&error, |reported| {
+        if let Some(reported) = reported {
+            // The capture bounds a context to the buffer's size.
+            let _ = context.append(reported.context.as_bytes());
+        }
+    });
+    copy.failed_diagnostic = crate::sql::eval::take_diagnostic();
+    copy.failed = Some(error);
+}
+
+/// A row error. With `ON_ERROR ignore`, an input conversion error skips the
+/// row, as `NextCopyFrom`'s soft errors do; every other error fails the copy.
+fn record_copy_input_error(
+    send: &mut FixedBuf,
+    copy: &mut CopyInProgress,
+    context: &mut FixedBuf,
+    error: SqlError,
+    conversion: Option<crate::sql::error_context::CopyConversion>,
+) {
+    let (true, Some(conversion)) = (
+        matches!(
+            copy.setup.on_error,
+            crate::sql::ast::CopyErrorAction::Ignore
+        ),
+        conversion,
+    ) else {
+        fail_copy(copy, context, error);
         return;
-    }
+    };
+    // The skipped error is not reported.
+    crate::sql::error_context::take(&error, |_| ());
+    let _ = crate::sql::eval::take_diagnostic();
     copy.ignored = copy.ignored.saturating_add(1);
     if matches!(
         copy.setup.log_verbosity,
         crate::sql::ast::CopyLogVerbosity::Verbose
-    ) {
-        let mut responder = Responder::new(send);
-        if responder
-            .notice(
-                error.sqlstate,
-                crate::stack_format!(
-                    192,
-                    "COPY ignored row {}: {}",
-                    copy.line,
-                    error.message.as_str()
-                )
-                .as_str(),
-            )
-            .is_err()
-        {
-            copy.failed = Some(crate::sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "COPY verbose diagnostics exceed the send buffer"
-            ));
-            return;
-        }
+    ) && Responder::new(send)
+        .notice(
+            sqlstate::SUCCESSFUL_COMPLETION,
+            conversion.skipped_notice().as_str(),
+        )
+        .is_err()
+    {
+        copy.failed = Some(crate::sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "COPY verbose diagnostics exceed the send buffer"
+        ));
+        return;
     }
     if let Some(limit) = copy.setup.reject_limit
         && copy.ignored > limit
     {
+        // Raised while the skipped row's column is still current.
+        context.clear();
+        let _ = context.append(conversion.context().as_str().as_bytes());
+        copy.failed_diagnostic = None;
         copy.failed = Some(crate::sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "COPY rejected more than {} rows",
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "skipped more than REJECT_LIMIT ({}) rows due to data type incompatibility",
             limit
         ));
     }
@@ -6514,7 +6729,10 @@ fn command_completion_in(mut bytes: &[u8]) -> Option<&str> {
     None
 }
 
-fn command_tag_rows(tag: &str, rows: u64) -> crate::util::StackStr<64> {
+fn command_tag_rows(
+    tag: &str,
+    rows: u64,
+) -> crate::util::StackStr<{ crate::pg::respond::COMMAND_TAG_MAX }> {
     use core::fmt::Write as _;
 
     let Some((prefix, count)) = tag.rsplit_once(' ') else {
@@ -6900,6 +7118,17 @@ mod tests {
         message.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
         message.extend_from_slice(payload);
         message
+    }
+
+    /// The type bytes of the backend messages in `bytes`.
+    fn backend_kinds(mut bytes: &[u8]) -> Vec<u8> {
+        let mut kinds = Vec::new();
+        while bytes.len() >= 5 {
+            kinds.push(bytes[0]);
+            let length = i32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
+            bytes = &bytes[1 + length..];
+        }
+        kinds
     }
 
     fn has_backend_message(mut bytes: &[u8], kind: u8) -> bool {
@@ -8008,7 +8237,11 @@ mod tests {
                 let sql = format!("INSERT INTO atomic_commit_rows VALUES ({id})");
                 match protocol {
                     0 => {
-                        query(&mut conn, &mut engine, &sql, failed);
+                        // PostgreSQL commits before the last statement's
+                        // tag, so a failed commit reports no tag.
+                        let output = query(&mut conn, &mut engine, &sql, failed);
+                        let expected: &[u8] = if failed { b"EZ" } else { b"CZ" };
+                        assert_eq!(backend_kinds(&output), expected);
                     }
                     1 => {
                         let mut parse = vec![0];
@@ -8016,7 +8249,10 @@ mod tests {
                         parse.extend_from_slice(&[0, 0, 0]);
                         message(&mut conn, &mut engine, wire::FMSG_PARSE, &parse, false);
                         message(&mut conn, &mut engine, wire::FMSG_BIND, &[0; 8], false);
-                        message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], false);
+                        let executed =
+                            message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], false);
+                        // Execute reports its tag; Sync commits afterwards.
+                        assert_eq!(backend_kinds(&executed), b"C");
                         let output = message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], failed);
                         assert!(output.ends_with(b"Z\0\0\0\x05I"));
                     }
@@ -8052,19 +8288,37 @@ mod tests {
                 assert_eq!(first_value(&output), expected);
             }
         }
-        query(
+        // Only the last statement's tag waits for the commit.
+        let output = query(
+            &mut conn,
+            &mut engine,
+            "INSERT INTO atomic_commit_rows VALUES (3); INSERT INTO atomic_commit_rows VALUES (-3)",
+            true,
+        );
+        assert_eq!(backend_kinds(&output), b"CEZ");
+        let output = query(
+            &mut conn,
+            &mut engine,
+            "INSERT INTO atomic_commit_rows VALUES (-4); SELECT 1",
+            true,
+        );
+        assert_eq!(backend_kinds(&output), b"CTDEZ");
+        // BEGIN makes the Query's implicit transaction explicit, so ROLLBACK
+        // also erases the statement before it.
+        let output = query(
             &mut conn,
             &mut engine,
             "INSERT INTO atomic_commit_rows VALUES (3); BEGIN; ROLLBACK",
             false,
         );
+        assert_eq!(backend_kinds(&output), b"CCCZ");
         let output = query(
             &mut conn,
             &mut engine,
             "SELECT count(*) FROM atomic_commit_audit",
             false,
         );
-        assert_eq!(first_value(&output), "7");
+        assert_eq!(first_value(&output), "6");
     }
 
     #[test]
@@ -10584,12 +10838,20 @@ mod tests {
     #[test]
     fn startup_event_trigger_escape_hatch_is_superuser_only() {
         let guc = GucState::new();
-        let error = apply_startup_options(&guc, "-c event_triggers=off", false)
-            .expect_err("ordinary roles cannot disable login event triggers");
+        for name in ["event_triggers", "session_replication_role"] {
+            let error = set_startup_parameter(&guc, name, "off", &|_| false)
+                .expect_err("ordinary roles cannot set superuser-only parameters");
+            assert_eq!(error.sqlstate, sqlstate::INSUFFICIENT_PRIVILEGE);
+        }
+        let error = apply_startup_options(&guc, "-c session_replication_role=replica", &|_| false)
+            .expect_err("ordinary roles cannot skip triggers");
         assert_eq!(error.sqlstate, sqlstate::INSUFFICIENT_PRIVILEGE);
-        apply_startup_options(&guc, "-c event_triggers=off", true)
+        apply_startup_options(&guc, "-c event_triggers=off", &|_| true)
             .expect("a superuser may disable login event triggers");
         assert!(!guc.event_triggers());
+        apply_startup_options(&guc, "-c session_replication_role=replica", &|_| true)
+            .expect("a superuser may load as a replica");
+        assert!(guc.session_replication_role().is_replica());
     }
 
     #[test]
@@ -10761,10 +11023,10 @@ mod tests {
         let guc = GucState::new();
         let oversized = format!("-c application_name={}", "x".repeat(257));
         crate::mem::guard::forbid_alloc(|| {
-            let error =
-                apply_startup_options(&guc, "-c application_name='one two'", true).unwrap_err();
+            let error = apply_startup_options(&guc, "-c application_name='one two'", &|_| true)
+                .unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::SYNTAX_ERROR);
-            let error = apply_startup_options(&guc, &oversized, true).unwrap_err();
+            let error = apply_startup_options(&guc, &oversized, &|_| true).unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         });
     }
@@ -11999,7 +12261,16 @@ mod tests {
                 assert!(conn.txn.commit_admission().is_none());
                 assert_eq!(count(conn.send.readable(), wire::MSG_ROW_DESCRIPTION), 1);
                 assert_eq!(count(conn.send.readable(), wire::MSG_DATA_ROW), 1);
-                assert_eq!(count(conn.send.readable(), wire::MSG_COMMAND_COMPLETE), 2);
+                // A simple Query reports its last tag only after the commit
+                // succeeds; each Execute reports its own before Sync commits.
+                assert_eq!(
+                    count(conn.send.readable(), wire::MSG_COMMAND_COMPLETE),
+                    if extended || outcome == "resume" {
+                        2
+                    } else {
+                        1
+                    }
+                );
                 assert_eq!(count(conn.send.readable(), wire::MSG_READY_FOR_QUERY), 1);
                 assert_eq!(
                     has_backend_message(conn.send.readable(), wire::MSG_ERROR_RESPONSE),

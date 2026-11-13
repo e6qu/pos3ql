@@ -52,8 +52,17 @@ first renumbers every row and then repoints each child, and an `AFTER DELETE`
 trigger on `orders` already sees the cascaded `lines` gone. These actions are
 never deferred, even for a `DEFERRABLE` key. A `SET DEFAULT` whose default is
 the deleted key fails like `NO ACTION` (`23503`, `Key (...) is still
-referenced`). The rewritten rows do not yet fire the referencing table's
-triggers or rules ([plan](../PLAN.md#pause-and-resume-every-query-path)).
+referenced`). Each action runs PostgreSQL's own query on the referencing
+table, such as `DELETE FROM ONLY "public"."lines" WHERE $1
+OPERATOR(pg_catalog.=) "order_id"`, as that table's owner: its rules rewrite
+it, its `BEFORE` triggers fire (a `BEFORE DELETE` trigger returning `NULL`
+keeps the row), and an error inside it names that query in `CONTEXT`. Its
+`AFTER` triggers fire after the statement's own, and an `AFTER STATEMENT`
+trigger of `lines` fires once with every cascaded row in its transition
+table. A rule that leaves no `DELETE` to report the result (`DO INSTEAD
+NOTHING`) fails the action with `XX000`, as in PostgreSQL. `ON DELETE SET
+NULL (owner)` and `SET DEFAULT (owner)` change only the listed columns of the
+key (shown in `pg_constraint.confdelsetcols`).
 
 **Foreign keys between different types.** A referencing column may have a
 different type than the key it references whenever PostgreSQL 18 accepts the
@@ -68,9 +77,13 @@ large for an `integer` referencing column fails with `22003`. Other pairs fail
 with PostgreSQL's `42804` (`foreign key constraint "orders_customer_fkey"
 cannot be implemented`, with a `DETAIL` naming both types), also when
 `ALTER COLUMN ... TYPE` would leave a key in that state. `pg_constraint`
-reports the chosen operators in `conpfeqop`, `conppeqop` and `conffeqop`. Two
-different composite types, which PostgreSQL compares field by field, and keys
-that need a user-defined implicit cast fail with `0A000`.
+reports the chosen operators in `conpfeqop`, `conppeqop` and `conffeqop`. A
+column of one composite type may reference a key of another: the values
+compare field by field, as `(1,'x')::pair = (1,'x')::other_pair` does in SQL,
+where two NULL fields are equal and fields of different types fail with
+`42804` (`cannot compare dissimilar column types integer and bigint at record
+column 1`) when the check reaches them. Keys that need a user-defined implicit
+cast fail with `0A000`.
 
 **Foreign keys and concurrent writers.** Inserting or updating a row that
 references another table locks the referenced (parent) row `FOR KEY SHARE`, as
@@ -121,6 +134,17 @@ partition first; retry the statement to update it in its new partition. A foreig
 key check that waited for its parent row fails the same way under `READ
 COMMITTED`. The move is recorded in the journal, so a prepared transaction's
 move still fails waiting statements after a restart.
+
+A partitioned or inherited table with foreign children reads their remote
+rows with its local ones, and `UPDATE` and `DELETE` change them there too: in
+`orders` partitioned with a foreign partition `orders_archive`, `SELECT *
+FROM orders` returns both partitions' rows. `MERGE` into such a table fails
+with PostgreSQL's `0A000` (`cannot execute MERGE on relation
+"orders_archive"`). Without `ORDER BY`, such a read and a write's
+`RETURNING` rows follow PostgreSQL's order: partitions in bound order (the
+default partition last, a list partition holding only `NULL` after the other
+list partitions, hash partitions by modulus and remainder), and an inherited
+table's children level by level in creation order.
 
 Under `READ COMMITTED`, `SELECT ... FOR UPDATE` returns the locked row's latest
 version: the join conditions, `WHERE` and output list run again over it, while
@@ -467,7 +491,8 @@ option, scrolling follows PostgreSQL's plan for the query, as
 [described above](#cursors-that-read-as-you-fetch).
 
 A cursor over a join of tables, `VALUES` lists and retained set-returning
-functions (inner, cross or `LEFT`, with a non-volatile condition) also reads
+functions (inner, cross or `LEFT`, or a `RIGHT` or `FULL` join of two
+items, with a non-volatile condition) also reads
 as it fetches, as a nested loop or, for a two-table equality join, a hash
 join whose build table is read into `plan_build_bytes` at `DECLARE` (a table
 that does not fit makes the cursor save its rows at `DECLARE` instead):
@@ -755,12 +780,14 @@ and types; a column written without the view column's type modifier
 (`numeric` for `numeric(5,2)`) keeps the view's declared type, as in
 PostgreSQL. `pg_get_ruledef` and `pg_rules` print a rule as PostgreSQL
 deparses it, in both formatting modes, when its condition is an expression
-over `OLD`, `NEW` and constants and each action is `NOTIFY`, a `SELECT`, or
-an `INSERT ... VALUES` (one or more rows), `INSERT ... SELECT`, `UPDATE ...
-SET ... [FROM t] WHERE` or `DELETE ... [USING t] WHERE`, each with an optional
-`RETURNING` list and reading at most one table besides its target (for
-example `DO INSTEAD ( UPDATE log SET b = new.b WHERE (log.a = old.a); ...)`);
-`_RETURN` rules print their query as `pg_get_viewdef` does. Other rules
+over `OLD`, `NEW` and constants and each action is `NOTIFY`, a query, or an
+`INSERT ... VALUES` (one or more rows), `INSERT ... SELECT`, `UPDATE ... SET
+... [FROM ...] WHERE` or `DELETE ... [USING ...] WHERE`, each with an optional
+`RETURNING` list. Their queries may read subqueries, functions, joins, set
+operations, `WITH` queries and `VALUES` lists, printed as `pg_get_viewdef`
+prints them (for example `DO INSTEAD ( UPDATE log SET b = new.b WHERE (log.a =
+old.a); ...)`); `_RETURN` rules print their query as `pg_get_viewdef` does.
+Other rules
 return their saved SQL, and their pretty form fails with `0A000`. A missing
 rule returns NULL.
 

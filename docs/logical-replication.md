@@ -82,13 +82,25 @@ Workers use their own session settings and an empty `search_path`, as in
 PostgreSQL. Schema-qualify tables inside replica-enabled trigger functions, for
 example `INSERT INTO public.order_audit ...`.
 
+Workers run with `session_replication_role = replica`, as PostgreSQL's do.
+Only triggers enabled with `ALTER TABLE ... ENABLE REPLICA TRIGGER` or `ENABLE
+ALWAYS TRIGGER` fire; ordinary triggers do not. Foreign keys are enforced by
+ordinary (ORIGIN) internal triggers, so the subscriber neither checks nor runs
+their actions.
+
+**User example:** the publisher sends an `order_lines` row before its `orders`
+row, or deletes an order whose lines a subscriber-only foreign key would
+cascade. The subscriber stores the line as sent and deletes only the order,
+exactly as the publisher's changes say. Rewrite rules never apply to
+replicated rows, whatever their firing mode.
+
 Target tables:
 
 - Ordinary and partitioned tables are accepted. A view, materialized view,
   foreign table or other relation kind returns `42809`.
 - Columns may be in a different order than on the publisher.
-- Initial COPY and later changes run row triggers and compute stored generated
-  columns using the actual local partition's definition.
+- Initial COPY and later changes run replica-enabled row triggers and compute
+  stored generated columns using the actual local partition's definition.
 - A replicated TRUNCATE of a partitioned table clears its partitions; ordinary
   inheritance children are not included.
 - An interrupted apply rolls back the whole local change without advancing its
@@ -163,6 +175,9 @@ Tests:
 - The external suite uses PostgreSQL 18's own subscriber worker and
   `pg_recvlogical`. One PostgreSQL publisher feeds both PostgreSQL and pos3ql
   subscribers, checking expected rows and trigger events after initial COPY,
-  later changes and moves between reordered partitions.
+  later changes and moves between reordered partitions. PostgreSQL and pos3ql
+  publishers each feed both subscribers orphan rows and parent deletes under
+  subscriber-only foreign keys, with ORIGIN, REPLICA, ALWAYS and disabled
+  triggers and an ALWAYS rule.
 - Raw-wire tests assert exact frames for options, logical-message order and
   binary content, keepalives, feedback and rejection paths.

@@ -997,7 +997,7 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
   else
   SUB_PG_SOCK=$(mktemp -d /tmp/pos3ql-subscription-pgsock.XXXX)
   if ! "$SUB_PGBIN/pg_ctl" -D "$WORK/subscription-pgdata" \
-    -o "-p $SUB_PG_PORT -k $SUB_PG_SOCK -c listen_addresses=127.0.0.1 -c wal_level=logical -c max_replication_slots=4 -c max_wal_senders=4 -c debug_logical_replication_streaming=immediate" \
+    -o "-p $SUB_PG_PORT -k $SUB_PG_SOCK -c listen_addresses=127.0.0.1 -c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8 -c debug_logical_replication_streaming=immediate" \
     -l "$WORK/subscription-pg.log" start >/dev/null; then
     bad "logical subscription publisher start"
     tail -20 "$WORK/subscription-pg.log"
@@ -1272,7 +1272,7 @@ result_stream_slots = 2
 index_statistics_slots = 4096
 trigger_event_spill_bytes = 64MiB
 max_value_indexes = 16
-max_replication_slots = 4
+max_replication_slots = 8
 work_arena_bytes = 16MiB
 EOF
 start_pos3ql "$WORK/subscription-pos3ql.conf" "$WORK/subscription-pos3ql.log" "$SUB_POS3QL_PORT"
@@ -1560,6 +1560,29 @@ if [[ "$PG_SUBSCRIBER_AVAILABLE" == true && "$SUB_PG_STARTED" == true ]]; then
     bad "reordered partition subscriber comparison"
     postgresql_subscriber_log
     tail -80 "$WORK/subscription-pos3ql.log"
+  fi
+fi
+if [[ "$PG_SUBSCRIBER_AVAILABLE" == true && "$SUB_PG_STARTED" == true ]]; then
+  step "replica-role apply compared with PostgreSQL 18"
+  if ensure_psycopg_venv && "$VENV/bin/python" "$EXT/subscription_replica_role_diff.py" \
+    --publisher "$SUB_PG_PORT" --control "$SUBSCRIBER_PG_PORT" --candidate "$SUB_POS3QL_PORT"; then
+    ok "PostgreSQL-published orphans, skipped foreign key actions and replica triggers match PostgreSQL"
+  else
+    bad "PostgreSQL-published replica-role apply comparison"
+    postgresql_subscriber_log
+    tail -80 "$WORK/subscription-pos3ql.log"
+  fi
+fi
+if [[ "$PG_SUBSCRIBER_AVAILABLE" == true ]]; then
+  step "replica-role apply from a pos3ql publisher compared with PostgreSQL 18"
+  if ensure_psycopg_venv && "$VENV/bin/python" "$EXT/subscription_replica_role_diff.py" \
+    --publisher "$SUB_POS3QL_PORT" --control "$SUBSCRIBER_PG_PORT" --candidate "$PG_PORT"; then
+    ok "pos3ql-published orphans, skipped foreign key actions and replica triggers match PostgreSQL"
+  else
+    bad "pos3ql-published replica-role apply comparison"
+    postgresql_subscriber_log
+    tail -80 "$WORK/subscription-pos3ql.log"
+    tail -80 "$WORK/server.log"
   fi
 fi
 if [[ "$SUB_PG_STARTED" == true ]]; then

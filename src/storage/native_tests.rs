@@ -1606,6 +1606,7 @@ fn catalog_creation_missing_actor_preserves_catalogs_and_identifiers() {
             make_def("unowned_table", &[("id", ColType::Int4, false)]),
             CatalogAllocation::New,
             TableCreation::Pending(7),
+            None,
         ));
         assert_eq!(storage.catalog_sequence.current(), sequence);
         assert_eq!(storage.large_objects.lock().unwrap().next_oid, next_oid);
@@ -3982,7 +3983,7 @@ fn catalog_object_pools_follow_their_independent_startup_capacities() {
     config.max_publications = 11;
     config.max_collations = 12;
     config.max_conversions = 13;
-    config.max_text_search_objects = 27;
+    config.max_text_search_objects = BUILTIN_TEXT_SEARCH_SLOTS + 6;
     config.max_event_triggers = 14;
     config.max_tablespaces = 15;
     config.max_comments = 16;
@@ -4194,7 +4195,10 @@ fn catalog_object_pools_follow_their_independent_startup_capacities() {
         .expect("text catalog lock poisoned");
     assert_eq!(text_catalog.collations.len(), 12);
     assert_eq!(text_catalog.conversions.len(), 13);
-    assert_eq!(text_catalog.text_search_objects.len(), 27);
+    assert_eq!(
+        text_catalog.text_search_objects.len(),
+        BUILTIN_TEXT_SEARCH_SLOTS + 6
+    );
     drop(text_catalog);
     assert_eq!(storage.event_trigger_capacity(), 14);
     assert_eq!(
@@ -4362,9 +4366,10 @@ fn shared_transaction_identity_sql_and_maintenance_reservations_are_unique() {
         }
         crate::mem::guard::forbid_alloc(|| {
             ids.sort_unstable();
-            assert_eq!(ids, std::array::from_fn(|index| index as u32 + 1));
+            // Identities 1 and 2 are PostgreSQL's bootstrap and frozen ones.
+            assert_eq!(ids, std::array::from_fn(|index| index as u32 + 3));
             assert!(storage.transaction_identity_state().active.is_empty());
-            assert_eq!(storage.latest_transaction_identity(), 192);
+            assert_eq!(storage.latest_transaction_identity(), 194);
         });
     });
 }
@@ -5323,6 +5328,7 @@ fn index_statistics_admission_exhaustion_preserves_catalogs_and_active_readers()
             table_definition,
             CatalogAllocation::New,
             table_creation::TableCreation::Committed,
+            None,
         )
         .unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
@@ -5446,6 +5452,7 @@ fn index_statistics_source_pins_survive_table_slot_reuse_without_cross_database_
             definition,
             CatalogAllocation::New,
             table_creation::TableCreation::Committed,
+            None,
         )
         .unwrap();
         assert_eq!(new, old);
@@ -5507,10 +5514,14 @@ fn relation_identity_recovery_accepts_only_matching_inline_backing_relations() {
     definition.n_exclusions = 1;
     definition.exclusions[0] = ExclusionConstraint {
         name: SqlName::parse("inline_recovery_value_exclusion").unwrap(),
-        columns: [1; MAX_INDEX_COLS],
-        n_cols: 1,
         ..ExclusionConstraint::EMPTY
     };
+    definition.exclusions[0]
+        .push(
+            super::ExclusionElement::Column(1),
+            super::ExclusionOperator::from_oid(3882).unwrap(),
+        )
+        .unwrap();
     let table = storage.create_table(definition).unwrap();
     let definition = storage.table_def(table, 0);
     let backing = IndexDef {
@@ -6505,7 +6516,7 @@ fn trigger_catalog_is_synchronized_and_startup_bounded() {
         name: SqlName::parse("trigger_full").unwrap(),
         target: TriggerTarget::Table(0),
         kind: TriggerKind::Ordinary,
-        function: 0,
+        function: TriggerFunction::Routine(0),
         timing: crate::sql::ast::TriggerTiming::Before,
         level: crate::sql::ast::TriggerLevel::Row,
         events: crate::sql::ast::TriggerEvents::from_bits(1).unwrap(),
@@ -7097,7 +7108,7 @@ fn text_catalog_is_synchronized_and_startup_bounded() {
     assert_send_sync::<TextSearchIter<'_>>();
 
     const WORKERS: usize = 4;
-    const BUILTINS: usize = 21;
+    const BUILTINS: usize = BUILTIN_TEXT_SEARCH_SLOTS;
     let mut config = test_config();
     config.max_collations = WORKERS;
     config.max_conversions = WORKERS;
@@ -7164,7 +7175,7 @@ fn text_catalog_is_synchronized_and_startup_bounded() {
     assert_eq!(storage.conversions_visible_to(0).count(), WORKERS);
     assert_eq!(
         storage.text_search_objects_visible_to(0).count(),
-        7 + WORKERS
+        BUILTIN_TEXT_SEARCH_OBJECTS + WORKERS
     );
     for (slot, definition) in storage.collations_visible_to(0) {
         assert_eq!(storage.collation(slot).definition.name, definition.name);

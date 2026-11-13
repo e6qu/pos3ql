@@ -218,7 +218,7 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v39";
+pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v41";
 
 struct ManifestMetadata {
     lsn: u64,
@@ -4351,7 +4351,9 @@ impl Checkpointer {
                     };
                     let tablespace: u16 = parse_field(words.next(), "table tablespace")?;
                     let access_method: i32 = parse_field(words.next(), "table access method")?;
-                    let access_method = if access_method == 2 {
+                    let access_method = if access_method == 0 {
+                        crate::storage::TableAccessMethod::Unspecified
+                    } else if access_method == 2 {
                         crate::storage::TableAccessMethod::Heap
                     } else {
                         crate::storage::TableAccessMethod::Catalog(
@@ -4360,11 +4362,6 @@ impl Checkpointer {
                             )?,
                         )
                     };
-                    if storage.table_access_method_name(access_method, 0).is_none() {
-                        return Err(CheckpointSetupError::Corrupt(
-                            "table references an unknown access method",
-                        ));
-                    }
                     let inheritance_count: usize =
                         parse_field(words.next(), "table inheritance count")?;
                     if inheritance_count > crate::storage::MAX_TABLE_INHERITANCE_PARENTS {
@@ -5054,7 +5051,7 @@ impl Checkpointer {
                     };
                     def.partition = parse_partition_manifest(&mut words)?;
                 }
-                Some("rls") => {
+                Some("rls2") => {
                     let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("rls outside table"));
                     };
@@ -5074,6 +5071,11 @@ impl Checkpointer {
                         parse_field(words.next(), "replica identity mode")?,
                     )
                     .ok_or(CheckpointSetupError::Corrupt("replica identity mode"))?;
+                    def.key_index_marks = crate::storage::KeyIndexMarks::decode([
+                        parse_field(words.next(), "clustered key index")?,
+                        parse_field(words.next(), "replica identity key index")?,
+                    ])
+                    .ok_or(CheckpointSetupError::Corrupt("key index marks"))?;
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("trailing rls fields"));
                     }
@@ -5998,7 +6000,28 @@ impl Checkpointer {
                     def.uniques[i] = uk;
                     def.n_uniques += 1;
                 }
-                Some("chk") => {
+                Some("xdep") => {
+                    let Some((_, _, def, _)) = pending_def.as_mut() else {
+                        return Err(CheckpointSetupError::Corrupt("xdep outside table"));
+                    };
+                    if def.n_expression_dependencies
+                        >= crate::storage::MAX_TABLE_EXPRESSION_DEPENDENCIES
+                    {
+                        return Err(CheckpointSetupError::Corrupt("too many xdep lines"));
+                    }
+                    let bytes = decode_manifest_hex_bytes(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("xdep bytes missing"))?,
+                    )?;
+                    let mut at = 0;
+                    let entry = crate::wal::decode_expression_dependency(&bytes, &mut at)
+                        .filter(|entry| at == bytes.len() && entry.owner.belongs_to_table())
+                        .ok_or(CheckpointSetupError::Corrupt("bad xdep"))?;
+                    def.expression_dependencies[def.n_expression_dependencies] = entry;
+                    def.n_expression_dependencies += 1;
+                }
+                Some("chk2") => {
                     let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("chk outside table"));
                     };
@@ -6006,6 +6029,11 @@ impl Checkpointer {
                         return Err(CheckpointSetupError::Corrupt("too many chk lines"));
                     }
                     let validation: u8 = parse_field(words.next(), "chk validation")?;
+                    let no_inherit = match parse_field::<u8>(words.next(), "chk inheritance")? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(CheckpointSetupError::Corrupt("bad chk inheritance")),
+                    };
                     let hex_name = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("chk name missing"))?;
@@ -6016,6 +6044,7 @@ impl Checkpointer {
                     check.validation = crate::storage::ConstraintValidation::from_code(validation)
                         .ok_or(CheckpointSetupError::Corrupt("bad chk validation"))?;
                     check.name = sql_name(&decode_hex_name(hex_name)?)?;
+                    check.no_inherit = no_inherit;
                     let expression = decode_hex_name(hexpr)?;
                     use core::fmt::Write;
                     let _ = write!(check.expression, "{expression}");
@@ -6062,6 +6091,19 @@ impl Checkpointer {
                         .ok_or(CheckpointSetupError::Corrupt("bad fkey timing"))?;
                     fk.validation = crate::storage::ConstraintValidation::from_code(validation)
                         .ok_or(CheckpointSetupError::Corrupt("bad fkey validation"))?;
+                    for mode in &mut fk.trigger_enabled {
+                        let code: u8 = parse_field(words.next(), "fkey trigger mode")?;
+                        *mode = crate::storage::TriggerEnabled::from_code(code)
+                            .ok_or(CheckpointSetupError::Corrupt("bad fkey trigger mode"))?;
+                    }
+                    let n_set: usize = parse_field(words.next(), "fkey nset")?;
+                    if n_set > n_cols {
+                        return Err(CheckpointSetupError::Corrupt("bad fkey nset"));
+                    }
+                    fk.n_delete_set_cols = n_set;
+                    for c in fk.delete_set_cols.iter_mut().take(n_set) {
+                        *c = parse_field(words.next(), "fkey set col")?;
+                    }
                     let hex_name = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("fkey name missing"))?;
@@ -6078,7 +6120,7 @@ impl Checkpointer {
                     def.fkeys[i] = fk;
                     def.n_fkeys += 1;
                 }
-                Some("excl") => {
+                Some("excl3") => {
                     let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("excl outside table"));
                     };
@@ -6086,6 +6128,7 @@ impl Checkpointer {
                         return Err(CheckpointSetupError::Corrupt("too many excl lines"));
                     }
                     let timing: u8 = parse_field(words.next(), "excl timing")?;
+                    let method: u8 = parse_field(words.next(), "excl method")?;
                     let n_cols: usize = parse_field(words.next(), "excl ncols")?;
                     if n_cols == 0 || n_cols > crate::storage::MAX_INDEX_COLS {
                         return Err(CheckpointSetupError::Corrupt("bad excl ncols"));
@@ -6093,13 +6136,30 @@ impl Checkpointer {
                     let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
                     exclusion.timing = crate::storage::ConstraintTiming::from_code(timing)
                         .ok_or(CheckpointSetupError::Corrupt("bad excl timing"))?;
-                    exclusion.n_cols = n_cols;
-                    for position in 0..n_cols {
-                        exclusion.columns[position] = parse_field(words.next(), "excl col")?;
-                        let operator: u8 = parse_field(words.next(), "excl operator")?;
-                        exclusion.operators[position] =
-                            crate::storage::ExclusionOperator::from_code(operator)
-                                .ok_or(CheckpointSetupError::Corrupt("bad excl operator"))?;
+                    exclusion.method = crate::sql::ast::IndexAccessMethod::from_code(method)
+                        .ok_or(CheckpointSetupError::Corrupt("bad excl method"))?;
+                    for _ in 0..n_cols {
+                        // `c COLUMN` or `e HEX_EXPRESSION`, then the operator.
+                        let expression;
+                        let element = match words.next() {
+                            Some("c") => crate::storage::ExclusionElement::Column(parse_field(
+                                words.next(),
+                                "excl col",
+                            )?),
+                            Some("e") => {
+                                expression = decode_hex_name(words.next().ok_or(
+                                    CheckpointSetupError::Corrupt("excl expression missing"),
+                                )?)?;
+                                crate::storage::ExclusionElement::Expression(expression.as_str())
+                            }
+                            _ => return Err(CheckpointSetupError::Corrupt("bad excl element")),
+                        };
+                        let operator: i32 = parse_field(words.next(), "excl operator")?;
+                        let operator = crate::storage::ExclusionOperator::from_oid(operator)
+                            .ok_or(CheckpointSetupError::Corrupt("bad excl operator"))?;
+                        exclusion.push(element, operator).map_err(|_| {
+                            CheckpointSetupError::Corrupt("excl expression too long")
+                        })?;
                     }
                     exclusion.name = sql_name(&decode_hex_name(
                         words
@@ -6286,28 +6346,25 @@ impl Checkpointer {
                         },
                     ));
                 }
-                Some("fdw") => {
+                Some("fdw2") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let slot = parse_field(words.next(), "foreign wrapper slot")?;
                     let created_at: u64 = parse_field(words.next(), "foreign wrapper sequence")?;
                     let owner = decode_hex_name(words.next().ok_or(
                         CheckpointSetupError::Corrupt("foreign wrapper owner missing"),
                     )?)?;
-                    let handler = match parse_field::<u8>(words.next(), "foreign wrapper handler")?
-                    {
-                        0 => crate::storage::foreign::ForeignDataHandler::None,
-                        1 => crate::storage::foreign::ForeignDataHandler::Postgres,
-                        _ => {
-                            return Err(CheckpointSetupError::Corrupt(
-                                "invalid foreign wrapper handler",
-                            ));
-                        }
-                    };
+                    let handler = crate::storage::foreign::ForeignDataHandler::from_routine_oid(
+                        parse_field::<i32>(words.next(), "foreign wrapper handler")?,
+                    )
+                    .ok_or(CheckpointSetupError::Corrupt(
+                        "invalid foreign wrapper handler",
+                    ))?;
                     let validator =
-                        match parse_field::<u8>(words.next(), "foreign wrapper validator")? {
-                            0 => crate::storage::foreign::ForeignDataValidator::None,
-                            1 => crate::storage::foreign::ForeignDataValidator::Postgres,
-                            _ => {
+                        match crate::storage::foreign::ForeignDataValidator::from_routine_oid(
+                            parse_field::<i32>(words.next(), "foreign wrapper validator")?,
+                        ) {
+                            Some(validator) => validator,
+                            None => {
                                 return Err(CheckpointSetupError::Corrupt(
                                     "invalid foreign wrapper validator",
                                 ));
@@ -6523,7 +6580,7 @@ impl Checkpointer {
                         )
                         .map_err(|_| CheckpointSetupError::Corrupt("invalid foreign table"))?;
                 }
-                Some("vw15") => {
+                Some("vw16") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     load_view(storage, line, metadata.catalog_sequence)?;
                 }
@@ -7228,22 +7285,19 @@ impl Checkpointer {
                         crate::storage::TextSearchDictionaryBehavior,
                         CheckpointSetupError,
                     > {
-                        Ok(
-                            match parse_field::<u8>(word, "text-search dictionary behavior")? {
-                                0 => crate::storage::TextSearchDictionaryBehavior::Simple {
-                                    accept: true,
-                                },
-                                1 => crate::storage::TextSearchDictionaryBehavior::Simple {
-                                    accept: false,
-                                },
-                                2 => crate::storage::TextSearchDictionaryBehavior::EnglishStem,
-                                _ => {
-                                    return Err(CheckpointSetupError::Corrupt(
-                                        "invalid text-search dictionary behavior",
-                                    ));
-                                }
-                            },
-                        )
+                        let code: u32 = parse_field(word, "text-search dictionary behavior")?;
+                        let [kind, value, stopwords, unused] = code.to_le_bytes();
+                        if unused != 0 {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid text-search dictionary behavior",
+                            ));
+                        }
+                        crate::storage::TextSearchDictionaryBehavior::from_code([
+                            kind, value, stopwords,
+                        ])
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "invalid text-search dictionary behavior",
+                        ))
                     };
                     let definition = match kind {
                         "p" => crate::storage::TextSearchDefinition::Parser {
@@ -7262,7 +7316,13 @@ impl Checkpointer {
                             oid,
                             init: parse_field(words.next(), "text-search template init")?,
                             lexize: parse_field(words.next(), "text-search template lexize")?,
-                            behavior: behavior(words.next())?,
+                            kind: crate::storage::TextSearchTemplateKind::from_code(parse_field(
+                                words.next(),
+                                "text-search template kind",
+                            )?)
+                            .ok_or(CheckpointSetupError::Corrupt(
+                                "invalid text-search template kind",
+                            ))?,
                         },
                         "d" => {
                             let owner = parse_field(words.next(), "text-search dictionary owner")?;
@@ -8171,6 +8231,8 @@ impl Checkpointer {
                             name: sql_name(&cname)?,
                             expression: crate::util::StackStr::from_str(&cexpr),
                             validation,
+                            // Domain constraints are never inherited.
+                            no_inherit: false,
                         };
                     }
                     let base_domain = match (base_domain.is_empty(), base_domain_schema.is_empty())
@@ -8547,7 +8609,9 @@ impl Checkpointer {
                     {
                         continue;
                     }
-                    if package_slot != storage.extension_packages().count() {
+                    if package_slot + storage.system_extension_package_count()
+                        != storage.extension_packages().count()
+                    {
                         return Err(CheckpointSetupError::Corrupt(
                             "extension package slots are not ordered",
                         ));
@@ -8647,7 +8711,7 @@ impl Checkpointer {
                     })?;
                     storage
                         .install_durable_extension_script(
-                            package_slot,
+                            package_slot + storage.system_extension_package_count(),
                             from,
                             to,
                             effective,
@@ -9450,6 +9514,34 @@ impl Checkpointer {
                             *range = parse_field(words.next(), "idx unsummarized range")?;
                         }
                     }
+                    let mut expression_dependencies = [crate::storage::ExpressionDependency::EMPTY;
+                        crate::storage::MAX_INDEX_EXPRESSION_DEPENDENCIES];
+                    let mut n_expression_dependencies = 0usize;
+                    if words.clone().next() == Some("xd") {
+                        let _ = words.next();
+                        n_expression_dependencies =
+                            parse_field(words.next(), "idx expression dependency count")?;
+                        if n_expression_dependencies == 0
+                            || n_expression_dependencies > expression_dependencies.len()
+                        {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "bad idx expression dependency count",
+                            ));
+                        }
+                        for entry in &mut expression_dependencies[..n_expression_dependencies] {
+                            let bytes = decode_manifest_hex_bytes(words.next().ok_or(
+                                CheckpointSetupError::Corrupt("idx expression dependency missing"),
+                            )?)?;
+                            let mut at = 0;
+                            *entry = crate::wal::decode_expression_dependency(&bytes, &mut at)
+                                .filter(|entry| {
+                                    at == bytes.len() && !entry.owner.belongs_to_table()
+                                })
+                                .ok_or(CheckpointSetupError::Corrupt(
+                                    "bad idx expression dependency",
+                                ))?;
+                        }
+                    }
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("trailing idx fields"));
                     }
@@ -9547,6 +9639,8 @@ impl Checkpointer {
                                 pending_definition: None,
                                 ddl_state: crate::storage::CatalogDdlState::Present,
                                 pending_parent_drop_txid: None,
+                                expression_dependencies,
+                                n_expression_dependencies: n_expression_dependencies as u8,
                             },
                             0,
                         )
@@ -10825,10 +10919,7 @@ impl Checkpointer {
                     crate::storage::TableKind::Foreign => 1,
                 },
                 definition.tablespace,
-                match definition.access_method {
-                    crate::storage::TableAccessMethod::Heap => 2,
-                    crate::storage::TableAccessMethod::Catalog(oid) => oid.get(),
-                },
+                definition.access_method.relam(),
                 definition.inheritance.parents_ref().len(),
             )
             .map_err(|_| {
@@ -10921,10 +11012,12 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "rls {} {} {}",
+                    "rls2 {} {} {} {} {}",
                     u8::from(definition.row_level_security.enabled),
                     u8::from(definition.row_level_security.forced),
                     definition.replica_identity.code(),
+                    definition.key_index_marks.encode()[0],
+                    definition.key_index_marks.encode()[1],
                 ),
             )?;
             for (column, c) in definition.columns().iter().enumerate() {
@@ -11073,7 +11166,7 @@ impl Checkpointer {
                     ),
                 )?;
             }
-            // `chk <validation> <hex-name> <hex-predicate>`
+            // `chk2 <validation> <no-inherit> <hex-name> <hex-predicate>`
             for check in definition.checks() {
                 use core::fmt::Write;
                 let mut hex_name = StackStr::<130>::new();
@@ -11087,23 +11180,45 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "chk {} {} {}",
+                        "chk2 {} {} {} {}",
                         check.validation.code(),
+                        u8::from(check.no_inherit),
                         hex_name.as_str(),
                         hexpr.as_str()
                     ),
                 )?;
             }
-            // `fkey <ncols> <c..> <nparent> <p..> <actions> <timing> <validation> <names>`
+            // `xdep <hex>`: one expression dependency in its journal encoding.
+            for entry in definition.expression_dependencies() {
+                let mut bytes = [0u8; crate::wal::EXPRESSION_DEPENDENCY_BYTES];
+                let length = crate::wal::expression_dependency_bytes(entry, &mut bytes)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "expression dependency exceeds its manifest line"
+                        )
+                    })?;
+                write_manifest(
+                    &mut self.manifest_output,
+                    format_args!("xdep {}", ManifestInputBytes(&bytes[..length])),
+                )?;
+            }
+            // `fkey <ncols> <c..> <nparent> <p..> <actions> <timing> <validation>
+            // <four trigger modes> <nset> <set..> <names>`; each position takes
+            // at most six bytes.
             for fk in definition.fkeys() {
                 use core::fmt::Write;
-                let mut columns = StackStr::<64>::new();
+                let mut columns = StackStr::<{ crate::storage::MAX_INDEX_COLS * 6 }>::new();
                 for c in fk.columns() {
                     let _ = write!(columns, "{c} ");
                 }
-                let mut pcols = StackStr::<64>::new();
+                let mut pcols = StackStr::<{ crate::storage::MAX_INDEX_COLS * 6 }>::new();
                 for c in fk.parent_cols() {
                     let _ = write!(pcols, "{c} ");
+                }
+                let mut set_columns = StackStr::<{ crate::storage::MAX_INDEX_COLS * 6 }>::new();
+                for c in fk.delete_set_cols() {
+                    let _ = write!(set_columns, "{c} ");
                 }
                 let mut hex_name = StackStr::<130>::new();
                 for b in fk.name.as_str().as_bytes() {
@@ -11120,7 +11235,7 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "fkey {} {}{} {}{} {} {} {} {} {} {}",
+                        "fkey {} {}{} {}{} {} {} {} {} {} {} {} {} {}{} {} {}",
                         fk.n_cols,
                         columns.as_str(),
                         fk.n_parent_cols,
@@ -11129,6 +11244,12 @@ impl Checkpointer {
                         fk.on_update.code(),
                         fk.timing.code(),
                         fk.validation.code(),
+                        fk.trigger_enabled[0].code(),
+                        fk.trigger_enabled[1].code(),
+                        fk.trigger_enabled[2].code(),
+                        fk.trigger_enabled[3].code(),
+                        fk.n_delete_set_cols,
+                        set_columns.as_str(),
                         hex_name.as_str(),
                         hparent.as_str(),
                         hparent_schema.as_str()
@@ -11137,14 +11258,26 @@ impl Checkpointer {
             }
             for exclusion in definition.exclusions() {
                 use core::fmt::Write;
-                let mut elements = StackStr::<128>::new();
-                for position in 0..exclusion.n_cols {
-                    let _ = write!(
-                        elements,
-                        "{} {} ",
-                        exclusion.columns[position],
-                        exclusion.operators[position].code()
-                    );
+                let mut elements = StackStr::<
+                    {
+                        24 * crate::storage::MAX_INDEX_COLS
+                            + 2 * crate::storage::EXCLUSION_EXPRESSIONS_MAX
+                    },
+                >::new();
+                for (element, operator) in exclusion.elements().zip(exclusion.operators()) {
+                    match element {
+                        crate::storage::ExclusionElement::Column(column) => {
+                            let _ = write!(elements, "c {column} ");
+                        }
+                        crate::storage::ExclusionElement::Expression(text) => {
+                            let _ = write!(elements, "e ");
+                            for byte in text.as_bytes() {
+                                let _ = write!(elements, "{byte:02x}");
+                            }
+                            let _ = write!(elements, " ");
+                        }
+                    }
+                    let _ = write!(elements, "{} ", operator.oid());
                 }
                 let mut hex_name = StackStr::<130>::new();
                 for byte in exclusion.name.as_str().as_bytes() {
@@ -11168,9 +11301,10 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "excl {} {} {}{} {}",
+                        "excl3 {} {} {} {}{} {}",
                         exclusion.timing.code(),
-                        exclusion.n_cols,
+                        exclusion.method.code(),
+                        exclusion.len(),
                         elements.as_str(),
                         hex_name.as_str(),
                         predicate.as_str()
@@ -11460,18 +11594,12 @@ impl Checkpointer {
             let mut line = StackStr::<12_288>::new();
             let _ = write!(
                 line,
-                "fdw {} {} {} {} {} {} {}",
+                "fdw2 {} {} {} {} {} {} {}",
                 slot,
                 entry.created_at,
                 manifest_hex::<130>(owner.as_str()),
-                match definition.handler {
-                    crate::storage::foreign::ForeignDataHandler::None => 0,
-                    crate::storage::foreign::ForeignDataHandler::Postgres => 1,
-                },
-                match definition.validator {
-                    crate::storage::foreign::ForeignDataValidator::None => 0,
-                    crate::storage::foreign::ForeignDataValidator::Postgres => 1,
-                },
+                definition.handler.routine_oid(),
+                definition.validator.routine_oid(),
                 manifest_hex::<130>(definition.name.as_str()),
                 definition.options.entries().len(),
             );
@@ -11633,7 +11761,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "vw15 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "vw16 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     view_slot,
                     view.created_at,
                     view.return_rule,
@@ -11642,15 +11770,11 @@ impl Checkpointer {
                     hschema.as_str(),
                     hpath.as_str(),
                     hname.as_str(),
-                    u8::from(matches!(
-                        view.options.security,
-                        crate::storage::ViewSecurity::Invoker
-                    )),
-                    view.options.security_barrier.code(),
-                    view.options
-                        .check_option
-                        .map_or(0, crate::storage::ViewCheckOption::code),
-                    view.options.query_origin.code(),
+                    view.options.encode()[0],
+                    view.options.encode()[1],
+                    view.options.encode()[2],
+                    view.options.encode()[3],
+                    ManifestInputBytes(&view.options.order.encode()),
                     ManifestViewColumns(view.columns),
                     ManifestInputBytes(view.default_inputs.bytes()),
                     ManifestDependencies(storage.view_dependencies(view_slot, 0).view())
@@ -12307,7 +12431,7 @@ impl Checkpointer {
                     oid,
                     init,
                     lexize,
-                    behavior,
+                    kind,
                 } => write_manifest(
                     &mut self.manifest_output,
                     format_args!(
@@ -12319,7 +12443,7 @@ impl Checkpointer {
                         oid,
                         init,
                         lexize,
-                        text_search_behavior_code(behavior),
+                        kind.code(),
                     ),
                 )?,
                 crate::storage::TextSearchDefinition::Dictionary {
@@ -12563,7 +12687,8 @@ impl Checkpointer {
                     (1u8, view.schema, view.name)
                 }
             };
-            let function = storage.routine(usize::from(trigger.function));
+            let (function_schema, function_name) =
+                storage.trigger_function_name(trigger.function, 0);
             let mut hname = StackStr::<130>::new();
             let mut hschema = StackStr::<130>::new();
             let mut htable = StackStr::<130>::new();
@@ -12589,10 +12714,10 @@ impl Checkpointer {
             for byte in relation_name.as_str().as_bytes() {
                 let _ = write!(htable, "{byte:02x}");
             }
-            for byte in function.schema.as_str().as_bytes() {
+            for byte in function_schema.as_str().as_bytes() {
                 let _ = write!(hfunction_schema, "{byte:02x}");
             }
-            for byte in function.name.as_str().as_bytes() {
+            for byte in function_name.as_str().as_bytes() {
                 let _ = write!(hfunction, "{byte:02x}");
             }
             if let Some(old) = trigger.transition_tables.old() {
@@ -12801,7 +12926,11 @@ impl Checkpointer {
         // The availability catalog is durable independently of installed
         // extensions. SQL and control metadata are immutable objects; the CAS
         // manifest publishes their ordered, bounded catalog in one step.
-        for (package_slot, package) in storage.extension_packages() {
+        // Built-in packages come from the binary and are not persisted:
+        // durable slots count from the first configured package.
+        let system_packages = storage.system_extension_package_count();
+        for (storage_slot, package) in storage.extension_packages().skip(system_packages) {
+            let package_slot = storage_slot - system_packages;
             let metadata = encode_extension_package(*package)?;
             let metadata_key = stack_format!(
                 80,
@@ -12814,7 +12943,7 @@ impl Checkpointer {
                 &mut self.manifest_output,
                 format_args!("xpk {} {}", package_slot, metadata_key.as_str()),
             )?;
-            for (_, script) in storage.extension_scripts_for(package_slot) {
+            for (_, script) in storage.extension_scripts_for(storage_slot) {
                 let effective = encode_extension_package(script.effective)?;
                 let effective_key = stack_format!(
                     80,
@@ -13142,7 +13271,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "idx {} {} {} {} {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {} {} {} gb{} bo{} gi{},{}{}",
+                    "idx {} {} {} {} {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {} {} {} gb{} bo{} gi{},{}{}{}",
                     index.created_at,
                     match index.relation {
                         crate::storage::IndexRelationSource::Table => 0,
@@ -13191,6 +13320,7 @@ impl Checkpointer {
                     fastupdate,
                     gin_pending_list_limit.as_str(),
                     maintenance_suffix.as_str(),
+                    ManifestIndexDependencies(index.expression_dependencies()),
                 ),
             )?;
         }
@@ -17944,6 +18074,12 @@ fn encode_extension_package(
     let code = match package.code {
         crate::storage::ExtensionPackageCode::Sql => 0,
         crate::storage::ExtensionPackageCode::NativeLibrary => 1,
+        crate::storage::ExtensionPackageCode::Builtin(_) => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a built-in extension package is not persisted"
+            ));
+        }
     };
     write!(
         encoded,
@@ -18139,6 +18275,11 @@ fn finish_pending(
         if seen != definition.n_columns {
             return Err(CheckpointSetupError::Corrupt(
                 "manifest column count mismatch",
+            ));
+        }
+        if !storage.table_access_method_valid(&definition, 0) {
+            return Err(CheckpointSetupError::Corrupt(
+                "table references an unknown access method",
             ));
         }
         let slot = if storage
@@ -18662,18 +18803,8 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
         ));
     }
     let function = storage
-        .routine_slot_by_signature(&function_schema, &function_name, &[], 0)
-        .ok_or(CheckpointSetupError::Corrupt(
-            "trigger function does not exist",
-        ))?;
-    if !matches!(
-        storage.routine(function).kind,
-        crate::storage::RoutineKind::Trigger
-    ) {
-        return Err(CheckpointSetupError::Corrupt(
-            "trigger function is not trigger typed",
-        ));
-    }
+        .trigger_function_named(&function_schema, &function_name, 0)
+        .map_err(CheckpointSetupError::Corrupt)?;
     storage
         .restore_trigger(
             identity,
@@ -19067,7 +19198,7 @@ fn load_view(
     catalog_sequence: u64,
 ) -> Result<(), CheckpointSetupError> {
     let mut words = line.split(' ');
-    if words.next() != Some("vw15") {
+    if words.next() != Some("vw16") {
         return Err(CheckpointSetupError::Corrupt("unsupported view record"));
     }
     let identity = crate::storage::ViewCatalogIdentity::new(
@@ -19095,29 +19226,26 @@ fn load_view(
     let path = read_hex(words.next(), "view path missing")?;
     let path_buffer = parse_creation_path(&path, "invalid view creation search path")?;
     let name = read_hex(words.next(), "view name missing")?;
-    let security = match parse_field::<u8>(words.next(), "view security missing")? {
-        0 => crate::storage::ViewSecurity::Definer,
-        1 => crate::storage::ViewSecurity::Invoker,
-        _ => return Err(CheckpointSetupError::Corrupt("invalid view security")),
-    };
-    let security_barrier = crate::storage::ViewSecurityBarrier::from_code(parse_field(
-        words.next(),
+    let mut option_codes = [0u8; crate::storage::ViewOptions::ENCODED_BYTES];
+    for (code, what) in option_codes.iter_mut().zip([
+        "view security missing",
         "view security barrier missing",
-    )?)
-    .ok_or(CheckpointSetupError::Corrupt(
-        "invalid view security barrier",
-    ))?;
-    let check_option = match parse_field::<u8>(words.next(), "view check option missing")? {
-        0 => None,
-        code => crate::storage::ViewCheckOption::from_code(code)
-            .ok_or(CheckpointSetupError::Corrupt("invalid view check option"))
-            .map(Some)?,
-    };
-    let query_origin = crate::storage::ViewQueryOrigin::from_code(parse_field(
-        words.next(),
+        "view check option missing",
         "view query origin missing",
-    )?)
-    .ok_or(CheckpointSetupError::Corrupt("invalid view query origin"))?;
+    ]) {
+        *code = parse_field::<u8>(words.next(), what)?;
+    }
+    let listed = decode_manifest_hex_bytes(
+        words
+            .next()
+            .ok_or(CheckpointSetupError::Corrupt("view option list missing"))?,
+    )?;
+    if listed.len() != crate::storage::ViewOptionOrder::ENCODED_BYTES {
+        return Err(CheckpointSetupError::Corrupt("invalid view option list"));
+    }
+    option_codes[4..].copy_from_slice(&listed);
+    let options = crate::storage::ViewOptions::decode(option_codes)
+        .ok_or(CheckpointSetupError::Corrupt("invalid view options"))?;
     let encoded_columns = words
         .next()
         .ok_or(CheckpointSetupError::Corrupt("view columns missing"))?;
@@ -19275,12 +19403,7 @@ fn load_view(
             creation_path: path_buffer,
             dependencies,
         },
-        options: crate::storage::ViewOptions {
-            security,
-            security_barrier,
-            check_option,
-            query_origin,
-        },
+        options,
     };
     storage
         .replay_view(identity, sql_name(&schema)?, sql_name(&name)?, definition)
@@ -19510,12 +19633,9 @@ impl core::fmt::Display for ManifestRoutineColumns<'_> {
     }
 }
 
-fn text_search_behavior_code(behavior: crate::storage::TextSearchDictionaryBehavior) -> u8 {
-    match behavior {
-        crate::storage::TextSearchDictionaryBehavior::Simple { accept: true } => 0,
-        crate::storage::TextSearchDictionaryBehavior::Simple { accept: false } => 1,
-        crate::storage::TextSearchDictionaryBehavior::EnglishStem => 2,
-    }
+fn text_search_behavior_code(behavior: crate::storage::TextSearchDictionaryBehavior) -> u32 {
+    let [kind, value, stopwords] = behavior.code();
+    u32::from_le_bytes([kind, value, stopwords, 0])
 }
 
 struct ManifestTextSearchMappings<'a>(&'a crate::storage::TextSearchMappings);
@@ -19675,6 +19795,26 @@ impl core::fmt::Display for ManifestDependencies<'_> {
 }
 
 struct ManifestInputBytes<'a>(&'a [u8]);
+
+/// ` xd <count> <hex>...`: an index's expression dependencies in their
+/// journal encoding, or nothing when it has none.
+struct ManifestIndexDependencies<'a>(&'a [crate::storage::ExpressionDependency]);
+
+impl core::fmt::Display for ManifestIndexDependencies<'_> {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0.is_empty() {
+            return Ok(());
+        }
+        write!(output, " xd {}", self.0.len())?;
+        for entry in self.0 {
+            let mut bytes = [0u8; crate::wal::EXPRESSION_DEPENDENCY_BYTES];
+            let length = crate::wal::expression_dependency_bytes(entry, &mut bytes)
+                .ok_or(core::fmt::Error)?;
+            write!(output, " {}", ManifestInputBytes(&bytes[..length]))?;
+        }
+        Ok(())
+    }
+}
 
 impl core::fmt::Display for ManifestInputBytes<'_> {
     fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -20188,7 +20328,7 @@ mod stored_dependency_tests {
             oversized_utf8.as_str(),
         ] {
             let view = format!(
-                "vw15 0 1 0 2 {} {} {} {} 0 0 0 0 0:0: - i2 0 -",
+                "vw16 0 1 0 2 {} {} {} {} 0 0 0 0 0 0:0: - i2 0 -",
                 ManifestName("SELECT 1"),
                 ManifestName("public"),
                 ManifestName(path),
@@ -21116,7 +21256,7 @@ mod stored_dependency_tests {
             )
             .unwrap();
         let manifest = format!(
-            "pos3ql-manifest-v39\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
+            "pos3ql-manifest-v41\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
             index_gc_hex(old.roster)
         );
         // Two backups and two readers share the same graph at the four-block limit.
@@ -21955,7 +22095,7 @@ mod stored_dependency_tests {
             );
             let empty_list =
                 b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>";
-            let manifest = b"pos3ql-manifest-v39\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
+            let manifest = b"pos3ql-manifest-v41\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
             let body: &[u8] = match phase {
                 "rows" | "index" => &root_body,
                 "manifest" => manifest,
@@ -22086,7 +22226,7 @@ mod stored_dependency_tests {
         let mut budget = Budget::new(Checkpointer::budget_bytes(&config));
         let mut checkpoint = Checkpointer::new(&config, &mut budget).unwrap();
         assert_eq!(budget.remaining(), 0);
-        let manifest = b"pos3ql-manifest-v39\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
+        let manifest = b"pos3ql-manifest-v41\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
         for index in 0..65 {
             checkpoint
                 .client
@@ -22695,7 +22835,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let mut manifest = String::from("pos3ql-manifest-v39\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
+                    let mut manifest = String::from("pos3ql-manifest-v41\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
                     for (oid, name) in [(first_oid, first_name), (second_oid, second_name)] {
                         let encoded = name
                             .as_bytes()
@@ -22721,7 +22861,7 @@ mod stored_dependency_tests {
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     assert!(matches!(checkpointer.load_manifest_text(&mut storage,
-                        "pos3ql-manifest-v39\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
+                        "pos3ql-manifest-v41\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
                         Err(CheckpointSetupError::Corrupt("duplicate system setting record"))));
                     assert_eq!(storage.system_settings().find(|(_, image)| image.live).unwrap().1
                         .value.as_str(), "first");
@@ -22730,7 +22870,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let manifest = format!("pos3ql-manifest-v39\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
+                    let manifest = format!("pos3ql-manifest-v41\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
                     match checkpointer.load_manifest_text(&mut storage, &manifest) {
                         Err(CheckpointSetupError::ObjectStore(message)) => {
                             assert!(message.contains("duplicate prepared transaction catalog identity"));
@@ -22936,7 +23076,9 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v36",
                 "pos3ql-manifest-v37",
                 "pos3ql-manifest-v38",
-                "pos3ql-manifest-v39 trailing",
+                "pos3ql-manifest-v39",
+                "pos3ql-manifest-v40",
+                "pos3ql-manifest-v41 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");
                 assert!(matches!(
@@ -23018,11 +23160,11 @@ mod stored_dependency_tests {
 
     #[test]
     fn backup_commit_floor_includes_prepared_transactions_and_logical_slots() {
-        let manifest = b"pos3ql-manifest-v39\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let manifest = b"pos3ql-manifest-v41\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_lsn(manifest).unwrap(), 100);
         assert_eq!(manifest_commit_retention_floor(manifest).unwrap(), 40);
 
-        let slot_only = b"pos3ql-manifest-v39\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let slot_only = b"pos3ql-manifest-v41\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_commit_retention_floor(slot_only).unwrap(), 60);
     }
 
@@ -23436,7 +23578,7 @@ mod stored_dependency_tests {
         let mut manifest = FixedBuf::new(&mut budget, "manifest", 1024).unwrap();
         manifest
             .append(
-                b"pos3ql-manifest-v39\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
+                b"pos3ql-manifest-v41\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
             );
         let before = manifest.readable().to_vec();
         retag_manifest_root(&mut manifest, replacement).unwrap();

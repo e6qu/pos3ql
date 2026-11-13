@@ -3983,7 +3983,7 @@ fn catalog_object_pools_follow_their_independent_startup_capacities() {
     config.max_publications = 11;
     config.max_collations = 12;
     config.max_conversions = 13;
-    config.max_text_search_objects = 27;
+    config.max_text_search_objects = BUILTIN_TEXT_SEARCH_SLOTS + 6;
     config.max_event_triggers = 14;
     config.max_tablespaces = 15;
     config.max_comments = 16;
@@ -7100,7 +7100,7 @@ fn text_catalog_is_synchronized_and_startup_bounded() {
     assert_send_sync::<TextSearchIter<'_>>();
 
     const WORKERS: usize = 4;
-    const BUILTINS: usize = 21;
+    const BUILTINS: usize = BUILTIN_TEXT_SEARCH_SLOTS;
     let mut config = test_config();
     config.max_collations = WORKERS;
     config.max_conversions = WORKERS;

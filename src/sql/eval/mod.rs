@@ -30,7 +30,7 @@ pub(crate) use cast::{
     validate_geometry_type_cast,
 };
 
-mod args;
+pub(crate) mod args;
 mod operators;
 pub(crate) use args::*;
 
@@ -621,6 +621,7 @@ pub mod sqlstate {
     pub const QUERY_CANCELED: &str = "57014";
     pub const ADMIN_SHUTDOWN: &str = "57P01";
     pub const IO_ERROR: &str = "58030";
+    pub const CONFIG_FILE_ERROR: &str = "F0000";
     pub const INTERNAL_ERROR: &str = "XX000";
     pub const ACTIVE_SQL_TRANSACTION: &str = "25001";
     pub const READ_ONLY_SQL_TRANSACTION: &str = "25006";
@@ -5244,6 +5245,22 @@ fn eval_binary_values<'a>(
                 ColType::Enum(Some(creation)) => coerce_enum_value(creation, r, hooks, arena)?,
                 _ => cast_to(r, target, arena)?,
             };
+        }
+    }
+    if operator == BinaryOp::TextSearchMatch {
+        // `text @@ tsquery` parses the text with the session's configuration.
+        let vector = |value: Datum<'a>| -> Result<Datum<'a>, SqlError> {
+            Ok(match value {
+                Datum::Text(document) => Datum::TsVector(crate::sql::full_text::restore_vector(
+                    funcs::full_text::current_config_vector(document, arena, hooks)?,
+                )),
+                other => other,
+            })
+        };
+        match (l, r) {
+            (Datum::Text(_), Datum::TsQuery(_)) => l = vector(l)?,
+            (Datum::TsQuery(_), Datum::Text(_)) => r = vector(r)?,
+            _ => {}
         }
     }
     if operator == BinaryOp::Concat {
@@ -12987,22 +13004,22 @@ pub(crate) fn regobject_cast<'a>(
         ColType::Regconfig => (if let Some(catalog) = catalog {
             catalog.text_search_configuration_name(object_oid)
         } else {
-            match object_oid {
-                3748 => Some(crate::util::StackStr::from_str("simple")),
-                13_248 => Some(crate::util::StackStr::from_str("english")),
-                _ => None,
-            }
+            crate::sql::full_text::builtin_object(
+                crate::sql::ast::TextSearchObjectKind::Configuration,
+                object_oid,
+            )
+            .map(|definition| crate::util::StackStr::from_str(definition.name().as_str()))
         })
         .map(|name| arena.alloc_str(name.as_str()).map_err(|_| arena_full()))
         .transpose()?,
         ColType::Regdictionary => (if let Some(catalog) = catalog {
             catalog.text_search_dictionary_name(object_oid)
         } else {
-            match object_oid {
-                3765 => Some(crate::util::StackStr::from_str("simple")),
-                13_247 => Some(crate::util::StackStr::from_str("english_stem")),
-                _ => None,
-            }
+            crate::sql::full_text::builtin_object(
+                crate::sql::ast::TextSearchObjectKind::Dictionary,
+                object_oid,
+            )
+            .map(|definition| crate::util::StackStr::from_str(definition.name().as_str()))
         })
         .map(|name| arena.alloc_str(name.as_str()).map_err(|_| arena_full()))
         .transpose()?,

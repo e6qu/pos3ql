@@ -1083,13 +1083,9 @@ impl<'a> Parser<'a> {
             }
             let name = self.col_ident("text search option name")?;
             self.expect_op("=")?;
+            // Repeated options reach the template's init routine, which
+            // reports them as PostgreSQL's do.
             let value = self.database_option_value("text search option value is required")?;
-            if options[..count]
-                .iter()
-                .any(|option| option.name.eq_ignore_ascii_case(name))
-            {
-                return Err(self.err_here("duplicate text search option"));
-            }
             options[count] = TextSearchOption { name, value };
             count += 1;
             if !self.eat_op(",")? {

@@ -204,7 +204,8 @@ pub struct Config {
     /// Fixed number of user-defined conversion catalog slots.
     pub max_conversions: usize,
     /// Fixed number of text-search parser, template, dictionary, and
-    /// configuration catalog slots.
+    /// configuration catalog slots. Every database holds its own copy of the
+    /// 66 built-in objects; `postgres`, `template1` and `template0` take 198.
     pub max_text_search_objects: usize,
     /// Fixed number of event-trigger catalog slots.
     pub max_event_triggers: usize,
@@ -530,7 +531,7 @@ impl Config {
             max_publications: 32,
             max_collations: 128,
             max_conversions: 128,
-            max_text_search_objects: 512,
+            max_text_search_objects: 2_560,
             max_event_triggers: 64,
             max_tablespaces: 64,
             max_comments: 64,
@@ -1765,10 +1766,13 @@ impl Config {
                 "max_tablespaces must reserve the two built-in tablespaces".to_string(),
             ));
         }
-        if config.max_text_search_objects < 21 {
+        if config.max_text_search_objects < crate::storage::BUILTIN_TEXT_SEARCH_SLOTS {
             return Err(ConfigError::at(
                 0,
-                "max_text_search_objects must reserve the 21 built-in objects".to_string(),
+                format!(
+                    "max_text_search_objects must reserve the {} built-in objects",
+                    crate::storage::BUILTIN_TEXT_SEARCH_SLOTS
+                ),
             ));
         }
         if config.max_locks_per_transaction == 0 {
@@ -3294,7 +3298,7 @@ sql_arena_bytes = 4096
             .is_err()
         );
         assert!(
-            Config::parse("max_text_search_objects = 20\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nplan_build_bytes = 16MiB\nplan_build_leases = 64\nresult_stream_bytes = 256KiB\nresult_stream_slots = 2\nindex_statistics_slots = 4096\ntrigger_event_spill_bytes = 0\n").is_err()
+            Config::parse("max_text_search_objects = 197\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nplan_build_bytes = 16MiB\nplan_build_leases = 64\nresult_stream_bytes = 256KiB\nresult_stream_slots = 2\nindex_statistics_slots = 4096\ntrigger_event_spill_bytes = 0\n").is_err()
         );
         assert!(
             Config::parse("database_collation_locale = \n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nplan_build_bytes = 16MiB\nplan_build_leases = 64\nresult_stream_bytes = 256KiB\nresult_stream_slots = 2\nindex_statistics_slots = 4096\ntrigger_event_spill_bytes = 0\n").is_err()

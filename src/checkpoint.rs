@@ -7249,22 +7249,19 @@ impl Checkpointer {
                         crate::storage::TextSearchDictionaryBehavior,
                         CheckpointSetupError,
                     > {
-                        Ok(
-                            match parse_field::<u8>(word, "text-search dictionary behavior")? {
-                                0 => crate::storage::TextSearchDictionaryBehavior::Simple {
-                                    accept: true,
-                                },
-                                1 => crate::storage::TextSearchDictionaryBehavior::Simple {
-                                    accept: false,
-                                },
-                                2 => crate::storage::TextSearchDictionaryBehavior::EnglishStem,
-                                _ => {
-                                    return Err(CheckpointSetupError::Corrupt(
-                                        "invalid text-search dictionary behavior",
-                                    ));
-                                }
-                            },
-                        )
+                        let code: u32 = parse_field(word, "text-search dictionary behavior")?;
+                        let [kind, value, stopwords, unused] = code.to_le_bytes();
+                        if unused != 0 {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid text-search dictionary behavior",
+                            ));
+                        }
+                        crate::storage::TextSearchDictionaryBehavior::from_code([
+                            kind, value, stopwords,
+                        ])
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "invalid text-search dictionary behavior",
+                        ))
                     };
                     let definition = match kind {
                         "p" => crate::storage::TextSearchDefinition::Parser {
@@ -7283,7 +7280,13 @@ impl Checkpointer {
                             oid,
                             init: parse_field(words.next(), "text-search template init")?,
                             lexize: parse_field(words.next(), "text-search template lexize")?,
-                            behavior: behavior(words.next())?,
+                            kind: crate::storage::TextSearchTemplateKind::from_code(parse_field(
+                                words.next(),
+                                "text-search template kind",
+                            )?)
+                            .ok_or(CheckpointSetupError::Corrupt(
+                                "invalid text-search template kind",
+                            ))?,
                         },
                         "d" => {
                             let owner = parse_field(words.next(), "text-search dictionary owner")?;
@@ -12368,7 +12371,7 @@ impl Checkpointer {
                     oid,
                     init,
                     lexize,
-                    behavior,
+                    kind,
                 } => write_manifest(
                     &mut self.manifest_output,
                     format_args!(
@@ -12380,7 +12383,7 @@ impl Checkpointer {
                         oid,
                         init,
                         lexize,
-                        text_search_behavior_code(behavior),
+                        kind.code(),
                     ),
                 )?,
                 crate::storage::TextSearchDefinition::Dictionary {
@@ -19568,12 +19571,9 @@ impl core::fmt::Display for ManifestRoutineColumns<'_> {
     }
 }
 
-fn text_search_behavior_code(behavior: crate::storage::TextSearchDictionaryBehavior) -> u8 {
-    match behavior {
-        crate::storage::TextSearchDictionaryBehavior::Simple { accept: true } => 0,
-        crate::storage::TextSearchDictionaryBehavior::Simple { accept: false } => 1,
-        crate::storage::TextSearchDictionaryBehavior::EnglishStem => 2,
-    }
+fn text_search_behavior_code(behavior: crate::storage::TextSearchDictionaryBehavior) -> u32 {
+    let [kind, value, stopwords] = behavior.code();
+    u32::from_le_bytes([kind, value, stopwords, 0])
 }
 
 struct ManifestTextSearchMappings<'a>(&'a crate::storage::TextSearchMappings);

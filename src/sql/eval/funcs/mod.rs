@@ -13,7 +13,7 @@ pub(crate) mod array;
 pub(crate) mod bytea;
 pub(super) mod conditional;
 pub(super) mod datetime;
-pub(super) mod full_text;
+pub(crate) mod full_text;
 pub(crate) mod geometry;
 pub(crate) mod hashing;
 pub(super) mod identity;

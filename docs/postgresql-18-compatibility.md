@@ -774,6 +774,73 @@ literal of an array of a named domain, such as
 AFTER-trigger results already survive waits. Closing these gaps is tracked in
 [PLAN.md](../PLAN.md#pause-and-resume-every-query-path).
 
+## Full-text search languages
+
+Full-text search turns a document into lexemes, the normalized word forms a
+`tsvector` holds. A language's stemmer reduces related forms to one lexeme,
+so `to_tsvector('german', 'Häuser')` is `'haus':1` and matches a query for
+`haus`. Every database has the text search objects PostgreSQL 18.6's initdb
+creates: the `default` parser; the `simple`, `synonym`, `ispell`,
+`thesaurus` and `snowball` templates; the `simple` dictionary and
+configuration; and for each of 29 languages (`arabic` through `yiddish`, as
+`\dF` lists them) a Snowball dictionary `<language>_stem` and a configuration
+`<language>`. Their OIDs, `dictinitoption` text, token mappings (Hindi and
+Russian stem all-ASCII words as English) and descriptions match the
+PostgreSQL 18.6 reference image, so psql's `\dF`, `\dF+`, `\dFd` and `\dFt`
+print the same tables. Each database keeps its own copy of these 66 objects,
+so `max_text_search_objects` must hold 66 per database.
+
+- `CREATE TEXT SEARCH DICTIONARY ... (TEMPLATE = snowball, Language = ...)`
+  accepts the 29 languages and `porter`, the original Porter stemmer
+  PostgreSQL also ships. `StopWords` names one of the 15 shipped stopword
+  lists (`danish`, `dutch`, `english`, `finnish`, `french`, `german`,
+  `hungarian`, `italian`, `nepali`, `norwegian`, `portuguese`, `russian`,
+  `spanish`, `swedish`, `turkish`); the `simple` template accepts `StopWords`
+  and `Accept`. There are no other stopword or dictionary files, so another
+  name fails with `F0000` (`could not open stop-word file`), and a dictionary
+  from the `synonym`, `ispell` or `thesaurus` template fails with `0A000`.
+- Words are lower-cased as under PostgreSQL's C ctype, the only database
+  ctype pos3ql provides: ASCII letters only, so
+  `ts_lexize('german_stem', 'HÄUSER')` is `{hÄus}` in both.
+- `SET default_text_search_config` resolves the configuration and stores its
+  schema-qualified name (`german` becomes `pg_catalog.german`); an unknown
+  configuration fails with `22023`. `text @@ tsquery` uses this setting.
+- Limits: as in PostgreSQL, a word longer than 1,000 bytes skips stemming and
+  stopwords. A word is stemmed in a fixed 4,096-byte buffer; a stem that
+  would outgrow it fails with `54000`, which no word within PostgreSQL's
+  limits reaches.
+
+### Snowball provenance
+
+The stemmers are a statement-for-statement Rust translation of PostgreSQL
+18.6's generated C files, `src/sql/snowball/<language>.rs`, produced by
+`tools/generate-snowball-stemmers.py` from
+[`src/backend/snowball/libstemmer`](https://github.com/postgres/postgres/tree/REL_18_6/src/backend/snowball/libstemmer)
+(each file's SHA-256 is in its header). PostgreSQL synced those files with
+[Snowball](https://snowballstem.org) commit
+[`d19326ac`](https://github.com/snowballstem/snowball/commit/d19326ac6c1b9a417fc872f7c2f845265a5e9ece)
+(2025-02-19; the files say Snowball 2.2.0 generated them).
+`src/sql/snowball/mod.rs` ports Snowball's runtime (`utilities.c`, `api.c`)
+to a fixed buffer and carries Snowball's BSD 3-clause license. The stopword
+lists in `src/sql/snowball/stopwords.rs` come from
+[`src/backend/snowball/stopwords`](https://github.com/postgres/postgres/tree/REL_18_6/src/backend/snowball/stopwords),
+which PostgreSQL took from snowballstem.org under the same license. The
+inputs were read from the `REL_18_6` source archive
+(`https://codeload.github.com/postgres/postgres/tar.gz/refs/tags/REL_18_6`,
+SHA-256 `ff9b1187e3ab120282b9f3e09a5efba2425838b3a843150c5cb2f019f47ac400`,
+retrieved 2026-11-13). Regenerate with:
+
+```sh
+python3 -I tools/generate-snowball-stemmers.py \
+  --source /path/to/postgres-REL_18_6/src/backend/snowball \
+  --output src/sql/snowball
+```
+
+Differential fixture
+`tests/external/differential_exact/390_snowball_text_search.sql` compares
+sample words of every language, configurations, dictionary DDL and psql's
+describe output with PostgreSQL 18.6.
+
 ## Physical access paths
 
 | Method | Supported paths |

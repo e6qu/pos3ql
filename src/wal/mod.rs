@@ -3675,9 +3675,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         common
             + match definition {
                 crate::storage::TextSearchDefinition::Parser { .. } => 20,
-                crate::storage::TextSearchDefinition::Template { .. } => 10,
+                crate::storage::TextSearchDefinition::Template { .. } => 9,
                 crate::storage::TextSearchDefinition::Dictionary { options, .. } => {
-                    8 + 1 + options.as_str().len() + 2
+                    8 + 1 + options.as_str().len() + 3
                 }
                 crate::storage::TextSearchDefinition::Configuration { mappings, .. } => {
                     8 + mappings
@@ -5200,12 +5200,6 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&[value.len() as u8])
                 && buffer.append(value.as_bytes())
         };
-        let behavior = |value| match value {
-            crate::storage::TextSearchDictionaryBehavior::Simple { accept } => {
-                [0, u8::from(accept)]
-            }
-            crate::storage::TextSearchDictionaryBehavior::EnglishStem => [1, 0],
-        };
         let mut ok = name(buffer, definition.schema().as_str())
             && name(buffer, definition.name().as_str())
             && buffer.append(&definition.oid().to_le_bytes());
@@ -5225,14 +5219,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     && buffer.append(&lextypes.to_le_bytes())
             }
             crate::storage::TextSearchDefinition::Template {
-                init,
-                lexize,
-                behavior: executable,
-                ..
+                init, lexize, kind, ..
             } => {
                 buffer.append(&init.to_le_bytes())
                     && buffer.append(&lexize.to_le_bytes())
-                    && buffer.append(&behavior(executable))
+                    && buffer.append(&[kind.code()])
             }
             crate::storage::TextSearchDefinition::Dictionary {
                 owner,
@@ -5244,7 +5235,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 buffer.append(&owner.to_le_bytes())
                     && buffer.append(&template.to_le_bytes())
                     && name(buffer, options.as_str())
-                    && buffer.append(&behavior(executable))
+                    && buffer.append(&executable.code())
             }
             crate::storage::TextSearchDefinition::Configuration {
                 owner,
@@ -11546,14 +11537,10 @@ fn decode_op_inner<'a>(
                 Some(value)
             };
             let read_behavior = |at: &mut usize| {
-                let behavior = match (*payload.get(*at)?, *payload.get(*at + 1)?) {
-                    (0, accept @ 0..=1) => crate::storage::TextSearchDictionaryBehavior::Simple {
-                        accept: accept != 0,
-                    },
-                    (1, 0) => crate::storage::TextSearchDictionaryBehavior::EnglishStem,
-                    _ => return None,
-                };
-                *at += 2;
+                let behavior = crate::storage::TextSearchDictionaryBehavior::from_code(
+                    payload.get(*at..*at + 3)?.try_into().ok()?,
+                )?;
+                *at += 3;
                 Some(behavior)
             };
             let definition = match object_kind {
@@ -11573,7 +11560,13 @@ fn decode_op_inner<'a>(
                     oid,
                     init: read_i32(&mut at)?,
                     lexize: read_i32(&mut at)?,
-                    behavior: read_behavior(&mut at)?,
+                    kind: {
+                        let kind = crate::storage::TextSearchTemplateKind::from_code(
+                            *payload.get(at)?,
+                        )?;
+                        at += 1;
+                        kind
+                    },
                 },
                 2 => {
                     let owner = read_i32(&mut at)?;

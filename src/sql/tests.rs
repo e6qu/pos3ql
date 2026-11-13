@@ -69512,7 +69512,8 @@ fn configured_database_and_schema_capacities_survive_publication_and_object_cold
     let mut config = test_config("database-schema-capacities");
     config.max_databases = 3 + USER_DATABASES;
     config.max_schemas = 3 + USER_DATABASES + USER_SCHEMAS;
-    config.max_text_search_objects = 21 + 7 * USER_DATABASES;
+    config.max_text_search_objects = crate::storage::BUILTIN_TEXT_SEARCH_SLOTS
+        + crate::storage::BUILTIN_TEXT_SEARCH_OBJECTS * USER_DATABASES;
     config.wal_buffer_bytes = 4 << 20;
     config.checkpoint_manifest_bytes = 4 << 20;
     config.object_store_on = true;
@@ -69910,7 +69911,7 @@ fn startup_sized_metadata_catalogs_exhaust_and_survive_object_cold_recovery() {
     config.max_tables = 4;
     config.max_collations = COLLATIONS;
     config.max_conversions = CONVERSIONS;
-    config.max_text_search_objects = 21 + TEXT_DICTIONARIES;
+    config.max_text_search_objects = crate::storage::BUILTIN_TEXT_SEARCH_SLOTS + TEXT_DICTIONARIES;
     config.max_event_triggers = EVENT_TRIGGERS;
     config.max_tablespaces = 2 + TABLESPACES;
     config.max_comments = TABLESPACES;

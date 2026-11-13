@@ -3862,6 +3862,143 @@ impl CollationDef {
 
 pub(crate) const MAX_CATALOG_CREATION: u64 = 9_999_999;
 
+/// Text search objects initdb creates in every database: the default parser,
+/// five templates, the `simple` dictionary and configuration, then a Snowball
+/// dictionary and configuration for each of PostgreSQL's 29 languages
+/// (`snowball_create.sql`). The Snowball OIDs follow the PostgreSQL 18.6
+/// reference image, where initdb numbers them after the platform collations.
+pub(crate) const BUILTIN_TEXT_SEARCH_OBJECTS: usize = 8 + 2 * SNOWBALL_CONFIGURATIONS;
+// Database identity checks track the built-in objects in a `u128` bitmap.
+const _: () = assert!(BUILTIN_TEXT_SEARCH_OBJECTS <= 128);
+/// Slots the built-in objects of `postgres`, `template1` and `template0` take.
+pub(crate) const BUILTIN_TEXT_SEARCH_SLOTS: usize = 3 * BUILTIN_TEXT_SEARCH_OBJECTS;
+const SNOWBALL_CONFIGURATIONS: usize = 29;
+const FIRST_SNOWBALL_DICTIONARY_OID: i32 = 13_235;
+
+/// The languages with a built-in Snowball configuration, in initdb's order.
+pub(crate) fn builtin_snowball_languages()
+-> impl Iterator<Item = crate::sql::snowball::SnowballLanguage> {
+    crate::sql::snowball::SnowballLanguage::ALL
+        .iter()
+        .copied()
+        .filter(|language| *language != crate::sql::snowball::SnowballLanguage::Porter)
+}
+
+pub(crate) fn builtin_text_search_definition(ordinal: usize) -> Option<TextSearchDefinition> {
+    use crate::sql::snowball::{SnowballLanguage, StopwordList};
+    use core::fmt::Write as _;
+    let pg_catalog = SqlName::parse("pg_catalog").expect("builtin schema fits");
+    let name = |value: &str| SqlName::parse(value).expect("builtin name fits");
+    let template = |value, oid, kind| {
+        let (_, init, lexize) = TextSearchTemplateKind::ALL
+            .into_iter()
+            .find(|(candidate, ..)| *candidate == kind)
+            .expect("listed template kind");
+        TextSearchDefinition::Template {
+            schema: pg_catalog,
+            name: name(value),
+            oid,
+            init,
+            lexize,
+            kind,
+        }
+    };
+    let mut simple_mappings = TextSearchMappings::EMPTY;
+    for token in [1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22] {
+        simple_mappings.dictionaries[token - 1][0] = 3765;
+        simple_mappings.counts[token - 1] = 1;
+    }
+    Some(match ordinal {
+        0 => TextSearchDefinition::Parser {
+            schema: pg_catalog,
+            name: name("default"),
+            oid: 3722,
+            start: 3717,
+            gettoken: 3718,
+            end: 3719,
+            headline: 3720,
+            lextypes: 3721,
+        },
+        1 => template("simple", 3727, TextSearchTemplateKind::Simple),
+        2 => template("synonym", 3730, TextSearchTemplateKind::Synonym),
+        3 => template("ispell", 3733, TextSearchTemplateKind::Ispell),
+        4 => template("thesaurus", 3742, TextSearchTemplateKind::Thesaurus),
+        5 => template("snowball", 13_234, TextSearchTemplateKind::Snowball),
+        6 => TextSearchDefinition::Dictionary {
+            schema: pg_catalog,
+            name: name("simple"),
+            oid: 3765,
+            owner: 10,
+            template: 3727,
+            options: StackStr::new(),
+            behavior: TextSearchDictionaryBehavior::SIMPLE,
+        },
+        7 => TextSearchDefinition::Configuration {
+            schema: pg_catalog,
+            name: name("simple"),
+            oid: 3748,
+            owner: 10,
+            parser: 3722,
+            mappings: simple_mappings,
+        },
+        _ => {
+            let index = (ordinal - 8) / 2;
+            let language = builtin_snowball_languages().nth(index)?;
+            let dictionary_oid = |language: SnowballLanguage| {
+                let index = builtin_snowball_languages()
+                    .position(|candidate| candidate == language)
+                    .expect("built-in language");
+                FIRST_SNOWBALL_DICTIONARY_OID + 2 * index as i32
+            };
+            let mut text = StackStr::<64>::new();
+            if (ordinal - 8) % 2 == 0 {
+                let stopwords = StopwordList::parse(language.name());
+                let mut options = StackStr::<512>::new();
+                let _ = write!(options, "language = '{}'", language.name());
+                if let Some(list) = stopwords {
+                    let _ = write!(options, ", stopwords = '{}'", list.name());
+                }
+                let _ = write!(text, "{}_stem", language.name());
+                TextSearchDefinition::Dictionary {
+                    schema: pg_catalog,
+                    name: name(text.as_str()),
+                    oid: dictionary_oid(language),
+                    owner: 10,
+                    template: 13_234,
+                    options,
+                    behavior: TextSearchDictionaryBehavior::Snowball {
+                        language,
+                        stopwords,
+                    },
+                }
+            } else {
+                // Hindi and Russian stem all-ASCII words as English.
+                let ascii = match language {
+                    SnowballLanguage::Hindi | SnowballLanguage::Russian => {
+                        SnowballLanguage::English
+                    }
+                    other => other,
+                };
+                let mut mappings = simple_mappings;
+                for token in [1usize, 11, 16] {
+                    mappings.dictionaries[token - 1][0] = dictionary_oid(ascii);
+                }
+                for token in [2usize, 10, 17] {
+                    mappings.dictionaries[token - 1][0] = dictionary_oid(language);
+                }
+                TextSearchDefinition::Configuration {
+                    schema: pg_catalog,
+                    name: name(language.name()),
+                    oid: dictionary_oid(language) + 1,
+                    owner: 10,
+                    parser: 3722,
+                    mappings,
+                }
+            }
+        }
+    })
+}
+
 #[derive(Clone, Copy)]
 enum TextSearchIdentity {
     Builtin { oid: i32, ordinal: u8 },
@@ -3880,22 +4017,18 @@ impl TextSearchIdentity {
             }
             return Ok(Self::Created(created));
         }
-        use crate::sql::ast::TextSearchObjectKind as Kind;
-        let ordinal = match (definition.kind(), definition.oid()) {
-            (Kind::Parser, 3722) => 0,
-            (Kind::Template, 3727) => 1,
-            (Kind::Template, 13_234) => 2,
-            (Kind::Dictionary, 3765) => 3,
-            (Kind::Dictionary, 13_247) => 4,
-            (Kind::Configuration, 3748) => 5,
-            (Kind::Configuration, 13_248) => 6,
-            _ => {
-                return Err(sql_err!(
+        let ordinal = (0..BUILTIN_TEXT_SEARCH_OBJECTS)
+            .find(|ordinal| {
+                builtin_text_search_definition(*ordinal).is_some_and(|builtin| {
+                    builtin.kind() == definition.kind() && builtin.oid() == definition.oid()
+                })
+            })
+            .ok_or_else(|| {
+                sql_err!(
                     sqlstate::DATA_EXCEPTION,
                     "stored text search object has no valid builtin or creation identity"
-                ));
-            }
-        };
+                )
+            })? as u8;
         Ok(Self::Builtin {
             oid: definition.oid(),
             ordinal,
@@ -3926,10 +4059,110 @@ fn text_search_lifetime_oid(
 pub(crate) const TEXT_SEARCH_TOKEN_TYPES: usize = 23;
 pub(crate) const TEXT_SEARCH_DICTIONARIES_PER_TOKEN: usize = 4;
 
+/// The dictionary kind a text search template's support routines implement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextSearchTemplateKind {
+    Simple,
+    Synonym,
+    Ispell,
+    Thesaurus,
+    Snowball,
+}
+
+impl TextSearchTemplateKind {
+    const ALL: [(Self, i32, i32); 5] = [
+        (Self::Simple, 3725, 3726),
+        (Self::Synonym, 3728, 3729),
+        (Self::Ispell, 3731, 3732),
+        (Self::Thesaurus, 3740, 3741),
+        (Self::Snowball, 13_232, 13_233),
+    ];
+
+    /// The kind whose `init` and `lexize` routines these are; `init` is
+    /// optional for the simple template, as in PostgreSQL's catalog.
+    pub(crate) fn from_routines(init: i32, lexize: i32) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .find(|(kind, kind_init, kind_lexize)| {
+                lexize == *kind_lexize
+                    && (init == *kind_init || (init == 0 && *kind == Self::Simple))
+            })
+            .map(|(kind, ..)| *kind)
+    }
+
+    pub(crate) fn code(self) -> u8 {
+        Self::ALL
+            .iter()
+            .position(|(kind, ..)| *kind == self)
+            .expect("listed template kind") as u8
+    }
+
+    pub(crate) fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(code)).map(|(kind, ..)| *kind)
+    }
+}
+
+/// How a text search dictionary turns a token into lexemes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TextSearchDictionaryBehavior {
-    Simple { accept: bool },
-    EnglishStem,
+    Simple {
+        accept: bool,
+        stopwords: Option<crate::sql::snowball::StopwordList>,
+    },
+    Snowball {
+        language: crate::sql::snowball::SnowballLanguage,
+        stopwords: Option<crate::sql::snowball::StopwordList>,
+    },
+}
+
+impl TextSearchDictionaryBehavior {
+    pub(crate) const SIMPLE: Self = Self::Simple {
+        accept: true,
+        stopwords: None,
+    };
+
+    /// Stable encoding: kind, then accept or language, then stopword list.
+    pub(crate) fn code(self) -> [u8; 3] {
+        let stopwords = |list: Option<crate::sql::snowball::StopwordList>| {
+            list.map_or(0, |list| {
+                1 + crate::sql::snowball::StopwordList::ALL
+                    .iter()
+                    .position(|candidate| *candidate == list)
+                    .expect("listed stopword file") as u8
+            })
+        };
+        match self {
+            Self::Simple { accept, stopwords: list } => [0, u8::from(accept), stopwords(list)],
+            Self::Snowball { language, stopwords: list } => [
+                1,
+                crate::sql::snowball::SnowballLanguage::ALL
+                    .iter()
+                    .position(|candidate| *candidate == language)
+                    .expect("listed Snowball language") as u8,
+                stopwords(list),
+            ],
+        }
+    }
+
+    pub(crate) fn from_code(code: [u8; 3]) -> Option<Self> {
+        let stopwords = match code[2] {
+            0 => None,
+            list => Some(
+                *crate::sql::snowball::StopwordList::ALL.get(usize::from(list) - 1)?,
+            ),
+        };
+        match code[0] {
+            0 if code[1] <= 1 => Some(Self::Simple {
+                accept: code[1] == 1,
+                stopwords,
+            }),
+            1 => Some(Self::Snowball {
+                language: *crate::sql::snowball::SnowballLanguage::ALL.get(usize::from(code[1]))?,
+                stopwords,
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3963,7 +4196,7 @@ pub(crate) enum TextSearchDefinition {
         oid: i32,
         init: i32,
         lexize: i32,
-        behavior: TextSearchDictionaryBehavior,
+        kind: TextSearchTemplateKind,
     },
     Dictionary {
         schema: SqlName,
@@ -4019,18 +4252,8 @@ impl TextSearchDefinition {
                     && matches!(headline, 0 | 3720)
             }
             Self::Template {
-                init,
-                lexize,
-                behavior,
-                ..
-            } => matches!(
-                (init, lexize, behavior),
-                (
-                    0 | 3725,
-                    3726,
-                    TextSearchDictionaryBehavior::Simple { accept: true }
-                ) | (13_232, 13_233, TextSearchDictionaryBehavior::EnglishStem)
-            ),
+                init, lexize, kind, ..
+            } => TextSearchTemplateKind::from_routines(init, lexize) == Some(kind),
             Self::Dictionary { .. } => true,
             Self::Configuration { mappings, .. } => (0..TEXT_SEARCH_TOKEN_TYPES).all(|token| {
                 usize::from(mappings.counts[token]) <= TEXT_SEARCH_DICTIONARIES_PER_TOKEN
@@ -5147,7 +5370,12 @@ impl StoredDependencyIdentity {
             Self::Collation(_) => class == DependencyClass::Collation,
             Self::TextSearchConfigurationOid(oid) => {
                 class == DependencyClass::TextSearchConfiguration
-                    && (matches!(oid, 3748 | 13_248) || (700_000_001..=709_999_999).contains(&oid))
+                    && ((0..BUILTIN_TEXT_SEARCH_OBJECTS).any(|ordinal| {
+                        builtin_text_search_definition(ordinal).is_some_and(|builtin| {
+                            builtin.kind() == crate::sql::ast::TextSearchObjectKind::Configuration
+                                && builtin.oid() == oid
+                        })
+                    }) || (700_000_001..=709_999_999).contains(&oid))
             }
             Self::RoutineOid(oid) => {
                 class == DependencyClass::Routine
@@ -22531,93 +22759,23 @@ impl Storage {
                 .push(TextSearchDef::EMPTY)
                 .expect("sized to text search capacity");
         }
-        let pg_catalog = SqlName::parse("pg_catalog").expect("builtin schema fits");
-        let present = |definition| TextSearchDef {
-            database: DatabaseOid::POSTGRES,
-            created_at: 0,
-            definition,
-            pending: None,
-            ddl_state: CatalogDdlState::Present,
-        };
-        text_search_objects[0] = present(TextSearchDefinition::Parser {
-            schema: pg_catalog,
-            name: SqlName::parse("default").expect("builtin name fits"),
-            oid: 3722,
-            start: 3717,
-            gettoken: 3718,
-            end: 3719,
-            headline: 3720,
-            lextypes: 3721,
-        });
-        text_search_objects[1] = present(TextSearchDefinition::Template {
-            schema: pg_catalog,
-            name: SqlName::parse("simple").expect("builtin name fits"),
-            oid: 3727,
-            init: 3725,
-            lexize: 3726,
-            behavior: TextSearchDictionaryBehavior::Simple { accept: true },
-        });
-        text_search_objects[2] = present(TextSearchDefinition::Template {
-            schema: pg_catalog,
-            name: SqlName::parse("snowball").expect("builtin name fits"),
-            oid: 13_234,
-            init: 13_232,
-            lexize: 13_233,
-            behavior: TextSearchDictionaryBehavior::EnglishStem,
-        });
-        text_search_objects[3] = present(TextSearchDefinition::Dictionary {
-            schema: pg_catalog,
-            name: SqlName::parse("simple").expect("builtin name fits"),
-            oid: 3765,
-            owner: 10,
-            template: 3727,
-            options: StackStr::new(),
-            behavior: TextSearchDictionaryBehavior::Simple { accept: true },
-        });
-        text_search_objects[4] = present(TextSearchDefinition::Dictionary {
-            schema: pg_catalog,
-            name: SqlName::parse("english_stem").expect("builtin name fits"),
-            oid: 13_247,
-            owner: 10,
-            template: 13_234,
-            options: StackStr::from_str("language = 'english', stopwords = 'english'"),
-            behavior: TextSearchDictionaryBehavior::EnglishStem,
-        });
-        let mut simple_mappings = TextSearchMappings::EMPTY;
-        for token in [
-            1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22,
-        ] {
-            simple_mappings.dictionaries[token - 1][0] = 3765;
-            simple_mappings.counts[token - 1] = 1;
-        }
-        text_search_objects[5] = present(TextSearchDefinition::Configuration {
-            schema: pg_catalog,
-            name: SqlName::parse("simple").expect("builtin name fits"),
-            oid: 3748,
-            owner: 10,
-            parser: 3722,
-            mappings: simple_mappings,
-        });
-        let mut english_mappings = simple_mappings;
-        for token in [1usize, 2, 10, 11, 16, 17] {
-            english_mappings.dictionaries[token - 1][0] = 13_247;
-        }
-        text_search_objects[6] = present(TextSearchDefinition::Configuration {
-            schema: pg_catalog,
-            name: SqlName::parse("english").expect("builtin name fits"),
-            oid: 13_248,
-            owner: 10,
-            parser: 3722,
-            mappings: english_mappings,
-        });
-        for (database, offset) in [
-            (DatabaseOid::TEMPLATE1, 7usize),
-            (DatabaseOid::TEMPLATE0, 14usize),
-        ] {
-            for builtin in 0..7 {
-                let mut definition = text_search_objects[builtin];
-                definition.database = database;
-                text_search_objects[offset + builtin] = definition;
+        for (offset, database) in [
+            DatabaseOid::POSTGRES,
+            DatabaseOid::TEMPLATE1,
+            DatabaseOid::TEMPLATE0,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for ordinal in 0..BUILTIN_TEXT_SEARCH_OBJECTS {
+                text_search_objects[offset * BUILTIN_TEXT_SEARCH_OBJECTS + ordinal] = TextSearchDef {
+                    database,
+                    created_at: 0,
+                    definition: builtin_text_search_definition(ordinal)
+                        .expect("ordinal below the builtin count"),
+                    pending: None,
+                    ddl_state: CatalogDdlState::Present,
+                };
             }
         }
         let mut event_triggers =

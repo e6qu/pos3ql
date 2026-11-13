@@ -43356,6 +43356,12 @@ fn text_search_support_routine(name: QualName<'_>) -> Result<i32, SqlError> {
         "prsd_lextype" => Ok(3721),
         "dsimple_init" => Ok(3725),
         "dsimple_lexize" => Ok(3726),
+        "dsynonym_init" => Ok(3728),
+        "dsynonym_lexize" => Ok(3729),
+        "dispell_init" => Ok(3731),
+        "dispell_lexize" => Ok(3732),
+        "thesaurus_init" => Ok(3740),
+        "thesaurus_lexize" => Ok(3741),
         "dsnowball_init" => Ok(13_232),
         "dsnowball_lexize" => Ok(13_233),
         _ => Err(sql_err!(
@@ -43591,25 +43597,20 @@ pub fn create_text_search_template(
             .transpose()?
             .unwrap_or(0);
         let lexize = text_search_support_routine(command.lexize)?;
-        let behavior = match (init, lexize) {
-            (0 | 3725, 3726) => {
-                crate::storage::TextSearchDictionaryBehavior::Simple { accept: true }
-            }
-            (13_232, 13_233) => crate::storage::TextSearchDictionaryBehavior::EnglishStem,
-            _ => {
-                return Err(sql_err!(
+        let kind = crate::storage::TextSearchTemplateKind::from_routines(init, lexize)
+            .ok_or_else(|| {
+                sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "text search template support routine combination is not executable"
-                ));
-            }
-        };
+                )
+            })?;
         Ok(crate::storage::TextSearchDefinition::Template {
             schema,
             name,
             oid: 0,
             init,
             lexize,
-            behavior,
+            kind,
         })
     })();
     if let Err(error) = definition
@@ -43621,96 +43622,293 @@ pub fn create_text_search_template(
     sql_ok()
 }
 
-fn dictionary_definition(
+const MAX_DICTIONARY_OPTIONS: usize = 32;
+
+/// A dictionary's options in order, as `pg_ts_dict.dictinitoption` holds them.
+struct DictionaryOptions {
+    entries: [(StackStr<64>, StackStr<512>); MAX_DICTIONARY_OPTIONS],
+    count: usize,
+}
+
+impl DictionaryOptions {
+    fn new() -> Self {
+        Self {
+            entries: [(StackStr::new(), StackStr::new()); MAX_DICTIONARY_OPTIONS],
+            count: 0,
+        }
+    }
+
+    fn too_long() -> SqlError {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "text search dictionary options exceed the catalog limit"
+        )
+    }
+
+    fn push(&mut self, name: &str, value: &str) -> Result<(), SqlError> {
+        let slot = self.entries.get_mut(self.count).ok_or_else(Self::too_long)?;
+        *slot = (StackStr::from_str(name), StackStr::from_str(value));
+        if slot.0.is_truncated() || slot.1.is_truncated() {
+            return Err(Self::too_long());
+        }
+        self.count += 1;
+        Ok(())
+    }
+
+    fn remove(&mut self, name: &str) {
+        let mut kept = 0;
+        for index in 0..self.count {
+            if self.entries[index].0.as_str() != name {
+                self.entries[kept] = self.entries[index];
+                kept += 1;
+            }
+        }
+        self.count = kept;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries[..self.count]
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+
+    /// Reads back what `render` stored.
+    fn parse_stored(text: &str) -> Result<Self, SqlError> {
+        use core::fmt::Write as _;
+        let malformed = || {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "stored text search dictionary options are malformed"
+            )
+        };
+        let mut options = Self::new();
+        let mut rest = text;
+        while !rest.is_empty() {
+            let mut name = StackStr::<64>::new();
+            if let Some(quoted) = rest.strip_prefix('"') {
+                let mut chars = quoted.char_indices();
+                loop {
+                    let (at, character) = chars.next().ok_or_else(malformed)?;
+                    if character == '"' {
+                        if quoted[at + 1..].starts_with('"') {
+                            chars.next();
+                        } else {
+                            rest = &quoted[at + 1..];
+                            break;
+                        }
+                    }
+                    let _ = name.write_char(character);
+                }
+            } else {
+                let end = rest.find(" = ").ok_or_else(malformed)?;
+                let _ = name.write_str(&rest[..end]);
+                rest = &rest[end..];
+            }
+            rest = rest.strip_prefix(" = ").ok_or_else(malformed)?;
+            let mut value = StackStr::<512>::new();
+            let escaped = rest.starts_with("E'");
+            if let Some(quoted) = rest.strip_prefix(if escaped { "E'" } else { "'" }) {
+                let mut chars = quoted.char_indices();
+                loop {
+                    let (at, character) = chars.next().ok_or_else(malformed)?;
+                    if character == '\'' || (escaped && character == '\\') {
+                        if quoted[at + 1..].starts_with(character) {
+                            chars.next();
+                        } else if character == '\'' {
+                            rest = &quoted[at + 1..];
+                            break;
+                        } else {
+                            return Err(malformed());
+                        }
+                    }
+                    let _ = value.write_char(character);
+                }
+            } else {
+                let end = rest.find(", ").unwrap_or(rest.len());
+                let _ = value.write_str(&rest[..end]);
+                rest = &rest[end..];
+            }
+            options.push(name.as_str(), value.as_str())?;
+            if !rest.is_empty() {
+                rest = rest.strip_prefix(", ").ok_or_else(malformed)?;
+            }
+        }
+        Ok(options)
+    }
+
+    /// `serialize_deflist`: quoted names and string values, `E''` when a
+    /// value holds a backslash.
+    fn render(&self) -> Result<StackStr<512>, SqlError> {
+        use core::fmt::Write as _;
+        let mut rendered = StackStr::<512>::new();
+        for (index, (name, value)) in self.iter().enumerate() {
+            if index > 0 {
+                let _ = rendered.write_str(", ");
+            }
+            let _ = write!(
+                rendered,
+                "{} = ",
+                crate::sql::eval::args::quote_identifier(name).as_str()
+            );
+            if value.contains('\\') {
+                let _ = rendered.write_char('E');
+            }
+            let _ = rendered.write_char('\'');
+            for character in value.chars() {
+                if matches!(character, '\'' | '\\') {
+                    let _ = rendered.write_char(character);
+                }
+                let _ = rendered.write_char(character);
+            }
+            let _ = rendered.write_char('\'');
+        }
+        if rendered.is_truncated() {
+            return Err(Self::too_long());
+        }
+        Ok(rendered)
+    }
+}
+
+/// `readstoplist`'s file lookup: an empty name loads no stopwords.
+fn stopword_file(name: &str) -> Result<Option<crate::sql::snowball::StopwordList>, SqlError> {
+    if name.is_empty() {
+        return Ok(None);
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "invalid text search configuration file name \"{}\"",
+            name
+        ));
+    }
+    crate::sql::snowball::StopwordList::parse(name)
+        .map(Some)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::CONFIG_FILE_ERROR,
+                "could not open stop-word file \"tsearch_data/{}.stop\": No such file or directory",
+                name
+            )
+        })
+}
+
+/// Runs the template's init routine (`dsimple_init`, `dsnowball_init`) over
+/// the options, reporting their errors as PostgreSQL does.
+fn dictionary_behavior(
     template: crate::storage::TextSearchDefinition,
-    options: &[crate::sql::ast::TextSearchOption<'_>],
-) -> Result<(crate::storage::TextSearchDictionaryBehavior, StackStr<512>), SqlError> {
-    use core::fmt::Write as _;
-    let crate::storage::TextSearchDefinition::Template { behavior, .. } = template else {
+    options: &DictionaryOptions,
+) -> Result<crate::storage::TextSearchDictionaryBehavior, SqlError> {
+    use crate::storage::{TextSearchDictionaryBehavior as Behavior, TextSearchTemplateKind as Kind};
+    let crate::storage::TextSearchDefinition::Template { kind, name, .. } = template else {
         return Err(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
             "object is not a text search template"
         ));
     };
-    let mut rendered = StackStr::<512>::new();
-    let executable = match behavior {
-        crate::storage::TextSearchDictionaryBehavior::Simple { .. } => {
-            let mut accept = true;
-            for option in options {
-                if !option.name.eq_ignore_ascii_case("accept") {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "unrecognized simple dictionary parameter: {}",
-                        option.name
-                    ));
-                }
-                accept = match option.value {
-                    value if value.eq_ignore_ascii_case("true") => true,
-                    value if value.eq_ignore_ascii_case("false") => false,
+    let multiple = |parameter: &str| {
+        sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "multiple {} parameters",
+            parameter
+        )
+    };
+    match kind {
+        Kind::Simple => {
+            let (mut accept, mut accept_loaded) = (true, false);
+            let (mut stopwords, mut stop_loaded) = (None, false);
+            for (option, value) in options.iter() {
+                match option {
+                    "stopwords" if stop_loaded => return Err(multiple("StopWords")),
+                    "stopwords" => {
+                        stopwords = stopword_file(value)?;
+                        stop_loaded = true;
+                    }
+                    "accept" if accept_loaded => return Err(multiple("Accept")),
+                    "accept" => {
+                        accept = match value.to_ascii_lowercase().as_str() {
+                            "true" | "on" | "1" => true,
+                            "false" | "off" | "0" => false,
+                            _ => {
+                                return Err(sql_err!(
+                                    sqlstate::SYNTAX_ERROR,
+                                    "accept requires a Boolean value"
+                                ));
+                            }
+                        };
+                        accept_loaded = true;
+                    }
                     _ => {
                         return Err(sql_err!(
                             sqlstate::INVALID_PARAMETER_VALUE,
-                            "invalid Accept value: {}",
-                            option.value
+                            "unrecognized simple dictionary parameter: \"{}\"",
+                            option
                         ));
                     }
-                };
-                let _ = write!(
-                    rendered,
-                    "accept = '{}'",
-                    if accept { "true" } else { "false" }
-                );
-            }
-            crate::storage::TextSearchDictionaryBehavior::Simple { accept }
-        }
-        crate::storage::TextSearchDictionaryBehavior::EnglishStem => {
-            let mut language = false;
-            let mut stopwords = false;
-            for option in options {
-                if option.name.eq_ignore_ascii_case("language") {
-                    if !option.value.eq_ignore_ascii_case("english") {
-                        return Err(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "only the English Snowball dictionary is executable"
-                        ));
-                    }
-                    language = true;
-                } else if option.name.eq_ignore_ascii_case("stopwords") {
-                    if !option.value.eq_ignore_ascii_case("english") {
-                        return Err(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "only PostgreSQL's English stopword file is available"
-                        ));
-                    }
-                    stopwords = true;
-                } else {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "unrecognized Snowball dictionary parameter: {}",
-                        option.name
-                    ));
                 }
             }
-            if !language {
-                return Err(sql_err!(
+            Ok(Behavior::Simple { accept, stopwords })
+        }
+        Kind::Snowball => {
+            let (mut language, mut stopwords, mut stop_loaded) = (None, None, false);
+            for (option, value) in options.iter() {
+                match option {
+                    "stopwords" if stop_loaded => return Err(multiple("StopWords")),
+                    "stopwords" => {
+                        stopwords = stopword_file(value)?;
+                        stop_loaded = true;
+                    }
+                    "language" if language.is_some() => return Err(multiple("Language")),
+                    "language" => {
+                        language = Some(crate::sql::snowball::SnowballLanguage::parse(value).ok_or_else(
+                            || {
+                                sql_err!(
+                                    sqlstate::UNDEFINED_OBJECT,
+                                    "no Snowball stemmer available for language \"{}\" and encoding \"UTF8\"",
+                                    value
+                                )
+                            },
+                        )?);
+                    }
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::INVALID_PARAMETER_VALUE,
+                            "unrecognized Snowball parameter: \"{}\"",
+                            option
+                        ));
+                    }
+                }
+            }
+            let language = language.ok_or_else(|| {
+                sql_err!(
                     sqlstate::INVALID_PARAMETER_VALUE,
                     "missing Language parameter"
-                ));
-            }
-            let _ = rendered.write_str("language = 'english'");
-            if stopwords {
-                let _ = rendered.write_str(", stopwords = 'english'");
-            }
-            crate::storage::TextSearchDictionaryBehavior::EnglishStem
+                )
+            })?;
+            Ok(Behavior::Snowball {
+                language,
+                stopwords,
+            })
         }
-    };
-    if rendered.is_truncated() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "text search dictionary options exceed the catalog limit"
-        ));
+        Kind::Synonym | Kind::Ispell | Kind::Thesaurus => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "text search dictionaries using template \"{}\" are not supported: pos3ql ships no dictionary files",
+            name.as_str()
+        )),
     }
-    Ok((executable, rendered))
+}
+
+fn dictionary_definition(
+    template: crate::storage::TextSearchDefinition,
+    options: &[crate::sql::ast::TextSearchOption<'_>],
+) -> Result<(crate::storage::TextSearchDictionaryBehavior, StackStr<512>), SqlError> {
+    let mut entries = DictionaryOptions::new();
+    for option in options {
+        entries.push(option.name, option.value)?;
+    }
+    Ok((dictionary_behavior(template, &entries)?, entries.render()?))
 }
 
 pub fn create_text_search_dictionary(
@@ -43914,6 +44112,7 @@ pub fn alter_text_search(
                 let crate::storage::TextSearchDefinition::Dictionary {
                     behavior,
                     options: stored_options,
+                    template,
                     ..
                 } = &mut definition
                 else {
@@ -43922,52 +44121,33 @@ pub fn alter_text_search(
                         "object is not a dictionary"
                     ));
                 };
-                use core::fmt::Write as _;
-                match behavior {
-                    crate::storage::TextSearchDictionaryBehavior::Simple { accept } => {
-                        for option in options {
-                            if !option.name.eq_ignore_ascii_case("accept") {
-                                return Err(sql_err!(
-                                    sqlstate::INVALID_PARAMETER_VALUE,
-                                    "unrecognized simple dictionary parameter: {}",
-                                    option.name
-                                ));
-                            }
-                            *accept = if option.value.eq_ignore_ascii_case("true") {
-                                true
-                            } else if option.value.eq_ignore_ascii_case("false") {
-                                false
-                            } else {
-                                return Err(sql_err!(
-                                    sqlstate::INVALID_PARAMETER_VALUE,
-                                    "invalid Accept value: {}",
-                                    option.value
-                                ));
-                            };
-                        }
-                        stored_options.clear();
-                        let _ = write!(
-                            stored_options,
-                            "accept = '{}'",
-                            if *accept { "true" } else { "false" }
-                        );
-                    }
-                    crate::storage::TextSearchDictionaryBehavior::EnglishStem => {
-                        for option in options {
-                            if !(option.name.eq_ignore_ascii_case("language")
-                                || option.name.eq_ignore_ascii_case("stopwords"))
-                                || !option.value.eq_ignore_ascii_case("english")
-                            {
-                                return Err(sql_err!(
-                                    sqlstate::FEATURE_NOT_SUPPORTED,
-                                    "only PostgreSQL's English Snowball dictionary is executable"
-                                ));
-                            }
-                        }
-                        *stored_options =
-                            StackStr::from_str("language = 'english', stopwords = 'english'");
-                    }
+                // `AlterTSDictionary`: a new option replaces every stored
+                // option of that name and goes to the end.
+                let mut merged = DictionaryOptions::parse_stored(stored_options.as_str())?;
+                for option in options {
+                    merged.remove(option.name);
+                    merged.push(option.name, option.value)?;
                 }
+                let template_slot = storage
+                    .text_search_slot_by_oid(
+                        crate::sql::ast::TextSearchObjectKind::Template,
+                        *template,
+                        txn.txid,
+                    )
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "text search template with OID {} does not exist",
+                            *template
+                        )
+                    })?;
+                *behavior = dictionary_behavior(
+                    storage
+                        .text_search_object(template_slot)
+                        .definition_for(txn.txid),
+                    &merged,
+                )?;
+                *stored_options = merged.render()?;
             }
             crate::sql::ast::AlterTextSearchAction::ConfigurationMapping(mapping) => {
                 let crate::storage::TextSearchDefinition::Configuration { mappings, .. } =

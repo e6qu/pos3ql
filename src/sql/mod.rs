@@ -88,6 +88,7 @@ pub(crate) mod type_inputs;
 pub(crate) mod type_layouts;
 pub mod types;
 pub mod tzif;
+pub(crate) mod snowball;
 pub(crate) mod unicode;
 mod unicode_data;
 pub mod xml;
@@ -10547,6 +10548,22 @@ impl Engine {
             responder.command_complete("SET")?;
             return Ok(Ok(()));
         }
+        // PostgreSQL resolves the configuration when it is set and keeps its
+        // schema-qualified name.
+        let canonical_config;
+        let value = if syntax == ast::SettingSyntax::DecodedValue
+            && name.eq_ignore_ascii_case("default_text_search_config")
+        {
+            match canonical_text_search_config(&self.storage, txn.txid, value) {
+                Ok(canonical) => {
+                    canonical_config = canonical;
+                    canonical_config.as_str()
+                }
+                Err(error) => return Ok(Err(error)),
+            }
+        } else {
+            value
+        };
         let changed = match syntax {
             ast::SettingSyntax::DecodedValue => {
                 guc.set_config(name, Some(value), local).map(|_| ())
@@ -32314,4 +32331,60 @@ fn rule_insert_target<'a>(
             })?;
     }
     Ok(query::RuleInsertTarget { names, type_oids })
+}
+
+/// `check_default_text_search_config`: the configuration named by `value` on
+/// the search path, as `schema.name`.
+fn canonical_text_search_config(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    value: &str,
+) -> Result<crate::util::StackStr<128>, SqlError> {
+    use core::fmt::Write as _;
+    let invalid = || {
+        sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "invalid value for parameter \"default_text_search_config\": \"{}\"",
+            value
+        )
+    };
+    let identifier = |part: &str| -> Option<crate::util::StackStr<64>> {
+        let mut out = crate::util::StackStr::<64>::new();
+        if let Some(quoted) = part.strip_prefix('"').and_then(|part| part.strip_suffix('"')) {
+            let mut previous_quote = false;
+            for character in quoted.chars() {
+                if character == '"' && previous_quote {
+                    previous_quote = false;
+                    continue;
+                }
+                previous_quote = character == '"';
+                let _ = out.write_char(character);
+            }
+        } else {
+            for character in part.chars() {
+                let _ = out.write_char(character.to_ascii_lowercase());
+            }
+        }
+        (!out.is_empty() && !out.is_truncated()).then_some(out)
+    };
+    let (schema, name) = catalog::split_qualified_name(value).ok_or_else(invalid)?;
+    let schema = schema.map(identifier).map(|part| part.ok_or_else(invalid)).transpose()?;
+    let name = identifier(name).ok_or_else(invalid)?;
+    let slot = storage
+        .text_search_slot_on_path(
+            ast::TextSearchObjectKind::Configuration,
+            schema.as_ref().map(crate::util::StackStr::as_str),
+            name.as_str(),
+            txid,
+        )
+        .ok_or_else(invalid)?;
+    let definition = storage.text_search_object(slot).definition_for(txid);
+    let mut canonical = crate::util::StackStr::<128>::new();
+    let _ = write!(
+        canonical,
+        "{}.{}",
+        crate::sql::eval::args::quote_identifier(definition.schema().as_str()).as_str(),
+        crate::sql::eval::args::quote_identifier(definition.name().as_str()).as_str()
+    );
+    Ok(canonical)
 }

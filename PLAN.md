@@ -442,8 +442,7 @@ shipped `pg_description` text and `pg_conversion` lists no built-in rows (the
 other shipped descriptions are listed); `pg_type`, `pg_operator` and
 `pg_opfamily` return built-in rows in OID order rather than a fresh cluster's
 physical order (`pg_opclass`, `pg_amop` and `pg_amproc` match it). psql's
-describe commands match PostgreSQL 18.6 except: `\dF`, `\dFd` and `\dFt`
-list only the `simple` and `english` text search objects; `\dfS+` lists
+describe commands match PostgreSQL 18.6 except: `\dfS+` lists
 `postgres_fdw_handler` and `postgres_fdw_validator` in `pg_catalog`, where
 PostgreSQL has them only in the schema of an installed `postgres_fdw`
 extension; and `\dfS+` over 3,400 routines takes about twice as long as

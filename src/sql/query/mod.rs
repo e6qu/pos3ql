@@ -4960,31 +4960,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 "invalid text-search dictionary catalog entry"
             ));
         };
-        match behavior {
-            super::super::storage::TextSearchDictionaryBehavior::Simple { accept: false } => {
-                Ok(super::full_text::TextSearchLexeme::Unmapped)
-            }
-            super::super::storage::TextSearchDictionaryBehavior::Simple { accept: true } => Ok(
-                match super::full_text::normalize_token(
-                    token,
-                    super::full_text::TextSearchConfig::Simple,
-                    arena,
-                )? {
-                    Some(lexeme) => super::full_text::TextSearchLexeme::Lexeme(lexeme),
-                    None => super::full_text::TextSearchLexeme::StopWord,
-                },
-            ),
-            super::super::storage::TextSearchDictionaryBehavior::EnglishStem => Ok(
-                match super::full_text::normalize_token(
-                    token,
-                    super::full_text::TextSearchConfig::English,
-                    arena,
-                )? {
-                    Some(lexeme) => super::full_text::TextSearchLexeme::Lexeme(lexeme),
-                    None => super::full_text::TextSearchLexeme::StopWord,
-                },
-            ),
-        }
+        super::full_text::lexize_dictionary(behavior, token, arena)
     }
 
     fn normalize_text_search_token<'a>(
@@ -5018,27 +4994,12 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 "invalid text-search configuration catalog entry"
             ));
         };
-        let token_index = usize::from(token_type.checked_sub(1).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "invalid text-search parser token type"
-            )
-        })?);
-        if token_index >= super::super::storage::TEXT_SEARCH_TOKEN_TYPES {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "invalid text-search parser token type"
-            ));
-        }
-        for dictionary_oid in mappings.dictionaries[token_index]
-            .iter()
-            .take(usize::from(mappings.counts[token_index]))
-        {
+        super::full_text::lexize_mapped(&mappings, token_type, token, arena, |dictionary_oid| {
             let dictionary_slot = self
                 .storage
                 .text_search_slot_by_oid(
                     super::ast::TextSearchObjectKind::Dictionary,
-                    *dictionary_oid,
+                    dictionary_oid,
                     self.txid,
                 )
                 .ok_or_else(|| {
@@ -5047,45 +5008,20 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                         "text-search configuration references a missing dictionary"
                     )
                 })?;
-            let super::super::storage::TextSearchDefinition::Dictionary { behavior, .. } = self
+            match self
                 .storage
                 .text_search_object(dictionary_slot)
                 .definition_for(self.txid)
-            else {
-                return Err(sql_err!(
+            {
+                super::super::storage::TextSearchDefinition::Dictionary { behavior, .. } => {
+                    Ok(behavior)
+                }
+                _ => Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "invalid text-search dictionary catalog entry"
-                ));
-            };
-            match behavior {
-                super::super::storage::TextSearchDictionaryBehavior::Simple { accept: false } => {}
-                super::super::storage::TextSearchDictionaryBehavior::Simple { accept: true } => {
-                    return Ok(
-                        match super::full_text::normalize_token(
-                            token,
-                            super::full_text::TextSearchConfig::Simple,
-                            arena,
-                        )? {
-                            Some(lexeme) => super::full_text::TextSearchLexeme::Lexeme(lexeme),
-                            None => super::full_text::TextSearchLexeme::StopWord,
-                        },
-                    );
-                }
-                super::super::storage::TextSearchDictionaryBehavior::EnglishStem => {
-                    return Ok(
-                        match super::full_text::normalize_token(
-                            token,
-                            super::full_text::TextSearchConfig::English,
-                            arena,
-                        )? {
-                            Some(lexeme) => super::full_text::TextSearchLexeme::Lexeme(lexeme),
-                            None => super::full_text::TextSearchLexeme::StopWord,
-                        },
-                    );
-                }
+                )),
             }
-        }
-        Ok(super::full_text::TextSearchLexeme::Unmapped)
+        })
     }
 
     fn has_operator_candidate(&self, name: &str) -> bool {

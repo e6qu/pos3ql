@@ -68,11 +68,7 @@ fn config(
     let resolved = if let Some(catalog) = hooks.catalog {
         catalog.resolve_text_search_configuration(schema, unqualified)
     } else {
-        match (schema, TextSearchConfig::parse(name)) {
-            (None | Some("pg_catalog"), Some(TextSearchConfig::Simple)) => Some(3_748),
-            (None | Some("pg_catalog"), Some(TextSearchConfig::English)) => Some(13_248),
-            _ => None,
-        }
+        TextSearchConfig::parse(name).map(TextSearchConfig::oid)
     };
     resolved.map(Some).ok_or_else(|| {
         sql_err!(
@@ -113,10 +109,12 @@ fn dictionary(
     let resolved = if let Some(catalog) = hooks.catalog {
         catalog.resolve_text_search_dictionary(schema, unqualified)
     } else {
-        match (schema, unqualified) {
-            (None | Some("pg_catalog"), "simple") => Some(3_765),
-            (None | Some("pg_catalog"), "english_stem") => Some(13_247),
-            _ => None,
+        match schema {
+            None | Some("pg_catalog") => full_text::builtin_object_oid(
+                crate::sql::ast::TextSearchObjectKind::Dictionary,
+                unqualified,
+            ),
+            Some(_) => None,
         }
     };
     resolved.map(Some).ok_or_else(|| {
@@ -138,26 +136,26 @@ fn normalize<'a>(
     if let Some(catalog) = hooks.catalog {
         return catalog.normalize_text_search_token(configuration_oid, token_type, token, arena);
     }
-    match configuration_oid {
-        3_748 | 13_248 => {
-            if !matches!(token_type, 1..=11 | 15..=22) {
-                return Ok(full_text::TextSearchLexeme::Unmapped);
-            }
-            let config = if configuration_oid == 3_748 {
-                TextSearchConfig::Simple
-            } else {
-                TextSearchConfig::English
-            };
-            Ok(match full_text::normalize_token(token, config, arena)? {
-                Some(lexeme) => full_text::TextSearchLexeme::Lexeme(lexeme),
-                None => full_text::TextSearchLexeme::StopWord,
-            })
-        }
-        _ => Err(sql_err!(
+    match TextSearchConfig::from_oid(configuration_oid) {
+        Some(config) => full_text::normalize_builtin(config, token_type, token, arena),
+        None => Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "text-search catalog access is unavailable"
         )),
     }
+}
+
+/// `to_tsvector(document)` under `default_text_search_config`, as `text @@
+/// tsquery` computes it.
+pub(crate) fn current_config_vector<'a>(
+    document: &str,
+    arena: &'a crate::mem::arena::Arena,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<&'a str, SqlError> {
+    let config = current_config(hooks)?;
+    full_text::to_tsvector_with(document, arena, |token_type, token, arena| {
+        normalize(config, token_type, token, arena, hooks)
+    })
 }
 
 fn current_config(hooks: &EvalHooks<'_, '_>) -> Result<i32, SqlError> {
@@ -912,11 +910,13 @@ pub(crate) fn dispatch<'a>(
                 let display = if let Some(catalog) = hooks.catalog {
                     catalog.text_search_configuration_name(oid)
                 } else {
-                    match oid {
-                        3_748 => Some(crate::util::StackStr::from_str("simple")),
-                        13_248 => Some(crate::util::StackStr::from_str("english")),
-                        _ => None,
-                    }
+                    full_text::builtin_object(
+                        crate::sql::ast::TextSearchObjectKind::Configuration,
+                        oid,
+                    )
+                    .map(|definition| {
+                        crate::util::StackStr::from_str(definition.name().as_str())
+                    })
                 }
                 .ok_or_else(|| {
                     sql_err!(
@@ -1123,23 +1123,13 @@ pub(crate) fn dispatch<'a>(
                 let lexeme = if let Some(catalog) = hooks.catalog {
                     catalog.lexize_text_search_dictionary(dictionary_oid, token, arena)?
                 } else {
-                    match dictionary_oid {
-                        3_765 => match full_text::normalize_token(
-                            token,
-                            TextSearchConfig::Simple,
-                            arena,
-                        )? {
-                            Some(value) => full_text::TextSearchLexeme::Lexeme(value),
-                            None => full_text::TextSearchLexeme::StopWord,
-                        },
-                        13_247 => match full_text::normalize_token(
-                            token,
-                            TextSearchConfig::English,
-                            arena,
-                        )? {
-                            Some(value) => full_text::TextSearchLexeme::Lexeme(value),
-                            None => full_text::TextSearchLexeme::StopWord,
-                        },
+                    match full_text::builtin_object(
+                        crate::sql::ast::TextSearchObjectKind::Dictionary,
+                        dictionary_oid,
+                    ) {
+                        Some(crate::storage::TextSearchDefinition::Dictionary {
+                            behavior, ..
+                        }) => full_text::lexize_dictionary(behavior, token, arena)?,
                         _ => {
                             return Err(sql_err!(
                                 sqlstate::UNDEFINED_OBJECT,

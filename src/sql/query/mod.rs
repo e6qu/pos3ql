@@ -122,6 +122,7 @@ pub(crate) use cte::expand_from_schema;
 pub(crate) mod instrument;
 mod outer_joins;
 mod pullup;
+pub(crate) use cte::expand_dml_ctes_schema;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
 pub(crate) use cte::{
@@ -8604,6 +8605,64 @@ pub(crate) fn check_rule_insert_returning<'a>(
 /// with OLD and NEW typed by `transition`: a query's relations, operators
 /// and types, and a data-changing statement's condition and assignments.
 /// Nothing is read or written.
+/// PostgreSQL's grouping check of a rule action's query: the rule's OLD and
+/// NEW are range table entries of the action's own query, so a grouped
+/// query reads them only through its grouping keys or aggregates.
+fn check_rule_query_grouping(select: &Select<'_>) -> Result<(), SqlError> {
+    fn ungrouped<'a>(expression: &'a Expr<'a>, keys: &[&Expr<'_>]) -> Result<(), SqlError> {
+        if keys.iter().any(|key| **key == *expression) || expression.is_aggregate_use() {
+            return Ok(());
+        }
+        if let Expr::Column {
+            qualifier: Some(qualifier),
+            name,
+        } = expression
+            && (qualifier.eq_ignore_ascii_case("old") || qualifier.eq_ignore_ascii_case("new"))
+        {
+            return Err(crate::sql::error_position::at_reference(
+                sql_err!(
+                    sqlstate::GROUPING_ERROR,
+                    "column \"{}.{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+                    qualifier,
+                    name
+                ),
+                qualifier,
+            ));
+        }
+        if matches!(
+            expression,
+            Expr::Subquery(_) | Expr::Exists(_) | Expr::ArraySubquery(_) | Expr::RowSubquery { .. }
+        ) {
+            return Ok(());
+        }
+        walk_children(expression, &mut |child| ungrouped(child, keys))
+    }
+    let items = || {
+        select.items.iter().filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                Some(*expression)
+            }
+            _ => None,
+        })
+    };
+    let grouped = !select.group_by.is_empty()
+        || select.having.is_some()
+        || items().chain(select.having).any(|expression| {
+            let mut aggregate = false;
+            let _ = walk_expression_tree(expression, &mut |node| {
+                aggregate |= node.is_aggregate_use();
+            });
+            aggregate
+        });
+    if !grouped {
+        return Ok(());
+    }
+    for expression in items().chain(select.having) {
+        ungrouped(expression, select.group_by)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn analyse_rule_action<'a>(
     statement: &'a Stmt<'a>,
     storage: &'a Storage,
@@ -8626,6 +8685,7 @@ pub(crate) fn analyse_rule_action<'a>(
                     Some(transition),
                 )?;
                 analyse_select(select, storage, txid, arena, Some(transition))?;
+                check_rule_query_grouping(select)?;
                 if select.from.is_none() && select.set_body.is_none() {
                     let catalog = storage_catalog(storage, arena, txid);
                     let columns = super::eval::RuntimeColumnTypes {
@@ -8657,8 +8717,45 @@ pub(crate) fn analyse_rule_action<'a>(
         Stmt::SetQuery(query) => {
             analyse_set_tree(query.body, storage, txid, arena, Some(transition))
         }
+        Stmt::Insert(insert)
+            if insert
+                .select
+                .is_some_and(|select| select.set_body.is_none() && select.from.is_some()) =>
+        {
+            // The inserted query is analysed as a SELECT action is, with
+            // OLD and NEW as its outer row.
+            let select = insert.select.expect("checked above");
+            let mark = arena.mark();
+            let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+            let analysed = expand_ctes(select, storage, txid, arena).and_then(|select| {
+                describe_select(
+                    select,
+                    storage,
+                    txid,
+                    arena,
+                    &mut columns,
+                    crate::sql::exec::DescriptionTarget::Sql,
+                    Some(transition),
+                )?;
+                analyse_select(select, storage, txid, arena, Some(transition))
+            });
+            unsafe { arena.rewind_to(mark) };
+            analysed?;
+            check_rule_query_grouping(select)?;
+            validate_dml_assignment_casts(statement, storage, txid, arena, Some(transition))
+        }
         Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
-            analyse_dml_condition(statement, storage, txid, arena, Some(transition))?;
+            if let Stmt::Insert(crate::sql::ast::Insert {
+                select: Some(select),
+                ..
+            }) = statement
+            {
+                check_rule_query_grouping(select)?;
+            }
+            // Views the action reads are analysed through their queries.
+            let expanded =
+                cte::expand_dml_ctes_schema(statement, &[], storage, txid, None, None, arena)?;
+            analyse_dml_condition(expanded, storage, txid, arena, Some(transition))?;
             validate_dml_assignment_casts(statement, storage, txid, arena, Some(transition))
         }
         _ => Ok(()),
@@ -16754,4 +16851,13 @@ pub(crate) fn named_composite_creation(oid: i32) -> Option<crate::storage::TypeC
         Some((crate::storage::NamedTypeKind::Composite, creation, false)) => Some(creation),
         _ => None,
     }
+}
+
+/// Visits `expression` and every expression below it, subqueries excepted.
+fn walk_expression_tree<'a>(
+    expression: &'a Expr<'a>,
+    visit: &mut dyn FnMut(&'a Expr<'a>),
+) -> Result<(), SqlError> {
+    visit(expression);
+    walk_children(expression, &mut |child| walk_expression_tree(child, visit))
 }

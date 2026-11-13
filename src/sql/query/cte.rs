@@ -2459,6 +2459,66 @@ pub(crate) struct RuleInsertTarget<'a> {
 /// the action set-oriented, so its statement triggers still fire once.
 /// `target` describes an `INSERT ... VALUES` action's relation; it is read
 /// only when a `VALUES` row writes `DEFAULT` or there are several rows.
+/// An action query's output list with each `*` spelled as the FROM items it
+/// covers, as PostgreSQL expands it when the rule is stored: the rule's
+/// OLD and NEW rows the action is joined with are not part of it.
+fn rule_action_star_items<'a>(
+    select: &'a Select<'a>,
+    arena: &'a Arena,
+) -> Result<&'a [SelectItem<'a>], SqlError> {
+    let Some(from) = select.from.as_ref() else {
+        return Ok(select.items);
+    };
+    let stars = select
+        .items
+        .iter()
+        .filter(|item| matches!(item, SelectItem::Wildcard(_)))
+        .count();
+    if stars == 0 {
+        return Ok(select.items);
+    }
+    // Merged USING and NATURAL columns have no per-item spelling.
+    if from
+        .joins
+        .iter()
+        .any(|join| join.using.is_some() || join.natural)
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "a rule action's * over a USING or NATURAL join is not supported"
+        ));
+    }
+    let tables = core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
+    let mut names = ArenaList::new(arena);
+    for table in tables {
+        let Some(name) = table
+            .alias
+            .or((table.subquery.is_none()).then_some(table.table))
+        else {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "a rule action's * over an unnamed subquery is not supported"
+            ));
+        };
+        names.push(name).map_err(|_| arena_full())?;
+    }
+    let names = names.as_slice();
+    let mut items = ArenaList::new(arena);
+    for item in select.items {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for name in names {
+                    items
+                        .push(SelectItem::TableWildcard(name))
+                        .map_err(|_| arena_full())?;
+                }
+            }
+            other => items.push(*other).map_err(|_| arena_full())?,
+        }
+    }
+    Ok(items.as_slice())
+}
+
 pub(crate) fn attach_rule_source<'a>(
     statement: &'a Stmt<'a>,
     source: TableRef<'a>,
@@ -2468,8 +2528,10 @@ pub(crate) fn attach_rule_source<'a>(
 ) -> Result<&'a Stmt<'a>, SqlError> {
     let rewritten = match statement {
         Stmt::Select(select) => {
+            let items = rule_action_star_items(select, arena)?;
             let from = prepend_rule_source(source, select.from.as_ref(), arena)?;
             Stmt::Select(Select {
+                items,
                 from: Some(from),
                 where_clause: and_where(condition, select.where_clause, arena)?,
                 ..*select
@@ -2497,8 +2559,10 @@ pub(crate) fn attach_rule_source<'a>(
         }
         Stmt::Insert(insert) => {
             let select = if let Some(select) = insert.select {
+                let items = rule_action_star_items(select, arena)?;
                 let from = prepend_rule_source(source, select.from.as_ref(), arena)?;
                 Select {
+                    items,
                     from: Some(from),
                     where_clause: and_where(condition, select.where_clause, arena)?,
                     ..*select

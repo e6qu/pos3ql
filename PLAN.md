@@ -553,15 +553,17 @@ join, so where PostgreSQL's costs pick `Merge Join` over sorted inputs
 pos3ql shows the hash join or nested loop it runs. `UPDATE ... FROM` and `DELETE ...
 USING` hash their first FROM table when it is joined to the target by
 equality, as a `SELECT` of the two tables would, and join later FROM items to
-it in nested loops; PostgreSQL may instead hash the joined FROM items. For a
-statement a rewrite rule changes, an `INSERT ... SELECT` action of an
-`INSERT` of several rows or of a query reading tables, an `INSERT` of an
-aggregated or ordered query, a conditional `INSTEAD` rule on an `INSERT` of
-several rows, a statement on a view with rules, and an action on a view or on
-a relation with rules of its own (which PostgreSQL rewrites again) fail with
-`0A000`. Planning them needs a `VALUES` list kept apart from a `UNION ALL`
-of rows for these rewrites, and a rewrite of each action's own rules; under `EXPLAIN ANALYZE` the statement runs
-once and its time and I/O are reported on its last query. `EXPLAIN ANALYZE`
+it in nested loops; PostgreSQL may instead hash the joined FROM items. A statement
+rewrite rules change is explained as every query PostgreSQL's rewriter
+produces, each rule action rewritten again by its target's rules; a rule
+action of several `VALUES` rows over a statement's query, several rows or
+condition fails with `0A000` (PostgreSQL joins the list into the action as a
+`VALUES` scan reading the other rows laterally). A view an `UPDATE ... FROM`
+or `DELETE ... USING` reads is pulled up only when its relations' names do
+not clash with the statement's own, where PostgreSQL renames them (`t_1`);
+otherwise its query runs under a `Subquery Scan`. Under `EXPLAIN ANALYZE` a rewritten statement runs
+once and its time, I/O and top node's rows are reported on its last query; its
+nodes carry no per-node figures. Otherwise `EXPLAIN ANALYZE`
 counts, per plan node, the loops, rows and the rows its `Filter` and `Join
 Filter` removed while the statement runs, and prints `(never executed)` for
 nodes that did not run: scans (also a nested loop's inner rescans and

@@ -24,6 +24,8 @@ use crate::storage::Storage;
 use crate::store::BlockIoStats;
 use crate::util::StackStr;
 
+mod rewrite;
+
 const MAX_EXPLAIN_STAGES: usize = 8;
 
 // A SELECT can expose one heap and one bitmap node per source plus every
@@ -4340,21 +4342,40 @@ pub(super) fn plan_modification<'a>(
         plan.nodes[0].total_cost = join.total_cost;
         plan.nodes[0].object_requests = join.object_requests;
         plan.nodes[0].cache_blocks = join.cache_blocks;
+        // A FROM item's own query runs under its Subquery Scan.
+        let items = core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
+        for (table, item) in items.enumerate().take(scope.n) {
+            let Some(body) = item.subquery.filter(|body| values_list(body).is_none()) else {
+                continue;
+            };
+            plan = with_derived_plan(
+                plan,
+                scope.names[table],
+                false,
+                plan_derived(
+                    storage,
+                    txid,
+                    body,
+                    BlockId::ROOT.child(Segment::Derived(
+                        u16::try_from(table).map_err(|_| arena_full())?,
+                    )),
+                    arena,
+                )?,
+                arena,
+            )?;
+        }
         plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         return Ok(plan);
     }
-    let child = if let Some(select) = source {
-        let source_plan = plan_select(
-            storage,
-            txid,
-            select,
-            BlockId::ROOT.child(Segment::Source),
-            arena,
-        )?;
+    let child = if let (Some(select), Stmt::Insert(insert)) = (source, statement) {
+        let source_plan = rewrite::insert_source_plan(storage, txid, insert, select, arena)?;
         let root = source_plan.nodes[0];
         for source_node in &source_plan.nodes[..source_plan.count] {
             let mut source_node = *source_node;
             source_node.depth = source_node.depth.saturating_add(1);
+            // The INSERT's range table holds the target and its source, so
+            // PostgreSQL qualifies the columns of the source's keys.
+            source_node.keys.plain = source_node.keys.verbose;
             // PostgreSQL names each range table entry uniquely: the source's
             // reference to the target's own name gets a numeric suffix.
             if source_node.alias.as_str().is_empty()
@@ -4366,6 +4387,23 @@ pub(super) fn plan_modification<'a>(
             plan.push(source_node)?;
         }
         root
+    } else if let (Stmt::Insert(insert), None) = (
+        statement,
+        relation_slot(storage, txid, target.schema, target.name),
+    ) {
+        // An INSERT into a view its INSTEAD OF trigger handles reads its rows.
+        let several = insert.rows.len() > 1;
+        let child = PlanNode {
+            name: StackStr::from_str(if several { "Values Scan" } else { "Result" }),
+            alias: StackStr::from_str(if several { "*VALUES*" } else { "" }),
+            depth: 1,
+            rows: insert.rows.len() as u64,
+            width: 32,
+            total_cost: 0.01,
+            ..PlanNode::EMPTY
+        };
+        plan.push(child)?;
+        child
     } else if let Some(slot) = relation_slot(storage, txid, target.schema, target.name) {
         let child = if let Stmt::Insert(insert) = statement {
             // Several rows are scanned from their VALUES list.
@@ -4736,9 +4774,10 @@ pub(super) fn plan_statement<'a>(
         Stmt::Select(select) => {
             let select = if select.with.iter().any(|cte| cte.dml.is_some()) {
                 return plan_data_modifying_cte_select(select, arena);
-            } else if select.with.is_empty() {
+            } else if select.with.is_empty() && !storage.has_any_view() {
                 select
             } else {
+                // A view is read through its query (its `_RETURN` rule).
                 query::expand_ctes(select, storage, txid, arena)?
             };
             plan_select(storage, txid, select, BlockId::ROOT, arena)
@@ -4759,6 +4798,20 @@ pub(super) fn plan_statement<'a>(
                 ..*set_query
             };
             plan_set_query(storage, txid, &planned, BlockId::ROOT, arena)
+        }
+        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_)
+            if storage.has_any_view() =>
+        {
+            // The views a statement reads are read through their queries;
+            // its target stays as written.
+            let expanded =
+                query::expand_dml_ctes_schema(statement, &[], storage, txid, None, None, arena)?;
+            plan_modification(
+                storage,
+                txid,
+                rewrite::pull_up_sources(storage, txid, expanded, arena)?,
+                arena,
+            )
         }
         Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
             plan_modification(storage, txid, statement, arena)
@@ -5484,526 +5537,6 @@ impl From<crate::mem::arena::ArenaFull> for RewriteFailure {
     }
 }
 
-/// The statements a rewrite rule turns a data-changing statement into, in
-/// PostgreSQL's order: for `INSERT` the original first, for `UPDATE` and
-/// `DELETE` the rule actions first. Each action reads the original
-/// relation's rows under the original's condition, with `OLD` and `NEW`
-/// replaced by that row and its new values. None when no rule applies.
-fn rule_rewritten_statements<'a>(
-    storage: &Storage,
-    txid: u32,
-    statement: &'a Stmt<'a>,
-    arena: &'a Arena,
-) -> Result<Option<&'a [&'a Stmt<'a>]>, SqlError> {
-    use crate::storage::{RewriteEvent, RewriteMode, RuleTarget};
-    let (table, alias, event, condition) = match statement {
-        Stmt::Insert(insert) => (insert.table, insert.alias, RewriteEvent::Insert, None),
-        Stmt::Update(update) => (
-            update.table,
-            update.alias,
-            RewriteEvent::Update,
-            update.where_clause,
-        ),
-        Stmt::Delete(delete) => (
-            delete.table,
-            delete.alias,
-            RewriteEvent::Delete,
-            delete.where_clause,
-        ),
-        _ => return Ok(None),
-    };
-    let slot = match storage.resolve_relation(table.schema, table.name, txid) {
-        Some(crate::storage::ResolvedRelation::Table(slot)) => slot,
-        Some(crate::storage::ResolvedRelation::View(view))
-            if storage
-                .firing_rules_for(
-                    RuleTarget::View(view as u16),
-                    event,
-                    crate::sql::guc::active_session_replication_role()?,
-                    txid,
-                )
-                .next()
-                .is_some() =>
-        {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "EXPLAIN of a statement a rewrite rule changes is not supported for a statement on a view"
-            ));
-        }
-        _ => return Ok(None),
-    };
-    let target = RuleTarget::Table(slot as u16);
-    if storage
-        .firing_rules_for(
-            target,
-            event,
-            crate::sql::guc::active_session_replication_role()?,
-            txid,
-        )
-        .next()
-        .is_none()
-    {
-        return Ok(None);
-    }
-    let unsupported = |what: &str| {
-        sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "EXPLAIN of a statement a rewrite rule changes is not supported for {}",
-            what
-        )
-    };
-    let definition = storage.table_def(slot, txid);
-    let exposed = alias.unwrap_or(table.name);
-    // A relation's unqualified columns named through its FROM item, as a
-    // rewritten action reads both its own target and the original relation.
-    let qualify_with = |expression: &'a Expr<'a>,
-                        relation: &crate::storage::TableDef,
-                        exposed: &'a str|
-     -> Result<&'a Expr<'a>, SqlError> {
-        crate::sql::ast::rewrite_expression(expression, arena, &mut |node: &'a Expr<'a>| -> Result<
-            Option<&'a Expr<'a>>,
-            RewriteFailure,
-        > {
-            Ok(match node {
-                Expr::Column {
-                    qualifier: None,
-                    name,
-                } if relation.column_index(name).is_some() => {
-                    Some(&*arena.alloc(Expr::Column {
-                        qualifier: Some(exposed),
-                        name,
-                    })?)
-                }
-                _ => None,
-            })
-        })
-        .map_err(|RewriteFailure(error)| error)
-    };
-    let qualify = |expression: &'a Expr<'a>| qualify_with(expression, &definition, exposed);
-    // An action's own target columns, before the original relation joins it.
-    let qualify_action = |expression: &'a Expr<'a>,
-                          action_table: crate::sql::ast::QualName<'a>|
-     -> Result<&'a Expr<'a>, SqlError> {
-        match storage.resolve_relation(action_table.schema, action_table.name, txid) {
-            Some(crate::storage::ResolvedRelation::Table(action_slot)) => qualify_with(
-                expression,
-                &storage.table_def(action_slot, txid),
-                action_table.name,
-            ),
-            _ => Err(unsupported(
-                "an action on a view or on a relation with rules",
-            )),
-        }
-    };
-    let old_value = |name: &'a str| -> Result<&'a Expr<'a>, SqlError> {
-        Ok(&*arena
-            .alloc(Expr::Column {
-                qualifier: Some(exposed),
-                name,
-            })
-            .map_err(|_| arena_full())?)
-    };
-    // The original INSERT's rows, or the simple query PostgreSQL pulls up
-    // into each action in place of `NEW`.
-    let (inserted_rows, inserted_query): (&'a [&'a [&'a Expr<'a>]], Option<&'a Select<'a>>) =
-        match statement {
-            Stmt::Insert(insert) => match insert.select {
-                Some(select)
-                    if !select.distinct
-                        && select.distinct_on.is_empty()
-                        && select.windows.is_empty()
-                        && select.group_by.is_empty()
-                        && select.grouping_sets.is_empty()
-                        && select.having.is_none()
-                        && select.order_by.is_empty()
-                        && select.limit.is_none()
-                        && select.offset.is_none()
-                        && select.with.is_empty()
-                        && select.set_body.is_none()
-                        && select.locking.is_empty()
-                        && select
-                            .items
-                            .iter()
-                            .all(|item| matches!(item, SelectItem::Expr { .. }))
-                        && !selects_aggregate(select, storage, txid, arena)? =>
-                {
-                    (&[], Some(select))
-                }
-                Some(_) => return Err(unsupported("an INSERT of an aggregated or ordered query")),
-                None => (insert.rows, None),
-            },
-            _ => (&[], None),
-        };
-    let inserted_count = inserted_rows.len().max(1);
-    let new_value = |name: &'a str, row: usize| -> Result<&'a Expr<'a>, SqlError> {
-        match statement {
-            Stmt::Update(update) => match update
-                .assignments
-                .iter()
-                .find(|(assigned, _)| *assigned == name)
-            {
-                Some((_, value)) => qualify(value),
-                None => old_value(name),
-            },
-            Stmt::Insert(insert) => {
-                let position = if insert.columns.is_empty() {
-                    definition.column_index(name)
-                } else {
-                    insert.columns.iter().position(|column| *column == name)
-                };
-                if let Some(select) = inserted_query {
-                    return Ok(
-                        match position.and_then(|position| select.items.get(position)) {
-                            Some(SelectItem::Expr { expression, .. }) => expression,
-                            _ => &Expr::Null,
-                        },
-                    );
-                }
-                match position.and_then(|position| inserted_rows[row].get(position)) {
-                    Some(Expr::DefaultMarker) => {
-                        let column = definition
-                            .column_index(name)
-                            .map(|column| &definition.columns()[column]);
-                        let default = column
-                            .filter(|column| !column.default.is_generated())
-                            .and_then(|column| column.default.expression());
-                        match default.map(StackStr::as_str) {
-                            None => Ok(&Expr::Null),
-                            Some(sql) => {
-                                let sql = arena.alloc_str(sql).map_err(|_| arena_full())?;
-                                crate::sql::parser::parse_expr(sql, arena)
-                            }
-                        }
-                    }
-                    Some(value) => Ok(value),
-                    None => Ok(&Expr::Null),
-                }
-            }
-            _ => Err(unsupported("NEW in a DELETE rule")),
-        }
-    };
-    let substitute_row = |expression: &'a Expr<'a>, row: usize| -> Result<&'a Expr<'a>, SqlError> {
-        crate::sql::ast::rewrite_expression(expression, arena, &mut |node: &'a Expr<'a>| -> Result<
-            Option<&'a Expr<'a>>,
-            RewriteFailure,
-        > {
-            match node {
-                Expr::Column {
-                    qualifier: Some(qualifier),
-                    name,
-                } if qualifier.eq_ignore_ascii_case("old") => {
-                    old_value(name).map(Some).map_err(RewriteFailure)
-                }
-                Expr::Column {
-                    qualifier: Some(qualifier),
-                    name,
-                } if qualifier.eq_ignore_ascii_case("new") => {
-                    new_value(name, row).map(Some).map_err(RewriteFailure)
-                }
-                _ => Ok(None),
-            }
-        })
-        .map_err(|RewriteFailure(error)| error)
-    };
-    let substitute = |expression: &'a Expr<'a>| substitute_row(expression, 0);
-    let source = (event != RewriteEvent::Insert).then(|| crate::sql::ast::FromClause {
-        base: query::rule_relation_ref(table, alias),
-        joins: &[],
-    });
-    // An action's own FROM items, then the original relation PostgreSQL
-    // adds to its range table.
-    let with_source = |own: Option<crate::sql::ast::FromClause<'a>>|
-     -> Result<Option<&'a crate::sql::ast::FromClause<'a>>, SqlError> {
-        let from = match (own, source) {
-            (None, None) => return Ok(None),
-            (Some(own), None) => own,
-            (None, Some(source)) => source,
-            (Some(own), Some(source)) => {
-                let joins = arena
-                    .alloc_slice_with(own.joins.len() + 1, |index| {
-                        own.joins.get(index).copied().unwrap_or(crate::sql::ast::Join {
-                            table: source.base,
-                            kind: crate::sql::ast::JoinKind::Comma,
-                            on: None,
-                            using: None,
-                            natural: false,
-                        })
-                    })
-                    .map_err(|_| arena_full())?;
-                crate::sql::ast::FromClause { base: own.base, joins }
-            }
-        };
-        Ok(Some(&*arena.alloc(from).map_err(|_| arena_full())?))
-    };
-    let original_condition = condition.map(qualify).transpose()?;
-    let mut actions = crate::mem::arena::ArenaList::new(arena);
-    let mut suppressed = false;
-    let mut exclusions: Option<&'a Expr<'a>> = None;
-    for (_, rule) in storage.firing_rules_for(
-        target,
-        event,
-        crate::sql::guc::active_session_replication_role()?,
-        txid,
-    ) {
-        let rule = rule.definition_for(txid);
-        let rule_condition = match rule.condition_sql() {
-            Some(sql) => {
-                let sql = arena.alloc_str(sql).map_err(|_| arena_full())?;
-                Some(substitute(crate::sql::parser::parse_expr(sql, arena)?)?)
-            }
-            None => None,
-        };
-        if rule.mode == RewriteMode::Instead {
-            match rule_condition {
-                None => suppressed = true,
-                Some(rule_condition) => {
-                    // `AddInvertedQual`: the original keeps the rows for
-                    // which the condition is not true.
-                    let whens = arena
-                        .alloc_slice_copy(&[(rule_condition, &Expr::Bool(false))])
-                        .map_err(|_| arena_full())?;
-                    let not_true = arena
-                        .alloc(Expr::Case {
-                            operand: None,
-                            whens,
-                            otherwise: Some(&Expr::Bool(true)),
-                            origin: crate::sql::ast::CaseOrigin::BooleanTest {
-                                value: true,
-                                negated: true,
-                            },
-                        })
-                        .map_err(|_| arena_full())?;
-                    exclusions = query::and_where(exclusions, Some(not_true), arena)?;
-                }
-            }
-        }
-        let filter = query::and_where(original_condition, rule_condition, arena)?;
-        for action in rule.action_sql() {
-            let action = arena.alloc_str(action).map_err(|_| arena_full())?;
-            let action = crate::sql::parser::parse_stored_statement(action, arena)?;
-            let rewritten: Stmt<'a> = match *action {
-                Stmt::Notify { .. } => *action,
-                Stmt::Insert(insert) if insert.select.is_none() => {
-                    // Each action row, once per original row it reads.
-                    let mut rows = crate::mem::arena::ArenaList::new(arena);
-                    for original in 0..inserted_count {
-                        for row in insert.rows {
-                            let mut values = crate::mem::arena::ArenaList::new(arena);
-                            for value in row.iter() {
-                                values
-                                    .push(substitute_row(value, original)?)
-                                    .map_err(|_| arena_full())?;
-                            }
-                            rows.push(values.as_slice()).map_err(|_| arena_full())?;
-                        }
-                    }
-                    let rows = rows.as_slice();
-                    let reads_query = inserted_query.is_some_and(|query| query.from.is_some())
-                        || inserted_query.is_some_and(|query| query.where_clause.is_some());
-                    if source.is_none() && filter.is_none() && !reads_query {
-                        Stmt::Insert(crate::sql::ast::Insert { rows, ..insert })
-                    } else {
-                        if rows.len() != 1 {
-                            return Err(unsupported("a conditional action inserting several rows"));
-                        }
-                        let items = arena
-                            .alloc_slice_with(rows[0].len(), |index| SelectItem::Expr {
-                                expression: rows[0][index],
-                                alias: None,
-                            })
-                            .map_err(|_| arena_full())?;
-                        let from = match (inserted_query.and_then(|query| query.from), source) {
-                            (Some(from), None) => Some(from),
-                            (None, source) => source,
-                            (Some(_), Some(_)) => unreachable!("an INSERT rule reads no relation"),
-                        };
-                        let where_clause = query::and_where(
-                            inserted_query.and_then(|query| query.where_clause),
-                            filter,
-                            arena,
-                        )?;
-                        let select = arena
-                            .alloc(query::rule_select(items, from, where_clause))
-                            .map_err(|_| arena_full())?;
-                        Stmt::Insert(crate::sql::ast::Insert {
-                            rows: &[],
-                            select: Some(select),
-                            ..insert
-                        })
-                    }
-                }
-                Stmt::Insert(insert) => {
-                    let select = insert.select.expect("matched above");
-                    if inserted_count > 1
-                        || inserted_query.is_some_and(|query| {
-                            query.from.is_some() || query.where_clause.is_some()
-                        })
-                    {
-                        return Err(unsupported(
-                            "an INSERT ... SELECT action of an INSERT of several or selected rows",
-                        ));
-                    }
-                    let items = arena
-                        .alloc_slice_with(select.items.len(), |index| select.items[index])
-                        .map_err(|_| arena_full())?;
-                    for item in items.iter_mut() {
-                        if let SelectItem::Expr { expression, .. } = item {
-                            *expression = substitute(expression)?;
-                        }
-                    }
-                    let own = select.where_clause.map(substitute).transpose()?;
-                    let from = with_source(select.from)?;
-                    let select = arena
-                        .alloc(Select {
-                            items,
-                            from: from.copied(),
-                            where_clause: query::and_where(own, filter, arena)?,
-                            ..*select
-                        })
-                        .map_err(|_| arena_full())?;
-                    Stmt::Insert(crate::sql::ast::Insert {
-                        select: Some(select),
-                        ..insert
-                    })
-                }
-                Stmt::Update(update) => {
-                    let assignments = arena
-                        .alloc_slice_with(update.assignments.len(), |index| {
-                            update.assignments[index]
-                        })
-                        .map_err(|_| arena_full())?;
-                    for (_, value) in assignments.iter_mut() {
-                        *value = substitute(qualify_action(value, update.table)?)?;
-                    }
-                    let own = update
-                        .where_clause
-                        .map(|own| substitute(qualify_action(own, update.table)?))
-                        .transpose()?;
-                    Stmt::Update(crate::sql::ast::Update {
-                        assignments,
-                        from: with_source(update.from.copied())?,
-                        where_clause: query::and_where(own, filter, arena)?,
-                        ..update
-                    })
-                }
-                Stmt::Delete(delete) => {
-                    let own = delete
-                        .where_clause
-                        .map(|own| substitute(qualify_action(own, delete.table)?))
-                        .transpose()?;
-                    Stmt::Delete(crate::sql::ast::Delete {
-                        using: with_source(delete.using.copied())?,
-                        where_clause: query::and_where(own, filter, arena)?,
-                        ..delete
-                    })
-                }
-                _ => return Err(unsupported("this rule action")),
-            };
-            // PostgreSQL rewrites an action on a relation with rules again.
-            let (action_table, action_event) = match &rewritten {
-                Stmt::Insert(insert) => (Some(insert.table), RewriteEvent::Insert),
-                Stmt::Update(update) => (Some(update.table), RewriteEvent::Update),
-                Stmt::Delete(delete) => (Some(delete.table), RewriteEvent::Delete),
-                _ => (None, RewriteEvent::Insert),
-            };
-            if let Some(action_table) = action_table {
-                let action_target =
-                    match storage.resolve_relation(action_table.schema, action_table.name, txid) {
-                        Some(crate::storage::ResolvedRelation::Table(slot)) => {
-                            RuleTarget::Table(slot as u16)
-                        }
-                        Some(crate::storage::ResolvedRelation::View(view)) => {
-                            RuleTarget::View(view as u16)
-                        }
-                        _ => return Err(unsupported("this rule action")),
-                    };
-                if matches!(action_target, RuleTarget::View(_))
-                    || storage
-                        .firing_rules_for(
-                            action_target,
-                            action_event,
-                            crate::sql::guc::active_session_replication_role()?,
-                            txid,
-                        )
-                        .next()
-                        .is_some()
-                {
-                    return Err(unsupported(
-                        "an action on a view or on a relation with rules",
-                    ));
-                }
-            }
-            let rewritten = &*arena.alloc(rewritten).map_err(|_| arena_full())?;
-            actions.push(rewritten).map_err(|_| arena_full())?;
-        }
-    }
-    let original = if suppressed {
-        None
-    } else if let Some(exclusions) = exclusions {
-        let rewritten = match statement {
-            Stmt::Update(update) => Stmt::Update(crate::sql::ast::Update {
-                where_clause: query::and_where(update.where_clause, Some(exclusions), arena)?,
-                ..*update
-            }),
-            Stmt::Delete(delete) => Stmt::Delete(crate::sql::ast::Delete {
-                where_clause: query::and_where(delete.where_clause, Some(exclusions), arena)?,
-                ..*delete
-            }),
-            Stmt::Insert(insert) => {
-                let select = match inserted_query {
-                    Some(select) => Select {
-                        where_clause: query::and_where(
-                            select.where_clause,
-                            Some(exclusions),
-                            arena,
-                        )?,
-                        ..*select
-                    },
-                    None => {
-                        let [row] = inserted_rows else {
-                            return Err(unsupported(
-                                "a conditional INSTEAD rule on an INSERT of several rows",
-                            ));
-                        };
-                        let items = arena
-                            .alloc_slice_with(row.len(), |index| SelectItem::Expr {
-                                expression: row[index],
-                                alias: None,
-                            })
-                            .map_err(|_| arena_full())?;
-                        query::rule_select(items, None, Some(exclusions))
-                    }
-                };
-                let select = &*arena.alloc(select).map_err(|_| arena_full())?;
-                Stmt::Insert(crate::sql::ast::Insert {
-                    rows: &[],
-                    select: Some(select),
-                    ..*insert
-                })
-            }
-            _ => unreachable!("only INSERT, UPDATE and DELETE are rewritten"),
-        };
-        Some(&*arena.alloc(rewritten).map_err(|_| arena_full())?)
-    } else {
-        Some(statement)
-    };
-    let actions = actions.as_slice();
-    let count = actions.len() + usize::from(original.is_some());
-    let ordered = arena
-        .alloc_slice_with(count, |_| statement)
-        .map_err(|_| arena_full())?;
-    let (first, rest) = if event == RewriteEvent::Insert {
-        (0, usize::from(original.is_some()))
-    } else {
-        (actions.len(), 0)
-    };
-    if let Some(original) = original {
-        ordered[first] = original;
-    }
-    ordered[rest..rest + actions.len()].copy_from_slice(actions);
-    Ok(Some(ordered))
-}
-
 /// One query of a statement a rewrite rule changes: a planned statement,
 /// or a `NOTIFY` action, which has no plan.
 pub(super) enum RewrittenQuery<'a> {
@@ -6019,7 +5552,7 @@ pub(super) fn rewritten_queries<'a>(
     statement: &'a Stmt<'a>,
     arena: &'a Arena,
 ) -> Result<Option<crate::mem::arena::OwnedArenaSlice<'a, RewrittenQuery<'a>>>, SqlError> {
-    let Some(statements) = rule_rewritten_statements(storage, txid, statement, arena)? else {
+    let Some(statements) = rewrite::rewritten_statements(storage, txid, statement, arena)? else {
         return Ok(None);
     };
     let mut queries = arena

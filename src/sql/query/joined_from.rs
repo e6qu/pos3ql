@@ -135,9 +135,10 @@ pub(super) fn scan_from_matches<'a>(
     params: &[Datum<'a>],
     target: &dyn ColumnLookup<'a>,
     sequences: Option<&dyn SequenceAccess>,
+    hashed: Option<&'a [u64]>,
     on_match: &mut FromMatch<'_, 'a>,
 ) -> Result<(), SqlError> {
-    let scope = QueryScope::resolve_exec_outer(
+    let mut scope = QueryScope::resolve_exec_outer(
         storage,
         from,
         where_clause,
@@ -147,6 +148,7 @@ pub(super) fn scan_from_matches<'a>(
         sequences,
         Some(target),
     )?;
+    scope.target_hash_candidates = hashed;
     let subquery_expressions = arena
         .alloc_slice_with(1 + 2 * scope.n, |_| None)
         .map_err(|_| arena_full())?;
@@ -225,6 +227,7 @@ pub(crate) fn joined_from_match<'a, 'r>(
     params: &[Datum<'a>],
     target: &dyn ColumnLookup<'a>,
     sequences: Option<&dyn SequenceAccess>,
+    hashed: Option<&'a [u64]>,
     retain: &'r Arena,
 ) -> Result<Option<JoinedFromRow<'r>>, SqlError> {
     let mut found = None;
@@ -239,6 +242,7 @@ pub(crate) fn joined_from_match<'a, 'r>(
         params,
         target,
         sequences,
+        hashed,
         &mut |row, _, _| {
             found = Some(JoinedFromRow::encode(row, retain)?);
             Ok(false)
@@ -278,6 +282,7 @@ pub(crate) fn recheck_joined_from_match<'a, 'r>(
         params,
         first,
         sequences,
+        None,
         &mut |row, joined_first, hooks| {
             let joined_latest = Chained {
                 inner: row,
@@ -394,6 +399,7 @@ pub(super) fn recheck_lateral_select<'a>(
         params,
         as_read,
         sequences,
+        None,
         &mut |row, joined_as_read, hooks| {
             let width = project_items(
                 select,
@@ -536,4 +542,257 @@ fn project_items<'a>(
         }
     }
     Ok(width)
+}
+
+/// The hash join of a data-modifying statement's target with its only FROM
+/// item: the target probes, and the FROM item, a table without descendants,
+/// row security or sampling, is hashed once on its join keys. The SELECT
+/// planner's choice decides it, so EXPLAIN and execution agree.
+#[derive(Clone, Copy)]
+pub(crate) struct TargetHashPlan {
+    slot: usize,
+    /// Equi-key column pairs (target column, FROM item column).
+    keys: [(usize, usize); 8],
+    key_count: usize,
+    collations: [crate::sql::ast::Collation; 8],
+}
+
+impl TargetHashPlan {
+    /// The equi-key column pairs (target column, FROM item column).
+    pub(crate) fn keys(&self) -> &[(usize, usize)] {
+        &self.keys[..self.key_count]
+    }
+}
+
+/// Selects the hash join of `target` with `from`, when the SELECT planner
+/// would hash this join of two relations.
+pub(crate) fn target_hash_plan<'a>(
+    storage: &'a Storage,
+    target: crate::sql::ast::QualName<'a>,
+    alias: Option<&'a str>,
+    from: &'a FromClause<'a>,
+    where_clause: Option<&'a Expr<'a>>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<TargetHashPlan>, SqlError> {
+    if !from.joins.is_empty() || from.base.sample.is_some() || from.base.lateral {
+        return Ok(None);
+    }
+    let (scope, joined) =
+        super::dependencies::dml_join_scope(storage, target, alias, Some(from), txid, arena, None)?;
+    if scope.n != 2 || scope.derived[1].is_some() || scope.slots[1] == usize::MAX {
+        return Ok(None);
+    }
+    let slot = scope.slots[1];
+    let Some(role) = storage.current_role_slot(txid) else {
+        return Ok(None);
+    };
+    let role = scope.authorization_roles[1].map_or(role, usize::from);
+    if storage.table_def(slot, txid).kind == crate::storage::TableKind::Foreign
+        || storage.relation_has_descendants(slot, txid)
+        || storage.row_security_applies(slot, role, txid)
+    {
+        return Ok(None);
+    }
+    // An index on the FROM item's own conditions selects its rows instead.
+    let source = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
+    if super::index_access_plan(storage, &source, txid, where_clause, arena)?.is_some() {
+        return Ok(None);
+    }
+    let Some(plan) =
+        super::select_hash_join_plan(storage, &scope, joined, where_clause, &[0, 1], txid, arena)?
+    else {
+        return Ok(None);
+    };
+    let layout = plan.key_layout();
+    if layout.probe_table != 0 || layout.build_table != 1 {
+        return Ok(None);
+    }
+    // A key column the conditions equate with a constant makes the join
+    // equality implied, as PostgreSQL's equivalence classes do: both sides
+    // are filtered by the constant and the join keeps no hash key.
+    let mut conjuncts = [&Expr::Null; super::plan::MAX_CONJUNCTS];
+    let mut count = 0;
+    if let Some(condition) = where_clause
+        && super::plan::flatten_and(condition, &mut conjuncts, &mut count)
+        && conjuncts[..count].iter().any(|conjunct| {
+            layout.keys.iter().any(|&(target_column, source_column)| {
+                super::scan::fixes_column(&scope, conjunct, (0, target_column))
+                    || super::scan::fixes_column(&scope, conjunct, (1, source_column))
+            })
+        })
+    {
+        return Ok(None);
+    }
+    let mut keys = [(0, 0); 8];
+    let mut collations = [crate::sql::ast::Collation::None; 8];
+    keys[..layout.keys.len()].copy_from_slice(layout.keys);
+    collations[..layout.keys.len()].copy_from_slice(layout.collations);
+    Ok(Some(TargetHashPlan {
+        slot,
+        keys,
+        key_count: layout.keys.len(),
+        collations,
+    }))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TARGET_HASH_BUILDS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Target hash joins this thread built, for tests of the selected plan.
+#[cfg(test)]
+pub(crate) fn target_hash_builds() -> u64 {
+    TARGET_HASH_BUILDS.with(core::cell::Cell::get)
+}
+
+/// A built [`TargetHashPlan`]: the FROM item's visible rows in the order its
+/// sequential scan reads them, chained by join-key hash.
+pub(crate) struct TargetHash<'a> {
+    plan: TargetHashPlan,
+    rowids: &'a [u64],
+    hashes: &'a [u64],
+    /// Bucket heads, then each row's next row in its bucket, both
+    /// `u32::MAX`-terminated; each chain lists rows in reverse scan order.
+    buckets: &'a [u32],
+    next: &'a [u32],
+}
+
+impl TargetHashPlan {
+    /// Reads the FROM item once, as the hash join's build side.
+    pub(crate) fn build<'a>(
+        self,
+        storage: &Storage,
+        txid: u32,
+        arena: &'a Arena,
+    ) -> Result<TargetHash<'a>, SqlError> {
+        use crate::storage::MAX_COLUMNS;
+        let slot = self.slot;
+        let full = |_| arena_full();
+        #[cfg(test)]
+        TARGET_HASH_BUILDS.with(|builds| builds.set(builds.get() + 1));
+        storage.record_relation_scan(txid, slot, None, 0, crate::sql::datetime::now_micros())?;
+        let count = storage.visible_row_count(slot, txid)?;
+        if count >= u32::MAX as usize {
+            return Err(arena_full());
+        }
+        let table_snapshot = storage.table_row_snapshot(slot, Some(arena))?;
+        let ordered = arena
+            .alloc_slice_with(count, |_| None::<crate::storage::OrderedRowSnapshot>)
+            .map_err(full)?;
+        let mut fill = 0usize;
+        storage.for_each_row_state(slot, &mut |rowid, state| {
+            if let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? {
+                ordered[fill] = Some(table_snapshot.retain(rowid, &home)?);
+                fill += 1;
+            }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })?;
+        // The order the nested loop's sequential scan reads candidates in.
+        ordered[..fill].sort_unstable_by_key(|row| row.expect("row snapshot").sort_key());
+        let rowids = arena.alloc_slice_with(fill, |_| 0u64).map_err(full)?;
+        let hashes = arena.alloc_slice_with(fill, |_| 0u64).map_err(full)?;
+        let next = arena.alloc_slice_with(fill, |_| u32::MAX).map_err(full)?;
+        let buckets = arena
+            .alloc_slice_with(fill.max(1).next_power_of_two(), |_| u32::MAX)
+            .map_err(full)?;
+        let definition = storage.table_def(slot, txid);
+        let mut schema = [crate::sql::types::ColType::Bool; MAX_COLUMNS];
+        definition.schema(&mut schema);
+        let schema = &schema[..definition.n_columns];
+        let hash_columns: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+        let mask = buckets.len() - 1;
+        // As PostgreSQL's hash table, each chain lists later rows first, so
+        // a target row joining several FROM rows keeps the last one scanned.
+        for index in 0..fill {
+            let row = ordered[index].expect("row snapshot");
+            let rowid = row.rowid();
+            let home = row.read()?;
+            storage.record_relation_tuple_read(txid, slot, None)?;
+            rowids[index] = rowid;
+            let mark = arena.mark();
+            let hash = (|| -> Result<Option<u64>, SqlError> {
+                let bytes = storage.row_bytes(slot, rowid, home, arena)?;
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                crate::storage::rowenc::decode(bytes, schema, &mut values)?;
+                let mut keys = [Datum::Null; 8];
+                for (key, &(_, column)) in keys.iter_mut().zip(self.keys()) {
+                    *key = values[column];
+                    if key.is_null() {
+                        return Ok(None);
+                    }
+                }
+                crate::sql::eval::hash_key_collated_catalog(
+                    storage,
+                    txid,
+                    &keys[..self.key_count],
+                    &hash_columns[..self.key_count],
+                    &self.collations[..self.key_count],
+                )
+                .map(Some)
+            })();
+            // SAFETY: only the key hash outlives the decoded row.
+            unsafe { arena.rewind_to(mark) };
+            // A NULL key equals nothing, so its row joins no target row.
+            let Some(hash) = hash? else { continue };
+            hashes[index] = hash;
+            let bucket = hash as usize & mask;
+            next[index] = buckets[bucket];
+            buckets[bucket] = index as u32;
+        }
+        Ok(TargetHash {
+            plan: self,
+            rowids,
+            hashes,
+            buckets,
+            next,
+        })
+    }
+}
+
+impl<'a> TargetHash<'a> {
+    /// The FROM item's rows whose join keys hash like the target row's,
+    /// later rows first. `target` holds the target's logical columns.
+    pub(crate) fn candidates(
+        &self,
+        storage: &Storage,
+        txid: u32,
+        target: &[Datum<'_>],
+        arena: &'a Arena,
+    ) -> Result<&'a [u64], SqlError> {
+        let plan = &self.plan;
+        let mut keys = [Datum::Null; 8];
+        for (key, &(column, _)) in keys.iter_mut().zip(plan.keys()) {
+            *key = target.get(column).copied().unwrap_or(Datum::Null);
+            if key.is_null() {
+                return Ok(&[]);
+            }
+        }
+        let hash_columns: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+        let hash = crate::sql::eval::hash_key_collated_catalog(
+            storage,
+            txid,
+            &keys[..plan.key_count],
+            &hash_columns[..plan.key_count],
+            &plan.collations[..plan.key_count],
+        )?;
+        let head = self.buckets[hash as usize & (self.buckets.len() - 1)];
+        let chain = || {
+            core::iter::successors((head != u32::MAX).then_some(head), |&entry| {
+                let next = self.next[entry as usize];
+                (next != u32::MAX).then_some(next)
+            })
+            .map(|entry| entry as usize)
+            .filter(move |&entry| self.hashes[entry] == hash)
+        };
+        let count = chain().count();
+        let mut entries = chain();
+        arena
+            .alloc_slice_with(count, |_| {
+                self.rowids[entries.next().expect("chain is stable")]
+            })
+            .map_err(|_| arena_full())
+            .map(|rowids| &*rowids)
+    }
 }

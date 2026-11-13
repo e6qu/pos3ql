@@ -321,8 +321,17 @@ pub(super) enum DmlCapture {
 
 impl DmlCapture {
     /// `UPDATE ... FROM` assignments read the FROM row each target row joined.
+    /// `UPDATE ... FROM` assignments and `DELETE ... USING ... RETURNING`
+    /// read the FROM row each selected target row joined.
     fn retains_joined(self) -> bool {
-        matches!(self, Self::Update { .. })
+        matches!(
+            self,
+            Self::Update { .. }
+                | Self::Delete {
+                    returning: true,
+                    ..
+                }
+        )
     }
 
     fn command(self) -> u32 {
@@ -32984,7 +32993,7 @@ fn execute_plpgsql_dynamic_explain(
         } else {
             None
         };
-        super::explain::visit_plan_rows(&plan, options, actual, &settings, emit)
+        super::explain::visit_plan_rows(&plan, options, actual, &settings, context.arena, emit)
     })
 }
 
@@ -80005,6 +80014,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 arena,
                                 values: &mut matched_from,
                             }),
+                            None,
                         ) {
                             Ok(matched) => matched,
                             Err(error) => return sql_fail(error),
@@ -80227,6 +80237,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 arena,
                                 values: &mut matched_from,
                             }),
+                            None,
                         ) {
                             Ok(matched) => matched,
                             Err(error) => return sql_fail(error),
@@ -82582,6 +82593,18 @@ pub(crate) fn update<'a>(
         Err(error) => return sql_fail(error),
     };
     let collect = if let Some(from) = statement.from {
+        let target_hash = match super::query::target_hash_plan(
+            storage,
+            statement.table,
+            statement.alias,
+            from,
+            statement.where_clause,
+            txn.txid,
+            arena,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return sql_fail(error),
+        };
         if let Some(outer) = outer {
             collect_join_matches_with_transition(
                 storage,
@@ -82600,6 +82623,7 @@ pub(crate) fn update<'a>(
                 DmlCapture::Update {
                     command: txn.command_id(),
                 },
+                target_hash,
                 outer,
             )
         } else {
@@ -82620,6 +82644,7 @@ pub(crate) fn update<'a>(
                 DmlCapture::Update {
                     command: txn.command_id(),
                 },
+                target_hash,
             )
         }
     } else {
@@ -83667,19 +83692,21 @@ pub(crate) fn update<'a>(
 }
 
 /// The FROM items' values joined to a deleted row for `RETURNING` of
-/// `DELETE ... USING`, found as the row selection found them.
+/// `DELETE ... USING`: the USING row its selection retained.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the match repeats the row selection's explicit inputs"
+    reason = "the retained row is read with the selection's explicit inputs"
 )]
 fn delete_returning_from<'r, Definition0: crate::storage::DefinitionBacking>(
     storage: &Storage,
     txn: &TxnState,
     statement: &Delete<'r>,
     def: &crate::storage::TableDefinition<Definition0>,
-    old: &[Datum<'_>],
+    old: &[Datum<'r>],
+    retained: &DmlRowImages<'r>,
+    row: PhysicalRow,
     arena: &'r Arena,
-    params: &[Datum<'_>],
+    params: &[Datum<'r>],
     seq_session: &crate::sql::guc::SeqSession,
 ) -> Result<Option<JoinedReturningValues<'r, 'r>>, SqlError> {
     let Some(using) = statement.using.filter(|_| !statement.returning.is_empty()) else {
@@ -83695,32 +83722,26 @@ fn delete_returning_from<'r, Definition0: crate::storage::DefinitionBacking>(
         values: old,
         alias: statement.alias,
     };
-    let found = super::query::first_from_match(
+    super::query::with_joined_from_row(
         storage,
         using,
         txid,
         statement.where_clause,
-        &[],
         arena,
         params,
-        &context,
-        &mut |_| Ok(()),
         Some(&crate::sql::sequence::SeqEval::new(
             storage,
             seq_session,
             txid,
         )),
+        &context,
+        retained.joined(row)?,
+        |_| Ok(()),
         Some(super::query::MatchedFromRow {
             arena,
             values: &mut values,
         }),
     )?;
-    if !found {
-        return Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "deleted row lost its USING match before RETURNING"
-        ));
-    }
     Ok(Some(JoinedReturningValues {
         table: statement.table,
         alias: statement.alias,
@@ -83940,6 +83961,18 @@ pub(crate) fn delete<'a>(
     };
     let row_security = super::query::conjoin_row_security(delete_security, select_security);
     let collect = if let Some(using) = statement.using {
+        let target_hash = match super::query::target_hash_plan(
+            storage,
+            statement.table,
+            statement.alias,
+            using,
+            statement.where_clause,
+            txn.txid,
+            arena,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return sql_fail(error),
+        };
         if let Some(outer) = outer {
             collect_join_matches_with_transition(
                 storage,
@@ -83959,6 +83992,7 @@ pub(crate) fn delete<'a>(
                     command: txn.command_id(),
                     returning: !statement.returning.is_empty(),
                 },
+                target_hash,
                 outer,
             )
         } else {
@@ -83980,6 +84014,7 @@ pub(crate) fn delete<'a>(
                     command: txn.command_id(),
                     returning: !statement.returning.is_empty(),
                 },
+                target_hash,
             )
         }
     } else {
@@ -84132,6 +84167,8 @@ pub(crate) fn delete<'a>(
                             statement,
                             def,
                             old,
+                            &retained_rows,
+                            scratch[i],
                             arena,
                             params,
                             seq_session,
@@ -84311,6 +84348,8 @@ pub(crate) fn delete<'a>(
                             statement,
                             def,
                             &old_transition[..def.n_columns],
+                            &retained_rows,
+                            scratch[i],
                             arena,
                             params,
                             seq_session,
@@ -84463,6 +84502,8 @@ pub(crate) fn delete<'a>(
                         statement,
                         def,
                         &logical_old[..def.n_columns],
+                        &retained_rows,
+                        scratch[i],
                         arena,
                         params,
                         seq_session,
@@ -92330,6 +92371,18 @@ pub(super) fn collect_matches<'a>(
     images.finish()
 }
 
+/// The FROM item rows a target hash join offers the target row `target`.
+fn target_hash_candidates<'a>(
+    hash: Option<&super::query::TargetHash<'a>>,
+    storage: &Storage,
+    txid: u32,
+    target: &[Datum<'_>],
+    arena: &'a Arena,
+) -> Result<Option<&'a [u64]>, SqlError> {
+    hash.map(|hash| hash.candidates(storage, txid, target, arena))
+        .transpose()
+}
+
 /// Collects target rows that join at least one row of the extra `from` tables
 /// satisfying `where_clause` — for `UPDATE ... FROM` / `DELETE ... USING`. The
 /// target row supplies its columns as the outer scope of the FROM scan.
@@ -92349,9 +92402,13 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
     row_security: Option<super::query::RowSecurityPlan<'a>>,
     scratch: &mut DmlScratch,
     capture: DmlCapture,
+    target_hash: Option<super::query::TargetHashPlan>,
 ) -> Result<DmlRowImages<'a>, SqlError> {
     let _snapshot = storage.dml_expression_snapshot(capture.command());
     scratch.clear();
+    let hash = target_hash
+        .map(|plan| plan.build(storage, txid, arena))
+        .transpose()?;
     let mut images = DmlRowImages::new(arena);
     if def.kind == crate::storage::TableKind::Foreign {
         images.capture_layout(table_index, def, def, capture, arena, storage, txid)?;
@@ -92395,6 +92452,13 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                         params,
                         &context,
                         None,
+                        target_hash_candidates(
+                            hash.as_ref(),
+                            storage,
+                            txid,
+                            context.values,
+                            arena,
+                        )?,
                         arena,
                     )? {
                         Some(joined) => {
@@ -92416,6 +92480,13 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                         &mut |_| Ok(()),
                         None,
                         None,
+                        target_hash_candidates(
+                            hash.as_ref(),
+                            storage,
+                            txid,
+                            context.values,
+                            arena,
+                        )?,
                     )?
                 };
                 if matched {
@@ -92481,6 +92552,13 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                                 params,
                                 &context,
                                 None,
+                                target_hash_candidates(
+                                    hash.as_ref(),
+                                    storage,
+                                    txid,
+                                    context.values,
+                                    arena,
+                                )?,
                                 arena,
                             )?;
                             Ok(joined.is_some())
@@ -92497,6 +92575,13 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                                 &mut |_| Ok(()),
                                 None,
                                 None,
+                                target_hash_candidates(
+                                    hash.as_ref(),
+                                    storage,
+                                    txid,
+                                    context.values,
+                                    arena,
+                                )?,
                             )
                         }
                     })();
@@ -92553,10 +92638,14 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
     row_security: Option<super::query::RowSecurityPlan<'a>>,
     scratch: &mut DmlScratch,
     capture: DmlCapture,
+    target_hash: Option<super::query::TargetHashPlan>,
     outer: &dyn ColumnLookup<'a>,
 ) -> Result<DmlRowImages<'a>, SqlError> {
     let _snapshot = storage.dml_expression_snapshot(capture.command());
     scratch.clear();
+    let hash = target_hash
+        .map(|plan| plan.build(storage, txid, arena))
+        .transpose()?;
     let mut images = DmlRowImages::new(arena);
     if def.kind == crate::storage::TableKind::Foreign {
         images.capture_layout(table_index, def, def, capture, arena, storage, txid)?;
@@ -92604,6 +92693,13 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                         params,
                         &scope,
                         None,
+                        target_hash_candidates(
+                            hash.as_ref(),
+                            storage,
+                            txid,
+                            context.values,
+                            arena,
+                        )?,
                         arena,
                     )? {
                         Some(joined) => {
@@ -92625,6 +92721,13 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                         &mut |_| Ok(()),
                         None,
                         None,
+                        target_hash_candidates(
+                            hash.as_ref(),
+                            storage,
+                            txid,
+                            context.values,
+                            arena,
+                        )?,
                     )?
                 };
                 if matched {
@@ -92692,6 +92795,13 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                                 params,
                                 &scope,
                                 None,
+                                target_hash_candidates(
+                                    hash.as_ref(),
+                                    storage,
+                                    txid,
+                                    context.values,
+                                    arena,
+                                )?,
                                 arena,
                             )?;
                             Ok(joined.is_some())
@@ -92708,6 +92818,13 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                                 &mut |_| Ok(()),
                                 None,
                                 None,
+                                target_hash_candidates(
+                                    hash.as_ref(),
+                                    storage,
+                                    txid,
+                                    context.values,
+                                    arena,
+                                )?,
                             )
                         }
                     })();

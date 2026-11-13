@@ -1795,35 +1795,39 @@ pub(crate) fn rule_action_definition<'a>(
         }
         return Ok(Some(output.text.as_str()));
     }
-    // The target (if any), then the FROM, USING or SELECT items, by exposed name.
-    let mut sources: [Option<(&str, &str)>; MAX_JOINED] = [None; MAX_JOINED];
+    // The target (if any), then the FROM, USING or SELECT items, each with
+    // the alias it is exposed under.
+    let mut sources: [Option<(&str, &str, Option<&str>)>; MAX_JOINED] = [None; MAX_JOINED];
     let mut source_count = 0;
-    let mut push_source = |schema: Option<&'a str>, table: &'a str| {
+    let mut push_source = |schema: Option<&'a str>, table: &'a str, alias: Option<&'a str>| {
         if source_count == MAX_JOINED {
             return false;
         }
-        sources[source_count] = Some((schema.unwrap_or(""), table));
+        sources[source_count] = Some((schema.unwrap_or(""), table, alias));
         source_count += 1;
         true
     };
+    // Plain tables, optionally aliased, listed with commas.
     let add_from = |from: Option<&'a crate::sql::ast::FromClause<'a>>,
-                    push: &mut dyn FnMut(Option<&'a str>, &'a str) -> bool|
+                    push: &mut dyn FnMut(Option<&'a str>, &'a str, Option<&'a str>) -> bool|
      -> bool {
         let Some(from) = from else {
             return true;
         };
-        // One plain table, unaliased: PostgreSQL prints it as written.
-        from.joins.is_empty()
-            && plain_table(&from.base).is_some()
-            && from.base.alias.is_none()
-            && push(from.base.schema, from.base.table)
+        core::iter::once(&from.base)
+            .chain(from.joins.iter().map(|join| &join.table))
+            .all(|item| plain_table(item).is_some() && item.sample.is_none() && !item.lateral)
+            && from
+                .joins
+                .iter()
+                .all(|join| join.kind == crate::sql::ast::JoinKind::Comma)
+            && core::iter::once(&from.base)
+                .chain(from.joins.iter().map(|join| &join.table))
+                .all(|item| push(item.schema, item.table, item.alias))
     };
     let (target, returning) = match statement {
         Stmt::Insert(insert) => {
-            if insert.alias.is_some() || insert.on_conflict.is_some() {
-                return Ok(None);
-            }
-            if !push_source(insert.table.schema, insert.table.name) {
+            if !push_source(insert.table.schema, insert.table.name, insert.alias) {
                 return Ok(None);
             }
             if let Some(select) = insert.select
@@ -1834,8 +1838,7 @@ pub(crate) fn rule_action_definition<'a>(
             (true, insert.returning)
         }
         Stmt::Update(update) => {
-            if update.alias.is_some()
-                || !push_source(update.table.schema, update.table.name)
+            if !push_source(update.table.schema, update.table.name, update.alias)
                 || !add_from(update.from, &mut push_source)
             {
                 return Ok(None);
@@ -1843,8 +1846,7 @@ pub(crate) fn rule_action_definition<'a>(
             (true, update.returning)
         }
         Stmt::Delete(delete) => {
-            if delete.alias.is_some()
-                || !push_source(delete.table.schema, delete.table.name)
+            if !push_source(delete.table.schema, delete.table.name, delete.alias)
                 || !add_from(delete.using, &mut push_source)
             {
                 return Ok(None);
@@ -1862,7 +1864,7 @@ pub(crate) fn rule_action_definition<'a>(
     let mut reads: [Option<crate::storage::TableDefinitionRead<'_>>; MAX_JOINED] =
         core::array::from_fn(|_| None);
     for (read, source) in reads.iter_mut().zip(&sources[..source_count]) {
-        let (schema, table) = source.expect("counted source");
+        let (schema, table, _) = source.expect("counted source");
         let schema = (!schema.is_empty()).then_some(schema);
         let Some(crate::storage::ResolvedRelation::Table(slot)) =
             storage.resolve_relation(schema, table, txid)
@@ -1871,13 +1873,24 @@ pub(crate) fn rule_action_definition<'a>(
         };
         *read = Some(storage.table_def(slot, txid));
     }
-    let mut joined = [Joined::rule_row("old", rule_table); MAX_JOINED + 2];
+    // OLD, NEW and, for ON CONFLICT DO UPDATE, EXCLUDED, then the sources.
+    let mut joined = [Joined::rule_row("old", rule_table); MAX_JOINED + 3];
     joined[1] = Joined::rule_row("new", rule_table);
     for (index, read) in reads[..source_count].iter().enumerate() {
         let definition = read.as_deref().expect("resolved source");
-        joined[index + 2] = Joined::new(definition.name.as_str(), definition);
+        let alias = sources[index].expect("counted source").2;
+        joined[index + 2] = Joined::new(alias.unwrap_or(definition.name.as_str()), definition);
     }
-    let joined = &joined[..source_count + 2];
+    let excluded = match statement {
+        Stmt::Insert(insert) if insert.on_conflict.is_some() => {
+            joined[source_count + 2] =
+                Joined::rule_row("excluded", reads[0].as_deref().expect("resolved target"));
+            1
+        }
+        _ => 0,
+    };
+    let joined = &joined[..source_count + 2 + excluded];
+    let sources = &joined[2..source_count + 2];
     let target_table = target.then(|| joined[2].table);
     let context = Context {
         storage,
@@ -1888,13 +1901,19 @@ pub(crate) fn rule_action_definition<'a>(
         pretty,
         qualify: true,
     };
-    let relation = |table: &TableDef| {
-        let mut relation = crate::util::StackStr::<264>::new();
+    // A source's relation, then its alias after `separator`.
+    let relation = |source: &Joined<'_>, separator: &str| {
+        let table = source.table;
+        let mut relation = crate::util::StackStr::<400>::new();
         if !storage.schema_is_on_path(table.schema, txid) {
             write_identifier(&mut relation, table.schema.as_str());
             let _ = relation.write_char('.');
         }
         write_identifier(&mut relation, table.name.as_str());
+        if source.name != table.name.as_str() {
+            let _ = relation.write_str(separator);
+            write_identifier(&mut relation, source.name);
+        }
         relation
     };
     let column_type = |table: &TableDef, name: &str| -> Result<Option<i32>, SqlError> {
@@ -1914,10 +1933,11 @@ pub(crate) fn rule_action_definition<'a>(
         }
         Ok::<(), SqlError>(())
     };
+    // `get_from_clause` with the target excluded: each later item wraps.
     let extra = |output: &mut Output<'_>, keyword: &str| {
-        if source_count > 1 {
-            output.push(keyword)?;
-            output.push(relation(joined[3].table).as_str())?;
+        for (index, source) in sources[1..].iter().enumerate() {
+            output.push(if index == 0 { keyword } else { ",\n    " })?;
+            output.push(relation(source, " ").as_str())?;
         }
         Ok::<(), SqlError>(())
     };
@@ -1947,7 +1967,7 @@ pub(crate) fn rule_action_definition<'a>(
                 None => target.columns()[index].name.as_str(),
             };
             output.push(" INSERT INTO ")?;
-            output.push(relation(target).as_str())?;
+            output.push(relation(&joined[2], " AS ").as_str())?;
             output.push(" (")?;
             for index in 0..width {
                 if index != 0 {
@@ -2009,10 +2029,10 @@ pub(crate) fn rule_action_definition<'a>(
                     // rule's rows, not the target, two levels past the action.
                     let mut inner = [joined[0]; MAX_JOINED + 2];
                     inner[1] = joined[1];
-                    inner[2..joined.len() - 1].copy_from_slice(&joined[3..]);
+                    inner[2..source_count + 1].copy_from_slice(&sources[1..]);
                     let inner_context = Context {
                         table: None,
-                        joined: &inner[..joined.len() - 1],
+                        joined: &inner[..source_count + 1],
                         ..context
                     };
                     if !write_rule_select(&inner_context, select, 8, &mut output)? {
@@ -2020,11 +2040,49 @@ pub(crate) fn rule_action_definition<'a>(
                     }
                 }
             }
+            if let Some(conflict) = insert.on_conflict {
+                // `get_insert_query_def`: the arbiter columns unqualified.
+                output.push(" ON CONFLICT")?;
+                if !conflict.target.is_empty() {
+                    output.push("(")?;
+                    for (index, element) in conflict.target.iter().enumerate() {
+                        let Some(column) = element.column else {
+                            return Ok(None);
+                        };
+                        if index != 0 {
+                            output.push(", ")?;
+                        }
+                        push_identifier(&mut output, column)?;
+                    }
+                    output.push(")")?;
+                } else if let Some(constraint) = conflict.constraint {
+                    output.push(" ON CONSTRAINT ")?;
+                    push_identifier(&mut output, constraint)?;
+                }
+                match conflict.update {
+                    None => output.push(" DO NOTHING")?,
+                    Some(assignments) => {
+                        output.push(" DO UPDATE SET ")?;
+                        for (index, (name, value)) in assignments.iter().enumerate() {
+                            let Some(type_oid) = column_type(target, name)? else {
+                                return Ok(None);
+                            };
+                            if index != 0 {
+                                output.push(", ")?;
+                            }
+                            push_identifier(&mut output, name)?;
+                            output.push(" = ")?;
+                            assigned_value(&mut output, value, type_oid)?;
+                        }
+                        condition(&mut output, conflict.update_where)?;
+                    }
+                }
+            }
         }
         Stmt::Update(update) => {
             let target = joined[2].table;
             output.push(" UPDATE ")?;
-            output.push(relation(target).as_str())?;
+            output.push(relation(&joined[2], " ").as_str())?;
             output.push(" SET ")?;
             for (index, (name, value)) in update.assignments.iter().enumerate() {
                 let Some(type_oid) = column_type(target, name)? else {
@@ -2042,7 +2100,7 @@ pub(crate) fn rule_action_definition<'a>(
         }
         Stmt::Delete(delete) => {
             output.push(" DELETE FROM ")?;
-            output.push(relation(joined[2].table).as_str())?;
+            output.push(relation(&joined[2], " ").as_str())?;
             extra(&mut output, "\n   USING ")?;
             condition(&mut output, delete.where_clause)?;
         }
@@ -2068,24 +2126,20 @@ fn push_identifier(output: &mut Output<'_>, name: &str) -> Result<(), SqlError> 
     output.push(identifier.as_str())
 }
 
-/// `get_basic_select_query` for a rule's query over at most one table,
-/// starting `indent` columns in (the enclosing statement's indentation).
-/// False when the query's shape is outside this module's coverage.
-fn write_rule_select(
+/// `get_select_query_def` for a rule's query over plain tables listed
+/// with commas, starting `indent` columns in (the enclosing statement's
+/// indentation). Each clause starts its own line as `appendContextKeyword`
+/// places it. False when the query's shape is outside this module's
+/// coverage.
+fn write_rule_select<'s>(
     context: &Context<'_>,
-    select: &crate::sql::ast::Select<'_>,
+    select: &'s crate::sql::ast::Select<'s>,
     indent: usize,
     output: &mut Output<'_>,
 ) -> Result<bool, SqlError> {
-    if select.distinct
-        || !select.distinct_on.is_empty()
+    if !select.distinct_on.is_empty()
         || !select.windows.is_empty()
-        || !select.group_by.is_empty()
         || !select.grouping_sets.is_empty()
-        || select.having.is_some()
-        || !select.order_by.is_empty()
-        || select.limit.is_some()
-        || select.offset.is_some()
         || select.with_ties
         || !select.with.is_empty()
         || select.set_body.is_some()
@@ -2093,35 +2147,114 @@ fn write_rule_select(
     {
         return Ok(false);
     }
-    output.push(" SELECT")?;
+    let clause = |output: &mut Output<'_>, plus: usize, keyword: &str| {
+        output.push("\n")?;
+        output.push_spaces(indent + plus)?;
+        output.push(keyword)
+    };
+    output.push(if select.distinct {
+        " SELECT DISTINCT"
+    } else {
+        " SELECT"
+    })?;
     if !write_targets(context, select.items, indent, output)? {
         return Ok(false);
     }
     if let Some(from) = &select.from {
-        let Some(table) = context
-            .joined
-            .iter()
-            .find(|joined| joined.unqualified && joined.name == from.base.table)
-        else {
-            return Ok(false);
-        };
-        output.push("\n")?;
-        output.push_spaces(indent + 2)?;
-        output.push(" FROM ")?;
-        if !context
-            .storage
-            .schema_is_on_path(table.table.schema, context.txid)
+        for (index, item) in core::iter::once(&from.base)
+            .chain(from.joins.iter().map(|join| &join.table))
+            .enumerate()
         {
-            push_identifier(output, table.table.schema.as_str())?;
-            output.push(".")?;
+            let exposed = item.alias.unwrap_or(item.table);
+            let Some(table) = context
+                .joined
+                .iter()
+                .find(|joined| joined.unqualified && joined.name == exposed)
+            else {
+                return Ok(false);
+            };
+            if index == 0 {
+                clause(output, 2, " FROM ")?;
+            } else {
+                output.push(",\n")?;
+                output.push_spaces(indent + 4)?;
+            }
+            if !context
+                .storage
+                .schema_is_on_path(table.table.schema, context.txid)
+            {
+                push_identifier(output, table.table.schema.as_str())?;
+                output.push(".")?;
+            }
+            push_identifier(output, table.table.name.as_str())?;
+            if table.name != table.table.name.as_str() {
+                output.push(" ")?;
+                push_identifier(output, table.name)?;
+            }
         }
-        push_identifier(output, table.table.name.as_str())?;
     }
     if let Some(condition) = select.where_clause {
-        output.push("\n")?;
-        output.push_spaces(indent + 1)?;
-        output.push(" WHERE ")?;
+        clause(output, 1, " WHERE ")?;
         context.write(condition, Some(oid::BOOL), output)?;
+    }
+    // `ORDER BY 1` and `GROUP BY 1` name a target by position.
+    let resolve = |expression: &'s Expr<'s>| -> Option<&'s Expr<'s>> {
+        match expression {
+            Expr::Int(position) if *position >= 1 => {
+                match select.items.get((*position - 1) as usize) {
+                    Some(crate::sql::ast::SelectItem::Expr { expression, .. }) => Some(expression),
+                    _ => None,
+                }
+            }
+            expression => Some(expression),
+        }
+    };
+    if !select.group_by.is_empty() {
+        clause(output, 1, " GROUP BY ")?;
+        for (index, expression) in select.group_by.iter().enumerate() {
+            if index != 0 {
+                output.push(", ")?;
+            }
+            let Some(expression) = resolve(expression) else {
+                return Ok(false);
+            };
+            let natural = context.type_of(expression)?;
+            context.write(expression, natural, output)?;
+        }
+    }
+    if let Some(having) = select.having {
+        clause(output, 0, " HAVING ")?;
+        context.write(having, Some(oid::BOOL), output)?;
+    }
+    if !select.order_by.is_empty() {
+        clause(output, 1, " ORDER BY ")?;
+        for (index, order) in select.order_by.iter().enumerate() {
+            if index != 0 {
+                output.push(", ")?;
+            }
+            let Some(expression) = resolve(order.expression) else {
+                return Ok(false);
+            };
+            let natural = context.type_of(expression)?;
+            context.write(expression, natural, output)?;
+            if order.descending {
+                output.push(" DESC")?;
+            }
+            if order.nulls_first != order.descending {
+                output.push(if order.nulls_first {
+                    " NULLS FIRST"
+                } else {
+                    " NULLS LAST"
+                })?;
+            }
+        }
+    }
+    for (keyword, value) in [(" OFFSET ", select.offset), (" LIMIT ", select.limit)] {
+        if let Some(value) = value {
+            clause(output, 0, keyword)?;
+            let natural = context.type_of(value)?;
+            context.write(value, natural, output)?;
+        }
     }
     Ok(true)
 }
@@ -2154,7 +2287,10 @@ fn write_targets(
                 push_identifier(output, alias)?;
             }
             (Expr::Column { .. }, None) => {}
-            (_, None) => output.unsupported()?,
+            (_, None) => {
+                output.push(" AS ")?;
+                push_identifier(output, crate::sql::exec::derived_name(expression))?;
+            }
         }
         Ok::<(), SqlError>(())
     };

@@ -8174,13 +8174,25 @@ fn required_comparison_collation(
     collation: Option<DerivedCollation>,
 ) -> Result<crate::sql::ast::Collation, SqlError> {
     match collation {
-        Some(collation) if collation.indeterminate => Err(sql_err!(
-            sqlstate::INDETERMINATE_COLLATION,
-            "could not determine which collation to use for string comparison"
-        )),
+        Some(collation) if collation.indeterminate => Err(indeterminate_string_comparison()),
         Some(collation) => Ok(collation.value),
         None => Ok(crate::sql::ast::Collation::None),
     }
+}
+
+/// A string comparison whose inputs' implicit collations conflict.
+pub(crate) fn indeterminate_string_comparison() -> SqlError {
+    let error = sql_err!(
+        sqlstate::INDETERMINATE_COLLATION,
+        "could not determine which collation to use for string comparison"
+    );
+    stash_diagnostic(
+        None,
+        Some(StackStr::from_str(
+            "Use the COLLATE clause to set the collation explicitly.",
+        )),
+    );
+    error
 }
 
 /// PostgreSQL's collation-combination rule, shared by every expression that

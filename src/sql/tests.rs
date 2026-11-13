@@ -23350,7 +23350,7 @@ fn maximum_statement_width_executes_before_and_after_object_cold_recovery() {
         assert_eq!(
             join_plan_rows
                 .iter()
-                .filter(|line| line.contains("Seq Scan on source_"))
+                .filter(|line| line.contains("Seq Scan on statement_lock_source source_"))
                 .count(),
             WIDTH,
             "{phase} join EXPLAIN: {}",
@@ -23381,8 +23381,8 @@ fn maximum_statement_width_executes_before_and_after_object_cold_recovery() {
             set_plan_rows
                 .iter()
                 .filter(|line| {
-                    line.contains("Seq Scan on set_left_")
-                        || line.contains("Seq Scan on set_right_")
+                    line.contains("Seq Scan on statement_lock_source set_left_")
+                        || line.contains("Seq Scan on statement_lock_source set_right_")
                 })
                 .count(),
             WIDTH * 2,
@@ -38722,7 +38722,7 @@ fn derived_projection_retains_its_declared_collation() {
          JOIN posix_values ON projected.value = posix_values.value",
     );
     assert!(
-        String::from_utf8_lossy(&output).contains("42P21"),
+        String::from_utf8_lossy(&output).contains("42P22"),
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -38747,7 +38747,7 @@ fn recursive_cte_retains_its_declared_collation() {
          ON projected.value = posix_values.value",
     );
     assert!(
-        String::from_utf8_lossy(&output).contains("42P21"),
+        String::from_utf8_lossy(&output).contains("42P22"),
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -38793,7 +38793,7 @@ fn data_modifying_cte_retains_returning_collation() {
          ON projected.value = posix_values.value",
     );
     assert!(
-        String::from_utf8_lossy(&output).contains("42P21"),
+        String::from_utf8_lossy(&output).contains("42P22"),
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -38938,11 +38938,15 @@ fn hash_join_rejects_conflicting_column_collations() {
         "CREATE TABLE collation_left (value text COLLATE \"C\"); \
          CREATE TABLE collation_right (value text COLLATE \"POSIX\"); \
          CREATE INDEX collation_right_value ON collation_right (value); \
+         INSERT INTO collation_left VALUES ('a'); \
+         INSERT INTO collation_right VALUES ('a'); \
          SELECT * FROM collation_left AS left_value \
          JOIN collation_right AS right_value ON left_value.value = right_value.value",
     );
+    // Conflicting implicit collations leave `=` without one, which
+    // PostgreSQL reports when the comparison runs.
     assert!(
-        String::from_utf8_lossy(&output).contains("42P21"),
+        String::from_utf8_lossy(&output).contains("42P22"),
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -54079,12 +54083,15 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
         "{settings:?}"
     );
     for (format, expected) in [
-        ("JSON", "\"Settings\":{\"search_path\":\"public\"}"),
+        (
+            "JSON",
+            "\"Settings\": {\n      \"search_path\": \"public\"\n    }",
+        ),
         (
             "XML",
-            "<Settings><search_path>public</search_path></Settings>",
+            "<Settings>\n      <search_path>public</search_path>\n    </Settings>",
         ),
-        ("YAML", "Settings:\n    search_path: \"public\""),
+        ("YAML", "Settings: \n    search_path: \"public\""),
     ] {
         let output = run_with(
             &mut engine,
@@ -54128,7 +54135,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
          DECLARE plan text; \
          BEGIN \
            EXECUTE 'EXPLAIN (SETTINGS, FORMAT JSON) SELECT * FROM ep' INTO STRICT plan; \
-           IF position('\"Settings\":{\"search_path\":\"public\"}' IN plan) = 0 THEN \
+           IF position('\"search_path\": \"public\"' IN plan) = 0 THEN \
              RETURN false; \
            END IF; \
            EXECUTE 'PREPARE ep_dynamic_generic(int) AS SELECT payload FROM ep WHERE id = $1'; \
@@ -54277,8 +54284,8 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
         "EXPLAIN (FORMAT JSON) SELECT 1",
     ));
     assert_eq!(json.len(), 1);
-    assert!(json[0].starts_with("[{\"Plan\":{"), "{json:?}");
-    assert!(json[0].contains("\"Node Type\":\"Result\""), "{json:?}");
+    assert!(json[0].starts_with("[\n  {\n    \"Plan\": {"), "{json:?}");
+    assert!(json[0].contains("\"Node Type\": \"Result\""), "{json:?}");
 
     let xml = data_rows(&run_with(
         &mut engine,
@@ -54293,7 +54300,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
         &mut budget,
         "EXPLAIN (FORMAT YAML) SELECT 1",
     ));
-    assert!(yaml[0].starts_with("- Plan:\n"), "{yaml:?}");
+    assert!(yaml[0].starts_with("- Plan: \n"), "{yaml:?}");
     assert!(yaml[0].contains("Node Type: \"Result\""), "{yaml:?}");
 
     // Structured renderers must preserve the plan tree rather than emitting
@@ -54304,16 +54311,18 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
         &mut budget,
         "EXPLAIN (FORMAT XML, SUMMARY OFF) SELECT payload FROM ep ORDER BY payload",
     ));
-    assert!(xml_tree[0].contains("<Plan><Node-Type>Sort</Node-Type>"));
-    assert!(xml_tree[0].contains("<Plans><Plan><Node-Type>Seq Scan</Node-Type>"));
+    assert!(xml_tree[0].contains("<Plan>\n      <Node-Type>Sort</Node-Type>"));
+    assert!(
+        xml_tree[0].contains("<Plans>\n        <Plan>\n          <Node-Type>Seq Scan</Node-Type>")
+    );
     assert!(!xml_tree[0].contains("<Node><Node-Type>"));
     let yaml_tree = data_rows(&run_with(
         &mut engine,
         &mut budget,
         "EXPLAIN (FORMAT YAML, SUMMARY OFF) SELECT payload FROM ep ORDER BY payload",
     ));
-    assert!(yaml_tree[0].contains("- Plan:\n    Node Type: \"Sort\""));
-    assert!(yaml_tree[0].contains("    Plans:\n      - Node Type: \"Seq Scan\""));
+    assert!(yaml_tree[0].contains("- Plan: \n    Node Type: \"Sort\""));
+    assert!(yaml_tree[0].contains("    Plans: \n      - Node Type: \"Seq Scan\""));
 
     // PostgreSQL includes the complete zero-valued runtime metric shape in
     // structured formats when BUFFERS or WAL is requested, unlike text.
@@ -54330,9 +54339,9 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
         &mut budget,
         "EXPLAIN (ANALYZE, BUFFERS, WAL, TIMING OFF, FORMAT JSON) SELECT payload FROM ep WHERE id = 2",
     ));
-    assert!(json_runtime[0].contains("\"Actual Rows\":1.00"));
-    assert!(json_runtime[0].contains("\"Shared Dirtied Blocks\":0"));
-    assert!(json_runtime[0].contains("\"WAL Records\":0"));
+    assert!(json_runtime[0].contains("\"Actual Rows\": 1.00"));
+    assert!(json_runtime[0].contains("\"Shared Dirtied Blocks\": 0"));
+    assert!(json_runtime[0].contains("\"WAL Records\": 0"));
     let yaml_runtime = data_rows(&run_with(
         &mut engine,
         &mut budget,
@@ -54579,7 +54588,7 @@ fn hash_join_decodes_derived_sources_and_preserves_left_join_semantics() {
             &format!("EXPLAIN {query}"),
         ));
         assert!(
-            plan.iter().any(|line| line.contains("Hash Join")),
+            plan.iter().any(|line| line.contains("Hash Left Join")),
             "{plan:?}"
         );
         assert_eq!(
@@ -54846,7 +54855,7 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
     );
     assert!(
         plan.iter()
-            .any(|row| row.contains("Index Scan using indexed_events_key on e")),
+            .any(|row| row.contains("Index Scan using indexed_events_key on indexed_events e")),
         "the reported inner scan must be the same parameterized path execution uses: {plan:?}"
     );
     assert!(
@@ -54895,7 +54904,7 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
     assert!(
         prepared
             .iter()
-            .any(|row| row.contains("Index Scan using indexed_events_key on e")),
+            .any(|row| row.contains("Index Scan using indexed_events_key on indexed_events e")),
         "{prepared:?}"
     );
 
@@ -54911,7 +54920,9 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
     // Before a checkpoint only the complete equality map is available; the
     // range correctly remains a sequential inner scan.
     assert!(
-        range_plan.iter().any(|row| row.contains("Seq Scan on e")),
+        range_plan
+            .iter()
+            .any(|row| row.contains("Seq Scan on indexed_events e")),
         "{range_plan:?}"
     );
 
@@ -54953,7 +54964,7 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
     assert_eq!(
         joined_dml_plan
             .iter()
-            .filter(|row| row.contains("Index Scan using indexed_events_key on e"))
+            .filter(|row| row.contains("Index Scan using indexed_events_key on indexed_events e"))
             .count(),
         2,
         "joined DML explanation must expose the parameterized source: {joined_dml_plan:?}"
@@ -55032,7 +55043,9 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
              AND e.event_id = p.wanted",
     ));
     assert!(
-        mixed_plan.iter().any(|row| row.contains("Seq Scan on e")),
+        mixed_plan
+            .iter()
+            .any(|row| row.contains("Seq Scan on indexed_events e")),
         "{mixed_plan:?}"
     );
     assert_eq!(
@@ -55162,7 +55175,7 @@ fn parameterized_range_join_reads_cold_object_index_generations() {
     assert!(
         exact_plan
             .iter()
-            .any(|row| row.contains("Index Scan using durable_events_key on e")),
+            .any(|row| row.contains("Index Scan using durable_events_key on durable_events e")),
         "{exact_plan:?}"
     );
     let plan = data_rows(&run_with(
@@ -55179,7 +55192,7 @@ fn parameterized_range_join_reads_cold_object_index_generations() {
     );
     assert!(
         plan.iter()
-            .any(|row| row.contains("Index Scan using durable_events_key on e")),
+            .any(|row| row.contains("Index Scan using durable_events_key on durable_events e")),
         "a cold equality-prefix range must retain the durable B-tree plan: {plan:?}"
     );
     assert!(
@@ -66295,13 +66308,13 @@ fn brin_indexes_drive_range_expression_dml_and_cold_object_scans() {
     assert!(
         indexed
             .iter()
-            .any(|row| { row.contains("Bitmap Index Scan using brin_events_active_category") }),
+            .any(|row| { row.contains("Bitmap Index Scan on brin_events_active_category") }),
         "{indexed:?}"
     );
     assert!(
         indexed
             .iter()
-            .any(|row| { row.contains("Bitmap Index Scan using brin_events_sequence") }),
+            .any(|row| { row.contains("Bitmap Index Scan on brin_events_sequence") }),
         "{indexed:?}"
     );
     assert!(
@@ -66432,7 +66445,7 @@ fn brin_indexes_drive_range_expression_dml_and_cold_object_scans() {
     );
     assert!(
         cold.iter()
-            .any(|row| { row.contains("Bitmap Index Scan using brin_events_sequence") }),
+            .any(|row| { row.contains("Bitmap Index Scan on brin_events_sequence") }),
         "{cold:?}"
     );
     assert!(cold.iter().any(|row| row == "1|3999|3999"), "{cold:?}");
@@ -68113,7 +68126,7 @@ fn gin_and_spgist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() 
         assert!(
             output
                 .iter()
-                .any(|row| row.contains(&format!("Bitmap Index Scan using {index}"))),
+                .any(|row| row.contains(&format!("Bitmap Index Scan on {index}"))),
             "{index}: {output:?}"
         );
     }
@@ -68231,7 +68244,7 @@ fn gin_and_spgist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() 
     );
     assert!(
         cold.iter()
-            .any(|row| row.contains("Bitmap Index Scan using search_rows_tags")),
+            .any(|row| row.contains("Bitmap Index Scan on search_rows_tags")),
         "{cold:?}"
     );
     assert!(
@@ -70210,7 +70223,7 @@ fn brin_inclusion_indexes_execute_range_and_network_predicates() {
     assert!(
         indexed
             .iter()
-            .filter(|row| row.contains("Bitmap Index Scan using brin_areas_inclusion"))
+            .filter(|row| row.contains("Bitmap Index Scan on brin_areas_inclusion"))
             .count()
             >= 10,
         "{indexed:?}"
@@ -70245,7 +70258,7 @@ fn brin_inclusion_indexes_execute_range_and_network_predicates() {
     ));
     assert!(
         cold.iter()
-            .any(|row| row.contains("Bitmap Index Scan using brin_areas_inclusion")),
+            .any(|row| row.contains("Bitmap Index Scan on brin_areas_inclusion")),
         "{cold:?}"
     );
     assert!(cold.iter().any(|row| row == "2|matched"), "{cold:?}");

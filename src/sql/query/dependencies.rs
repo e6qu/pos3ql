@@ -2949,6 +2949,20 @@ pub(crate) fn dml_dependency_scope<'a>(
     arena: &'a Arena,
     outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
 ) -> Result<super::QueryScope<'a>, SqlError> {
+    dml_join_scope(storage, target, alias, extra, txid, arena, outer).map(|(scope, _)| scope)
+}
+
+/// The schema scope of [`dml_dependency_scope`] with the FROM clause it
+/// resolves: the target first, then each extra FROM item joined by a comma.
+pub(crate) fn dml_join_scope<'a>(
+    storage: &'a Storage,
+    target: QualName<'a>,
+    alias: Option<&'a str>,
+    extra: Option<&'a FromClause<'a>>,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
+) -> Result<(super::QueryScope<'a>, &'a FromClause<'a>), SqlError> {
     let base = super::dml_target_ref(target, alias);
     let joins = match extra {
         None => &[][..],
@@ -2975,7 +2989,8 @@ pub(crate) fn dml_dependency_scope<'a>(
         .alloc(FromClause { base, joins })
         .map_err(|_| super::arena_full())?;
     let from = super::cte::expand_from_schema(from, storage, txid, arena)?;
-    super::QueryScope::resolve_dml_schema(storage, from, txid, arena, outer)
+    let scope = super::QueryScope::resolve_dml_schema(storage, from, txid, arena, outer)?;
+    Ok((scope, from))
 }
 
 fn collect_select<'a>(

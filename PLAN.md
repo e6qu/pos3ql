@@ -516,19 +516,29 @@ query text. In a `BEGIN ATOMIC` body only a `SELECT` of expressions
 without `FROM` is deparsed (`SELECT (x + 1);`, under the current names of
 the routines and types it named); other statements are printed one per line
 as written, keeping names that were since renamed, where PostgreSQL prints its analyzed form (`INSERT
-INTO t (a, b) VALUES (f.x, 'q'::text);`); a rule action that reads more than one table besides its target, aliases a
-relation, uses `ON CONFLICT`, or whose query groups, orders, limits or
-combines rows (`DO ALSO INSERT INTO log SELECT a FROM t GROUP BY a`) is
-printed as written, and its pretty form fails with `0A000`; policy
+INTO t (a, b) VALUES (f.x, 'q'::text);`); a rule action whose FROM list holds a subquery, a function or an explicit
+`JOIN`, or whose query combines rows with set operations, `DISTINCT ON`,
+windows or grouping sets (`DO ALSO INSERT INTO log SELECT a FROM (SELECT a
+FROM t) s`), is printed as written, and its pretty form fails with `0A000`; policy
 expressions are not deparsed. `EXPLAIN` prints
-scan filters, a hash join's condition and a nested loop's join filter only
-for queries over one or two relations; the executor has no merge join, so
-where PostgreSQL's costs pick `Merge Join` over sorted inputs pos3ql shows
-the hash join or nested loop it runs, and `UPDATE ... FROM` and `DELETE ...
-USING` always run as a nested loop where PostgreSQL may hash or merge. For a
-statement a rewrite rule changes, `EXPLAIN ANALYZE`, the structured formats
-and actions with their own `FROM`, `RETURNING` or an `INSERT ... SELECT`
-fail with `0A000`. Notices carry
+the left-deep join tree pos3ql runs, with scan filters, a hash join's
+condition and each nested loop's join filter, for relations joined by
+commas, `CROSS JOIN` or inner `ON` conditions; outer joins print the tree
+without their conditions, and index scans omit `Index Cond`. The join order
+is pos3ql's (FROM order, or its selectivity order for comma lists), which
+can differ from PostgreSQL's cost-based order. The executor has no merge
+join, so where PostgreSQL's costs pick `Merge Join` over sorted inputs
+pos3ql shows the hash join or nested loop it runs. `UPDATE ... FROM` and `DELETE ...
+USING` hash a single FROM table joined by equality, as a `SELECT` of the
+two tables would; other FROM lists run as a nested loop. For a
+statement a rewrite rule changes, an `INSERT ... SELECT` action of an
+`INSERT` of several rows or of a query reading tables, an `INSERT` of an
+aggregated or ordered query, a conditional `INSTEAD` rule on an `INSERT` of
+several rows and an action on a view fail with `0A000`; under `EXPLAIN ANALYZE` the statement runs
+once and its time and I/O are reported on its last query. `EXPLAIN ANALYZE`
+reports actual rows only on each plan's top node, where PostgreSQL reports
+every node (`(never executed)` for nodes that did not run), because the
+executor keeps no per-node counters. Notices carry
 no position (`''::tsquery` points at the literal in PostgreSQL). Built-in
 calls with constant arguments are not folded once while planning: `SELECT
 timestamptypmodin('{7}') FROM generate_series(1, 3)` warns three times where

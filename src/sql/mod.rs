@@ -21920,26 +21920,32 @@ impl Engine {
                     return Ok(planned);
                 }
                 // A statement a rewrite rule changes is explained as the
-                // statements the rule produces.
-                match explain::emit_rewritten_plans(
+                // queries the rule produces.
+                let rewritten = match explain::rewritten_queries(
                     &self.storage,
                     txn.txid,
                     planned_statement,
-                    *options,
-                    &settings,
                     arena,
-                    responder,
-                )? {
-                    Ok(true) => return Ok(Ok(())),
-                    Ok(false) => {}
+                ) {
+                    Ok(rewritten) => rewritten,
                     Err(error) => return Ok(Err(error)),
-                }
-                let plan = with_prepared_parameter_types(parameter_types, || {
-                    explain::plan_statement(&self.storage, txn.txid, planned_statement, arena)
-                });
-                let plan = match plan {
-                    Ok(plan) => plan,
-                    Err(error) => return Ok(Err(error)),
+                };
+                let plan = match rewritten.as_ref() {
+                    Some(_) => None,
+                    None => {
+                        let plan = with_prepared_parameter_types(parameter_types, || {
+                            explain::plan_statement(
+                                &self.storage,
+                                txn.txid,
+                                planned_statement,
+                                arena,
+                            )
+                        });
+                        match plan {
+                            Ok(plan) => Some(plan),
+                            Err(error) => return Ok(Err(error)),
+                        }
+                    }
                 };
                 // SQL EXECUTE arguments are bounded by the pool's declared
                 // parameter count (prep::MAX_PREP_PARAMS) whenever types were
@@ -22013,7 +22019,15 @@ impl Engine {
                 } else {
                     None
                 };
-                explain::emit_plan(&plan, *options, actual, &settings, responder)
+                match (rewritten, plan) {
+                    (Some(queries), _) => explain::emit_rewritten(
+                        &queries, *options, actual, &settings, arena, responder,
+                    ),
+                    (None, Some(plan)) => {
+                        explain::emit_plan(&plan, *options, actual, &settings, arena, responder)
+                    }
+                    (None, None) => unreachable!("an unrewritten statement is planned"),
+                }
             }
             Stmt::With { .. } if reset_workspace => self.execute_modification_resumable(
                 statement, arena, params, txn, sqlprep, cursors, guc, responder,

@@ -46,8 +46,11 @@ pub(crate) use setops::set_query_into_rows;
 
 pub(crate) mod generator;
 mod joined_from;
+#[cfg(test)]
+pub(crate) use joined_from::target_hash_builds;
 pub(crate) use joined_from::{
-    JoinedFromRow, joined_from_match, recheck_joined_from_match, with_joined_from_row,
+    JoinedFromRow, TargetHash, TargetHashPlan, joined_from_match, recheck_joined_from_match,
+    target_hash_plan, with_joined_from_row,
 };
 mod materialize;
 pub(crate) use materialize::{ScopeSchema, locked_row_where_passes};
@@ -16466,6 +16469,7 @@ pub fn first_from_match<'a, 'r>(
     on_match: &mut dyn FnMut(&dyn ColumnLookup<'a>) -> Result<(), SqlError>,
     sequences: Option<&dyn SequenceAccess>,
     matched_row: Option<MatchedFromRow<'_, 'r>>,
+    hashed: Option<&'a [u64]>,
 ) -> Result<bool, SqlError> {
     let mut found = false;
     let mut matched_row = matched_row;
@@ -16480,6 +16484,7 @@ pub fn first_from_match<'a, 'r>(
         params,
         target,
         sequences,
+        hashed,
         &mut |row, joined, _| {
             if let Some(matched_row) = matched_row.as_mut() {
                 *matched_row.values = detached_join_values(row, arena, matched_row.arena)?;

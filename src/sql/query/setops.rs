@@ -395,10 +395,7 @@ fn resolve_set_order(
             }
         };
         if columns[index].collation_derivation == CollationDerivation::Indeterminate {
-            return Err(sql_err!(
-                sqlstate::INDETERMINATE_COLLATION,
-                "could not determine which collation to use for string comparison"
-            ));
+            return Err(crate::sql::eval::indeterminate_string_comparison());
         }
         reject_missing_ordering(columns[index].type_oid)?;
         keys[count] = (index, order.descending, order.nulls_first);
@@ -2274,10 +2271,7 @@ pub(crate) fn sort_set_rows(
             }
         };
         if columns[index].collation_derivation == CollationDerivation::Indeterminate {
-            return Err(sql_err!(
-                sqlstate::INDETERMINATE_COLLATION,
-                "could not determine which collation to use for string comparison"
-            ));
+            return Err(crate::sql::eval::indeterminate_string_comparison());
         }
         reject_missing_ordering(columns[index].type_oid)?;
         keys[nk] = (index, ob.descending, ob.nulls_first);

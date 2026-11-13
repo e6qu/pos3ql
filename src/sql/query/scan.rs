@@ -5648,8 +5648,51 @@ fn key_column(scope: &QueryScope<'_>, expression: &Expr<'_>) -> Option<ResolvedC
     }
 }
 
+/// The collation `=` compares two join-key columns with: PostgreSQL's
+/// implicit-collation rule, where a non-default collation beats the
+/// database default and two different non-default ones conflict (`None`).
+fn join_key_collation(
+    scope: &QueryScope<'_>,
+    (left_table, left_column): (usize, usize),
+    (right_table, right_column): (usize, usize),
+) -> Option<Collation> {
+    let left = scope.defs.get(left_table).expect("resolved").columns[left_column].collation;
+    let right = scope.defs.get(right_table).expect("resolved").columns[right_column].collation;
+    match (left, right) {
+        _ if left == right => Some(left),
+        (Collation::Default, other) | (other, Collation::Default) => Some(other),
+        _ => None,
+    }
+}
+
 /// Up to eight (probe column, build column) join key pairs and their count.
 type JoinKeyPairs = ([(usize, usize); 8], usize);
+
+/// Whether `conjunct` equates the column `(table, column)` with a literal.
+pub(crate) fn fixes_column(
+    scope: &QueryScope<'_>,
+    conjunct: &Expr<'_>,
+    (table, column): (usize, usize),
+) -> bool {
+    let Expr::Binary {
+        operator: BinaryOp::Eq,
+        left,
+        right,
+        ..
+    } = conjunct
+    else {
+        return false;
+    };
+    let literal = |side: &Expr<'_>| {
+        matches!(
+            side,
+            Expr::Int(_) | Expr::Str(_) | Expr::Float(_) | Expr::NumericLit(_) | Expr::Bool(_)
+        )
+    };
+    let names =
+        |side: &Expr<'_>| key_column(scope, side) == Some(ResolvedColumn::Table(table, column));
+    (names(left) && literal(right)) || (names(right) && literal(left))
+}
 
 fn hash_join_keys<'a>(
     scope: &QueryScope<'a>,
@@ -5704,17 +5747,10 @@ fn hash_join_keys<'a>(
         if !join_key_types_compatible(pt, bt) {
             continue;
         }
-        let probe_collation =
-            scope.defs.get(probe_t).expect("resolved").columns[probe_col].collation;
-        let build_collation =
-            scope.defs.get(build_t).expect("resolved").columns[build_col].collation;
-        if probe_collation != build_collation {
-            return Err(sql_err!(
-                crate::sql::eval::sqlstate::COLLATION_MISMATCH,
-                "collation mismatch between \"{}\" and \"{}\"",
-                probe_collation.name(),
-                build_collation.name()
-            ));
+        // Conflicting implicit collations leave `=` without one; evaluating
+        // the condition reports that, so such a key selects no hash plan.
+        if join_key_collation(scope, (probe_t, probe_col), (build_t, build_col)).is_none() {
+            continue;
         }
         if npairs < pairs.len() {
             pairs[npairs] = (probe_col, build_col);
@@ -5805,7 +5841,8 @@ fn derived_probe<'a>(
                 .map(|(keys, _)| (earlier, keys[0]))
         })
         .map(|(earlier, key)| {
-            let collation = scope.defs.get(table).expect("resolved").columns[key.1].collation;
+            let collation = join_key_collation(scope, (earlier, key.0), (table, key.1))
+                .expect("hash keys have a collation");
             ((earlier, key), collation)
         })
     else {
@@ -5985,9 +6022,13 @@ pub(crate) fn select_hash_join_plan<'a>(
     // representation without executing a derived query for planning.
     let build_capacity = build_capacity.max(1);
     let mut key_collations = [Collation::None; 8];
-    for (index, &(probe_column, _)) in keys.iter().take(key_count).enumerate() {
-        key_collations[index] =
-            scope.defs.get(probe_table).expect("resolved").columns[probe_column].collation;
+    for (index, &(probe_column, build_column)) in keys.iter().take(key_count).enumerate() {
+        key_collations[index] = join_key_collation(
+            scope,
+            (probe_table, probe_column),
+            (build_table, build_column),
+        )
+        .expect("hash keys have a collation");
     }
     Ok(Some(HashJoinPlan {
         probe_table,
@@ -7896,12 +7937,16 @@ fn scan_source_mode<'a>(
                 return Ok(true);
             }
             let access = indexed.filter(|access| access.table == order[depth]);
-            let candidates = access.map(|access| access.rowids);
+            // A target hash join's build already scanned this source once.
+            let hashed = (depth == 0 && access.is_none())
+                .then_some(scope.target_hash_candidates)
+                .flatten();
+            let candidates = access.map(|access| access.rowids).or(hashed);
             if candidates.is_none() && storage.spill_generation_count(slot) != 0 {
                 visit_sequential_physical_rows!(slot);
                 return Ok(true);
             }
-            if access.is_none_or(|access| access.scan_executed) {
+            if hashed.is_none() && access.is_none_or(|access| access.scan_executed) {
                 storage.record_relation_scan(
                     txid,
                     slot,
@@ -8037,8 +8082,9 @@ fn scan_source_mode<'a>(
             }
             // Spilled rows sort by rowid (their SST order — the physical order
             // they were written in); heap rows keep heap-offset order after
-            // them, matching insertion order within each group.
-            if access.is_none_or(|access| !access.preserves_order) {
+            // them, matching insertion order within each group. A hash
+            // chain's order is the hash join's output order.
+            if hashed.is_none() && access.is_none_or(|access| !access.preserves_order) {
                 ordered[..fill].sort_unstable_by_key(|row| {
                     row.expect("row snapshots are initialized").sort_key()
                 });
@@ -8047,11 +8093,13 @@ fn scan_source_mode<'a>(
                 let rowid = row.rowid();
                 let home = row.read()?;
                 check_timeout()?;
-                storage.record_relation_tuple_read(
-                    txid,
-                    slot,
-                    access.map(|access| access.statistics()),
-                )?;
+                if hashed.is_none() {
+                    storage.record_relation_tuple_read(
+                        txid,
+                        slot,
+                        access.map(|access| access.statistics()),
+                    )?;
+                }
                 let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                     let bytes = storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?;
                     visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))

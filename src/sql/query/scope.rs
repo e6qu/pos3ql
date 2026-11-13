@@ -437,6 +437,10 @@ pub struct QueryScope<'d> {
     /// Set while adding the right side of a `RIGHT` or `FULL` join, which
     /// may not read the join's other side even when `LATERAL`.
     right_of_outer_join: bool,
+    /// The rows of the first FROM item a hash join of a data-modifying
+    /// statement's target found for the current target row, in scan order.
+    /// The statement's conditions still decide each of them.
+    pub(crate) target_hash_candidates: Option<&'d [u64]>,
 }
 
 /// A table (or `USING` alias) inside an unaliased parenthesized join. Its
@@ -1312,6 +1316,7 @@ impl<'d> QueryScope<'d> {
             hidden_origins: &[],
             lateral_from: 0,
             right_of_outer_join: false,
+            target_hash_candidates: None,
         })
     }
 

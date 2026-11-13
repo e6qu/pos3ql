@@ -225,7 +225,6 @@ fn for_each_materialized_projection<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
-    correlated: &'a [&'a Expr<'a>],
     base: &SubqueryValues<'a, 'a>,
     where_correlated: &[&'a Expr<'a>],
     order_exprs: &[Option<super::ResolvedSortKey<'a>>; MAX_PROJ],
@@ -249,9 +248,7 @@ fn for_each_materialized_projection<'a>(
         return Ok(());
     }
     // The row's correlated subqueries run as its expressions reach them.
-    if !correlated.is_empty() {
-        super::subquery::bind_correlated_row(base, row, outer);
-    }
+    let _row_binding = super::subquery::bind_correlated_row(base, row, outer);
     let row_hooks = hooks;
     let project_set = if has_srf {
         prepare_project_set(
@@ -453,7 +450,6 @@ pub(super) struct LockedRowRecheck<'r, 'a> {
     statement: &'a Select<'a>,
     scope: &'r QueryScope<'a>,
     from: &'a FromClause<'a>,
-    correlated: &'a [&'a Expr<'a>],
     base: &'r SubqueryValues<'a, 'a>,
     params: &'r [Datum<'a>],
     hooks: &'r EvalHooks<'r, 'a>,
@@ -774,7 +770,6 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
             statement,
             scope,
             from,
-            correlated,
             base,
             params,
             hooks,
@@ -1094,7 +1089,6 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
             arena,
             self.params,
             self.hooks,
-            self.correlated,
             self.base,
             &[],
             &self.plan.order_exprs,
@@ -1950,7 +1944,6 @@ pub(crate) fn materialized_rows<'a>(
             arena,
             params,
             hooks,
-            correlated,
             base,
             where_correlated,
             &order_exprs,
@@ -2516,7 +2509,6 @@ pub(crate) fn external_materialized_into<'a>(
                     arena,
                     params,
                     hooks,
-                    correlated,
                     base,
                     plan.where_correlated,
                     &plan.order_exprs,
@@ -2565,7 +2557,6 @@ pub(crate) fn external_materialized_into<'a>(
             arena,
             params,
             hooks,
-            correlated,
             base,
             plan.where_correlated,
             &plan.order_exprs,

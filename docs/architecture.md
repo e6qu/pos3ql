@@ -494,10 +494,13 @@ its comparison collations and column types.
 **Built: correlated subqueries where evaluation reaches them.** A query's
 correlated subqueries are deferred like its uncorrelated ones, without a
 cache, and share one runner per statement (`CorrelatedSubqueries` in
-`src/sql/query/subquery.rs`). Each row the query evaluates (a scan row, a
-grouped input row, a group, a window row) first binds itself to the runner,
-which keeps only erased pointers to that row and the rows enclosing it; when
-an expression reaches a subquery, the runner runs it against the bound row.
+`src/sql/query/subquery.rs`). When an expression reaches a subquery, the
+runner runs it against the row being evaluated, which carries the rows
+enclosing it. A row evaluated through a lookup that does not answer the
+query's columns itself (a group, whose output reads grouping keys and
+aggregate values; a window row) binds itself to the runner for exactly as
+long as its expressions are evaluated: the binding is a guard that restores
+the previous one when dropped, so a stale row is never read.
 So a row that does not take a `CASE` branch, or a `COALESCE` argument after a
 non-NULL one, never runs that branch's subquery, as PostgreSQL's subplans do:
 `SELECT CASE WHEN id > 10 THEN (SELECT 1/(x - t.id) FROM z WHERE x = t.id)

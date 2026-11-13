@@ -3053,25 +3053,43 @@ struct BoundRow {
 
 impl<'a> CorrelatedSubqueries<'a> {
     /// Makes `row`, inside `enclosing`, the row the correlated subqueries
-    /// read until the next binding. The caller evaluates the row's
-    /// expressions while both stay alive.
-    pub(crate) fn bind_row(
-        &self,
-        row: &dyn ColumnLookup<'a>,
-        enclosing: Option<&dyn ColumnLookup<'a>>,
-    ) {
-        // SAFETY: only the lifetimes are erased; `evaluate` dereferences the
-        // pointers while the caller evaluates this row, as `bind_row` requires.
+    /// read while the returned binding lives; dropping it restores the
+    /// previous binding. Without a binding a subquery reads the row it is
+    /// evaluated against.
+    pub(crate) fn bind_row<'g>(
+        &'g self,
+        row: &'g dyn ColumnLookup<'a>,
+        enclosing: Option<&'g dyn ColumnLookup<'a>>,
+    ) -> RowBinding<'g> {
+        // SAFETY: only the lifetimes are erased; the binding is dropped
+        // before `row` and `enclosing` are, so `evaluate` never reads a row
+        // that is gone.
         let erase = |lookup: &dyn ColumnLookup<'a>| unsafe {
             core::mem::transmute::<
                 *const (dyn ColumnLookup<'a> + '_),
                 *const (dyn ColumnLookup<'static> + 'static),
             >(lookup)
         };
-        self.row.set(Some(BoundRow {
+        let previous = self.row.replace(Some(BoundRow {
             row: erase(row),
             enclosing: enclosing.map(erase),
         }));
+        RowBinding {
+            cell: self.row,
+            previous,
+        }
+    }
+}
+
+/// The row a [`CorrelatedSubqueries`] reads while this lives.
+pub(crate) struct RowBinding<'g> {
+    cell: &'g core::cell::Cell<Option<BoundRow>>,
+    previous: Option<BoundRow>,
+}
+
+impl Drop for RowBinding<'_> {
+    fn drop(&mut self) {
+        self.cell.set(self.previous);
     }
 }
 
@@ -3081,29 +3099,31 @@ impl super::super::eval::SubqueryExecution for CorrelatedSubqueries<'_> {
         expression: &Expr<'x>,
         arena: &'x Arena,
         params: &[Datum<'x>],
-        _row: &dyn ColumnLookup<'x>,
+        row: &dyn ColumnLookup<'x>,
         sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     ) -> Result<super::super::eval::SubqueryResult<'x>, SqlError> {
-        let Some(bound) = self.row.get() else {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "a correlated subquery ran before its query bound a row"
-            ));
-        };
-        // SAFETY: see `bind_row`: the bound rows outlive this evaluation, and
-        // the statement's storage, bindings and slots outlive every row.
+        // SAFETY: a bound row outlives its binding (see `bind_row`), and the
+        // statement's storage, bindings and slots outlive every row.
         let (row, enclosing, storage, bindings, statement) = unsafe {
-            (
-                &*core::mem::transmute::<
-                    *const (dyn ColumnLookup<'static> + 'static),
-                    *const (dyn ColumnLookup<'x> + 'static),
-                >(bound.row),
-                bound.enclosing.map(|enclosing| {
+            let (row, enclosing) = match self.row.get() {
+                Some(bound) => (
                     &*core::mem::transmute::<
                         *const (dyn ColumnLookup<'static> + 'static),
                         *const (dyn ColumnLookup<'x> + 'static),
-                    >(enclosing)
-                }),
+                    >(bound.row),
+                    bound.enclosing.map(|enclosing| {
+                        &*core::mem::transmute::<
+                            *const (dyn ColumnLookup<'static> + 'static),
+                            *const (dyn ColumnLookup<'x> + 'static),
+                        >(enclosing)
+                    }),
+                ),
+                // The row being evaluated, which carries its enclosing rows.
+                None => (row, None),
+            };
+            (
+                row,
+                enclosing,
                 &*(self.storage as *const Storage),
                 core::mem::transmute::<&[SubqueryBinding<'_>], &'x [SubqueryBinding<'x>]>(
                     self.bindings,
@@ -3148,35 +3168,19 @@ impl super::super::eval::SubqueryExecution for CorrelatedSubqueries<'_> {
     }
 }
 
-/// The query's subquery values for one of its rows: `row`, inside
-/// `enclosing`, becomes the row its correlated subqueries read (see
-/// [`CorrelatedSubqueries`]).
-pub(super) fn correlated_row<'b, 'a>(
-    base: &SubqueryValues<'b, 'a>,
-    row: &dyn ColumnLookup<'a>,
-    enclosing: Option<&dyn ColumnLookup<'a>>,
-) -> SubqueryValues<'b, 'a> {
-    bind_correlated_row(base, row, enclosing);
-    SubqueryValues {
-        scalars: base.scalars,
-        lists: base.lists,
-        deferred: base.deferred,
-        statement: base.statement,
-        bindings: base.bindings,
-        correlated: base.correlated,
-    }
-}
-
 /// Binds `row`, inside `enclosing`, as the row a query's correlated
-/// subqueries read (see [`CorrelatedSubqueries`]).
-pub(super) fn bind_correlated_row<'a>(
+/// subqueries read while the returned binding lives (see
+/// [`CorrelatedSubqueries`]).
+pub(super) fn bind_correlated_row<'g, 'a>(
     base: &SubqueryValues<'_, 'a>,
-    row: &dyn ColumnLookup<'a>,
-    enclosing: Option<&dyn ColumnLookup<'a>>,
-) {
-    if let Some(correlated) = base.correlated {
-        correlated.bind_row(row, enclosing);
-    }
+    row: &'g dyn ColumnLookup<'a>,
+    enclosing: Option<&'g dyn ColumnLookup<'a>>,
+) -> Option<RowBinding<'g>>
+where
+    'a: 'g,
+{
+    base.correlated
+        .map(|correlated| correlated.bind_row(row, enclosing))
 }
 
 /// Evaluates a `WHERE` that reads correlated subqueries for one row: they
@@ -3195,7 +3199,7 @@ pub(super) fn correlated_where_passes<'a>(
     let Some(predicate) = predicate else {
         return Ok(true);
     };
-    bind_correlated_row(base, row, enclosing);
+    let _binding = bind_correlated_row(base, row, enclosing);
     let row = Chained {
         inner: row,
         outer: enclosing,

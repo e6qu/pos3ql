@@ -11634,7 +11634,7 @@ pub(crate) fn select_query_resumable<'a>(
                 }
                 // The row's correlated subqueries run as its expressions
                 // reach them.
-                subquery::bind_correlated_row(&outer_subs.base, row, None);
+                let _row_binding = subquery::bind_correlated_row(&outer_subs.base, row, None);
                 let row_hooks = &hooks;
                 // Number of output rows this source row yields (1, unless an
                 // `_pg_expandarray` expands it per array element).
@@ -13410,7 +13410,7 @@ fn select_into_rows_mode<'a>(
             return Ok(true);
         }
         // The row's correlated subqueries run as its expressions reach them.
-        subquery::bind_correlated_row(&outer_subs.base, row, outer);
+        let _row_binding = subquery::bind_correlated_row(&outer_subs.base, row, outer);
         let row_hooks = &hooks;
         let mut projected = [Datum::Null; MAX_PROJ];
         let project_set = if projection_has_project_set {

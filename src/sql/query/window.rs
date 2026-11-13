@@ -1968,13 +1968,8 @@ pub(crate) fn project_window_rows<'a>(
         let jr = window_row(scope, rows[i], offs);
         // Correlated subqueries in the select list / ORDER BY re-evaluate per
         // output row (their outer references resolve to this window row).
-        let row_subs;
-        let subs = if correlated.is_empty() {
-            hooks.subs
-        } else {
-            row_subs = super::subquery::correlated_row(base, &jr, outer);
-            Some(&row_subs)
-        };
+        let _row_binding = super::subquery::bind_correlated_row(base, &jr, outer);
+        let subs = hooks.subs;
         let win_hooks = EvalHooks {
             group: None,
             aggs: None,
@@ -2694,13 +2689,8 @@ pub(crate) fn external_window_into<'a>(
                     .with_block_store(|blocks| reader.advance(blocks))
                     .expect("spill-attached block store")?;
             }
-            let row_subs;
-            let subs = if correlated.is_empty() {
-                hooks.subs
-            } else {
-                row_subs = super::subquery::correlated_row(base, row, outer);
-                Some(&row_subs)
-            };
+            let _row_binding = super::subquery::bind_correlated_row(base, row, outer);
+            let subs = hooks.subs;
             let win_hooks = EvalHooks {
                 group: None,
                 aggs: None,

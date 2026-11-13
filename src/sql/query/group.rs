@@ -182,7 +182,6 @@ pub(super) fn groups_for_mask<'a>(
     scan_where: Option<&'a Expr<'a>>,
     correlated: &'a [&'a Expr<'a>],
     where_correlated: &'a [&'a Expr<'a>],
-    row_correlated: &'a [&'a Expr<'a>],
     outer: Option<&dyn ColumnLookup<'a>>,
     mask: GroupingSet<'a>,
     group_collations: &[Collation],
@@ -194,19 +193,6 @@ pub(super) fn groups_for_mask<'a>(
     pax_demand: super::PaxReadDemand,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let n_keys = statement.group_by.len();
-    // The key passes read only the correlated subqueries in grouping keys;
-    // the aggregate pass runs those in aggregate arguments.
-    let mut key_correlated = ArenaList::new(arena);
-    for &node in row_correlated {
-        if statement
-            .group_by
-            .iter()
-            .any(|key| expr_contains_node(key, node as *const Expr))
-        {
-            key_correlated.push(node).map_err(|_| arena_full())?;
-        }
-    }
-    let key_correlated = key_correlated.as_slice();
 
     // Pass 2: encode group keys per row (columns outside this set → NULL),
     // sort them, and compute group assignments. When durable object storage
@@ -254,22 +240,12 @@ pub(super) fn groups_for_mask<'a>(
                 )? {
                     return Ok(true);
                 }
-                let row_subs;
-                let row_hooks_store;
-                let row_hooks: &EvalHooks = if key_correlated.is_empty() {
-                    hooks
-                } else {
-                    row_subs = super::subquery::correlated_row(
-                        hooks.subs.expect("outer subqueries prepared"),
-                        row,
-                        outer,
-                    );
-                    row_hooks_store = EvalHooks {
-                        subs: Some(&row_subs),
-                        ..*hooks
-                    };
-                    &row_hooks_store
-                };
+                let _row_binding = super::subquery::bind_correlated_row(
+                    hooks.subs.expect("outer subqueries prepared"),
+                    row,
+                    outer,
+                );
+                let row_hooks: &EvalHooks = hooks;
                 // Outer references, such as an enclosing query's aggregate,
                 // read the caller's row.
                 let row = &super::scan::Chained { inner: row, outer };
@@ -377,22 +353,12 @@ pub(super) fn groups_for_mask<'a>(
                     )? {
                         return Ok(true);
                     }
-                    let row_subs;
-                    let row_hooks_store;
-                    let row_hooks: &EvalHooks = if key_correlated.is_empty() {
-                        hooks
-                    } else {
-                        row_subs = super::subquery::correlated_row(
-                            hooks.subs.expect("outer subqueries prepared"),
-                            row,
-                            outer,
-                        );
-                        row_hooks_store = EvalHooks {
-                            subs: Some(&row_subs),
-                            ..*hooks
-                        };
-                        &row_hooks_store
-                    };
+                    let _row_binding = super::subquery::bind_correlated_row(
+                        hooks.subs.expect("outer subqueries prepared"),
+                        row,
+                        outer,
+                    );
+                    let row_hooks: &EvalHooks = hooks;
                     // Outer references, such as PL/pgSQL variables, read
                     // the caller's row.
                     let row = &super::scan::Chained { inner: row, outer };
@@ -599,22 +565,12 @@ pub(super) fn groups_for_mask<'a>(
             }
             // Correlated subqueries inside aggregate arguments re-evaluate
             // against each input row.
-            let row_subs;
-            let row_hooks_store;
-            let row_hooks: &EvalHooks = if row_correlated.is_empty() {
-                hooks
-            } else {
-                row_subs = super::subquery::correlated_row(
-                    hooks.subs.expect("outer subqueries prepared"),
-                    row,
-                    outer,
-                );
-                row_hooks_store = EvalHooks {
-                    subs: Some(&row_subs),
-                    ..*hooks
-                };
-                &row_hooks_store
-            };
+            let _row_binding = super::subquery::bind_correlated_row(
+                hooks.subs.expect("outer subqueries prepared"),
+                row,
+                outer,
+            );
+            let row_hooks: &EvalHooks = hooks;
             let g = if n_keys == 0 {
                 0
             } else {
@@ -751,17 +707,16 @@ pub(super) fn groups_for_mask<'a>(
         let own = ScopeSchema(scope);
         let schema = super::Chained { inner: &own, outer };
         if let Some(h) = statement.having {
-            let having_subs;
+            let _having_subs_binding = super::subquery::bind_correlated_row(
+                hooks.subs.expect("outer subqueries prepared"),
+                &group_row,
+                outer,
+            );
             let having_hooks = if having_correlated.is_empty() {
                 base_hooks
             } else {
-                having_subs = super::subquery::correlated_row(
-                    hooks.subs.expect("outer subqueries prepared"),
-                    &group_row,
-                    outer,
-                );
                 EvalHooks {
-                    subs: Some(&having_subs),
+                    subs: hooks.subs,
                     ..base_hooks
                 }
             };
@@ -776,17 +731,16 @@ pub(super) fn groups_for_mask<'a>(
                 }
             }
         }
-        let merged_subs;
+        let _merged_subs_binding = super::subquery::bind_correlated_row(
+            hooks.subs.expect("outer subqueries prepared"),
+            &group_row,
+            outer,
+        );
         let group_hooks = if output_correlated.is_empty() {
             base_hooks
         } else {
-            merged_subs = super::subquery::correlated_row(
-                hooks.subs.expect("outer subqueries prepared"),
-                &group_row,
-                outer,
-            );
             EvalHooks {
-                subs: Some(&merged_subs),
+                subs: hooks.subs,
                 ..base_hooks
             }
         };
@@ -932,21 +886,6 @@ pub(super) fn grouped_rows<'a>(
     // sees the same filtered sequence.
     let where_correlated = correlated_in_expression(statement.where_clause, correlated, arena)?;
     let scan_where = correlated_scan_conjuncts(statement.where_clause, where_correlated, arena)?;
-    // Grouping keys and aggregate inputs read correlated subqueries per input
-    // row; those in the output, HAVING and ORDER BY run once per group.
-    let mut row_correlated = ArenaList::new(arena);
-    for &node in correlated {
-        let pointer = node as *const Expr;
-        if statement
-            .group_by
-            .iter()
-            .chain(agg_nodes.iter().map(|(_, aggregate)| aggregate))
-            .any(|expression| expr_contains_node(expression, pointer))
-        {
-            row_correlated.push(node).map_err(|_| arena_full())?;
-        }
-    }
-    let row_correlated = row_correlated.as_slice();
     let mut row_count = 0usize;
     // A global aggregate has one group even for an empty source. It needs no
     // per-row group assignments and must not execute its source just to size them.
@@ -1076,7 +1015,6 @@ pub(super) fn grouped_rows<'a>(
             scan_where,
             correlated,
             where_correlated,
-            row_correlated,
             outer,
             mask,
             group_collations,

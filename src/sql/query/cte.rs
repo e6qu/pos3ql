@@ -4083,9 +4083,93 @@ pub fn rewrite_view_dml<'a>(
         }
         _ => unreachable!("statement kind checked above"),
     };
+    let rewritten = view_assignment_defaults(rewritten, view, storage, txid, arena)?;
     Ok(super::ViewRewrite {
         statement: arena.alloc(rewritten).map_err(|_| arena_full())?,
         written,
+    })
+}
+
+/// `rewritten`, a write onto `view`'s base relation, with each `SET column
+/// = DEFAULT` replaced by the view's own default for the column, or NULL:
+/// PostgreSQL's rewriter fills in the written view's defaults before it
+/// rewrites the write onto the base relation.
+fn view_assignment_defaults<'a>(
+    rewritten: Stmt<'a>,
+    view: &super::UpdatableView<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Stmt<'a>, SqlError> {
+    let defaults_cell = core::cell::Cell::new(None::<&'a [(&'a str, &'a Expr<'a>)]>);
+    let replace = |assignments: &'a [(&'a str, &'a Expr<'a>)]| -> Result<_, SqlError> {
+        if !assignments
+            .iter()
+            .any(|(_, value)| matches!(value, Expr::DefaultMarker))
+        {
+            return Ok(assignments);
+        }
+        let defaults = match defaults_cell.get() {
+            Some(defaults) => defaults,
+            None => {
+                let level = view.view_check(storage, txid, arena)?.defaults[0];
+                let defaults = crate::sql::exec::view_assignment_defaults(
+                    storage, level, view.base, txid, arena,
+                )?;
+                defaults_cell.set(Some(defaults));
+                defaults
+            }
+        };
+        let replaced = arena
+            .alloc_slice_with(assignments.len(), |index| {
+                let (name, value) = assignments[index];
+                if !matches!(value, Expr::DefaultMarker) {
+                    return (name, value);
+                }
+                let default = defaults
+                    .iter()
+                    .find(|(column, _)| *column == name)
+                    .map_or(&Expr::Null, |(_, default)| *default);
+                (name, default)
+            })
+            .map_err(|_| arena_full())?;
+        Ok(&*replaced)
+    };
+    Ok(match rewritten {
+        Stmt::Insert(insert) => Stmt::Insert(Insert {
+            on_conflict: match insert.on_conflict {
+                Some(conflict) => Some(OnConflict {
+                    update: conflict.update.map(replace).transpose()?,
+                    ..conflict
+                }),
+                None => None,
+            },
+            ..insert
+        }),
+        Stmt::Update(update) => Stmt::Update(Update {
+            assignments: replace(update.assignments)?,
+            ..update
+        }),
+        Stmt::Merge(merge) => {
+            let whens = arena
+                .alloc_slice_copy(merge.whens)
+                .map_err(|_| arena_full())?;
+            for when in whens.iter_mut() {
+                let action = match when {
+                    MergeWhen::Matched { action, .. }
+                    | MergeWhen::NotMatchedBySource { action, .. } => action,
+                    MergeWhen::NotMatchedByTarget { .. } => continue,
+                };
+                if let MergeTargetAction::Update(assignments) = action {
+                    *assignments = replace(assignments)?;
+                }
+            }
+            Stmt::Merge(Merge {
+                whens: &*whens,
+                ..merge
+            })
+        }
+        other => other,
     })
 }
 

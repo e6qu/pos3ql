@@ -1,0 +1,49 @@
+-- PostgreSQL's rewriter fills in the written view's own column defaults
+-- (ALTER VIEW ... ALTER COLUMN ... SET DEFAULT) before it rewrites a write
+-- onto the view's base relation: a rule on the base table sees them in NEW,
+-- and SET column = DEFAULT writes the view's default, or the column type's
+-- domain default, or NULL, never the base table's default.
+CREATE DOMAIN d433 AS text DEFAULT 'domain';
+CREATE TABLE b433 (a int, c text DEFAULT 'base', d int DEFAULT 7);
+CREATE TABLE log433 (a int, c text, d int);
+CREATE RULE b433_ins AS ON INSERT TO b433 DO ALSO INSERT INTO log433 VALUES (new.a, new.c, new.d);
+CREATE VIEW v433 AS SELECT a, c, d FROM b433;
+ALTER VIEW v433 ALTER COLUMN c SET DEFAULT 'view';
+CREATE VIEW w433 AS SELECT a, c FROM v433;
+ALTER VIEW w433 ALTER COLUMN a SET DEFAULT 99;
+INSERT INTO v433 (a) VALUES (1);
+INSERT INTO v433 (a, d) VALUES (2, 3), (3, 4);
+INSERT INTO v433 (a) SELECT 4;
+INSERT INTO w433 (c) VALUES ('w');
+INSERT INTO w433 DEFAULT VALUES;
+INSERT INTO v433 DEFAULT VALUES RETURNING *;
+SELECT * FROM b433 ORDER BY a, c;
+SELECT * FROM log433 ORDER BY a, c;
+CREATE TABLE i433 (a int, c text DEFAULT 'base');
+CREATE RULE i433_ins AS ON INSERT TO i433 DO INSTEAD INSERT INTO log433 VALUES (new.a, new.c, 0);
+CREATE VIEW iv433 AS SELECT a, c FROM i433;
+ALTER VIEW iv433 ALTER COLUMN c SET DEFAULT upper('view');
+INSERT INTO iv433 (a) VALUES (10);
+SELECT * FROM log433 WHERE a = 10;
+-- SET column = DEFAULT through views, with and without base rules.
+CREATE TABLE u433 (a int PRIMARY KEY, c text DEFAULT 'base', e d433 DEFAULT 'base');
+CREATE VIEW uv433 AS SELECT a, c, e FROM u433;
+INSERT INTO u433 VALUES (1, 'x', 'y');
+UPDATE uv433 SET c = DEFAULT, e = DEFAULT WHERE a = 1;
+SELECT * FROM u433 ORDER BY a;
+ALTER VIEW uv433 ALTER COLUMN c SET DEFAULT 'view';
+UPDATE uv433 SET c = DEFAULT RETURNING *;
+INSERT INTO uv433 VALUES (2, DEFAULT), (3, 'q');
+INSERT INTO uv433 VALUES (1, 'q', 'r') ON CONFLICT (a) DO UPDATE SET c = 'conflict', e = DEFAULT;
+CREATE VIEW uw433 AS SELECT a, c FROM uv433;
+UPDATE uw433 SET c = DEFAULT WHERE a = 2;
+MERGE INTO uv433 USING (SELECT 3 AS k) s ON uv433.a = s.k WHEN MATCHED THEN UPDATE SET c = DEFAULT;
+MERGE INTO uw433 USING (SELECT 1 AS k) s ON uw433.a = s.k WHEN MATCHED THEN UPDATE SET c = DEFAULT;
+MERGE INTO uw433 USING (SELECT 8 AS k) s ON uw433.a = s.k WHEN NOT MATCHED THEN INSERT VALUES (8, DEFAULT);
+SELECT * FROM u433 ORDER BY a;
+CREATE TABLE ulog433 (a int, c text);
+CREATE RULE u433_upd AS ON UPDATE TO u433 DO ALSO INSERT INTO ulog433 VALUES (new.a, new.c);
+UPDATE uv433 SET c = DEFAULT WHERE a = 1;
+UPDATE uw433 SET c = DEFAULT WHERE a = 3;
+SELECT * FROM u433 ORDER BY a;
+SELECT * FROM ulog433 ORDER BY a;

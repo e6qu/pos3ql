@@ -6317,7 +6317,7 @@ pub(crate) struct HashKeyLayout<'p> {
     pub(crate) capacity: usize,
 }
 
-impl HashJoinPlan<'_> {
+impl<'a> HashJoinPlan<'a> {
     /// PostgreSQL's name for this join node: the outer (probe) side's rows
     /// are preserved by a left join, the inner (hashed) side's by a right join.
     pub(crate) fn node_name(&self) -> &'static str {
@@ -6330,6 +6330,63 @@ impl HashJoinPlan<'_> {
     }
 
     /// Whether build rows nothing matched are returned after the probe.
+    /// For an outer join, the conjuncts each side's scan filters its rows
+    /// by, as PostgreSQL places them: a side the join never null-extends
+    /// takes the `WHERE` conjuncts that read only it, and a side whose rows
+    /// only it null-extends takes the `ON` conjuncts that read only it. Only
+    /// error-safe conjuncts move; the join still checks every condition.
+    /// None for an inner join.
+    pub(crate) fn outer_side_filters(
+        &self,
+        scope: &QueryScope<'_>,
+        where_clause: Option<&'a Expr<'a>>,
+        arena: &'a Arena,
+    ) -> Result<Option<HashJoinFilters<'a, 'a>>, SqlError> {
+        if !self.preserves_probe_rows && !self.preserves_build_rows {
+            return Ok(None);
+        }
+        let side = |table: usize, preserved: bool, nullable: bool| {
+            let source = match (preserved, nullable) {
+                (true, false) => where_clause,
+                (false, true) => self.on,
+                _ => None,
+            };
+            let Some(condition) = source else {
+                return Ok(&[][..]);
+            };
+            let mut conjuncts = [condition; MAX_CONJUNCTS];
+            let mut count = 0;
+            let conjuncts: &[&Expr] = if flatten_and(condition, &mut conjuncts, &mut count) {
+                &conjuncts[..count]
+            } else {
+                core::slice::from_ref(&condition)
+            };
+            let own = arena
+                .alloc_slice_with(conjuncts.len(), |_| &Expr::Null)
+                .map_err(|_| arena_full())?;
+            let mut kept = 0;
+            for &conjunct in conjuncts {
+                if is_error_safe(conjunct) && expr_tables(conjunct, scope) == Some(1 << table) {
+                    own[kept] = conjunct;
+                    kept += 1;
+                }
+            }
+            Ok::<_, SqlError>(&own[..kept])
+        };
+        Ok(Some(HashJoinFilters {
+            probe: side(
+                self.probe_table,
+                self.preserves_probe_rows,
+                self.preserves_build_rows,
+            )?,
+            build: side(
+                self.build_table,
+                self.preserves_build_rows,
+                self.preserves_probe_rows,
+            )?,
+        }))
+    }
+
     pub(crate) fn preserves_build_rows(&self) -> bool {
         self.preserves_build_rows
     }
@@ -6843,9 +6900,9 @@ struct DepthConjuncts<'p, 'a> {
 
 /// The conjuncts of a hash join's scans: [`DepthConjuncts::scan`] of each.
 #[derive(Clone, Copy)]
-struct HashJoinFilters<'p, 'a> {
-    probe: &'p [&'a Expr<'a>],
-    build: &'p [&'a Expr<'a>],
+pub(crate) struct HashJoinFilters<'p, 'a> {
+    pub(crate) probe: &'p [&'a Expr<'a>],
+    pub(crate) build: &'p [&'a Expr<'a>],
 }
 
 /// The `EXPLAIN ANALYZE` nodes of a hash join of two relations.
@@ -9130,9 +9187,12 @@ fn scan_source_mode<'a>(
         None
     };
     if let Some(hash_plan) = hash_plan {
-        let filters = HashJoinFilters {
-            probe: position_conjuncts(hash_plan.probe_table).scan,
-            build: position_conjuncts(hash_plan.build_table).scan,
+        let filters = match hash_plan.outer_side_filters(scope, where_clause, arena)? {
+            Some(filters) => filters,
+            None => HashJoinFilters {
+                probe: position_conjuncts(hash_plan.probe_table).scan,
+                build: position_conjuncts(hash_plan.build_table).scan,
+            },
         };
         execute_hash_join_plan(
             storage,

@@ -16216,6 +16216,18 @@ impl Engine {
                         },
                     };
                 }
+                if let (Stmt::Insert(_), Some(views)) = (statement, inherited)
+                    && let Err(error) = exec::overlay_view_rule_defaults(
+                        storage,
+                        views,
+                        &definition,
+                        &mut rule_defaults,
+                        txn.txid,
+                        arena,
+                    )
+                {
+                    return Ok(Err(error));
+                }
                 let columns = match arena.alloc_slice_copy(&names[..definition.n_columns]) {
                     Ok(columns) => &*columns,
                     Err(_) => return Ok(Err(query::arena_full_pub())),

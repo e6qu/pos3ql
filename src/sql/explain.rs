@@ -893,20 +893,35 @@ fn join_quals<'a>(
     Ok(Some(quals))
 }
 
-/// The `Hash Cond` and `Join Filter` of an outer hash join of two relations
-/// with no WHERE clause: its condition's equalities between the probe and
-/// build relations, outer side first, and its other conjuncts. None when a
-/// conjunct reads only one side, which PostgreSQL places elsewhere.
+/// The qualifications of an outer hash join of two relations: the
+/// conditions execution moves into each scan (`pushed`, by FROM position),
+/// the equalities it hashes, the rest of its `ON` condition as its join
+/// filter and the rest of the `WHERE` condition as the filter of its output.
+struct OuterHashQuals {
+    scan_filters: [Option<StackStr<512>>; 2],
+    hash_cond: StackStr<512>,
+    join_filter: Option<StackStr<512>>,
+    output_filter: Option<StackStr<512>>,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn outer_hash_quals<'a>(
     storage: &Storage,
     txid: u32,
     relations: &[(&'a str, &'a crate::storage::TableDef)],
     probe: usize,
     condition: &'a Expr<'a>,
+    where_clause: Option<&'a Expr<'a>>,
+    pushed: [&[&'a Expr<'a>]; 2],
     arena: &'a Arena,
-) -> Result<Option<(StackStr<512>, Option<StackStr<512>>)>, SqlError> {
+) -> Result<Option<OuterHashQuals>, SqlError> {
     let resolve =
         |qualifier: Option<&str>, name: &str| resolve_relation(relations, qualifier, name);
+    let is_pushed = |conjunct: &Expr<'_>| {
+        pushed
+            .iter()
+            .any(|side| side.iter().any(|held| core::ptr::eq(*held, conjunct)))
+    };
     let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
     let mut count = 0;
     if split_conjuncts(condition, &mut conjuncts, &mut count).is_none() {
@@ -917,8 +932,8 @@ fn outer_hash_quals<'a>(
     let mut filters = [&Expr::Null; MAX_CONJUNCTS];
     let mut filter_count = 0;
     for &conjunct in &conjuncts[..count] {
-        if relation_mask(conjunct, &resolve) != Some(0b11) {
-            return Ok(None);
+        if is_pushed(conjunct) {
+            continue;
         }
         if let Some(equality) = equijoin(conjunct, &resolve, probe, arena)? {
             hash_conds[hash_count] = equality;
@@ -927,6 +942,53 @@ fn outer_hash_quals<'a>(
             filters[filter_count] = conjunct;
             filter_count += 1;
         }
+    }
+    let mut rest = [&Expr::Null; MAX_CONJUNCTS];
+    let mut rest_count = 0;
+    if let Some(where_clause) = where_clause {
+        let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
+        let mut count = 0;
+        if split_conjuncts(where_clause, &mut conjuncts, &mut count).is_none() {
+            return Ok(None);
+        }
+        for &conjunct in &conjuncts[..count] {
+            if !is_pushed(conjunct) {
+                rest[rest_count] = conjunct;
+                rest_count += 1;
+            }
+        }
+    }
+    let own = arena
+        .alloc_slice_with(2 * MAX_CONJUNCTS, |_| &Expr::Null)
+        .map_err(|_| arena_full())?;
+    let own_count = arena
+        .alloc_slice_with(2, |index| pushed[index].len())
+        .map_err(|_| arena_full())?;
+    for (index, side) in pushed.iter().enumerate() {
+        if side.len() > MAX_CONJUNCTS {
+            return Ok(None);
+        }
+        own[index * MAX_CONJUNCTS..index * MAX_CONJUNCTS + side.len()].copy_from_slice(side);
+    }
+    let moved = arena
+        .alloc_slice_with(2 * MAX_CONJUNCTS, |_| &Expr::Null)
+        .map_err(|_| arena_full())?;
+    let moved_count = arena
+        .alloc_slice_with(2, |_| 0usize)
+        .map_err(|_| arena_full())?;
+    let mut scan_filters = [None, None];
+    if !self::scan_filters(
+        storage,
+        txid,
+        relations,
+        own,
+        own_count,
+        moved,
+        moved_count,
+        &mut scan_filters,
+        arena,
+    )? {
+        return Ok(None);
     }
     let joined = arena
         .alloc_slice_with(relations.len(), |index| {
@@ -950,10 +1012,17 @@ fn outer_hash_quals<'a>(
         return Ok(None);
     };
     let join_filter = deparse_qual(&context, &filters[..filter_count], arena)?;
-    if filter_count != 0 && join_filter.is_none() {
+    let output_filter = deparse_qual(&context, &rest[..rest_count], arena)?;
+    if (filter_count != 0 && join_filter.is_none()) || (rest_count != 0 && output_filter.is_none())
+    {
         return Ok(None);
     }
-    Ok(Some((hash_cond, join_filter)))
+    Ok(Some(OuterHashQuals {
+        scan_filters,
+        hash_cond,
+        join_filter,
+        output_filter,
+    }))
 }
 
 /// Each relation's scan filter: its own conjuncts in PostgreSQL's order,
@@ -2494,6 +2563,9 @@ pub(super) fn plan_select<'a>(
     let mut cache_blocks = 0u64;
     let mut hash_join = false;
     let mut hash_join_name = "Hash Join";
+    // Per FROM position of an outer hash join, the conditions execution
+    // moves into its scan.
+    let mut hash_pushed: [&[&Expr<'_>]; 2] = [&[], &[]];
     let table_count = scope.as_ref().map_or(0, |scope| scope.n);
     let table_order = arena
         .alloc_slice_with(table_count, |index| index)
@@ -2566,6 +2638,11 @@ pub(super) fn plan_select<'a>(
                 arena,
             )?
         {
+            if let Some(filters) = plan.outer_side_filters(scope, statement.where_clause, arena)? {
+                let layout = plan.key_layout();
+                hash_pushed[layout.probe_table] = filters.probe;
+                hash_pushed[layout.build_table] = filters.build;
+            }
             // The hash join probes its outer relation.
             let layout = plan.key_layout();
             table_order[0] = layout.probe_table;
@@ -2975,7 +3052,6 @@ pub(super) fn plan_select<'a>(
             joined_index_conditions(storage, txid, relations, scan_indexes, index_conds, arena)?;
         } else if hash_join
             && scope.n == 2
-            && statement.where_clause.is_none()
             && let Some(join) = statement.from.as_ref().and_then(|from| from.joins.first())
             && matches!(
                 join.kind,
@@ -2985,17 +3061,21 @@ pub(super) fn plan_select<'a>(
             )
             && let Some(condition) = join.on.or(scope.join_on[0])
             && let (Some(first), Some(second)) = (relation(0), relation(1))
-            && let Some((hash_cond, join_filter)) = outer_hash_quals(
+            && let Some(quals) = outer_hash_quals(
                 storage,
                 txid,
                 &[first, second],
                 table_order[0],
                 condition,
+                statement.where_clause,
+                hash_pushed,
                 arena,
             )?
         {
-            stages[0] = stages[0].with_qual(QualLabel::HashCond, Some(hash_cond));
-            join_filters[1] = join_filter;
+            stages[0] = stages[0].with_qual(QualLabel::HashCond, Some(quals.hash_cond));
+            join_filters[1] = quals.join_filter;
+            post_filters[1] = quals.output_filter;
+            filters[..2].copy_from_slice(&quals.scan_filters);
         }
     }
     for (depth, stage) in stages[..stage_count].iter().rev().enumerate() {

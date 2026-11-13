@@ -544,7 +544,10 @@ relation. An outer hash join hashes its
 nullable side (a `RIGHT JOIN` shows as `Hash Left Join` probing its right
 item, as PostgreSQL plans tables of similar size), or its preserved side
 (`Hash Right Join`) when only that side fits the build; a `FULL JOIN` shows
-as `Hash Full Join`; `enable_hashjoin = off` runs each as a nested loop. Other
+as `Hash Full Join`. Its `WHERE` conditions reading only the side it never
+null-extends filter that side's scan, and its `ON` conditions reading only
+the null-extended side filter that side's scan before the build, as
+PostgreSQL places them; `enable_hashjoin = off` runs each as a nested loop. Other
 right or full joins run, and print, as a `Nested Loop Right Join` or
 `Nested Loop Full Join`, where PostgreSQL may also merge. The join order
 is pos3ql's (FROM order, or its selectivity order for comma lists), which

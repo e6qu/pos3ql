@@ -78548,6 +78548,26 @@ fn parse_view_defaults<'a, Definition0: crate::storage::DefinitionBacking>(
                 )?;
             }
         }
+        // A column the level exposes without a default of its own takes its
+        // domain type's, which PostgreSQL's `build_column_default` fills in
+        // at that level.
+        for base_name in defaults.base_columns {
+            if base_name.is_empty() {
+                continue;
+            }
+            let Some(base_index) = definition.column_index(base_name) else {
+                continue;
+            };
+            if claimed[base_index] {
+                continue;
+            }
+            if let Some(default) =
+                domain_type_default(storage, &definition.columns()[base_index], txid, arena)?
+            {
+                claimed[base_index] = true;
+                parsed[base_index] = Some(default);
+            }
+        }
     }
     Ok(parsed)
 }
@@ -78633,20 +78653,40 @@ fn parse_view_default<'a, Definition0: crate::storage::DefinitionBacking>(
     Ok(())
 }
 
+/// The default the views written through give base column `base_index`:
+/// the first level's own default for it, or, at the first level exposing it
+/// without one, its domain type's default.
 fn view_default_for<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    txid: u32,
     view: Option<ViewCheck<'_>>,
     definition: &crate::storage::TableDefinition<Definition0>,
     base_index: usize,
-) -> Option<crate::storage::ColumnDefault> {
-    let base_name = definition.columns().get(base_index)?.name.as_str();
-    view?.defaults.iter().find_map(|defaults| {
-        defaults
-            .base_columns
-            .iter()
-            .enumerate()
-            .filter(|(_, candidate)| **candidate == base_name)
-            .find_map(|(view_index, _)| level_default(defaults, view_index))
-    })
+) -> Result<Option<crate::storage::ColumnDefault>, SqlError> {
+    let (Some(view), Some(column)) = (view, definition.columns().get(base_index)) else {
+        return Ok(None);
+    };
+    let base_name = column.name.as_str();
+    let mut domain_checked = false;
+    for defaults in view.defaults {
+        let mut exposed = false;
+        for (view_index, candidate) in defaults.base_columns.iter().enumerate() {
+            if *candidate != base_name {
+                continue;
+            }
+            exposed = true;
+            if let Some(default) = level_default(defaults, view_index) {
+                return Ok(Some(default));
+            }
+        }
+        if exposed && !domain_checked {
+            domain_checked = true;
+            if let Some(text) = domain_default_text(storage, column, txid)? {
+                return Ok(Some(crate::storage::ColumnDefault::Expression(text)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[expect(clippy::too_many_arguments, reason = "default evaluation context")]
@@ -78665,7 +78705,7 @@ where
     'arena: 'values,
 {
     let column = &definition.columns()[base_index];
-    let (default, expression) = match view_default_for(view, definition, base_index) {
+    let (default, expression) = match view_default_for(storage, txid, view, definition, base_index)? {
         Some(default) => (default, view_expression),
         None => (column.default, table_expression),
     };
@@ -83366,13 +83406,195 @@ pub(crate) fn view_rule_defaults<'a>(
 ) -> Result<constraints::ParsedDefaults<'a>, SqlError> {
     let definition = view_trigger_definition(storage, view_slot, txid, arena)?;
     let check = instead_of_view_defaults(storage, view_slot, &definition, above, txid, arena)?;
-    let mut parsed = parse_view_defaults(Some(check), &definition, arena, storage, txid)?;
+    let parsed = rule_view_defaults(storage, check, &definition, txid, arena)?;
+    Ok(parsed)
+}
+
+/// Overlays the defaults of the views an INSERT was written through
+/// (`views`) on `defaults`, a rewrite rule's `NEW` defaults for their base
+/// table: PostgreSQL fills the view's own defaults into the INSERT before
+/// it rewrites the write onto the base table.
+pub(crate) fn overlay_view_rule_defaults<'a>(
+    storage: &Storage,
+    views: ViewCheck<'a>,
+    definition: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    defaults: &mut constraints::ParsedDefaults<'a>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let overlay = rule_view_defaults(storage, views, definition, txid, arena)?;
+    for (index, default) in overlay.iter().enumerate() {
+        if view_default_for(storage, txid, Some(views), definition, index)?.is_some() {
+            defaults[index] = *default;
+        }
+    }
+    Ok(())
+}
+
+/// The values `SET column = DEFAULT` writes through the auto-updatable view
+/// whose defaults are `view` (its own level, over its base relation's
+/// columns), by base column name: the view's own default, or NULL for a
+/// column without one. PostgreSQL's rewriter fills them in before it
+/// rewrites the write onto the base relation, whose defaults never apply.
+pub(crate) fn view_assignment_defaults<'a>(
+    storage: &Storage,
+    view: ViewInsertDefaults<'a>,
+    base: crate::sql::ast::QualName<'_>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [(&'a str, &'a Expr<'a>)], SqlError> {
+    let levels = arena
+        .alloc_slice_copy(&[view])
+        .map_err(|_| super::query::arena_full_pub())?;
+    let check = ViewCheck {
+        checks: &[],
+        defaults: levels,
+    };
+    match storage.resolve_relation(base.schema, base.name, txid) {
+        Some(crate::storage::ResolvedRelation::Table(slot)) => {
+            let definition = storage.table_def(slot, txid);
+            let parsed = rule_view_defaults(storage, check, &definition, txid, arena)?;
+            assignment_defaults(&parsed, definition.columns(), arena)
+        }
+        Some(crate::storage::ResolvedRelation::View(slot)) => {
+            let definition = view_trigger_definition(storage, slot, txid, arena)?;
+            let parsed = rule_view_defaults(storage, check, &definition, txid, arena)?;
+            assignment_defaults(&parsed, definition.columns(), arena)
+        }
+        _ => Err(sql_err!(
+            sqlstate::UNDEFINED_TABLE,
+            "relation \"{}\" does not exist",
+            base.name
+        )),
+    }
+}
+
+/// Per column of `columns` with a default in `parsed`, its name and default.
+fn assignment_defaults<'a>(
+    parsed: &constraints::ParsedDefaults<'a>,
+    columns: &[ColumnMeta],
+    arena: &'a Arena,
+) -> Result<&'a [(&'a str, &'a Expr<'a>)], SqlError> {
+    let mut out = [("", &Expr::Null as &Expr); MAX_COLUMNS];
+    let mut count = 0;
+    for (index, column) in columns.iter().enumerate() {
+        if let Some(default) = parsed[index] {
+            out[count] = (
+                arena
+                    .alloc_str(column.name.as_str())
+                    .map_err(|_| super::query::arena_full_pub())?,
+                default,
+            );
+            count += 1;
+        }
+    }
+    arena
+        .alloc_slice_copy(&out[..count])
+        .map(|out| &*out)
+        .map_err(|_| super::query::arena_full_pub())
+}
+
+/// `read` of the domain that is `column`'s type, if it is one.
+fn with_column_domain<R>(
+    storage: &Storage,
+    column: &ColumnMeta,
+    txid: u32,
+    read: impl FnOnce(&crate::storage::DomainDef) -> Result<R, SqlError>,
+) -> Result<Option<R>, SqlError> {
+    let Some((crate::storage::NamedTypeKind::Domain, creation, false)) = storage
+        .routine_type_oid(column.ctype, column.user_type, txid)
+        .and_then(crate::storage::NamedTypeKind::from_oid)
+    else {
+        return Ok(None);
+    };
+    let target = crate::storage::TypeDefinitionTarget::by_creation(
+        storage,
+        crate::storage::NamedTypeKind::Domain,
+        creation,
+    )?;
+    let domain = storage
+        .read_domain_definition(target, txid)?
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain default source is unavailable"))?;
+    read(&domain).map(Some)
+}
+
+/// The default expression of `column`'s type when it is a domain that has
+/// one.
+fn domain_default_text(
+    storage: &Storage,
+    column: &ColumnMeta,
+    txid: u32,
+) -> Result<Option<StackStr<{ crate::storage::DEFAULT_EXPR_MAX }>>, SqlError> {
+    Ok(with_column_domain(storage, column, txid, |domain| Ok(domain.default_expr))?.flatten())
+}
+
+/// The default of `column`'s type when it is a domain that has one.
+fn domain_type_default<'a>(
+    storage: &Storage,
+    column: &ColumnMeta,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<&'a Expr<'a>>, SqlError> {
+    let Some((text, inputs)) = with_column_domain(storage, column, txid, |domain| {
+        Ok(match domain.default_expr {
+            Some(text) => Some((
+                text,
+                domain
+                    .default_inputs
+                    .detached_bindings(crate::storage::StoredInputSection::DomainDefault, arena)?,
+            )),
+            None => None,
+        })
+    })?
+    .flatten() else {
+        return Ok(None);
+    };
+    let original = super::enum_values::checks::default_display(text.as_str(), arena)?;
+    let source =
+        super::enum_values::checks::resolve_default(text.as_str(), column.ctype, storage, txid, arena)?;
+    let inputs = super::type_inputs::rebase(
+        original,
+        source,
+        super::parser::StoredSqlKind::Expression,
+        inputs,
+        |name| Ok(super::type_inputs::target_oid(storage, txid, name)),
+        arena,
+    )?;
+    Ok(Some(crate::sql::parser::parse_expression_with_type_inputs(
+        source,
+        inputs,
+        arena,
+        |parser| {
+            super::type_inputs::validate_restored_candidates(parser, |candidate| {
+                Ok(inputs
+                    .iter()
+                    .find(|input| {
+                        (input.start, input.end, input.kind)
+                            == (candidate.start, candidate.end, candidate.kind)
+                    })
+                    .map(|input| input.type_oid)
+                    .or_else(|| super::type_inputs::candidate_target_oid(storage, txid, candidate)))
+            })
+        },
+    )?))
+}
+
+/// The defaults `views` give the columns of `definition`, as a rewrite
+/// rule's `NEW` reads them.
+fn rule_view_defaults<'a, Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    check: ViewCheck<'a>,
+    definition: &crate::storage::TableDefinition<Definition0>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<constraints::ParsedDefaults<'a>, SqlError> {
+    let mut parsed = parse_view_defaults(Some(check), definition, arena, storage, txid)?;
     // A constant default is stored typed; the rule reads it as a literal.
     for (index, column) in definition.columns().iter().enumerate() {
         if parsed[index].is_some() {
             continue;
         }
-        let Some(default) = view_default_for(Some(check), &definition, index) else {
+        let Some(default) = view_default_for(storage, txid, Some(check), definition, index)? else {
             continue;
         };
         let (Some(constant), Some(source)) = (default.constant(), default.expression()) else {

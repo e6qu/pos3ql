@@ -1322,10 +1322,6 @@ fn unsupported_system_columns_fail_loudly_and_tables_cannot_take_their_names() {
                 "SELECT s.xmin FROM st s",
                 "ERROR 0A000 system column \"xmin\" is not supported",
             ),
-            (
-                "SELECT tableoid FROM st",
-                "ERROR 0A000 system column \"tableoid\" is not supported",
-            ),
             // Views and subqueries have no system columns.
             (
                 "SELECT xmin FROM sv",
@@ -1357,6 +1353,15 @@ fn unsupported_system_columns_fail_loudly_and_tables_cannot_take_their_names() {
         assert_eq!(
             data_rows(&run_with(engine, budget, "SELECT ctid FROM sv")),
             ["1"]
+        );
+        // `tableoid` is provided: the oid of the row's table.
+        assert_eq!(
+            data_rows(&run_with(
+                engine,
+                budget,
+                "INSERT INTO st VALUES (1); SELECT tableoid::regclass, tableoid = 'st'::regclass FROM st"
+            )),
+            ["st|t"]
         );
     });
 }

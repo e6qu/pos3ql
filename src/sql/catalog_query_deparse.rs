@@ -1958,6 +1958,17 @@ fn find(entries: &[Joined<'_>], part: Part<'_>, name: &str) -> Option<(u16, u16)
 /// A FROM function as the call it makes.
 fn function_call<'x>(function: &TableRef<'x>, arena: &'x Arena) -> Result<&'x Expr<'x>, SqlError> {
     let args = function.func_args.unwrap_or(&[]);
+    // The parser keeps a qualified function's schema beside its name; a call
+    // names it as `schema.name`.
+    let name = match function.schema {
+        Some(schema) => {
+            use core::fmt::Write as _;
+            let mut name = ArenaString::new(arena);
+            write!(name, "{schema}.{}", function.table).map_err(full)?;
+            name.as_str()
+        }
+        None => function.table,
+    };
     arena
         .alloc(Expr::Call {
             kind: if crate::sql::eval::sql_syntax_call_name(function.table) {
@@ -1965,7 +1976,7 @@ fn function_call<'x>(function: &TableRef<'x>, arena: &'x Arena) -> Result<&'x Ex
             } else {
                 crate::sql::ast::CallKind::Routine
             },
-            name: function.table,
+            name,
             bound_oid: None,
             bound_strict: None,
             source_position: function.func_source_position,

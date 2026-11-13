@@ -335,3 +335,37 @@ fn json_table_views_print_postgresql_layout() {
         )]
     );
 }
+
+/// `ROWS FROM` over a table function and a scalar one prints each function
+/// and the item's full column list (outputs captured from PostgreSQL 18.6).
+#[test]
+fn rows_from_views_print_postgresql_layout() {
+    let (mut engine, mut budget) = test_engine();
+    rows(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA d; \
+         CREATE FUNCTION d.dump_rows(start_value integer) RETURNS TABLE(item integer, label text) \
+           LANGUAGE sql AS 'SELECT start_value, ''one'' UNION ALL SELECT start_value + 1, ''two'''; \
+         CREATE VIEW d.row_view AS SELECT item,label,generated,ordinality \
+           FROM ROWS FROM (d.dump_rows(1), generate_series(10,30,10)) WITH ORDINALITY \
+           AS rows(item,label,generated,ordinality); \
+         CREATE VIEW d.v2 AS SELECT * FROM d.dump_rows(3); \
+         CREATE VIEW d.v3 AS SELECT * FROM ROWS FROM (d.dump_rows(1), generate_series(1,2)) r",
+    );
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_viewdef('d.row_view'), pg_get_viewdef('d.v2'), pg_get_viewdef('d.v3')"
+        ),
+        [concat!(
+            " SELECT item,\n    label,\n    generated,\n    ordinality\n",
+            "   FROM ROWS FROM(d.dump_rows(1), generate_series(10, 30, 10)) WITH ORDINALITY ",
+            "rows(item, label, generated, ordinality);|",
+            " SELECT item,\n    label\n   FROM d.dump_rows(3) dump_rows(item, label);|",
+            " SELECT item,\n    label,\n    generate_series\n",
+            "   FROM ROWS FROM(d.dump_rows(1), generate_series(1, 2)) r(item, label, generate_series);"
+        )]
+    );
+}

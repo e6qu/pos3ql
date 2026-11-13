@@ -7248,6 +7248,9 @@ where
             excluded: logical_excluded,
             outer,
         };
+        // Its subqueries run when first read, as of the statement: they do
+        // not see the rows it inserted or updated before this one.
+        let _snapshot = storage.dml_expression_snapshot(txn.command_id());
         let mut subquery_expressions: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
         let mut subquery_expression_count = 0usize;
         if let Some(condition) = oc.update_where {
@@ -79530,6 +79533,57 @@ pub(crate) fn instead_of_view_dml<'a>(
     let schema = &schema[..def.n_columns];
     let mut affected: u64;
     let no_transitions = row_progress::capture_lengths([None; row_progress::CAPTURES]);
+    // The statement's subqueries run when first read, as of its command: an
+    // uncorrelated one once, a correlated one for each row that reaches it.
+    let view_expression_count = match statement {
+        Stmt::Insert(insert) => insert.rows.iter().map(|row| row.len()).sum(),
+        Stmt::Update(update) => 1 + update.assignments.len(),
+        Stmt::Delete(_) => 1,
+        _ => 0,
+    };
+    let view_expressions = match arena.alloc_slice_with(view_expression_count, |_| None) {
+        Ok(expressions) => expressions,
+        Err(_) => return sql_fail(arena_full()),
+    };
+    match statement {
+        Stmt::Insert(insert) => {
+            for (slot, expression) in view_expressions
+                .iter_mut()
+                .zip(insert.rows.iter().flat_map(|row| row.iter()))
+            {
+                *slot = Some(*expression);
+            }
+        }
+        Stmt::Update(update) => {
+            view_expressions[0] = update.where_clause;
+            for (slot, (_, expression)) in view_expressions[1..]
+                .iter_mut()
+                .zip(update.assignments.iter())
+            {
+                *slot = Some(*expression);
+            }
+        }
+        Stmt::Delete(delete) => view_expressions[0] = delete.where_clause,
+        _ => {}
+    }
+    let view_subqueries = match super::query::uncorrelated_subquery_hooks(
+        view_expressions,
+        storage,
+        txn.txid,
+        Some(txn.command_id()),
+        arena,
+        params,
+        None,
+        Some(&crate::sql::sequence::SeqEval::new(
+            storage,
+            seq_session,
+            txn.txid,
+        )),
+    ) {
+        Ok(subqueries) => subqueries,
+        Err(error) => return sql_fail(error),
+    };
+    let view_queries = super::query::DmlSubqueries::new(storage, txn.txid, txn.command_id());
     let selected: usize;
     let outcome = match statement {
         Stmt::Insert(insert) => {
@@ -79805,6 +79859,8 @@ pub(crate) fn instead_of_view_dml<'a>(
                             let hooks = EvalHooks {
                                 catalog: Some(&catalog),
                                 sequences: Some(&sequences),
+                                subs: Some(&view_subqueries),
+                                subquery_executor: Some(&view_queries),
                                 ..NO_HOOKS
                             };
                             for (index, expression) in row.iter().enumerate() {
@@ -79975,6 +80031,8 @@ pub(crate) fn instead_of_view_dml<'a>(
                         let hooks = super::eval::EvalHooks {
                             catalog: Some(&catalog),
                             sequences: Some(&sequences),
+                            subs: Some(&view_subqueries),
+                            subquery_executor: Some(&view_queries),
                             ..super::eval::NO_HOOKS
                         };
                         let matched = match super::query::first_from_match(
@@ -80029,6 +80087,8 @@ pub(crate) fn instead_of_view_dml<'a>(
                         let hooks = EvalHooks {
                             catalog: Some(&catalog),
                             sequences: Some(&sequences),
+                            subs: Some(&view_subqueries),
+                            subquery_executor: Some(&view_queries),
                             ..NO_HOOKS
                         };
                         if let Some(predicate) = predicate {
@@ -80249,6 +80309,8 @@ pub(crate) fn instead_of_view_dml<'a>(
                         let hooks = EvalHooks {
                             catalog: Some(&catalog),
                             sequences: Some(&sequences),
+                            subs: Some(&view_subqueries),
+                            subquery_executor: Some(&view_queries),
                             ..NO_HOOKS
                         };
                         match row_matches_values(
@@ -81499,6 +81561,9 @@ where
                 // A per-row sequence evaluator (`nextval`/`setval` in a VALUES item
                 // or a DEFAULT expression advance once per row). Scoped so its shared
                 // `&storage` borrow ends before the row is written mutably below.
+                // The row's subqueries run when first read, as of the
+                // statement: they do not see the rows it inserted before.
+                let _snapshot = storage.dml_expression_snapshot(txn.command_id());
                 let mut subquery_expressions: [Option<&Expr>; MAX_COLUMNS] = [None; MAX_COLUMNS];
                 for (index, expression) in row_exprs.iter().enumerate() {
                     subquery_expressions[index] = Some(expression);
@@ -82520,6 +82585,7 @@ pub(crate) fn update<'a>(
         &subquery_expressions[..subquery_expression_count],
         storage,
         txn.txid,
+        Some(txn.command_id()),
         arena,
         params,
         outer,
@@ -82534,10 +82600,8 @@ pub(crate) fn update<'a>(
     };
     let catalog = super::query::storage_catalog(storage, arena, txn.txid);
     let effect_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-    let correlated_subqueries = super::query::ProceduralSubqueries {
-        storage,
-        txid: txn.txid,
-    };
+    let correlated_subqueries =
+        super::query::DmlSubqueries::new(storage, txn.txid, txn.command_id());
     let hooks = super::eval::EvalHooks {
         group: None,
         aggs: None,
@@ -82592,6 +82656,19 @@ pub(crate) fn update<'a>(
         Ok(plan) => plan,
         Err(error) => return sql_fail(error),
     };
+    // A condition that reads no row of the statement runs once, before the
+    // target scan, as PostgreSQL's one-time filter: when it fails, no row
+    // is read and no other condition runs.
+    let selection_where = match super::query::rowless_one_time_filter_passes(
+        statement.where_clause,
+        arena,
+        params,
+        &hooks,
+    ) {
+        Ok(true) => statement.where_clause,
+        Ok(false) => Some(&Expr::Bool(false)),
+        Err(error) => return sql_fail(error),
+    };
     let collect = if let Some(from) = statement.from {
         let target_hash = match super::query::target_hash_plan(
             storage,
@@ -82613,7 +82690,7 @@ pub(crate) fn update<'a>(
                 statement.alias,
                 schema,
                 from,
-                statement.where_clause,
+                selection_where,
                 arena,
                 params,
                 txn.txid,
@@ -82634,7 +82711,7 @@ pub(crate) fn update<'a>(
                 statement.alias,
                 schema,
                 from,
-                statement.where_clause,
+                selection_where,
                 arena,
                 params,
                 txn.txid,
@@ -82654,7 +82731,7 @@ pub(crate) fn update<'a>(
             statement.alias,
             txn.txid,
             schema,
-            statement.where_clause,
+            selection_where,
             arena,
             params,
             &hooks,
@@ -83900,6 +83977,7 @@ pub(crate) fn delete<'a>(
         &[statement.where_clause],
         storage,
         txn.txid,
+        Some(txn.command_id()),
         arena,
         params,
         outer,
@@ -83914,10 +83992,8 @@ pub(crate) fn delete<'a>(
     };
     let catalog = super::query::storage_catalog(storage, arena, txn.txid);
     let effect_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-    let correlated_subqueries = super::query::ProceduralSubqueries {
-        storage,
-        txid: txn.txid,
-    };
+    let correlated_subqueries =
+        super::query::DmlSubqueries::new(storage, txn.txid, txn.command_id());
     let hooks = super::eval::EvalHooks {
         group: None,
         aggs: None,
@@ -83960,6 +84036,19 @@ pub(crate) fn delete<'a>(
         None
     };
     let row_security = super::query::conjoin_row_security(delete_security, select_security);
+    // A condition that reads no row of the statement runs once, before the
+    // target scan, as PostgreSQL's one-time filter: when it fails, no row
+    // is read and no other condition runs.
+    let selection_where = match super::query::rowless_one_time_filter_passes(
+        statement.where_clause,
+        arena,
+        params,
+        &hooks,
+    ) {
+        Ok(true) => statement.where_clause,
+        Ok(false) => Some(&Expr::Bool(false)),
+        Err(error) => return sql_fail(error),
+    };
     let collect = if let Some(using) = statement.using {
         let target_hash = match super::query::target_hash_plan(
             storage,
@@ -83981,7 +84070,7 @@ pub(crate) fn delete<'a>(
                 statement.alias,
                 schema,
                 using,
-                statement.where_clause,
+                selection_where,
                 arena,
                 params,
                 txn.txid,
@@ -84003,7 +84092,7 @@ pub(crate) fn delete<'a>(
                 statement.alias,
                 schema,
                 using,
-                statement.where_clause,
+                selection_where,
                 arena,
                 params,
                 txn.txid,
@@ -84024,7 +84113,7 @@ pub(crate) fn delete<'a>(
             statement.alias,
             txn.txid,
             schema,
-            statement.where_clause,
+            selection_where,
             arena,
             params,
             &hooks,
@@ -91903,11 +91992,14 @@ pub fn eval_offset_pub<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
+    // The enclosing row of a subquery, whose columns the bound may read.
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<u64, SqlError> {
     let Some(expression) = offset else {
         return Ok(0);
     };
-    match eval_full(expression, arena, params, &NoColumns, hooks)? {
+    let row: &dyn ColumnLookup<'a> = outer.unwrap_or(&NoColumns);
+    match eval_full(expression, arena, params, &row, hooks)? {
         Datum::Null => Ok(0),
         Datum::Int2(v) if v >= 0 => Ok(v as u64),
         Datum::Int4(v) if v >= 0 => Ok(v as u64),
@@ -91991,11 +92083,14 @@ pub fn eval_limit_pub<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
+    // The enclosing row of a subquery, whose columns the bound may read.
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<u64, SqlError> {
     let Some(expression) = limit else {
         return Ok(u64::MAX);
     };
-    match eval_full(expression, arena, params, &NoColumns, hooks)? {
+    let row: &dyn ColumnLookup<'a> = outer.unwrap_or(&NoColumns);
+    match eval_full(expression, arena, params, &row, hooks)? {
         Datum::Null => Ok(u64::MAX),
         Datum::Int2(v) if v >= 0 => Ok(v as u64),
         Datum::Int4(v) if v >= 0 => Ok(v as u64),

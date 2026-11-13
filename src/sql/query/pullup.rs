@@ -169,6 +169,7 @@ fn move_having_to_where<'a>(
                 storage,
                 txid,
                 super::predicate_safety::AnalysisStage::RuntimeProjection,
+                arena,
             )?
             .volatile;
         if stays || !grouped {
@@ -722,6 +723,7 @@ fn pull_up_one<'a>(
                         storage,
                         txid,
                         super::predicate_safety::AnalysisStage::RuntimeProjection,
+                        arena,
                     )?
                     .volatile
                 {

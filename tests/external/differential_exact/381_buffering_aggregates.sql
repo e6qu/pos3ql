@@ -1,0 +1,10 @@
+CREATE TABLE bag_t(id int, s text, n numeric, r int4range, j jsonb);
+INSERT INTO bag_t VALUES (1, 'pear', 1.5, '[1,3)', '{"a":1}'), (2, 'apple', NULL, '[2,5)', '[1]'), (3, 'fig', 2.25, NULL, 'null'), (4, NULL, -1, '[10,12)', NULL), (5, 'pear', 1.5, '[0,1)', '"x"');
+SELECT array_agg(s ORDER BY s DESC NULLS LAST), string_agg(DISTINCT s, ',' ORDER BY s), array_agg(DISTINCT n), json_agg(DISTINCT n) FROM bag_t;
+SELECT id % 2, array_agg(n ORDER BY id), json_agg(s ORDER BY id), jsonb_agg(j ORDER BY id DESC), json_object_agg(id, s ORDER BY id), jsonb_object_agg(s, n) FILTER (WHERE s IS NOT NULL) FROM bag_t GROUP BY 1 ORDER BY 1;
+SELECT range_agg(r), range_intersect_agg(r) FILTER (WHERE id < 3), count(DISTINCT s), sum(DISTINCT n), avg(DISTINCT id) FROM bag_t;
+SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY n), percentile_disc(0.5) WITHIN GROUP (ORDER BY s), mode() WITHIN GROUP (ORDER BY s) FROM bag_t;
+SELECT xmlagg(xmlelement(name e, s) ORDER BY id), xmlelement(name e, NULL, NULL), xmlelement(name e, xmlattributes(1 AS x), NULL), xmlelement(name e, NULL, 'a') FROM bag_t;
+SELECT array_agg(DISTINCT x), json_agg(DISTINCT x), count(DISTINCT x) FROM (VALUES (2), (NULL), (1), (NULL), (2)) v(x);
+SELECT jsonb_object_agg(k, v), json_object_agg(k, v) FROM (VALUES ('b', 1), ('a', 2), ('b', 3), ('aa', 4)) t(k, v);
+SELECT g % 3, count(DISTINCT length(repeat('a', 800) || (g % 5))), length(string_agg(right(repeat('b', 900) || g, 2), '' ORDER BY g)), cardinality(array_agg(DISTINCT length(repeat('c', 700) || g))) FROM generate_series(1, 6000) g GROUP BY 1 ORDER BY 1;

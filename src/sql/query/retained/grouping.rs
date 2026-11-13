@@ -72,7 +72,7 @@ fn before_input_end(
     Ok(safe_casts
         && retained_expression(expression, catalog, Some((storage, columns.txid)))
         && retained_scalar_calls(expression, columns)?
-        && !crate::sql::eval::routine_input_handoff(expression, Some(catalog))
+        && !crate::sql::eval::routine_input_handoff_kept_subqueries(expression, Some(catalog))
         && !super::predicate_safety::expression_properties(
             expression,
             columns,
@@ -928,13 +928,15 @@ impl<'a> GroupState<'a> {
 
     /// Folds every group not yet folded; a failure keeps the groups folded
     /// so far. The saved input is released once every group is folded.
-    pub(super) fn fold(
+    pub(super) fn fold<'w>(
         &mut self,
         scope: &QueryScope<'_>,
         storage: &Storage,
         txid: u32,
-        work: &Arena,
-        params: &[Datum<'_>],
+        work: &'w Arena,
+        params: &[Datum<'w>],
+        // The reader's uncorrelated subqueries, which aggregate arguments read.
+        subqueries: Option<&'w crate::sql::eval::SubqueryValues<'w, 'w>>,
     ) -> Result<(), SqlError> {
         let Phase::Folding { mut next } = self.phase else {
             return Ok(());
@@ -978,6 +980,7 @@ impl<'a> GroupState<'a> {
                 (next..end).map(|index| record(&self.inputs, bytes, index)),
                 work,
                 params,
+                subqueries,
             )
             .and_then(|group| push_record(&mut self.groups, &mut self.group_bytes, group));
             // SAFETY: the group's record was copied into its lease.
@@ -1126,6 +1129,7 @@ fn fold_group<'t: 'w, 'w>(
     mut rows: impl Iterator<Item = &'w [u8]>,
     work: &'w Arena,
     params: &[Datum<'w>],
+    subqueries: Option<&'w crate::sql::eval::SubqueryValues<'w, 'w>>,
 ) -> Result<&'w [u8], SqlError> {
     let catalog = StorageCatalog {
         storage,
@@ -1136,6 +1140,7 @@ fn fold_group<'t: 'w, 'w>(
     };
     let hooks = EvalHooks {
         catalog: Some(&catalog),
+        subs: subqueries,
         ..crate::sql::eval::NO_HOOKS
     };
     let states = work

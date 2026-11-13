@@ -109,7 +109,7 @@ is owned.
   restarts the statement. PL/pgSQL cursor reads (`OPEN`, `FETCH` and cursor
   `FOR` loops) read storage synchronously; their lock waits already park. A top-level `SELECT` that the retained reader cannot hold
   (`DISTINCT` over routine output, grouping sets, groupings whose keys or aggregate inputs call
-  routines, subqueries, sorts in object-store mode or over non-volatile
+  routines, correlated subqueries, sorts in object-store mode or over non-volatile
   routine output, joins it would probe through an index) restarts once for
   each first call of a SQL-language routine, so its work grows with the square
   of those calls; single-table, `VALUES` and `generate_series` sources,
@@ -207,19 +207,12 @@ is owned.
     over generator calls, grouping sets,
     subqueries other than the simple FROM subqueries merged into their query
     and uncorrelated scalar, `EXISTS`, `ARRAY`, row and `IN`/`ANY`/`ALL`
-    subqueries of unsorted or sorted streams (correlated ones, subqueries
-    under a grouping, grouped or bounded derived tables, and scans of CTEs
-    that run once). A correlated scalar or `ARRAY` subquery binds its result
-    type, executor and aggregate calls once per statement, but still resolves
-    its FROM scope and evaluates its operators unbound for each outer row;
-    correlated `EXISTS`, row, `IN`, `ANY` and `ALL` subqueries are analysed
-    again for each outer row. Rewinding a retained child tree per outer row
-    removes that analysis. A correlated subquery in a query's output or
-    `WHERE` runs for every row that query produces, even one under a `CASE`
-    branch the row does not take (`SELECT CASE WHEN id > 10 THEN (SELECT
-    1/(x - t.id) FROM z WHERE x = t.id) END FROM t` divides by zero where
-    PostgreSQL returns NULLs); running it where evaluation reaches it needs
-    the per-row values kept apart from the shared per-statement scratch,
+    subqueries of unsorted, sorted or grouped streams (correlated ones,
+    grouped or bounded derived tables, and scans of CTEs that run once). A
+    correlated subquery binds its result type, executor, aggregate calls,
+    row type or list collations once per statement, but still resolves its
+    FROM scope and evaluates its operators unbound each time a row reaches
+    it; rewinding a retained child tree per outer row removes that analysis,
     set operations other than `UNION ALL` (and `UNION ALL` under
     `ORDER BY`, in a declared cursor, or with volatile or routine-calling
     expressions), sorts in object-store mode (external runs

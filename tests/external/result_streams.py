@@ -107,6 +107,16 @@ QUERIES = (
         ALL_PROTOCOLS,
         BOTH,
     ),
+    # A grouping keeps its uncorrelated subqueries: they run when first read,
+    # in its filter, keys, aggregate arguments or output.
+    (
+        "SELECT id, max(payload), (SELECT count(*) FROM generate_series(1, 3) g) "
+        "FROM result_stream_rows WHERE id % 2 IN (SELECT g FROM generate_series(0, 1) g) "
+        "GROUP BY id ORDER BY id",
+        TABLE_ROWS,
+        ALL_PROTOCOLS,
+        BOTH,
+    ),
     # Fixed-size aggregate states fold per group as the input is read.
     (
         "SELECT id, repeat('x', 199 + count(*)::int), sum(id) FROM result_stream_rows "

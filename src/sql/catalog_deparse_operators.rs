@@ -105,6 +105,18 @@ impl Context<'_> {
                 if operator == BinaryOp::Sub && l == Some(oid::JSONB) && r.is_none() {
                     return Ok((l, Some(oid::TEXT)));
                 }
+                // An interval scales by `double precision`.
+                if matches!(operator, BinaryOp::Mul | BinaryOp::Div) {
+                    let scalar = |found: Option<i32>| {
+                        found.is_some_and(|found| super::numeric_rank(found).is_some())
+                    };
+                    if l == Some(oid::INTERVAL) && scalar(r) {
+                        return Ok((l, Some(oid::FLOAT8)));
+                    }
+                    if r == Some(oid::INTERVAL) && scalar(l) && operator == BinaryOp::Mul {
+                        return Ok((Some(oid::FLOAT8), r));
+                    }
+                }
                 let object = |found: Option<i32>| {
                     found.is_some_and(|found| {
                         found == oid::OID
@@ -630,6 +642,11 @@ impl Context<'_> {
                 self.write(args[0], kind, output)?;
                 output.push("))")?;
             }
+            // `substring(text FROM pattern)` is an ordinary call.
+            ("pg_catalog.substring", 2) if !matches!(self.type_of(args[1])?, Some(found) if integer_rank(found).is_some()) =>
+            {
+                return Ok(false);
+            }
             ("pg_catalog.substring", 2 | 3) => {
                 let kind = text(0)?;
                 output.push("SUBSTRING(")?;
@@ -795,7 +812,12 @@ impl Context<'_> {
         output: &mut Output<'_>,
     ) -> Result<(), SqlError> {
         self.open(output)?;
-        self.wrapped(operand, None, Parent::Collate, true, output)?;
+        // An untyped literal is resolved as `text` before it is collated.
+        let expected = match operand {
+            Expr::Str(_) | Expr::Null => Some(Some(oid::TEXT)),
+            _ => None,
+        };
+        self.wrapped(operand, expected, Parent::Collate, true, output)?;
         output.push(" COLLATE ")?;
         let resolved = match collation {
             crate::sql::ast::ParsedCollation::Builtin(collation) => Some(*collation),

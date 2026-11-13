@@ -5605,20 +5605,11 @@ fn eval_binary_values<'a>(
         row,
         hooks,
     )?;
-    // A number or boolean is never an enum's value, so neither operand's
-    // declared type can be an enum or a domain over one.
-    let not_enum = |value: &Datum<'_>| {
-        matches!(
-            value,
-            Datum::Bool(_)
-                | Datum::Int2(_)
-                | Datum::Int4(_)
-                | Datum::Int8(_)
-                | Datum::Float4(_)
-                | Datum::Float8(_)
-        )
-    };
-    if comparison_collation.is_some() && !(not_enum(&l) && not_enum(&r)) {
+    // Only an enum member (or a NULL, of any type) can have an enum or a
+    // domain over one as its declared type, so other values skip the
+    // per-row type lookup.
+    let may_be_enum = |value: &Datum<'_>| matches!(value, Datum::Enum { .. } | Datum::Null);
+    if comparison_collation.is_some() && (may_be_enum(&l) || may_be_enum(&r)) {
         validate_enum_operator_types(operator, left, right, row, hooks, arena)?;
     }
     if nulls == OperatorNulls::ReturnNull {

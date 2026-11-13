@@ -841,7 +841,8 @@ impl Context<'_> {
         }
         let natural = self.type_of(expression)?;
         match (natural, expected) {
-            (Some(natural), Some(expected)) if natural != expected => {
+            // A row is a `record` without a coercion.
+            (Some(natural), Some(expected)) if natural != expected && expected != oid::RECORD => {
                 self.wrapped(expression, None, Parent::Cast, true, output)?;
                 output.push("::")?;
                 self.type_name(expected, output)
@@ -1556,11 +1557,11 @@ impl Context<'_> {
                     }
                     // An `"any"` parameter keeps an untyped literal unknown;
                     // polymorphic parameters take the argument as it is.
-                    if parameter == oid::ANY {
-                        if let Expr::Str(text) = argument {
-                            quote_literal(output, text)?;
-                            continue;
-                        }
+                    if parameter == oid::ANY
+                        && let Expr::Str(text) = argument
+                    {
+                        quote_literal(output, text)?;
+                        continue;
                     }
                     let expected = (crate::storage::PolymorphicType::from_oid(parameter).is_none()
                         && parameter != oid::ANY)

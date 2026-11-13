@@ -462,9 +462,7 @@ body spells (`RETURN 'a'::e`) leaves the body spelling the old label, so the
 call fails with `22P02`. An index key whose value is a row
 (`CREATE INDEX ON t ((t))`) fails with `0A000`, since row values have no stored
 key encoding. A rule action that names its table's renamed column without
-`NEW.` or `OLD.` fails the rename with `0A000`. After a table, routine or type rename,
-`pg_get_viewdef` of a view it cannot deparse (see below) still prints the old
-names from the stored query text. A
+`NEW.` or `OLD.` fails the rename with `0A000`. A
 partition's `UNIQUE` or `PRIMARY KEY` constraint cannot be attached to
 its parent's plain unique index, so attaching such a partition builds a
 separate copy where PostgreSQL reuses the constraint's index; constraint
@@ -483,18 +481,24 @@ journal records and checkpoint image. `pg_operator` lists 27 `=` operators
 where PostgreSQL lists 63, so a foreign key's `conpfeqop`, `conppeqop` and
 `conffeqop` are NULL where PostgreSQL lists each key column's equality
 operator (`{96}`); they need the complete built-in operator rows first. `pg_get_viewdef`, `pg_views`,
-`pg_get_ruledef` and `pg_rules` print a view's or rule action's query as
-PostgreSQL deparses it, in its indented layout and wrap column, including
-subqueries, functions, explicit, `USING` and `NATURAL` joins, set operations,
-`DISTINCT ON`, windows, grouping sets, `WITH` queries, `LATERAL` items,
-`VALUES` lists, `TABLESAMPLE` and sublinks. A query that reads a function
-returning a record or composite type, a catalog relation, a `WITH` query with
-`SEARCH` or `CYCLE` or one that modifies data, or that groups or orders by a
-constant, or an expression outside the typed expression coverage, still prints
-its stored text, and a rule action's pretty form then fails with `0A000`. The
-routines and types a view's subqueries name are printed as the subquery names
-them, so after such a routine or type is renamed the view prints its stored
-text. In a `BEGIN ATOMIC` body only a `SELECT` of expressions
+`pg_get_ruledef` and `pg_rules` print every view's and rule's query as
+PostgreSQL deparses it, in its indented layout and wrap column, from the
+stored query, never its stored text: subqueries, functions (including ones
+returning composite rows, `OUT` parameters or a `json_to_record` column
+definition list), catalog and `information_schema` relations, joins, set
+operations, windows, grouping sets, `WITH` queries with `SEARCH` and `CYCLE`,
+constant and repeated sort keys, and the analyzed form of each expression
+(operator coercions, SQL-syntax functions, `IN` lists, row comparisons,
+`BETWEEN`, `LIKE ... ESCAPE`, `SIMILAR TO`, subscripts, `COLLATE`, typmod
+casts, variadic and named arguments). Routines, types and relations are
+printed under their current names at every query level. A rule on a view
+prints like one on a table. A query shape the deparser does not cover fails
+with `0A000` (`deparsing the query of view "v" is not supported`): a rule
+action with a data-modifying `WITH` query is one. A `FROM` function returning
+`record` with a column definition list is accepted only for the
+`json[b]_to_record[set]` family; for other functions the list is a syntax
+error, and `SYSTEM_USER` and system columns such as `xmin` are rejected.
+In a `BEGIN ATOMIC` body only a `SELECT` of expressions
 without `FROM` is deparsed (`SELECT (x + 1);`, under the current names of
 the routines and types it named); other statements are printed one per line
 as written, keeping names that were since renamed, where PostgreSQL prints its analyzed form (`INSERT

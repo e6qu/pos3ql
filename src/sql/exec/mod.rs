@@ -53214,6 +53214,42 @@ fn stored_rule_definition<'a>(
                 reference,
             ));
         }
+        // `transformRuleStmt`: a WITH query cannot read the rule's rows.
+        let ctes = match action.statement {
+            crate::sql::ast::Stmt::Select(select) => select.with,
+            crate::sql::ast::Stmt::With { ctes, .. } => ctes,
+            _ => &[],
+        };
+        if !ctes.is_empty() {
+            condition_columns.used_old.set(false);
+            condition_columns.used_new.set(false);
+            let items = arena
+                .alloc_slice_copy(&[crate::sql::ast::SelectItem::Expr {
+                    expression: &Expr::Int(1),
+                    alias: None,
+                }])
+                .map_err(|_| arena_full())?;
+            let probe = arena
+                .alloc(crate::sql::ast::Stmt::Select(crate::sql::ast::Select {
+                    with: ctes,
+                    items,
+                    ..crate::sql::ast::Select::EMPTY
+                }))
+                .map_err(|_| arena_full())?;
+            super::query::analyse_rule_action(probe, storage, txn.txid, arena, &condition_columns)?;
+            for (used, row) in [
+                (&condition_columns.used_old, "OLD"),
+                (&condition_columns.used_new, "NEW"),
+            ] {
+                if used.get() {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cannot refer to {} within WITH query",
+                        row
+                    ));
+                }
+            }
+        }
         condition_columns.used_old.set(false);
         condition_columns.used_new.set(false);
         super::query::analyse_rule_action(

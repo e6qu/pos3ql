@@ -618,7 +618,7 @@ impl<'r> Writer<'r> {
         let names = arena
             .alloc_slice_with(columns.len(), |index| columns[index].name)
             .map_err(full)?;
-        self.set_operation(leaves, tree, naming, names, arena, output)?;
+        self.set_operation(leaves, tree, naming, arena, output)?;
         // `ORDER BY` on a set operation names output columns by position.
         if !select.order_by.is_empty() {
             output.keyword(" ORDER BY ", -STD, STD, 1)?;
@@ -773,7 +773,6 @@ impl<'r> Writer<'r> {
         scope: &'x [Joined<'x>],
         tree: &'x SetTree<'x>,
         naming: Naming<'_>,
-        names: &[&str],
         arena: &'x Arena,
         output: &mut Output<'_>,
     ) -> Result<(), SqlError>
@@ -818,7 +817,7 @@ impl<'r> Writer<'r> {
                 } else {
                     0
                 };
-                self.set_operation(scope, left, naming, names, arena, output)?;
+                self.set_operation(scope, left, naming, arena, output)?;
                 if paren {
                     output.keyword(") ", -indent, 0, 0)?;
                 } else {
@@ -850,7 +849,6 @@ impl<'r> Writer<'r> {
                         visible: false,
                         unknown: naming.unknown,
                     },
-                    names,
                     arena,
                     output,
                 )?;

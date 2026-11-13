@@ -27,7 +27,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 29;
+pub(crate) const RECORD_VERSION: u8 = 30;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -1555,6 +1555,7 @@ pub(crate) enum WalOp<'a> {
         security_invoker: bool,
         security_barrier: u8,
         check_option: u8,
+        query_origin: u8,
         dependencies: WalStoredQueryDependencies<'a>,
     },
     DropView {
@@ -1567,6 +1568,7 @@ pub(crate) enum WalOp<'a> {
         security_invoker: bool,
         security_barrier: u8,
         check_option: u8,
+        query_origin: u8,
     },
     SetViewColumns {
         schema: &'a str,
@@ -3605,9 +3607,12 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             security_invoker: _,
             security_barrier: _,
             check_option: _,
+            query_origin: _,
             dependencies,
         } => {
+            // One more byte for the query origin after the three option bytes.
             crate::storage::ViewCatalogIdentity::ENCODED_BYTES
+                + 1
                 + 1
                 + name.len()
                 + columns.encoded_len()
@@ -3621,7 +3626,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + dependencies.encoded_len()
         }
         WalOp::DropView { schema, name } => 1 + name.len() + 1 + schema.len(),
-        WalOp::SetViewOptions { schema, name, .. } => 1 + name.len() + 1 + schema.len() + 3,
+        WalOp::SetViewOptions { schema, name, .. } => 1 + name.len() + 1 + schema.len() + 4,
         WalOp::SetViewColumns {
             schema,
             name,
@@ -5334,6 +5339,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             security_invoker,
             security_barrier,
             check_option,
+            query_origin,
             dependencies,
         } => {
             buffer.append(&(identity.slot() as u16).to_le_bytes())
@@ -5351,6 +5357,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     u8::from(*security_invoker),
                     *security_barrier,
                     *check_option,
+                    *query_origin,
                 ])
                 && dependencies.append(buffer)
         }
@@ -5361,6 +5368,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             security_invoker,
             security_barrier,
             check_option,
+            query_origin,
         } => {
             name_bytes(buffer, name)
                 && name_bytes(buffer, schema)
@@ -5368,6 +5376,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     u8::from(*security_invoker),
                     *security_barrier,
                     *check_option,
+                    *query_origin,
                 ])
         }
         WalOp::SetViewColumns {
@@ -8919,6 +8928,9 @@ fn decode_op_inner<'a>(
                 _ => return None,
             };
             at += 1;
+            let query_origin = *payload.get(at)?;
+            crate::storage::ViewQueryOrigin::from_code(query_origin)?;
+            at += 1;
             let encoded = payload.get(at..)?;
             if !validate_stored_query_dependencies(encoded) {
                 return None;
@@ -8935,6 +8947,7 @@ fn decode_op_inner<'a>(
                 security_invoker,
                 security_barrier,
                 check_option,
+                query_origin,
                 dependencies,
             })
         }),
@@ -8960,12 +8973,16 @@ fn decode_op_inner<'a>(
                 return None;
             }
             at += 1;
+            let query_origin = *payload.get(at)?;
+            crate::storage::ViewQueryOrigin::from_code(query_origin)?;
+            at += 1;
             (at == payload.len()).then_some(WalOp::SetViewOptions {
                 schema,
                 name,
                 security_invoker,
                 security_barrier,
                 check_option,
+                query_origin,
             })
         }),
         KIND_SET_VIEW_COLUMNS_V2 => decode_large_op(|| {
@@ -14697,6 +14714,7 @@ mod tests {
                     security_invoker: false,
                     security_barrier: 0,
                     check_option: 0,
+                    query_origin: 0,
                     dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
                 },
             ),
@@ -16278,6 +16296,7 @@ mod tests {
                     security_invoker: false,
                     security_barrier: 0,
                     check_option: 0,
+                    query_origin: 0,
                     dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
                 }
             ));
@@ -16401,6 +16420,7 @@ mod tests {
                 security_invoker: true,
                 security_barrier: 1,
                 check_option: 2,
+                query_origin: 0,
                 dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
             },
         ));
@@ -16492,6 +16512,7 @@ mod tests {
                 security_invoker: true,
                 security_barrier: 1,
                 check_option: 1,
+                query_origin: 0,
             },
         ));
         assert!(matches!(
@@ -17886,6 +17907,7 @@ mod tests {
                         security_invoker: false,
                         security_barrier: 0,
                         check_option: 0,
+                        query_origin: 0,
                         dependencies: WalStoredQueryDependencies::Captured(dependencies),
                     }
                 } else {
@@ -18211,6 +18233,7 @@ mod tests {
                         security_invoker: false,
                         security_barrier: 0,
                         check_option: 0,
+                        query_origin: 0,
                         dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
                     },
                     WalOp::CreateMatview {

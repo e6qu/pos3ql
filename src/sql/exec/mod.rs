@@ -19332,6 +19332,9 @@ pub struct CreateViewCommand<'a> {
     /// modifier (PostgreSQL leaves the view's attributes unchanged). Empty
     /// for `CREATE VIEW`.
     pub kept_column_types: &'a [crate::storage::ViewColumnType],
+    /// The statement writing the query: `CREATE VIEW` or the view's
+    /// `_RETURN` rule.
+    pub query_origin: crate::storage::ViewQueryOrigin,
 }
 
 pub struct AlterViewCommand<'a> {
@@ -30601,6 +30604,8 @@ fn execute_bound_plpgsql_utility<'a>(
                                                     sql,
                                                     raw_path: schema_path,
                                                     kept_column_types: &[],
+                                                    query_origin:
+                                                        crate::storage::ViewQueryOrigin::View,
                                                 },
                                                 context.arena,
                                                 responder,
@@ -30886,6 +30891,7 @@ fn execute_bound_plpgsql_utility<'a>(
                         sql,
                         raw_path: guc.search_path().as_str(),
                         kept_column_types: &[],
+                        query_origin: crate::storage::ViewQueryOrigin::View,
                     },
                     context.arena,
                     responder,
@@ -50801,6 +50807,7 @@ pub fn create_view(
         sql,
         raw_path,
         kept_column_types,
+        query_origin,
     } = command;
     let literal_inputs = match super::type_inputs::bindings_for_active_source(sql, arena) {
         Ok(Some(inputs)) => inputs,
@@ -51080,6 +51087,7 @@ pub fn create_view(
                         crate::storage::ViewCheckOption::Cascaded
                     }
                 }),
+                query_origin,
             },
         },
         or_replace,
@@ -51136,6 +51144,7 @@ pub fn create_view(
                             super::ast::ViewCheckOption::Local => 1,
                             super::ast::ViewCheckOption::Cascaded => 2,
                         }),
+                        query_origin: query_origin.code(),
                         dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                             storage.view_dependencies(new_slot, txn.txid).view(),
                         ),
@@ -52165,6 +52174,7 @@ fn alter_view_inner(
                 check_option: options
                     .check_option
                     .map_or(0, crate::storage::ViewCheckOption::code),
+                query_origin: options.query_origin.code(),
             },
         )
     };
@@ -52391,6 +52401,7 @@ fn publish_rewritten_view(
                 check_option: view
                     .check_option_for(txn.txid)
                     .map_or(0, |option| option.code()),
+                query_origin: view.options_for(txn.txid).query_origin.code(),
                 dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                     storage.view_dependencies(new_slot, txn.txid).view(),
                 ),
@@ -53637,6 +53648,7 @@ fn replace_view_query(
                 sql,
                 raw_path,
                 kept_column_types: columns.types(),
+                query_origin: crate::storage::ViewQueryOrigin::ReturnRule,
             },
             arena,
             responder,
@@ -64087,6 +64099,7 @@ fn rewrite_composite_dependent_views(
                     check_option: view
                         .check_option_for(txn.txid)
                         .map_or(0, |option| option.code()),
+                    query_origin: view.options_for(txn.txid).query_origin.code(),
                     dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                         storage.view_dependencies(new_slot, txn.txid).view(),
                     ),

@@ -12259,6 +12259,7 @@ fn write_statistics_keys<const N: usize>(
                 parameters: &[],
                 joined: &[],
                 pretty: true,
+                qualify: false,
             },
             source.as_str(),
             deparse::Destination::Value,
@@ -12382,6 +12383,7 @@ pub(crate) fn extended_statistics_expressions_by_oid<'a>(
                     parameters: &[],
                     joined: &[],
                     pretty: false,
+                    qualify: false,
                 },
                 expression.as_str(),
                 deparse::Destination::Value,
@@ -15381,6 +15383,7 @@ fn write_sql_body(
         parameters: routine.parameters(),
         joined: &[],
         pretty: false,
+        qualify: false,
     };
     let dependencies = storage.snapshot_routine_dependencies_for(slot, txid, arena)?;
     let _formal = super::exec::enter_routine_parameter_types(
@@ -15958,6 +15961,7 @@ pub fn trigger_def_text<'a>(
                         parameters: &[],
                         joined: &joined,
                         pretty,
+                        qualify: false,
                     },
                     when.as_str(),
                     deparse::Destination::Condition,
@@ -16076,6 +16080,7 @@ fn write_routine_arguments(
                 parameters: &[],
                 joined: &[],
                 pretty: false,
+                qualify: false,
             };
             let deparsed = match storage
                 .routine_type_oid(parameter.ctype, parameter.user_type, txid)
@@ -16526,8 +16531,16 @@ pub(crate) fn view_def_text_pretty<'a>(
             .alloc_str(view.sql.as_str().trim().trim_end_matches(';'))
             .map_err(|_| arena_full())?;
         if let Ok(select) = crate::sql::parser::parse_query(query, arena)
-            && let Some(deparsed) =
-                deparse::view_definition(storage, txid, select, None, names, layout, arena)?
+            && let Some(deparsed) = deparse::view_definition(
+                storage,
+                txid,
+                select,
+                None,
+                names,
+                layout,
+                crate::storage::ViewQueryOrigin::View,
+                arena,
+            )?
         {
             return Ok(Some(deparsed));
         }
@@ -16567,6 +16580,7 @@ pub(crate) fn view_def_text_pretty<'a>(
             Some(dependencies),
             names,
             layout,
+            view.options_for(txid).query_origin,
             arena,
         )? {
             return Ok(Some(deparsed));
@@ -18233,6 +18247,7 @@ pub fn constraint_def_text<'a>(
                 parameters: &[],
                 joined: &[],
                 pretty,
+                qualify: false,
             };
             match deparse::deparse(
                 &context,
@@ -19077,6 +19092,7 @@ pub fn index_def_text<'a>(
                     parameters: &[],
                     joined: &[],
                     pretty,
+                    qualify: false,
                 },
                 predicate.as_str(),
                 deparse::Destination::Condition,
@@ -19148,6 +19164,7 @@ fn index_expression_display<'a>(
             parameters: &[],
             joined: &[],
             pretty,
+            qualify: false,
         },
         source,
         deparse::Destination::Value,

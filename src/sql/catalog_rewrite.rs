@@ -491,6 +491,7 @@ pub(super) fn rule_definition<'a>(
                             parameters: &[],
                             joined: &joined,
                             pretty,
+                            qualify: false,
                         },
                         source,
                         super::deparse::Destination::Condition,

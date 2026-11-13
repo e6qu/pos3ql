@@ -551,11 +551,7 @@ IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 set, and omits an explicit `security_invoker=false`. A `CHECK` constraint
 marked `NO INHERIT` fails with `0A000`, and exclusion constraints support only
 GiST over range columns (`EXCLUDE USING btree (a WITH =)` fails with `0A000`).
-`pg_constraint` omits the system catalogs' own not-null constraints. After
-`CREATE OR REPLACE RULE "_RETURN"`, `pg_get_viewdef` prints the view's
-columns unqualified (`SELECT (a)::numeric AS a`) where PostgreSQL, whose
-rule query also holds the rule's `OLD` and `NEW` entries, qualifies them
-(`(rt.a)::numeric`). A missing column's spelling suggestion (`Perhaps you
+`pg_constraint` omits the system catalogs' own not-null constraints. A missing column's spelling suggestion (`Perhaps you
 meant to reference the column "t.v".`) in a set operation's later branch does
 not offer the earlier branches' columns (`*SELECT* 1.x`). Virtual generated
 columns, PostgreSQL 18's default when `STORED` is not written, fail with

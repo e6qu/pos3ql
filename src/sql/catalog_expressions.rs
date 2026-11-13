@@ -558,6 +558,7 @@ pub(super) fn deparse<'a>(
                             parameters: &[],
                             joined: &[],
                             pretty: false,
+                            qualify: false,
                         },
                         element,
                         super::deparse::Destination::Assignment(type_oid),
@@ -590,6 +591,7 @@ pub(super) fn deparse<'a>(
             parameters: &[],
             joined: &[],
             pretty,
+            qualify: false,
         };
         let destination = match destination {
             Some(type_oid) => super::deparse::Destination::Assignment(type_oid),

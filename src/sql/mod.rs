@@ -22050,6 +22050,7 @@ impl Engine {
                     sql,
                     raw_path: guc.search_path().as_str(),
                     kept_column_types: &[],
+                    query_origin: crate::storage::ViewQueryOrigin::View,
                 },
                 arena,
                 responder,
@@ -23519,6 +23520,7 @@ impl Engine {
                                         sql,
                                         raw_path: schema_path,
                                         kept_column_types: &[],
+                                        query_origin: crate::storage::ViewQueryOrigin::View,
                                     },
                                     arena,
                                     responder,
@@ -30033,6 +30035,7 @@ fn apply_wal_op(
             security_invoker,
             security_barrier,
             check_option,
+            query_origin,
             dependencies,
         } => {
             let (columns, default_inputs) = columns.materialize(storage, 0)?;
@@ -30089,6 +30092,13 @@ fn apply_wal_op(
                                 )?)
                             }
                         },
+                        query_origin: crate::storage::ViewQueryOrigin::from_code(query_origin)
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::DATA_EXCEPTION,
+                                    "journal has invalid view query origin"
+                                )
+                            })?,
                     },
                 },
             )?;
@@ -30104,6 +30114,7 @@ fn apply_wal_op(
             security_invoker,
             security_barrier,
             check_option,
+            query_origin,
         } => {
             let slot = storage
                 .resolve_access_object(crate::storage::AccessClass::View, schema, name, 0)
@@ -30144,6 +30155,13 @@ fn apply_wal_op(
                         )
                     })?,
                     check_option,
+                    query_origin: crate::storage::ViewQueryOrigin::from_code(query_origin)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "journal has invalid view query origin"
+                            )
+                        })?,
                 },
                 0,
             )?;

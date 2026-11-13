@@ -26,7 +26,7 @@ schema changes follow a different procedure; see
 | Object | Identity | Read | Write | Notes |
 |---|---|---:|---:|---|
 | Checkpoint manifest | `pos3ql-manifest-v39` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
-| Journal record | Version `29` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
+| Journal record | Version `30` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | Identity is SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; the LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process's writer token. |
@@ -87,7 +87,7 @@ Do not keep a decoder or add a conversion solely for an older pos3ql version.
 ### Journal records
 
 Framing is 24 bytes: CRC32C, payload length and LSN in bytes 0–15; byte 16 is
-the operation kind; byte 17 is the version (`29`); bytes 18–23 are zero.
+the operation kind; byte 17 is the version (`30`); bytes 18–23 are zero.
 Field-width changes use new kind bytes. Kinds with special rules:
 
 | Kind | Meaning | Rule |
@@ -97,7 +97,7 @@ Field-width changes use new kind bytes. Kinds with special rules:
 | 141 | Trigger create | Current; requires the ten-byte position prefix. Kind 55 remains readable. |
 | 142 | Routine create | Current; 16-bit result counts. Kind 45 remains readable. |
 | 143 | Composite create | Current. Kind 58 remains readable. |
-| 144/145 | View create / view columns | Current; 16-bit column count. Each column's name is followed by its type (four-byte type OID, two-byte length, four-byte modifier, four-byte collation code), then its default and the default's four-byte `pg_attrdef` stamp. Kinds 5/126, whose columns have no types, are rejected. |
+| 144/145 | View create / view columns | Current; 16-bit column count. Each column's name is followed by its type (four-byte type OID, two-byte length, four-byte modifier, four-byte collation code), then its default and the default's four-byte `pg_attrdef` stamp. Kinds 5/126, whose columns have no types, are rejected. A view create ends its options with a query-origin byte (0 `CREATE VIEW`, 1 `CREATE OR REPLACE RULE "_RETURN"`), which view-option changes also carry. |
 | 148 | Composite rename or schema move | Prior name, prior schema, new schema, new name. Preserves current fields. |
 | 149 | Enum create | Current. Kinds 23 and 147 are rejected. |
 | 150 | Extended statistics ANALYZE | Current. Kind 77 enum-dependent hash summaries are retired; counts stay valid. |
@@ -161,7 +161,7 @@ inserts a missing writer.
 | `table2` | Slot, creation stamp, hexadecimal checked-input image, name. Internal large-object page table keeps its reserved slot and stamp zero. |
 | `sq7`, `rtn2` | Sequence / routine slot and creation stamp. |
 | `mv6` | Materialized-view catalog position and backing-table position. |
-| `vw14` | View position and stamp, return-rule position and stamp, encoded query, then each column by ordinal: name, checked default, `pg_attrdef` stamp (zero without a default), type OID, type length, type modifier and collation code. |
+| `vw15` | View position and stamp, return-rule position and stamp, encoded query, schema, search path, name, security, security barrier, check option and query origin (0 `CREATE VIEW`, 1 `_RETURN` rule; it decides whether `pg_get_viewdef` qualifies columns), then each column by ordinal: name, checked default, `pg_attrdef` stamp (zero without a default), type OID, type length, type modifier and collation code. |
 | `hidx <table-slot> <0-or-1>` | Required once per table, including tables without indexes. The large-object page table requires `0`. |
 | `col4` | Hexadecimal column name and NOT NULL constraint name (empty when nullable). Extra fields are rejected. |
 | `attributes2` | Entry count and each attribute entry as sixteen hex digits. |

@@ -40,6 +40,9 @@ pub(crate) struct Context<'s> {
     pub joined: &'s [Joined<'s>],
     /// `PRETTYFLAG_PAREN`: parentheses only where precedence requires them.
     pub pretty: bool,
+    /// Qualify every column, as PostgreSQL does when the query's range table
+    /// holds more than the FROM items (a rule's `OLD` and `NEW`).
+    pub qualify: bool,
 }
 
 /// A FROM item: the name stored references qualify columns with, the name
@@ -761,7 +764,7 @@ impl Context<'_> {
                     return output.unsupported();
                 }
                 let mut identifier = crate::util::StackStr::<260>::new();
-                if self.joined.len() > 1 {
+                if self.joined.len() > 1 || self.qualify {
                     let Some((exposed, _)) = self.joined_source(*qualifier, name) else {
                         return output.unsupported();
                     };
@@ -1445,6 +1448,7 @@ pub(crate) fn view_definition<'a>(
     dependencies: Option<crate::storage::StoredQueryDependencyView<'_>>,
     column_names: &[&str],
     layout: ViewLayout,
+    origin: crate::storage::ViewQueryOrigin,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
     let pretty = layout.pretty;
@@ -1534,6 +1538,7 @@ pub(crate) fn view_definition<'a>(
         parameters: &[],
         joined: &joined[..count],
         pretty,
+        qualify: origin == crate::storage::ViewQueryOrigin::ReturnRule,
     };
     let mut output = Output {
         arena,
@@ -1799,6 +1804,7 @@ pub(crate) fn rule_action_definition<'a>(
         parameters: &[],
         joined: &joined,
         pretty,
+        qualify: false,
     };
     let mut relation = crate::util::StackStr::<264>::new();
     if !storage.schema_is_on_path(target.schema, txid) {

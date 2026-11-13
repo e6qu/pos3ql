@@ -6137,6 +6137,7 @@ pub struct ViewOptions {
     pub security: ViewSecurity,
     pub security_barrier: ViewSecurityBarrier,
     pub check_option: Option<ViewCheckOption>,
+    pub query_origin: ViewQueryOrigin,
 }
 
 impl ViewOptions {
@@ -6144,7 +6145,35 @@ impl ViewOptions {
         security: ViewSecurity::Definer,
         security_barrier: ViewSecurityBarrier::Default,
         check_option: None,
+        query_origin: ViewQueryOrigin::View,
     };
+}
+
+/// Which statement wrote a view's query. PostgreSQL's `CREATE OR REPLACE
+/// RULE "_RETURN"` keeps the rule's `OLD` and `NEW` entries in the query's
+/// range table, so `pg_get_viewdef` qualifies every column it prints; a
+/// `CREATE VIEW` query has no such entries. Not a reloption.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewQueryOrigin {
+    View,
+    ReturnRule,
+}
+
+impl ViewQueryOrigin {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::View => 0,
+            Self::ReturnRule => 1,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::View),
+            1 => Some(Self::ReturnRule),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]

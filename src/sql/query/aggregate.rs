@@ -2873,13 +2873,13 @@ impl<'a> AggState<'a> {
         }
         let vals = unsafe { core::slice::from_raw_parts_mut(self.vals, self.vals_len) };
         crate::util::try_sort_unstable_by(vals, |a, b| {
-            compare_datums_with_catalog(self.collation, catalog, a, b)
+            compare_distinct(self.collation, catalog, a, b)
         })?;
         let mut prev: Option<Datum<'a>> = None;
         for &v in vals.iter() {
             let fresh = match prev {
                 None => true,
-                Some(p) => !compare_datums_with_catalog(self.collation, catalog, &p, &v)?.is_eq(),
+                Some(p) => !compare_distinct(self.collation, catalog, &p, &v)?.is_eq(),
             };
             if fresh {
                 self.count += 1;
@@ -3459,6 +3459,16 @@ impl<'a> AggState<'a> {
         let text = arena
             .alloc_str_display(JsonObjectAggregateDisplay { pairs, jsonb })
             .map_err(|_| arena_full())?;
+        // A jsonb object sorts its keys and keeps the last value of a
+        // repeated key, as jsonb input does.
+        let text = if jsonb {
+            let tree = crate::sql::json::parse(text, arena)?;
+            arena
+                .alloc_str_display(crate::sql::json::JsonWrite(&tree))
+                .map_err(|_| arena_full())?
+        } else {
+            text
+        };
         Ok(Datum::Json { text, jsonb })
     }
 
@@ -3507,19 +3517,13 @@ impl<'a> AggState<'a> {
             crate::mem::arena::try_stable_sort_via(
                 arena,
                 vals,
-                |a, b| compare_datums_with_catalog(self.collation, catalog, a, b),
+                |a, b| compare_distinct(self.collation, catalog, a, b),
                 |_| arena_full(),
             )?;
             let mut unique = 0usize;
             for i in 0..vals.len() {
                 let same = i > 0
-                    && compare_datums_with_catalog(
-                        self.collation,
-                        catalog,
-                        &vals[i],
-                        &vals[i - 1],
-                    )?
-                    .is_eq();
+                    && compare_distinct(self.collation, catalog, &vals[i], &vals[i - 1])?.is_eq();
                 if !same {
                     vals[unique] = vals[i];
                     unique += 1;
@@ -3545,5 +3549,22 @@ impl core::fmt::Display for XmlAggregateDisplay<'_> {
             }
         }
         Ok(())
+    }
+}
+
+/// Orders an aggregate's `DISTINCT` values. NULLs, which `array_agg` and
+/// `json_agg` keep, are one value that sorts last, as PostgreSQL's sort
+/// places them.
+fn compare_distinct(
+    collation: Collation,
+    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    a: &Datum<'_>,
+    b: &Datum<'_>,
+) -> Result<core::cmp::Ordering, SqlError> {
+    match (a.is_null(), b.is_null()) {
+        (true, true) => Ok(core::cmp::Ordering::Equal),
+        (true, false) => Ok(core::cmp::Ordering::Greater),
+        (false, true) => Ok(core::cmp::Ordering::Less),
+        (false, false) => compare_datums_with_catalog(collation, catalog, a, b),
     }
 }

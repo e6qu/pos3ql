@@ -4863,6 +4863,7 @@ fn prepare_recursive_decoration<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
+    params: Option<&[Datum<'a>]>,
 ) -> Result<RecursiveDecoration<'a>, SqlError> {
     let generated = usize::from(cte.search.is_some()) + usize::from(cte.cycle.is_some()) * 2;
     if base_names.len() + generated > MAX_PROJ
@@ -4937,30 +4938,37 @@ fn prepare_recursive_decoration<'a>(
                 .ok_or_else(|| {
                     sql_err!(sqlstate::DATATYPE_MISMATCH, "CYCLE types cannot be matched")
                 })?;
-                let catalog = super::storage_catalog(storage, arena, txid);
-                let hooks = crate::sql::eval::EvalHooks {
-                    catalog: Some(&catalog),
-                    ..crate::sql::eval::NO_HOOKS
-                };
-                let value = crate::sql::eval::eval_full(
-                    value,
-                    arena,
-                    crate::sql::eval::NO_PARAMS,
-                    &crate::sql::eval::NoColumns,
-                    &hooks,
-                )?;
-                let default = crate::sql::eval::eval_full(
-                    default,
-                    arena,
-                    crate::sql::eval::NO_PARAMS,
-                    &crate::sql::eval::NoColumns,
-                    &hooks,
-                )?;
-                (
-                    super::setops::coerce_set_value(value, mark_type, arena)?,
-                    super::setops::coerce_set_value(default, mark_type, arena)?,
-                    mark_type,
-                )
+                // Describing the query needs only the mark's type; its
+                // values may be parameters of the statement being checked.
+                match params {
+                    Some(params) => {
+                        let catalog = super::storage_catalog(storage, arena, txid);
+                        let hooks = crate::sql::eval::EvalHooks {
+                            catalog: Some(&catalog),
+                            ..crate::sql::eval::NO_HOOKS
+                        };
+                        let value = crate::sql::eval::eval_full(
+                            value,
+                            arena,
+                            params,
+                            &crate::sql::eval::NoColumns,
+                            &hooks,
+                        )?;
+                        let default = crate::sql::eval::eval_full(
+                            default,
+                            arena,
+                            params,
+                            &crate::sql::eval::NoColumns,
+                            &hooks,
+                        )?;
+                        (
+                            super::setops::coerce_set_value(value, mark_type, arena)?,
+                            super::setops::coerce_set_value(default, mark_type, arena)?,
+                            mark_type,
+                        )
+                    }
+                    None => (Datum::Null, Datum::Null, mark_type),
+                }
             }
         };
         names[next] = cycle.mark_column;
@@ -5505,6 +5513,7 @@ fn describe_recursive_materialized<'a>(
         storage,
         txid,
         arena,
+        None,
     )?;
     let recursive_tree = subst_set_tree(recursive_tree, outer, arena)?;
     reject_recursive_name_collision(cte, recursive_tree, decoration, storage, txid, arena)?;
@@ -5931,6 +5940,7 @@ fn materialize_recursive<'a>(
         storage,
         txid,
         arena,
+        Some(params),
     )?;
     reject_recursive_name_collision(cte, recursive_tree, decoration, storage, txid, arena)?;
     let decorated = decoration.column_names.len() != decoration.visible;

@@ -2,10 +2,14 @@
 -- returning composite rows or column definition lists, catalog and
 -- information schema relations, WITH queries with SEARCH and CYCLE, and
 -- constant or repeated GROUP BY and ORDER BY keys; a rule on a view prints
--- its condition and actions over the view's columns. A non-integer constant
--- as a GROUP BY or ORDER BY key is rejected.
+-- its condition and actions over the view's columns. A WITH query's CYCLE
+-- mark is described while an enum type makes CREATE VIEW check the query's
+-- string literals. A non-integer constant as a GROUP BY or ORDER BY key is
+-- rejected.
 CREATE TABLE t421 (a int, b text, c numeric);
 CREATE TYPE comp421 AS (x int, y text);
+-- An enum type makes CREATE VIEW check the query's string literals.
+CREATE TYPE mood421 AS ENUM ('sad', 'ok');
 CREATE FUNCTION fc421() RETURNS comp421 LANGUAGE sql AS $$ SELECT 1, 'a'::text $$;
 CREATE FUNCTION fsc421() RETURNS SETOF comp421 LANGUAGE sql AS $$ SELECT 1, 'a'::text $$;
 CREATE FUNCTION ft421() RETURNS SETOF t421 LANGUAGE sql AS $$ SELECT * FROM t421 $$;

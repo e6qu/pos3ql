@@ -87,8 +87,9 @@ mod view_write;
 pub(crate) use cte::captured_type_oid;
 pub(crate) use cte::{CteReader, dml_cte_runs_after, select_relations, set_query_relations};
 pub use view_write::{
-    UpdatableView, ViewRewrite, ViewWrite, and_where, function_view_write_error,
-    resolve_view_for_dml, view_column_is_updatable, view_is_auto_updatable,
+    UpdatableView, ViewRewrite, ViewWrite, and_where, conditional_instead_view_error,
+    function_view_write_error, resolve_view_for_dml, view_column_is_updatable,
+    view_is_auto_updatable,
 };
 mod dependencies;
 mod procedural_names;

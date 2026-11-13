@@ -1497,6 +1497,8 @@ pub(crate) fn restrict_rule_original<'a>(
 /// that relation once, preserving statement-level behavior while OLD/NEW are
 /// ordinary typed column references rather than magic evaluator states.
 pub(crate) fn rule_transition_source<'a>(
+    storage: &Storage,
+    txid: u32,
     statement: &'a Stmt<'a>,
     columns: &'a [&'a str],
     types: &'a [RuleTransitionType<'a>],
@@ -1603,17 +1605,15 @@ pub(crate) fn rule_transition_source<'a>(
         }
         Stmt::Insert(insert) => {
             let input_columns = if insert.columns.is_empty() {
-                if insert.select.is_none() {
-                    let width = insert.rows.first().map_or(0, |row| row.len());
-                    columns.get(..width).ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::SYNTAX_ERROR,
-                            "INSERT has more expressions than target columns"
-                        )
-                    })?
-                } else {
-                    columns
-                }
+                // A query's columns fill the first target columns, as a
+                // VALUES row's do.
+                let width = super::dependencies::insert_source_width(insert, storage, txid, arena)?;
+                columns.get(..width).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "INSERT has more expressions than target columns"
+                    )
+                })?
             } else {
                 insert.columns
             };

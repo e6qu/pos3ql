@@ -76490,14 +76490,21 @@ pub(crate) fn merge<'a>(
         schema: statement.target.schema,
         name: statement.target.name,
     };
-    let Some(crate::storage::ResolvedRelation::View(_)) =
-        storage.resolve_relation(target_qual.schema, target_qual.name, txn.txid)
-    else {
+    let resolved = storage.resolve_relation(target_qual.schema, target_qual.name, txn.txid);
+    if let Some(target) = resolved
+        && let Err(error) = reject_merge_rules(storage, target, txn.txid)
+    {
+        return sql_fail(error);
+    }
+    let Some(crate::storage::ResolvedRelation::View(view_slot)) = resolved else {
         return merge_target(
             storage, txn, statement, arena, params, services, responder, capture, progress, outer,
             None,
         );
     };
+    if let Err(error) = reject_merge_instead_triggers(storage, view_slot, statement, txn.txid) {
+        return sql_fail(error);
+    }
     // PostgreSQL rejects a view that is not automatically updatable for the
     // first action that would write it.
     for when in statement.whens {
@@ -76529,6 +76536,16 @@ pub(crate) fn merge<'a>(
         }
         Err(error) => return sql_fail(error),
     };
+    // The levels can end at a view that writes itself, as PostgreSQL's
+    // rewriter then targets it with the MERGE.
+    if let Some(base) = view.base_view {
+        let target = crate::storage::ResolvedRelation::View(base);
+        if let Err(error) = reject_merge_rules(storage, target, txn.txid)
+            .and_then(|()| reject_merge_instead_triggers(storage, base, statement, txn.txid))
+        {
+            return sql_fail(error);
+        }
+    }
     let original = match arena.alloc(Stmt::Merge(*statement)) {
         Ok(original) => &*original,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
@@ -76579,6 +76596,86 @@ pub(crate) fn merge<'a>(
         outer,
         Some(view_target),
     )
+}
+
+/// PostgreSQL's rewriter refuses a MERGE whose target has an enabled
+/// `INSERT`, `UPDATE` or `DELETE` rewrite rule.
+fn reject_merge_rules(
+    storage: &Storage,
+    target: crate::storage::ResolvedRelation,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let (rule_target, name) = match target {
+        crate::storage::ResolvedRelation::Table(slot) => (
+            crate::storage::RuleTarget::Table(slot as u16),
+            storage.table_def(slot, txid).name,
+        ),
+        crate::storage::ResolvedRelation::View(slot) => (
+            crate::storage::RuleTarget::View(slot as u16),
+            storage.view(slot).name_for(txid),
+        ),
+        crate::storage::ResolvedRelation::Catalog => return Ok(()),
+    };
+    let role = super::guc::active_session_replication_role()?;
+    let ruled = [
+        crate::storage::RewriteEvent::Insert,
+        crate::storage::RewriteEvent::Update,
+        crate::storage::RewriteEvent::Delete,
+    ]
+    .into_iter()
+    .any(|event| {
+        storage
+            .firing_rules_for(rule_target, event, role, txid)
+            .next()
+            .is_some()
+    });
+    if !ruled {
+        return Ok(());
+    }
+    crate::sql::eval::stash_diagnostic(
+        Some(crate::util::StackStr::from_str(
+            "MERGE is not supported for relations with rules.",
+        )),
+        None,
+    );
+    Err(sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "cannot execute MERGE on relation \"{}\"",
+        name.as_str()
+    ))
+}
+
+/// A MERGE whose every action has an `INSTEAD OF` row trigger on the view
+/// it writes is PostgreSQL's trigger-updatable MERGE, which pos3ql does not
+/// run; it fails instead of writing the view's base relation.
+fn reject_merge_instead_triggers(
+    storage: &Storage,
+    view: usize,
+    statement: &crate::sql::ast::Merge<'_>,
+    txid: u32,
+) -> Result<(), SqlError> {
+    use crate::sql::ast::MergeActionRef as MergeAction;
+    let has_trigger = |event| {
+        storage.triggers_for_view(view, txid).any(|(_, trigger)| {
+            matches!(trigger.level, TriggerLevel::Row)
+                && matches!(trigger.timing, TriggerTiming::InsteadOf)
+                && trigger.events.contains(event)
+        })
+    };
+    let triggered = statement.whens.iter().all(|when| match when.action() {
+        MergeAction::Insert { .. } => has_trigger(TriggerEvents::INSERT),
+        MergeAction::Update(_) => has_trigger(TriggerEvents::UPDATE),
+        MergeAction::Delete => has_trigger(TriggerEvents::DELETE),
+        MergeAction::DoNothing => true,
+    });
+    if !triggered {
+        return Ok(());
+    }
+    Err(sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "MERGE into view \"{}\" through its INSTEAD OF triggers is not supported",
+        storage.view(view).name_for(txid).as_str()
+    ))
 }
 
 /// The rules of the auto-updatable view a MERGE writes through.
@@ -79878,12 +79975,70 @@ where
     }
 }
 
+/// The defaults a rewrite rule's `NEW` takes for the columns an INSERT into
+/// the view `view_slot` leaves out, by view column: those of the views
+/// written through into it (`above`, outermost first), then its own.
+pub(crate) fn view_rule_defaults<'a>(
+    storage: &Storage,
+    view_slot: usize,
+    above: &'a [ViewInsertDefaults<'a>],
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<constraints::ParsedDefaults<'a>, SqlError> {
+    let definition = view_trigger_definition(storage, view_slot, txid, arena)?;
+    let check = instead_of_view_defaults(storage, view_slot, &definition, above, txid, arena)?;
+    let mut parsed = parse_view_defaults(Some(check), &definition, arena, storage, txid)?;
+    // A constant default is stored typed; the rule reads it as a literal.
+    for (index, column) in definition.columns().iter().enumerate() {
+        if parsed[index].is_some() {
+            continue;
+        }
+        let Some(default) = view_default_for(Some(check), &definition, index) else {
+            continue;
+        };
+        let (Some(constant), Some(source)) = (default.constant(), default.expression()) else {
+            continue;
+        };
+        let type_oid = storage
+            .routine_type_oid(column.ctype, column.user_type, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "view column default has an unknown type"
+                )
+            })?;
+        let source = arena
+            .alloc_str(source.as_str())
+            .map_err(|_| super::query::arena_full_pub())?;
+        let source = super::parser::parse_expr(source, arena)?;
+        let value = super::enum_values::materialize(constant.as_datum(), storage, txid, arena)?;
+        parsed[index] = Some(
+            arena
+                .alloc(Expr::BoundLiteral {
+                    value: crate::sql::ast::BoundLiteralValue::CachedDefault(encode_projected_pub(
+                        &[value],
+                        arena,
+                    )?),
+                    type_oid,
+                    type_mod: column.type_mod,
+                    collation: Some(column.collation),
+                    source,
+                })
+                .map(|value| &*value)
+                .map_err(|_| super::query::arena_full_pub())?,
+        );
+    }
+    Ok(parsed)
+}
+
 /// The view-column defaults an INSERT through an INSTEAD OF trigger applies
-/// to the columns it does not write.
+/// to the columns it does not write: those of the views written through
+/// into this one (`above`, outermost first), then the view's own.
 fn instead_of_view_defaults<'a>(
     storage: &Storage,
     view_slot: usize,
     definition: &crate::storage::TableDefView<'a>,
+    above: &'a [ViewInsertDefaults<'a>],
     txid: u32,
     arena: &'a Arena,
 ) -> Result<ViewCheck<'a>, SqlError> {
@@ -79896,16 +80051,19 @@ fn instead_of_view_defaults<'a>(
             .alloc_str(column.name.as_str())
             .map_err(|_| super::query::arena_full_pub())?;
     }
+    let own = ViewInsertDefaults {
+        base_columns,
+        columns: *view.columns_for(txid),
+        inputs: view.default_inputs_for(txid).detached_sections(arena)?,
+    };
     let defaults = arena
-        .alloc(ViewInsertDefaults {
-            base_columns,
-            columns: *view.columns_for(txid),
-            inputs: view.default_inputs_for(txid).detached_sections(arena)?,
+        .alloc_slice_with(above.len() + 1, |index| {
+            above.get(index).copied().unwrap_or(own)
         })
         .map_err(|_| super::query::arena_full_pub())?;
     Ok(ViewCheck {
         checks: &[],
-        defaults: core::slice::from_ref(defaults),
+        defaults,
     })
 }
 
@@ -80074,9 +80232,16 @@ pub(crate) fn instead_of_view_dml<'a>(
     responder: &mut Responder,
     mut capture: Option<&mut super::ReturningCapture<'_>>,
     mut progress: Option<&mut RowProgress>,
+    inherited: Option<ViewCheck<'a>>,
 ) -> Outcome {
     let seq_session = services.seq_session;
     let coercion_txid = txn.txid;
+    // The check options of the views written through into this one apply to
+    // the rows its triggers return.
+    let checks = inherited.map(|inherited| ViewCheck {
+        checks: inherited.checks,
+        defaults: &[],
+    });
     let assignment_casts =
         match prepare_dml_assignment_casts(statement, storage, txn.txid, arena, None) {
             Ok(casts) => casts,
@@ -80229,8 +80394,14 @@ pub(crate) fn instead_of_view_dml<'a>(
             let targets = &targets[..target_count];
             // A column the statement leaves out or writes as DEFAULT takes the
             // view column's default, as PostgreSQL's rewriter supplies it.
-            let defaults = match instead_of_view_defaults(storage, view_slot, &def, txn.txid, arena)
-            {
+            let defaults = match instead_of_view_defaults(
+                storage,
+                view_slot,
+                &def,
+                inherited.map_or(&[], |inherited| inherited.defaults),
+                txn.txid,
+                arena,
+            ) {
                 Ok(defaults) => defaults,
                 Err(error) => return sql_fail(error),
             };
@@ -80401,6 +80572,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 changed: affected,
                                 transitions: no_transitions,
                             },
+                            checks,
                         ) {
                             Ok(Ok(true)) => {}
                             Ok(Ok(false)) => continue,
@@ -80534,6 +80706,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 changed: affected,
                                 transitions: no_transitions,
                             },
+                            checks,
                         ) {
                             Ok(Ok(true)) => {}
                             Ok(Ok(false)) => continue,
@@ -80761,6 +80934,20 @@ pub(crate) fn instead_of_view_dml<'a>(
                         Ok(true) => {}
                         Ok(false) => continue,
                         Err(error) => return sql_fail(error),
+                    }
+                    if let Err(error) = enforce_view_check(
+                        checks,
+                        &def,
+                        new,
+                        ViewCheckContext {
+                            storage,
+                            txid: txn.txid,
+                            arena,
+                            params,
+                            seq_session,
+                        },
+                    ) {
+                        return sql_fail(error);
                     }
                     if !returning.is_empty() {
                         match emit_row_returning(
@@ -81176,6 +81363,7 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
     capture: &mut Option<&mut super::ReturningCapture<'_>>,
     progress: Option<&mut RowProgress>,
     position: ChangedRow,
+    checks: Option<ViewCheck<'a>>,
 ) -> Result<Result<bool, SqlError>, WireFull> {
     let seq_session = services.seq_session;
     let fired = match fire_view_row_trigger(
@@ -81195,6 +81383,20 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
     };
     if !fired {
         return Ok(Ok(false));
+    }
+    if let Err(error) = enforce_view_check(
+        checks,
+        definition,
+        values,
+        ViewCheckContext {
+            storage,
+            txid: txn.txid,
+            arena,
+            params,
+            seq_session,
+        },
+    ) {
+        return Ok(Err(error));
     }
     if !returning.is_empty() {
         match emit_row_returning(

@@ -870,9 +870,14 @@ impl Storage {
                     });
             }
         }
-        let mut selected = RoutineCallSelection::Absent;
-        let mut selected_procedure = false;
-        for candidate in candidates().filter(|candidate| competitive(candidate)) {
+        // `func_select_candidate`: when every unknown input resolved to one
+        // category, keep the candidates that match it; when none match, or
+        // a conflict left some input unresolved, all candidates stay.
+        let resolved = argument_oids
+            .iter()
+            .enumerate()
+            .all(|(index, actual)| *actual != oid::UNKNOWN || unknown_categories[index].is_some());
+        let matches_unknowns = |candidate: &Candidate| {
             let mapping = candidate
                 .mapping(
                     self,
@@ -882,7 +887,7 @@ impl Storage {
                     explicit_variadic,
                 )
                 .expect("admitted input mapping");
-            if argument_oids.iter().enumerate().any(|(index, actual)| {
+            !argument_oids.iter().enumerate().any(|(index, actual)| {
                 if *actual != oid::UNKNOWN {
                     return false;
                 }
@@ -891,15 +896,51 @@ impl Storage {
                 unknown_categories[index]
                     .is_some_and(|chosen| category(self, transaction, expected) != chosen)
                     || unknown_preferred[index] && !preferred_type(expected)
-            }) {
-                continue;
+            })
+        };
+        let filtered = resolved
+            && candidates()
+                .any(|candidate| competitive(&candidate) && matches_unknowns(&candidate));
+        let remaining = |candidate: &Candidate| {
+            competitive(candidate) && (!filtered || matches_unknowns(candidate))
+        };
+        let mut remaining_candidates = candidates().filter(|candidate| remaining(candidate));
+        let mut chosen = remaining_candidates.next();
+        if chosen.is_some() && remaining_candidates.next().is_some() {
+            chosen = None;
+            // Last gasp: with known and unknown inputs whose known types all
+            // agree, treat the unknowns as that type and accept a unique
+            // implicitly coercible candidate.
+            let mut known = argument_oids
+                .iter()
+                .copied()
+                .filter(|actual| *actual != oid::UNKNOWN);
+            if let Some(known_type) = known.next()
+                && known.all(|actual| actual == known_type)
+                && argument_oids.contains(&oid::UNKNOWN)
+            {
+                let assumed = [known_type; MAX_ROUTINE_ARGUMENTS];
+                let assumed = &assumed[..argument_oids.len()];
+                let mut coercible = candidates().filter(|candidate| {
+                    remaining(candidate)
+                        && candidate.accepts(
+                            self,
+                            transaction,
+                            argument_names,
+                            assumed,
+                            explicit_variadic,
+                        )
+                });
+                chosen = coercible.next().filter(|_| coercible.next().is_none());
             }
-            if selected != RoutineCallSelection::Absent {
+            if chosen.is_none() {
                 return RoutineCallSelection::Ambiguous;
             }
-            selected = candidate.selected();
-            selected_procedure = candidate.is_procedure;
         }
+        let (selected, selected_procedure) = chosen
+            .map_or((RoutineCallSelection::Absent, false), |candidate| {
+                (candidate.selected(), candidate.is_procedure)
+            });
         if selected != RoutineCallSelection::Absent
             && matches!(kind, RoutineCallKind::Procedure) != selected_procedure
         {

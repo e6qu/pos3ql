@@ -183,6 +183,26 @@ class DifferentialDiagnosticsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unterminated COPY data"):
             DIAGNOSTICS.copy_line_positions("COPY t FROM STDIN;\n", "corpus.sql")
 
+    def test_verbose_comparison_keeps_copy_context_lines_only(self):
+        stderr = (
+            "psql:c.sql:3: ERROR:  22P02: invalid input syntax for type integer: \"z\"\n"
+            "CONTEXT:  COPY ct, line 2, column a: \"z\"\n"
+            "LOCATION:  pg_strtoint32_safe, numutils.c:616\n"
+            "psql:c.sql:9: ERROR:  P0001: boom\n"
+            "CONTEXT:  PL/pgSQL function f() line 3 at RAISE\n"
+            "COPY ct, line 1: \"1\tx\"\n"
+            "LOCATION:  exec_stmt_raise, pl_exec.c:3911\n"
+            "psql:c.sql:12: ERROR:  P0001: plain\n"
+            "CONTEXT:  PL/pgSQL function g() line 2 at RAISE\n"
+        )
+        records = DIAGNOSTICS.normalize_diagnostics(
+            stderr, "verbose", {}, input_diagnostics="verbose")
+        self.assertEqual(records[0]["copy_context"], ['COPY ct, line 2, column a: "z"'])
+        self.assertEqual(records[1]["copy_context"], ['COPY ct, line 1: "1\tx"'])
+        self.assertNotIn("copy_context", records[2])
+        self.assertNotIn("copy_context", DIAGNOSTICS.normalize_diagnostics(
+            stderr, "sqlstate", {}, input_diagnostics="verbose")[0])
+
     def test_verbose_capture_keeps_state_comparison_separate_from_primary_text(self):
         first = "psql:corpus.sql:8: ERROR:  54000: memtable exhausted\n"
         changed = first.replace("memtable exhausted", "another primary message")
@@ -228,7 +248,7 @@ PGUSER=postgres
 PSQL=psql
 P3_PID=1
 REFERENCE_DATABASE=postgres
-REFERENCE_EXTENSION_CONTROL_ROOT=/oracle/extensions
+REFERENCE_PGOPTIONS='-c timezone=UTC -c extension_control_path=$system:/oracle/extensions'
 PGOPTIONS=
 server_alive() { return 0; }
 psql() {
@@ -267,7 +287,7 @@ psql() {
                         rows = stdout.splitlines()[1:]
                         self.assertEqual(
                             rows[0],
-                            "options=-c timezone=UTC -c extension_control_path=/oracle/extensions"
+                            "options=-c timezone=UTC -c extension_control_path=$system:/oracle/extensions"
                             if reference else "options=",
                         )
                         self.assertIn("-e", rows)
@@ -279,6 +299,32 @@ psql() {
                         self.assertEqual(record["line"], 8)
                         self.assertEqual(record["sqlstate"], "23505")
                         self.assertEqual("message" in record, diagnostics == "verbose")
+
+    def test_reference_options_escape_whitespace_instead_of_quoting(self):
+        for harness in ("ci_diff.sh", "differential.sh"):
+            with self.subTest(harness=harness):
+                source = (ROOT / "tests/external" / harness).read_text()
+                start = source.index("pgoptions_value() {")
+                end = source.index("\n}", start) + 2
+                definition = source[start:end]
+                start = source.index("REFERENCE_PGOPTIONS=")
+                end = source.index("\n", start)
+                assignment = source[start:end]
+                completed = subprocess.run(
+                    [
+                        "bash", "-c",
+                        "set -eu\n" + definition
+                        + '\nREFERENCE_EXTENSION_CONTROL_PATH="$1"\n' + assignment
+                        + '\nprintf %s "$REFERENCE_PGOPTIONS"',
+                        "test", "$system:/oracle/a b\\c\td",
+                    ],
+                    text=True, capture_output=True, check=True,
+                )
+                self.assertEqual(
+                    completed.stdout,
+                    "-c timezone=UTC -c extension_control_path="
+                    "$system:/oracle/a\\ b\\\\c\\\td",
+                )
 
     def test_both_harnesses_reject_a_failed_client_before_comparing_results(self):
         for harness in ("ci_diff.sh", "differential.sh"):

@@ -1322,10 +1322,6 @@ fn unsupported_system_columns_fail_loudly_and_tables_cannot_take_their_names() {
                 "SELECT s.xmin FROM st s",
                 "ERROR 0A000 system column \"xmin\" is not supported",
             ),
-            (
-                "SELECT tableoid FROM st",
-                "ERROR 0A000 system column \"tableoid\" is not supported",
-            ),
             // Views and subqueries have no system columns.
             (
                 "SELECT xmin FROM sv",
@@ -1357,6 +1353,15 @@ fn unsupported_system_columns_fail_loudly_and_tables_cannot_take_their_names() {
         assert_eq!(
             data_rows(&run_with(engine, budget, "SELECT ctid FROM sv")),
             ["1"]
+        );
+        // `tableoid` is provided: the oid of the row's table.
+        assert_eq!(
+            data_rows(&run_with(
+                engine,
+                budget,
+                "INSERT INTO st VALUES (1); SELECT tableoid::regclass, tableoid = 'st'::regclass FROM st"
+            )),
+            ["st|t"]
         );
     });
 }
@@ -1791,6 +1796,61 @@ fn data_change_subquery_constants_convert_before_rows_are_read() {
                     at + 1
                 )],
                 "{written}"
+            );
+        }
+    });
+}
+
+/// A missing column's error carries PostgreSQL's spelling suggestion from the
+/// failing query and the queries enclosing it, and a virtual generated
+/// column, PostgreSQL 18's default kind, refuses what PostgreSQL refuses.
+#[test]
+fn missing_columns_suggest_spellings_and_virtual_columns_follow_postgresql() {
+    with_engine("missing-column-suggestions", |engine, budget| {
+        run_with(
+            engine,
+            budget,
+            "CREATE TABLE t (abc int, xyz text, abe int); CREATE TABLE u (abc int, qqq int); \
+             CREATE TABLE vg (a int, b int GENERATED ALWAYS AS (a + 1))",
+        );
+        for (sql, expected) in [
+            (
+                "SELECT xyy FROM t",
+                "ERROR 42703 column \"xyy\" does not exist @8 hint: Perhaps you meant to \
+                 reference the column \"t.xyz\".",
+            ),
+            (
+                "SELECT abd FROM t",
+                "ERROR 42703 column \"abd\" does not exist @8 hint: Perhaps you meant to \
+                 reference the column \"t.abc\" or the column \"t.abe\".",
+            ),
+            (
+                "SELECT abf FROM t, u",
+                "ERROR 42703 column \"abf\" does not exist @8",
+            ),
+            (
+                "SELECT t.qqq FROM t, u",
+                "ERROR 42703 column t.qqq does not exist @8 hint: Perhaps you meant to \
+                 reference the column \"u.qqq\".",
+            ),
+            (
+                "SELECT (SELECT xyy FROM u) FROM t",
+                "ERROR 42703 column \"xyy\" does not exist @16 hint: Perhaps you meant to \
+                 reference the column \"t.xyz\".",
+            ),
+            (
+                "CREATE TABLE v (a int, b int GENERATED ALWAYS AS (a + 1) VIRTUAL UNIQUE)",
+                "ERROR 0A000 unique constraints on virtual generated columns are not supported",
+            ),
+            (
+                "CREATE INDEX ON vg (b)",
+                "ERROR 0A000 indexes on virtual generated columns are not supported",
+            ),
+        ] {
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, sql)),
+                [expected],
+                "{sql}"
             );
         }
     });

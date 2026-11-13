@@ -2676,9 +2676,11 @@ impl<'b> Responder<'b> {
                             m.u8(b'D');
                             m.cstr(detail.as_str());
                         }
-                        Some(crate::sql::error_position::AnalysisNote::Hint(hint))
-                            if analysis_hint.is_none()
-                                && diagnostic.as_ref().is_none_or(|d| d.hint.is_none()) =>
+                        Some(
+                            crate::sql::error_position::AnalysisNote::Hint(hint)
+                            | crate::sql::error_position::AnalysisNote::Suggestion(hint),
+                        ) if analysis_hint.is_none()
+                            && diagnostic.as_ref().is_none_or(|d| d.hint.is_none()) =>
                         {
                             m.u8(b'H');
                             m.cstr(hint.as_str());
@@ -3183,11 +3185,13 @@ mod tests {
             RecordField {
                 name: "id",
                 type_oid: oid::INT4,
+                type_mod: -1,
                 value: Datum::Int4(42),
             },
             RecordField {
                 name: "note",
                 type_oid: oid::TEXT,
+                type_mod: -1,
                 value: Datum::Null,
             },
         ];
@@ -3348,6 +3352,7 @@ mod tests {
         let fields = [RecordField {
             name: "kind",
             type_oid: oid::CHAR,
+            type_mod: -1,
             value: Datum::Char(0xff),
         }];
         let value = Datum::Record(&fields);
@@ -3368,6 +3373,7 @@ mod tests {
         let fields = [RecordField {
             name: "value",
             type_oid: oid::TEXT,
+            type_mod: -1,
             value: Datum::Text("quote\"and\\slash"),
         }];
         let value = Datum::Record(&fields);

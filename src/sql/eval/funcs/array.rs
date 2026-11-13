@@ -171,21 +171,32 @@ pub(crate) fn coerce_compatible_arguments<'a>(
 /// type or the typed inputs have none (their comparison reports the mismatch).
 /// Untyped literals alone resolve to `text`. Returns each input's declared
 /// type alongside, so callers convert exactly the untyped ones.
+/// Each argument's declared type OID, `unknown` for an untyped literal.
+pub(crate) fn declared_argument_oids<'a>(
+    args: &[&Expr<'a>],
+    arena: &'a crate::mem::arena::Arena,
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<&'a [i32], SqlError> {
+    let declared = arena
+        .alloc_slice_with(args.len(), |_| crate::sql::types::oid::UNKNOWN)
+        .map_err(|_| arena_full())?;
+    for (input, argument) in declared.iter_mut().zip(args) {
+        *input =
+            super::super::expression_type_identity(argument, row, hooks)?.routine_argument_oid();
+    }
+    Ok(declared)
+}
+
 pub(crate) fn common_argument_type<'a>(
     args: &[&Expr<'a>],
     arena: &'a crate::mem::arena::Arena,
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<(Option<ColType>, &'a [i32]), SqlError> {
+    let declared = declared_argument_oids(args, arena, row, hooks)?;
     let inputs = arena
-        .alloc_slice_with(args.len(), |_| (false, crate::sql::types::oid::UNKNOWN))
-        .map_err(|_| arena_full())?;
-    for (input, argument) in inputs.iter_mut().zip(args) {
-        input.1 =
-            super::super::expression_type_identity(argument, row, hooks)?.routine_argument_oid();
-    }
-    let declared = arena
-        .alloc_slice_with(args.len(), |index| inputs[index].1)
+        .alloc_slice_with(args.len(), |index| (false, declared[index]))
         .map_err(|_| arena_full())?;
     if declared
         .iter()

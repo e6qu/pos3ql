@@ -198,7 +198,7 @@ fn subscription_workers_share_foreground_admission_without_reserving_payload() {
             .row_work
             .lease::<u8>(config.row_work_bytes)
             .unwrap();
-        let error = worker.copy_line(&mut engine, &setup, b"1").unwrap_err();
+        let error = worker.copy_line(&mut engine, &setup, b"1", 1).unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert!(error.message.as_str().contains("row work pool exhausted"));
         worker.stop(&mut engine);
@@ -215,7 +215,7 @@ fn subscription_workers_share_foreground_admission_without_reserving_payload() {
         let setup = worker
             .start_copy_table(&mut engine, schema, table, &columns)
             .unwrap();
-        worker.copy_line(&mut engine, &setup, b"1").unwrap();
+        worker.copy_line(&mut engine, &setup, b"1", 1).unwrap();
         worker.finish_copy_table(&mut engine, &setup).unwrap();
         worker.finish_bootstrap(&mut engine, 41).unwrap();
     });

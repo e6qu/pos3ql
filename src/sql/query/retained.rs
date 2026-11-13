@@ -18,6 +18,15 @@ pub(crate) enum RetainedUse {
     Stream,
     Cursor,
 }
+
+/// What a statement-mode reader serves: a `SELECT` whose routine calls hand
+/// off row by row, or the source of `INSERT ... SELECT`, streamed to the
+/// write whatever its calls.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatementUse {
+    Handoff,
+    WriteSource,
+}
 use crate::storage::{
     CursorRow, MAX_COLUMNS, RowCursor, RowCursorBuffers, SpilledRowRepresentation, rowenc,
 };
@@ -1804,6 +1813,7 @@ fn appended_select<'a>(
             set_body: None,
             locking: &[],
             windows: &[],
+            written: crate::sql::ast::WrittenQuery::PLAIN,
         })
         .map_err(|_| arena_full())?;
     Ok(Some(&*wrapper))
@@ -1889,6 +1899,7 @@ pub(crate) fn set_query_select<'a>(
             set_body: Some(query.body),
             locking: query.locking,
             windows: &[],
+            written: crate::sql::ast::WrittenQuery::PLAIN,
         })
         .map(|select| &*select)
         .map_err(|_| arena_full())
@@ -2786,6 +2797,7 @@ impl<'a> RetainedSelect<'a> {
             responder,
             RetainedMode::Cursor,
             reader_use,
+            StatementUse::Handoff,
         )
     }
 
@@ -2797,6 +2809,48 @@ impl<'a> RetainedSelect<'a> {
         arena: &'a Arena,
         responder: &mut Responder<'_>,
     ) -> Result<Option<Self>, SqlError> {
+        Self::open_statement_for(
+            storage,
+            txid,
+            statement,
+            params,
+            arena,
+            responder,
+            StatementUse::Handoff,
+        )
+    }
+
+    /// A reader of an `INSERT ... SELECT` source, whatever its calls. A
+    /// single-table source the general executor reads through an index keeps
+    /// that path.
+    pub(crate) fn open_write_source(
+        storage: &Storage,
+        txid: u32,
+        statement: &'a Select<'a>,
+        params: &[Datum<'a>],
+        arena: &'a Arena,
+        responder: &mut Responder<'_>,
+    ) -> Result<Option<Self>, SqlError> {
+        Self::open_statement_for(
+            storage,
+            txid,
+            statement,
+            params,
+            arena,
+            responder,
+            StatementUse::WriteSource,
+        )
+    }
+
+    fn open_statement_for(
+        storage: &Storage,
+        txid: u32,
+        statement: &'a Select<'a>,
+        params: &[Datum<'a>],
+        arena: &'a Arena,
+        responder: &mut Responder<'_>,
+        statement_use: StatementUse,
+    ) -> Result<Option<Self>, SqlError> {
         let reader = RetainedSelect::open_mode(
             storage,
             txid,
@@ -2806,6 +2860,7 @@ impl<'a> RetainedSelect<'a> {
             responder,
             RetainedMode::Statement,
             RetainedUse::Stream,
+            statement_use,
         )?;
         // SAFETY: only one physical local table without policies, inheritance
         // or joins, a literal VALUES list, or a builtin function source reaches
@@ -2832,6 +2887,7 @@ impl<'a> RetainedSelect<'a> {
         responder: &mut Responder<'_>,
         mode: RetainedMode,
         reader_use: RetainedUse,
+        statement_use: StatementUse,
     ) -> Result<Option<Self>, SqlError> {
         // A stream or statement returns its rows once, in order: it sorts
         // them itself. A declared cursor keeps its own ordered path.
@@ -2839,6 +2895,10 @@ impl<'a> RetainedSelect<'a> {
             && (mode == RetainedMode::Statement || reader_use == RetainedUse::Stream);
         // Likewise it groups them itself.
         let groups_itself = mode == RetainedMode::Statement || reader_use == RetainedUse::Stream;
+        // A statement-mode SELECT is read here only for its routine calls;
+        // others keep the general executor's index access paths.
+        let handoff_only =
+            mode == RetainedMode::Statement && statement_use == StatementUse::Handoff;
         // Only a reader that returns its rows once runs subqueries before
         // them; a declared cursor or an appended query does not.
         let Some(sublinks) = statement_sublinks(statement, storage, txid, arena)? else {
@@ -2865,6 +2925,7 @@ impl<'a> RetainedSelect<'a> {
                 self_sorts,
                 groups_itself,
                 sublinks,
+                handoff_only,
             );
         }
         let from = statement.from.as_ref();
@@ -3072,6 +3133,7 @@ impl<'a> RetainedSelect<'a> {
             }
         };
         check_select_types(statement, &scope, storage, txid, arena, None)?;
+        super::check_key_types(statement, &scope, arena, storage, txid)?;
         check_select_constants(statement, arena, storage, txid)?;
         super::require_select_routine_execute(statement, &scope, arena, storage, txid)?;
         let locking = if locks {
@@ -3079,7 +3141,6 @@ impl<'a> RetainedSelect<'a> {
                 return Ok(None);
             }
             super::validate_locking(statement, storage, txid, arena)?;
-            super::check_key_types(statement, &scope, arena, storage, txid)?;
             arena
                 .alloc_slice_copy(statement.locking)
                 .map_err(|_| arena_full())?
@@ -3153,6 +3214,15 @@ impl<'a> RetainedSelect<'a> {
         let predicate = statement
             .where_clause
             .map(|predicate| {
+                let predicate = plan::fold_catalog_inputs(
+                    predicate,
+                    arena,
+                    params,
+                    &EvalHooks {
+                        catalog: Some(&catalog),
+                        ..super::super::eval::NO_HOOKS
+                    },
+                )?;
                 // A grouping filters its input as the general executor's
                 // scan does, with the same planning-time folding.
                 if mode == RetainedMode::Statement && aggregates.is_none() {
@@ -3191,7 +3261,7 @@ impl<'a> RetainedSelect<'a> {
         let predicate = predicate
             .map(|predicate| bind_expression(predicate, arena, binding_columns, None))
             .transpose()?;
-        if mode == RetainedMode::Statement
+        if handoff_only
             && !items.iter().any(|item| match item {
                 SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
                     super::super::eval::routine_input_handoff(expression, Some(&catalog))
@@ -3207,6 +3277,13 @@ impl<'a> RetainedSelect<'a> {
         {
             // Binding can prove a cast/operator cannot suspend. Keep such
             // queries on the general executor's existing index access paths.
+            return Ok(None);
+        }
+        if statement_use == StatementUse::WriteSource
+            && table.is_some()
+            && super::scan::index_access_plan(storage, &scope, txid, statement.where_clause, arena)?
+                .is_some()
+        {
             return Ok(None);
         }
         let bounds = RowBounds::Unstarted {
@@ -3271,6 +3348,7 @@ impl<'a> RetainedSelect<'a> {
                     responder,
                     RetainedMode::Branch,
                     RetainedUse::Stream,
+                    StatementUse::Handoff,
                 )?
                 else {
                     return Ok(None);
@@ -3405,6 +3483,7 @@ impl<'a> RetainedSelect<'a> {
         self_sorts: bool,
         groups_itself: bool,
         sublinks: &'a [&'a Expr<'a>],
+        handoff_only: bool,
     ) -> Result<Option<Self>, SqlError> {
         let Some((scope, shape, statement, aggregates)) = retained_join_scope(
             storage,
@@ -3495,6 +3574,15 @@ impl<'a> RetainedSelect<'a> {
         let predicate = statement
             .where_clause
             .map(|predicate| {
+                let predicate = plan::fold_catalog_inputs(
+                    predicate,
+                    arena,
+                    params,
+                    &EvalHooks {
+                        catalog: Some(&catalog),
+                        ..super::super::eval::NO_HOOKS
+                    },
+                )?;
                 // A grouping filters its input as the general executor's
                 // scan does, with the same planning-time folding.
                 if mode == RetainedMode::Statement && aggregates.is_none() {
@@ -3532,7 +3620,7 @@ impl<'a> RetainedSelect<'a> {
         let predicate = predicate
             .map(|predicate| bind_expression(predicate, arena, binding_columns, None))
             .transpose()?;
-        if mode == RetainedMode::Statement
+        if handoff_only
             && !items.iter().any(|item| match item {
                 SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
                     super::super::eval::routine_input_handoff(expression, Some(&catalog))

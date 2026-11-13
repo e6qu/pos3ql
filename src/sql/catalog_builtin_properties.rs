@@ -1,4 +1,6 @@
-//! Builtin safety metadata queried from PostgreSQL 18.6 (Homebrew).
+//! Builtin safety metadata queried from PostgreSQL 18.6 (Homebrew). Routines
+//! initdb creates after the platform collations carry the pinned CI image's
+//! OIDs, 406 below Homebrew's (see `catalog::DSNOWBALL_INIT_OID`).
 //! Full routine-query SQL SHA256: 9a2acb1f1c877228c99717fdc27da8c8bcbb4963e97ab31a03c388510ab14cb4
 //! Full routine JSON SHA256: f8e3b1cfb54af43d88f32eae955653b5ea5b51f631cf454781fc46a39b2c7ec1
 //! This metadata classifies expressions; it does not add executable routines.
@@ -2249,8 +2251,8 @@ pub(super) const ROUTINES: &[BuiltinRoutine] = &[
     BuiltinRoutine { oid: 228, name: "dround", arguments: "701", argument_count: 1, volatile: false },
     BuiltinRoutine { oid: 3725, name: "dsimple_init", arguments: "2281", argument_count: 1, volatile: false },
     BuiltinRoutine { oid: 3726, name: "dsimple_lexize", arguments: "2281 2281 2281 2281", argument_count: 4, volatile: false },
-    BuiltinRoutine { oid: 13638, name: "dsnowball_init", arguments: "2281", argument_count: 1, volatile: true },
-    BuiltinRoutine { oid: 13639, name: "dsnowball_lexize", arguments: "2281 2281 2281 2281", argument_count: 4, volatile: true },
+    BuiltinRoutine { oid: 13232, name: "dsnowball_init", arguments: "2281", argument_count: 1, volatile: true },
+    BuiltinRoutine { oid: 13233, name: "dsnowball_lexize", arguments: "2281 2281 2281 2281", argument_count: 4, volatile: true },
     BuiltinRoutine { oid: 230, name: "dsqrt", arguments: "701", argument_count: 1, volatile: false },
     BuiltinRoutine { oid: 3728, name: "dsynonym_init", arguments: "2281", argument_count: 1, volatile: false },
     BuiltinRoutine { oid: 3729, name: "dsynonym_lexize", arguments: "2281 2281 2281 2281", argument_count: 4, volatile: false },
@@ -4073,9 +4075,9 @@ pub(super) const ROUTINES: &[BuiltinRoutine] = &[
     BuiltinRoutine { oid: 1610, name: "pi", arguments: "", argument_count: 0, volatile: false },
     BuiltinRoutine { oid: 3751, name: "plainto_tsquery", arguments: "25", argument_count: 1, volatile: false },
     BuiltinRoutine { oid: 3747, name: "plainto_tsquery", arguments: "3734 25", argument_count: 2, volatile: false },
-    BuiltinRoutine { oid: 14050, name: "plpgsql_call_handler", arguments: "", argument_count: 0, volatile: true },
-    BuiltinRoutine { oid: 14051, name: "plpgsql_inline_handler", arguments: "2281", argument_count: 1, volatile: true },
-    BuiltinRoutine { oid: 14052, name: "plpgsql_validator", arguments: "26", argument_count: 1, volatile: true },
+    BuiltinRoutine { oid: 13644, name: "plpgsql_call_handler", arguments: "", argument_count: 0, volatile: true },
+    BuiltinRoutine { oid: 13645, name: "plpgsql_inline_handler", arguments: "2281", argument_count: 1, volatile: true },
+    BuiltinRoutine { oid: 13646, name: "plpgsql_validator", arguments: "26", argument_count: 1, volatile: true },
     BuiltinRoutine { oid: 1532, name: "point", arguments: "601", argument_count: 1, volatile: false },
     BuiltinRoutine { oid: 1534, name: "point", arguments: "603", argument_count: 1, volatile: false },
     BuiltinRoutine { oid: 1540, name: "point", arguments: "604", argument_count: 1, volatile: false },
@@ -8390,9 +8392,9 @@ pub(super) const ROUTINE_OIDS: &[(i32, usize)] = &[
     (6428, 3289),
     (6429, 3290),
     (6430, 3291),
-    (13638, 661),
-    (13639, 662),
-    (14050, 2485),
-    (14051, 2486),
-    (14052, 2487),
+    (13232, 661),
+    (13233, 662),
+    (13644, 2485),
+    (13645, 2486),
+    (13646, 2487),
 ];

@@ -115,10 +115,13 @@ pub(crate) struct Annotation {
 pub(crate) enum AnalysisNote {
     Detail(crate::util::StackStr<NOTE_BYTES>),
     Hint(crate::util::StackStr<NOTE_BYTES>),
+    /// A missing column's spelling suggestion: a later search over more
+    /// enclosing queries replaces it.
+    Suggestion(crate::util::StackStr<NOTE_BYTES>),
 }
 
 /// Two quoted identifiers of `NAMEDATALEN - 1` bytes plus the wording.
-const NOTE_BYTES: usize = 2 * crate::sql::lexer::MAX_IDENTIFIER_BYTES + 128;
+pub(crate) const NOTE_BYTES: usize = 2 * crate::sql::lexer::MAX_IDENTIFIER_BYTES + 128;
 
 /// Attaches a computed DETAIL to `error`.
 pub(crate) fn with_detail(error: SqlError, detail: core::fmt::Arguments<'_>) -> SqlError {
@@ -128,6 +131,58 @@ pub(crate) fn with_detail(error: SqlError, detail: core::fmt::Arguments<'_>) -> 
 /// Attaches a computed HINT to `error`.
 pub(crate) fn with_computed_hint(error: SqlError, hint: core::fmt::Arguments<'_>) -> SqlError {
     note(error, AnalysisNote::Hint(note_text(hint)))
+}
+
+/// Attaches PostgreSQL's spelling suggestion for a missing column to
+/// `error`, replacing an earlier suggestion; an explanation already attached
+/// (why an existing column is out of reach) stays.
+pub(crate) fn with_column_suggestion(
+    error: SqlError,
+    suggestion: &crate::sql::column_suggestion::ColumnSuggestion<'_>,
+) -> SqlError {
+    if error.sqlstate.as_str() != crate::sql::eval::sqlstate::UNDEFINED_COLUMN
+        || error.sqlstate.internal_control().is_some()
+    {
+        return error;
+    }
+    let message_hash = message_hash(&error.message);
+    PENDING.with(|pending| {
+        let known = pending
+            .get()
+            .filter(|known| known.sqlstate == error.sqlstate && known.message_hash == message_hash);
+        if known.is_some_and(|known| {
+            matches!(
+                known.note,
+                Some(AnalysisNote::Detail(_) | AnalysisNote::Hint(_))
+            ) || known.hint.is_some()
+        }) {
+            return;
+        }
+        pending.set(Some(Pending {
+            sqlstate: error.sqlstate,
+            message_hash,
+            position: known.and_then(|known| known.position),
+            hint: None,
+            note: {
+                let mut suggestion = *suggestion;
+                crate::sql::column_suggestion::offer_set_branches(&mut suggestion);
+                suggestion.hint().map(AnalysisNote::Suggestion)
+            },
+        }))
+    });
+    error
+}
+
+/// Whether `error` already carries a detail, hint or suggestion.
+fn has_pending_note(error: &SqlError) -> bool {
+    let message_hash = message_hash(&error.message);
+    PENDING.with(|pending| {
+        pending.get().is_some_and(|known| {
+            known.sqlstate == error.sqlstate
+                && known.message_hash == message_hash
+                && (known.note.is_some() || known.hint.is_some())
+        })
+    })
 }
 
 fn note_text(text: core::fmt::Arguments<'_>) -> crate::util::StackStr<NOTE_BYTES> {
@@ -158,6 +213,8 @@ fn note(error: SqlError, note: AnalysisNote) -> SqlError {
 }
 
 const FUNCTION_HINT: &str = "No function matches the given name and argument types. You might need to add explicit type casts.";
+const AMBIGUOUS_FUNCTION_HINT: &str =
+    "Could not choose a best candidate function. You might need to add explicit type casts.";
 const BINARY_OPERATOR_HINT: &str = "No operator matches the given name and argument types. You might need to add explicit type casts.";
 const AMBIGUOUS_OPERATOR_HINT: &str =
     "Could not choose a best candidate operator. You might need to add explicit type casts.";
@@ -545,6 +602,15 @@ pub(crate) fn with_hint(error: SqlError, hint: &'static str) -> SqlError {
     error
 }
 
+/// The one-based character position of `subject`, a slice of the client's
+/// statement, for a notice that points at it; `None` inside a routine's
+/// stored text.
+pub(crate) fn client_position(subject: &str) -> Option<usize> {
+    locate(subject)
+        .filter(|(_, source)| !source.internal)
+        .map(|(at, source)| character_position(source, at))
+}
+
 /// Positions `error` where the parser recorded `position`.
 pub(crate) fn at_source_position(
     error: SqlError,
@@ -647,6 +713,22 @@ pub(crate) fn expression_error(
                 }
             }
         }
+        Expr::Call {
+            name,
+            source_position,
+            ..
+        } if state == sqlstate::AMBIGUOUS_FUNCTION
+            && message.starts_with("function ")
+            && message.ends_with(") is not unique") =>
+        {
+            match source_position.get() {
+                Some(at) => annotated(error, Some(at), AMBIGUOUS_FUNCTION_HINT),
+                None => {
+                    let error = at_subject(error, name);
+                    annotated(error, None, AMBIGUOUS_FUNCTION_HINT)
+                }
+            }
+        }
         Expr::Binary {
             source_position, ..
         } if state == sqlstate::UNDEFINED_FUNCTION && message.starts_with("operator ") => {
@@ -663,6 +745,48 @@ pub(crate) fn expression_error(
             source_position, ..
         } if state == sqlstate::UNDEFINED_FUNCTION && message.starts_with("operator ") => {
             annotated(error, source_position.get(), UNARY_OPERATOR_HINT)
+        }
+        Expr::Param(_) if state == sqlstate::UNDEFINED_PARAMETER => {
+            at_expression(error, expression)
+        }
+        // A named row type without the field is reported where the row got
+        // its type: a cast's `::`, or its literal; a cast to `record`
+        // changes nothing.
+        Expr::Field { base, .. }
+            if state == sqlstate::UNDEFINED_COLUMN
+                && message.contains("\" not found in data type ") =>
+        {
+            let mut typed = *base;
+            while let Expr::Cast {
+                operand, type_name, ..
+            } = typed
+                && type_name.eq_ignore_ascii_case("record")
+            {
+                typed = operand;
+            }
+            match typed {
+                Expr::Cast {
+                    operand: Expr::Str(literal),
+                    ..
+                } => at_subject(error, literal),
+                Expr::Cast {
+                    source_position, ..
+                } => at_parsed_offset(error, source_position.get()),
+                _ => at_expression(error, typed),
+            }
+        }
+        // A field selection PostgreSQL cannot resolve is reported at its
+        // base expression.
+        Expr::Field { base, field }
+            if (state == sqlstate::WRONG_OBJECT_TYPE
+                && message.starts_with("column notation ."))
+                || (state == sqlstate::UNDEFINED_COLUMN
+                    && (message.starts_with("could not identify column ")
+                        || message.ends_with(
+                            crate::stack_format!(80, ".{} does not exist", field).as_str(),
+                        ))) =>
+        {
+            at_expression(error, base)
         }
         _ => error,
     }
@@ -777,6 +901,17 @@ pub(crate) fn with_copied_source<R>(written: &str, copy: &str, run: impl FnOnce(
 }
 
 /// Runs `run` positioning relation and column lookups in the installed
+/// statement text, for a utility statement that analyses queries written
+/// inside it (`CREATE RULE`).
+pub(crate) fn with_analysis<R>(run: impl FnOnce() -> R) -> R {
+    let _scope = SourceScope(
+        SOURCE.with(Cell::get),
+        ANALYZED.with(|flag| flag.replace(true)),
+    );
+    run()
+}
+
+/// Runs `run` positioning relation and column lookups in the installed
 /// statement text, for queries parsed from `text`, a slice of it written
 /// inside a utility statement (a `CREATE FUNCTION ... BEGIN ATOMIC` body):
 /// their parsed offsets count from the slice's start.
@@ -845,9 +980,7 @@ pub(crate) fn take_annotation(sqlstate: &str, message: &dyn core::fmt::Display) 
 /// column and a missing or invalid FROM-clause entry.
 pub(crate) fn column_reference(error: SqlError, qualifier: Option<&str>, name: &str) -> SqlError {
     use crate::sql::eval::sqlstate;
-    // PL/pgSQL reports a record variable's missing field without a position.
-    let message = error.message.as_str();
-    if message.starts_with("record \"") && message.contains("\" has no field \"") {
+    if is_record_field_failure(&error) {
         return error;
     }
     if matches!(
@@ -857,10 +990,29 @@ pub(crate) fn column_reference(error: SqlError, qualifier: Option<&str>, name: &
             | sqlstate::AMBIGUOUS_COLUMN
             | sqlstate::GROUPING_ERROR
     ) {
-        at_reference(error, qualifier.unwrap_or(name))
+        let error = at_reference(error, qualifier.unwrap_or(name));
+        // A reference no FROM item answers still searches the earlier
+        // branches of an enclosing set operation for a suggestion.
+        if crate::sql::column_suggestion::set_branches_in_reach() && !has_pending_note(&error) {
+            with_column_suggestion(
+                error,
+                &crate::sql::column_suggestion::ColumnSuggestion::new(qualifier, name),
+            )
+        } else {
+            error
+        }
     } else {
         error
     }
+}
+
+/// A procedural record's missing field: PostgreSQL resolves the field while
+/// planning the expression that names it and reports it without a position.
+pub(crate) fn is_record_field_failure(error: &SqlError) -> bool {
+    let message = error.message.as_str();
+    error.sqlstate == crate::sql::eval::sqlstate::UNDEFINED_COLUMN
+        && message.starts_with("record \"")
+        && message.contains("\" has no field \"")
 }
 
 /// A cast's type modifier is applied after the constant's input, when the

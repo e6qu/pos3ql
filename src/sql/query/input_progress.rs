@@ -1448,6 +1448,7 @@ mod tests {
                         .alloc_slice_copy(&[crate::sql::types::RecordField {
                             name: field,
                             type_oid: crate::sql::types::oid::TEXT,
+                            type_mod: -1,
                             value: Datum::Text(text),
                         }])
                         .unwrap();

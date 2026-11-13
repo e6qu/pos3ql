@@ -369,7 +369,7 @@ impl Storage {
                             definition.created_at,
                         )?;
                     }
-                    let mut builtin_seen = 0u8;
+                    let mut builtin_seen = 0u128;
                     for definition in text.text_search_objects.iter().filter(|root| {
                         root.ddl_state != CatalogDdlState::Absent && Some(root.database) == database
                     }) {
@@ -383,7 +383,7 @@ impl Storage {
                                 created.created_at(),
                             )?,
                             TextSearchIdentity::Builtin { ordinal, .. } => {
-                                let bit = 1 << ordinal;
+                                let bit = 1u128 << ordinal;
                                 if builtin_seen & bit != 0 {
                                     return Err(sql_err!(
                                         sqlstate::DATA_EXCEPTION,
@@ -909,7 +909,7 @@ mod tests {
             oid: 0,
             init: 0,
             lexize: 3726,
-            behavior: TextSearchDictionaryBehavior::Simple { accept: true },
+            kind: TextSearchTemplateKind::Simple,
         };
         storage.catalog_sequence.observe(MAX_CATALOG_CREATION);
         crate::mem::guard::forbid_alloc(|| {
@@ -980,7 +980,7 @@ mod tests {
             oid: 660_000_001,
             init: 0,
             lexize: 3726,
-            behavior: TextSearchDictionaryBehavior::Simple { accept: true },
+            kind: TextSearchTemplateKind::Simple,
         };
         crate::mem::guard::forbid_alloc(|| {
             for birth in [0, MAX_CATALOG_CREATION + 1, u64::MAX] {

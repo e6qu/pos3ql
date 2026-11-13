@@ -250,6 +250,7 @@ impl SqlResult {
                         .alloc_slice_with(values.len(), |index| crate::sql::types::RecordField {
                             name: "",
                             type_oid: values[index].type_oid(),
+                            type_mod: -1,
                             value: values[index],
                         })
                         .map_err(|_| query::arena_full_pub())?;

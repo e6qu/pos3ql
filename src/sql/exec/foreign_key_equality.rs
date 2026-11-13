@@ -27,9 +27,8 @@ pub(crate) enum KeyEquality {
 
 /// The input type of a type's default btree operator class, or `None` for
 /// the polymorphic classes (arrays, enums, ranges, multiranges and records),
-/// which accept only the referenced type itself here. PostgreSQL's `record`
-/// class also accepts a different composite type; that pair is rejected
-/// with `0A000` (see [`dissimilar_composites`]).
+/// which accept only the referenced type itself here, except that the
+/// `record` class compares two composite types field by field.
 pub(crate) fn operator_class_input(referenced: ColType) -> Option<ColType> {
     match referenced {
         ColType::Varchar => Some(ColType::Text),
@@ -71,7 +70,12 @@ fn cross_type_family(value: ColType) -> Option<u8> {
 /// `referencing` and a referenced column of base type `referenced`, or
 /// `None` when the key cannot be implemented with built-in operators.
 pub(crate) fn key_equality(referencing: ColType, referenced: ColType) -> Option<KeyEquality> {
-    if referencing == referenced {
+    if referencing == referenced
+        || matches!(
+            (referencing, referenced),
+            (ColType::Composite(_), ColType::Composite(_))
+        )
+    {
         return Some(KeyEquality::Direct);
     }
     let input = operator_class_input(referenced)?;
@@ -87,15 +91,6 @@ pub(crate) fn key_equality(referencing: ColType, referenced: ColType) -> Option<
     crate::sql::catalog::builtin_cast_context(from, to)
         .is_some_and(crate::storage::CastContext::permits_implicit)
         .then_some(KeyEquality::Cast(input))
-}
-
-/// Two different composite types, which PostgreSQL compares field by field
-/// and pos3ql does not implement as a key.
-pub(crate) fn dissimilar_composites(referencing: ColType, referenced: ColType) -> bool {
-    matches!(
-        (referencing, referenced),
-        (ColType::Composite(left), ColType::Composite(right)) if left != right
-    )
 }
 
 /// The resolved comparison of a stored key; DDL rejected every other pair.
@@ -244,6 +239,14 @@ fn btree_equality_operator(left: ColType, right: ColType) -> Option<i32> {
     BTREE_EQUALITY_OPERATORS
         .iter()
         .find_map(|&(operator, l, r)| (l == left && r == right).then_some(operator))
+}
+
+/// The left and right input types of the catalogued btree equality
+/// `operator`.
+pub(crate) fn operator_inputs(operator: i32) -> Option<(i32, i32)> {
+    BTREE_EQUALITY_OPERATORS
+        .iter()
+        .find_map(|&(candidate, left, right)| (candidate == operator).then_some((left, right)))
 }
 
 /// PostgreSQL's `conpfeqop`, `conppeqop` and `conffeqop` entries for one key

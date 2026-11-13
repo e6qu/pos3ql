@@ -165,6 +165,7 @@ pub(super) struct ColumnClauses<'a> {
     pub(super) default: Option<&'a Expr<'a>>,
     pub(super) default_text: Option<&'a str>,
     pub(super) generated_text: Option<&'a str>,
+    pub(super) generated_kind: crate::storage::Generation,
     pub(super) identity: Option<crate::sql::ast::IdentitySpec<'a>>,
 }
 
@@ -1083,13 +1084,9 @@ impl<'a> Parser<'a> {
             }
             let name = self.col_ident("text search option name")?;
             self.expect_op("=")?;
+            // Repeated options reach the template's init routine, which
+            // reports them as PostgreSQL's do.
             let value = self.database_option_value("text search option value is required")?;
-            if options[..count]
-                .iter()
-                .any(|option| option.name.eq_ignore_ascii_case(name))
-            {
-                return Err(self.err_here("duplicate text search option"));
-            }
             options[count] = TextSearchOption { name, value };
             count += 1;
             if !self.eat_op(",")? {
@@ -1101,7 +1098,7 @@ impl<'a> Parser<'a> {
 
     fn create_text_search(&mut self) -> Result<Stmt<'a>, ParseError> {
         if self.eat_ident("parser")? {
-            let name = self.any_qual_name("text search parser name")?;
+            let name = self.any_name("text search parser name")?;
             self.expect_op("(")?;
             let mut start = None;
             let mut gettoken = None;
@@ -1143,7 +1140,7 @@ impl<'a> Parser<'a> {
             }));
         }
         if self.eat_ident("template")? {
-            let name = self.any_qual_name("text search template name")?;
+            let name = self.any_name("text search template name")?;
             self.expect_op("(")?;
             let mut init = None;
             let mut lexize = None;
@@ -1174,7 +1171,7 @@ impl<'a> Parser<'a> {
             }));
         }
         if self.eat_ident("dictionary")? {
-            let name = self.any_qual_name("text search dictionary name")?;
+            let name = self.any_name("text search dictionary name")?;
             self.expect_op("(")?;
             self.expect_ident("template")?;
             self.expect_op("=")?;
@@ -1194,7 +1191,7 @@ impl<'a> Parser<'a> {
             ));
         }
         if self.eat_ident("configuration")? {
-            let name = self.any_qual_name("text search configuration name")?;
+            let name = self.any_name("text search configuration name")?;
             self.expect_op("(")?;
             let source = if self.eat_ident("parser")? {
                 self.expect_op("=")?;
@@ -3726,9 +3723,18 @@ impl<'a> Parser<'a> {
                 );
             }
         }
+        // The condition stays a slice of the statement, so its analysis
+        // errors carry their position.
         let when = self
             .eat_ident("when")?
-            .then(|| self.check_text())
+            .then(|| {
+                self.expect_op("(")?;
+                let start = self.peek_at;
+                let _ = self.expression(0)?;
+                let text = self.text[start..self.peek_at].trim_end();
+                self.expect_op(")")?;
+                Ok(text)
+            })
             .transpose()?;
         if when.is_some() && matches!(timing, TriggerTiming::InsteadOf) {
             return Err(self.err_here("INSTEAD OF triggers cannot have WHEN conditions"));
@@ -5567,8 +5573,14 @@ impl<'a> Parser<'a> {
                 let _ = self.expression(0)?;
                 let text = self.text[start..self.peek_at].trim_end();
                 self.expect_op(")")?;
-                self.expect_ident("stored")?;
-                return Ok(ColGen::Generated(text));
+                // PostgreSQL 18 makes VIRTUAL the default.
+                let kind = if self.eat_ident("stored")? {
+                    crate::storage::Generation::Stored
+                } else {
+                    let _ = self.eat_ident("virtual")?;
+                    crate::storage::Generation::Virtual
+                };
+                return Ok(ColGen::Generated(text, kind));
             }
             true
         } else {
@@ -7363,7 +7375,14 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
-            let name = self.any_qual_name(kind.noun())?;
+            let mut names = ArenaList::new(self.arena);
+            loop {
+                let name = self.any_name(kind.noun())?;
+                self.push(&mut names, name)?;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
             let cascade = if self.eat_ident("cascade")? {
                 true
             } else {
@@ -7372,7 +7391,7 @@ impl<'a> Parser<'a> {
             };
             return Ok(Stmt::DropTextSearch {
                 kind,
-                name,
+                names: names.as_slice(),
                 if_exists,
                 cascade,
             });
@@ -8629,6 +8648,7 @@ impl<'a> Parser<'a> {
                     default: clauses.default,
                     default_text: clauses.default_text,
                     generated_text: clauses.generated_text,
+                    generated_kind: clauses.generated_kind,
                     identity: clauses.identity,
                 },
             )?;
@@ -8911,6 +8931,7 @@ impl<'a> Parser<'a> {
             default: None,
             default_text: None,
             generated_text: None,
+            generated_kind: crate::storage::Generation::Virtual,
             identity: None,
         };
         let mut null_clause = None;
@@ -9009,8 +9030,9 @@ impl<'a> Parser<'a> {
                 self.push(constraints, constraint)?;
             } else if self.eat_ident("generated")? {
                 match self.generated_clause()? {
-                    crate::sql::ast::ColGen::Generated(text) => {
+                    crate::sql::ast::ColGen::Generated(text, kind) => {
                         clauses.generated_text = Some(text);
+                        clauses.generated_kind = kind;
                     }
                     crate::sql::ast::ColGen::Identity(spec) => clauses.identity = Some(spec),
                 }
@@ -9443,17 +9465,36 @@ impl<'a> Parser<'a> {
         };
         let mut on_delete = FkAction::NoAction;
         let mut on_update = FkAction::NoAction;
-        while self.eat_ident("on")? {
+        let mut delete_set_columns: &'a [&'a str] = &[];
+        while self.peeked == Tok::Ident("on") {
+            let on_at = self.peek_at;
+            self.advance()?;
             let is_delete = if self.eat_ident("delete")? {
                 true
             } else {
                 self.expect_ident("update")?;
                 false
             };
-            let action = self.fk_action()?;
+            let (action, set_columns) = self.fk_action()?;
             if is_delete {
                 on_delete = action;
+                delete_set_columns = set_columns;
             } else {
+                if !set_columns.is_empty() {
+                    return Err(ParseError {
+                        at: on_at,
+                        message: crate::util::StackStr::from_str(if action == FkAction::SetNull {
+                            "a column list with SET NULL is only supported for ON DELETE actions"
+                        } else {
+                            "a column list with SET DEFAULT is only supported for ON DELETE actions"
+                        }),
+                        sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                        cursor: Some(on_at),
+                        hint: None,
+                        near: None,
+                        detail: None,
+                    });
+                }
                 on_update = action;
             }
         }
@@ -9473,6 +9514,7 @@ impl<'a> Parser<'a> {
             parent,
             parent_cols,
             on_delete,
+            delete_set_columns,
             on_update,
             timing,
             validation,
@@ -9609,21 +9651,29 @@ impl<'a> Parser<'a> {
         Ok(self.constraint_attributes(rules)?.timing)
     }
 
-    fn fk_action(&mut self) -> Result<FkAction, ParseError> {
+    /// A referential action, with the column list `SET NULL` and `SET
+    /// DEFAULT` may name.
+    fn fk_action(&mut self) -> Result<(FkAction, &'a [&'a str]), ParseError> {
         if self.eat_ident("no")? {
             self.expect_ident("action")?;
-            Ok(FkAction::NoAction)
+            Ok((FkAction::NoAction, &[]))
         } else if self.eat_ident("restrict")? {
-            Ok(FkAction::Restrict)
+            Ok((FkAction::Restrict, &[]))
         } else if self.eat_ident("cascade")? {
-            Ok(FkAction::Cascade)
+            Ok((FkAction::Cascade, &[]))
         } else if self.eat_ident("set")? {
-            if self.eat_ident("null")? {
-                Ok(FkAction::SetNull)
+            let action = if self.eat_ident("null")? {
+                FkAction::SetNull
             } else {
                 self.expect_ident("default")?;
-                Ok(FkAction::SetDefault)
-            }
+                FkAction::SetDefault
+            };
+            let columns = if self.peeked == Tok::Op("(") {
+                self.column_name_list()?
+            } else {
+                &[]
+            };
+            Ok((action, columns))
         } else {
             Err(self.syntax_error_here())
         }

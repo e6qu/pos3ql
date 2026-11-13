@@ -105,6 +105,14 @@ REFERENCE_EXTENSION_CONTROL_ROOT=${POS3QL_REFERENCE_EXTENSION_CONTROL_PATH:-$PWD
 # contrib's postgres_fdw is installed), then the test packages.
 EXTENSION_CONTROL_PATH="\$system:$EXTENSION_CONTROL_ROOT"
 REFERENCE_EXTENSION_CONTROL_PATH="\$system:$REFERENCE_EXTENSION_CONTROL_ROOT"
+# The server splits PGOPTIONS on whitespace and honours only backslash
+# escapes, so quotes would become part of a value.
+pgoptions_value() {
+  local value=${1//\\/\\\\}
+  value=${value// /\\ }
+  printf '%s' "${value//$'\t'/\\$'\t'}"
+}
+REFERENCE_PGOPTIONS="-c timezone=UTC -c extension_control_path=$(pgoptions_value "$REFERENCE_EXTENSION_CONTROL_PATH")"
 
 PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); echo "PASS: $1"; }
@@ -606,6 +614,44 @@ else
   bad "foreign procedural subtransaction cleanup"
   cat "$WORK/foreign_subtransaction_reference.out" "$WORK/foreign_subtransaction_pos3ql.out"
 fi
+# The same remote table is a plain partition in PostgreSQL and a foreign
+# partition in pos3ql.
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -q -v ON_ERROR_STOP=1 \
+  -c 'DROP TABLE IF EXISTS public.pos3ql_fdw_mixed' \
+  -c 'CREATE TABLE public.pos3ql_fdw_mixed (id integer, note text)' \
+  > "$WORK/foreign_mixed_setup.out" 2>&1
+psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -q -v ON_ERROR_STOP=1 \
+  -c 'IMPORT FOREIGN SCHEMA public LIMIT TO (pos3ql_fdw_mixed) FROM SERVER reference_server INTO public' \
+  >> "$WORK/foreign_mixed_setup.out" 2>&1
+for side in reference pos3ql; do
+  if [[ $side == reference ]]; then host=$PGHOST port=$PGPORT; else host=127.0.0.1 port=$P3_PORT; fi
+  psql -h "$host" -p "$port" -U "$PGUSER" -d postgres -X -Atq -F '|' \
+    -v ON_ERROR_STOP=1 -f "$EXT/foreign-row-progress.sql" \
+    > "$WORK/foreign_row_progress_$side.out" 2>&1 || echo "status $?" >> "$WORK/foreign_row_progress_$side.out"
+done
+# The reference must run the whole script: no error and no failed status.
+if diff -u "$WORK/foreign_row_progress_reference.out" "$WORK/foreign_row_progress_pos3ql.out" \
+  && ! grep -Eq '^(status |psql:.*ERROR)' "$WORK/foreign_row_progress_reference.out"; then
+  ok "foreign writes keep changed rows across routine calls"
+else
+  bad "foreign write row progress"
+fi
+# PostgreSQL refuses MERGE when a result relation is a foreign partition.
+foreign_mixed_merge=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -q 2>&1 <<'SQL'
+BEGIN;
+CREATE TABLE fdw_merge_parent (id integer, note text) PARTITION BY RANGE (id);
+ALTER TABLE fdw_merge_parent ATTACH PARTITION pos3ql_fdw_mixed FOR VALUES FROM (0) TO (2000);
+MERGE INTO fdw_merge_parent USING (VALUES (1)) v(x) ON id = x
+  WHEN MATCHED THEN UPDATE SET note = 'm';
+ROLLBACK;
+SQL
+)
+if [[ "$foreign_mixed_merge" == *'ERROR:  cannot execute MERGE on relation "pos3ql_fdw_mixed"'*'DETAIL:  This operation is not supported for foreign tables.'* ]]; then
+  ok "MERGE over a foreign partition fails as in PostgreSQL"
+else
+  bad "MERGE over a foreign partition"
+  printf '%s\n' "$foreign_mixed_merge"
+fi
 cat > "$WORK/foreign_merge.sql" <<'SQL'
 BEGIN;
 SAVEPOINT outer_foreign_merge;
@@ -885,7 +931,7 @@ psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 \
   -c 'DROP EXTENSION IF EXISTS pos3ql_ext CASCADE; DROP EXTENSION IF EXISTS pos3ql_base CASCADE; DROP SCHEMA IF EXISTS extension_dump CASCADE' \
   > "$WORK/extension_reference_clean.out" 2>&1
-PGOPTIONS="-c extension_control_path=$REFERENCE_EXTENSION_CONTROL_PATH" \
+PGOPTIONS="$REFERENCE_PGOPTIONS" \
   psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
     -v ON_ERROR_STOP=1 -f "$WORK/extension.sql" \
     > "$WORK/extension_restore.out" 2>&1
@@ -1511,7 +1557,7 @@ run_corpus() { # host port outfile file diagnostics
     *) printf 'FAIL: unknown corpus diagnostics %s\n' "$diagnostics" >&2; return 1 ;;
   esac
   if [[ "$1" == "$PGHOST" && "$2" == "$PGPORT" ]]; then
-    PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_PATH" \
+    PGOPTIONS="$REFERENCE_PGOPTIONS" \
       psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -e -P pager=off \
         -v VERBOSITY=verbose -f "$4" > "$3.stdout" 2> "$3.stderr" || status=$?
   else
@@ -1670,6 +1716,22 @@ fi
 if [[ "$AUXILIARY_PHASE" == all || "$AUXILIARY_PHASE" == exact ]]; then
 restart_p3_fresh || exit 1
 echo "=== exact-error corpora (message wording must match) ==="
+# initdb draws the OIDs of what it creates after importing the platform's
+# collations from one counter, so those objects' absolute OIDs depend on the
+# reference's locale and ICU set, and the fixtures compare offsets only.
+# pos3ql numbers them as the pinned CI image does, whose last imported
+# collation is OID 13231; rebasing the reference's numbers onto that
+# collation makes this check exact on the CI image and portable elsewhere.
+initdb_objects="'dsnowball_init'::regproc::oid::int8, 'information_schema'::regnamespace::oid::int8, (SELECT oid::int8 FROM pg_extension WHERE extname = 'plpgsql'), (SELECT oid::int8 FROM pg_language WHERE lanname = 'plpgsql')"
+reference_numbering=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -A -t -c \
+  "SELECT d - c + 13231, n - c + 13231, e - c + 13231, l - c + 13231 FROM (SELECT $initdb_objects, (SELECT max(oid)::int8 FROM pg_collation)) AS reference(d, n, e, l, c)" 2>&1)
+p3_numbering=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -A -t \
+  -c "SELECT $initdb_objects" 2>&1)
+if [[ "$reference_numbering" == "$p3_numbering" ]]; then ok "initdb numbering of the pinned reference image"
+else
+  bad "initdb numbering of the pinned reference image"
+  printf 'PostgreSQL (rebased): %s\npos3ql:               %s\n' "$reference_numbering" "$p3_numbering"
+fi
 for f in "$EXT"/differential_exact/*.sql; do
   n=$(basename "$f" .sql)
   # Each fixture starts from an empty catalog on both servers, so objects a

@@ -338,6 +338,7 @@ jobs:
           tools/tests/test_workflow_timeouts.py
           tools/tests/test_coverage_script.py
           tools/tests/test_check_dups.py
+          tools/tests/test_generate_snowball_stemmers.py
           tools/tests/test_postgres_regress_diff.py
           tools/tests/test_differential_diagnostics.py
           tools/tests/test_s3_audit.py

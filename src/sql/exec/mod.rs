@@ -20,7 +20,7 @@ use crate::storage::rowenc;
 use crate::storage::{
     CHECK_SQL_MAX, ColumnMeta, ColumnSet, IndexDef, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS,
     MAX_ROUTINE_OUTPUT_COLUMNS, PartitionBound as StoredPartitionBound, PartitionBoundValue,
-    PartitionDef, PartitionStrategy as StoredPartitionStrategy, PolicyCommandKind, ROUTINE_SQL_MAX,
+    PartitionDef, PartitionStrategy as StoredPartitionStrategy, ROUTINE_SQL_MAX,
     RoutineArgumentDef, RoutineIdentity, RoutineParameterDef, RoutineParameterMode, RoutineSpec,
     SeqSpec, SeqType, SqlName, Storage, TableDef, TableDefBuilder,
 };
@@ -116,6 +116,18 @@ impl DmlTableLayout<'_> {
         self.columns.overlay(logical, physical);
     }
 
+    /// Decodes a row stored in this table's own columns into the target's.
+    fn decode_logical<'values>(
+        self,
+        bytes: &'values [u8],
+        logical: &mut [Datum<'values>; MAX_COLUMNS],
+    ) -> Result<(), SqlError> {
+        let mut physical = [Datum::Null; MAX_COLUMNS];
+        rowenc::decode(bytes, self.schema, &mut physical)?;
+        self.project(&physical, logical);
+        Ok(())
+    }
+
     fn column_set(self, logical: ColumnSet) -> ColumnSet {
         self.columns.column_set(logical)
     }
@@ -165,6 +177,25 @@ impl<'arena> DmlRowImages<'arena> {
             rows[index].1 = joined;
         }
         Ok(())
+    }
+
+    /// The stored image kept for a local `row`, when its write needs one.
+    fn image(&self, row: PhysicalRow) -> Option<&'arena [u8]> {
+        let PhysicalRow::Local {
+            table_index, rowid, ..
+        } = row
+        else {
+            return None;
+        };
+        self.bytes(table_index, rowid).ok()
+    }
+
+    /// The joined row kept for `row`, when the selection joined one.
+    fn joined_bytes(&self, row: PhysicalRow) -> Option<&'arena [u8]> {
+        let rows = self.joined.as_slice();
+        rows.binary_search_by_key(&row.sort_key(), |(key, _)| *key)
+            .ok()
+            .map(|index| rows[index].1.bytes())
     }
 
     fn joined(&self, row: PhysicalRow) -> Result<super::query::JoinedFromRow<'arena>, SqlError> {
@@ -321,8 +352,17 @@ pub(super) enum DmlCapture {
 
 impl DmlCapture {
     /// `UPDATE ... FROM` assignments read the FROM row each target row joined.
+    /// `UPDATE ... FROM` assignments and `DELETE ... USING ... RETURNING`
+    /// read the FROM row each selected target row joined.
     fn retains_joined(self) -> bool {
-        matches!(self, Self::Update { .. })
+        matches!(
+            self,
+            Self::Update { .. }
+                | Self::Delete {
+                    returning: true,
+                    ..
+                }
+        )
     }
 
     fn command(self) -> u32 {
@@ -437,6 +477,7 @@ impl<'a, Definition: crate::storage::DefinitionBacking> DmlRequalify<'_, 'a, Def
             if !row_matches_values(
                 storage,
                 txid,
+                Some(table),
                 self.def,
                 self.alias,
                 &values,
@@ -465,11 +506,13 @@ impl<'a, Definition: crate::storage::DefinitionBacking> DmlRequalify<'_, 'a, Def
             layout.project(&first_physical, &mut first_values);
             let relation = crate::storage::RelationDefinition::from_definition(self.def);
             let first_row = RowCtx {
+                table_oid: None,
                 def: relation,
                 values: &first_values[..self.def.n_columns],
                 alias: self.alias,
             };
             let latest_row = RowCtx {
+                table_oid: None,
                 def: relation,
                 values: &values[..self.def.n_columns],
                 alias: self.alias,
@@ -501,6 +544,7 @@ impl<'a, Definition: crate::storage::DefinitionBacking> DmlRequalify<'_, 'a, Def
             return Ok(matched.then_some(unjoined));
         };
         let context = RowCtx {
+            table_oid: None,
             def: crate::storage::RelationDefinition::from_definition(self.def),
             values: &values[..self.def.n_columns],
             alias: self.alias,
@@ -524,6 +568,7 @@ impl<'a, Definition: crate::storage::DefinitionBacking> DmlRequalify<'_, 'a, Def
         let mut first_values = [Datum::Null; MAX_COLUMNS];
         layout.project(&first_physical, &mut first_values);
         let first_row = RowCtx {
+            table_oid: None,
             values: &first_values[..self.def.n_columns],
             ..context
         };
@@ -783,16 +828,36 @@ pub struct RowCtx<'s, 'v, 'd> {
     pub def: crate::storage::RelationDefinition<'d>,
     pub values: &'s [Datum<'v>],
     pub alias: Option<&'d str>,
+    /// The oid of the stored table holding the row, its `tableoid`; `None`
+    /// for a row without one (a view's or a trigger's row).
+    pub table_oid: Option<u32>,
 }
 
-/// A view predicate that must remain true after an auto-updatable rewrite.
-/// The predicate is retained as a parsed expression, so the write boundary
-/// never reparses catalog text while rows are being changed.
+impl RowCtx<'_, '_, '_> {
+    /// Whether `qualifier.name` names the row's `tableoid` system column.
+    fn names_table_oid(&self, qualifier: Option<&str>, name: &str) -> bool {
+        self.table_oid.is_some()
+            && name == "tableoid"
+            && self.def.column_index(name).is_none()
+            && qualifier.is_none_or(|qualifier| {
+                crate::sql::eval::qualifier_answers_target(self.def, self.alias, qualifier)
+            })
+    }
+}
+
+/// The view rules a write through an auto-updatable view keeps: the
+/// `WITH CHECK OPTION` filters its rows must pass and the view defaults an
+/// INSERT applies. Predicates are retained as parsed expressions over the
+/// base table, so the write boundary never reparses catalog text while rows
+/// are being changed.
 #[derive(Clone, Copy)]
 pub(crate) struct ViewCheck<'a> {
-    pub predicate: Option<&'a Expr<'a>>,
-    pub view_name: &'a str,
-    pub defaults: ViewInsertDefaults<'a>,
+    /// `(view name, filter)` pairs, innermost view first, as PostgreSQL's
+    /// `ExecWithCheckOptions` evaluates them.
+    pub checks: &'a [(&'a str, &'a Expr<'a>)],
+    /// Each view level's defaults, outermost first; the first level with a
+    /// default for a base column supplies it.
+    pub defaults: &'a [ViewInsertDefaults<'a>],
 }
 
 /// View-column defaults paired with the base columns reached by an
@@ -844,6 +909,9 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ColType, SqlError> {
+        if self.names_table_oid(qualifier, name) {
+            return Ok(ColType::Oid);
+        }
         describe::AliasedDefCols {
             definition: self.def,
             alias: self.alias,
@@ -873,6 +941,9 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
         }
         match self.def.column_index(name) {
             Some(i) => Ok(self.values[i]),
+            None if self.names_table_oid(qualifier, name) => {
+                Ok(Datum::Oid(self.table_oid.expect("a row with a tableoid")))
+            }
             None => Err(sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
                 "column \"{}\" does not exist",
@@ -897,6 +968,7 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
         let mut fields = [super::types::RecordField {
             name: "",
             type_oid: 0,
+            type_mod: -1,
             value: Datum::Null,
         }; MAX_COLUMNS];
         let too_large = || sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "record exceeds the arena");
@@ -918,6 +990,9 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
             && !crate::sql::eval::qualifier_answers_target(self.def, self.alias, q)
         {
             return None;
+        }
+        if self.names_table_oid(qualifier, name) {
+            return Some(ColType::Oid);
         }
         self.def
             .column_index(name)
@@ -958,6 +1033,8 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
 struct ReturningLookup<'d, 'v> {
     definition: crate::storage::RelationDefinition<'d>,
     target_alias: Option<&'d str>,
+    /// The `tableoid` of the changed row's table; `None` for a view's row.
+    table_oid: Option<u32>,
     current: &'v [Datum<'v>],
     old_name: &'d str,
     old: Option<&'v [Datum<'v>]>,
@@ -992,6 +1069,7 @@ impl<'v> ReturningLookup<'_, 'v> {
         let mut fields = [super::types::RecordField {
             name: "",
             type_oid: 0,
+            type_mod: -1,
             value: Datum::Null,
         }; MAX_COLUMNS];
         for (index, field) in fields
@@ -1055,9 +1133,17 @@ impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
         if let Some(qualifier) = qualifier
             && let Some(image) = self.image(qualifier)
         {
+            // An image's `tableoid` is its row's table, null without one.
+            if let Some(oid) = self.table_oid
+                && name == "tableoid"
+                && self.definition.column_index(name).is_none()
+            {
+                return Ok(image.map_or(Datum::Null, |_| Datum::Oid(oid)));
+            }
             return self.image_column(image, name);
         }
         let context = RowCtx {
+            table_oid: self.table_oid,
             def: self.definition,
             values: self.current,
             alias: self.target_alias,
@@ -1074,6 +1160,7 @@ impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
             return self.image_fields(image, arena).map(Some);
         }
         let context = RowCtx {
+            table_oid: self.table_oid,
             def: self.definition,
             values: self.current,
             alias: self.target_alias,
@@ -1083,12 +1170,19 @@ impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         if qualifier.is_some_and(|qualifier| self.image(qualifier).is_some()) {
+            if self.table_oid.is_some()
+                && name == "tableoid"
+                && self.definition.column_index(name).is_none()
+            {
+                return Some(ColType::Oid);
+            }
             return self
                 .definition
                 .column_index(name)
                 .map(|i| self.definition.columns()[i].ctype);
         }
         RowCtx {
+            table_oid: self.table_oid,
             def: self.definition,
             values: self.current,
             alias: self.target_alias,
@@ -1105,6 +1199,7 @@ impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
                 .unwrap_or(crate::sql::ast::Collation::None);
         }
         RowCtx {
+            table_oid: self.table_oid,
             def: self.definition,
             values: self.current,
             alias: self.target_alias,
@@ -1124,6 +1219,7 @@ impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
                 .and_then(|i| self.definition.columns()[i].user_type);
         }
         RowCtx {
+            table_oid: self.table_oid,
             def: self.definition,
             values: self.current,
             alias: self.target_alias,
@@ -1167,6 +1263,19 @@ impl<'v> JoinedReturningLookup<'_, '_, 'v> {
 
 impl<'v> ColumnLookup<'v> for JoinedReturningLookup<'_, '_, 'v> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
+        // The target's `tableoid` is the changed row's table, which the
+        // joined row's flattened values do not carry.
+        if name == "tableoid"
+            && qualifier.is_some_and(|qualifier| {
+                crate::sql::eval::qualifier_answers_target(
+                    self.returning.definition,
+                    self.returning.target_alias,
+                    qualifier,
+                )
+            })
+        {
+            return self.returning.lookup(qualifier, name);
+        }
         self.row(qualifier).lookup(qualifier, name)
     }
 
@@ -1390,6 +1499,7 @@ fn run_reported_drop<'b>(
     }
 }
 
+mod copy_batch;
 mod copy_transition;
 mod partition_insert;
 mod partition_update;
@@ -1404,7 +1514,7 @@ pub(crate) use describe::{
     builtin_type_name_fixed, catalog_builtin_call_result_metadata, catalog_composite_field,
     catalog_operator_first_argument_type, catalog_routine_record_field, expand_record_call_items,
     function_lookup_error, numeric_log_type, procedure_lookup_error, resolved_set_call,
-    visit_catalog_composite_fields, visit_catalog_rowtype_fields,
+    static_meta_for_column, visit_catalog_composite_fields, visit_catalog_rowtype_fields,
 };
 pub use describe::{
     ColTypeResolver, DefCols, DescriptionTarget, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
@@ -1452,6 +1562,7 @@ pub(crate) use sql_function_execution::{
 mod engine_triggers;
 mod plpgsql_conditions;
 pub(crate) use engine_triggers::{engine_required, run_pending_trigger};
+mod merge_view;
 mod row_conflicts;
 mod row_progress;
 mod trigger_firing;
@@ -4603,6 +4714,8 @@ fn build_inherited_table_def(
     for index in 0..definition.n_fkeys {
         definition.fkeys[index].columns =
             remap_columns(&definition, &own, definition.fkeys[index].columns())?;
+        definition.fkeys[index].delete_set_cols =
+            remap_columns(&definition, &own, definition.fkeys[index].delete_set_cols())?;
     }
     for index in 0..definition.n_fkeys {
         let key = definition.fkeys[index];
@@ -4752,9 +4865,15 @@ fn resolve_partition_scheme<Definition0: crate::storage::DefinitionBacking>(
             .default
             .is_generated()
         {
-            return Err(sql_err!(
-                sqlstate::INVALID_OBJECT_DEFINITION,
-                "cannot use generated column in partition key"
+            return Err(crate::sql::error_position::with_detail(
+                crate::sql::error_position::at_subject(
+                    sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "cannot use generated column in partition key"
+                    ),
+                    name,
+                ),
+                format_args!("Column \"{}\" is a generated column.", name),
             ));
         }
     }
@@ -4934,7 +5053,13 @@ fn partition_bounds_overlap(
         ) => {
             for left in &lv[..usize::from(ln)] {
                 for right in &rv[..usize::from(rn)] {
-                    if compare_datums(&left.as_datum(), &right.as_datum())?.is_eq() {
+                    // A NULL bound value matches only the other NULL.
+                    let same = match (left.as_datum(), right.as_datum()) {
+                        (Datum::Null, Datum::Null) => true,
+                        (Datum::Null, _) | (_, Datum::Null) => false,
+                        (left, right) => compare_datums(&left, &right)?.is_eq(),
+                    };
+                    if same {
                         return Ok(true);
                     }
                 }
@@ -4987,6 +5112,195 @@ fn compare_partition_bound_tuples(
     Ok(Ordering::Equal)
 }
 
+/// The leaf tables a scan or write of `root` and its descendants reads, in
+/// PostgreSQL's order, which a result without `ORDER BY` and `RETURNING`
+/// follow: a partitioned table's partitions in bound order, a partitioned
+/// partition's own leaves in its place, and an inheritance tree level by
+/// level with each level's children in OID order, as `find_all_inheritors`
+/// lists them.
+pub(crate) fn relation_leaves_in_order<'a>(
+    storage: &Storage,
+    root: usize,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [usize], SqlError> {
+    let full = || {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "partition target list exceeds the statement arena"
+        )
+    };
+    let out = arena
+        .alloc_slice_with(storage.table_count(), |_| usize::MAX)
+        .map_err(|_| full())?;
+    let children = arena
+        .alloc_slice_with(storage.table_count(), |_| usize::MAX)
+        .map_err(|_| full())?;
+    let mut n = 0usize;
+    if storage.table_def(root, txid).partition.is_partitioned() {
+        partition_leaves_in_order(storage, root, txid, out, &mut n, children)?;
+        return Ok(&out[..n]);
+    }
+    out[0] = root;
+    n = 1;
+    let mut next = 0usize;
+    while next < n {
+        let parent = out[next];
+        next += 1;
+        let mut found = 0usize;
+        for child in 0..storage.table_count() {
+            if storage.relation_visible_to_current_session(child, txid)
+                && !out[..n].contains(&child)
+                && storage.table_def(child, txid).inheritance.contains(parent)
+            {
+                children[found] = child;
+                found += 1;
+            }
+        }
+        let level = &mut children[..found];
+        level.sort_unstable_by_key(|&child| {
+            crate::sql::catalog::user_table_oid(storage, child) as u32
+        });
+        for &child in level.iter() {
+            out[n] = child;
+            n += 1;
+        }
+    }
+    Ok(&out[..n])
+}
+
+fn partition_leaves_in_order(
+    storage: &Storage,
+    parent: usize,
+    txid: u32,
+    out: &mut [usize],
+    n: &mut usize,
+    scratch: &mut [usize],
+) -> Result<(), SqlError> {
+    let mut found = 0usize;
+    for child in 0..storage.table_count() {
+        if !storage.relation_visible_to_current_session(child, txid) {
+            continue;
+        }
+        if storage
+            .table_def(child, txid)
+            .partition
+            .attachment
+            .is_some_and(|attachment| {
+                usize::from(attachment.parent) == parent && attachment.state.routable()
+            })
+        {
+            scratch[found] = child;
+            found += 1;
+        }
+    }
+    let (level, rest) = scratch.split_at_mut(found);
+    let mut failed = None;
+    level.sort_unstable_by(|&left, &right| {
+        match partition_bound_order(storage, left, right, txid) {
+            Ok(ordering) => ordering,
+            Err(error) => {
+                failed.get_or_insert(error);
+                core::cmp::Ordering::Equal
+            }
+        }
+    });
+    if let Some(error) = failed {
+        return Err(error);
+    }
+    for &child in level.iter() {
+        if storage.table_def(child, txid).partition.is_partitioned() {
+            partition_leaves_in_order(storage, child, txid, out, n, rest)?;
+        } else {
+            out[*n] = child;
+            *n += 1;
+        }
+    }
+    Ok(())
+}
+
+/// PostgreSQL's partition descriptor order of two sibling partitions: range
+/// partitions by lower bound, list partitions by their least value with a
+/// partition of only `NULL` after them, hash partitions by modulus and
+/// remainder, and the default partition last.
+fn partition_bound_order(
+    storage: &Storage,
+    left: usize,
+    right: usize,
+    txid: u32,
+) -> Result<core::cmp::Ordering, SqlError> {
+    use crate::storage::PartitionBound;
+    use core::cmp::Ordering;
+    let bound = |slot: usize| {
+        storage
+            .table_def(slot, txid)
+            .partition
+            .attachment
+            .map(|attachment| attachment.bound)
+    };
+    let least = |values: &[crate::storage::OwnedDatum]| -> Result<Option<usize>, SqlError> {
+        let mut least: Option<usize> = None;
+        for (index, value) in values.iter().enumerate() {
+            if matches!(value.as_datum(), Datum::Null) {
+                continue;
+            }
+            let lower = match least {
+                None => true,
+                Some(current) => {
+                    compare_datums(&value.as_datum(), &values[current].as_datum())?.is_lt()
+                }
+            };
+            if lower {
+                least = Some(index);
+            }
+        }
+        Ok(least)
+    };
+    Ok(match (bound(left), bound(right)) {
+        (Some(PartitionBound::Default), Some(PartitionBound::Default)) => Ordering::Equal,
+        (Some(PartitionBound::Default), _) => Ordering::Greater,
+        (_, Some(PartitionBound::Default)) => Ordering::Less,
+        (
+            Some(PartitionBound::Range {
+                lower: left,
+                n_keys,
+                ..
+            }),
+            Some(PartitionBound::Range { lower: right, .. }),
+        ) => compare_partition_bound_tuples(&left, &right, n_keys)?,
+        (
+            Some(PartitionBound::List {
+                values: left,
+                n_values: left_count,
+            }),
+            Some(PartitionBound::List {
+                values: right,
+                n_values: right_count,
+            }),
+        ) => {
+            let left = &left[..usize::from(left_count)];
+            let right = &right[..usize::from(right_count)];
+            match (least(left)?, least(right)?) {
+                (Some(l), Some(r)) => compare_datums(&left[l].as_datum(), &right[r].as_datum())?,
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            }
+        }
+        (
+            Some(PartitionBound::Hash {
+                modulus: left_modulus,
+                remainder: left_remainder,
+            }),
+            Some(PartitionBound::Hash {
+                modulus: right_modulus,
+                remainder: right_remainder,
+            }),
+        ) => (left_modulus, left_remainder).cmp(&(right_modulus, right_remainder)),
+        _ => left.cmp(&right),
+    })
+}
+
 fn row_trigger_when_passes<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     trigger: &crate::storage::TriggerDef,
@@ -5011,6 +5325,7 @@ fn row_trigger_when_passes<'a>(
             position: 0,
             text: source,
             exception_variables: false,
+            positionals: 0,
         },
         context.storage(),
         context.txn.txid,
@@ -5040,6 +5355,68 @@ fn row_trigger_when_passes<'a>(
     }
 }
 
+/// Runs one firing of a PostgreSQL built-in trigger function. `old` and
+/// `new` are a row firing's row images; the result says whether the row
+/// proceeds.
+fn fire_builtin_trigger(
+    builtin: crate::storage::BuiltinTriggerFunction,
+    trigger: &crate::storage::TriggerDef,
+    event: u8,
+    old: Option<&[Datum<'_>]>,
+    new: Option<&[Datum<'_>]>,
+) -> Result<bool, SqlError> {
+    match builtin {
+        crate::storage::BuiltinTriggerFunction::SuppressRedundantUpdates => {
+            // PostgreSQL's trigfuncs.c checks in this order.
+            let violation = |message| {
+                sql_err!(
+                    sqlstate::TRIGGER_PROTOCOL_VIOLATED,
+                    "suppress_redundant_updates_trigger: must be called {}",
+                    message
+                )
+            };
+            if event != TriggerEvents::UPDATE {
+                return Err(violation("on update"));
+            }
+            if trigger.timing != crate::sql::ast::TriggerTiming::Before {
+                return Err(violation("before update"));
+            }
+            if trigger.level != crate::sql::ast::TriggerLevel::Row {
+                return Err(violation("for each row"));
+            }
+            let (Some(old), Some(new)) = (old, new) else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "row UPDATE trigger firing has no old or new row"
+                ));
+            };
+            Ok(old.len() != new.len()
+                || old
+                    .iter()
+                    .zip(new)
+                    .any(|(old, new)| !same_stored_value(old, new)))
+        }
+    }
+}
+
+/// Whether two column values are stored identically, as PostgreSQL's
+/// `suppress_redundant_updates_trigger` compares tuple bytes: `1.5` and
+/// `1.50` differ, and so do `0` and `-0` as floats.
+fn same_stored_value(left: &Datum<'_>, right: &Datum<'_>) -> bool {
+    match (left, right) {
+        (Datum::Float4(left), Datum::Float4(right)) => left.to_bits() == right.to_bits(),
+        (Datum::Float8(left), Datum::Float8(right)) => left.to_bits() == right.to_bits(),
+        // Numeric equality compares values; storage keeps the display scale.
+        (Datum::Numeric(left), Datum::Numeric(right)) => {
+            left.sign == right.sign
+                && left.weight == right.weight
+                && left.dscale == right.dscale
+                && left.digits == right.digits
+        }
+        _ => left == right,
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "a trigger firing carries its complete typed transition context"
@@ -5056,6 +5433,9 @@ fn execute_row_trigger_body<'a, Definition0: crate::storage::DefinitionBacking>(
     new: &mut Option<&mut [Datum<'a>]>,
     transition_rows: Option<TransitionRows<'a>>,
 ) -> Result<bool, SqlError> {
+    if let crate::storage::TriggerFunction::Builtin(builtin) = trigger.function {
+        return fire_builtin_trigger(builtin, trigger, event, old, new.as_deref());
+    }
     // A BEFORE or INSTEAD OF row trigger can move to the engine; an AFTER
     // row trigger fired here belongs to a write without completion handoff.
     let movable = (before && transition_rows.is_none()).then_some(engine_triggers::MovableFiring {
@@ -5131,7 +5511,7 @@ fn execute_row_trigger_body_here<'a, Definition0: crate::storage::DefinitionBack
     reason = "selected trigger construction carries its exact row and relation bindings"
 )]
 fn prepare_trigger_firing<'values, 'schema, 'rows>(
-    context: &TriggerExecContext<'_, 'values, '_>,
+    context: &mut TriggerExecContext<'_, 'values, '_>,
     trigger: &crate::storage::TriggerDef,
     relation: TriggerRelationIdentity,
     definition: crate::storage::RelationDefinition<'schema>,
@@ -5141,9 +5521,53 @@ fn prepare_trigger_firing<'values, 'schema, 'rows>(
     new: Option<&'rows mut [Datum<'values>]>,
     transition_rows: Option<TransitionRows<'values>>,
 ) -> Result<trigger_firing::TriggerFiring<'values, 'schema, 'rows>, SqlError> {
+    let crate::storage::TriggerFunction::Routine(function) = trigger.function else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "built-in trigger function reached the routine firing path"
+        ));
+    };
+    context.load_plpgsql()?;
+    // A trigger's OLD and NEW hold no virtual generated column's value, which
+    // PostgreSQL computes only when a query reads the table. A BEFORE
+    // trigger's NEW is recomputed afterwards, so it is cleared in place.
+    let columns = definition.columns();
+    let (old, new) = if columns.iter().any(|column| column.default.is_virtual()) {
+        let without_virtual = |values: &[Datum<'values>]| {
+            let copied = context
+                .arena
+                .alloc_slice_copy(values)
+                .map_err(|_| super::query::arena_full_pub())?;
+            for (value, column) in copied.iter_mut().zip(columns) {
+                if column.default.is_virtual() {
+                    *value = Datum::Null;
+                }
+            }
+            Ok::<_, SqlError>(copied)
+        };
+        let old = match old {
+            Some(old) => Some(&*without_virtual(old)?),
+            None => None,
+        };
+        let new = match new {
+            Some(values) if before => {
+                for (value, column) in values.iter_mut().zip(columns) {
+                    if column.default.is_virtual() {
+                        *value = Datum::Null;
+                    }
+                }
+                Some(values)
+            }
+            Some(values) => Some(without_virtual(values)?),
+            None => None,
+        };
+        (old, new)
+    } else {
+        (old, new)
+    };
     let routine = context
         .storage()
-        .routine_for(usize::from(trigger.function), context.txn.txid);
+        .routine_for(usize::from(function), context.txn.txid);
     let owner = crate::storage::SessionIdentity::bound(context.storage().capture_role_slot(
         routine.ownership.owner_to(context.txn.txid).into(),
         context.txn.txid,
@@ -5153,11 +5577,18 @@ fn prepare_trigger_firing<'values, 'schema, 'rows>(
         .security_definer
         .then(|| super::eval::funcs::system::enter_current_user(owner));
     let config = (!routine.configs().is_empty())
-        .then(|| super::guc::enter_active_routine_configs(routine.configs()))
+        .then(|| {
+            super::guc::enter_active_routine_configs(
+                context.storage(),
+                context.txn.txid,
+                routine.configs(),
+            )
+        })
         .transpose()?;
     let (program, code) = compile_plpgsql_execution(
         routine.body.as_str(),
         PlpgsqlProgramKind::Trigger,
+        0,
         context.storage(),
         context.txn.txid,
         context.arena,
@@ -5447,7 +5878,9 @@ fn build_def_with_likes(
             push_column(
                 &mut def,
                 &mut n,
-                build_column(column, storage, txid, arena)?,
+                crate::sql::error_position::with_analysis(|| {
+                    build_column(column, storage, txid, arena)
+                })?,
             )?;
             if let Some(name) = column.not_null_name {
                 def.set_not_null_constraint_name(n - 1, SqlName::parse(name)?);
@@ -5455,6 +5888,9 @@ fn build_def_with_likes(
         }
     }
     def.n_columns = n;
+    crate::sql::error_position::with_analysis(|| {
+        ddl::validate_generated_refs(&def, Some(statement.columns), storage, txid, arena)
+    })?;
     Ok(def)
 }
 
@@ -7192,6 +7628,7 @@ where
                 .resolve_column_type(qualifier, name);
         }
         RowCtx {
+            table_oid: None,
             def: self.def,
             values: self.existing,
             alias: self.alias,
@@ -7546,6 +7983,7 @@ where
         }
         if let Some(plan) = row_security_using {
             let policy_row = RowCtx {
+                table_oid: None,
                 def: crate::storage::RelationDefinition::from_definition(logical_definition),
                 values: logical_existing,
                 alias: None,
@@ -7688,6 +8126,7 @@ where
             arena,
         )?;
         let policy_row = RowCtx {
+            table_oid: None,
             def: crate::storage::RelationDefinition::from_definition(logical_definition),
             values: logical_new,
             alias: None,
@@ -8820,6 +9259,18 @@ fn drop_table_kind_with_columns(
                         Ok(closure) => closure,
                         Err(error) => return sql_fail(error),
                     };
+                    // A rule on another table this statement drops goes with
+                    // that table, as PostgreSQL drops the objects together.
+                    for (rule, selected) in dependent_rules.iter_mut().enumerate() {
+                        if *selected
+                            && let crate::storage::RuleTarget::Table(table) =
+                                storage.rule(rule).definition_for(txn.txid).target
+                            && usize::from(table) != index
+                            && selected_tables[..selected_table_count].contains(&usize::from(table))
+                        {
+                            *selected = false;
+                        }
+                    }
                     let policy_root = PolicyDependencySelection::Catalog {
                         class: crate::storage::DependencyClass::Table,
                         slot: index,
@@ -10847,7 +11298,9 @@ pub fn alter_role_setting(
             };
             let value = match value {
                 crate::sql::ast::RoutineConfigValue::Current => {
-                    match guc.capture_setting_value(name.as_str()) {
+                    match super::guc::SettingAuthorization::set(storage, name.as_str(), txn.txid)
+                        .and_then(|authorization| guc.capture_setting_value(authorization))
+                    {
                         Ok(value) => Some(value),
                         Err(error) => return sql_fail(error),
                     }
@@ -10857,14 +11310,21 @@ pub fn alter_role_setting(
                     if storage
                         .role_settings()
                         .any(|(_, setting)| setting.visible_to(txn.txid) && setting.scope == scope)
-                        && let Err(error) = guc.validate_setting_value(name.as_str(), None)
+                        && let Err(error) =
+                            super::guc::SettingAuthorization::set(storage, name.as_str(), txn.txid)
+                                .and_then(|authorization| {
+                                    guc.validate_setting_value(authorization, None)
+                                })
                     {
                         return sql_fail(error);
                     }
                     None
                 }
                 crate::sql::ast::RoutineConfigValue::Value(value) => {
-                    match guc.validate_setting_value(name.as_str(), Some(value)) {
+                    match super::guc::SettingAuthorization::set(storage, name.as_str(), txn.txid)
+                        .and_then(|authorization| {
+                            guc.validate_setting_value(authorization, Some(value))
+                        }) {
                         Ok(()) => Some(crate::util::StackStr::from_str(value)),
                         Err(error) => return sql_fail(error),
                     }
@@ -10887,7 +11347,8 @@ pub fn alter_role_setting(
                 && storage
                     .role_settings()
                     .any(|(_, setting)| setting.visible_to(txn.txid) && setting.scope == scope)
-                && let Err(error) = guc.validate_setting_value(name, None)
+                && let Err(error) = super::guc::SettingAuthorization::set(storage, name, txn.txid)
+                    .and_then(|authorization| guc.validate_setting_value(authorization, None))
             {
                 return sql_fail(error);
             }
@@ -11018,31 +11479,26 @@ pub fn alter_system(
     let current = storage
         .current_role_slot(txn.txid)
         .expect("current role exists");
-    let superuser = storage.role(current).attributes_to(txn.txid).superuser;
-    if !superuser
-        && name
-            .and_then(crate::sql::ast::ParameterName::parse)
-            .is_none_or(|parameter| {
-                !storage.has_parameter_privilege(
-                    parameter,
-                    current,
-                    crate::sql::ast::ParameterPrivileges::ALTER_SYSTEM,
-                    txn.txid,
-                )
-            })
-    {
+    if name.is_none() && !storage.role(current).attributes_to(txn.txid).superuser {
         return sql_fail(sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
-            "permission denied to alter system configuration"
+            "permission denied to perform ALTER SYSTEM RESET ALL"
         ));
     }
-    match (name, raw) {
-        (Some(name), Some(raw)) => {
-            let name = match super::guc::canonical_setting_name(name) {
+    let authorization = match name
+        .map(|name| super::guc::SettingAuthorization::alter_system(storage, name, txn.txid))
+        .transpose()
+    {
+        Ok(authorization) => authorization,
+        Err(error) => return sql_fail(error),
+    };
+    match (authorization, raw) {
+        (Some(authorization), Some(raw)) => {
+            let name = match super::guc::canonical_setting_name(authorization.name()) {
                 Ok(name) => name,
                 Err(error) => return sql_fail(error),
             };
-            let value = match guc.validate_setting_value(name.as_str(), Some(raw)) {
+            let value = match guc.validate_system_setting(authorization, Some(raw)) {
                 Ok(()) => crate::util::StackStr::from_str(raw),
                 Err(error) => return sql_fail(error),
             };
@@ -11056,11 +11512,11 @@ pub fn alter_system(
                 return sql_fail(error);
             }
         }
-        (Some(name), None) => {
-            if let Err(error) = guc.validate_system_reset(name) {
+        (Some(authorization), None) => {
+            if let Err(error) = guc.validate_system_setting(authorization, None) {
                 return sql_fail(error);
             }
-            let name = match super::guc::canonical_setting_name(name) {
+            let name = match super::guc::canonical_setting_name(authorization.name()) {
                 Ok(name) => name,
                 Err(error) => return sql_fail(error),
             };
@@ -15336,7 +15792,9 @@ fn parameter_acl_grantor(
 }
 
 fn ensure_parameter_acl_target(parameter: crate::sql::ast::ParameterName) -> Result<(), SqlError> {
-    if crate::sql::guc::knows_parameter(parameter.as_str()) {
+    if crate::sql::guc::knows_parameter(parameter.as_str())
+        || crate::sql::guc::is_valid_custom_parameter(parameter.as_str())
+    {
         Ok(())
     } else {
         Err(sql_err!(
@@ -17093,7 +17551,7 @@ pub(crate) fn drop_schema(
                     matches!(
                         object,
                         SchemaObject::Routine(routine)
-                            if *routine == usize::from(trigger.function)
+                            if trigger.function.routine() == Some(*routine)
                     )
                 })
             })
@@ -17208,6 +17666,11 @@ pub(crate) fn drop_schema(
                         arena,
                         responder,
                     ) {
+                        return sql_fail(error);
+                    }
+                    // The view's triggers are journaled as dropped before
+                    // the view, so recovery can still resolve their target.
+                    if let Err(error) = drop_view_trigger_dependencies(storage, wal, txn, *v) {
                         return sql_fail(error);
                     }
                     if !temporary {
@@ -19644,6 +20107,14 @@ pub struct CreateViewCommand<'a> {
     pub option_order: crate::storage::ViewOptionOrder,
     pub sql: &'a str,
     pub raw_path: &'a str,
+    /// The replaced view's column types, which `CREATE OR REPLACE RULE
+    /// "_RETURN"` keeps where its query's column has the same type without a
+    /// modifier (PostgreSQL leaves the view's attributes unchanged). Empty
+    /// for `CREATE VIEW`.
+    pub kept_column_types: &'a [crate::storage::ViewColumnType],
+    /// The statement writing the query: `CREATE VIEW` or the view's
+    /// `_RETURN` rule.
+    pub query_origin: crate::storage::ViewQueryOrigin,
 }
 
 pub struct AlterViewCommand<'a> {
@@ -19748,6 +20219,16 @@ struct ParsedTriggerLocalDecl<'a> {
     /// `name [NO] [SCROLL] CURSOR [(arguments)] FOR query`: a `refcursor`
     /// local whose `OPEN` runs this query.
     bound: Option<BoundPlpgsqlCursor<'a>>,
+    /// `name ALIAS FOR item`: another name for a variable declared before
+    /// it, a parameter (`$n` or its name) or a trigger's `NEW` or `OLD`.
+    alias: Option<PlpgsqlAliasItem<'a>>,
+}
+
+/// The item an `ALIAS FOR` declaration names, as written.
+#[derive(Clone, Copy)]
+struct PlpgsqlAliasItem<'a> {
+    target: PlpgsqlVariableName,
+    written: &'a str,
 }
 
 /// A bound cursor's declared query, as PostgreSQL's `cursor_explicit_expr`.
@@ -19874,6 +20355,62 @@ struct TriggerLocalDecl {
     record_shape: Option<PlpgsqlRecordShape>,
     constant: bool,
     not_null: bool,
+    /// `ALIAS FOR`: the variable this name stands for, as declared before
+    /// it, so the alias shares that variable's slot; [`plpgsql_binding`]
+    /// follows it. A trigger's `NEW` or `OLD` is not a slot.
+    alias: Option<PlpgsqlVariableName>,
+}
+
+/// What a declared name stands for once its aliases are followed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlpgsqlBinding {
+    Slot(usize),
+    /// A trigger's `NEW` or `OLD` record.
+    Transition(&'static str),
+}
+
+/// Follows the alias declared at `index`, if any, to the variable it names
+/// among the declarations before it.
+fn plpgsql_binding(locals: &[TriggerLocalDecl], mut index: usize) -> Option<PlpgsqlBinding> {
+    while let Some(target) = locals[index].alias {
+        match locals[..index]
+            .iter()
+            .rposition(|local| target.names(local))
+        {
+            Some(found) => index = found,
+            None if target.label.is_none() && target.name.as_str() == "new" => {
+                return Some(PlpgsqlBinding::Transition("new"));
+            }
+            None if target.label.is_none() && target.name.as_str() == "old" => {
+                return Some(PlpgsqlBinding::Transition("old"));
+            }
+            None => return None,
+        }
+    }
+    Some(PlpgsqlBinding::Slot(index))
+}
+
+/// `NEW` or `OLD` when the innermost declaration of `name` is an alias of
+/// that trigger record.
+fn plpgsql_transition_alias(locals: &[TriggerLocalDecl], name: &str) -> Option<&'static str> {
+    let index = locals
+        .iter()
+        .rposition(|local| local.name.as_str() == name)?;
+    match plpgsql_binding(locals, index)? {
+        PlpgsqlBinding::Transition(record) => Some(record),
+        PlpgsqlBinding::Slot(_) => None,
+    }
+}
+
+/// The slot of the innermost variable `matches` selects, following aliases.
+fn plpgsql_slot(
+    locals: &[TriggerLocalDecl],
+    matches: impl Fn(&TriggerLocalDecl) -> bool,
+) -> Option<usize> {
+    match plpgsql_binding(locals, locals.iter().rposition(matches)?)? {
+        PlpgsqlBinding::Slot(index) => Some(index),
+        PlpgsqlBinding::Transition(_) => None,
+    }
 }
 
 impl TriggerLocalDecl {
@@ -19903,6 +20440,8 @@ struct TriggerInvocation<'a> {
     input_owner: super::type_input_plans::Owner,
     input_collation: crate::sql::ast::Collation,
     input_sites: &'a [super::plpgsql_inputs::Site<'a>],
+    /// How many parameters the body names `$1` onwards.
+    positionals: u32,
     /// How the body's statements resolve a name that is both a variable and
     /// a column: its `#variable_conflict` option, else the setting it was
     /// compiled under.
@@ -20077,6 +20616,7 @@ impl<'a> TriggerInvocation<'a> {
             input_owner: super::type_input_plans::Owner::Backend,
             input_collation: crate::sql::ast::Collation::None,
             input_sites: &[],
+            positionals: 0,
             variable_conflict: settings.variable_conflict,
             print_strict_params: settings.print_strict_params,
             fresh_snapshots: true,
@@ -20114,6 +20654,7 @@ impl<'a> TriggerInvocation<'a> {
             input_owner: super::type_input_plans::owner()?,
             input_collation: crate::sql::ast::Collation::None,
             input_sites: &[],
+            positionals: 0,
             variable_conflict: settings.variable_conflict,
             print_strict_params: settings.print_strict_params,
             fresh_snapshots: true,
@@ -20155,6 +20696,7 @@ impl<'a> TriggerInvocation<'a> {
             input_owner: super::type_input_plans::owner()?,
             input_collation,
             input_sites: &[],
+            positionals: routine_positionals(routine),
             variable_conflict: settings.variable_conflict,
             print_strict_params: settings.print_strict_params,
             fresh_snapshots: true,
@@ -20197,6 +20739,7 @@ impl<'a> TriggerInvocation<'a> {
             input_owner: super::type_input_plans::owner()?,
             input_collation,
             input_sites: &[],
+            positionals: routine_positionals(routine),
             variable_conflict: settings.variable_conflict,
             print_strict_params: settings.print_strict_params,
             fresh_snapshots: routine.attributes.volatility
@@ -20241,6 +20784,7 @@ impl<'a> TriggerInvocation<'a> {
             input_owner: super::type_input_plans::Owner::Backend,
             input_collation: crate::sql::ast::Collation::None,
             input_sites: &[],
+            positionals: 0,
             variable_conflict: settings.variable_conflict,
             print_strict_params: settings.print_strict_params,
             fresh_snapshots: true,
@@ -20807,7 +21351,11 @@ fn cursor_loop_portal_local() -> SqlName {
 struct TriggerFor<'a> {
     /// A numeric loop declares its counter under the loop's label.
     label: Option<SqlName>,
+    /// The loop's variable, the first of `row_targets` when it has several.
     target: PlpgsqlVariableName,
+    /// `FOR a, b IN query`: the scalar variables each row's columns are
+    /// assigned to, in order; empty for a loop with one variable.
+    row_targets: &'a [PlpgsqlVariableName],
     source: TriggerForSource<'a>,
     block: TriggerBlock<'a>,
 }
@@ -21101,6 +21649,7 @@ impl<'s, 'v> TriggerTransition<'_, 's, 'v> {
             .alloc_slice_with(columns.len(), |index| RecordField {
                 name: "",
                 type_oid: columns[index].ctype.oid(),
+                type_mod: columns[index].type_mod,
                 value: values.map_or(Datum::Null, |values| values[index]),
             })
             .map_err(|_| super::query::arena_full_pub())?;
@@ -21360,10 +21909,22 @@ fn validate_trigger_when(
             ));
         } else if let Some(definition) = definition {
             if name != "old" && name != "new" && definition.column_index(name).is_none() {
-                reference_error = Some(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
-                    name
+                let error = match qualifier {
+                    Some(qualifier) => sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column {}.{} does not exist",
+                        qualifier,
+                        name
+                    ),
+                    None => sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        name
+                    ),
+                };
+                reference_error = Some(crate::sql::error_position::at_reference(
+                    error,
+                    qualifier.unwrap_or(name),
                 ));
             } else if is_new
                 && matches!(timing, TriggerTiming::Before)
@@ -21372,10 +21933,18 @@ fn validate_trigger_when(
                         .column_index(name)
                         .is_some_and(|column| definition.columns()[column].default.is_generated()))
             {
-                reference_error = Some(sql_err!(
+                let error = sql_err!(
                     sqlstate::INVALID_OBJECT_DEFINITION,
                     "BEFORE trigger's WHEN condition cannot reference NEW generated columns"
-                ));
+                );
+                reference_error = Some(if name == "new" {
+                    error
+                } else {
+                    crate::sql::error_position::with_detail(
+                        crate::sql::error_position::at_reference(error, qualifier.unwrap_or(name)),
+                        format_args!("Column \"{}\" is a generated column.", name),
+                    )
+                });
             }
         }
     });
@@ -21406,6 +21975,30 @@ fn validate_trigger_when(
             sqlstate::DATATYPE_MISMATCH,
             "trigger WHEN condition must be type boolean"
         ));
+    }
+    // Unknown literals convert to their operands' types as PostgreSQL's
+    // analysis converts them.
+    if let Some(definition) = definition {
+        let transition = TriggerTransition {
+            definition,
+            old: TriggerRecordValue::Empty,
+            new: TriggerRecordValue::Empty,
+        };
+        let columns = super::eval::RuntimeColumnTypes {
+            row: &transition,
+            catalog: Some(&catalog),
+        };
+        super::query::check_literal_operands_typed(
+            expression,
+            &|other| {
+                super::exec::infer_type_res(other, &columns)
+                    .ok()
+                    .and_then(|(oid, _)| ColType::from_oid(oid))
+            },
+            storage,
+            txid,
+            arena,
+        )?;
     }
     Ok(())
 }
@@ -21995,7 +22588,9 @@ fn execute_atomic_procedure_call<'a>(
         .security_definer
         .then(|| super::eval::funcs::system::enter_current_user(owner));
     let _config = (!routine.configs().is_empty())
-        .then(|| super::guc::enter_active_routine_configs(routine.configs()))
+        .then(|| {
+            super::guc::enter_active_routine_configs(context.storage(), txid, routine.configs())
+        })
         .transpose()?;
     let track = match super::guc::active_track_functions() {
         super::guc::TrackFunctions::None => false,
@@ -23109,6 +23704,15 @@ fn parse_plpgsql_variable_name(
     arena: &Arena,
 ) -> Result<PlpgsqlVariableName, SqlError> {
     let source = source.trim();
+    // A parameter is also the variable `$n`.
+    if let Some(number) = source.strip_prefix('$')
+        && !number.is_empty()
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Ok(PlpgsqlVariableName::plain(positional_parameter_name(
+            number.parse().map_err(|_| unsupported_trigger_body())?,
+        )?));
+    }
     let first_end = parse_plpgsql_identifier_prefix(source, arena)?.1;
     let rest = source[first_end..].trim_start();
     let Some(name) = rest.strip_prefix('.') else {
@@ -23150,6 +23754,27 @@ fn parse_trigger_local<'a>(
     };
     let (name, split) = parse_plpgsql_identifier_prefix(declaration, arena)?;
     let mut declaration = declaration[split..].trim();
+    if let Some(item) = strip_trigger_keyword(declaration, "alias")
+        .and_then(|rest| strip_trigger_keyword(rest.trim_start(), "for"))
+    {
+        if initial.is_some() {
+            return Err(unsupported_trigger_body());
+        }
+        let written = item.trim();
+        return Ok(ParsedTriggerLocalDecl {
+            source: statement,
+            name,
+            ty: ParsedPlpgsqlLocalType::Record,
+            initial: None,
+            constant: false,
+            not_null: false,
+            bound: None,
+            alias: Some(PlpgsqlAliasItem {
+                target: parse_plpgsql_variable_name(written, arena)?,
+                written,
+            }),
+        });
+    }
     let constant = strip_trigger_keyword(declaration, "constant").is_some();
     if let Some(rest) = strip_trigger_keyword(declaration, "constant") {
         declaration = rest.trim();
@@ -23182,6 +23807,7 @@ fn parse_trigger_local<'a>(
             constant: false,
             not_null: false,
             bound: Some(bound),
+            alias: None,
         });
     }
     let ty = if declaration.eq_ignore_ascii_case("record") {
@@ -23203,7 +23829,10 @@ fn parse_trigger_local<'a>(
             relation: relation.trim(),
         }
     } else {
-        let (name, type_mod) = super::parser::parse_type_name(declaration, arena)?;
+        let frame = crate::sql::error_context::PlpgsqlTypeNameFrame { text: declaration };
+        let (name, type_mod) = crate::sql::error_context::within(&frame, || {
+            super::parser::parse_declared_type_name(declaration, arena)
+        })?;
         ParsedPlpgsqlLocalType::Named { name, type_mod }
     };
     Ok(ParsedTriggerLocalDecl {
@@ -23214,7 +23843,13 @@ fn parse_trigger_local<'a>(
         constant,
         not_null,
         bound: None,
+        alias: None,
     })
+}
+
+/// The name a routine's `n`th parameter also has, `$n`.
+fn positional_parameter_name(number: u32) -> Result<SqlName, SqlError> {
+    SqlName::parse(crate::stack_format!(16, "${}", number).as_str())
 }
 
 /// `[NO] [SCROLL] CURSOR [(name type, ...)] {FOR | IS} query` after a local's
@@ -23383,6 +24018,83 @@ fn bind_plpgsql_dml_ctes<'a>(
         arena,
     )?;
     Ok((expand_plpgsql_with(context, bound, scope)?, materialized))
+}
+
+/// Runs a session cursor's query with data-modifying `WITH` queries on its
+/// first read from a trigger fired inside a writing statement: the writes run
+/// as the trigger's own nested writes do, and the main query's rows fill the
+/// cursor as the session's first FETCH fills it.
+fn fill_trigger_writing_cursor<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    name: &str,
+) -> Result<(), SqlError> {
+    let Some((at, super::cursor::PendingFill::Write)) =
+        context.host.cursors().pending_fill(name)?
+    else {
+        return Ok(());
+    };
+    let arena = context.arena;
+    let (query, mut description, mut rows) =
+        context.host.cursors_mut().begin_write_fill(at, arena)?;
+    let description_mark = description.mark();
+    let render = super::guc::with_active_state(|guc| Ok(guc.render()))?;
+    let outer_params = context.params;
+    context.params = query.params;
+    let filled = super::type_input_plans::with_owner(query.owner, || {
+        with_bound_parameter_types(query.parameter_types, || {
+            context.storage_mut().set_read_snapshot(query.snapshot.0);
+            let (bound, materialized) =
+                bind_plpgsql_dml_ctes(context, query.statement, &crate::sql::eval::NoColumns)?;
+            let txid = context.txn.txid;
+            let sequence =
+                crate::sql::sequence::SeqEval::new(context.storage(), context.seq_session(), txid);
+            let mut capture = Responder::for_cursor(
+                &mut description,
+                crate::pg::respond::CursorRowOutput::Save(&mut rows),
+            )
+            .rows_only();
+            capture.set_render(render);
+            let selected = if bound.from.is_some() {
+                super::query::select_query(
+                    context.storage(),
+                    txid,
+                    bound,
+                    arena,
+                    query.params,
+                    Some(&sequence),
+                    &mut capture,
+                )
+            } else {
+                super::query::constant_select(
+                    context.storage(),
+                    txid,
+                    bound,
+                    arena,
+                    query.params,
+                    Some(&sequence),
+                    &mut capture,
+                )
+            };
+            match selected {
+                Ok(outcome) => outcome?,
+                Err(WireFull) => {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "cursor result exceeds cursor_bytes"
+                    ));
+                }
+            }
+            finish_plpgsql_dml_ctes(context, query.statement, materialized)
+        })
+    });
+    context.params = outer_params;
+    // The description was written when the cursor opened.
+    description.truncate_to(description_mark);
+    context
+        .host
+        .cursors_mut()
+        .end_write_fill(at, description, rows, filled.is_ok())?;
+    filled
 }
 
 /// Binds a query's ordinary `WITH` queries. A materialized one only
@@ -23638,6 +24350,7 @@ fn finish_plpgsql_dml_ctes_of<'a>(
         PlpgsqlExecHost::Routine {
             engine,
             guc,
+            sqlprep,
             cursors,
             ..
         },
@@ -23656,7 +24369,7 @@ fn finish_plpgsql_dml_ctes_of<'a>(
         context.arena,
         context.params,
         guc,
-        cursors,
+        (&mut **sqlprep, &mut **cursors),
         context.responder,
     )
 }
@@ -24357,6 +25070,9 @@ fn parse_trigger_return<'a>(
         PlpgsqlProgramKind::Trigger if value.eq_ignore_ascii_case("new") => TriggerReturn::New,
         PlpgsqlProgramKind::Trigger if value.eq_ignore_ascii_case("old") => TriggerReturn::Old,
         PlpgsqlProgramKind::Trigger if value.eq_ignore_ascii_case("null") => TriggerReturn::Null,
+        PlpgsqlProgramKind::Trigger if !value.is_empty() => {
+            TriggerReturn::Value(parse_plpgsql_expression(value, arena)?)
+        }
         PlpgsqlProgramKind::EventTrigger
         | PlpgsqlProgramKind::Procedure
         | PlpgsqlProgramKind::Anonymous
@@ -24425,10 +25141,18 @@ fn trigger_top_level_range(text: &str, arena: &Arena) -> Result<Option<usize>, S
     })
 }
 
+/// A `FOR` loop's header: its variable, the variables of a target list,
+/// and what it iterates over.
+type PlpgsqlForHeader<'a> = (
+    PlpgsqlVariableName,
+    &'a [PlpgsqlVariableName],
+    TriggerForSource<'a>,
+);
+
 fn parse_trigger_for_header<'a>(
     segment: &'a str,
     arena: &'a Arena,
-) -> Result<Option<(PlpgsqlVariableName, TriggerForSource<'a>)>, SqlError> {
+) -> Result<Option<PlpgsqlForHeader<'a>>, SqlError> {
     let Some(body) = strip_trigger_keyword(segment, "for") else {
         return Ok(None);
     };
@@ -24439,7 +25163,31 @@ fn parse_trigger_for_header<'a>(
         return Err(unsupported_trigger_body());
     };
     let target_source = body[..in_at].trim();
-    let variable = parse_plpgsql_variable_name(target_source, arena)?;
+    let first_target = target_source
+        .split(',')
+        .next()
+        .map_or(target_source, str::trim);
+    let row_targets = if target_source.contains(',') {
+        parse_plpgsql_into_targets(target_source, arena)?.0
+    } else {
+        &[]
+    };
+    // PostgreSQL reads a list only as the scalar variables of a loop over
+    // rows.
+    let single = |kind: &str| -> Result<(), SqlError> {
+        if row_targets.is_empty() {
+            return Ok(());
+        }
+        Err(crate::sql::error_position::at_subject(
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "{} FOR loop must have only one target variable",
+                kind
+            ),
+            first_target,
+        ))
+    };
+    let variable = parse_plpgsql_variable_name(first_target, arena)?;
     let mut source = body[in_at + 2..].trim();
     if source.is_empty() {
         return Err(unsupported_trigger_body());
@@ -24451,7 +25199,11 @@ fn parse_trigger_for_header<'a>(
             using_at.map(|at| &command[at + "using".len()..]),
             arena,
         )?;
-        return Ok(Some((variable, TriggerForSource::DynamicQuery(query))));
+        return Ok(Some((
+            variable,
+            row_targets,
+            TriggerForSource::DynamicQuery(query),
+        )));
     }
     if strip_trigger_keyword(source, "with").is_some() {
         if plpgsql_with_main_keyword(source, arena)? != Some("select") {
@@ -24462,12 +25214,14 @@ fn parse_trigger_for_header<'a>(
         }
         return Ok(Some((
             variable,
+            row_targets,
             TriggerForSource::Query(parse_plpgsql_query(source, source, arena)?),
         )));
     }
     if strip_trigger_keyword(source, "select").is_some() {
         return Ok(Some((
             variable,
+            row_targets,
             TriggerForSource::Query(parse_plpgsql_query(source, source, arena)?),
         )));
     }
@@ -24476,6 +25230,7 @@ fn parse_trigger_for_header<'a>(
     {
         match plpgsql_cursor_variable(cursor) {
             Some(Some(bound)) => {
+                single("cursor")?;
                 let arguments = match source[split..].trim() {
                     // PostgreSQL points a missing argument list at `LOOP`.
                     "" => {
@@ -24511,7 +25266,11 @@ fn parse_trigger_for_header<'a>(
                 let fetch = &*arena
                     .alloc(fetch)
                     .map_err(|_| super::query::arena_full_pub())?;
-                return Ok(Some((variable, TriggerForSource::Cursor { open, fetch })));
+                return Ok(Some((
+                    variable,
+                    row_targets,
+                    TriggerForSource::Cursor { open, fetch },
+                )));
             }
             Some(None) => {
                 return Err(super::error_position::at_subject(
@@ -24537,7 +25296,7 @@ fn parse_trigger_for_header<'a>(
             source,
             arena,
         )?;
-        return Ok(Some((variable, TriggerForSource::Dml(source))));
+        return Ok(Some((variable, row_targets, TriggerForSource::Dml(source))));
     }
     let reverse = if let Some(rest) = strip_trigger_keyword(source, "reverse") {
         source = rest.trim();
@@ -24563,10 +25322,12 @@ fn parse_trigger_for_header<'a>(
             .alloc(Expr::Int(1))
             .map_err(|_| super::query::arena_full_pub())?,
     };
+    single("integer")?;
     // An integer loop declares its counter, which a label cannot qualify.
     let target = parse_plpgsql_identifier(target_source, arena)?;
     Ok(Some((
         variable,
+        row_targets,
         TriggerForSource::Numeric {
             counter_keyword: (!target.quoted && target.name.as_str() == "sqlstate")
                 .then_some(target.spelling),
@@ -24581,7 +25342,7 @@ fn parse_trigger_for_header<'a>(
 fn parse_trigger_foreach_header<'a>(
     segment: &'a str,
     arena: &'a Arena,
-) -> Result<Option<(PlpgsqlVariableName, TriggerForSource<'a>)>, SqlError> {
+) -> Result<Option<PlpgsqlForHeader<'a>>, SqlError> {
     let Some(body) = strip_trigger_keyword(segment, "foreach") else {
         return Ok(None);
     };
@@ -24592,16 +25353,22 @@ fn parse_trigger_foreach_header<'a>(
         return Err(unsupported_trigger_body());
     };
     let target_source = body[..in_at].trim();
-    let (target, slice) = match trigger_top_level_keyword(target_source, "slice", arena)? {
+    let (variables, slice) = match trigger_top_level_keyword(target_source, "slice", arena)? {
         Some(at) => {
-            let target = parse_plpgsql_variable_name(&target_source[..at], arena)?;
             let slice = target_source[at + 5..].trim();
             let slice = slice
                 .parse::<u8>()
                 .map_err(|_| unsupported_trigger_body())?;
-            (target, NonZeroU8::new(slice))
+            (target_source[..at].trim(), NonZeroU8::new(slice))
         }
-        None => (parse_plpgsql_variable_name(target_source, arena)?, None),
+        None => (target_source, None),
+    };
+    // A list of variables takes each element's fields.
+    let (target, row_targets) = if variables.contains(',') {
+        let targets = parse_plpgsql_into_targets(variables, arena)?.0;
+        (targets[0], targets)
+    } else {
+        (parse_plpgsql_variable_name(variables, arena)?, &[][..])
     };
     let array = strip_trigger_keyword(body[in_at + 2..].trim(), "array")
         .ok_or_else(unsupported_trigger_body)?
@@ -24611,6 +25378,7 @@ fn parse_trigger_foreach_header<'a>(
     }
     Ok(Some((
         target,
+        row_targets,
         TriggerForSource::Array {
             expression: parse_plpgsql_expression(array, arena)?,
             slice,
@@ -25936,7 +26704,9 @@ fn parse_trigger_block<'a>(
                 }
                 statement => statement,
             }
-        } else if let Some((target, source)) = parse_trigger_for_header(loop_header, arena)? {
+        } else if let Some((target, row_targets, source)) =
+            parse_trigger_for_header(loop_header, arena)?
+        {
             targets[depth] = PlpgsqlExitTarget {
                 label: loop_label,
                 is_loop: true,
@@ -25957,10 +26727,13 @@ fn parse_trigger_block<'a>(
             TriggerStatement::For(TriggerFor {
                 label: loop_label,
                 target,
+                row_targets,
                 source,
                 block,
             })
-        } else if let Some((target, source)) = parse_trigger_foreach_header(loop_header, arena)? {
+        } else if let Some((target, row_targets, source)) =
+            parse_trigger_foreach_header(loop_header, arena)?
+        {
             targets[depth] = PlpgsqlExitTarget {
                 label: loop_label,
                 is_loop: true,
@@ -25981,6 +26754,7 @@ fn parse_trigger_block<'a>(
             TriggerStatement::For(TriggerFor {
                 label: loop_label,
                 target,
+                row_targets,
                 source,
                 block,
             })
@@ -26075,11 +26849,24 @@ fn parse_plpgsql_program<'a>(
     arena: &'a Arena,
     program_kind: PlpgsqlProgramKind,
 ) -> Result<ParsedTriggerProgram<'a>, SqlError> {
+    parse_routine_program(body, arena, program_kind, 0)
+}
+
+/// Parses the body of a routine with `positionals` parameters, which its
+/// text also names `$1` to `$positionals`.
+fn parse_routine_program<'a>(
+    body: &'a str,
+    arena: &'a Arena,
+    program_kind: PlpgsqlProgramKind,
+    positionals: u32,
+) -> Result<ParsedTriggerProgram<'a>, SqlError> {
     // A compile error points into the body where the statement wrote it, as
     // PostgreSQL's do; a body from the catalog is not in the statement.
     let (mut program, sites) = crate::sql::error_position::with_analysis_in(body, || {
         super::plpgsql_inputs::capture(body, arena, || {
-            parse_plpgsql_program_inner(body, arena, program_kind)
+            super::parser::with_procedural_positionals(positionals, || {
+                parse_plpgsql_program_inner(body, arena, program_kind)
+            })
         })
     })?;
     program.input_sites = sites;
@@ -26272,11 +27059,139 @@ fn parse_plpgsql_program_body<'a>(
 /// The declared type of a routine's parameter or output column named `name`.
 type ParameterType<'p> = dyn Fn(SqlName) -> Option<ColType> + 'p;
 
+/// The PL/pgSQL variable a routine's `index`th parameter is: its own name,
+/// or `$n` when it has none.
+fn parameter_variable_name(
+    index: usize,
+    parameter: &RoutineParameterDef,
+) -> Result<SqlName, SqlError> {
+    if parameter.name.as_str().is_empty() {
+        positional_parameter_name(u32::try_from(index + 1).expect("routine parameter capacity"))
+    } else {
+        Ok(parameter.name)
+    }
+}
+
+/// How many invocation-level variables [`declare_routine_parameters`]
+/// declares for a routine's `parameters`.
+fn parameter_variable_count(parameters: &[RoutineParameterDef]) -> usize {
+    parameters.len()
+        + parameters
+            .iter()
+            .filter(|parameter| !parameter.name.as_str().is_empty())
+            .count()
+}
+
+/// Declares a routine's parameters as PL/pgSQL variables, as PostgreSQL's
+/// compiler does: each parameter in order, named after it or `$n` when it
+/// has no name, then `$n` for each named one as an alias of it. Returns how
+/// many variables it declared.
+fn declare_routine_parameters(
+    routine: &crate::storage::RoutineDef,
+    declarations: &mut [TriggerLocalDecl],
+) -> Result<usize, SqlError> {
+    let parameters = routine.parameters();
+    let mut count = 0usize;
+    for (index, parameter) in parameters.iter().enumerate() {
+        let name = parameter_variable_name(index, parameter)?;
+        if declarations[..count]
+            .iter()
+            .any(|prior: &TriggerLocalDecl| prior.name == name)
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "routine parameter \"{}\" conflicts with a PL/pgSQL variable",
+                name.as_str()
+            ));
+        }
+        declarations[count] = TriggerLocalDecl {
+            label: Some(routine.name),
+            scope: PlpgsqlScope::Invocation,
+            name,
+            ctype: parameter.ctype,
+            user_type: parameter.user_type,
+            ..empty_plpgsql_local()
+        };
+        count += 1;
+    }
+    for (index, parameter) in parameters.iter().enumerate() {
+        if parameter.name.as_str().is_empty() {
+            continue;
+        }
+        declarations[count] = TriggerLocalDecl {
+            label: Some(routine.name),
+            scope: PlpgsqlScope::Invocation,
+            name: positional_parameter_name(
+                u32::try_from(index + 1).expect("routine parameter capacity"),
+            )?,
+            alias: Some(PlpgsqlVariableName::plain(parameter.name)),
+            ..empty_plpgsql_local()
+        };
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// The initial values of [`declare_routine_parameters`]'s variables: each
+/// input in order, NULL for an output-only parameter and for every alias.
+fn seed_routine_parameters<'a>(
+    parameters: &[RoutineParameterDef],
+    inputs: &[Datum<'a>],
+    values: &mut [Datum<'a>],
+) -> Result<usize, SqlError> {
+    let count = parameter_variable_count(parameters);
+    values[..count].fill(Datum::Null);
+    let mut input_index = 0usize;
+    for (value, parameter) in values.iter_mut().zip(parameters) {
+        if parameter.mode.is_input() {
+            *value = inputs.get(input_index).copied().ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "routine inputs do not match its parameters"
+                )
+            })?;
+            input_index += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// The slot of a routine's `index`th parameter among `locals`.
+fn parameter_slot(
+    locals: &[TriggerLocalDecl],
+    index: usize,
+    parameter: &RoutineParameterDef,
+) -> Option<usize> {
+    let name = parameter_variable_name(index, parameter).ok()?;
+    locals
+        .iter()
+        .position(|local| local.name == name && local.alias.is_none())
+}
+
+/// How many parameters a routine's PL/pgSQL body names `$1` onwards: all of
+/// them, output parameters included, as PostgreSQL numbers them.
+fn routine_positionals(routine: &crate::storage::RoutineDef) -> u32 {
+    u32::try_from(routine.parameters().len()).expect("routine parameter capacity fits u32")
+}
+
+/// The parameter `$n` names, where `name` is `$n`.
+fn positional_parameter(
+    parameters: &[RoutineParameterDef],
+    name: SqlName,
+) -> Option<&RoutineParameterDef> {
+    let number = name.as_str().strip_prefix('$')?;
+    if number.starts_with('0') {
+        return None;
+    }
+    parameters.get(number.parse::<usize>().ok()?.checked_sub(1)?)
+}
+
 fn routine_parameter_type(routine: &crate::storage::RoutineDef, name: SqlName) -> Option<ColType> {
     routine
         .parameters()
         .iter()
         .find(|parameter| parameter.name == name)
+        .or_else(|| positional_parameter(routine.parameters(), name))
         .map(|parameter| parameter.ctype)
         .or_else(|| {
             routine.result_columns[..routine.result_column_count]
@@ -26305,6 +27220,7 @@ fn resolve_plpgsql_program_locals<'a>(
             record_shape: None,
             constant: false,
             not_null: false,
+            alias: None,
         })
         .map_err(|_| super::query::arena_full_pub())?;
     for (index, local) in program.locals.iter().copied().enumerate() {
@@ -26319,6 +27235,7 @@ fn resolve_plpgsql_program_locals<'a>(
     // Nested blocks resolve their declarations on entry; resolving them here
     // reports a missing type when the routine is created, as PostgreSQL does.
     validate_plpgsql_nested_declarations(program.body, storage, txid)?;
+    let declarations = program.locals;
     let program = TriggerProgram {
         locals: resolved,
         body: program.body,
@@ -26328,11 +27245,205 @@ fn resolve_plpgsql_program_locals<'a>(
     };
     validate_plpgsql_variable_uses(
         &program,
+        declarations,
         parsed_kind == PlpgsqlProgramKind::Trigger,
         has_parameter,
         arena,
     )?;
     Ok(program)
+}
+
+/// The variables one PL/pgSQL namespace level declares, innermost level
+/// first through `parent`.
+#[derive(Clone, Copy)]
+enum PlpgsqlNames<'s> {
+    /// The routine's own level: its parameters, `found` and, for a trigger
+    /// function, the trigger's special variables.
+    Routine {
+        parameters: &'s [RoutineParameterDef],
+        /// A `RETURNS TABLE` function's columns.
+        outputs: &'s [crate::storage::RoutineArgumentDef],
+        kind: PlpgsqlProgramKind,
+    },
+    Declarations(&'s [ParsedTriggerLocalDecl<'s>]),
+    /// A `FOR` loop's counter or record.
+    Loop(SqlName),
+    /// An exception handler's `sqlstate` and `sqlerrm`.
+    Handler,
+}
+
+#[derive(Clone, Copy)]
+struct PlpgsqlNamespace<'s> {
+    names: PlpgsqlNames<'s>,
+    parent: Option<&'s PlpgsqlNamespace<'s>>,
+}
+
+impl PlpgsqlNamespace<'_> {
+    fn declares(&self, name: SqlName) -> bool {
+        let here = match self.names {
+            PlpgsqlNames::Routine {
+                parameters,
+                outputs,
+                kind,
+            } => {
+                parameters.iter().any(|parameter| parameter.name == name)
+                    || outputs.iter().any(|output| output.name == name)
+                    // Every parameter is also `$n`.
+                    || name
+                        .as_str()
+                        .strip_prefix('$')
+                        .and_then(|number| number.parse::<usize>().ok())
+                        .is_some_and(|number| {
+                            number >= 1
+                                && number <= parameters.len()
+                                && !name.as_str()[1..].starts_with('0')
+                        })
+                    || name.as_str() == "found"
+                    || matches!(kind, PlpgsqlProgramKind::Trigger)
+                        && matches!(
+                            name.as_str(),
+                            "new"
+                                | "old"
+                                | "tg_name"
+                                | "tg_when"
+                                | "tg_level"
+                                | "tg_op"
+                                | "tg_relid"
+                                | "tg_relname"
+                                | "tg_table_name"
+                                | "tg_table_schema"
+                                | "tg_nargs"
+                                | "tg_argv"
+                        )
+                    || matches!(kind, PlpgsqlProgramKind::EventTrigger)
+                        && matches!(name.as_str(), "tg_event" | "tg_tag")
+            }
+            PlpgsqlNames::Declarations(declarations) => declarations
+                .iter()
+                .any(|declaration| declaration.name == name),
+            PlpgsqlNames::Loop(declared) => declared == name,
+            PlpgsqlNames::Handler => matches!(name.as_str(), "sqlstate" | "sqlerrm"),
+        };
+        here || self.parent.is_some_and(|parent| parent.declares(name))
+    }
+}
+
+/// PL/pgSQL's `shadowed_variables` extra check, which `CREATE FUNCTION` and
+/// `CREATE PROCEDURE` make while validating a body: each declaration whose
+/// name a level enclosing its block already declares is reported at the
+/// name, as a warning or, from `plpgsql.extra_errors`, an error.
+fn check_shadowed_variables(
+    program: &ParsedTriggerProgram<'_>,
+    routine: PlpgsqlNames<'_>,
+    level: super::guc::PlpgsqlExtraCheckLevel,
+    responder: &mut Responder<'_>,
+) -> Result<(), SqlError> {
+    fn report(
+        declaration: &ParsedTriggerLocalDecl<'_>,
+        level: super::guc::PlpgsqlExtraCheckLevel,
+        responder: &mut Responder<'_>,
+    ) -> Result<(), SqlError> {
+        let written = declaration.source.trim_start();
+        let spelling = written
+            .find(char::is_whitespace)
+            .map_or(written, |end| &written[..end]);
+        let error = sql_err!(
+            sqlstate::DUPLICATE_ALIAS,
+            "variable \"{}\" shadows a previously defined variable",
+            declaration.name.as_str()
+        );
+        match level {
+            super::guc::PlpgsqlExtraCheckLevel::Error => {
+                Err(crate::sql::error_position::at_subject(error, spelling))
+            }
+            super::guc::PlpgsqlExtraCheckLevel::Warning => responder
+                .parse_notice(
+                    true,
+                    error.sqlstate.as_str(),
+                    error.message.as_str(),
+                    crate::sql::error_position::client_position(spelling)
+                        .and_then(crate::pg::respond::CursorPosition::from_position),
+                )
+                .map_err(trigger_notice_to_sql),
+        }
+    }
+    fn declare<'s>(
+        declarations: &'s [ParsedTriggerLocalDecl<'s>],
+        block: TriggerBlock<'s>,
+        enclosing: &PlpgsqlNamespace<'_>,
+        level: super::guc::PlpgsqlExtraCheckLevel,
+        responder: &mut Responder<'_>,
+    ) -> Result<(), SqlError> {
+        for declaration in declarations {
+            if enclosing.declares(declaration.name) {
+                report(declaration, level, responder)?;
+            }
+        }
+        let namespace = PlpgsqlNamespace {
+            names: PlpgsqlNames::Declarations(declarations),
+            parent: Some(enclosing),
+        };
+        visit(block, &namespace, level, responder)
+    }
+    fn visit(
+        block: TriggerBlock<'_>,
+        namespace: &PlpgsqlNamespace<'_>,
+        level: super::guc::PlpgsqlExtraCheckLevel,
+        responder: &mut Responder<'_>,
+    ) -> Result<(), SqlError> {
+        let mut result = Ok(());
+        numeric_loops::visit_nested_blocks(block, |child, edge| {
+            if result.is_err() {
+                return;
+            }
+            result = match edge {
+                numeric_loops::BlockEdge::Scope(declarations) => {
+                    declare(declarations, child, namespace, level, responder)
+                }
+                numeric_loops::BlockEdge::Numeric | numeric_loops::BlockEdge::Cursor => {
+                    let counter = block
+                        .statements
+                        .iter()
+                        .find_map(|statement| match statement {
+                            TriggerStatement::For(program)
+                                if core::ptr::eq(program.block.statements, child.statements) =>
+                            {
+                                Some(program.target.name)
+                            }
+                            _ => None,
+                        });
+                    match counter {
+                        Some(counter) => visit(
+                            child,
+                            &PlpgsqlNamespace {
+                                names: PlpgsqlNames::Loop(counter),
+                                parent: Some(namespace),
+                            },
+                            level,
+                            responder,
+                        ),
+                        None => visit(child, namespace, level, responder),
+                    }
+                }
+                numeric_loops::BlockEdge::Handler => visit(
+                    child,
+                    &PlpgsqlNamespace {
+                        names: PlpgsqlNames::Handler,
+                        parent: Some(namespace),
+                    },
+                    level,
+                    responder,
+                ),
+                numeric_loops::BlockEdge::Ordinary => visit(child, namespace, level, responder),
+            };
+        });
+        result
+    }
+    let routine = PlpgsqlNamespace {
+        names: routine,
+        parent: None,
+    };
+    declare(program.locals, program.body, &routine, level, responder)
 }
 
 /// Resolves one declaration's type against the catalog.
@@ -26343,6 +27454,15 @@ fn resolve_plpgsql_local(
     storage: &Storage,
     txid: u32,
 ) -> Result<TriggerLocalDecl, SqlError> {
+    if let Some(item) = local.alias {
+        return Ok(TriggerLocalDecl {
+            scope,
+            label,
+            name: local.name,
+            alias: Some(item.target),
+            ..empty_plpgsql_local()
+        });
+    }
     let (ctype, user_type, type_mod, record_shape) = match local.ty {
         // A table's name also names its row type, as with `%ROWTYPE`.
         ParsedPlpgsqlLocalType::Named { name, type_mod }
@@ -26389,6 +27509,7 @@ fn resolve_plpgsql_local(
         record_shape,
         constant: local.constant,
         not_null: local.not_null,
+        alias: None,
     })
 }
 
@@ -26418,13 +27539,15 @@ fn validate_plpgsql_nested_declarations(
 fn compile_plpgsql_execution<'a>(
     source: &str,
     kind: PlpgsqlProgramKind,
+    positionals: u32,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     has_parameter: &ParameterType<'_>,
 ) -> Result<(TriggerProgram<'a>, CompiledProgram<'a>), SqlError> {
+    crate::sql::guc::note_plpgsql_use();
     let written = source;
-    let source = ProgramSource::capture(source, kind, &storage.execution_control)?;
+    let source = ProgramSource::capture(source, kind, positionals, &storage.execution_control)?;
     let (parsed, code) = source.parse(arena, Some(written))?;
     let program = crate::sql::error_position::with_copied_source(written, code.text(), || {
         resolve_plpgsql_program_locals(parsed, storage, txid, arena, has_parameter)
@@ -26434,6 +27557,7 @@ fn compile_plpgsql_execution<'a>(
 
 fn validate_plpgsql_variable_uses(
     program: &TriggerProgram<'_>,
+    declarations: &[ParsedTriggerLocalDecl<'_>],
     trigger: bool,
     has_parameter: &ParameterType<'_>,
     arena: &Arena,
@@ -26458,13 +27582,54 @@ fn validate_plpgsql_variable_uses(
             }
             shadowed = local.parent;
         }
-        locals
-            .iter()
-            .rfind(|local| target.names(local))
-            .map(|local| local.constant)
+        match locals.iter().rposition(|local| target.names(local)) {
+            // An alias is as constant as the variable it names; one of a
+            // trigger's `NEW` or `OLD` is assignable.
+            Some(index) => match locals[index].alias {
+                Some(aliased) => binding_constant(aliased, &locals[..index], None, has_parameter)
+                    .or_else(|| {
+                        (aliased.label.is_none() && matches!(aliased.name.as_str(), "new" | "old"))
+                            .then_some(false)
+                    }),
+                None => Some(locals[index].constant),
+            },
             // A parameter's label is its routine's name, which this check
             // does not know; execution resolves the label.
-            .or_else(|| has_parameter(target.name).map(|_| false))
+            None => has_parameter(target.name).map(|_| false),
+        }
+    }
+    /// An `ALIAS FOR` names a variable declared before it, a parameter, or
+    /// in a trigger function `NEW` or `OLD`.
+    fn alias_target(
+        item: PlpgsqlAliasItem<'_>,
+        locals: &[TriggerLocalDecl],
+        shadowed: Option<&ScopedLocal<'_>>,
+        has_parameter: &ParameterType<'_>,
+        trigger: bool,
+    ) -> Result<bool, SqlError> {
+        if let Some(constant) = binding_constant(item.target, locals, shadowed, has_parameter) {
+            return Ok(constant);
+        }
+        if trigger
+            && item.target.label.is_none()
+            && matches!(item.target.name.as_str(), "new" | "old")
+        {
+            return Ok(false);
+        }
+        let error = match item.target.label {
+            Some(label) => sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "variable \"{}.{}\" does not exist",
+                label.as_str(),
+                item.target.name.as_str()
+            ),
+            None => sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "variable \"{}\" does not exist",
+                item.target.name.as_str()
+            ),
+        };
+        Err(crate::sql::error_position::at_subject(error, item.written))
     }
     fn reject(
         target: PlpgsqlVariableName,
@@ -26718,6 +27883,44 @@ fn validate_plpgsql_variable_uses(
                         )?;
                     } else {
                         reject(statement.target, Some("for"))?;
+                        // A list names scalar variables only.
+                        for target in statement.row_targets {
+                            reject(*target, Some("for"))?;
+                            let error =
+                                match binding_constant(*target, locals, shadowed, has_parameter) {
+                                    None => Some(sql_err!(
+                                        sqlstate::SYNTAX_ERROR,
+                                        "\"{}\" is not a known variable",
+                                        target.name.as_str()
+                                    )),
+                                    Some(_) => plpgsql_slot(locals, |local| target.names(local))
+                                        .map(|slot| locals[slot])
+                                        .filter(|local| {
+                                            local.record_shape.is_some()
+                                                || matches!(
+                                                    local.ctype,
+                                                    ColType::Record | ColType::Composite(_)
+                                                )
+                                        })
+                                        .map(|_| {
+                                            sql_err!(
+                                                sqlstate::SYNTAX_ERROR,
+                                                "\"{}\" is not a scalar variable",
+                                                target.name.as_str()
+                                            )
+                                        }),
+                                };
+                            if let Some(error) = error {
+                                return Err(
+                                    match plpgsql_target_text(source, Some("for"), *target, arena) {
+                                        Some(text) => {
+                                            crate::sql::error_position::at_subject(error, text)
+                                        }
+                                        None => error,
+                                    },
+                                );
+                            }
+                        }
                         validate_block(
                             statement.block,
                             locals,
@@ -26844,10 +28047,14 @@ fn validate_plpgsql_variable_uses(
         match declarations.split_first() {
             None => validate_block(block, locals, shadowed, has_parameter, trigger, arena),
             Some((first, rest)) => {
+                let constant = match first.alias {
+                    Some(item) => alias_target(item, locals, shadowed, has_parameter, trigger)?,
+                    None => first.constant,
+                };
                 let local = ScopedLocal {
                     label,
                     name: first.name,
-                    constant: first.constant,
+                    constant,
                     parent: shadowed,
                 };
                 validate_scope(
@@ -26861,6 +28068,11 @@ fn validate_plpgsql_variable_uses(
                     arena,
                 )
             }
+        }
+    }
+    for (index, (local, declared)) in program.locals.iter().zip(declarations).enumerate() {
+        if let (Some(_), Some(item)) = (local.alias, declared.alias) {
+            alias_target(item, &program.locals[..index], None, has_parameter, trigger)?;
         }
     }
     validate_block(
@@ -27043,6 +28255,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
     let (program, code) = compile_plpgsql_execution(
         source,
         PlpgsqlProgramKind::Anonymous,
+        0,
         &engine.storage,
         txn.txid,
         arena,
@@ -27117,6 +28330,7 @@ pub(crate) fn execute_event_trigger<'a>(
     let (program, code) = compile_plpgsql_execution(
         routine.body.as_str(),
         PlpgsqlProgramKind::EventTrigger,
+        0,
         &engine.storage,
         txn.txid,
         arena,
@@ -27364,6 +28578,7 @@ pub(in crate::sql) fn execute_retained_anonymous_plpgsql<'a>(
     let (program, code) = compile_plpgsql_execution(
         source,
         PlpgsqlProgramKind::Anonymous,
+        0,
         context.storage(),
         context.txn.txid,
         arena,
@@ -27404,6 +28619,7 @@ fn compile_plpgsql_procedure<'a>(
     compile_plpgsql_execution(
         routine.body.as_str(),
         PlpgsqlProgramKind::Procedure,
+        routine_positionals(routine),
         context.storage(),
         context.txn.txid,
         arena,
@@ -27411,91 +28627,36 @@ fn compile_plpgsql_procedure<'a>(
     )
 }
 
-/// Named formal parameters first, then the body's declarations, as one
-/// typed namespace.
+/// The parameters first, then the body's declarations, as one typed
+/// namespace.
 fn procedure_declarations<'a>(
     routine: &crate::storage::RoutineDef,
     program_locals: &[TriggerLocalDecl],
     arena: &'a Arena,
 ) -> Result<&'a [TriggerLocalDecl], SqlError> {
-    let named = routine
-        .parameters()
-        .iter()
-        .filter(|parameter| !parameter.name.as_str().is_empty())
-        .count();
     let declarations = arena
-        .alloc_slice_with(named.saturating_add(program_locals.len()), |_| {
-            empty_plpgsql_local()
-        })
+        .alloc_slice_with(
+            parameter_variable_count(routine.parameters()).saturating_add(program_locals.len()),
+            |_| empty_plpgsql_local(),
+        )
         .map_err(|_| super::query::arena_full_pub())?;
-    let mut count = 0usize;
-    for parameter in routine.parameters() {
-        if parameter.name.as_str().is_empty() {
-            continue;
-        }
-        if declarations[..count]
-            .iter()
-            .any(|prior: &TriggerLocalDecl| prior.name == parameter.name)
-        {
-            return Err(sql_err!(
-                sqlstate::INVALID_FUNCTION_DEFINITION,
-                "procedure parameter \"{}\" conflicts with a PL/pgSQL variable",
-                parameter.name.as_str()
-            ));
-        }
-        declarations[count] = TriggerLocalDecl {
-            label: Some(routine.name),
-            scope: PlpgsqlScope::Invocation,
-            name: parameter.name,
-            ctype: parameter.ctype,
-            user_type: parameter.user_type,
-            type_mod: -1,
-            record_shape: None,
-            constant: false,
-            not_null: false,
-        };
-        count += 1;
-    }
+    let count = declare_routine_parameters(routine, declarations)?;
     declarations[count..].copy_from_slice(program_locals);
     Ok(declarations)
 }
 
-/// Initial values of the named formal parameters: inputs in order, NULL for
-/// output-only parameters.
+/// Initial values of the parameters' variables.
 fn procedure_seeded_values<'a>(
     routine: &crate::storage::RoutineDef,
     inputs: &'a [Datum<'a>],
     arena: &'a Arena,
 ) -> Result<&'a [Datum<'a>], SqlError> {
-    let named = routine
-        .parameters()
-        .iter()
-        .filter(|parameter| !parameter.name.as_str().is_empty())
-        .count();
     let seeded = arena
-        .alloc_slice_with(named, |_| Datum::Null)
+        .alloc_slice_with(parameter_variable_count(routine.parameters()), |_| {
+            Datum::Null
+        })
         .map_err(|_| super::query::arena_full_pub())?;
-    let mut input_index = 0usize;
-    let mut count = 0usize;
-    for parameter in routine.parameters() {
-        let input = if parameter.mode.is_input() {
-            let value = inputs.get(input_index).copied().ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "procedure inputs do not match its parameters"
-                )
-            })?;
-            input_index += 1;
-            Some(value)
-        } else {
-            None
-        };
-        if parameter.name.as_str().is_empty() {
-            continue;
-        }
-        seeded[count] = input.unwrap_or(Datum::Null);
-        count += 1;
-    }
+    seed_routine_parameters(routine.parameters(), inputs, seeded)?;
     Ok(seeded)
 }
 
@@ -27506,16 +28667,12 @@ fn procedure_output_values<'a>(
     outputs: &mut [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
 ) -> usize {
     let mut output_count = 0usize;
-    for parameter in routine.parameters() {
+    for (index, parameter) in routine.parameters().iter().enumerate() {
         if !parameter.mode.is_output() {
             continue;
         }
-        outputs[output_count] = execution
-            .locals
-            .iter()
-            .position(|local| local.name == parameter.name)
-            .filter(|_| !parameter.name.as_str().is_empty())
-            .map_or(Datum::Null, |index| execution.values[index]);
+        outputs[output_count] = parameter_slot(&execution.locals, index, parameter)
+            .map_or(Datum::Null, |slot| execution.values[slot]);
         output_count += 1;
     }
     output_count
@@ -27545,65 +28702,23 @@ fn run_plpgsql_procedure<'a>(
     let (program, code) = compile_plpgsql_execution(
         routine.body.as_str(),
         PlpgsqlProgramKind::Procedure,
+        routine_positionals(routine),
         context.storage(),
         txid,
         arena,
         &|name| routine_parameter_type(routine, name),
     )?;
-    let declaration_capacity = routine
-        .parameters()
-        .iter()
-        .filter(|parameter| !parameter.name.as_str().is_empty())
-        .count()
-        .saturating_add(program.locals.len());
+    let declaration_capacity =
+        parameter_variable_count(routine.parameters()).saturating_add(program.locals.len());
     let declarations = arena
         .alloc_slice_with(declaration_capacity, |_| empty_plpgsql_local())
         .map_err(|_| super::query::arena_full_pub())?;
     let mut seeded = allocate_plpgsql_local_values(
         &context.storage().execution_control,
-        routine
-            .parameters()
-            .iter()
-            .filter(|parameter| !parameter.name.as_str().is_empty())
-            .count(),
+        parameter_variable_count(routine.parameters()),
     )?;
-    let mut declaration_count = 0usize;
-    let mut input_index = 0usize;
-    for parameter in routine.parameters() {
-        let input = if parameter.mode.is_input() {
-            let value = inputs[input_index];
-            input_index += 1;
-            Some(value)
-        } else {
-            None
-        };
-        if parameter.name.as_str().is_empty() {
-            continue;
-        }
-        if declarations[..declaration_count]
-            .iter()
-            .any(|prior: &TriggerLocalDecl| prior.name == parameter.name)
-        {
-            return Err(sql_err!(
-                sqlstate::INVALID_FUNCTION_DEFINITION,
-                "procedure parameter \"{}\" conflicts with a PL/pgSQL variable",
-                parameter.name.as_str()
-            ));
-        }
-        declarations[declaration_count] = TriggerLocalDecl {
-            label: Some(routine.name),
-            scope: PlpgsqlScope::Invocation,
-            name: parameter.name,
-            ctype: parameter.ctype,
-            user_type: parameter.user_type,
-            type_mod: -1,
-            record_shape: None,
-            constant: false,
-            not_null: false,
-        };
-        seeded[declaration_count] = input.unwrap_or(Datum::Null);
-        declaration_count += 1;
-    }
+    let mut declaration_count = declare_routine_parameters(routine, declarations)?;
+    seed_routine_parameters(routine.parameters(), inputs, &mut seeded)?;
     let seeded_count = declaration_count;
     for local in program.locals {
         declarations[declaration_count] = *local;
@@ -27651,20 +28766,7 @@ fn run_plpgsql_procedure<'a>(
             return Err(unsupported_trigger_body());
         }
     }
-    let mut output_count = 0usize;
-    for parameter in routine.parameters() {
-        if !parameter.mode.is_output() {
-            continue;
-        }
-        outputs[output_count] = execution
-            .locals
-            .iter()
-            .position(|local| local.name == parameter.name)
-            .filter(|_| !parameter.name.as_str().is_empty())
-            .map_or(Datum::Null, |index| execution.values[index]);
-        output_count += 1;
-    }
-    Ok(output_count)
+    Ok(procedure_output_values(routine, &execution, outputs))
 }
 
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
@@ -28176,9 +29278,7 @@ fn plpgsql_row_variable(
     name: &str,
 ) -> Option<crate::sql::eval::RowVariable> {
     use crate::sql::eval::RowVariable;
-    let index = locals
-        .iter()
-        .rposition(|local| local.name.as_str() == name)?;
+    let index = plpgsql_slot(locals, |local| local.name.as_str() == name)?;
     let local = locals[index];
     match values[index] {
         Datum::Null => match (local.record_shape, local.ctype) {
@@ -28204,7 +29304,7 @@ fn plpgsql_variable<'a>(
     name: &str,
 ) -> Option<PlpgsqlVariable<'a>> {
     // Parameter slots precede body declarations; the innermost name wins.
-    let local = locals.iter().rposition(|local| local.name.as_str() == name);
+    let local = plpgsql_slot(locals, |local| local.name.as_str() == name);
     if let Some(variable) = TriggerExceptionVariable::parse(name)
         && let Some(exception) = invocation.exception
         && local.is_none_or(|index| locals[index].scope <= exception.scope)
@@ -28251,13 +29351,17 @@ fn plpgsql_labeled_index(
     let record = locals
         .iter()
         .rposition(|local| local.name.as_str() == qualifier);
-    locals
+    let index = locals
         .iter()
         .rposition(|local| {
             local.name.as_str() == name
                 && local.label.is_some_and(|label| label.as_str() == qualifier)
         })
-        .filter(|index| record.is_none_or(|record| record < *index))
+        .filter(|index| record.is_none_or(|record| record < *index))?;
+    match plpgsql_binding(locals, index)? {
+        PlpgsqlBinding::Slot(index) => Some(index),
+        PlpgsqlBinding::Transition(_) => None,
+    }
 }
 
 /// The record variable whose field `qualifier.field` names: `record.field`,
@@ -28265,9 +29369,7 @@ fn plpgsql_labeled_index(
 fn plpgsql_record_index(locals: &[TriggerLocalDecl], qualifier: &str) -> Option<usize> {
     match qualifier.split_once('.') {
         Some((label, record)) => plpgsql_labeled_index(locals, label, record),
-        None => locals
-            .iter()
-            .rposition(|local| local.name.as_str() == qualifier),
+        None => plpgsql_slot(locals, |local| local.name.as_str() == qualifier),
     }
 }
 
@@ -28305,9 +29407,27 @@ struct TriggerLocalScope<'t, 'a> {
 }
 
 impl<'a> TriggerLocalScope<'_, 'a> {
+    /// `NEW` or `OLD` when `name` is declared an alias of one in a trigger
+    /// function.
+    fn transition_alias(&self, name: &str) -> Option<&'static str> {
+        if self.invocation.program_kind != PlpgsqlProgramKind::Trigger {
+            return None;
+        }
+        plpgsql_transition_alias(self.locals, name)
+    }
+
+    /// `name`, or the trigger record it is an alias of.
+    fn canonical<'n>(&self, name: &'n str) -> &'n str {
+        self.transition_alias(name).unwrap_or(name)
+    }
+
     /// `NEW.x` and `OLD.x` read a trigger function's records.
     fn names_trigger_record(&self, qualifier: Option<&str>) -> bool {
-        qualifier.is_some_and(|name| self.transition.whole_row_type(name).is_some())
+        qualifier.is_some_and(|name| {
+            self.transition
+                .whole_row_type(self.canonical(name))
+                .is_some()
+        })
     }
 
     fn variable(&self, name: &str) -> Option<PlpgsqlVariable<'a>> {
@@ -28315,14 +29435,13 @@ impl<'a> TriggerLocalScope<'_, 'a> {
     }
 
     fn local_index(&self, name: &str) -> Option<usize> {
-        self.locals
-            .iter()
-            .rposition(|local| local.name.as_str() == name)
+        plpgsql_slot(self.locals, |local| local.name.as_str() == name)
     }
 
     /// Whether `table` names a trigger's `NEW` or `OLD` row rather than a
     /// variable; outside a trigger both are ordinary names.
     fn transition_row(&self, table: &str) -> bool {
+        let table = self.canonical(table);
         matches!(table, "new" | "old")
             && self.invocation.program_kind == PlpgsqlProgramKind::Trigger
             && self.local_index(table).is_none()
@@ -28433,9 +29552,11 @@ impl<'a> TriggerLocalScope<'_, 'a> {
                     )
                     .expect("static context name")
                 });
-            let variable = self
-                .variable(name.as_str())
-                .expect("declared cursor variable");
+            // An alias for a trigger's `NEW` or `OLD` is no variable; the
+            // records themselves are captured below.
+            let Some(variable) = self.variable(name.as_str()) else {
+                continue;
+            };
             captured.name = name;
             captured.value = variable.value;
             captured.type_oid = storage
@@ -28460,6 +29581,7 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<super::guc::VariableConflict> {
+        let qualifier = qualifier.map(|qualifier| self.canonical(qualifier));
         let answers = self.named(qualifier, name).is_some()
             || self
                 .record_index(qualifier, name)
@@ -28476,6 +29598,7 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ColType, SqlError> {
+        let qualifier = qualifier.map(|qualifier| self.canonical(qualifier));
         if let Some(ctype) = self.col_type(qualifier, name) {
             return Ok(ctype);
         }
@@ -28508,6 +29631,7 @@ where
 
     /// A trigger's whole `NEW` or `OLD` row, unless a variable shadows it.
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        let table = self.canonical(table);
         self.transition_row(table)
             .then(|| self.transition.whole_row_type(table))
             .flatten()
@@ -28518,6 +29642,7 @@ where
         table: &str,
         arena: &'value Arena,
     ) -> Result<Option<&'value [RecordField<'value>]>, SqlError> {
+        let table = self.canonical(table);
         match self.transition_row(table) {
             true => self.transition.whole_row_fields(table, arena),
             false => Err(sql_err!(
@@ -28534,6 +29659,7 @@ where
         index: usize,
         catalog: Option<&dyn super::eval::CatalogAccess>,
     ) -> Option<(StackStr<64>, StaticTypeMeta)> {
+        let table = self.canonical(table);
         self.transition_row(table)
             .then(|| {
                 self.transition
@@ -28543,6 +29669,7 @@ where
     }
 
     fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        let qualifier = qualifier.map(|qualifier| self.canonical(qualifier));
         let index = self.record_index(qualifier, name)?;
         PlpgsqlVariable {
             value: self.values[index],
@@ -28560,6 +29687,7 @@ where
         catalog: Option<&dyn super::eval::CatalogAccess>,
         arena: &'value Arena,
     ) -> Result<(), SqlError> {
+        let qualifier = self.canonical(qualifier);
         let Some(index) = self.record_index(Some(qualifier), name) else {
             return Ok(());
         };
@@ -28608,10 +29736,12 @@ where
         table: &str,
         arena: &'value Arena,
     ) -> Result<&'value [RecordField<'value>], SqlError> {
+        let table = self.canonical(table);
         self.transition.whole_row_expansion_fields(table, arena)
     }
 
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        let table = self.canonical(table);
         self.transition.whole_row_present(table)
     }
 
@@ -28620,6 +29750,7 @@ where
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
+        let qualifier = qualifier.map(|qualifier| self.canonical(qualifier));
         if self.names_trigger_record(qualifier) {
             return self.transition.lookup(qualifier, name);
         }
@@ -28686,6 +29817,7 @@ where
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        let qualifier = qualifier.map(|qualifier| self.canonical(qualifier));
         if self.names_trigger_record(qualifier) {
             return self.transition.col_type(qualifier, name);
         }
@@ -28715,6 +29847,7 @@ where
     }
 
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        let qualifier = qualifier.map(|qualifier| self.canonical(qualifier));
         if self.names_trigger_record(qualifier) {
             return self.transition.collation(qualifier, name);
         }
@@ -28774,6 +29907,7 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
+        let qualifier = qualifier.map(|qualifier| self.canonical(qualifier));
         if self.names_trigger_record(qualifier) {
             return self.transition.column_user_type(qualifier, name);
         }
@@ -29282,6 +30416,22 @@ struct TriggerExecContext<'s, 'a, 'b> {
 }
 
 impl<'s, 'a, 'b> TriggerExecContext<'s, 'a, 'b> {
+    /// Loads PL/pgSQL into the session before a trigger function compiles.
+    fn load_plpgsql(&mut self) -> Result<(), SqlError> {
+        let storage = match &self.host {
+            PlpgsqlExecHost::Routine { engine, .. } => &engine.storage,
+            PlpgsqlExecHost::Atomic { storage, .. } => &**storage,
+        };
+        let txid = self.txn.txid;
+        super::guc::load_active_plpgsql(self.responder, &|name| {
+            storage.current_role_has_parameter_privilege(
+                name,
+                crate::sql::ast::ParameterPrivileges::SET,
+                txid,
+            )
+        })
+    }
+
     /// Where a nested write's AFTER work starts when this frame takes it,
     /// and whether the frame keeps it across a wait.
     fn nested_write_boundary(&self) -> Option<(super::txn::StatementMark, bool)> {
@@ -29611,9 +30761,6 @@ fn record_reference_error(error: &SqlError) -> bool {
                 && message.contains("\" has no field \""))
 }
 
-/// The error PostgreSQL's planner raises folding `expression`'s constant
-/// subexpressions (literals combined by operators and casts), in the order
-/// it folds them, if any.
 /// Whether PostgreSQL's planner folds `expression` to a constant: literals
 /// combined by operators and casts.
 fn folds_to_constant(expression: &Expr<'_>) -> bool {
@@ -29623,11 +30770,46 @@ fn folds_to_constant(expression: &Expr<'_>) -> bool {
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::NumericLit(_)
+        | Expr::BitLit(_)
         | Expr::Str(_) => true,
         Expr::Unary { operand, .. } | Expr::Cast { operand, .. } => folds_to_constant(operand),
         Expr::Binary { left, right, .. } => folds_to_constant(left) && folds_to_constant(right),
         _ => false,
     }
+}
+
+/// Whether PostgreSQL's planner folds a PL/pgSQL assignment's `expression`
+/// to a constant: [`folds_to_constant`], or literals passed through
+/// immutable built-in calls (`upper('abc')`). Variables are never folded.
+fn assignment_folds_to_constant(expression: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
+    fn literal_leaves(expression: &Expr<'_>) -> bool {
+        match expression {
+            Expr::Null
+            | Expr::Bool(_)
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::NumericLit(_)
+            | Expr::BitLit(_)
+            | Expr::Str(_) => true,
+            Expr::Unary { operand, .. } | Expr::Cast { operand, .. } => literal_leaves(operand),
+            Expr::Binary { left, right, .. } => literal_leaves(left) && literal_leaves(right),
+            Expr::Call {
+                kind: crate::sql::ast::CallKind::Routine,
+                args,
+                over: None,
+                filter: None,
+                ..
+            } => args.iter().all(|argument| literal_leaves(argument)),
+            _ => false,
+        }
+    }
+    folds_to_constant(expression)
+        || literal_leaves(expression)
+            && crate::sql::planner_inputs::inline::folds_builtin_constant(expression, storage, txid)
+                .unwrap_or_else(|_| {
+                    crate::sql::eval::take_diagnostic();
+                    false
+                })
 }
 
 /// PL/pgSQL converts a value assigned to an array element or slice as it
@@ -29899,12 +31081,14 @@ fn eval_procedural_expression_in<'a>(
     // every loop entry would consume fresh statement memory.
     let expression = match prepared.as_ref() {
         Some((site, prepared)) if !prepared.bindings.is_empty() => {
-            super::parser::parse_expression_with_type_inputs(
-                site.text,
-                prepared.bindings,
-                arena,
-                |parser| super::type_inputs::validate_restored(parser, &engine.storage, txid),
-            )?
+            super::parser::with_procedural_positionals(site.positionals, || {
+                super::parser::parse_expression_with_type_inputs(
+                    site.text,
+                    prepared.bindings,
+                    arena,
+                    |parser| super::type_inputs::validate_restored(parser, &engine.storage, txid),
+                )
+            })?
         }
         Some(_) | None => expression,
     };
@@ -30051,6 +31235,7 @@ fn bind_plpgsql_dynamic_query<'a>(
         },
         text: command,
         exception_variables: false,
+        positionals: 0,
     };
     let prepared = match &mut context.host {
         PlpgsqlExecHost::Routine {
@@ -30096,6 +31281,7 @@ fn bind_plpgsql_dynamic_query<'a>(
     let inputs = prepared.map_or(&[][..], |prepared| prepared.bindings);
     let statement = restore_plpgsql_statement(
         command,
+        0,
         inputs,
         context.storage(),
         context.txn.txid,
@@ -30425,6 +31611,40 @@ fn execute_nested_write<'a>(
         )?,
         None => statement,
     };
+    // `pg_settings` is a view over a function: its rules run `set_config`
+    // for an UPDATE, which reports no rows, and nothing else can write it.
+    match statement {
+        Stmt::Update(update) if super::is_pg_settings(update.table) => {
+            let select = super::pg_settings_rule_query(update, context.arena)?;
+            let (arena, txid) = (context.arena, context.txn.txid);
+            execute_procedural_query(context, false, None, |storage, sequence| {
+                super::query::select_into_rows(
+                    storage,
+                    txid,
+                    select,
+                    arena,
+                    arguments,
+                    None,
+                    Some(sequence),
+                    &mut |_| Ok(()),
+                )
+            })?;
+            return Ok(0);
+        }
+        Stmt::Insert(insert) if super::is_pg_settings(insert.table) => {
+            return Err(super::query::function_view_write_error(
+                "pg_settings",
+                super::query::ViewWrite::Insert,
+            ));
+        }
+        Stmt::Delete(delete) if super::is_pg_settings(delete.table) => {
+            return Err(super::query::function_view_write_error(
+                "pg_settings",
+                super::query::ViewWrite::Delete,
+            ));
+        }
+        _ => {}
+    }
     super::query::validate_dml_assignment_casts(
         statement,
         context.storage(),
@@ -30432,7 +31652,7 @@ fn execute_nested_write<'a>(
         context.arena,
         None,
     )?;
-    if let Some(command) = rewritten_write_target(context.storage(), statement, context.txn) {
+    if let Some(command) = rewritten_write_target(context.storage(), statement, context.txn)? {
         return execute_rewritten_nested_write(
             context, statement, arguments, capture, pending, progress, command,
         );
@@ -30924,6 +32144,9 @@ fn execute_bound_plpgsql_utility<'a>(
                                                     option_order: *option_order,
                                                     sql,
                                                     raw_path: schema_path,
+                                                    kept_column_types: &[],
+                                                    query_origin:
+                                                        crate::storage::ViewQueryOrigin::View,
                                                 },
                                                 context.arena,
                                                 responder,
@@ -31210,6 +32433,8 @@ fn execute_bound_plpgsql_utility<'a>(
                         option_order: *option_order,
                         sql,
                         raw_path: guc.search_path().as_str(),
+                        kept_column_types: &[],
+                        query_origin: crate::storage::ViewQueryOrigin::View,
                     },
                     context.arena,
                     responder,
@@ -31981,7 +33206,7 @@ fn execute_bound_plpgsql_utility<'a>(
                 ),
                 Stmt::DropTextSearch {
                     kind,
-                    name,
+                    names,
                     if_exists,
                     cascade,
                 } => super::exec::drop_text_search(
@@ -31991,7 +33216,7 @@ fn execute_bound_plpgsql_utility<'a>(
                     &mut engine.dml_scratch,
                     guc.seq_session(),
                     *kind,
-                    name,
+                    names,
                     *if_exists,
                     *cascade,
                     context.arena,
@@ -32689,12 +33914,16 @@ fn routine_utility_outcome(outcome: Outcome) -> Result<(), SqlError> {
 }
 
 /// Whether rules for its event rewrite a write into several steps.
-fn rewritten_into_steps(storage: &Storage, statement: &Stmt<'_>, txn: &TxnState) -> bool {
+fn rewritten_into_steps(
+    storage: &Storage,
+    statement: &Stmt<'_>,
+    txn: &TxnState,
+) -> Result<bool, SqlError> {
     let (relation, event) = match statement {
         Stmt::Insert(insert) => (insert.table, crate::storage::RewriteEvent::Insert),
         Stmt::Update(update) => (update.table, crate::storage::RewriteEvent::Update),
         Stmt::Delete(delete) => (delete.table, crate::storage::RewriteEvent::Delete),
-        _ => return false,
+        _ => return Ok(false),
     };
     let target = match storage.resolve_relation(relation.schema, relation.name, txn.txid) {
         Some(crate::storage::ResolvedRelation::View(slot)) => {
@@ -32703,40 +33932,67 @@ fn rewritten_into_steps(storage: &Storage, statement: &Stmt<'_>, txn: &TxnState)
         Some(crate::storage::ResolvedRelation::Table(slot)) => {
             crate::storage::RuleTarget::Table(slot as u16)
         }
-        _ => return false,
+        _ => return Ok(false),
     };
-    storage
-        .firing_rules_for(target, event, txn.replication_apply, txn.txid)
+    let replication_role = crate::sql::guc::active_session_replication_role()?;
+    Ok(storage
+        .firing_rules_for(target, event, replication_role, txn.txid)
         .next()
-        .is_some()
+        .is_some())
 }
 
 /// The command of a routine's `INSERT`, `UPDATE` or `DELETE` whose target
 /// is a view or a table with rules for it: the engine rewrites those.
+/// `UPDATE pg_settings` in a PL/pgSQL body: the rule's query runs with
+/// the body's variables, its rows go nowhere.
+fn run_pg_settings_rule<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    update: &crate::sql::ast::Update<'a>,
+    scope: &TriggerLocalScope<'_, '_>,
+) -> Result<(), SqlError> {
+    let select = super::pg_settings_rule_query(update, context.arena)?;
+    let (arena, txid) = (context.arena, context.txn.txid);
+    execute_procedural_query(context, false, None, |storage, sequence| {
+        super::query::select_into_rows(
+            storage,
+            txid,
+            select,
+            arena,
+            crate::sql::eval::NO_PARAMS,
+            Some(scope),
+            Some(sequence),
+            &mut |_| Ok(()),
+        )
+    })
+}
+
 fn rewritten_write_target(
     storage: &Storage,
     statement: &Stmt<'_>,
     txn: &TxnState,
-) -> Option<&'static str> {
+) -> Result<Option<&'static str>, SqlError> {
     let (relation, event, command) = match statement {
         Stmt::Insert(insert) => (insert.table, crate::storage::RewriteEvent::Insert, "INSERT"),
         Stmt::Update(update) => (update.table, crate::storage::RewriteEvent::Update, "UPDATE"),
         Stmt::Delete(delete) => (delete.table, crate::storage::RewriteEvent::Delete, "DELETE"),
-        _ => return None,
+        _ => return Ok(None),
     };
-    match storage.resolve_relation(relation.schema, relation.name, txn.txid)? {
-        crate::storage::ResolvedRelation::View(_) => Some(command),
-        crate::storage::ResolvedRelation::Table(slot) => storage
-            .firing_rules_for(
-                crate::storage::RuleTarget::Table(slot as u16),
-                event,
-                txn.replication_apply,
-                txn.txid,
-            )
-            .next()
-            .map(|_| command),
-        crate::storage::ResolvedRelation::Catalog => None,
-    }
+    let replication_role = crate::sql::guc::active_session_replication_role()?;
+    Ok(
+        match storage.resolve_relation(relation.schema, relation.name, txn.txid) {
+            Some(crate::storage::ResolvedRelation::View(_)) => Some(command),
+            Some(crate::storage::ResolvedRelation::Table(slot)) => storage
+                .firing_rules_for(
+                    crate::storage::RuleTarget::Table(slot as u16),
+                    event,
+                    replication_role,
+                    txn.txid,
+                )
+                .next()
+                .map(|_| command),
+            Some(crate::storage::ResolvedRelation::Catalog) | None => None,
+        },
+    )
 }
 
 /// The routine's variables, and a trigger's `NEW` and `OLD` rows, as values
@@ -32790,6 +34046,7 @@ fn static_write_locals<'a>(
             .alloc_slice_with(columns.len(), |_| RecordField {
                 name: "",
                 type_oid: 0,
+                type_mod: -1,
                 value: Datum::Null,
             })
             .map_err(|_| super::query::arena_full_pub())?;
@@ -32847,6 +34104,7 @@ fn execute_static_rewritten_write<'a>(
     let bound =
         super::cursor::bind_locals(arena, context.params, captured, static_write_arena_full)?;
     let inputs = super::type_inputs::bindings_for_active_source(source, arena)?.unwrap_or(&[]);
+    // The captured variables include `$n`, which the query reads as such.
     let statement =
         super::parser::parse_cursor_command(source, arena, bound.bindings, inputs, |parser| {
             super::type_inputs::validate_restored(parser, context.storage(), txid)
@@ -32881,6 +34139,7 @@ fn execute_static_rewritten_write<'a>(
         );
         match result {
             Ok(rows) => {
+                let width = returning.width;
                 let selected = returning.values(arena)?;
                 finish_static_returning(
                     context,
@@ -32890,6 +34149,7 @@ fn execute_static_rewritten_write<'a>(
                     into,
                     returns,
                     selected,
+                    width,
                     rows,
                     status,
                 )
@@ -32897,12 +34157,19 @@ fn execute_static_rewritten_write<'a>(
             Err(_) if status.pending_write.is_some() => {
                 if into.is_some() && returns {
                     let returned = returning.rows;
+                    let width = returning.width;
                     let values = returning.values(arena)?;
                     status
                         .pending_write
                         .as_mut()
                         .expect("pending nested write")
-                        .save_output(Some(values), returned, &[], &context.storage().row_work)?;
+                        .save_output(
+                            Some(values),
+                            width,
+                            returned,
+                            &[],
+                            &context.storage().row_work,
+                        )?;
                 }
                 let (rows, output) = resume_nested_write(context, status)?;
                 finish_resumed_static_write(
@@ -32937,9 +34204,8 @@ fn execute_rewritten_nested_write<'a>(
     // A statement rules rewrite into several steps finishes each step's
     // AFTER triggers before the next step runs, so none of them can hand
     // its completion to the caller.
-    let boundary = context
-        .nested_write_boundary()
-        .filter(|_| !rewritten_into_steps(context.storage(), statement, context.txn));
+    let steps = rewritten_into_steps(context.storage(), statement, context.txn)?;
+    let boundary = context.nested_write_boundary().filter(|_| !steps);
     let PlpgsqlExecHost::Routine {
         engine,
         guc,
@@ -33084,6 +34350,7 @@ fn execute_plpgsql_dynamic_explain(
             let PlpgsqlExecHost::Routine {
                 engine,
                 guc,
+                sqlprep,
                 cursors,
                 ..
             } = host
@@ -33103,8 +34370,8 @@ fn execute_plpgsql_dynamic_explain(
                 arena,
                 planned.arguments,
                 txn,
+                (sqlprep, cursors),
                 guc,
-                cursors,
                 responder,
             );
             let output = responder.finish_discard_query_output();
@@ -33138,7 +34405,7 @@ fn execute_plpgsql_dynamic_explain(
         } else {
             None
         };
-        super::explain::visit_plan_rows(&plan, options, actual, &settings, emit)
+        super::explain::visit_plan_rows(&plan, options, actual, &settings, context.arena, emit)
     })
 }
 
@@ -33311,6 +34578,7 @@ fn empty_plpgsql_local() -> TriggerLocalDecl {
         record_shape: None,
         constant: false,
         not_null: false,
+        alias: None,
     }
 }
 
@@ -33318,22 +34586,19 @@ fn trigger_local_index(
     locals: &[TriggerLocalDecl],
     name: PlpgsqlVariableName,
 ) -> Result<usize, SqlError> {
-    locals
-        .iter()
-        .rposition(|local| name.names(local))
-        .ok_or_else(|| match name.label {
-            Some(label) => sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "\"{}.{}\" is not a known variable",
-                label.as_str(),
-                name.name.as_str()
-            ),
-            None => sql_err!(
-                sqlstate::UNDEFINED_COLUMN,
-                "PL/pgSQL local \"{}\" does not exist",
-                name.name.as_str()
-            ),
-        })
+    plpgsql_slot(locals, |local| name.names(local)).ok_or_else(|| match name.label {
+        Some(label) => sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "\"{}.{}\" is not a known variable",
+            label.as_str(),
+            name.name.as_str()
+        ),
+        None => sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "PL/pgSQL local \"{}\" does not exist",
+            name.name.as_str()
+        ),
+    })
 }
 
 fn coerce_plpgsql_local<'a>(
@@ -33445,6 +34710,7 @@ fn fit_plpgsql_row<'a>(
         .alloc_slice_with(target_oids.len(), |index| RecordField {
             name: "",
             type_oid: target_oids[index],
+            type_mod: -1,
             value: Datum::Null,
         })
         .map_err(|_| super::query::arena_full_pub())?;
@@ -33459,6 +34725,7 @@ fn fit_plpgsql_row<'a>(
             } else {
                 source.type_oid
             },
+            type_mod: source.type_mod,
             value: converted,
         };
     }
@@ -33530,6 +34797,7 @@ fn coerce_plpgsql_table_rowtype<'a>(
     let mut coerced = [RecordField {
         name: "",
         type_oid: 0,
+        type_mod: -1,
         value: Datum::Null,
     }; MAX_COLUMNS];
     for (index, (source, column)) in fields.iter().zip(definition.columns()).enumerate() {
@@ -33539,6 +34807,7 @@ fn coerce_plpgsql_table_rowtype<'a>(
                 .alloc_str(column.name.as_str())
                 .map_err(|_| super::query::arena_full_pub())?,
             type_oid: column.ctype.oid(),
+            type_mod: column.type_mod,
             value: coerce_assignment(
                 source.value,
                 column,
@@ -33610,6 +34879,88 @@ fn assign_trigger_local<'a>(
     Ok(())
 }
 
+/// Whether assigning `value` to the PL/pgSQL variable or row field `target`
+/// fails only its type modifier: the value converts to the unconstrained type.
+fn local_fails_type_modifier_only<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
+    locals: &[TriggerLocalDecl],
+    target: PlpgsqlVariableName,
+    value: Datum<'a>,
+) -> bool {
+    let storage = context.storage();
+    let txid = context.txn.txid;
+    let arena = context.arena;
+    let converts_unconstrained = |column: &ColumnMeta| {
+        let mut unconstrained = *column;
+        unconstrained.type_mod >= 0 && {
+            unconstrained.type_mod = -1;
+            prepare_assignment_cast(value.type_oid(), &unconstrained, storage, txid, arena)
+                .is_ok_and(|cast| {
+                    coerce_assignment(
+                        value,
+                        &unconstrained,
+                        PlannedAssignmentCast {
+                            input_collation: crate::sql::ast::Collation::None,
+                            defined: cast.as_ref(),
+                            site: None,
+                        },
+                        storage,
+                        txid,
+                        arena,
+                        None,
+                    )
+                    .is_ok()
+                })
+        }
+    };
+    let mark = arena.mark();
+    let converts = crate::sql::error_position::preserving_pending(|| {
+        if let Ok(index) = trigger_local_index(locals, target) {
+            let mut unconstrained = locals[index];
+            unconstrained.type_mod >= 0 && {
+                unconstrained.type_mod = -1;
+                let sequences =
+                    crate::sql::sequence::SeqEval::new(storage, context.seq_session(), txid);
+                coerce_plpgsql_local(unconstrained, value, storage, txid, arena, &sequences).is_ok()
+            }
+        } else if let Some(record) = target
+            .label
+            .and_then(|label| trigger_local_index(locals, PlpgsqlVariableName::plain(label)).ok())
+        {
+            match (locals[record].record_shape, locals[record].ctype) {
+                (Some(PlpgsqlRecordShape::Table { slot, .. }), _) => storage
+                    .table_def(usize::from(slot), txid)
+                    .columns()
+                    .iter()
+                    .find(|column| column.name == target.name)
+                    .is_some_and(converts_unconstrained),
+                (None, ColType::Composite(Some(creation))) => storage
+                    .require_row_type_definition(creation, txid)
+                    .is_ok_and(|definition| {
+                        definition
+                            .active_fields()
+                            .find(|field| field.name == target.name)
+                            .is_some_and(|field| {
+                                converts_unconstrained(&ColumnMeta {
+                                    name: field.name,
+                                    ctype: field.ctype,
+                                    user_type: field.user_type,
+                                    type_mod: field.type_mod,
+                                    ..ColumnMeta::EMPTY
+                                })
+                            })
+                    }),
+                _ => false,
+            }
+        } else {
+            false
+        }
+    });
+    // The probe's values are discarded with its scratch.
+    unsafe { arena.rewind_to(mark) };
+    converts
+}
+
 /// Where a PL/pgSQL `INTO` target stores its value.
 #[derive(Clone, Copy)]
 enum PlpgsqlIntoTarget {
@@ -33647,7 +34998,9 @@ fn plpgsql_into_target(
     };
     match target.label {
         Some(label) => {
-            let Some(record) = TriggerRecordName::parse(label.as_str()) else {
+            let Some(record) = TriggerRecordName::parse(
+                plpgsql_transition_alias(locals, label.as_str()).unwrap_or(label.as_str()),
+            ) else {
                 return Err(error);
             };
             if trigger_local_index(locals, PlpgsqlVariableName::plain(label)).is_ok() {
@@ -33665,9 +35018,11 @@ fn plpgsql_into_target(
                     )
                 })
         }
-        None => TriggerRecordName::parse(target.name.as_str())
-            .map(PlpgsqlIntoTarget::TriggerRecord)
-            .ok_or(error),
+        None => TriggerRecordName::parse(
+            plpgsql_transition_alias(locals, target.name.as_str()).unwrap_or(target.name.as_str()),
+        )
+        .map(PlpgsqlIntoTarget::TriggerRecord)
+        .ok_or(error),
     }
 }
 
@@ -33732,6 +35087,7 @@ fn assign_plpgsql_into_target<'a>(
             record_shape: None,
             constant: false,
             not_null: false,
+            alias: None,
         },
         value,
         context.storage(),
@@ -33751,7 +35107,9 @@ fn trigger_record_field_target(
     target: PlpgsqlVariableName,
 ) -> Option<TriggerRecordName> {
     let label = target.label?;
-    let record = TriggerRecordName::parse(label.as_str())?;
+    let record = TriggerRecordName::parse(
+        plpgsql_transition_alias(locals, label.as_str()).unwrap_or(label.as_str()),
+    )?;
     (definition.n_columns > 0
         && trigger_local_index(locals, target).is_err()
         && trigger_local_index(locals, PlpgsqlVariableName::plain(label)).is_err())
@@ -33864,7 +35222,7 @@ fn assign_trigger_record_column<'a>(
     let input_collation =
         super::eval::coercion_input_collation(assignment.expression, &scope, hooks.catalog)?;
     let value = eval_procedural_expression(context, assignment.expression, &scope, continuation)?;
-    let value = coerce_assignment(
+    let coerced = coerce_assignment(
         value,
         &definition.columns()[column],
         PlannedAssignmentCast {
@@ -33880,7 +35238,81 @@ fn assign_trigger_record_column<'a>(
             context.seq_session(),
             context.txn.txid,
         )),
-    )?;
+    );
+    let value = match coerced {
+        Ok(value) => value,
+        // PostgreSQL plans the field's conversion into the assignment's
+        // expression, so a constant that fails the field's type modifier
+        // (and not its type's input) fails while the assignment is planned.
+        Err(error)
+            if assignment_folds_to_constant(
+                assignment.expression,
+                context.storage(),
+                context.txn.txid,
+            ) && {
+                let mut unconstrained = definition.columns()[column];
+                unconstrained.type_mod = -1;
+                coerce_assignment(
+                    value,
+                    &unconstrained,
+                    PlannedAssignmentCast {
+                        input_collation,
+                        defined: cast.as_ref(),
+                        site: None,
+                    },
+                    context.storage(),
+                    context.txn.txid,
+                    context.arena,
+                    None,
+                )
+                .is_ok()
+            } =>
+        {
+            return match crate::sql::error_context::innermost_assignment() {
+                Some(statement) => in_procedural_query(
+                    statement,
+                    crate::sql::error_context::QueryMode::Assignment,
+                    false,
+                    || Err(error),
+                ),
+                None => Err(error),
+            };
+        }
+        // A literal's input fails while the assignment is parsed, at the
+        // literal; a folded constant's conversion while it is planned.
+        Err(error) => {
+            let Some(statement) = crate::sql::error_context::innermost_assignment() else {
+                return Err(error);
+            };
+            return match assignment.expression {
+                Expr::Str(literal)
+                | Expr::BoundLiteral {
+                    source: Expr::Str(literal),
+                    ..
+                } => in_procedural_query(
+                    statement,
+                    crate::sql::error_context::QueryMode::Assignment,
+                    false,
+                    || Err(crate::sql::error_position::at_subject(error, literal)),
+                ),
+                expression
+                    if assignment_folds_to_constant(
+                        expression,
+                        context.storage(),
+                        context.txn.txid,
+                    ) =>
+                {
+                    in_procedural_query(
+                        statement,
+                        crate::sql::error_context::QueryMode::Assignment,
+                        false,
+                        || Err(error),
+                    )
+                }
+                _ => Err(error),
+            };
+        }
+    };
     records.record_mut(record).set_field(column, value);
 
     Ok(())
@@ -34029,9 +35461,24 @@ pub(super) fn trigger_record_row<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
+    // A named composite's fields keep their declared type modifiers and a
+    // record's fields their own, which PostgreSQL compares too.
+    let mut field_mods = [-1; crate::storage::MAX_COMPOSITE_FIELDS];
     let fields = match value {
         Datum::Null => return Ok(None),
-        Datum::Record(fields) | Datum::Composite { fields, .. } => fields,
+        Datum::Composite { slot, fields } => {
+            let definition = storage.require_row_type_definition(slot, txid)?;
+            for (target, field) in field_mods.iter_mut().zip(definition.active_fields()) {
+                *target = field.type_mod;
+            }
+            fields
+        }
+        Datum::Record(fields) => {
+            for (target, field) in field_mods.iter_mut().zip(fields.iter()) {
+                *target = field.type_mod;
+            }
+            fields
+        }
         _ if source == TriggerRowSource::Return => {
             return Err(sql_err!(
                 sqlstate::DATATYPE_MISMATCH,
@@ -34078,9 +35525,26 @@ pub(super) fn trigger_record_row<'a>(
         let declared = storage
             .routine_type_oid(column.ctype, column.user_type, txid)
             .unwrap_or(column.ctype.oid());
-        if field.type_oid != declared && field.type_oid != column.ctype.oid() {
-            let returned = crate::sql::catalog::format_type_name(storage, txid, field.type_oid)?;
-            let expected = crate::sql::catalog::format_type_name(storage, txid, declared)?;
+        let returned_mod = field_mods.get(index).copied().unwrap_or(-1);
+        // A domain column's attribute has no modifier of its own; its base
+        // type's modifier belongs to the domain.
+        let column_mod = if column.user_type.is_some() {
+            -1
+        } else {
+            column.type_mod
+        };
+        // PostgreSQL's `build_attrmap_by_position`: a constrained column
+        // requires the same modifier; an unconstrained one accepts any.
+        if (field.type_oid != declared && field.type_oid != column.ctype.oid())
+            || (column_mod >= 0 && returned_mod != column_mod)
+        {
+            let returned = if returned_mod >= 0 {
+                crate::sql::catalog::format_type_oid(storage, txid, field.type_oid, returned_mod)
+            } else {
+                crate::sql::catalog::format_type_name(storage, txid, field.type_oid)?
+            };
+            let expected =
+                crate::sql::catalog::format_type_oid(storage, txid, declared, column_mod);
             return Err(mismatch(format_args!(
                 "Returned type {} does not match expected type {} in column \"{}\" (position {}).",
                 returned.as_str(),
@@ -34129,6 +35593,7 @@ fn assign_trigger_record_field<'a>(
         let mut fields = [RecordField {
             name: "",
             type_oid: 0,
+            type_mod: -1,
             value: Datum::Null,
         }; MAX_COLUMNS];
         let mut count = 0;
@@ -34138,6 +35603,7 @@ fn assign_trigger_record_field<'a>(
                     .alloc_str(name)
                     .map_err(|_| super::query::arena_full_pub())?,
                 type_oid,
+                type_mod: -1,
                 value: Datum::Null,
             };
             count += 1;
@@ -34433,6 +35899,9 @@ fn trigger_loop_integer(value: Datum<'_>, arena: &Arena, bound: &str) -> Result<
 struct TriggerForRows<'a> {
     values: &'a [Datum<'a>],
     empty: Datum<'a>,
+    /// How many columns a scalar variable's query returns: it takes the
+    /// first, and `strict_multi_assignment` reports a mismatch.
+    width: usize,
 }
 
 #[expect(
@@ -34453,6 +35922,7 @@ where
     'result: 'query,
 {
     let mut rows = ArenaList::new(result_arena);
+    let mut width = 1;
     super::query::select_into_rows(
         storage,
         txid,
@@ -34462,19 +35932,19 @@ where
         Some(scope),
         Some(sequence),
         &mut |values| {
-            if values.len() != 1 {
-                return Err(sql_err!(
-                    sqlstate::DATATYPE_MISMATCH,
-                    "FOR query must return exactly one column"
-                ));
-            }
-            let value = detached_trigger_datum(values[0], result_arena)?;
+            // PostgreSQL assigns the first column; others are left over.
+            width = values.len();
+            let value = detached_trigger_datum(
+                values.first().copied().unwrap_or(Datum::Null),
+                result_arena,
+            )?;
             rows.push(value).map_err(|_| super::query::arena_full_pub())
         },
     )?;
     Ok(TriggerForRows {
         values: rows.as_slice(),
         empty: Datum::Null,
+        width,
     })
 }
 
@@ -34485,7 +35955,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
 ) -> Result<TriggerForRows<'a>, SqlError> {
     let arena = context.arena;
     with_bound_parameter_types(query.parameter_types, || {
-        let mut fields = [("", 0); MAX_PROJ];
+        let mut fields = [("", 0, -1); MAX_PROJ];
         let width = {
             let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
             let width = match query.statement {
@@ -34514,6 +35984,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                         .alloc_str(column.name)
                         .map_err(|_| super::query::arena_full_pub())?,
                     column.type_oid,
+                    column.type_mod,
                 );
             }
             width
@@ -34536,12 +36007,14 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                 let mut row_fields = [RecordField {
                     name: "",
                     type_oid: 0,
+                    type_mod: -1,
                     value: Datum::Null,
                 }; MAX_PROJ];
                 for index in 0..width {
                     row_fields[index] = RecordField {
                         name: fields[index].0,
                         type_oid: fields[index].1,
+                        type_mod: fields[index].2,
                         value: detached_trigger_datum(values[index], arena)?,
                     };
                 }
@@ -34559,6 +36032,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                 .alloc_slice_with(width, |index| RecordField {
                     name: fields[index].0,
                     type_oid: fields[index].1,
+                    type_mod: fields[index].2,
                     value: Datum::Null,
                 })
                 .map_err(|_| super::query::arena_full_pub())?;
@@ -34569,6 +36043,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
         Ok(TriggerForRows {
             values: rows.as_slice(),
             empty,
+            width: if record_target { 1 } else { width },
         })
     })
 }
@@ -34592,6 +36067,7 @@ fn materialize_trigger_for_dml<'a>(
     let bound =
         super::cursor::bind_locals(arena, context.params, captured, static_write_arena_full)?;
     let inputs = super::type_inputs::bindings_for_active_source(source, arena)?.unwrap_or(&[]);
+    // The captured variables include `$n`, which the query reads as such.
     let statement =
         super::parser::parse_cursor_command(source, arena, bound.bindings, inputs, |parser| {
             super::type_inputs::validate_restored(parser, context.storage(), txid)
@@ -34667,6 +36143,7 @@ fn resume_for_dml_rows<'a>(
     Ok(TriggerForRows {
         values,
         empty: *empty,
+        width: 1,
     })
 }
 
@@ -34706,6 +36183,7 @@ fn for_dml_rows<'a>(
             .alloc_slice_with(width, |index| RecordField {
                 name: "",
                 type_oid: columns[index].type_oid,
+                type_mod: columns[index].type_mod,
                 value: Datum::Null,
             })
             .map_err(|_| super::query::arena_full_pub())?;
@@ -34774,6 +36252,7 @@ fn for_dml_rows<'a>(
             let saved = rows.len() as u64 - 1;
             pending.save_output(
                 Some(rows.as_slice()),
+                rows.len(),
                 saved,
                 &[],
                 &context.storage().row_work,
@@ -34783,6 +36262,7 @@ fn for_dml_rows<'a>(
         Ok(TriggerForRows {
             values: rows.as_slice(),
             empty,
+            width: 1,
         })
     }
 }
@@ -34833,6 +36313,7 @@ where
             let mut fields = [RecordField {
                 name: "",
                 type_oid: 0,
+                type_mod: -1,
                 value: Datum::Null,
             }; MAX_PROJ];
             for index in 0..width {
@@ -34841,6 +36322,7 @@ where
                         .alloc_str(columns[index].name)
                         .map_err(|_| super::query::arena_full_pub())?,
                     type_oid: columns[index].type_oid,
+                    type_mod: columns[index].type_mod,
                     value: detached_trigger_datum(values[index], result_arena)?,
                 };
             }
@@ -34856,6 +36338,7 @@ where
             .alloc_slice_with(width, |index| RecordField {
                 name: "",
                 type_oid: columns[index].type_oid,
+                type_mod: columns[index].type_mod,
                 value: Datum::Null,
             })
             .map_err(|_| super::query::arena_full_pub())?;
@@ -34871,11 +36354,16 @@ where
     Ok(TriggerForRows {
         values: rows.as_slice(),
         empty,
+        width: 1,
     })
 }
 
+/// Parses `source` again under its checked type inputs. A body's static
+/// text names the routine's `positionals` parameters `$1` onwards; dynamic
+/// text has none.
 fn restore_plpgsql_statement<'a>(
     source: &'a str,
+    positionals: u32,
     inputs: &'a [super::type_inputs::Binding<'a>],
     storage: &Storage,
     txid: u32,
@@ -34884,15 +36372,18 @@ fn restore_plpgsql_statement<'a>(
     let mut parser = super::parser::Parser::new(source, arena)
         .map_err(|error| super::parse_error_to_sql(&error))?;
     parser.set_type_inputs(inputs);
-    let statement = parser
-        .next_stmt()
-        .map_err(|error| super::parse_error_to_sql(&error))?
-        .ok_or_else(|| sql_err!(sqlstate::SYNTAX_ERROR, "PL/pgSQL statement is empty"))?;
-    if parser
-        .next_stmt()
-        .map_err(|error| super::parse_error_to_sql(&error))?
-        .is_some()
-    {
+    let (statement, more) = super::parser::with_procedural_positionals(positionals, || {
+        let statement = parser
+            .next_stmt()
+            .map_err(|error| super::parse_error_to_sql(&error))?
+            .ok_or_else(|| sql_err!(sqlstate::SYNTAX_ERROR, "PL/pgSQL statement is empty"))?;
+        let more = parser
+            .next_stmt()
+            .map_err(|error| super::parse_error_to_sql(&error))?
+            .is_some();
+        Ok::<_, SqlError>((statement, more))
+    })?;
+    if more {
         return Err(sql_err!(
             sqlstate::SYNTAX_ERROR,
             "PL/pgSQL statement contains multiple commands"
@@ -35004,14 +36495,20 @@ fn prepare_static_plpgsql_statement<'a>(
             source: TriggerForSource::Query(_),
             ..
         }) => {
-            let query = super::parser::parse_query_with_type_inputs(
-                site.text,
-                prepared.bindings,
-                context.arena,
-                |parser| {
-                    super::type_inputs::validate_restored(parser, &engine.storage, context.txn.txid)
-                },
-            )?;
+            let query = super::parser::with_procedural_positionals(site.positionals, || {
+                super::parser::parse_query_with_type_inputs(
+                    site.text,
+                    prepared.bindings,
+                    context.arena,
+                    |parser| {
+                        super::type_inputs::validate_restored(
+                            parser,
+                            &engine.storage,
+                            context.txn.txid,
+                        )
+                    },
+                )
+            })?;
             match statement {
                 TriggerStatement::Perform(_) => TriggerStatement::Perform(query),
                 TriggerStatement::ReturnQuery(_) => TriggerStatement::ReturnQuery(query),
@@ -35030,6 +36527,7 @@ fn prepare_static_plpgsql_statement<'a>(
             source: site.text,
             statement: restore_plpgsql_statement(
                 site.text,
+                site.positionals,
                 prepared.bindings,
                 &engine.storage,
                 context.txn.txid,
@@ -35040,6 +36538,7 @@ fn prepare_static_plpgsql_statement<'a>(
             source: site.text,
             statement: restore_plpgsql_statement(
                 site.text,
+                site.positionals,
                 prepared.bindings,
                 &engine.storage,
                 context.txn.txid,
@@ -35055,6 +36554,7 @@ fn prepare_static_plpgsql_statement<'a>(
         TriggerStatement::Dml { into, .. } => {
             let restored = restore_plpgsql_statement(
                 site.text,
+                site.positionals,
                 prepared.bindings,
                 &engine.storage,
                 context.txn.txid,
@@ -35108,16 +36608,14 @@ fn bind_procedural_names<'a>(
             query: query(into.query)?,
             ..into
         }),
-        TriggerStatement::For(TriggerFor {
-            label,
-            target,
-            source: TriggerForSource::Query(select),
-            block,
-        }) => TriggerStatement::For(TriggerFor {
-            label,
-            target,
+        TriggerStatement::For(
+            program @ TriggerFor {
+                source: TriggerForSource::Query(select),
+                ..
+            },
+        ) => TriggerStatement::For(TriggerFor {
             source: TriggerForSource::Query(query(select)?),
-            block,
+            ..program
         }),
         TriggerStatement::Dml {
             source,
@@ -35326,12 +36824,13 @@ fn execute_trigger_step_in<'a>(
                         "nested write lost its returned values"
                     )
                 })?;
-                let (values, returned, arguments) = match output {
+                let (values, returned, arguments, source_width) = match output {
                     write_completion::NestedWriteOutput::Rows {
                         values,
                         rows,
                         arguments,
-                    } => (values, rows, arguments),
+                        source_width,
+                    } => (values, rows, arguments, source_width),
                     write_completion::NestedWriteOutput::NoResult => {
                         status.set_row_count(rows)?;
                         return Err(sql_err!(
@@ -35359,6 +36858,7 @@ fn execute_trigger_step_in<'a>(
                     statement,
                     arguments,
                     selected,
+                    source_width,
                     rows,
                     status,
                 )?;
@@ -35542,6 +37042,25 @@ fn execute_trigger_step_in<'a>(
                 let arena = context.arena;
                 let params = context.params;
                 let txid = context.txn.txid;
+                if let Some(result) = status.set_result.as_ref() {
+                    let mark = arena.mark();
+                    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+                    let checked = super::query::describe_select(
+                        query,
+                        context.storage(),
+                        txid,
+                        arena,
+                        &mut columns,
+                        crate::sql::exec::DescriptionTarget::Sql,
+                        Some(&scope),
+                    )
+                    .and_then(|count| {
+                        result.check_query_structure(&columns[..count], context.storage(), txid)
+                    });
+                    // SAFETY: the descriptions are only compared here.
+                    unsafe { arena.rewind_to(mark) };
+                    checked?;
+                }
                 let rows = execute_procedural_query(
                     context,
                     invocation.fresh_snapshots && dml_ctes.is_empty(),
@@ -35641,10 +37160,15 @@ fn execute_trigger_step_in<'a>(
                             &scope,
                             retained_parent.then_some(&mut status.pending_query),
                         )?;
+                        // A trigger function returns a row: PostgreSQL's
+                        // `exec_stmt_return` rejects any other non-NULL value.
                         if invocation.program_kind == PlpgsqlProgramKind::Trigger
                             && !matches!(
                                 value,
-                                Datum::Null | Datum::Record(_) | Datum::Composite { .. }
+                                Datum::Null
+                                    | Datum::Record(_)
+                                    | Datum::Composite { .. }
+                                    | Datum::CompositeText { .. }
                             )
                         {
                             return Err(sql_err!(
@@ -35683,7 +37207,11 @@ fn execute_trigger_step_in<'a>(
                     invocation,
                     transition: &transition,
                 };
-                let folded = folds_to_constant(assigned_value(assignment.expression));
+                let folded = assignment_folds_to_constant(
+                    assigned_value(assignment.expression),
+                    context.storage(),
+                    context.txn.txid,
+                );
                 let (expression, foldable) =
                     plpgsql_element_assignment(context, assignment, locals, &scope)?;
                 let folded = folded && foldable;
@@ -35760,8 +37288,17 @@ fn execute_trigger_step_in<'a>(
                                 value,
                             )
                             .map_err(|error| {
+                                // A literal's input fails where it is written; its
+                                // value then fails a type modifier while planned.
                                 match assignment.expression {
-                                    Expr::Str(literal) => {
+                                    Expr::Str(literal)
+                                        if !local_fails_type_modifier_only(
+                                            context,
+                                            locals,
+                                            assignment.name,
+                                            value,
+                                        ) =>
+                                    {
                                         crate::sql::error_position::at_subject(error, literal)
                                     }
                                     _ => error,
@@ -35778,6 +37315,16 @@ fn execute_trigger_step_in<'a>(
                     retained_parent.then_some(&mut status.pending_query),
                 )?;
                 if locals.iter().any(|local| assignment.name.names(local)) {
+                    if let Datum::Record(fields) | Datum::Composite { fields, .. } = value
+                        && let Ok(index) = trigger_local_index(locals, assignment.name)
+                        && let Some(width) = declared_record_width(
+                            locals[index],
+                            context.storage(),
+                            context.txn.txid,
+                        )
+                    {
+                        check_multi_assignment(context.responder, width, fields.len())?;
+                    }
                     assign_trigger_local(context, locals, local_values, assignment.name, value)?;
                 } else if assignment.name.label.is_none()
                     && TriggerStatusVariable::parse(assignment.name.name.as_str()).is_some()
@@ -35890,9 +37437,14 @@ fn execute_trigger_step_in<'a>(
                                 inputs,
                             ) = match statement.query {
                                 PlpgsqlCursorQuery::Static(source) => {
-                                    let parsed = super::parser::parse_stored_statement(
-                                        source,
-                                        context.arena,
+                                    let parsed = super::parser::with_procedural_positionals(
+                                        invocation.positionals,
+                                        || {
+                                            super::parser::parse_stored_statement(
+                                                source,
+                                                context.arena,
+                                            )
+                                        },
                                     )?;
                                     // The cursor's own query binds variables as
                                     // parameters; PostgreSQL's analysis reports an
@@ -36247,6 +37799,11 @@ fn execute_trigger_step_in<'a>(
                                         services,
                                         arena,
                                         context.txn.txid,
+                                        matches!(
+                                            context.txn.isolation,
+                                            super::ast::TransactionIsolation::RepeatableRead
+                                                | super::ast::TransactionIsolation::Serializable
+                                        ),
                                         name,
                                         motion,
                                         statement.move_only,
@@ -36261,13 +37818,17 @@ fn execute_trigger_step_in<'a>(
                         };
                         // A query with data-modifying WITH queries runs on its
                         // first read, in a new command as PostgreSQL runs it.
-                        let fills = matches!(context.host, PlpgsqlExecHost::Routine { .. })
-                            && matches!(
-                                context.host.cursors().pending_fill(name)?,
-                                Some((_, super::cursor::PendingFill::Write))
-                            );
+                        let fills = matches!(
+                            context.host.cursors().pending_fill(name)?,
+                            Some((_, super::cursor::PendingFill::Write))
+                        );
                         let (count, rows) = if fills {
-                            in_new_plpgsql_command(context, fetch)?
+                            in_new_plpgsql_command(context, |context| {
+                                if matches!(context.host, PlpgsqlExecHost::Atomic { .. }) {
+                                    fill_trigger_writing_cursor(context, name)?;
+                                }
+                                fetch(context)
+                            })?
                         } else {
                             fetch(context)?
                         };
@@ -36282,6 +37843,7 @@ fn execute_trigger_step_in<'a>(
                             let record_target = targets.len() == 1 && targets[0].takes_row(locals);
                             let mut column_names = [None; MAX_COLUMNS];
                             let mut column_type_oids = [0; MAX_COLUMNS];
+                            let mut column_type_mods = [-1; MAX_COLUMNS];
                             let column_count = {
                                 let cursors = context.host.cursors();
                                 let mut borrowed_names = [None; MAX_COLUMNS];
@@ -36289,6 +37851,7 @@ fn execute_trigger_step_in<'a>(
                                     name,
                                     &mut borrowed_names,
                                     &mut column_type_oids,
+                                    &mut column_type_mods,
                                 )?;
                                 for (target, source) in column_names[..count]
                                     .iter_mut()
@@ -36323,11 +37886,21 @@ fn execute_trigger_step_in<'a>(
                                 if !record_target {
                                     values[..width].copy_from_slice(&decoded[..width]);
                                 }
+                                if let Some(target_width) = into_target_width(
+                                    statement.targets,
+                                    locals,
+                                    definition,
+                                    context.storage(),
+                                    context.txn.txid,
+                                )? {
+                                    check_multi_assignment(context.responder, target_width, width)?;
+                                }
                             }
                             if record_target {
                                 let mut fields = [RecordField {
                                     name: "",
                                     type_oid: 0,
+                                    type_mod: -1,
                                     value: Datum::Null,
                                 }; MAX_COLUMNS];
                                 for index in 0..column_count {
@@ -36344,6 +37917,7 @@ fn execute_trigger_step_in<'a>(
                                         name: column_names[index]
                                             .expect("cursor description name initialized"),
                                         type_oid: column_type_oids[index],
+                                        type_mod: column_type_mods[index],
                                         value,
                                     };
                                 }
@@ -36470,7 +38044,7 @@ fn execute_trigger_step_in<'a>(
                 };
                 let record_target = statement.targets.len() == 1 && targets[0].takes_row(locals);
                 let arena = context.arena;
-                let mut fields = [("", 0); MAX_PROJ];
+                let mut fields = [("", 0, -1); MAX_PROJ];
                 let record_width = if record_target {
                     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
                     let width = super::query::describe_select(
@@ -36488,6 +38062,7 @@ fn execute_trigger_step_in<'a>(
                                 .alloc_str(column.name)
                                 .map_err(|_| super::query::arena_full_pub())?,
                             column.type_oid,
+                            column.type_mod,
                         );
                     }
                     width
@@ -36501,6 +38076,10 @@ fn execute_trigger_step_in<'a>(
                 } else {
                     None
                 };
+                let too_many_rows = super::guc::active_plpgsql_extra_check(
+                    super::guc::PlpgsqlExtraCheck::TooManyRows,
+                )?;
+                let mut source_width = 0usize;
                 let (selected, row_count) = execute_procedural_query(
                     context,
                     // The main query reads the snapshot its WITH writes ran
@@ -36512,8 +38091,14 @@ fn execute_trigger_step_in<'a>(
                         let mut found = false;
                         let mut row_count = 0usize;
                         super::query::consume_query_rows(
-                            core::num::NonZeroU64::new(if statement.strict { 2 } else { 1 })
-                                .expect("SELECT INTO consumes one or two rows"),
+                            core::num::NonZeroU64::new(
+                                if statement.strict || too_many_rows.is_some() {
+                                    2
+                                } else {
+                                    1
+                                },
+                            )
+                            .expect("SELECT INTO consumes one or two rows"),
                             |emit| {
                                 super::query::select_into_rows(
                                     storage,
@@ -36534,10 +38119,12 @@ fn execute_trigger_step_in<'a>(
                                     ));
                                 }
                                 if !found {
+                                    source_width = values.len();
                                     if record_target {
                                         let mut row_fields = [RecordField {
                                             name: "",
                                             type_oid: 0,
+                                            type_mod: -1,
                                             value: Datum::Null,
                                         };
                                             MAX_PROJ];
@@ -36545,6 +38132,7 @@ fn execute_trigger_step_in<'a>(
                                             row_fields[index] = RecordField {
                                                 name: fields[index].0,
                                                 type_oid: fields[index].1,
+                                                type_mod: fields[index].2,
                                                 value: detached_trigger_datum(value, arena)?,
                                             };
                                         }
@@ -36573,6 +38161,7 @@ fn execute_trigger_step_in<'a>(
                                 .alloc_slice_with(record_width, |index| RecordField {
                                     name: fields[index].0,
                                     type_oid: fields[index].1,
+                                    type_mod: fields[index].2,
                                     value: Datum::Null,
                                 })
                                 .map_err(|_| super::query::arena_full_pub())?;
@@ -36586,15 +38175,35 @@ fn execute_trigger_step_in<'a>(
                 // Checking the row count and storing the row happen after the
                 // query, outside its context.
                 crate::sql::error_context::outside_query(|| {
+                    let parameters = StrictParameters::Variables {
+                        locals,
+                        values: &local_values[..locals.len()],
+                    };
                     if statement.strict {
-                        let parameters = StrictParameters::Variables {
-                            locals,
-                            values: &local_values[..locals.len()],
-                        };
                         match row_count {
                             0 => return Err(no_rows_returned(parameters, context.arena)),
                             1 => {}
                             _ => return Err(too_many_rows_returned(parameters, context.arena)),
+                        }
+                    } else if row_count > 1
+                        && let Some(level) = too_many_rows
+                    {
+                        check_too_many_rows(context, level, parameters)?;
+                    }
+                    if row_count > 0 {
+                        let target_width = if record_target {
+                            into_record_width(
+                                targets[0],
+                                locals,
+                                definition,
+                                context.storage(),
+                                context.txn.txid,
+                            )
+                        } else {
+                            Some(statement.targets.len())
+                        };
+                        if let Some(target_width) = target_width {
+                            check_multi_assignment(context.responder, target_width, source_width)?;
                         }
                     }
                     for (index, resolved) in targets[..statement.targets.len()].iter().enumerate() {
@@ -36630,6 +38239,7 @@ fn execute_trigger_step_in<'a>(
                 let mut selected = [Datum::Null; MAX_COLUMNS];
                 let mut found = false;
                 let mut row_count = 0usize;
+                let mut source_width = 0usize;
                 let query = bind_plpgsql_dynamic_query(
                     context,
                     statement.query,
@@ -36653,9 +38263,10 @@ fn execute_trigger_step_in<'a>(
                 with_bound_parameter_types(query.parameter_types, || {
                     let record_target =
                         statement.targets.len() == 1 && targets[0].takes_row(locals);
-                    let (record_width, record_names, record_type_oids) = {
+                    let (record_width, record_names, record_type_oids, record_type_mods) = {
                         let mut names = [StackStr::<63>::new(); MAX_PROJ];
                         let mut type_oids = [0i32; MAX_PROJ];
+                        let mut type_mods = [-1i32; MAX_PROJ];
                         let width = if record_target
                             && let Stmt::FetchCursor {
                                 name,
@@ -36665,8 +38276,12 @@ fn execute_trigger_step_in<'a>(
                         {
                             let cursors = context.host.cursors();
                             let mut borrowed = [None; MAX_PROJ];
-                            let width =
-                                cursors.record_columns(name, &mut borrowed, &mut type_oids)?;
+                            let width = cursors.record_columns(
+                                name,
+                                &mut borrowed,
+                                &mut type_oids,
+                                &mut type_mods,
+                            )?;
                             for (name, source) in names[..width].iter_mut().zip(&borrowed[..width])
                             {
                                 *name = StackStr::from_str(
@@ -36736,10 +38351,11 @@ fn execute_trigger_step_in<'a>(
                             for (index, column) in columns[..width].iter().enumerate() {
                                 names[index] = StackStr::from_str(column.name);
                                 type_oids[index] = column.type_oid;
+                                type_mods[index] = column.type_mod;
                             }
                             width
                         };
-                        (width, names, type_oids)
+                        (width, names, type_oids, type_mods)
                     };
                     let arena = context.arena;
                     let prepare_empty_record =
@@ -36749,6 +38365,7 @@ fn execute_trigger_step_in<'a>(
                                     .alloc_slice_with(record_width, |index| RecordField {
                                         name: "",
                                         type_oid: record_type_oids[index],
+                                        type_mod: record_type_mods[index],
                                         value: Datum::Null,
                                     })
                                     .map_err(|_| super::query::arena_full_pub())?;
@@ -36771,10 +38388,12 @@ fn execute_trigger_step_in<'a>(
                             ));
                         }
                         if !found {
+                            source_width = values.len();
                             if record_target {
                                 let mut fields = [RecordField {
                                     name: "",
                                     type_oid: 0,
+                                    type_mod: -1,
                                     value: Datum::Null,
                                 }; MAX_PROJ];
                                 for (index, value) in values.iter().copied().enumerate() {
@@ -36783,6 +38402,7 @@ fn execute_trigger_step_in<'a>(
                                             .alloc_str(record_names[index].as_str())
                                             .map_err(|_| super::query::arena_full_pub())?,
                                         type_oid: record_type_oids[index],
+                                        type_mod: record_type_mods[index],
                                         value: detached_trigger_datum(value, arena)?,
                                     };
                                 }
@@ -36868,6 +38488,9 @@ fn execute_trigger_step_in<'a>(
                             move_only: false,
                         } => {
                             let arena = context.arena;
+                            if matches!(context.host, PlpgsqlExecHost::Atomic { .. }) {
+                                fill_trigger_writing_cursor(context, name)?;
+                            }
                             let rows = {
                                 let cursors = match &mut context.host {
                                     PlpgsqlExecHost::Routine {
@@ -36899,6 +38522,11 @@ fn execute_trigger_step_in<'a>(
                                             services,
                                             arena,
                                             context.txn.txid,
+                                            matches!(
+                                                context.txn.isolation,
+                                                super::ast::TransactionIsolation::RepeatableRead
+                                                    | super::ast::TransactionIsolation::Serializable
+                                            ),
                                             name,
                                             *motion,
                                             false,
@@ -36973,6 +38601,7 @@ fn execute_trigger_step_in<'a>(
                                         };
                                         pending.save_output(
                                             values,
+                                            source_width,
                                             row_count as u64,
                                             query.arguments,
                                             &context.storage().row_work,
@@ -37020,6 +38649,7 @@ fn execute_trigger_step_in<'a>(
                         statement,
                         query.arguments,
                         &selected[..statement.targets.len()],
+                        source_width,
                         row_count as u64,
                         status,
                     )?;
@@ -37249,6 +38879,10 @@ fn execute_trigger_step_in<'a>(
                 Ok(None)
             }),
             TriggerStatement::Assert(assertion) => execute_trigger_statement(|| {
+                // `plpgsql.check_asserts = off` skips the statement entirely.
+                if !crate::sql::guc::active_check_asserts()? {
+                    return Ok(None);
+                }
                 let transition = records.transition(definition);
                 let scope = TriggerLocalScope {
                     locals,
@@ -37507,7 +39141,13 @@ fn execute_trigger_step_in<'a>(
                 statement: TriggerDml::Insert(statement),
                 into,
             } => execute_trigger_statement(|| {
-                if rewritten_write_target(context.storage(), &Stmt::Insert(statement), context.txn)
+                if super::is_pg_settings(statement.table) {
+                    return Err(super::query::function_view_write_error(
+                        "pg_settings",
+                        super::query::ViewWrite::Insert,
+                    ));
+                }
+                if rewritten_write_target(context.storage(), &Stmt::Insert(statement), context.txn)?
                     .is_some()
                 {
                     let transition = records.transition(definition);
@@ -37690,8 +39330,11 @@ fn execute_trigger_step_in<'a>(
                         write_completion::PendingNestedWrite::new(command.suspend(), completion);
                     if into.is_some() && returns {
                         let returned = returning.rows;
+                        let width = returning.width;
+                        let values = returning.values(context.arena)?;
                         pending.save_output(
-                            Some(returning.values(context.arena)?),
+                            Some(values),
+                            width,
                             returned,
                             &[],
                             &context.storage().row_work,
@@ -37722,6 +39365,7 @@ fn execute_trigger_step_in<'a>(
                             .responder
                             .take_affected_rows()
                             .expect("trigger INSERT publishes an affected-row count");
+                        let width = returning.width;
                         let selected = returning.values(context.arena)?;
                         finish_static_returning(
                             context,
@@ -37734,6 +39378,7 @@ fn execute_trigger_step_in<'a>(
                             into,
                             returns,
                             selected,
+                            width,
                             rows,
                             status,
                         )?;
@@ -37754,7 +39399,21 @@ fn execute_trigger_step_in<'a>(
                 statement: TriggerDml::Update(statement),
                 into,
             } => execute_trigger_statement(|| {
-                if rewritten_write_target(context.storage(), &Stmt::Update(statement), context.txn)
+                if super::is_pg_settings(statement.table) {
+                    let transition = records.transition(definition);
+                    let scope = TriggerLocalScope {
+                        locals,
+                        values: &local_values[..locals.len()],
+                        found: status.found,
+                        invocation,
+                        transition: &transition,
+                    };
+                    run_pg_settings_rule(context, &statement, &scope)?;
+                    status.found = Some(false);
+                    status.row_count = 0;
+                    return Ok(None);
+                }
+                if rewritten_write_target(context.storage(), &Stmt::Update(statement), context.txn)?
                     .is_some()
                 {
                     let transition = records.transition(definition);
@@ -37890,8 +39549,11 @@ fn execute_trigger_step_in<'a>(
                         write_completion::PendingNestedWrite::new(command.suspend(), completion);
                     if into.is_some() && returns {
                         let returned = returning.rows;
+                        let width = returning.width;
+                        let values = returning.values(context.arena)?;
                         pending.save_output(
-                            Some(returning.values(context.arena)?),
+                            Some(values),
+                            width,
                             returned,
                             &[],
                             &context.storage().row_work,
@@ -37922,6 +39584,7 @@ fn execute_trigger_step_in<'a>(
                             .responder
                             .take_affected_rows()
                             .expect("trigger UPDATE publishes an affected-row count");
+                        let width = returning.width;
                         let selected = returning.values(context.arena)?;
                         finish_static_returning(
                             context,
@@ -37934,6 +39597,7 @@ fn execute_trigger_step_in<'a>(
                             into,
                             returns,
                             selected,
+                            width,
                             rows,
                             status,
                         )?;
@@ -37954,7 +39618,13 @@ fn execute_trigger_step_in<'a>(
                 statement: TriggerDml::Delete(statement),
                 into,
             } => execute_trigger_statement(|| {
-                if rewritten_write_target(context.storage(), &Stmt::Delete(statement), context.txn)
+                if super::is_pg_settings(statement.table) {
+                    return Err(super::query::function_view_write_error(
+                        "pg_settings",
+                        super::query::ViewWrite::Delete,
+                    ));
+                }
+                if rewritten_write_target(context.storage(), &Stmt::Delete(statement), context.txn)?
                     .is_some()
                 {
                     let transition = records.transition(definition);
@@ -38089,8 +39759,11 @@ fn execute_trigger_step_in<'a>(
                         write_completion::PendingNestedWrite::new(command.suspend(), completion);
                     if into.is_some() && returns {
                         let returned = returning.rows;
+                        let width = returning.width;
+                        let values = returning.values(context.arena)?;
                         pending.save_output(
-                            Some(returning.values(context.arena)?),
+                            Some(values),
+                            width,
                             returned,
                             &[],
                             &context.storage().row_work,
@@ -38121,6 +39794,7 @@ fn execute_trigger_step_in<'a>(
                             .responder
                             .take_affected_rows()
                             .expect("trigger DELETE publishes an affected-row count");
+                        let width = returning.width;
                         let selected = returning.values(context.arena)?;
                         finish_static_returning(
                             context,
@@ -38133,6 +39807,7 @@ fn execute_trigger_step_in<'a>(
                             into,
                             returns,
                             selected,
+                            width,
                             rows,
                             status,
                         )?;
@@ -38256,8 +39931,11 @@ fn execute_trigger_step_in<'a>(
                         write_completion::PendingNestedWrite::new(command.suspend(), completion);
                     if into.is_some() && returns {
                         let returned = returning.rows;
+                        let width = returning.width;
+                        let values = returning.values(context.arena)?;
                         pending.save_output(
-                            Some(returning.values(context.arena)?),
+                            Some(values),
+                            width,
                             returned,
                             &[],
                             &context.storage().row_work,
@@ -38288,6 +39966,7 @@ fn execute_trigger_step_in<'a>(
                             .responder
                             .take_affected_rows()
                             .expect("trigger MERGE publishes an affected-row count");
+                        let width = returning.width;
                         let selected = returning.values(context.arena)?;
                         finish_static_returning(
                             context,
@@ -38300,6 +39979,7 @@ fn execute_trigger_step_in<'a>(
                             into,
                             returns,
                             selected,
+                            width,
                             rows,
                             status,
                         )?;
@@ -38388,10 +40068,12 @@ fn execute_trigger_step_in<'a>(
                             | TriggerForSource::Dml(_)
                             | TriggerForSource::DynamicQuery(_)
                     );
-                    let record_target = matches!(
-                        locals[target].ctype,
-                        ColType::Record | ColType::Composite(_)
-                    );
+                    // A list of variables takes the row's columns in order.
+                    let record_target = !program.row_targets.is_empty()
+                        || matches!(
+                            locals[target].ctype,
+                            ColType::Record | ColType::Composite(_)
+                        );
                     let mut dynamic = None;
                     let dml_rows = match program.source {
                         // The data change waited for its AFTER triggers with
@@ -38481,10 +40163,7 @@ fn execute_trigger_step_in<'a>(
                                 source,
                                 captured,
                                 transition_relations,
-                                matches!(
-                                    locals[target].ctype,
-                                    ColType::Record | ColType::Composite(_)
-                                ),
+                                record_target,
                                 status,
                                 retained_parent,
                             )?)
@@ -38536,10 +40215,7 @@ fn execute_trigger_step_in<'a>(
                                         invocation.fresh_snapshots && dml_ctes.is_empty(),
                                         None,
                                         |storage, sequence| {
-                                            if matches!(
-                                                locals[target].ctype,
-                                                ColType::Record | ColType::Composite(_)
-                                            ) {
+                                            if record_target {
                                                 materialize_trigger_for_record_query(
                                                     storage, query, arena, arena, txid, params,
                                                     sequence, &scope,
@@ -38657,6 +40333,7 @@ fn execute_trigger_step_in<'a>(
                                     TriggerForRows {
                                         values: &*values,
                                         empty: Datum::Null,
+                                        width: 1,
                                     }
                                 }
                                 TriggerForSource::Dml(_) => {
@@ -39317,6 +40994,7 @@ fn finish_dynamic_into<'a>(
     statement: PlpgsqlDynamicSelectInto<'a>,
     arguments: &[Datum<'a>],
     selected: &[Datum<'a>],
+    source_width: usize,
     rows: u64,
     status: &mut TriggerExecutionStatus<'a>,
 ) -> Result<(), SqlError> {
@@ -39346,6 +41024,17 @@ fn finish_dynamic_into<'a>(
                     ));
                 }
             }
+        }
+        if rows > 0
+            && let Some(target_width) = into_target_width(
+                statement.targets,
+                locals,
+                new_row.definition,
+                context.storage(),
+                context.txn.txid,
+            )?
+        {
+            check_multi_assignment(context.responder, target_width, source_width)?;
         }
         for (target, value) in statement
             .targets
@@ -39380,9 +41069,11 @@ struct NewRowTarget<'r, 'n, 'm, 'a> {
 struct StaticReturning<'a> {
     into: Option<PlpgsqlInto<'a>>,
     /// Field names and types when a single record variable receives the row.
-    record: Option<&'a [(&'a str, i32)]>,
+    record: Option<&'a [(&'a str, i32, i32)]>,
     selected: [Datum<'a>; MAX_COLUMNS],
     rows: u64,
+    /// The columns of the first returned row.
+    width: usize,
 }
 
 impl<'a> StaticReturning<'a> {
@@ -39413,7 +41104,9 @@ impl<'a> StaticReturning<'a> {
                 crate::sql::exec::DescriptionTarget::Sql,
             )?;
             let fields = arena
-                .alloc_slice_with(width, |index| ("", columns[index].type_oid))
+                .alloc_slice_with(width, |index| {
+                    ("", columns[index].type_oid, columns[index].type_mod)
+                })
                 .map_err(|_| super::query::arena_full_pub())?;
             for (field, column) in fields.iter_mut().zip(&columns[..width]) {
                 field.0 = arena
@@ -39427,17 +41120,20 @@ impl<'a> StaticReturning<'a> {
             record,
             selected: [Datum::Null; MAX_COLUMNS],
             rows: 0,
+            width: 0,
         })
     }
 
     fn capture(&mut self, values: &[Datum<'_>], arena: &'a Arena) -> Result<(), SqlError> {
         if self.rows == 0 && self.into.is_some() {
+            self.width = values.len();
             match self.record {
                 Some(fields) => {
                     let row = arena
                         .alloc_slice_with(fields.len(), |index| RecordField {
                             name: fields[index].0,
                             type_oid: fields[index].1,
+                            type_mod: fields[index].2,
                             value: Datum::Null,
                         })
                         .map_err(|_| super::query::arena_full_pub())?;
@@ -39470,6 +41166,7 @@ impl<'a> StaticReturning<'a> {
                 .alloc_slice_with(fields.len(), |index| RecordField {
                     name: fields[index].0,
                     type_oid: fields[index].1,
+                    type_mod: fields[index].2,
                     value: Datum::Null,
                 })
                 .map_err(|_| super::query::arena_full_pub())?;
@@ -39494,6 +41191,7 @@ fn finish_static_returning<'a>(
     into: Option<PlpgsqlInto<'a>>,
     returns: bool,
     selected: &[Datum<'a>],
+    source_width: usize,
     rows: u64,
     status: &mut TriggerExecutionStatus<'a>,
 ) -> Result<(), SqlError> {
@@ -39509,6 +41207,7 @@ fn finish_static_returning<'a>(
             into,
             returns,
             selected,
+            source_width,
             rows,
         )
     })
@@ -39526,6 +41225,7 @@ fn store_static_returning<'a>(
     into: Option<PlpgsqlInto<'a>>,
     returns: bool,
     selected: &[Datum<'a>],
+    source_width: usize,
     rows: u64,
 ) -> Result<(), SqlError> {
     let into = match (into, returns) {
@@ -39552,6 +41252,17 @@ fn store_static_returning<'a>(
         0 if into.strict => return Err(no_rows_returned(parameters, context.arena)),
         0 | 1 => {}
         _ => return Err(too_many_rows_returned(parameters, context.arena)),
+    }
+    if rows > 0
+        && let Some(target_width) = into_target_width(
+            into.targets,
+            locals,
+            targets.definition,
+            context.storage(),
+            context.txn.txid,
+        )?
+    {
+        check_multi_assignment(context.responder, target_width, source_width)?;
     }
     for (target, value) in into.targets.iter().copied().zip(selected.iter().copied()) {
         let resolved = plpgsql_into_target(locals, targets.definition, target)?;
@@ -39586,13 +41297,14 @@ fn finish_resumed_static_write<'a>(
     output: Option<write_completion::NestedWriteOutput>,
     status: &mut TriggerExecutionStatus<'a>,
 ) -> Result<(), SqlError> {
-    let selected = match output {
-        None if into.is_none() || !returns => &[][..],
+    let (selected, source_width) = match output {
+        None if into.is_none() || !returns => (&[][..], 0),
         Some(write_completion::NestedWriteOutput::Rows {
             values,
             rows: returned,
+            source_width,
             ..
-        }) if returned == rows => values.decode(context.arena)?,
+        }) if returned == rows => (&*values.decode(context.arena)?, source_width),
         _ => {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -39608,6 +41320,7 @@ fn finish_resumed_static_write<'a>(
         into,
         returns,
         selected,
+        source_width,
         rows,
         status,
     )
@@ -39643,6 +41356,136 @@ fn too_many_rows_returned(parameters: StrictParameters<'_, '_>, arena: &Arena) -
         ),
         "Make sure the query returns a single row, or use LIMIT 1.",
     )
+}
+
+/// PL/pgSQL's `too_many_rows` extra check of a non-`STRICT` `SELECT ...
+/// INTO` that found a second row: the `STRICT` error, or the same report as
+/// a warning before the first row is stored.
+fn check_too_many_rows(
+    context: &mut TriggerExecContext<'_, '_, '_>,
+    level: super::guc::PlpgsqlExtraCheckLevel,
+    parameters: StrictParameters<'_, '_>,
+) -> Result<(), SqlError> {
+    if level == super::guc::PlpgsqlExtraCheckLevel::Error {
+        return Err(too_many_rows_returned(parameters, context.arena));
+    }
+    let warning = with_strict_parameters(
+        sql_err!(sqlstate::TOO_MANY_ROWS, "query returned more than one row"),
+        parameters,
+        context.arena,
+    );
+    let detail = crate::sql::eval::take_diagnostic().and_then(|diagnostic| diagnostic.detail);
+    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
+        detail,
+        hint: Some(crate::util::StackStr::from_str(
+            "Make sure the query returns a single row, or use LIMIT 1.",
+        )),
+        objects: crate::sql::eval::ErrorObjects::default(),
+    });
+    context
+        .responder
+        .warning(warning.sqlstate, warning.message.as_str())
+        .map_err(trigger_notice_to_sql)
+}
+
+/// PL/pgSQL's `strict_multi_assignment` extra check of a row stored into
+/// `targets` fields from `sources` columns: one report for each target
+/// without a source, then one when sources remain, as PostgreSQL's
+/// `exec_move_row_from_fields` makes them.
+fn check_multi_assignment(
+    responder: &mut Responder<'_>,
+    targets: usize,
+    sources: usize,
+) -> Result<(), SqlError> {
+    use super::guc::{PlpgsqlExtraCheck, PlpgsqlExtraCheckLevel};
+    if targets == sources {
+        return Ok(());
+    }
+    let Some(level) =
+        super::guc::active_plpgsql_extra_check(PlpgsqlExtraCheck::StrictMultiAssignment)?
+    else {
+        return Ok(());
+    };
+    let reports = targets.saturating_sub(sources) + usize::from(sources > targets);
+    for _ in 0..reports {
+        crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
+            detail: Some(crate::util::StackStr::from_str(match level {
+                PlpgsqlExtraCheckLevel::Error => {
+                    "strict_multi_assignment check of extra_errors is active."
+                }
+                PlpgsqlExtraCheckLevel::Warning => {
+                    "strict_multi_assignment check of extra_warnings is active."
+                }
+            })),
+            hint: Some(crate::util::StackStr::from_str(
+                "Make sure the query returns the exact list of columns.",
+            )),
+            objects: crate::sql::eval::ErrorObjects::default(),
+        });
+        let message = "number of source and target fields in assignment does not match";
+        match level {
+            PlpgsqlExtraCheckLevel::Error => {
+                return Err(sql_err!(sqlstate::DATATYPE_MISMATCH, "{}", message));
+            }
+            PlpgsqlExtraCheckLevel::Warning => responder
+                .warning(sqlstate::DATATYPE_MISMATCH, message)
+                .map_err(trigger_notice_to_sql)?,
+        }
+    }
+    Ok(())
+}
+
+/// The field count of a record or row variable declared with a composite
+/// type, which a whole-row assignment fills field by field; `None` for a
+/// `record` variable, which takes its source's fields.
+fn declared_record_width(local: TriggerLocalDecl, storage: &Storage, txid: u32) -> Option<usize> {
+    match (local.record_shape, local.ctype) {
+        (Some(PlpgsqlRecordShape::Table { slot, .. }), _) => {
+            Some(storage.table_def(usize::from(slot), txid).columns().len())
+        }
+        (None, ColType::Composite(Some(creation))) => storage
+            .require_row_type_definition(creation, txid)
+            .ok()
+            .map(|definition| definition.active_fields().count()),
+        _ => None,
+    }
+}
+
+/// The fields an `INTO` list fills from a row field by field: one per
+/// variable, or a single composite variable's or trigger record's fields;
+/// `None` for a `record` variable, which takes the row's own fields.
+fn into_target_width(
+    targets: &[PlpgsqlVariableName],
+    locals: &[TriggerLocalDecl],
+    definition: crate::storage::RelationDefinition<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> Result<Option<usize>, SqlError> {
+    let [target] = targets else {
+        return Ok(Some(targets.len()));
+    };
+    let target = plpgsql_into_target(locals, definition, *target)?;
+    Ok(if target.takes_row(locals) {
+        into_record_width(target, locals, definition, storage, txid)
+    } else {
+        Some(1)
+    })
+}
+
+/// The fields a single `INTO` target receives a whole row into, when it is
+/// filled field by field: a composite variable or a trigger's `NEW`/`OLD`.
+fn into_record_width(
+    target: PlpgsqlIntoTarget,
+    locals: &[TriggerLocalDecl],
+    definition: crate::storage::RelationDefinition<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> Option<usize> {
+    match target {
+        PlpgsqlIntoTarget::Local(index) => declared_record_width(locals[index], storage, txid),
+        PlpgsqlIntoTarget::TriggerRecord(_) => Some(definition.n_columns),
+        PlpgsqlIntoTarget::TriggerField(..) => None,
+    }
 }
 
 /// Adds PostgreSQL's `parameters: name = 'value', ...` DETAIL to a `STRICT`
@@ -39743,11 +41586,11 @@ fn mark_statement_variables(
     use crate::sql::lexer::{Lexer, Tok};
     let mut mark = |label: Option<SqlName>, name: SqlName| {
         let index = match label {
-            Some(label) => locals
-                .iter()
-                .rposition(|local| local.name == name && local.label == Some(label))
-                .or_else(|| locals.iter().rposition(|local| local.name == label)),
-            None => locals.iter().rposition(|local| local.name == name),
+            Some(label) => plpgsql_slot(locals, |local| {
+                local.name == name && local.label == Some(label)
+            })
+            .or_else(|| plpgsql_slot(locals, |local| local.name == label)),
+            None => plpgsql_slot(locals, |local| local.name == name),
         };
         if let Some(index) = index {
             referenced[index] = true;
@@ -39920,11 +41763,8 @@ fn fire_row_trigger_slot<'a, Definition0: crate::storage::DefinitionBacking>(
                 .partition_trigger_enabled_to(trigger_slot, table, context.txn.txid)
         },
     );
-    if !(if context.txn.replication_apply {
-        enabled.fires_for_replication()
-    } else {
-        enabled.fires_for_origin()
-    }) || !matches!(trigger.level, TriggerLevel::Row)
+    if !enabled.fires_in(crate::sql::guc::active_session_replication_role()?)
+        || !matches!(trigger.level, TriggerLevel::Row)
         || trigger.timing
             != if matches!(target, crate::storage::TriggerTarget::View(_)) {
                 TriggerTiming::InsteadOf
@@ -40101,33 +41941,58 @@ pub(crate) enum TriggerQueueBoundary {
     Constraints(Option<crate::sql::txn::ConstraintIdentity>),
 }
 
-/// Runs one queued event: a foreign key check, or a row trigger body.
+/// Runs one queued event: a foreign key check or action, a row trigger
+/// body, or an AFTER STATEMENT trigger. `own` holds the transition rows of
+/// the statement's own target when the event belongs to it.
 fn execute_queued_firing<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     firing: write_completion::QueuedFiring,
-    transition_rows: Option<TransitionRows<'a>>,
+    own: Option<TransitionRows<'a>>,
 ) -> Result<(), SqlError> {
-    match firing.trigger_slot {
-        Some(trigger_slot) => execute_deferred_trigger_event(
+    let Some(trigger_slot) = firing.trigger_slot else {
+        return constraints::fire_queued_foreign_key_event(context, firing.index);
+    };
+    let trigger = context.storage().trigger(usize::from(trigger_slot));
+    let rows = write_completion::queued_transition_rows(context, &trigger, firing, own)?;
+    if !firing.statement {
+        return execute_deferred_trigger_event(
             context,
             firing.index,
             trigger_slot,
             firing.table,
-            transition_rows,
-        ),
-        None => {
-            let arena = context.arena;
-            let (storage, txn, _, services) = context.dml_parts();
-            let seq_session = services.seq_session;
-            constraints::fire_queued_foreign_key_event(
-                storage,
-                txn,
-                firing.index,
-                arena,
-                seq_session,
-            )
-        }
+            rows,
+        );
     }
+    // Its WHEN condition passed when it was queued.
+    context.txn.fire_trigger_event(firing.index)?;
+    if let crate::storage::TriggerFunction::Builtin(builtin) = trigger.function {
+        return fire_builtin_trigger(builtin, &trigger, firing.event, None, None).map(|_| ());
+    }
+    let definition = (*context
+        .storage()
+        .table_def(usize::from(firing.table), context.txn.txid))
+    .clone();
+    let relation = crate::storage::RelationDefinition::from_definition(&definition);
+    let target = crate::storage::TriggerTarget::Table(firing.table);
+    let mut context = context.for_trigger();
+    let mut statement_firing = prepare_trigger_firing(
+        &mut context,
+        &trigger,
+        TriggerRelationIdentity {
+            target,
+            schema: relation.schema,
+            name: relation.name,
+        },
+        relation,
+        firing.event,
+        false,
+        None,
+        None,
+        rows,
+    )?;
+    super::query::protect_replayable_effect();
+    statement_firing.execute(&mut context)?;
+    Ok(())
 }
 
 fn execute_deferred_trigger_event<'a>(
@@ -40195,6 +42060,46 @@ fn fire_statement_row_trigger_events<'a>(
     Ok(())
 }
 
+/// Runs the AFTER events the statement at `depth` running as `command` still
+/// has queued: those of its data-modifying `WITH` sub-statements when the
+/// main statement fired no events of its own (a `SELECT`, or a write
+/// rewritten into other statements). They run with the engine's executor, so
+/// a referential action may run rules, write views or run DDL in trigger
+/// bodies as at top level.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the engine host carries every per-connection execution service"
+)]
+pub(crate) fn fire_statement_after_events(
+    engine: &mut super::Engine,
+    guc: &crate::sql::guc::GucState,
+    sqlprep: &mut super::prep::SqlPreparedPool,
+    cursors: &mut super::cursor::CursorPool,
+    txn: &mut TxnState,
+    (depth, command): (u16, u32),
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Result<(), SqlError> {
+    let mut context = TriggerExecContext {
+        host: PlpgsqlExecHost::Routine {
+            engine,
+            guc,
+            sqlprep,
+            cursors,
+            transaction_context: PlpgsqlTransactionContext::Atomic,
+        },
+        txn,
+        arena,
+        params: crate::sql::eval::NO_PARAMS,
+        responder,
+    };
+    let mut cursor = write_completion::AfterRowCursor::new(depth, command);
+    while let Some(firing) = cursor.next(&mut context)? {
+        execute_queued_firing(&mut context, firing, None)?;
+    }
+    Ok(())
+}
+
 /// Fires deferred constraint triggers at their typed boundary. Row images were
 /// captured at the event, so later updates cannot change OLD or NEW.
 pub(crate) fn fire_constraint_triggers(
@@ -40206,30 +42111,72 @@ pub(crate) fn fire_constraint_triggers(
     boundary: TriggerQueueBoundary,
 ) -> Result<(), SqlError> {
     txn.queue_all_pending_row_events()?;
+    let mut context = TriggerExecContext {
+        host: PlpgsqlExecHost::Atomic {
+            storage,
+            services: services.reborrow(),
+        },
+        txn,
+        arena,
+        params: crate::sql::eval::NO_PARAMS,
+        responder,
+    };
     let mut next = 0u64;
-    while next < txn.trigger_events_end() {
+    while next < context.txn.trigger_events_end() {
         let index = next;
-        let (event, following, fired) = txn.trigger_event(index)?;
+        let (event, following, fired) = context.txn.trigger_event(index)?;
         next = following;
         if fired {
             continue;
         }
         let (trigger_slot, table) = match event.kind {
-            crate::sql::txn::DeferredTriggerKind::AfterRow { .. } => {
-                if matches!(boundary, TriggerQueueBoundary::Constraints(_)) {
+            crate::sql::txn::DeferredTriggerKind::Transition { .. } => continue,
+            crate::sql::txn::DeferredTriggerKind::AfterRow {
+                trigger_slot,
+                effective_table,
+                ..
+            }
+            | crate::sql::txn::DeferredTriggerKind::AfterStatement {
+                trigger_slot,
+                effective_table,
+                ..
+            } => match boundary {
+                TriggerQueueBoundary::Constraints(_) => continue,
+                // A referential action this boundary ran queued them.
+                TriggerQueueBoundary::Statement => {
+                    execute_queued_firing(
+                        &mut context,
+                        write_completion::QueuedFiring {
+                            index,
+                            trigger_slot: Some(trigger_slot),
+                            table: effective_table,
+                            event: event.event,
+                            statement: matches!(
+                                event.kind,
+                                crate::sql::txn::DeferredTriggerKind::AfterStatement { .. }
+                            ),
+                        },
+                        None,
+                    )?;
                     continue;
                 }
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "AFTER ROW event escaped its statement boundary"
-                ));
-            }
+                TriggerQueueBoundary::Transaction => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "AFTER trigger event escaped its statement boundary"
+                    ));
+                }
+            },
             crate::sql::txn::DeferredTriggerKind::ForeignKey {
                 identity, check, ..
             } => {
-                let Some(mode) = constraints::foreign_key_event_mode(storage, txn, identity, check)
-                else {
-                    txn.fire_trigger_event(index)?;
+                let Some(mode) = constraints::foreign_key_event_mode(
+                    context.storage(),
+                    context.txn,
+                    identity,
+                    check,
+                ) else {
+                    context.txn.fire_trigger_event(index)?;
                     continue;
                 };
                 let fires = match boundary {
@@ -40240,18 +42187,12 @@ pub(crate) fn fire_constraint_triggers(
                     TriggerQueueBoundary::Constraints(selected) => {
                         selected.is_none_or(|selected| {
                             selected == identity
-                                || selected == txn.current_constraint_identity(identity)
+                                || selected == context.txn.current_constraint_identity(identity)
                         })
                     }
                 };
                 if fires {
-                    constraints::fire_queued_foreign_key_event(
-                        storage,
-                        txn,
-                        index,
-                        arena,
-                        services.seq_session,
-                    )?;
+                    constraints::fire_queued_foreign_key_event(&mut context, index)?;
                 }
                 continue;
             }
@@ -40260,14 +42201,15 @@ pub(crate) fn fire_constraint_triggers(
                 effective_table,
                 ..
             } => {
-                let Some(timing) = constraints::constraint_timing(storage, identity, txn.txid)
+                let Some(timing) =
+                    constraints::constraint_timing(context.storage(), identity, context.txn.txid)
                 else {
-                    txn.fire_trigger_event(index)?;
+                    context.txn.fire_trigger_event(index)?;
                     continue;
                 };
                 let fires = match boundary {
                     TriggerQueueBoundary::Statement => {
-                        txn.constraint_mode(identity, timing)
+                        context.txn.constraint_mode(identity, timing)
                             == crate::sql::ast::ConstraintMode::Immediate
                     }
                     TriggerQueueBoundary::Transaction => true,
@@ -40284,22 +42226,7 @@ pub(crate) fn fire_constraint_triggers(
                 (slot, effective_table)
             }
         };
-        execute_deferred_trigger_event(
-            &mut TriggerExecContext {
-                host: PlpgsqlExecHost::Atomic {
-                    storage,
-                    services: services.reborrow(),
-                },
-                txn,
-                arena,
-                params: crate::sql::eval::NO_PARAMS,
-                responder,
-            },
-            index,
-            trigger_slot,
-            table,
-            None,
-        )?;
+        execute_deferred_trigger_event(&mut context, index, trigger_slot, table, None)?;
     }
     Ok(())
 }
@@ -40518,7 +42445,8 @@ fn fire_statement_triggers_with_rows<'a, Definition0: crate::storage::Definition
     rows: Option<TransitionRows<'a>>,
 ) -> Result<(), SqlError> {
     let mut cursor = write_completion::StatementTriggerCursor::new();
-    while let Some((slot, trigger)) = cursor.next(&context, target, event, before, updated_columns)
+    while let Some((slot, trigger)) =
+        cursor.next(&context, target, event, before, updated_columns)?
     {
         execute_statement_trigger(
             &mut context,
@@ -40548,6 +42476,9 @@ fn execute_statement_trigger<'a>(
     before: bool,
     rows: Option<TransitionRows<'a>>,
 ) -> Result<(), SqlError> {
+    if let crate::storage::TriggerFunction::Builtin(builtin) = trigger.function {
+        return fire_builtin_trigger(builtin, trigger, event, None, None).map(|_| ());
+    }
     // A BEFORE statement trigger can move to the engine; an AFTER one fired
     // here belongs to a write without completion handoff.
     let movable =
@@ -40578,7 +42509,7 @@ fn execute_statement_trigger_here<'a>(
         return Ok(());
     }
     let mut firing = prepare_trigger_firing(
-        &context,
+        &mut context,
         trigger,
         TriggerRelationIdentity {
             target,
@@ -40621,6 +42552,9 @@ fn fire_after_triggers_with_rows<'a, Definition0: crate::storage::DefinitionBack
     )
 }
 
+/// Fires `table`'s statement triggers for `event`. BEFORE STATEMENT triggers
+/// fire once per table and operation in a statement, its referential
+/// actions and data-modifying `WITH` sub-statements included.
 fn fire_statement_triggers<'a, Definition0: crate::storage::DefinitionBacking>(
     context: TriggerExecContext<'_, 'a, '_>,
     table: usize,
@@ -40629,6 +42563,12 @@ fn fire_statement_triggers<'a, Definition0: crate::storage::DefinitionBacking>(
     before: bool,
     updated_columns: ColumnSet,
 ) -> Result<(), SqlError> {
+    if before
+        && (!write_completion::has_statement_triggers(&context, table.into(), event, true)?
+            || !context.txn.claim_before_statement(table as u16, event)?)
+    {
+        return Ok(());
+    }
     fire_statement_triggers_with_rows(
         context,
         table.into(),
@@ -40644,15 +42584,12 @@ fn transition_capture_required(
     storage: &Storage,
     table: usize,
     txid: u32,
-    replication_apply: bool,
+    replication_role: crate::sql::guc::SessionReplicationRole,
     event: u8,
 ) -> bool {
     storage.triggers_for_table(table, txid).any(|(_, trigger)| {
-        (if replication_apply {
-            trigger.enabled_to(txid).fires_for_replication()
-        } else {
-            trigger.enabled_to(txid).fires_for_origin()
-        }) && matches!(trigger.timing, TriggerTiming::After)
+        trigger.enabled_to(txid).fires_in(replication_role)
+            && matches!(trigger.timing, TriggerTiming::After)
             && trigger.events.contains(event)
             && !matches!(
                 trigger.transition_tables,
@@ -41075,7 +43012,30 @@ pub fn create_trigger(
         txn.txid,
         crate::storage::RoutineCallKind::Trigger,
     ) {
-        crate::storage::RoutineCallSelection::Stored(slot) => slot,
+        crate::storage::RoutineCallSelection::Stored(slot) => {
+            if !matches!(
+                storage.routine_for(slot, txn.txid).kind,
+                crate::storage::RoutineKind::Trigger
+            ) {
+                return sql_fail(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "function \"{}\" must return type trigger",
+                    trigger.function.name
+                ));
+            }
+            if let Err(error) = storage.require_routine_execute(slot, txn.txid) {
+                return sql_fail(error);
+            }
+            match crate::storage::TriggerFunction::routine_slot(slot) {
+                Ok(function) => function,
+                Err(error) => return sql_fail(error),
+            }
+        }
+        crate::storage::RoutineCallSelection::Builtin { oid, .. }
+            if let Some(builtin) = crate::storage::BuiltinTriggerFunction::from_oid(oid) =>
+        {
+            crate::storage::TriggerFunction::Builtin(builtin)
+        }
         crate::storage::RoutineCallSelection::Builtin { oid, .. } => {
             let declaration = super::catalog::builtin_callable_by_oid(oid)
                 .expect("selected builtin has a callable declaration");
@@ -41115,19 +43075,6 @@ pub fn create_trigger(
             ));
         }
     };
-    if !matches!(
-        storage.routine_for(function, txn.txid).kind,
-        crate::storage::RoutineKind::Trigger
-    ) {
-        return sql_fail(sql_err!(
-            sqlstate::WRONG_OBJECT_TYPE,
-            "function \"{}\" must return type trigger",
-            trigger.function.name
-        ));
-    }
-    if let Err(error) = storage.require_routine_execute(function, txn.txid) {
-        return sql_fail(error);
-    }
     let events = trigger.events.iter().fold(0u8, |mask, event| {
         mask | match event {
             TriggerEvent::Insert => 1,
@@ -41157,18 +43104,21 @@ pub fn create_trigger(
     }
     let when = match trigger.when {
         Some(source) => {
-            if let Err(error) = validate_trigger_when(
-                storage,
-                txn.txid,
-                arena,
-                Some(crate::storage::RelationDefinition::from_definition(
-                    &target_definition,
-                )),
-                timing,
-                level,
-                events,
-                source,
-            ) {
+            // The condition is analysed in the statement's text.
+            if let Err(error) = crate::sql::error_position::with_analysis_in(source, || {
+                validate_trigger_when(
+                    storage,
+                    txn.txid,
+                    arena,
+                    Some(crate::storage::RelationDefinition::from_definition(
+                        &target_definition,
+                    )),
+                    timing,
+                    level,
+                    events,
+                    source,
+                )
+            }) {
                 return sql_fail(error);
             }
             match crate::storage::trigger_when_stackstr(source) {
@@ -41233,8 +43183,7 @@ pub fn create_trigger(
             }
         }
     };
-    let function_schema = storage.routine(function).schema_for(txn.txid);
-    let function_name = storage.routine(function).name_for(txn.txid);
+    let (function_schema, function_name) = storage.trigger_function_name(function, txn.txid);
     let spec = crate::storage::TriggerSpec {
         name,
         target,
@@ -43640,8 +45589,14 @@ fn text_search_support_routine(name: QualName<'_>) -> Result<i32, SqlError> {
         "prsd_lextype" => Ok(3721),
         "dsimple_init" => Ok(3725),
         "dsimple_lexize" => Ok(3726),
-        "dsnowball_init" => Ok(13_232),
-        "dsnowball_lexize" => Ok(13_233),
+        "dsynonym_init" => Ok(3728),
+        "dsynonym_lexize" => Ok(3729),
+        "dispell_init" => Ok(3731),
+        "dispell_lexize" => Ok(3732),
+        "thesaurus_init" => Ok(3740),
+        "thesaurus_lexize" => Ok(3741),
+        "dsnowball_init" => Ok(crate::sql::catalog::DSNOWBALL_INIT_OID),
+        "dsnowball_lexize" => Ok(crate::sql::catalog::DSNOWBALL_LEXIZE_OID),
         _ => Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "text search support routine {} is not executable",
@@ -43875,25 +45830,21 @@ pub fn create_text_search_template(
             .transpose()?
             .unwrap_or(0);
         let lexize = text_search_support_routine(command.lexize)?;
-        let behavior = match (init, lexize) {
-            (0 | 3725, 3726) => {
-                crate::storage::TextSearchDictionaryBehavior::Simple { accept: true }
-            }
-            (13_232, 13_233) => crate::storage::TextSearchDictionaryBehavior::EnglishStem,
-            _ => {
-                return Err(sql_err!(
+        let kind = crate::storage::TextSearchTemplateKind::from_routines(init, lexize).ok_or_else(
+            || {
+                sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "text search template support routine combination is not executable"
-                ));
-            }
-        };
+                )
+            },
+        )?;
         Ok(crate::storage::TextSearchDefinition::Template {
             schema,
             name,
             oid: 0,
             init,
             lexize,
-            behavior,
+            kind,
         })
     })();
     if let Err(error) = definition
@@ -43905,96 +45856,300 @@ pub fn create_text_search_template(
     sql_ok()
 }
 
-fn dictionary_definition(
+const MAX_DICTIONARY_OPTIONS: usize = 32;
+
+/// A dictionary's options in order, as `pg_ts_dict.dictinitoption` holds them.
+struct DictionaryOptions {
+    entries: [(StackStr<64>, StackStr<512>); MAX_DICTIONARY_OPTIONS],
+    count: usize,
+}
+
+impl DictionaryOptions {
+    fn new() -> Self {
+        Self {
+            entries: [(StackStr::new(), StackStr::new()); MAX_DICTIONARY_OPTIONS],
+            count: 0,
+        }
+    }
+
+    fn too_long() -> SqlError {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "text search dictionary options exceed the catalog limit"
+        )
+    }
+
+    fn push(&mut self, name: &str, value: &str) -> Result<(), SqlError> {
+        let slot = self
+            .entries
+            .get_mut(self.count)
+            .ok_or_else(Self::too_long)?;
+        *slot = (StackStr::from_str(name), StackStr::from_str(value));
+        if slot.0.is_truncated() || slot.1.is_truncated() {
+            return Err(Self::too_long());
+        }
+        self.count += 1;
+        Ok(())
+    }
+
+    fn remove(&mut self, name: &str) {
+        let mut kept = 0;
+        for index in 0..self.count {
+            if self.entries[index].0.as_str() != name {
+                self.entries[kept] = self.entries[index];
+                kept += 1;
+            }
+        }
+        self.count = kept;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries[..self.count]
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+
+    /// Reads back what `render` stored.
+    fn parse_stored(text: &str) -> Result<Self, SqlError> {
+        use core::fmt::Write as _;
+        let malformed = || {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "stored text search dictionary options are malformed"
+            )
+        };
+        let mut options = Self::new();
+        let mut rest = text;
+        while !rest.is_empty() {
+            let mut name = StackStr::<64>::new();
+            if let Some(quoted) = rest.strip_prefix('"') {
+                let mut chars = quoted.char_indices();
+                loop {
+                    let (at, character) = chars.next().ok_or_else(malformed)?;
+                    if character == '"' {
+                        if quoted[at + 1..].starts_with('"') {
+                            chars.next();
+                        } else {
+                            rest = &quoted[at + 1..];
+                            break;
+                        }
+                    }
+                    let _ = name.write_char(character);
+                }
+            } else {
+                let end = rest.find(" = ").ok_or_else(malformed)?;
+                let _ = name.write_str(&rest[..end]);
+                rest = &rest[end..];
+            }
+            rest = rest.strip_prefix(" = ").ok_or_else(malformed)?;
+            let mut value = StackStr::<512>::new();
+            let escaped = rest.starts_with("E'");
+            if let Some(quoted) = rest.strip_prefix(if escaped { "E'" } else { "'" }) {
+                let mut chars = quoted.char_indices();
+                loop {
+                    let (at, character) = chars.next().ok_or_else(malformed)?;
+                    if character == '\'' || (escaped && character == '\\') {
+                        if quoted[at + 1..].starts_with(character) {
+                            chars.next();
+                        } else if character == '\'' {
+                            rest = &quoted[at + 1..];
+                            break;
+                        } else {
+                            return Err(malformed());
+                        }
+                    }
+                    let _ = value.write_char(character);
+                }
+            } else {
+                let end = rest.find(", ").unwrap_or(rest.len());
+                let _ = value.write_str(&rest[..end]);
+                rest = &rest[end..];
+            }
+            options.push(name.as_str(), value.as_str())?;
+            if !rest.is_empty() {
+                rest = rest.strip_prefix(", ").ok_or_else(malformed)?;
+            }
+        }
+        Ok(options)
+    }
+
+    /// `serialize_deflist`: quoted names and string values, `E''` when a
+    /// value holds a backslash.
+    fn render(&self) -> Result<StackStr<512>, SqlError> {
+        use core::fmt::Write as _;
+        let mut rendered = StackStr::<512>::new();
+        for (index, (name, value)) in self.iter().enumerate() {
+            if index > 0 {
+                let _ = rendered.write_str(", ");
+            }
+            let _ = write!(
+                rendered,
+                "{} = ",
+                crate::sql::eval::args::quote_identifier(name).as_str()
+            );
+            if value.contains('\\') {
+                let _ = rendered.write_char('E');
+            }
+            let _ = rendered.write_char('\'');
+            for character in value.chars() {
+                if matches!(character, '\'' | '\\') {
+                    let _ = rendered.write_char(character);
+                }
+                let _ = rendered.write_char(character);
+            }
+            let _ = rendered.write_char('\'');
+        }
+        if rendered.is_truncated() {
+            return Err(Self::too_long());
+        }
+        Ok(rendered)
+    }
+}
+
+/// `readstoplist`'s file lookup: an empty name loads no stopwords.
+fn stopword_file(name: &str) -> Result<Option<crate::sql::snowball::StopwordList>, SqlError> {
+    if name.is_empty() {
+        return Ok(None);
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "invalid text search configuration file name \"{}\"",
+            name
+        ));
+    }
+    crate::sql::snowball::StopwordList::parse(name)
+        .map(Some)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::CONFIG_FILE_ERROR,
+                "could not open stop-word file \"tsearch_data/{}.stop\": No such file or directory",
+                name
+            )
+        })
+}
+
+/// Runs the template's init routine (`dsimple_init`, `dsnowball_init`) over
+/// the options, reporting their errors as PostgreSQL does.
+fn dictionary_behavior(
     template: crate::storage::TextSearchDefinition,
-    options: &[crate::sql::ast::TextSearchOption<'_>],
-) -> Result<(crate::storage::TextSearchDictionaryBehavior, StackStr<512>), SqlError> {
-    use core::fmt::Write as _;
-    let crate::storage::TextSearchDefinition::Template { behavior, .. } = template else {
+    options: &DictionaryOptions,
+) -> Result<crate::storage::TextSearchDictionaryBehavior, SqlError> {
+    use crate::storage::{
+        TextSearchDictionaryBehavior as Behavior, TextSearchTemplateKind as Kind,
+    };
+    let crate::storage::TextSearchDefinition::Template { kind, name, .. } = template else {
         return Err(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
             "object is not a text search template"
         ));
     };
-    let mut rendered = StackStr::<512>::new();
-    let executable = match behavior {
-        crate::storage::TextSearchDictionaryBehavior::Simple { .. } => {
-            let mut accept = true;
-            for option in options {
-                if !option.name.eq_ignore_ascii_case("accept") {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "unrecognized simple dictionary parameter: {}",
-                        option.name
-                    ));
-                }
-                accept = match option.value {
-                    value if value.eq_ignore_ascii_case("true") => true,
-                    value if value.eq_ignore_ascii_case("false") => false,
+    let multiple = |parameter: &str| {
+        sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "multiple {} parameters",
+            parameter
+        )
+    };
+    match kind {
+        Kind::Simple => {
+            let (mut accept, mut accept_loaded) = (true, false);
+            let (mut stopwords, mut stop_loaded) = (None, false);
+            for (option, value) in options.iter() {
+                match option {
+                    "stopwords" if stop_loaded => return Err(multiple("StopWords")),
+                    "stopwords" => {
+                        stopwords = stopword_file(value)?;
+                        stop_loaded = true;
+                    }
+                    "accept" if accept_loaded => return Err(multiple("Accept")),
+                    "accept" => {
+                        // `defGetBoolean`.
+                        let is = |word: &str| value.eq_ignore_ascii_case(word);
+                        accept = if is("true") || is("on") || value == "1" {
+                            true
+                        } else if is("false") || is("off") || value == "0" {
+                            false
+                        } else {
+                            return Err(sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "accept requires a Boolean value"
+                            ));
+                        };
+                        accept_loaded = true;
+                    }
                     _ => {
                         return Err(sql_err!(
                             sqlstate::INVALID_PARAMETER_VALUE,
-                            "invalid Accept value: {}",
-                            option.value
+                            "unrecognized simple dictionary parameter: \"{}\"",
+                            option
                         ));
                     }
-                };
-                let _ = write!(
-                    rendered,
-                    "accept = '{}'",
-                    if accept { "true" } else { "false" }
-                );
-            }
-            crate::storage::TextSearchDictionaryBehavior::Simple { accept }
-        }
-        crate::storage::TextSearchDictionaryBehavior::EnglishStem => {
-            let mut language = false;
-            let mut stopwords = false;
-            for option in options {
-                if option.name.eq_ignore_ascii_case("language") {
-                    if !option.value.eq_ignore_ascii_case("english") {
-                        return Err(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "only the English Snowball dictionary is executable"
-                        ));
-                    }
-                    language = true;
-                } else if option.name.eq_ignore_ascii_case("stopwords") {
-                    if !option.value.eq_ignore_ascii_case("english") {
-                        return Err(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "only PostgreSQL's English stopword file is available"
-                        ));
-                    }
-                    stopwords = true;
-                } else {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "unrecognized Snowball dictionary parameter: {}",
-                        option.name
-                    ));
                 }
             }
-            if !language {
-                return Err(sql_err!(
+            Ok(Behavior::Simple { accept, stopwords })
+        }
+        Kind::Snowball => {
+            let (mut language, mut stopwords, mut stop_loaded) = (None, None, false);
+            for (option, value) in options.iter() {
+                match option {
+                    "stopwords" if stop_loaded => return Err(multiple("StopWords")),
+                    "stopwords" => {
+                        stopwords = stopword_file(value)?;
+                        stop_loaded = true;
+                    }
+                    "language" if language.is_some() => return Err(multiple("Language")),
+                    "language" => {
+                        language = Some(crate::sql::snowball::SnowballLanguage::parse(value).ok_or_else(
+                            || {
+                                sql_err!(
+                                    sqlstate::UNDEFINED_OBJECT,
+                                    "no Snowball stemmer available for language \"{}\" and encoding \"UTF8\"",
+                                    value
+                                )
+                            },
+                        )?);
+                    }
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::INVALID_PARAMETER_VALUE,
+                            "unrecognized Snowball parameter: \"{}\"",
+                            option
+                        ));
+                    }
+                }
+            }
+            let language = language.ok_or_else(|| {
+                sql_err!(
                     sqlstate::INVALID_PARAMETER_VALUE,
                     "missing Language parameter"
-                ));
-            }
-            let _ = rendered.write_str("language = 'english'");
-            if stopwords {
-                let _ = rendered.write_str(", stopwords = 'english'");
-            }
-            crate::storage::TextSearchDictionaryBehavior::EnglishStem
+                )
+            })?;
+            Ok(Behavior::Snowball {
+                language,
+                stopwords,
+            })
         }
-    };
-    if rendered.is_truncated() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "text search dictionary options exceed the catalog limit"
-        ));
+        Kind::Synonym | Kind::Ispell | Kind::Thesaurus => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "text search dictionaries using template \"{}\" are not supported: pos3ql ships no dictionary files",
+            name.as_str()
+        )),
     }
-    Ok((executable, rendered))
+}
+
+fn dictionary_definition(
+    template: crate::storage::TextSearchDefinition,
+    options: &[crate::sql::ast::TextSearchOption<'_>],
+) -> Result<(crate::storage::TextSearchDictionaryBehavior, StackStr<512>), SqlError> {
+    let mut entries = DictionaryOptions::new();
+    for option in options {
+        entries.push(option.name, option.value)?;
+    }
+    Ok((dictionary_behavior(template, &entries)?, entries.render()?))
 }
 
 pub fn create_text_search_dictionary(
@@ -44141,6 +46296,62 @@ fn resolve_text_search_dictionary(
     Ok(storage.text_search_object(slot).definition_for(txid).oid())
 }
 
+/// `NameListToString`: a text search object's name as the statement wrote it.
+fn written_name(name: &QualName<'_>) -> StackStr<256> {
+    match name.schema {
+        Some(schema) => stack_format!(256, "{}.{}", schema, name.name),
+        None => stack_format!(256, "{}", name.name),
+    }
+}
+
+/// The text search object `name` names, or PostgreSQL's error for a missing
+/// schema or object.
+fn text_search_slot_named(
+    storage: &Storage,
+    kind: crate::sql::ast::TextSearchObjectKind,
+    name: &QualName<'_>,
+    txid: u32,
+) -> Result<usize, SqlError> {
+    if let Some(slot) = storage.text_search_slot_on_path(kind, name.schema, name.name, txid) {
+        return Ok(slot);
+    }
+    if let Some(schema) = name.schema
+        && !storage.namespace_exists(schema, txid)
+    {
+        return Err(sql_err!(
+            sqlstate::INVALID_SCHEMA_NAME,
+            "schema \"{}\" does not exist",
+            schema
+        ));
+    }
+    Err(sql_err!(
+        sqlstate::UNDEFINED_OBJECT,
+        "{} \"{}\" does not exist",
+        kind.noun(),
+        written_name(name).as_str()
+    ))
+}
+
+/// Ownership of a text search object; built-in parsers and templates, which
+/// have no owner, need a superuser.
+fn require_text_search_owner(
+    storage: &Storage,
+    txid: u32,
+    definition: &crate::storage::TextSearchDefinition,
+    kind: crate::sql::ast::TextSearchObjectKind,
+    name: &QualName<'_>,
+) -> Result<(), SqlError> {
+    match definition.owner() {
+        Some(owner) => require_definition_owner(
+            storage,
+            txid,
+            owner,
+            stack_format!(256, "{} {}", kind.noun(), written_name(name).as_str()).as_str(),
+        ),
+        None => text_search_superuser(storage, txid),
+    }
+}
+
 pub fn alter_text_search(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -44150,20 +46361,12 @@ pub fn alter_text_search(
     action: crate::sql::ast::AlterTextSearchAction<'_>,
     responder: &mut Responder<'_>,
 ) -> Outcome {
-    let Some(slot) = storage.text_search_slot_on_path(kind, name.schema, name.name, txn.txid)
-    else {
-        return sql_fail(sql_err!(
-            sqlstate::UNDEFINED_OBJECT,
-            "{} \"{}\" does not exist",
-            kind.noun(),
-            name.name
-        ));
+    let slot = match text_search_slot_named(storage, kind, name, txn.txid) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
     };
     let mut definition = storage.text_search_object(slot).definition_for(txn.txid);
-    let authority = match definition.owner() {
-        Some(owner) => require_definition_owner(storage, txn.txid, owner, kind.noun()),
-        None => text_search_superuser(storage, txn.txid),
-    };
+    let authority = require_text_search_owner(storage, txn.txid, &definition, kind, name);
     if let Err(error) = authority {
         return sql_fail(error);
     }
@@ -44198,6 +46401,7 @@ pub fn alter_text_search(
                 let crate::storage::TextSearchDefinition::Dictionary {
                     behavior,
                     options: stored_options,
+                    template,
                     ..
                 } = &mut definition
                 else {
@@ -44206,52 +46410,33 @@ pub fn alter_text_search(
                         "object is not a dictionary"
                     ));
                 };
-                use core::fmt::Write as _;
-                match behavior {
-                    crate::storage::TextSearchDictionaryBehavior::Simple { accept } => {
-                        for option in options {
-                            if !option.name.eq_ignore_ascii_case("accept") {
-                                return Err(sql_err!(
-                                    sqlstate::INVALID_PARAMETER_VALUE,
-                                    "unrecognized simple dictionary parameter: {}",
-                                    option.name
-                                ));
-                            }
-                            *accept = if option.value.eq_ignore_ascii_case("true") {
-                                true
-                            } else if option.value.eq_ignore_ascii_case("false") {
-                                false
-                            } else {
-                                return Err(sql_err!(
-                                    sqlstate::INVALID_PARAMETER_VALUE,
-                                    "invalid Accept value: {}",
-                                    option.value
-                                ));
-                            };
-                        }
-                        stored_options.clear();
-                        let _ = write!(
-                            stored_options,
-                            "accept = '{}'",
-                            if *accept { "true" } else { "false" }
-                        );
-                    }
-                    crate::storage::TextSearchDictionaryBehavior::EnglishStem => {
-                        for option in options {
-                            if !(option.name.eq_ignore_ascii_case("language")
-                                || option.name.eq_ignore_ascii_case("stopwords"))
-                                || !option.value.eq_ignore_ascii_case("english")
-                            {
-                                return Err(sql_err!(
-                                    sqlstate::FEATURE_NOT_SUPPORTED,
-                                    "only PostgreSQL's English Snowball dictionary is executable"
-                                ));
-                            }
-                        }
-                        *stored_options =
-                            StackStr::from_str("language = 'english', stopwords = 'english'");
-                    }
+                // `AlterTSDictionary`: a new option replaces every stored
+                // option of that name and goes to the end.
+                let mut merged = DictionaryOptions::parse_stored(stored_options.as_str())?;
+                for option in options {
+                    merged.remove(option.name);
+                    merged.push(option.name, option.value)?;
                 }
+                let template_slot = storage
+                    .text_search_slot_by_oid(
+                        crate::sql::ast::TextSearchObjectKind::Template,
+                        *template,
+                        txn.txid,
+                    )
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "text search template with OID {} does not exist",
+                            *template
+                        )
+                    })?;
+                *behavior = dictionary_behavior(
+                    storage
+                        .text_search_object(template_slot)
+                        .definition_for(txn.txid),
+                    &merged,
+                )?;
+                *stored_options = merged.render()?;
             }
             crate::sql::ast::AlterTextSearchAction::ConfigurationMapping(mapping) => {
                 let crate::storage::TextSearchDefinition::Configuration { mappings, .. } =
@@ -44538,6 +46723,9 @@ fn drop_text_search_slot(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `DROP TEXT SEARCH {PARSER|TEMPLATE|DICTIONARY|CONFIGURATION} name [, ...]`:
+/// resolves and checks every name in order (`RemoveObjects`), then drops them
+/// together under one dependency check, as `performMultipleDeletions` does.
 pub(crate) fn drop_text_search(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -44545,86 +46733,79 @@ pub(crate) fn drop_text_search(
     scratch: &mut DmlScratch,
     seq_session: &crate::sql::guc::SeqSession,
     kind: crate::sql::ast::TextSearchObjectKind,
-    name: &QualName<'_>,
+    names: &[QualName<'_>],
     if_exists: bool,
     cascade: bool,
     arena: &Arena,
     responder: &mut Responder<'_>,
 ) -> Outcome {
-    let Some(slot) = storage.text_search_slot_on_path(kind, name.schema, name.name, txn.txid)
-    else {
-        if if_exists {
-            responder.notice(
-                sqlstate::SUCCESSFUL_COMPLETION,
-                stack_format!(
-                    128,
-                    "{} \"{}\" does not exist, skipping",
-                    kind.noun(),
-                    name.name
-                )
-                .as_str(),
-            )?;
-            responder.command_complete(match kind {
-                crate::sql::ast::TextSearchObjectKind::Parser => "DROP TEXT SEARCH PARSER",
-                crate::sql::ast::TextSearchObjectKind::Template => "DROP TEXT SEARCH TEMPLATE",
-                crate::sql::ast::TextSearchObjectKind::Dictionary => "DROP TEXT SEARCH DICTIONARY",
-                crate::sql::ast::TextSearchObjectKind::Configuration => {
-                    "DROP TEXT SEARCH CONFIGURATION"
-                }
-            })?;
-            return sql_ok();
-        }
-        return sql_fail(sql_err!(
-            sqlstate::UNDEFINED_OBJECT,
-            "{} \"{}\" does not exist",
-            kind.noun(),
-            name.name
-        ));
+    let tag = match kind {
+        crate::sql::ast::TextSearchObjectKind::Parser => "DROP TEXT SEARCH PARSER",
+        crate::sql::ast::TextSearchObjectKind::Template => "DROP TEXT SEARCH TEMPLATE",
+        crate::sql::ast::TextSearchObjectKind::Dictionary => "DROP TEXT SEARCH DICTIONARY",
+        crate::sql::ast::TextSearchObjectKind::Configuration => "DROP TEXT SEARCH CONFIGURATION",
     };
-    let definition = storage.text_search_object(slot).definition_for(txn.txid);
-    let authority = match definition.owner() {
-        Some(owner) => require_definition_owner(storage, txn.txid, owner, kind.noun()),
-        None => text_search_superuser(storage, txn.txid),
-    };
-    if let Err(error) = authority {
-        return sql_fail(error);
-    }
     let class = match kind {
         crate::sql::ast::TextSearchObjectKind::Parser => super::catalog::PG_TS_PARSER_OID,
         crate::sql::ast::TextSearchObjectKind::Template => super::catalog::PG_TS_TEMPLATE_OID,
         crate::sql::ast::TextSearchObjectKind::Dictionary => super::catalog::PG_TS_DICT_OID,
         crate::sql::ast::TextSearchObjectKind::Configuration => super::catalog::PG_TS_CONFIG_OID,
     };
+    let mut slots = ArenaList::new(arena);
+    let mut originals = ArenaList::new(arena);
+    for name in names {
+        let slot = match text_search_slot_named(storage, kind, name, txn.txid) {
+            Ok(slot) => slot,
+            Err(error) if if_exists => {
+                // `does_not_exist_skipping`: the missing schema or object.
+                let notice = stack_format!(256, "{}, skipping", error.message.as_str());
+                responder.notice(sqlstate::SUCCESSFUL_COMPLETION, notice.as_str())?;
+                continue;
+            }
+            Err(error) => return sql_fail(error),
+        };
+        let definition = storage.text_search_object(slot).definition_for(txn.txid);
+        if let Err(error) = require_text_search_owner(storage, txn.txid, &definition, kind, name) {
+            return sql_fail(error);
+        }
+        if !slots.borrowed_slice().contains(&slot)
+            && (slots.push(slot).is_err()
+                || originals
+                    .push(ObjectAddress::new(class, definition.oid(), 0))
+                    .is_err())
+        {
+            return sql_fail(arena_full());
+        }
+    }
+    if slots.is_empty() {
+        responder.command_complete(tag)?;
+        return sql_ok();
+    }
     let report = dependency_report::report_drop(
         storage,
         txn.txid,
-        &[ObjectAddress::new(class, definition.oid(), 0)],
+        originals.borrowed_slice(),
         cascade,
         arena,
         responder,
     );
     let outcome = run_reported_drop(report, responder, |responder| {
-        if let Err(error) = drop_text_search_slot(
-            storage,
-            wal,
-            txn,
-            &mut *scratch,
-            seq_session,
-            &mut *responder,
-            slot,
-            cascade,
-            arena,
-        ) {
-            return sql_fail(error);
-        }
-        responder.command_complete(match kind {
-            crate::sql::ast::TextSearchObjectKind::Parser => "DROP TEXT SEARCH PARSER",
-            crate::sql::ast::TextSearchObjectKind::Template => "DROP TEXT SEARCH TEMPLATE",
-            crate::sql::ast::TextSearchObjectKind::Dictionary => "DROP TEXT SEARCH DICTIONARY",
-            crate::sql::ast::TextSearchObjectKind::Configuration => {
-                "DROP TEXT SEARCH CONFIGURATION"
+        for &slot in slots.borrowed_slice() {
+            if let Err(error) = drop_text_search_slot(
+                storage,
+                wal,
+                txn,
+                &mut *scratch,
+                seq_session,
+                &mut *responder,
+                slot,
+                cascade,
+                arena,
+            ) {
+                return sql_fail(error);
             }
-        })?;
+        }
+        responder.command_complete(tag)?;
         sql_ok()
     });
     finish_expression_cascade(
@@ -47023,7 +49204,10 @@ pub(crate) fn resolve_routine_declaration(
                 .iter()
                 .filter(|parameter| parameter.mode.is_output())
             {
-                let name = SqlName::parse(parameter.name.unwrap_or(""))?;
+                let name = crate::storage::output_column_name(
+                    SqlName::parse(parameter.name.unwrap_or(""))?,
+                    result_column_count,
+                );
                 let resolved = resolve_routine_type(storage, txn.txid, parameter.type_name)?;
                 if resolved.ctype.is_pseudo() {
                     // One OUT parameter is the routine's result type.
@@ -47244,19 +49428,18 @@ pub(crate) fn resolve_routine_declaration(
     let mut config_count = 0;
     for config in routine.configs.iter() {
         let name = super::guc::canonical_setting_name(config.name)?;
+        let authorization = super::guc::SettingAuthorization::set(storage, config.name, txn.txid)?;
         let value = match config.value {
             super::ast::RoutineConfigValue::Default => {
-                guc.validate_setting_value(config.name, None)?;
+                guc.validate_setting_value(authorization, None)?;
                 continue;
             }
             super::ast::RoutineConfigValue::Value(value) => {
-                match guc.validate_setting_value(config.name, Some(value)) {
-                    Ok(()) => StackStr::from_str(value),
-                    Err(error) => return Err(error),
-                }
+                guc.validate_setting_value(authorization, Some(value))?;
+                StackStr::from_str(value)
             }
             super::ast::RoutineConfigValue::Current => {
-                StackStr::from_str(guc.capture_setting_value(config.name)?.as_str())
+                StackStr::from_str(guc.capture_setting_value(authorization)?.as_str())
             }
         };
         if value.is_truncated() {
@@ -47684,18 +49867,41 @@ pub(crate) fn validate_routine_body(
     guc: &crate::sql::guc::GucState,
     arena: &Arena,
     check_string_body: bool,
+    responder: &mut Responder<'_>,
 ) -> Result<ValidatedRoutineBody, SqlError> {
     let body_kind = declaration.body_kind;
     let kind = declaration.kind;
+    // Every parameter is also `$n` in a PL/pgSQL body.
+    let positionals = u32::try_from(routine.arguments.len())
+        .map_err(|_| sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "too many routine parameters"))?;
     let arguments = &declaration.arguments;
     let argument_count = declaration.argument_count;
     let parameters = &declaration.parameters;
     let result_columns = &declaration.result_columns;
     let result_column_count = declaration.result_column_count;
+    // PostgreSQL's validator compiles the body with the session's
+    // `shadowed_variables` check; calls compile without it.
+    let mut check_shadowing = |program: &ParsedTriggerProgram<'_>| {
+        let Some(level) = guc.plpgsql_extra_check(super::guc::PlpgsqlExtraCheck::ShadowedVariables)
+        else {
+            return Ok(());
+        };
+        let names = PlpgsqlNames::Routine {
+            parameters: &parameters[..routine.arguments.len()],
+            outputs: if matches!(kind, crate::storage::RoutineKind::TableFunction) {
+                &result_columns[..result_column_count]
+            } else {
+                &[]
+            },
+            kind: program.kind,
+        };
+        check_shadowed_variables(program, names, level, responder)
+    };
     let has_parameter = |name| {
         parameters[..routine.arguments.len()]
             .iter()
             .find(|parameter| parameter.name == name)
+            .or_else(|| positional_parameter(&parameters[..routine.arguments.len()], name))
             .map(|parameter| parameter.ctype)
             .or_else(|| {
                 result_columns[..result_column_count]
@@ -47768,7 +49974,8 @@ pub(crate) fn validate_routine_body(
                 } else {
                     PlpgsqlProgramKind::Function
                 };
-                let program = parse_plpgsql_program(body_text, arena, program_kind)?;
+                let program = parse_routine_program(body_text, arena, program_kind, positionals)?;
+                check_shadowing(&program)?;
                 resolve_plpgsql_program_locals(program, storage, txn.txid, arena, &has_parameter)?;
                 validate_plpgsql_parameter_names(&parameters[..routine.arguments.len()])?;
             } else {
@@ -47848,7 +50055,8 @@ pub(crate) fn validate_routine_body(
                 } else {
                     PlpgsqlProgramKind::OutputFunction
                 };
-                let program = parse_plpgsql_program(body_text, arena, program_kind)?;
+                let program = parse_routine_program(body_text, arena, program_kind, positionals)?;
+                check_shadowing(&program)?;
                 resolve_plpgsql_program_locals(program, storage, txn.txid, arena, &has_parameter)?;
                 let namespace_capacity = routine.arguments.len().saturating_add(
                     matches!(kind, crate::storage::RoutineKind::TableFunction)
@@ -47934,6 +50142,7 @@ pub(crate) fn validate_routine_body(
                 ));
             }
             let program = parse_trigger_program(body_text, arena)?;
+            check_shadowing(&program)?;
             resolve_plpgsql_program_locals(program, storage, txn.txid, arena, &has_parameter)?;
         }
         crate::storage::RoutineKind::EventTrigger => {
@@ -47944,6 +50153,7 @@ pub(crate) fn validate_routine_body(
                 ));
             }
             let program = parse_event_trigger_program(body_text, arena)?;
+            check_shadowing(&program)?;
             resolve_plpgsql_program_locals(program, storage, txn.txid, arena, &has_parameter)?;
         }
         crate::storage::RoutineKind::Procedure => {
@@ -47960,8 +50170,13 @@ pub(crate) fn validate_routine_body(
                         "PL/pgSQL procedures require a string-literal body"
                     ));
                 }
-                let program =
-                    parse_plpgsql_program(body_text, arena, PlpgsqlProgramKind::Procedure)?;
+                let program = parse_routine_program(
+                    body_text,
+                    arena,
+                    PlpgsqlProgramKind::Procedure,
+                    positionals,
+                )?;
+                check_shadowing(&program)?;
                 resolve_plpgsql_program_locals(program, storage, txn.txid, arena, &has_parameter)?;
                 validate_plpgsql_parameter_names(&parameters[..routine.arguments.len()])?;
             } else {
@@ -50059,8 +52274,9 @@ fn apply_routine_definition_actions(
                     ));
                 };
                 let stored_name = super::guc::canonical_setting_name(name)?;
+                let authorization = super::guc::SettingAuthorization::set(storage, name, txid)?;
                 if value == super::ast::RoutineConfigValue::Default {
-                    guc.validate_setting_value(name, None)?;
+                    guc.validate_setting_value(authorization, None)?;
                     if let Some(index) = configs[..config_count]
                         .iter()
                         .position(|config| config.name == stored_name)
@@ -50076,11 +52292,11 @@ fn apply_routine_definition_actions(
                         unreachable!("default removes the setting above")
                     }
                     super::ast::RoutineConfigValue::Value(value) => {
-                        guc.validate_setting_value(name, Some(value))?;
+                        guc.validate_setting_value(authorization, Some(value))?;
                         StackStr::from_str(value)
                     }
                     super::ast::RoutineConfigValue::Current => {
-                        StackStr::from_str(guc.capture_setting_value(name)?.as_str())
+                        StackStr::from_str(guc.capture_setting_value(authorization)?.as_str())
                     }
                 };
                 if stored_value.is_truncated() {
@@ -50118,7 +52334,10 @@ fn apply_routine_definition_actions(
                             "routine configuration state is unavailable"
                         ));
                     };
-                    guc.validate_setting_value(name, None)?;
+                    guc.validate_setting_value(
+                        super::guc::SettingAuthorization::set(storage, name, txid)?,
+                        None,
+                    )?;
                     if let Some(index) = configs[..config_count]
                         .iter()
                         .position(|config| config.name.as_str().eq_ignore_ascii_case(name))
@@ -51154,7 +53373,7 @@ pub(crate) fn drop_routine(
             }
             if storage
                 .triggers_with_slots_visible_to(txn.txid)
-                .any(|(_, trigger)| usize::from(trigger.function) == slot)
+                .any(|(_, trigger)| trigger.function.routine() == Some(slot))
                 && !cascade
             {
                 return sql_fail(sql_err!(
@@ -51166,7 +53385,8 @@ pub(crate) fn drop_routine(
             loop {
                 let dependency = storage.triggers_with_slots_visible_to(txn.txid).find_map(
                     |(trigger_slot, trigger)| {
-                        (usize::from(trigger.function) == slot).then_some((trigger_slot, trigger))
+                        (trigger.function.routine() == Some(slot))
+                            .then_some((trigger_slot, trigger))
                     },
                 );
                 let Some((trigger_slot, trigger)) = dependency else {
@@ -51246,6 +53466,8 @@ pub fn create_view(
         option_order,
         sql,
         raw_path,
+        kept_column_types,
+        query_origin,
     } = command;
     let literal_inputs = match super::type_inputs::bindings_for_active_source(sql, arena) {
         Ok(Some(inputs)) => inputs,
@@ -51299,8 +53521,18 @@ pub fn create_view(
         ));
     }
     let mut column_types = [crate::storage::ViewColumnType::PLACEHOLDER; MAX_COLUMNS];
-    for (slot, description) in column_types.iter_mut().zip(&described[..described_count]) {
+    for (index, (slot, description)) in column_types
+        .iter_mut()
+        .zip(&described[..described_count])
+        .enumerate()
+    {
         *slot = crate::storage::ViewColumnType::from_description(description);
+        if let Some(kept) = kept_column_types.get(index)
+            && kept.oid() == slot.oid()
+            && (kept.type_mod() == -1 || slot.type_mod() == -1)
+        {
+            *slot = *kept;
+        }
     }
     let column_types = &column_types[..described_count];
     let mut columns = if columns.is_empty() {
@@ -51515,6 +53747,7 @@ pub fn create_view(
                         crate::storage::ViewCheckOption::Cascaded
                     }
                 }),
+                query_origin,
                 order: option_order,
             },
         },
@@ -51524,7 +53757,13 @@ pub fn create_view(
         Ok(publication) => {
             let new_slot = publication.slot();
             if check_option.is_some() {
-                match super::query::resolve_view_for_dml(storage, *name, txn.txid, arena) {
+                match super::query::resolve_view_for_dml(
+                    storage,
+                    *name,
+                    txn.txid,
+                    arena,
+                    super::query::ViewWrite::CheckOption,
+                ) {
                     Ok(Some(_)) => {}
                     Ok(None) => {
                         storage.finish_view_publication(
@@ -52283,7 +54522,13 @@ fn alter_view_inner(
                             crate::storage::ViewSecurityBarrier::from_enabled(enabled);
                     }
                     ViewOptionValue::CheckOption(option) => {
-                        match super::query::resolve_view_for_dml(storage, name, txn.txid, arena) {
+                        match super::query::resolve_view_for_dml(
+                            storage,
+                            name,
+                            txn.txid,
+                            arena,
+                            super::query::ViewWrite::CheckOption,
+                        ) {
                             Ok(Some(_)) => {}
                             Ok(None) => {
                                 return sql_fail(sql_err!(
@@ -52372,6 +54617,7 @@ fn alter_view_inner(
                 Err(error) => return sql_fail(error),
             };
             let default = match ddl::resolve_default(
+                column,
                 Some(parsed),
                 Some(expression),
                 ctype,
@@ -53002,16 +55248,182 @@ fn return_rule_required(
     )
 }
 
+/// Where a rule's OLD and NEW are visible, as PostgreSQL's rule analysis
+/// adds them to each part's namespace.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuleNameScope {
+    /// The WHERE condition sees the event's rows by name and unqualified
+    /// columns resolve to them.
+    Condition,
+    /// An action may name OLD and NEW, but its unqualified columns never
+    /// resolve to them; using the row an event lacks fails afterwards.
+    Action,
+}
+
 struct RuleConditionColumns<'a> {
     names: [&'a str; crate::storage::MAX_COLUMNS],
     metadata: [StaticTypeMeta; crate::storage::MAX_COLUMNS],
     count: usize,
+    /// The relation the rule is defined on.
+    relation: &'a str,
+    /// The event has an OLD (not INSERT) or a NEW (not DELETE) row.
     old: bool,
     new: bool,
+    scope: core::cell::Cell<RuleNameScope>,
+    used_old: core::cell::Cell<bool>,
+    used_new: core::cell::Cell<bool>,
     catalog: CatalogCols<'a>,
 }
 
+impl RuleConditionColumns<'_> {
+    /// Whether `qualifier` names a rule row the current part of the rule
+    /// can reference.
+    fn row_visible(&self, qualifier: &str) -> Option<bool> {
+        let (present, used) = match qualifier {
+            "old" => (self.old, &self.used_old),
+            "new" => (self.new, &self.used_new),
+            _ => return None,
+        };
+        Some(match self.scope.get() {
+            RuleNameScope::Condition => present,
+            RuleNameScope::Action => {
+                used.set(true);
+                true
+            }
+        })
+    }
+
+    /// The rule row column `qualifier.name` names, or PostgreSQL's error for
+    /// a name this part of the rule cannot reference.
+    fn column(&self, qualifier: Option<&str>, name: &str) -> Result<usize, SqlError> {
+        let index = self.names[..self.count]
+            .iter()
+            .position(|column| *column == name);
+        let error = match qualifier {
+            Some(qualifier) => match self.row_visible(qualifier) {
+                Some(true) => match index {
+                    Some(index) => return Ok(index),
+                    None => sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column {}.{} does not exist",
+                        qualifier,
+                        name
+                    ),
+                },
+                Some(false) => super::query::unreachable_entry(qualifier),
+                None if qualifier == self.relation => {
+                    let error = sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "invalid reference to FROM-clause entry for table \"{}\"",
+                        qualifier
+                    );
+                    // PostgreSQL names the rule's first entry for the
+                    // relation, OLD, and whether it can be referenced here.
+                    if self.scope.get() == RuleNameScope::Action || self.old {
+                        crate::sql::error_position::with_computed_hint(
+                            error,
+                            format_args!("Perhaps you meant to reference the table alias \"old\"."),
+                        )
+                    } else {
+                        crate::sql::error_position::with_detail(
+                            error,
+                            format_args!(
+                                "There is an entry for table \"old\", but it cannot be referenced from this part of the query."
+                            ),
+                        )
+                    }
+                }
+                None => sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "missing FROM-clause entry for table \"{}\"",
+                    qualifier
+                ),
+            },
+            None => match (self.scope.get(), index) {
+                (RuleNameScope::Condition, Some(_)) if self.old && self.new => sql_err!(
+                    sqlstate::AMBIGUOUS_COLUMN,
+                    "column reference \"{}\" is ambiguous",
+                    name
+                ),
+                (RuleNameScope::Condition, Some(index)) => {
+                    if self.old {
+                        self.used_old.set(true);
+                    } else {
+                        self.used_new.set(true);
+                    }
+                    return Ok(index);
+                }
+                (RuleNameScope::Action, Some(_)) => crate::sql::error_position::with_hint(
+                    crate::sql::error_position::with_detail(
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column \"{}\" does not exist",
+                            name
+                        ),
+                        format_args!(
+                            "There are columns named \"{}\", but they are in tables that cannot be referenced from this part of the query.",
+                            name
+                        ),
+                    ),
+                    "Try using a table-qualified name.",
+                ),
+                (_, None) => sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" does not exist",
+                    name
+                ),
+            },
+        };
+        let mut suggestion = crate::sql::column_suggestion::ColumnSuggestion::new(qualifier, name);
+        self.suggest_rule_rows(&mut suggestion);
+        Err(crate::sql::error_position::with_column_suggestion(
+            crate::sql::error_position::at_reference(error, qualifier.unwrap_or(name)),
+            &suggestion,
+        ))
+    }
+
+    /// The rule's OLD and NEW entries, in PostgreSQL's order, for a missing
+    /// column's spelling suggestion.
+    fn suggest_rule_rows(
+        &self,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        for row in ["old", "new"] {
+            suggestion.relation(row, self.names[..self.count].iter().copied());
+        }
+    }
+
+    /// PostgreSQL's check, after analysing one action, that it uses only the
+    /// rows its event has.
+    fn check_action_rows(&self) -> Result<(), SqlError> {
+        if self.used_old.get() && !self.old {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "ON INSERT rule cannot use OLD"
+            ));
+        }
+        if self.used_new.get() && !self.new {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "ON DELETE rule cannot use NEW"
+            ));
+        }
+        Ok(())
+    }
+
+    fn whole_row_visible(&self, name: &str) -> bool {
+        self.row_visible(name).unwrap_or(false)
+    }
+}
+
 impl<'value> ColumnLookup<'value> for RuleConditionColumns<'_> {
+    fn suggest_columns(
+        &self,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        self.suggest_rule_rows(suggestion);
+    }
+
     fn resolve_column_type(
         &self,
         qualifier: Option<&str>,
@@ -53021,40 +55433,12 @@ impl<'value> ColumnLookup<'value> for RuleConditionColumns<'_> {
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
-        self.col_type(qualifier, name)
-            .map(|_| Datum::Null)
-            .ok_or_else(|| {
-                if qualifier.is_some_and(|value| {
-                    !value.eq_ignore_ascii_case("old") && !value.eq_ignore_ascii_case("new")
-                }) {
-                    sql_err!(
-                        sqlstate::UNDEFINED_TABLE,
-                        "missing FROM-clause entry for table \"{}\"",
-                        qualifier.unwrap_or("")
-                    )
-                } else {
-                    sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" does not exist",
-                        name
-                    )
-                }
-            })
+        self.column(qualifier, name).map(|_| Datum::Null)
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
-        let available = match qualifier {
-            Some(value) if value.eq_ignore_ascii_case("old") => self.old,
-            Some(value) if value.eq_ignore_ascii_case("new") => self.new,
-            _ => false,
-        };
-        available
-            .then(|| {
-                self.names[..self.count]
-                    .iter()
-                    .position(|column| *column == name)
-            })
-            .flatten()
+        self.column(qualifier, name)
+            .ok()
             .map(|column| self.metadata[column].ctype)
     }
 }
@@ -53062,6 +55446,21 @@ impl<'value> ColumnLookup<'value> for RuleConditionColumns<'_> {
 impl ColTypeResolver for RuleConditionColumns<'_> {
     fn validate_enum_input_literal(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
         self.catalog.validate_enum_input_literal(text, target_oid)
+    }
+
+    fn validate_literal_input(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
+        self.catalog.validate_literal_input(text, target_oid)
+    }
+
+    fn validate_call_literal_inputs(
+        &self,
+        selection: crate::sql::eval::RoutineCallSelection,
+        args: &[&crate::sql::ast::Expr<'_>],
+        argument_names: &[Option<&str>],
+        variadic: bool,
+    ) -> Result<(), SqlError> {
+        self.catalog
+            .validate_call_literal_inputs(selection, args, argument_names, variadic)
     }
 
     fn type_name_fixed(&self, oid: i32) -> Result<Option<StackStr<260>>, SqlError> {
@@ -53108,6 +55507,10 @@ impl ColTypeResolver for RuleConditionColumns<'_> {
 
     fn domain_base_type(&self, oid: i32) -> Option<ColType> {
         self.catalog.domain_base_type(oid)
+    }
+
+    fn select_common_type(&self, inputs: &[i32]) -> Result<i32, crate::storage::CommonTypeFailure> {
+        self.catalog.select_common_type(inputs)
     }
 
     fn named_type_oid(&self, name: &str) -> Option<i32> {
@@ -53162,56 +55565,33 @@ impl ColTypeResolver for RuleConditionColumns<'_> {
     }
 
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
-        if let Some(qualifier) = qualifier {
-            let old = qualifier.eq_ignore_ascii_case("old");
-            let new = qualifier.eq_ignore_ascii_case("new");
-            if old && !self.old || new && !self.new {
-                return Err(sql_err!(
-                    sqlstate::INVALID_OBJECT_DEFINITION,
-                    "ON {} rule cannot use {}",
-                    if old { "INSERT" } else { "DELETE" },
-                    if old { "OLD" } else { "NEW" }
-                ));
-            }
-        }
-        self.col_type(qualifier, name).ok_or_else(|| {
-            if qualifier.is_some_and(|value| {
-                !value.eq_ignore_ascii_case("old") && !value.eq_ignore_ascii_case("new")
-            }) {
-                sql_err!(
-                    sqlstate::UNDEFINED_TABLE,
-                    "missing FROM-clause entry for table \"{}\"",
-                    qualifier.unwrap_or("")
-                )
-            } else {
-                sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
-                    name
-                )
-            }
-        })
+        self.column(qualifier, name)
+            .map(|column| self.metadata[column].ctype)
+    }
+
+    fn subquery_type(&self, expression: &Expr<'_>) -> Result<Option<(i32, i16)>, SqlError> {
+        let arena = self.catalog.arena;
+        let mark = arena.mark();
+        let result = super::query::subquery_expression_type(
+            expression,
+            self.catalog.storage,
+            self.catalog.txid,
+            arena,
+            self,
+        );
+        // Only the declared OID escapes; nested schema descriptions are scratch.
+        unsafe { arena.rewind_to(mark) };
+        result.map(|oid| oid.map(|oid| (oid, ColType::from_oid(oid).map_or(-1, ColType::typlen))))
     }
 
     fn column_meta(&self, qualifier: Option<&str>, name: &str) -> Option<StaticTypeMeta> {
-        let available = match qualifier {
-            Some(value) if value.eq_ignore_ascii_case("old") => self.old,
-            Some(value) if value.eq_ignore_ascii_case("new") => self.new,
-            _ => false,
-        };
-        available
-            .then(|| {
-                self.names[..self.count]
-                    .iter()
-                    .position(|column| *column == name)
-            })
-            .flatten()
+        self.column(qualifier, name)
+            .ok()
             .map(|column| self.metadata[column])
     }
 
     fn is_whole_row(&self, name: &str) -> bool {
-        (name.eq_ignore_ascii_case("old") && self.old)
-            || (name.eq_ignore_ascii_case("new") && self.new)
+        self.whole_row_visible(name)
     }
 
     fn whole_row_field(
@@ -53219,7 +55599,7 @@ impl ColTypeResolver for RuleConditionColumns<'_> {
         name: &str,
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
-        if !self.is_whole_row(name) || index >= self.count {
+        if !self.whole_row_visible(name) || index >= self.count {
             return None;
         }
         Some((
@@ -53229,20 +55609,63 @@ impl ColTypeResolver for RuleConditionColumns<'_> {
     }
 }
 
-fn stored_rule_definition(
+/// A reference to the rule's `OLD` or `NEW` row in a member of a rule
+/// action's set operation, which PostgreSQL rejects: the rows belong to the
+/// action's own query level.
+fn set_member_rule_row<'a>(statement: &'a crate::sql::ast::Stmt<'a>) -> Option<&'a Expr<'a>> {
+    use crate::sql::ast::{SetTree, Stmt};
+    fn in_expression<'a>(expression: &'a Expr<'a>) -> Option<&'a Expr<'a>> {
+        let row = |name: &str| name.eq_ignore_ascii_case("old") || name.eq_ignore_ascii_case("new");
+        match expression {
+            Expr::Column {
+                qualifier: Some(qualifier),
+                ..
+            } if row(qualifier) => return Some(expression),
+            Expr::WholeRow(name) if row(name) => return Some(expression),
+            _ => {}
+        }
+        let mut found = None;
+        let _ = super::query::walk_children(expression, &mut |child| {
+            if found.is_none() {
+                found = in_expression(child);
+            }
+            Ok(())
+        });
+        found
+    }
+    fn in_tree<'a>(tree: &'a SetTree<'a>) -> Option<&'a Expr<'a>> {
+        match tree {
+            SetTree::Op { left, right, .. } => in_tree(left).or_else(|| in_tree(right)),
+            SetTree::Select(select) => select
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    crate::sql::ast::SelectItem::Expr { expression, .. } => Some(*expression),
+                    _ => None,
+                })
+                .chain(select.where_clause)
+                .chain(select.having)
+                .chain(select.group_by.iter().copied())
+                .find_map(in_expression),
+        }
+    }
+    let tree = match statement {
+        Stmt::Insert(insert) => insert.select.and_then(|select| select.set_body)?,
+        Stmt::Select(select) => select.set_body?,
+        Stmt::SetQuery(query) => query.body,
+        _ => return None,
+    };
+    in_tree(tree)
+}
+
+fn stored_rule_definition<'a>(
     storage: &Storage,
     txn: &TxnState,
     rule: &crate::sql::ast::CreateRule<'_>,
     target: crate::storage::RuleTarget,
     raw_path: &str,
-    arena: &Arena,
-) -> Result<
-    (
-        crate::storage::RuleDefinition,
-        crate::storage::StoredQueryDependencies,
-    ),
-    SqlError,
-> {
+    arena: &'a Arena,
+) -> Result<AnalysedRule<'a>, SqlError> {
     use core::fmt::Write;
     let event = match rule.event {
         crate::sql::ast::RuleEvent::Select => crate::storage::RewriteEvent::Select,
@@ -53270,8 +55693,12 @@ fn stored_rule_definition(
             collation: crate::sql::ast::Collation::Default,
         }; crate::storage::MAX_COLUMNS],
         count: 0,
+        relation: rule.table.name,
         old: !matches!(event, crate::storage::RewriteEvent::Insert),
         new: !matches!(event, crate::storage::RewriteEvent::Delete),
+        scope: core::cell::Cell::new(RuleNameScope::Condition),
+        used_old: core::cell::Cell::new(false),
+        used_new: core::cell::Cell::new(false),
         catalog: CatalogCols {
             definition: None,
             alias: None,
@@ -53336,36 +55763,84 @@ fn stored_rule_definition(
             }
         }
     }
-    if matches!(event, crate::storage::RewriteEvent::Select) {
-        if !matches!(target, crate::storage::RuleTarget::View(_)) {
-            return Err(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "ON SELECT rule target must be a view"
-            ));
-        }
-        if rule.name != "_return"
-            || !matches!(mode, crate::storage::RewriteMode::Instead)
-            || rule.condition.is_some()
-            || rule.actions.len() != 1
-            || !matches!(
-                rule.actions[0].statement,
-                crate::sql::ast::Stmt::Select(_) | crate::sql::ast::Stmt::SetQuery(_)
-            )
+    // PostgreSQL analyses the condition and every action before it checks
+    // the rule's shape.
+    if let Some(condition) = rule.condition {
+        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+        let hooks = super::eval::EvalHooks {
+            catalog: Some(&catalog),
+            ..super::eval::NO_HOOKS
+        };
+        super::query::analyse_sublinks(condition, storage, txn.txid, arena, &condition_columns)?;
+        super::eval::expression_type_identity(condition, &condition_columns, &hooks)?;
+        if let Some(aggregate) =
+            super::query::first_aggregate(condition, storage, txn.txid, &condition_columns, arena)?
         {
-            return Err(sql_err!(
-                sqlstate::INVALID_OBJECT_DEFINITION,
-                "view rule must be named \"_RETURN\", be unconditional INSTEAD, and contain one SELECT action"
+            return Err(crate::sql::error_position::at_expression(
+                sql_err!(
+                    sqlstate::GROUPING_ERROR,
+                    "aggregate functions are not allowed in WHERE"
+                ),
+                aggregate,
             ));
         }
-    } else if rule.name == "_return" {
-        return Err(sql_err!(
-            sqlstate::INVALID_OBJECT_DEFINITION,
-            "rule \"_RETURN\" must be an ON SELECT rule"
-        ));
+        super::query::check_rule_condition_aggregates(
+            rule.table, condition, storage, txn.txid, arena,
+        )?;
+        super::query::check_rule_condition_type(
+            condition,
+            &condition_columns,
+            storage,
+            txn.txid,
+            arena,
+        )?;
     }
-    if rule.condition.is_some()
-        && rule.actions.iter().any(|action| {
-            !matches!(
+    condition_columns.scope.set(RuleNameScope::Action);
+    for action in rule.actions {
+        if let Some(reference) = set_member_rule_row(action.statement) {
+            return Err(crate::sql::error_position::at_expression(
+                sql_err!(
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                    "UNION/INTERSECT/EXCEPT member statement cannot refer to other relations of same query level"
+                ),
+                reference,
+            ));
+        }
+        // `transformRuleStmt`: a WITH query cannot read the rule's rows.
+        let ctes = match action.statement {
+            crate::sql::ast::Stmt::Select(select) => select.with,
+            crate::sql::ast::Stmt::With { ctes, .. } => ctes,
+            _ => &[],
+        };
+        for (row, spelling) in [("old", "OLD"), ("new", "NEW")] {
+            if ctes.iter().any(|cte| rule_rows::cte_reads(cte, row)) {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot refer to {} within WITH query",
+                    spelling
+                ));
+            }
+        }
+        condition_columns.used_old.set(false);
+        condition_columns.used_new.set(false);
+        super::query::analyse_rule_action(
+            action.statement,
+            storage,
+            txn.txid,
+            arena,
+            &condition_columns,
+        )?;
+        condition_columns.check_action_rows()?;
+        if super::query::statement_returns_rows(action.statement) {
+            super::query::check_rule_insert_returning(
+                action.statement,
+                storage,
+                txn.txid,
+                &condition_columns,
+            )?;
+        }
+        if rule.condition.is_some()
+            && !matches!(
                 action.statement,
                 crate::sql::ast::Stmt::Select(_)
                     | crate::sql::ast::Stmt::SetQuery(_)
@@ -53373,109 +55848,15 @@ fn stored_rule_definition(
                     | crate::sql::ast::Stmt::Update(_)
                     | crate::sql::ast::Stmt::Delete(_)
             )
-        })
-    {
-        return Err(sql_err!(
-            sqlstate::INVALID_OBJECT_DEFINITION,
-            "rules with WHERE conditions can only have SELECT, INSERT, UPDATE, or DELETE actions"
-        ));
-    }
-    let mut returning_action = None;
-    for (index, action) in rule.actions.iter().enumerate() {
-        if !super::query::statement_returns_rows(action.statement) {
-            continue;
-        }
-        // PostgreSQL's DefineQueryRewrite checks in this order.
-        if returning_action.replace(index as u8).is_some() {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "cannot have multiple RETURNING lists in a rule"
-            ));
-        }
-        if rule.condition.is_some() {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "RETURNING lists are not supported in conditional rules"
-            ));
-        }
-        if !matches!(mode, crate::storage::RewriteMode::Instead) {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "RETURNING lists are not supported in non-INSTEAD rules"
-            ));
-        }
-    }
-    if let Some(condition) = rule.condition {
-        if condition.contains_subquery() {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "cannot use subquery in rule condition"
-            ));
-        }
-        if super::query::expr_has_aggregate(condition, storage, txn.txid, &condition_columns)? {
-            return Err(sql_err!(
-                sqlstate::GROUPING_ERROR,
-                "aggregate functions are not allowed in rule conditions"
-            ));
-        }
-        let mut invalid = None;
-        condition.for_each_column_reference(&mut |qualifier, column| {
-            if invalid.is_some() {
-                return;
-            }
-            let Some(qualifier) = qualifier else {
-                invalid = Some(sql_err!(
-                    sqlstate::INVALID_OBJECT_DEFINITION,
-                    "rule condition column \"{}\" must be qualified with OLD or NEW",
-                    column
-                ));
-                return;
-            };
-            let old = qualifier.eq_ignore_ascii_case("old");
-            let new = qualifier.eq_ignore_ascii_case("new");
-            if !old && !new {
-                invalid = Some(sql_err!(
-                    sqlstate::INVALID_OBJECT_DEFINITION,
-                    "rule condition may only reference OLD or NEW"
-                ));
-            } else if old && matches!(event, crate::storage::RewriteEvent::Insert)
-                || new && matches!(event, crate::storage::RewriteEvent::Delete)
-            {
-                // A condition sees OLD and NEW as range-table entries, so
-                // PostgreSQL reports the missing one as an invalid reference.
-                invalid = Some(super::error_position::column_reference(
-                    super::query::unreachable_entry(if old { "old" } else { "new" }),
-                    Some(qualifier),
-                    column,
-                ));
-            } else if condition_columns.names[..condition_columns.count]
-                .iter()
-                .all(|candidate| *candidate != column)
-            {
-                invalid = Some(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
-                    column
-                ));
-            }
-        });
-        if let Some(error) = invalid {
-            return Err(error);
-        }
-        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
-        let hooks = super::eval::EvalHooks {
-            catalog: Some(&catalog),
-            ..super::eval::NO_HOOKS
-        };
-        if super::eval::expression_type_identity(condition, &condition_columns, &hooks)?
-            .record_field_oid()
-            != ColType::Bool.oid()
         {
             return Err(sql_err!(
-                sqlstate::DATATYPE_MISMATCH,
-                "rule WHERE condition must be type boolean"
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "rules with WHERE conditions can only have SELECT, INSERT, UPDATE, or DELETE actions"
             ));
         }
+    }
+    if matches!(event, crate::storage::RewriteEvent::Select) {
+        return view_rule_query(storage, txn.txid, rule, mode, target, raw_path, arena);
     }
     let mut source = crate::util::StackStr::<{ crate::storage::RULE_SQL_MAX }>::new();
     let mut source_inputs = ArenaList::new(arena);
@@ -53592,7 +55973,11 @@ fn stored_rule_definition(
             .map(|expression| &*expression)
             .map_err(|_| arena_full())?;
     }
-    for (index, action) in rule.actions.iter().enumerate() {
+    // Each action's RETURNING list is analysed with the action, before the
+    // rule's shape is checked; the first is kept for the result list check.
+    let mut returning_entries = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let mut returning_count = None;
+    for action in rule.actions {
         let expanded = super::query::expand_stored_rule_action_exec(
             action.statement,
             storage,
@@ -53609,18 +55994,64 @@ fn stored_rule_definition(
             condition_columns.old,
             condition_columns.new,
         )?;
-        if returning_action == Some(index as u8) {
-            check_rule_returning_list(
+        if super::query::statement_returns_rows(action.statement) {
+            let mut entries = [ColDesc::new("", 0, 0); MAX_PROJ];
+            let count = describe_data_modification_columns(
                 storage,
-                txn.txid,
-                target,
-                &condition_columns,
                 expanded,
                 arena,
+                txn.txid,
+                &mut entries,
+                DescriptionTarget::Sql,
             )?;
+            if returning_count.is_none() {
+                returning_entries = entries;
+                returning_count = Some(count);
+            }
         }
     }
-    Ok((
+    let mut returning_action = None;
+    for (index, action) in rule.actions.iter().enumerate() {
+        if !super::query::statement_returns_rows(action.statement) {
+            continue;
+        }
+        // PostgreSQL's DefineQueryRewrite checks in this order.
+        if returning_action.replace(index as u8).is_some() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot have multiple RETURNING lists in a rule"
+            ));
+        }
+        if rule.condition.is_some() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "RETURNING lists are not supported in conditional rules"
+            ));
+        }
+        if !matches!(mode, crate::storage::RewriteMode::Instead) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "RETURNING lists are not supported in non-INSTEAD rules"
+            ));
+        }
+    }
+    if let Some(count) = returning_count {
+        check_rule_returning_list(
+            storage,
+            txn.txid,
+            target,
+            &condition_columns,
+            &returning_entries[..count],
+        )?;
+    }
+    if rule.name == "_RETURN" {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "non-view rule for \"{}\" must not be named \"_RETURN\"",
+            rule.table.name
+        ));
+    }
+    Ok(AnalysedRule::Stored(
         crate::storage::RuleDefinition {
             name: SqlName::parse(rule.name)?,
             target,
@@ -53638,6 +56069,195 @@ fn stored_rule_definition(
     ))
 }
 
+/// What `CREATE RULE` installs once its rule is analysed.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "returned once per CREATE RULE; runtime memory never comes from the heap"
+)]
+enum AnalysedRule<'a> {
+    Stored(
+        crate::storage::RuleDefinition,
+        crate::storage::StoredQueryDependencies,
+    ),
+    /// `CREATE OR REPLACE RULE "_RETURN"` replaces a view's query.
+    ViewQuery { view: usize, sql: &'a str },
+}
+
+/// PostgreSQL's `DefineQueryRewrite` checks of an `ON SELECT` rule, in its
+/// order. Every view already has its `_RETURN` rule, so only `CREATE OR
+/// REPLACE RULE "_RETURN"` with a query producing the view's columns passes.
+fn view_rule_query<'a>(
+    storage: &Storage,
+    txid: u32,
+    rule: &crate::sql::ast::CreateRule<'_>,
+    mode: crate::storage::RewriteMode,
+    target: crate::storage::RuleTarget,
+    raw_path: &str,
+    arena: &'a Arena,
+) -> Result<AnalysedRule<'a>, SqlError> {
+    let crate::storage::RuleTarget::View(view) = target else {
+        let crate::storage::RuleTarget::Table(table) = target else {
+            unreachable!("rule targets are tables or views")
+        };
+        let table = storage.table_def(usize::from(table), txid);
+        let kind = if table.kind == crate::storage::TableKind::Foreign {
+            "foreign tables"
+        } else if table.partition.is_partitioned() {
+            "partitioned tables"
+        } else {
+            "tables"
+        };
+        return Err(crate::sql::error_position::with_detail(
+            sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "relation \"{}\" cannot have ON SELECT rules",
+                rule.table.name
+            ),
+            format_args!("This operation is not supported for {kind}."),
+        ));
+    };
+    let view = usize::from(view);
+    if rule.actions.len() > 1 {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "multiple actions for rules on SELECT are not implemented"
+        ));
+    }
+    let with = match rule.actions.first().map(|action| action.statement) {
+        Some(crate::sql::ast::Stmt::Select(select))
+            if matches!(mode, crate::storage::RewriteMode::Instead) =>
+        {
+            select.with
+        }
+        Some(crate::sql::ast::Stmt::SetQuery(query))
+            if matches!(mode, crate::storage::RewriteMode::Instead) =>
+        {
+            query.with
+        }
+        _ => {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "rules on SELECT must have action INSTEAD SELECT"
+            ));
+        }
+    };
+    if with.iter().any(|cte| cte.dml.is_some()) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "rules on SELECT must not contain data-modifying statements in WITH"
+        ));
+    }
+    if rule.condition.is_some() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "event qualifications are not implemented for rules on SELECT"
+        ));
+    }
+    let sql = arena
+        .alloc_str(rule.actions[0].sql)
+        .map_err(|_| arena_full())?;
+    let inputs = super::type_inputs::bindings_for_active_source(sql, arena)?.unwrap_or(&[]);
+    let user = super::eval::funcs::system::session_user_owned();
+    let path = storage.compute_path(raw_path, user.as_str(), txid);
+    let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let count = super::query::describe_query_under(
+        sql,
+        storage,
+        txid,
+        path,
+        inputs,
+        arena,
+        &mut described,
+    )?;
+    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let column_count =
+        super::catalog::describe_view(&storage.view(view), txid, arena, &mut columns)?;
+    for (index, entry) in described[..count].iter().enumerate() {
+        let Some(column) = columns[..column_count].get(index) else {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "SELECT rule's target list has too many entries"
+            ));
+        };
+        if entry.name != column.name {
+            return Err(crate::sql::error_position::with_detail(
+                sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "SELECT rule's target entry {} has different column name from column \"{}\"",
+                    index + 1,
+                    column.name
+                ),
+                format_args!("SELECT target entry is named \"{}\".", entry.name),
+            ));
+        }
+        if entry.type_oid != column.type_oid {
+            let entry_type = super::catalog::format_type_name(storage, txid, entry.type_oid)?;
+            let column_type = super::catalog::format_type_name(storage, txid, column.type_oid)?;
+            return Err(crate::sql::error_position::with_detail(
+                sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "SELECT rule's target entry {} has different type from column \"{}\"",
+                    index + 1,
+                    column.name
+                ),
+                format_args!(
+                    "SELECT target entry has type {}, but column has type {}.",
+                    entry_type.as_str(),
+                    column_type.as_str()
+                ),
+            ));
+        }
+        if entry.type_mod != column.type_mod && entry.type_mod != -1 && column.type_mod != -1 {
+            let entry_type = super::eval::funcs::system::format_type_with_type_mod(
+                storage,
+                txid,
+                entry.type_oid,
+                entry.type_mod,
+            )?;
+            let column_type = super::eval::funcs::system::format_type_with_type_mod(
+                storage,
+                txid,
+                column.type_oid,
+                column.type_mod,
+            )?;
+            return Err(crate::sql::error_position::with_detail(
+                sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "SELECT rule's target entry {} has different size from column \"{}\"",
+                    index + 1,
+                    column.name
+                ),
+                format_args!(
+                    "SELECT target entry has type {}, but column has type {}.",
+                    entry_type.as_str(),
+                    column_type.as_str()
+                ),
+            ));
+        }
+    }
+    if count != column_count {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "SELECT rule's target list has too few entries"
+        ));
+    }
+    if !rule.or_replace {
+        return Err(sql_err!(
+            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+            "\"{}\" is already a view",
+            rule.table.name
+        ));
+    }
+    if rule.name != "_RETURN" {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "view rule for \"{}\" must be named \"_RETURN\"",
+            rule.table.name
+        ));
+    }
+    Ok(AnalysedRule::ViewQuery { view, sql })
+}
+
 /// PostgreSQL's `checkRuleResultList` for a rule's RETURNING list: one entry
 /// per relation attribute (dropped ones included), each of the column's type,
 /// with typmods equal unless either is unspecified.
@@ -53646,18 +56266,9 @@ fn check_rule_returning_list(
     txid: u32,
     target: crate::storage::RuleTarget,
     relation: &RuleConditionColumns<'_>,
-    action: &Stmt<'_>,
-    arena: &Arena,
+    entries: &[ColDesc<'_>],
 ) -> Result<(), SqlError> {
-    let mut entries = [ColDesc::new("", 0, 0); MAX_PROJ];
-    let count = describe_data_modification_columns(
-        storage,
-        action,
-        arena,
-        txid,
-        &mut entries,
-        DescriptionTarget::Sql,
-    )?;
+    let count = entries.len();
     let definitions = storage.table_definition_images();
     let table = match target {
         crate::storage::RuleTarget::Table(slot) => {
@@ -53768,11 +56379,15 @@ pub fn create_rule(
     if let Err(error) = storage.require_owner(target.access_object(), txn.txid, "relation") {
         return sql_fail(error);
     }
-    let (definition, dependencies) =
-        match stored_rule_definition(storage, txn, rule, target, raw_path, arena) {
-            Ok(definition) => definition,
-            Err(error) => return sql_fail(error),
-        };
+    let (definition, dependencies) = match crate::sql::error_position::with_analysis(|| {
+        stored_rule_definition(storage, txn, rule, target, raw_path, arena)
+    }) {
+        Ok(AnalysedRule::Stored(definition, dependencies)) => (definition, dependencies),
+        Ok(AnalysedRule::ViewQuery { view, sql }) => {
+            return replace_view_query(storage, wal, txn, view, sql, raw_path, arena, responder);
+        }
+        Err(error) => return sql_fail(error),
+    };
     let publication =
         match storage.create_rule(definition, dependencies.view(), rule.or_replace, txn.txid) {
             Ok(publication) => publication,
@@ -53813,6 +56428,86 @@ pub fn create_rule(
             crate::storage::CatalogDdlDecision::Rollback,
         );
         return sql_fail(error);
+    }
+    responder.command_complete("CREATE RULE")?;
+    sql_ok()
+}
+
+/// Replaces a view's query as `CREATE OR REPLACE RULE "_RETURN"` does,
+/// keeping its options and column defaults.
+#[expect(clippy::too_many_arguments, reason = "DDL execution context")]
+fn replace_view_query(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    view: usize,
+    sql: &str,
+    raw_path: &str,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
+    let (schema, name, persistence, options, columns) = {
+        let definition = storage.view(view);
+        (
+            definition.schema_for(txn.txid),
+            definition.name_for(txn.txid),
+            definition.persistence,
+            definition.options_for(txn.txid),
+            *definition.columns_for(txn.txid),
+        )
+    };
+    let temporary = persistence == crate::storage::RelationPersistence::Temporary;
+    let name = crate::sql::ast::QualName {
+        schema: (!temporary).then_some(schema.as_str()),
+        name: name.as_str(),
+    };
+    let outcome = responder.without_command_complete(|responder| {
+        create_view(
+            storage,
+            wal,
+            txn,
+            CreateViewCommand {
+                name: &name,
+                persistence: if temporary {
+                    super::ast::RelationPersistence::Temporary
+                } else {
+                    super::ast::RelationPersistence::Permanent
+                },
+                columns: &[],
+                or_replace: true,
+                security: match options.security {
+                    crate::storage::ViewSecurity::Definer => super::ast::ViewSecurity::Definer,
+                    crate::storage::ViewSecurity::Invoker => super::ast::ViewSecurity::Invoker,
+                },
+                security_barrier: match options.security_barrier {
+                    crate::storage::ViewSecurityBarrier::Default => {
+                        super::ast::ViewSecurityBarrier::Default
+                    }
+                    crate::storage::ViewSecurityBarrier::Enabled => {
+                        super::ast::ViewSecurityBarrier::Enabled
+                    }
+                    crate::storage::ViewSecurityBarrier::Disabled => {
+                        super::ast::ViewSecurityBarrier::Disabled
+                    }
+                },
+                check_option: options.check_option.map(|option| match option {
+                    crate::storage::ViewCheckOption::Local => super::ast::ViewCheckOption::Local,
+                    crate::storage::ViewCheckOption::Cascaded => {
+                        super::ast::ViewCheckOption::Cascaded
+                    }
+                }),
+                sql,
+                raw_path,
+                option_order: options.order,
+                kept_column_types: columns.types(),
+                query_origin: crate::storage::ViewQueryOrigin::ReturnRule,
+            },
+            arena,
+            responder,
+        )
+    })?;
+    if outcome.is_err() {
+        return Ok(outcome);
     }
     responder.command_complete("CREATE RULE")?;
     sql_ok()
@@ -54394,21 +57089,13 @@ pub fn comment(
             kind,
             name: object_name,
         } => {
-            let Some(slot) =
-                storage.text_search_slot_on_path(kind, object_name.schema, object_name.name, txid)
-            else {
-                return sql_fail(sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "{} \"{}\" does not exist",
-                    kind.noun(),
-                    object_name.name
-                ));
+            let slot = match text_search_slot_named(storage, kind, &object_name, txid) {
+                Ok(slot) => slot,
+                Err(error) => return sql_fail(error),
             };
             let definition = storage.text_search_object(slot).definition_for(txid);
-            let authority = match definition.owner() {
-                Some(owner) => require_definition_owner(storage, txid, owner, kind.noun()),
-                None => text_search_superuser(storage, txid),
-            };
+            let authority =
+                require_text_search_owner(storage, txid, &definition, kind, &object_name);
             if let Err(error) = authority {
                 return sql_fail(error);
             }
@@ -56641,7 +59328,7 @@ fn rewrite_sequence_default_references(
                     changed |= rewritten != expression;
                     crate::storage::ColumnDefault::Expression(rewritten)
                 }
-                crate::storage::ColumnDefault::Generated(expression) => {
+                crate::storage::ColumnDefault::Generated { expression, kind } => {
                     let rewritten = rewrite_sequence_default_reference(
                         expression.as_str(),
                         storage,
@@ -56652,7 +59339,10 @@ fn rewrite_sequence_default_references(
                         arena,
                     )?;
                     changed |= rewritten != expression;
-                    crate::storage::ColumnDefault::Generated(rewritten)
+                    crate::storage::ColumnDefault::Generated {
+                        expression: rewritten,
+                        kind,
+                    }
                 }
             };
         }
@@ -58297,7 +60987,11 @@ fn drop_type_dependent_routines(
             storage
                 .triggers_with_slots_visible_to(txn.txid)
                 .find_map(|(slot, trigger)| {
-                    selected[usize::from(trigger.function)].then_some((slot, trigger))
+                    trigger
+                        .function
+                        .routine()
+                        .is_some_and(|routine| selected[routine])
+                        .then_some((slot, trigger))
                 });
         let Some((slot, trigger)) = dependency else {
             break;
@@ -62329,7 +65023,11 @@ fn drop_selected_stored_queries_with_columns(
             storage
                 .triggers_with_slots_visible_to(txn.txid)
                 .find_map(|(slot, trigger)| {
-                    routines[usize::from(trigger.function)].then_some((slot, trigger))
+                    trigger
+                        .function
+                        .routine()
+                        .is_some_and(|routine| routines[routine])
+                        .then_some((slot, trigger))
                 });
         let Some((slot, trigger)) = dependency else {
             break;
@@ -63323,15 +66021,18 @@ fn rewrite_table_owned_column_references(
                     arena,
                 )?)
             }
-            crate::storage::ColumnDefault::Generated(expression) => {
-                crate::storage::ColumnDefault::Generated(rewrite_table_column_reference(
-                    expression.as_str(),
-                    &current,
-                    &target_shape,
-                    rename,
-                    catalog,
-                    arena,
-                )?)
+            crate::storage::ColumnDefault::Generated { expression, kind } => {
+                crate::storage::ColumnDefault::Generated {
+                    expression: rewrite_table_column_reference(
+                        expression.as_str(),
+                        &current,
+                        &target_shape,
+                        rename,
+                        catalog,
+                        arena,
+                    )?,
+                    kind,
+                }
             }
         };
     }
@@ -64330,7 +67031,7 @@ fn rewrite_composite_dependent_tables(
                     changed |= rewritten != expression;
                     crate::storage::ColumnDefault::Expression(rewritten)
                 }
-                crate::storage::ColumnDefault::Generated(expression) => {
+                crate::storage::ColumnDefault::Generated { expression, kind } => {
                     let rewritten = rewrite_typed_composite_field_selectors(
                         expression.as_str(),
                         &columns,
@@ -64339,7 +67040,10 @@ fn rewrite_composite_dependent_tables(
                         arena,
                     )?;
                     changed |= rewritten != expression;
-                    crate::storage::ColumnDefault::Generated(rewritten)
+                    crate::storage::ColumnDefault::Generated {
+                        expression: rewritten,
+                        kind,
+                    }
                 }
             };
         }
@@ -65538,6 +68242,12 @@ pub fn create_statistics(
                         column
                     ));
                 };
+                if table_definition.columns()[column].default.is_virtual() {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "statistics creation on virtual generated columns is not supported"
+                    ));
+                }
                 ExtendedStatisticsKey::Column(table_definition.columns()[column].name)
             }
             StatisticsKey::Expression(expression) => {
@@ -65563,6 +68273,18 @@ pub fn create_statistics(
                         return sql_fail(sql_err!(
                             sqlstate::FEATURE_NOT_SUPPORTED,
                             "statistics creation on system columns is not supported"
+                        ));
+                    }
+                    Ok(variables)
+                        if table_definition.columns().iter().enumerate().any(
+                            |(index, column)| {
+                                column.default.is_virtual() && variables.columns().contains(index)
+                            },
+                        ) =>
+                    {
+                        return sql_fail(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "statistics creation on virtual generated columns is not supported"
                         ));
                     }
                     Ok(_) => {}
@@ -66368,6 +69090,27 @@ pub fn create_index(
         return sql_fail(error);
     }
     let tdef = (*storage.table_def(table_index, txn.txid)).clone();
+    // PostgreSQL 18 indexes no virtual generated column, by key, key
+    // expression or predicate.
+    let reads_virtual = |expression: &Expr<'_>| {
+        ddl::expression_variables(expression, &tdef).is_ok_and(|variables| {
+            tdef.columns().iter().enumerate().any(|(index, column)| {
+                column.default.is_virtual() && variables.columns().contains(index)
+            })
+        })
+    };
+    if command.columns.iter().any(|index_column| {
+        let simple = crate::sql::exec::index_expression_column_name(index_column.expression);
+        tdef.column_index(simple)
+            .is_some_and(|column| tdef.columns()[column].default.is_virtual())
+            || reads_virtual(index_column.expression)
+    }) || command.predicate.is_some_and(reads_virtual)
+    {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "indexes on virtual generated columns are not supported"
+        ));
+    }
     let phased = command.build == crate::sql::ast::IndexBuildMode::Concurrent
         && tdef.persistence != crate::storage::RelationPersistence::Temporary;
     if tdef.partition.is_partitioned()
@@ -66380,11 +69123,12 @@ pub fn create_index(
         ));
     }
     if let Some(predicate_expression) = command.predicate {
-        let (type_oid, _) =
-            match infer_type_catalog(predicate_expression, Some(&tdef), storage, txn.txid, arena) {
-                Ok(value) => value,
-                Err(error) => return sql_fail(error),
-            };
+        let (type_oid, _) = match crate::sql::error_position::with_analysis(|| {
+            infer_type_catalog(predicate_expression, Some(&tdef), storage, txn.txid, arena)
+        }) {
+            Ok(value) => value,
+            Err(error) => return sql_fail(error),
+        };
         if type_oid != crate::sql::types::oid::BOOL {
             return sql_fail(sql_err!(
                 sqlstate::DATATYPE_MISMATCH,
@@ -66648,13 +69392,16 @@ pub fn create_index(
             if let Err(error) = ddl::check_referenced_columns(index_column.expression, &tdef) {
                 return sql_fail(error);
             }
-            let (type_oid, _) = match infer_type_catalog(
-                index_column.expression,
-                Some(&tdef),
-                storage,
-                txn.txid,
-                arena,
-            ) {
+            // PostgreSQL analyses the key expression in the statement's text.
+            let (type_oid, _) = match crate::sql::error_position::with_analysis(|| {
+                infer_type_catalog(
+                    index_column.expression,
+                    Some(&tdef),
+                    storage,
+                    txn.txid,
+                    arena,
+                )
+            }) {
                 Ok(result) => result,
                 Err(error) => return sql_fail(error),
             };
@@ -69300,33 +72047,40 @@ pub fn alter_database(
                 Ok(name) => name,
                 Err(error) => return sql_fail(error),
             };
-            let value = match value {
-                crate::sql::ast::RoutineConfigValue::Current => {
-                    match guc.capture_setting_value(name.as_str()) {
-                        Ok(value) => Some(value),
-                        Err(error) => return sql_fail(error),
+            let authorize =
+                || super::guc::SettingAuthorization::set(storage, name.as_str(), txn.txid);
+            let value =
+                match value {
+                    crate::sql::ast::RoutineConfigValue::Current => {
+                        match authorize()
+                            .and_then(|authorization| guc.capture_setting_value(authorization))
+                        {
+                            Ok(value) => Some(value),
+                            Err(error) => return sql_fail(error),
+                        }
                     }
-                }
-                crate::sql::ast::RoutineConfigValue::Default => {
-                    let scope = crate::storage::RoleSettingScope::AllRolesInDatabase(
-                        storage.database(slot).oid,
-                    );
-                    if storage
-                        .role_settings()
-                        .any(|(_, setting)| setting.visible_to(txn.txid) && setting.scope == scope)
-                        && let Err(error) = guc.validate_setting_value(name.as_str(), None)
-                    {
-                        return sql_fail(error);
+                    crate::sql::ast::RoutineConfigValue::Default => {
+                        let scope = crate::storage::RoleSettingScope::AllRolesInDatabase(
+                            storage.database(slot).oid,
+                        );
+                        if storage.role_settings().any(|(_, setting)| {
+                            setting.visible_to(txn.txid) && setting.scope == scope
+                        }) && let Err(error) = authorize().and_then(|authorization| {
+                            guc.validate_setting_value(authorization, None)
+                        }) {
+                            return sql_fail(error);
+                        }
+                        None
                     }
-                    None
-                }
-                crate::sql::ast::RoutineConfigValue::Value(raw) => {
-                    match guc.validate_setting_value(name.as_str(), Some(raw)) {
-                        Ok(()) => Some(crate::util::StackStr::from_str(raw)),
-                        Err(error) => return sql_fail(error),
+                    crate::sql::ast::RoutineConfigValue::Value(raw) => {
+                        match authorize().and_then(|authorization| {
+                            guc.validate_setting_value(authorization, Some(raw))
+                        }) {
+                            Ok(()) => Some(crate::util::StackStr::from_str(raw)),
+                            Err(error) => return sql_fail(error),
+                        }
                     }
-                }
-            };
+                };
             if value
                 .as_ref()
                 .is_some_and(crate::util::StackStr::is_truncated)
@@ -69356,7 +72110,10 @@ pub fn alter_database(
                 if storage
                     .role_settings()
                     .any(|(_, setting)| setting.visible_to(txn.txid) && setting.scope == scope)
-                    && let Err(error) = guc.validate_setting_value(name, None)
+                    && let Err(error) = super::guc::SettingAuthorization::set(
+                        storage, name, txn.txid,
+                    )
+                    .and_then(|authorization| guc.validate_setting_value(authorization, None))
                 {
                     return sql_fail(error);
                 }
@@ -71417,9 +74174,9 @@ pub struct CopySetup {
     pub reject_limit: Option<u64>,
     pub log_verbosity: crate::sql::ast::CopyLogVerbosity,
     filter: CopyFilter,
-    /// SQL COPY is authorized as the role fixed when the statement begins.
-    /// Subscription apply is a replication operation and has no SQL role.
-    security_role: Option<u16>,
+    /// The insert method `copy_statement_begin` chooses and its buffering
+    /// window, which decides when an index error is reported.
+    batch: Mutex<copy_batch::CopyBatch>,
 }
 
 impl CopySetup {
@@ -71481,6 +74238,9 @@ impl CopyFilter {
     fn resolve<Definition0: crate::storage::DefinitionBacking>(
         statement: &crate::sql::ast::CopyStmt,
         def: &crate::storage::TableDefinition<Definition0>,
+        storage: &Storage,
+        txid: u32,
+        arena: &Arena,
     ) -> Result<Self, SqlError> {
         let Some(predicate) = statement.where_clause else {
             return Ok(Self {
@@ -71494,8 +74254,37 @@ impl CopyFilter {
                 "COPY WHERE cannot be used with COPY TO"
             ));
         }
-        validate_copy_predicate(predicate, def)?;
+        // PostgreSQL analyses the condition in the statement's text.
+        crate::sql::error_position::with_analysis(|| validate_copy_predicate(predicate, def))?;
+        // The predicate is analysed with the statement, before any data is
+        // read: its functions resolve and its literals run their inputs.
+        let mark = arena.mark();
+        let columns = CatalogCols {
+            definition: Some(crate::storage::RelationDefinition::from_definition(def)),
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        };
+        let analysed = infer_type_res(predicate, &columns).and_then(|_| {
+            super::query::check_literal_operands_typed(
+                predicate,
+                &|other| {
+                    infer_type_res(other, &columns)
+                        .ok()
+                        .and_then(|(oid, _)| ColType::from_oid(oid))
+                },
+                storage,
+                txid,
+                arena,
+            )
+        });
+        // Only the verdict leaves; analysis scratch is discarded.
+        unsafe { arena.rewind_to(mark) };
+        analysed?;
         let row = RowCtx {
+            table_oid: None,
             def: crate::storage::RelationDefinition::from_definition(def),
             values: &[],
             alias: None,
@@ -71526,6 +74315,17 @@ impl CopyFilter {
         })
     }
 
+    /// Whether the predicate calls a volatile function, `nextval` included.
+    fn is_volatile(self, storage: &Storage, txid: u32, arena: &Arena) -> Result<bool, SqlError> {
+        if self.mode == CopyFilterMode::All {
+            return Ok(false);
+        }
+        let predicate = crate::sql::parser::parse_expr(self.source.as_str(), arena)?;
+        Ok(super::query::expression_contains_volatile(
+            predicate, storage, txid, false,
+        ))
+    }
+
     /// Evaluates after input coercion and defaults, before row triggers,
     /// generated values, constraints, or a durable write. The source was parsed before
     /// CopyInResponse and is re-parsed only because streamed rows recycle the
@@ -71544,6 +74344,7 @@ impl CopyFilter {
         }
         let predicate = crate::sql::parser::parse_expr(self.source.as_str(), arena)?;
         let row = RowCtx {
+            table_oid: None,
             def: crate::storage::RelationDefinition::from_definition(def),
             values,
             alias: None,
@@ -71590,10 +74391,11 @@ fn validate_copy_predicate<Definition0: crate::storage::DefinitionBacking>(
             ));
         }
         let Some(index) = def.column_index(name) else {
-            return Err(sql_err!(
-                sqlstate::UNDEFINED_COLUMN,
-                "column \"{}\" does not exist",
-                name
+            return Err(crate::sql::column_suggestion::missing_relation_column(
+                qualifier,
+                name,
+                def.name.as_str(),
+                def.columns(),
             ));
         };
         if def.columns()[index].default.is_generated() {
@@ -71843,6 +74645,7 @@ pub fn copy_begin(
     storage: &Storage,
     statement: &crate::sql::ast::CopyStmt,
     txid: u32,
+    arena: &Arena,
 ) -> Result<CopySetup, SqlError> {
     let security_role = storage.current_role_slot(txid).ok_or_else(|| {
         sql_err!(
@@ -71864,11 +74667,17 @@ pub fn copy_begin(
     let definitions = storage.table_definition_images();
     let def = definitions.definition(storage, table_index, txid)?;
     let mut targets = [0usize; MAX_COLUMNS];
+    // COPY reads and writes no generated column: the default list omits
+    // them, and naming one is an error.
     let n_targets = if statement.columns.is_empty() {
-        for (i, t) in targets.iter_mut().enumerate().take(def.n_columns) {
-            *t = i;
+        let mut count = 0;
+        for (index, column) in def.columns().iter().enumerate().take(def.n_columns) {
+            if !column.default.is_generated() {
+                targets[count] = index;
+                count += 1;
+            }
         }
-        def.n_columns
+        count
     } else {
         for (i, name) in statement.columns.iter().enumerate() {
             let Some(col) = def.column_index(name) else {
@@ -71882,6 +74691,16 @@ pub fn copy_begin(
                     name,
                 ));
             };
+            if def.columns()[col].default.is_generated() {
+                return Err(crate::sql::eval::with_detail(
+                    sql_err!(
+                        sqlstate::INVALID_COLUMN_REFERENCE,
+                        "column \"{}\" is a generated column",
+                        name
+                    ),
+                    format_args!("Generated columns cannot be used in COPY."),
+                ));
+            }
             if targets[..i].contains(&col) {
                 return Err(sql_err!(
                     sqlstate::DUPLICATE_COLUMN,
@@ -71908,57 +74727,72 @@ pub fn copy_begin(
         target_columns,
         txid,
     )?;
-    if !statement.to && storage.matview_slot_for_table(table_index, txid).is_some() {
+    // `DoCopy`: policies cannot filter COPY FROM's rows.
+    if !statement.to && storage.row_security_applies(table_index, security_role, txid) {
+        if !crate::sql::guc::active_row_security() {
+            return Err(super::query::row_security_off_error(
+                storage,
+                table_index,
+                security_role,
+                txid,
+            ));
+        }
+        super::eval::stash_diagnostic(
+            None,
+            Some(crate::util::StackStr::from_str(
+                "Use INSERT statements instead.",
+            )),
+        );
         return Err(sql_err!(
-            sqlstate::WRONG_OBJECT_TYPE,
-            "cannot copy to materialized view \"{}\"",
-            def.name.as_str()
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "COPY FROM not supported with row-level security"
         ));
     }
     if statement.to {
         if !storage.row_security_applies(table_index, security_role, txid) {
             if def.partition.is_partitioned() {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "cannot copy from partitioned table \"{}\"",
-                    def.name.as_str()
+                return Err(crate::sql::error_position::with_hint(
+                    sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "cannot copy from partitioned table \"{}\"",
+                        def.name.as_str()
+                    ),
+                    COPY_QUERY_HINT,
                 ));
             }
             if def.kind == crate::storage::TableKind::Foreign {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "cannot copy from foreign table \"{}\"",
-                    def.name.as_str()
+                return Err(crate::sql::error_position::with_hint(
+                    sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "cannot copy from foreign table \"{}\"",
+                        def.name.as_str()
+                    ),
+                    COPY_QUERY_HINT,
                 ));
             }
         }
         if storage.matviews_visible_to(txid).any(|(_, view)| {
             usize::from(view.backing_table) == table_index && !view.populated_for(txid)
         }) {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "cannot copy from unpopulated materialized view \"{}\"",
-                def.name.as_str()
+            return Err(crate::sql::error_position::with_hint(
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot copy from unpopulated materialized view \"{}\"",
+                    def.name.as_str()
+                ),
+                "Use the REFRESH MATERIALIZED VIEW command.",
             ));
         }
     }
     let opts = &statement.options;
     let fmt = CopyFmt::resolve(def, statement.table.name, opts)?;
-    let filter = CopyFilter::resolve(statement, def)?;
-    if !statement.to {
-        for &target in &targets[..n_targets] {
-            if def.columns()[target].default.is_generated() {
-                return Err(sql_err!(
-                    sqlstate::GENERATED_ALWAYS,
-                    "cannot insert a non-DEFAULT value into column \"{}\"",
-                    def.columns()[target].name.as_str()
-                ));
-            }
-        }
-    }
+    let filter = CopyFilter::resolve(statement, def, storage, txid, arena)?;
     Ok(CopySetup {
         clock: super::datetime::statement_clock(),
         snapshot_lease: Mutex::new(None),
+        batch: Mutex::new(copy_batch::CopyBatch::new(
+            copy_batch::CopyInsertMethod::Single,
+        )),
         definitions,
         table_index,
         txid,
@@ -71969,12 +74803,6 @@ pub fn copy_begin(
         reject_limit: opts.reject_limit,
         log_verbosity: opts.log_verbosity,
         filter,
-        security_role: Some(u16::try_from(security_role).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "role catalog exceeds COPY capacity"
-            )
-        })?),
     })
 }
 
@@ -72004,7 +74832,7 @@ fn copy_export_table(
         }
         StoredRelKind::View => (AccessClass::View, "view"),
         StoredRelKind::Sequence => (AccessClass::Sequence, "sequence"),
-        StoredRelKind::Index => (AccessClass::Index, "non-table relation"),
+        StoredRelKind::Index => return Err(copy_index_error(name.name)),
     };
     let object = storage
         .resolve_access_object(class, schema.as_str(), name.name, txid)
@@ -72050,16 +74878,203 @@ fn copy_export_table(
     if !permitted {
         return Err(sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
-            "permission denied for table {}",
+            "permission denied for {} {}",
+            description,
             name.name
         ));
     }
-    Err(sql_err!(
+    let error = sql_err!(
         sqlstate::WRONG_OBJECT_TYPE,
         "cannot copy from {} \"{}\"",
         description,
         name.name
-    ))
+    );
+    Err(if kind == StoredRelKind::View {
+        crate::sql::error_position::with_hint(error, COPY_QUERY_HINT)
+    } else {
+        error
+    })
+}
+
+/// PostgreSQL's hint for COPY TO of a relation that only a query can read.
+const COPY_QUERY_HINT: &str = "Try the COPY (SELECT ...) TO variant.";
+
+/// COPY opens its relation as a table, which an index is not.
+fn copy_index_error(name: &str) -> SqlError {
+    crate::sql::eval::with_detail(
+        sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "cannot open relation \"{}\"",
+            name
+        ),
+        format_args!("This operation is not supported for indexes."),
+    )
+}
+
+/// A COPY FROM target PostgreSQL accepts only after it has entered copy-in
+/// mode: `CopyFrom` refuses these relations once the client is sending data.
+#[derive(Clone, Copy, Debug)]
+pub enum CopyRefusal {
+    View(SqlName),
+    MaterializedView(SqlName),
+    Sequence(SqlName),
+}
+
+impl CopyRefusal {
+    /// The error, with its hint stashed for the report.
+    pub fn error(self) -> SqlError {
+        match self {
+            Self::View(name) => crate::sql::error_position::with_hint(
+                sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "cannot copy to view \"{}\"",
+                    name.as_str()
+                ),
+                "To enable copying to a view, provide an INSTEAD OF INSERT trigger.",
+            ),
+            Self::MaterializedView(name) => sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "cannot copy to materialized view \"{}\"",
+                name.as_str()
+            ),
+            Self::Sequence(name) => sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "cannot copy to sequence \"{}\"",
+                name.as_str()
+            ),
+        }
+    }
+}
+
+/// A refused COPY FROM, after the checks PostgreSQL makes before copy-in:
+/// the relation opens, the role may insert, and the column list resolves.
+pub struct RefusedCopyIn {
+    pub refusal: CopyRefusal,
+    pub n_targets: usize,
+    pub binary: bool,
+}
+
+/// COPY FROM into a view or sequence. `None` leaves every other relation to
+/// [`copy_begin`]; an index fails here as PostgreSQL's open does.
+pub fn copy_from_refusal(
+    storage: &Storage,
+    statement: &crate::sql::ast::CopyStmt,
+    txid: u32,
+) -> Result<Option<RefusedCopyIn>, SqlError> {
+    use crate::storage::StoredRelKind;
+    if statement.to {
+        return Ok(None);
+    }
+    let name = &statement.table;
+    let Some((schema, kind)) = storage.classify_relation(name.schema, name.name, txid) else {
+        return Ok(None);
+    };
+    let role = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        )
+    })?;
+    let (refusal, columns): (CopyRefusal, &[&str]) = match kind {
+        StoredRelKind::Index => return Err(copy_index_error(name.name)),
+        StoredRelKind::View => {
+            let object = storage
+                .resolve_access_object(
+                    crate::storage::AccessClass::View,
+                    schema.as_str(),
+                    name.name,
+                    txid,
+                )
+                .ok_or_else(|| undefined_qual(name))?;
+            let slot = usize::from(object.slot);
+            require_view_privilege_as(
+                storage,
+                slot,
+                crate::storage::PrivilegeSet::INSERT,
+                role,
+                txid,
+            )?;
+            let target = crate::storage::TriggerTarget::View(object.slot);
+            if storage
+                .triggers_for_target(target, txid)
+                .any(|(_, trigger)| {
+                    matches!(trigger.timing, crate::sql::ast::TriggerTiming::InsteadOf)
+                        && trigger
+                            .events
+                            .contains(crate::sql::ast::TriggerEvents::INSERT)
+                })
+            {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "COPY FROM through a view's INSTEAD OF INSERT trigger is not supported"
+                ));
+            }
+            let view = storage.view(slot);
+            let names = view.columns_for(txid).names();
+            let n_targets = copy_refused_targets(
+                statement.columns,
+                name.name,
+                |column| names.iter().any(|candidate| candidate.as_str() == column),
+                names.len(),
+            )?;
+            return Ok(Some(RefusedCopyIn {
+                refusal: CopyRefusal::View(view.name),
+                n_targets,
+                binary: statement.options.format == crate::sql::ast::CopyFormat::Binary,
+            }));
+        }
+        StoredRelKind::Sequence => {
+            // A sequence's privileges do not include INSERT.
+            if !storage.role(role).attributes_to(txid).superuser {
+                return Err(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied for sequence {}",
+                    name.name
+                ));
+            }
+            (
+                CopyRefusal::Sequence(SqlName::parse(name.name)?),
+                &["last_value", "log_cnt", "is_called"],
+            )
+        }
+        StoredRelKind::Table | StoredRelKind::ForeignTable | StoredRelKind::Matview => {
+            return Ok(None);
+        }
+    };
+    let n_targets = copy_refused_targets(
+        statement.columns,
+        name.name,
+        |column| columns.contains(&column),
+        columns.len(),
+    )?;
+    Ok(Some(RefusedCopyIn {
+        refusal,
+        n_targets,
+        binary: statement.options.format == crate::sql::ast::CopyFormat::Binary,
+    }))
+}
+
+fn copy_refused_targets(
+    written: &[&str],
+    relation: &str,
+    exists: impl Fn(&str) -> bool,
+    all: usize,
+) -> Result<usize, SqlError> {
+    for column in written {
+        if !exists(column) {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" of relation \"{}\" does not exist",
+                column,
+                relation
+            ));
+        }
+    }
+    Ok(if written.is_empty() {
+        all
+    } else {
+        written.len()
+    })
 }
 
 pub(crate) fn subscription_copy_setup(
@@ -72112,6 +75127,9 @@ pub(crate) fn subscription_copy_setup(
     Ok(CopySetup {
         clock: super::datetime::statement_clock(),
         snapshot_lease: Mutex::new(None),
+        batch: Mutex::new(copy_batch::CopyBatch::new(
+            copy_batch::CopyInsertMethod::Single,
+        )),
         definitions,
         table_index,
         txid,
@@ -72138,7 +75156,6 @@ pub(crate) fn subscription_copy_setup(
             mode: CopyFilterMode::All,
             source: StackStr::new(),
         },
-        security_role: None,
     })
 }
 
@@ -72154,17 +75171,8 @@ pub(crate) fn copy_statement_begin(
     let definition = setup
         .definitions
         .definition(storage, setup.table_index, txn.txid)?;
-    if let Some(role) = setup.security_role {
-        let _ = super::query::plan_row_security(
-            storage,
-            setup.table_index,
-            usize::from(role),
-            PolicyCommandKind::Insert,
-            super::query::RowSecurityExpression::WithCheck,
-            txn.txid,
-            arena,
-        )?;
-    }
+    let method = copy_insert_method(storage, setup, definition, txn, arena)?;
+    *setup.batch.lock().unwrap() = copy_batch::CopyBatch::new(method);
     fire_statement_triggers(
         TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
@@ -72197,14 +75205,19 @@ pub(crate) fn copy_statement_end(
     let definition = setup
         .definitions
         .definition(storage, setup.table_index, txn.txid)?;
+    let flushed = setup.batch.lock().unwrap().finish();
+    if let Err(failure) = flushed {
+        return Err(failure.raise(definition.name.as_str(), setup.fmt.binary));
+    }
+    let replication_role = crate::sql::guc::active_session_replication_role()?;
     let mut transition_capture = if transition_capture_required(
         storage,
         setup.table_index,
         txn.txid,
-        txn.replication_apply,
+        replication_role,
         TriggerEvents::INSERT,
     ) {
-        Some(TransitionCapture::new(arena, 0, inserted.len())?)
+        Some(TransitionCapture::new(arena))
     } else {
         None
     };
@@ -72243,7 +75256,21 @@ pub(crate) fn copy_statement_end(
 /// Validates a `HEADER MATCH` line against COPY's resolved target columns.
 /// This runs before any row mutation, so a mismatched header cannot leave a
 /// partially loaded statement behind.
-pub fn copy_match_header(
+pub(crate) fn copy_match_header<'a>(
+    storage: &Storage,
+    setup: &CopySetup,
+    line: &'a [u8],
+    frame: &crate::sql::error_context::CopyFrame<'a>,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    name_copy_frame(frame, storage, setup, setup.txid);
+    frame.text.set(core::str::from_utf8(line).ok());
+    crate::sql::error_context::within(frame, || {
+        copy_match_header_in_frame(storage, setup, line, arena)
+    })
+}
+
+fn copy_match_header_in_frame(
     storage: &Storage,
     setup: &CopySetup,
     line: &[u8],
@@ -72256,40 +75283,50 @@ pub fn copy_match_header(
         crate::sql::copy::decode_row_csv(
             line,
             arena,
-            &mut fields[..setup.n_targets],
+            &mut fields,
             setup.fmt.delimiter,
             setup.fmt.quote,
             setup.fmt.escape,
             setup.fmt.null.as_str(),
             &|_| false,
             &|_| false,
+            None,
+            &mut [],
         )?
     } else {
         crate::sql::copy::decode_row_text(
             line,
             arena,
-            &mut fields[..setup.n_targets],
+            &mut fields,
             setup.fmt.delimiter,
             setup.fmt.null.as_str(),
+            None,
+            &mut [],
         )?
     };
     if count != setup.n_targets {
         return Err(sql_err!(
             sqlstate::BAD_COPY_FILE_FORMAT,
-            "COPY header has {} columns, expected {}",
+            "wrong number of fields in header line: got {}, expected {}",
             count,
             setup.n_targets
         ));
     }
     for (index, field) in fields.iter().enumerate().take(count) {
-        let actual = field.ok_or_else(|| {
-            sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "COPY header column is NULL")
-        })?;
         let expected = def.columns()[setup.targets[index]].name.as_str();
-        if actual != expected {
+        let Some(actual) = field else {
             return Err(sql_err!(
                 sqlstate::BAD_COPY_FILE_FORMAT,
-                "COPY header column {} is \"{}\", expected \"{}\"",
+                "column name mismatch in header line field {}: got null value (\"{}\"), expected \"{}\"",
+                index + 1,
+                setup.fmt.null.as_str(),
+                expected
+            ));
+        };
+        if *actual != expected {
+            return Err(sql_err!(
+                sqlstate::BAD_COPY_FILE_FORMAT,
+                "column name mismatch in header line field {}: got \"{}\", expected \"{}\"",
                 index + 1,
                 actual,
                 expected
@@ -72297,12 +75334,6 @@ pub fn copy_match_header(
         }
     }
     Ok(())
-}
-
-/// `ON_ERROR ignore` only discards data-conversion failures. Constraint,
-/// transaction, storage, and protocol errors remain statement failures.
-pub fn copy_ignorable_error(error: &SqlError) -> bool {
-    error.sqlstate.starts_with("22") && error.sqlstate != sqlstate::BAD_COPY_FILE_FORMAT
 }
 
 /// One COPY FROM data line: text fields decode, coerce through each column's
@@ -72313,15 +75344,81 @@ pub fn copy_ignorable_error(error: &SqlError) -> bool {
     clippy::too_many_arguments,
     reason = "COPY rows share the bounded statement trigger capture with INSERT execution"
 )]
-pub(crate) fn copy_row(
+pub(crate) fn copy_row<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
     services: &mut TriggerServices<'_>,
     setup: &CopySetup,
-    line: &[u8],
-    arena: &Arena,
+    line: &'a [u8],
+    frame: &crate::sql::error_context::CopyFrame<'a>,
+    arena: &'a Arena,
     responder: &mut Responder,
     inserted: &mut CopyTransitionRows,
+) -> Result<CopyRowOutcome, SqlError> {
+    name_copy_frame(frame, storage, setup, txn.txid);
+    frame.text.set(core::str::from_utf8(line).ok());
+    setup.batch.lock().unwrap().begin_row();
+    let outcome = crate::sql::error_context::within(frame, || {
+        copy_row_in_frame(
+            storage, txn, services, setup, line, arena, responder, inserted, frame,
+        )
+    });
+    // PostgreSQL counts the line without its end-of-line.
+    let line_bytes = line.len() - usize::from(line.last() == Some(&b'\r'));
+    finish_copy_row_window(storage, setup, txn.txid, outcome, line_bytes)
+}
+
+/// Accounts a COPY row in the buffering window, reporting the index error of
+/// a flush that fails before or after it.
+fn finish_copy_row_window(
+    storage: &Storage,
+    setup: &CopySetup,
+    txid: u32,
+    outcome: Result<CopyRowOutcome, SqlError>,
+    line_bytes: usize,
+) -> Result<CopyRowOutcome, SqlError> {
+    let mut batch = setup.batch.lock().unwrap();
+    let flushed = match batch.take_failure() {
+        Some(failure) => Err(failure),
+        None => {
+            let outcome = outcome?;
+            batch.finish_row(line_bytes).map(|()| outcome)
+        }
+    };
+    drop(batch);
+    flushed.map_err(|failure| {
+        failure.raise(
+            storage.table_def(setup.table_index, txid).name.as_str(),
+            setup.fmt.binary,
+        )
+    })
+}
+
+fn name_copy_frame(
+    frame: &crate::sql::error_context::CopyFrame<'_>,
+    storage: &Storage,
+    setup: &CopySetup,
+    txid: u32,
+) {
+    frame.relation.set(StackStr::from_str(
+        storage.table_def(setup.table_index, txid).name.as_str(),
+    ));
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "COPY rows share the bounded statement trigger capture with INSERT execution"
+)]
+fn copy_row_in_frame<'a>(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    services: &mut TriggerServices<'_>,
+    setup: &CopySetup,
+    line: &'a [u8],
+    arena: &'a Arena,
+    responder: &mut Responder,
+    inserted: &mut CopyTransitionRows,
+    frame: &crate::sql::error_context::CopyFrame<'a>,
 ) -> Result<CopyRowOutcome, SqlError> {
     let seq_session = services.seq_session;
     let coercion_txid = txn.txid;
@@ -72330,7 +75427,28 @@ pub(crate) fn copy_row(
         .definitions
         .selection(storage, setup.table_index, txn.txid)?;
     let mut fields: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
+    let mut defaulted = [false; MAX_COLUMNS];
     let fmt = &setup.fmt;
+    let accept_default = |i: usize| {
+        let column = &def.columns()[setup.targets[i]];
+        if column.auto_increment || column.default.expression().is_some() {
+            return Ok(());
+        }
+        Err(crate::sql::eval::with_detail(
+            sql_err!(
+                sqlstate::BAD_COPY_FILE_FORMAT,
+                "unexpected default marker in COPY data"
+            ),
+            format_args!("Column \"{}\" has no default value.", column.name.as_str()),
+        ))
+    };
+    let default = fmt
+        .default
+        .as_ref()
+        .map(|marker| crate::sql::copy::DefaultMarker {
+            marker: marker.as_str(),
+            accept: &accept_default,
+        });
     let n_fields = if fmt.csv {
         crate::sql::copy::decode_row_csv(
             line,
@@ -72342,6 +75460,8 @@ pub(crate) fn copy_row(
             fmt.null.as_str(),
             &|i| CopyFmt::forced(fmt.force_not_null, setup.targets[i]),
             &|i| CopyFmt::forced(fmt.force_null, setup.targets[i]),
+            default.as_ref(),
+            &mut defaulted[..setup.n_targets],
         )?
     } else {
         crate::sql::copy::decode_row_text(
@@ -72350,15 +75470,10 @@ pub(crate) fn copy_row(
             &mut fields[..setup.n_targets],
             fmt.delimiter,
             fmt.null.as_str(),
+            default.as_ref(),
+            &mut defaulted[..setup.n_targets],
         )?
     };
-    if n_fields < setup.n_targets {
-        return Err(sql_err!(
-            sqlstate::BAD_COPY_FILE_FORMAT,
-            "missing data for column \"{}\"",
-            def.columns()[setup.targets[n_fields]].name.as_str()
-        ));
-    }
     let checks = parse_checks(def, storage, txn.txid, arena)?;
     let default_exprs = parse_defaults(def, arena, storage, txn.txid)?;
     let generated_exprs = parse_generated(def, arena, storage, txn.txid)?;
@@ -72367,11 +75482,18 @@ pub(crate) fn copy_row(
     for (i, field) in fields.iter().enumerate().take(setup.n_targets) {
         let col_index = setup.targets[i];
         let col = &def.columns()[col_index];
-        let use_default = field.is_some_and(|text| {
-            fmt.default
-                .as_ref()
-                .is_some_and(|default| text == default.as_str())
-        });
+        // PostgreSQL converts the columns before a missing one.
+        if i >= n_fields {
+            return Err(sql_err!(
+                sqlstate::BAD_COPY_FILE_FORMAT,
+                "missing data for column \"{}\"",
+                col.name.as_str()
+            ));
+        }
+        frame
+            .column
+            .set(Some((StackStr::from_str(col.name.as_str()), *field)));
+        let use_default = defaulted[i];
         values[col_index] = match field {
             None => Datum::Null,
             Some(_) if use_default => Datum::Null,
@@ -72386,17 +75508,9 @@ pub(crate) fn copy_row(
                     seq_session,
                     coercion_txid,
                 )),
-            )
-            .map_err(|error| SqlError {
-                sqlstate: error.sqlstate,
-                message: stack_format!(
-                    192,
-                    "COPY column \"{}\": {}",
-                    col.name.as_str(),
-                    error.message.as_str()
-                ),
-            })?,
+            )?,
         };
+        frame.column.set(None);
         explicit[col_index] = !use_default;
     }
     fill_omitted_defaults(
@@ -72429,13 +75543,14 @@ pub(crate) fn copy_row(
         return Ok(CopyRowOutcome::Filtered);
     }
     finish_copy_row(
+        frame,
         storage,
         txn,
         services,
         responder,
         inserted,
         write_target,
-        setup.security_role,
+        &setup.batch,
         def,
         &checks,
         &generated_exprs,
@@ -72452,15 +75567,42 @@ pub(crate) fn copy_row(
     clippy::too_many_arguments,
     reason = "COPY rows share the bounded statement trigger capture with INSERT execution"
 )]
-pub(crate) fn copy_row_binary(
+pub(crate) fn copy_row_binary<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
     services: &mut TriggerServices<'_>,
     setup: &CopySetup,
-    row: &[u8],
-    arena: &Arena,
+    row: &'a [u8],
+    frame: &crate::sql::error_context::CopyFrame<'a>,
+    arena: &'a Arena,
     responder: &mut Responder,
     inserted: &mut CopyTransitionRows,
+) -> Result<CopyRowOutcome, SqlError> {
+    name_copy_frame(frame, storage, setup, txn.txid);
+    setup.batch.lock().unwrap().begin_row();
+    let outcome = crate::sql::error_context::within(frame, || {
+        copy_row_binary_in_frame(
+            storage, txn, services, setup, row, arena, responder, inserted, frame,
+        )
+    });
+    // Binary input has no line buffer, so only the row count fills a window.
+    finish_copy_row_window(storage, setup, txn.txid, outcome, 0)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "COPY rows share the bounded statement trigger capture with INSERT execution"
+)]
+fn copy_row_binary_in_frame<'a>(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    services: &mut TriggerServices<'_>,
+    setup: &CopySetup,
+    row: &'a [u8],
+    arena: &'a Arena,
+    responder: &mut Responder,
+    inserted: &mut CopyTransitionRows,
+    frame: &crate::sql::error_context::CopyFrame<'a>,
 ) -> Result<CopyRowOutcome, SqlError> {
     let seq_session = services.seq_session;
     let coercion_txid = txn.txid;
@@ -72490,6 +75632,9 @@ pub(crate) fn copy_row_binary(
             return Err(malformed());
         }
         let col = def.columns()[col_index];
+        frame
+            .column
+            .set(Some((StackStr::from_str(col.name.as_str()), None)));
         values[col_index] = if field_len == -1 {
             Datum::Null
         } else {
@@ -72519,6 +75664,7 @@ pub(crate) fn copy_row_binary(
                 )),
             )?
         };
+        frame.column.set(None);
         explicit[col_index] = true;
     }
     if !reader.done() {
@@ -72554,13 +75700,14 @@ pub(crate) fn copy_row_binary(
         return Ok(CopyRowOutcome::Filtered);
     }
     finish_copy_row(
+        frame,
         storage,
         txn,
         services,
         responder,
         inserted,
         write_target,
-        setup.security_role,
+        &setup.batch,
         def,
         &checks,
         &generated_exprs,
@@ -72569,18 +75716,91 @@ pub(crate) fn copy_row_binary(
     )
 }
 
+/// PostgreSQL's choice of COPY FROM insert method (`CopyFrom`): rows are
+/// inserted one at a time when the target has a BEFORE or INSTEAD OF row
+/// trigger, is a foreign table, is partitioned with an INSERT transition
+/// table, fills an omitted column from a volatile default other than
+/// `nextval`, or filters with a volatile WHERE.
+fn copy_insert_method<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    setup: &CopySetup,
+    definition: &crate::storage::TableDefinition<Definition0>,
+    txn: &TxnState,
+    arena: &Arena,
+) -> Result<copy_batch::CopyInsertMethod, SqlError> {
+    use copy_batch::CopyInsertMethod;
+    let table = setup.table_index;
+    let partitioned = definition.partition.is_partitioned();
+    if definition.kind == crate::storage::TableKind::Foreign
+        || !copy_buffers_rows(storage, table, txn.txid)
+        || (partitioned
+            && transition_capture_required(
+                storage,
+                table,
+                txn.txid,
+                crate::sql::guc::active_session_replication_role()?,
+                TriggerEvents::INSERT,
+            ))
+    {
+        return Ok(CopyInsertMethod::Single);
+    }
+    let defaults = parse_defaults(definition, arena, storage, txn.txid)?;
+    for (column, default) in defaults.iter().enumerate().take(definition.n_columns) {
+        // The DEFAULT option can default any column, so all of them count.
+        let defaulted =
+            setup.fmt.default.is_some() || !setup.targets[..setup.n_targets].contains(&column);
+        if let Some(default) = default
+            && defaulted
+            && super::query::expression_contains_volatile(default, storage, txn.txid, true)
+        {
+            return Ok(CopyInsertMethod::Single);
+        }
+    }
+    if setup.filter.is_volatile(storage, txn.txid, arena)? {
+        return Ok(CopyInsertMethod::Single);
+    }
+    Ok(if partitioned {
+        CopyInsertMethod::MultiConditional
+    } else {
+        CopyInsertMethod::Multi
+    })
+}
+
+/// Whether PostgreSQL's COPY FROM buffers rows for `table` (`CIM_MULTI`):
+/// no BEFORE or INSTEAD OF row INSERT trigger on it or a partition ancestor.
+fn copy_buffers_rows(storage: &Storage, table: usize, txid: u32) -> bool {
+    let mut target = table;
+    loop {
+        if storage
+            .triggers_for_table(target, txid)
+            .any(|(_, trigger)| {
+                matches!(trigger.level, TriggerLevel::Row)
+                    && trigger.events.contains(TriggerEvents::INSERT)
+                    && !matches!(trigger.timing, crate::sql::ast::TriggerTiming::After)
+            })
+        {
+            return false;
+        }
+        let Some(attachment) = storage.table_def(target, txid).partition.attachment else {
+            return true;
+        };
+        target = usize::from(attachment.parent);
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "COPY shares the bounded INSERT trigger and constraint context"
 )]
 fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
+    frame: &crate::sql::error_context::CopyFrame<'_>,
     storage: &mut Storage,
     txn: &mut TxnState,
     services: &mut TriggerServices<'_>,
     responder: &mut Responder,
     inserted: &mut CopyTransitionRows,
     logical_target: crate::storage::TableDefinitionTarget,
-    security_role: Option<u16>,
+    batch: &Mutex<copy_batch::CopyBatch>,
     definition: &crate::storage::TableDefinition<Definition0>,
     checks: &ParsedChecks<'a>,
     generated: &constraints::ParsedDefaults<'a>,
@@ -72601,6 +75821,12 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
             if txn.replication_apply {
                 storage.require_subscription_target(target, txn.txid)?;
             }
+            let leaf_batches = physical.kind != crate::storage::TableKind::Foreign
+                && copy_buffers_rows(storage, target, txn.txid);
+            let Some(buffered) = batch.lock().unwrap().route(target, leaf_batches) else {
+                // The flush before this row failed; `copy_row` reports it.
+                return Ok(CopyRowOutcome::Filtered);
+            };
             let leaf_checks;
             let checks = if target == logical_table {
                 checks
@@ -72639,51 +75865,6 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                 &values[..physical.n_columns],
                 txn.txid,
             )?;
-            if let Some(role) = security_role
-                && let Some(plan) = super::query::plan_row_security(
-                    storage,
-                    logical_table,
-                    usize::from(role),
-                    PolicyCommandKind::Insert,
-                    super::query::RowSecurityExpression::WithCheck,
-                    txn.txid,
-                    arena,
-                )?
-            {
-                let logical_values = partition_insert::logical_insert_values(
-                    mapping,
-                    definition.n_columns,
-                    &values[..physical.n_columns],
-                    arena,
-                )?;
-                let row = RowCtx {
-                    def: crate::storage::RelationDefinition::from_definition(definition),
-                    values: logical_values,
-                    alias: None,
-                };
-                let catalog = super::query::storage_catalog(storage, arena, txn.txid);
-                let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                let hooks = EvalHooks {
-                    catalog: Some(&catalog),
-                    sequences: Some(&sequences),
-                    ..NO_HOOKS
-                };
-                if !super::query::row_security_passes(
-                    plan,
-                    &row,
-                    storage,
-                    txn.txid,
-                    arena,
-                    &[],
-                    &hooks,
-                )? {
-                    return Err(sql_err!(
-                        sqlstate::INSUFFICIENT_PRIVILEGE,
-                        "new row violates row-level security policy for table \"{}\"",
-                        definition.name.as_str()
-                    ));
-                }
-            }
             check_not_null(physical, values)?;
             let mut schema = [ColType::Bool; MAX_COLUMNS];
             physical.schema(&mut schema);
@@ -72692,15 +75873,11 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
             } else {
                 ConstraintRow::insert(storage.next_rowid()?)
             };
-            enforce_row_constraints(
+            constraints::enforce_row_checks(
                 storage,
-                target,
                 physical,
-                &schema[..physical.n_columns],
                 &values[..physical.n_columns],
-                row,
                 txn.txid,
-                Some(txn),
                 checks,
                 arena,
                 &[],
@@ -72710,6 +75887,30 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                     coercion_txid,
                 )),
             )?;
+            if let Err(error) = constraints::enforce_row_keys(
+                storage,
+                target,
+                physical,
+                &schema[..physical.n_columns],
+                &values[..physical.n_columns],
+                row,
+                txn.txid,
+                Some(&mut *txn),
+                checks,
+                arena,
+            ) {
+                // PostgreSQL inserts a buffered row's index entries when the
+                // buffers flush; the row goes no further either way.
+                if buffered
+                    && error.sqlstate.internal_control().is_none()
+                    && error.sqlstate != sqlstate::INTERNAL_ERROR
+                {
+                    let diagnostic = crate::sql::eval::take_diagnostic();
+                    batch.lock().unwrap().defer(error, diagnostic, frame.line);
+                    return Ok(CopyRowOutcome::Stored);
+                }
+                return Err(error);
+            }
             if physical.kind == crate::storage::TableKind::Foreign {
                 crate::sql::foreign::insert_row(
                     storage,
@@ -72740,11 +75941,12 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                     &values[..physical.n_columns],
                 )?;
             }
+            let replication_role = crate::sql::guc::active_session_replication_role()?;
             if transition_capture_required(
                 storage,
                 logical_table,
                 txn.txid,
-                txn.replication_apply,
+                replication_role,
                 TriggerEvents::INSERT,
             ) {
                 let logical_values = partition_insert::logical_insert_values(
@@ -74222,6 +77424,7 @@ fn decode_binary_record<'a>(
         .alloc_slice_with(field_count as usize, |_| super::types::RecordField {
             name: "",
             type_oid: 0,
+            type_mod: -1,
             value: Datum::Null,
         })
         .map_err(|_| {
@@ -75197,6 +78400,7 @@ fn compute_generated<'a, Definition0: crate::storage::DefinitionBacking>(
     let mut snapshot = [Datum::Null; MAX_COLUMNS];
     snapshot[..def.n_columns].copy_from_slice(&values[..def.n_columns]);
     let context = RowCtx {
+        table_oid: None,
         def: crate::storage::RelationDefinition::from_definition(def),
         values: &snapshot[..def.n_columns],
         alias: None,
@@ -75300,75 +78504,118 @@ fn parse_view_defaults<'a, Definition0: crate::storage::DefinitionBacking>(
     let Some(view) = view else {
         return Ok(parsed);
     };
-    for (view_index, base_name) in view.defaults.base_columns.iter().enumerate() {
-        let Some(default) = view.defaults.columns.default_at(view_index) else {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "view default columns do not match the view output"
-            ));
-        };
-        let Some(source) = default.expression() else {
-            continue;
-        };
-        if default.constant().is_some() {
-            continue;
+    let mut claimed = [false; MAX_COLUMNS];
+    for defaults in view.defaults {
+        for (view_index, base_name) in defaults.base_columns.iter().enumerate() {
+            if base_name.is_empty() {
+                continue;
+            }
+            let Some(base_index) = definition.column_index(base_name) else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "view default target is absent from its base relation"
+                ));
+            };
+            if claimed[base_index] {
+                continue;
+            }
+            if level_default(defaults, view_index).is_some() {
+                claimed[base_index] = true;
+                parse_view_default(
+                    defaults,
+                    view_index,
+                    base_index,
+                    definition,
+                    &mut parsed,
+                    arena,
+                    storage,
+                    txid,
+                )?;
+            }
         }
-        if default.is_generated() {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "view column default is a generated expression"
-            ));
-        }
-        let Some(base_index) = definition.column_index(base_name) else {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "view default target is absent from its base relation"
-            ));
-        };
-        let original = super::enum_values::checks::default_display(source.as_str(), arena)?;
-        let source = super::enum_values::checks::resolve_default(
-            source.as_str(),
-            definition.columns.as_ref()[base_index].ctype,
-            storage,
-            txid,
-            arena,
-        )?;
-        let section = crate::storage::StoredInputSection::ViewDefault((view_index + 1) as u16);
-        let inputs = view
-            .defaults
-            .inputs
-            .binary_search_by_key(&section, |(section, _)| *section)
-            .ok()
-            .map_or(&[][..], |index| view.defaults.inputs[index].1);
-        let inputs = super::type_inputs::rebase(
-            original,
-            source,
-            super::parser::StoredSqlKind::Expression,
-            inputs,
-            |name| Ok(super::type_inputs::target_oid(storage, txid, name)),
-            arena,
-        )?;
-        parsed[base_index] = Some(crate::sql::parser::parse_expression_with_type_inputs(
-            source,
-            inputs,
-            arena,
-            |parser| {
-                super::type_inputs::validate_restored_candidates(parser, |candidate| {
-                    Ok(inputs
-                        .iter()
-                        .find(|input| {
-                            (input.start, input.end, input.kind)
-                                == (candidate.start, candidate.end, candidate.kind)
-                        })
-                        .map(|input| input.type_oid)
-                        .or_else(|| {
-                            super::type_inputs::candidate_target_oid(storage, txid, candidate)
-                        }))
-                })
-            },
-        )?);
     }
     Ok(parsed)
+}
+
+fn level_default(
+    defaults: &ViewInsertDefaults<'_>,
+    view_index: usize,
+) -> Option<crate::storage::ColumnDefault> {
+    defaults
+        .columns
+        .default_at(view_index)
+        .filter(|default| !matches!(default, crate::storage::ColumnDefault::None))
+}
+
+#[expect(clippy::too_many_arguments, reason = "default parsing context")]
+fn parse_view_default<'a, Definition0: crate::storage::DefinitionBacking>(
+    view: &ViewInsertDefaults<'a>,
+    view_index: usize,
+    base_index: usize,
+    definition: &crate::storage::TableDefinition<Definition0>,
+    parsed: &mut constraints::ParsedDefaults<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let Some(default) = view.columns.default_at(view_index) else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "view default columns do not match the view output"
+        ));
+    };
+    let Some(source) = default.expression() else {
+        return Ok(());
+    };
+    if default.constant().is_some() {
+        return Ok(());
+    }
+    if default.is_generated() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "view column default is a generated expression"
+        ));
+    }
+    let original = super::enum_values::checks::default_display(source.as_str(), arena)?;
+    let source = super::enum_values::checks::resolve_default(
+        source.as_str(),
+        definition.columns.as_ref()[base_index].ctype,
+        storage,
+        txid,
+        arena,
+    )?;
+    let section = crate::storage::StoredInputSection::ViewDefault((view_index + 1) as u16);
+    let inputs = view
+        .inputs
+        .binary_search_by_key(&section, |(section, _)| *section)
+        .ok()
+        .map_or(&[][..], |index| view.inputs[index].1);
+    let inputs = super::type_inputs::rebase(
+        original,
+        source,
+        super::parser::StoredSqlKind::Expression,
+        inputs,
+        |name| Ok(super::type_inputs::target_oid(storage, txid, name)),
+        arena,
+    )?;
+    parsed[base_index] = Some(crate::sql::parser::parse_expression_with_type_inputs(
+        source,
+        inputs,
+        arena,
+        |parser| {
+            super::type_inputs::validate_restored_candidates(parser, |candidate| {
+                Ok(inputs
+                    .iter()
+                    .find(|input| {
+                        (input.start, input.end, input.kind)
+                            == (candidate.start, candidate.end, candidate.kind)
+                    })
+                    .map(|input| input.type_oid)
+                    .or_else(|| super::type_inputs::candidate_target_oid(storage, txid, candidate)))
+            })
+        },
+    )?);
+    Ok(())
 }
 
 fn view_default_for<Definition0: crate::storage::DefinitionBacking>(
@@ -75376,17 +78623,15 @@ fn view_default_for<Definition0: crate::storage::DefinitionBacking>(
     definition: &crate::storage::TableDefinition<Definition0>,
     base_index: usize,
 ) -> Option<crate::storage::ColumnDefault> {
-    let view = view?;
     let base_name = definition.columns().get(base_index)?.name.as_str();
-    let view_index = view
-        .defaults
-        .base_columns
-        .iter()
-        .position(|candidate| *candidate == base_name)?;
-    view.defaults
-        .columns
-        .default_at(view_index)
-        .filter(|default| !matches!(default, crate::storage::ColumnDefault::None))
+    view?.defaults.iter().find_map(|defaults| {
+        defaults
+            .base_columns
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| **candidate == base_name)
+            .find_map(|(view_index, _)| level_default(defaults, view_index))
+    })
 }
 
 #[expect(clippy::too_many_arguments, reason = "default evaluation context")]
@@ -75487,13 +78732,32 @@ fn reject_generated_write<Definition0: crate::storage::DefinitionBacking>(
     column: usize,
 ) -> Result<(), SqlError> {
     if def.columns()[column].default.is_generated() {
-        return Err(sql_err!(
-            sqlstate::GENERATED_ALWAYS,
-            "cannot insert a non-DEFAULT value into column \"{}\"",
-            def.columns()[column].name.as_str()
+        return Err(generated_write_error(
+            "cannot insert a non-DEFAULT value into column",
+            def.columns()[column].name.as_str(),
         ));
     }
     Ok(())
+}
+
+/// PostgreSQL's 428C9 refusal of an `UPDATE` to a generated column.
+fn generated_update_error(column: &str) -> SqlError {
+    crate::sql::error_position::with_detail(
+        sql_err!(
+            sqlstate::GENERATED_ALWAYS,
+            "column \"{}\" can only be updated to DEFAULT",
+            column
+        ),
+        format_args!("Column \"{}\" is a generated column.", column),
+    )
+}
+
+/// PostgreSQL's 428C9 refusal of an explicit value for a generated column.
+fn generated_write_error(message: &str, column: &str) -> SqlError {
+    crate::sql::error_position::with_detail(
+        sql_err!(sqlstate::GENERATED_ALWAYS, "{} \"{}\"", message, column),
+        format_args!("Column \"{}\" is a generated column.", column),
+    )
 }
 
 /// A two-table column lookup for MERGE's ON / WHEN-condition / SET expressions:
@@ -75772,7 +79036,54 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
     }
 
     fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        if self.whole_row_image(table).is_some() {
+            return Some(ColType::Record);
+        }
         self.source_members.range(table).map(|_| ColType::Record)
+    }
+
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        // The source is a derived row with no stored row type.
+        (self.old_name == Some(table) || self.new_name == Some(table) || table == self.target_alias)
+            .then(|| {
+                (
+                    self.target_def.schema.as_str(),
+                    self.target_def.name.as_str(),
+                )
+            })
+    }
+
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Option<(StackStr<64>, StaticTypeMeta)> {
+        let (definition, _) = self.whole_row_image(table)?;
+        crate::sql::eval::stored_row_field_metadata(definition.columns().get(index)?, catalog)
+    }
+
+    fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        match self.whole_row_image(table) {
+            Some((_, image)) => Ok(image.is_some()),
+            None => Ok(self.source_members.range(table).is_some() && self.source.is_some()),
+        }
+    }
+
+    fn whole_row_expansion_fields(
+        &self,
+        table: &str,
+        arena: &'v Arena,
+    ) -> Result<&'v [RecordField<'v>], SqlError> {
+        match self.whole_row_image(table) {
+            Some((definition, image)) => merge_row_fields(definition, image, arena),
+            None => self.whole_row_fields(table, arena)?.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "null whole-row expansion lacks its declared shape"
+                )
+            }),
+        }
     }
 
     fn whole_row_fields(
@@ -75780,6 +79091,12 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
         table: &str,
         arena: &'v Arena,
     ) -> Result<Option<&'v [RecordField<'v>]>, SqlError> {
+        if let Some((definition, image)) = self.whole_row_image(table) {
+            return match image {
+                Some(_) => merge_row_fields(definition, image, arena).map(Some),
+                None => Ok(None),
+            };
+        }
         let Some(columns) = self.source_members.range(table) else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_TABLE,
@@ -75795,6 +79112,7 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
             .alloc_slice_with(columns.len(), |index| RecordField {
                 name: "",
                 type_oid: self.source_def.columns()[first + index].ctype.oid(),
+                type_mod: self.source_def.columns()[first + index].type_mod,
                 value: source[first + index],
             })
             .map_err(|_| super::query::arena_full_pub())?;
@@ -75823,6 +79141,63 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
     ) -> Option<crate::storage::UserTypeName> {
         self.column(qualifier, name)
             .and_then(|column| column.user_type)
+    }
+}
+
+/// A MERGE row image as record fields: NULL fields for an absent image.
+fn merge_row_fields<'v>(
+    definition: crate::storage::RelationDefinition<'_>,
+    image: Option<&[Datum<'v>]>,
+    arena: &'v Arena,
+) -> Result<&'v [RecordField<'v>], SqlError> {
+    let fields = arena
+        .alloc_slice_with(definition.n_columns, |index| RecordField {
+            name: "",
+            type_oid: definition.columns()[index].ctype.oid(),
+            type_mod: definition.columns()[index].type_mod,
+            value: image.map_or(Datum::Null, |values| values[index]),
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    for (field, column) in fields.iter_mut().zip(definition.columns()) {
+        field.name = arena
+            .alloc_str(column.name.as_str())
+            .map_err(|_| super::query::arena_full_pub())?;
+    }
+    Ok(&*fields)
+}
+
+impl<'d, 'v> MergeLookup<'d, 'v> {
+    /// The row a whole-row reference to `table` reads: the `RETURNING`
+    /// images, the target, or the source (its visible columns), with `None`
+    /// for an absent row.
+    fn whole_row_image(
+        &self,
+        table: &str,
+    ) -> Option<(
+        crate::storage::RelationDefinition<'d>,
+        Option<&'v [Datum<'v>]>,
+    )> {
+        if self.old_name == Some(table) {
+            return Some((self.target_def, self.old));
+        }
+        if self.new_name == Some(table) {
+            return Some((self.target_def, self.new));
+        }
+        if table == self.target_alias {
+            return Some((self.target_def, Some(self.target)));
+        }
+        if !self.source_alias.is_empty()
+            && table == self.source_alias
+            && (self.source.is_some() || self.source_namespace_when_absent)
+        {
+            let visible = self.source_def.n_columns.min(self.source_members.visible);
+            let definition = crate::storage::RelationDefinition {
+                n_columns: visible,
+                ..*self.source_def
+            };
+            return Some((definition, self.source.map(|values| &values[..visible])));
+        }
+        None
     }
 }
 
@@ -76233,10 +79608,10 @@ fn describe_joined_returning<'a>(
                 found = *qualifier == returning.old_name() || *qualifier == returning.new_name();
             }
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-                expression.for_each_column_reference(&mut |qualifier, _| {
-                    found |= qualifier.is_some_and(|qualifier| {
-                        qualifier == returning.old_name() || qualifier == returning.new_name()
-                    });
+                // A bare `old` or `new` is a whole-row reference to an image.
+                expression.for_each_column_reference(&mut |qualifier, name| {
+                    let named = qualifier.unwrap_or(name);
+                    found |= named == returning.old_name() || named == returning.new_name();
                 });
             }
             SelectItem::Wildcard(_) => {}
@@ -76330,10 +79705,528 @@ pub(crate) fn merge<'a>(
     params: &[Datum<'a>],
     services: &mut TriggerServices<'_>,
     responder: &mut Responder,
+    capture: Option<&mut super::ReturningCapture<'_>>,
+    progress: Option<&mut RowProgress>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Outcome {
+    use crate::sql::ast::MergeActionRef as MergeAction;
+    let target_qual = crate::sql::ast::QualName {
+        schema: statement.target.schema,
+        name: statement.target.name,
+    };
+    let resolved = storage.resolve_relation(target_qual.schema, target_qual.name, txn.txid);
+    if let Some(target) = resolved
+        && let Err(error) = reject_merge_rules(storage, target, txn.txid)
+    {
+        return sql_fail(error);
+    }
+    let Some(crate::storage::ResolvedRelation::View(view_slot)) = resolved else {
+        return merge_target(
+            storage, txn, statement, arena, params, services, responder, capture, progress, outer,
+            None,
+        );
+    };
+    // A view whose every writing action has an INSTEAD OF row trigger is the
+    // MERGE's result relation, as PostgreSQL's `view_has_instead_trigger`
+    // decides.
+    if merge_view::merge_is_trigger_updatable(storage, view_slot, statement, txn.txid) {
+        return merge_view::merge_through_instead_triggers(
+            storage,
+            txn,
+            statement,
+            merge_view::TriggerMergeTarget {
+                view: view_slot,
+                above: None,
+            },
+            arena,
+            params,
+            services,
+            responder,
+            capture,
+            progress,
+            outer,
+        );
+    }
+    // PostgreSQL rejects a view that is not automatically updatable for the
+    // first action that has no INSTEAD OF trigger to write it.
+    let mut events = 0u8;
+    for when in statement.whens {
+        let write = match when.action() {
+            MergeAction::Insert { .. } => super::query::ViewWrite::MergeInsert,
+            MergeAction::Update(_) => super::query::ViewWrite::MergeUpdate,
+            MergeAction::Delete => super::query::ViewWrite::MergeDelete,
+            MergeAction::DoNothing => continue,
+        };
+        let event = merge_view::merge_action_event(when.action()).unwrap_or(0);
+        events |= event;
+        if merge_view::view_has_instead_trigger(storage, view_slot, event, txn.txid) {
+            continue;
+        }
+        if let Err(error) =
+            super::query::resolve_view_for_dml(storage, target_qual, txn.txid, arena, write)
+        {
+            return sql_fail(error);
+        }
+    }
+    if let Err(error) =
+        merge_view::reject_partial_merge_triggers(storage, view_slot, statement, txn.txid)
+    {
+        return sql_fail(error);
+    }
+    let view =
+        match super::query::resolve_view_for_merge(storage, target_qual, txn.txid, arena, events) {
+            Ok(Some(view)) => view,
+            Ok(None) => {
+                return sql_fail(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "MERGE target view is absent during rewriting"
+                ));
+            }
+            Err(error) => return sql_fail(error),
+        };
+    // The levels can end at a view that writes itself, as PostgreSQL's
+    // rewriter then targets it with the MERGE.
+    let base_triggered = match view.base_view {
+        Some(base) => {
+            let target = crate::storage::ResolvedRelation::View(base);
+            if let Err(error) = reject_merge_rules(storage, target, txn.txid) {
+                return sql_fail(error);
+            }
+            if merge_view::merge_is_trigger_updatable(storage, base, statement, txn.txid) {
+                Some(base)
+            } else {
+                if let Err(error) =
+                    merge_view::reject_partial_merge_triggers(storage, base, statement, txn.txid)
+                {
+                    return sql_fail(error);
+                }
+                None
+            }
+        }
+        None => None,
+    };
+    let original = match arena.alloc(Stmt::Merge(*statement)) {
+        Ok(original) => &*original,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let rewrite = match super::query::rewrite_view_dml(
+        original,
+        target_qual.name,
+        &view,
+        storage,
+        txn.txid,
+        arena,
+    ) {
+        Ok(rewrite) => rewrite,
+        Err(error) => return sql_fail(error),
+    };
+    let Stmt::Merge(rewritten) = rewrite.statement else {
+        unreachable!("MERGE rewrite keeps its statement kind")
+    };
+    let authorization = match require_merge_view_privileges(
+        storage, original, statement, &view, &rewrite, txn.txid, arena,
+    ) {
+        Ok(authorization) => authorization,
+        Err(error) => return sql_fail(error),
+    };
+    // The views' filters select the target rows before the join, as
+    // PostgreSQL applies them as security quals of the target.
+    let view_target = match (
+        view.filter_over(view.base.name, None, storage, txn.txid, arena),
+        view.view_check(storage, txn.txid, arena),
+    ) {
+        (Ok(filter), Ok(check)) => MergeViewTarget {
+            filter,
+            check,
+            authorization,
+        },
+        (Err(error), _) | (_, Err(error)) => return sql_fail(error),
+    };
+    if let Some(base) = base_triggered {
+        return merge_view::merge_through_instead_triggers(
+            storage,
+            txn,
+            rewritten,
+            merge_view::TriggerMergeTarget {
+                view: base,
+                above: Some(view_target),
+            },
+            arena,
+            params,
+            services,
+            responder,
+            capture,
+            progress,
+            outer,
+        );
+    }
+    merge_target(
+        storage,
+        txn,
+        rewritten,
+        arena,
+        params,
+        services,
+        responder,
+        capture,
+        progress,
+        outer,
+        Some(view_target),
+    )
+}
+
+/// PostgreSQL's rewriter refuses a MERGE whose target has an enabled
+/// `INSERT`, `UPDATE` or `DELETE` rewrite rule.
+fn reject_merge_rules(
+    storage: &Storage,
+    target: crate::storage::ResolvedRelation,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let (rule_target, name) = match target {
+        crate::storage::ResolvedRelation::Table(slot) => (
+            crate::storage::RuleTarget::Table(slot as u16),
+            storage.table_def(slot, txid).name,
+        ),
+        crate::storage::ResolvedRelation::View(slot) => (
+            crate::storage::RuleTarget::View(slot as u16),
+            storage.view(slot).name_for(txid),
+        ),
+        crate::storage::ResolvedRelation::Catalog => return Ok(()),
+    };
+    let role = super::guc::active_session_replication_role()?;
+    let ruled = [
+        crate::storage::RewriteEvent::Insert,
+        crate::storage::RewriteEvent::Update,
+        crate::storage::RewriteEvent::Delete,
+    ]
+    .into_iter()
+    .any(|event| {
+        storage
+            .firing_rules_for(rule_target, event, role, txid)
+            .next()
+            .is_some()
+    });
+    if !ruled {
+        return Ok(());
+    }
+    crate::sql::eval::stash_diagnostic(
+        Some(crate::util::StackStr::from_str(
+            "MERGE is not supported for relations with rules.",
+        )),
+        None,
+    );
+    Err(sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "cannot execute MERGE on relation \"{}\"",
+        name.as_str()
+    ))
+}
+
+/// The rules of the auto-updatable view a MERGE writes through.
+#[derive(Clone, Copy)]
+struct MergeViewTarget<'a> {
+    /// Every view level's filter over the base table: target rows outside
+    /// the view are not candidates.
+    filter: Option<&'a Expr<'a>>,
+    check: ViewCheck<'a>,
+    /// The authorization the base table is checked with.
+    authorization: DmlAuthorization,
+}
+
+/// The columns a MERGE's `UPDATE` actions and `INSERT` column lists write,
+/// after PostgreSQL's per-action checks of the target's column names.
+fn merge_written_columns<Definition0: crate::storage::DefinitionBacking>(
+    statement: &crate::sql::ast::Merge<'_>,
+    def: &crate::storage::TableDefinition<Definition0>,
+) -> Result<(ColumnSet, ColumnSet), SqlError> {
+    use crate::sql::ast::MergeActionRef as MergeAction;
+    let mut update_columns = ColumnSet::EMPTY;
+    let mut insert_columns = ColumnSet::EMPTY;
+    for when in statement.whens {
+        match when.action() {
+            MergeAction::Update(assignments) => {
+                let mut assigned = ColumnSet::EMPTY;
+                for (name, expression) in assignments {
+                    let column = def
+                        .column_index(name)
+                        .ok_or_else(|| undefined_column(name))?;
+                    if assigned.contains(column) {
+                        return Err(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "multiple assignments to same column \"{}\"",
+                            name
+                        ));
+                    }
+                    if !matches!(expression, Expr::DefaultMarker) {
+                        reject_generated_write(def, column)?;
+                    }
+                    assigned.insert(column);
+                    update_columns.insert(column);
+                }
+            }
+            MergeAction::Insert {
+                columns,
+                default_values,
+                ..
+            } if !default_values => {
+                if columns.is_empty() {
+                    insert_columns |= all_columns_mask(def);
+                } else {
+                    let mut assigned = ColumnSet::EMPTY;
+                    for name in columns {
+                        let column = def
+                            .column_index(name)
+                            .ok_or_else(|| undefined_column(name))?;
+                        if assigned.contains(column) {
+                            return Err(sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "column \"{}\" specified more than once",
+                                name
+                            ));
+                        }
+                        assigned.insert(column);
+                        insert_columns.insert(column);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok((update_columns, insert_columns))
+}
+
+/// Whether a WHEN clause's `AND` condition holds for the candidate's row
+/// scope; a clause without one always applies.
+fn merge_condition_holds<'a, R: ColumnLookup<'a>>(
+    when: &crate::sql::ast::MergeWhen<'a>,
+    storage: &Storage,
+    txid: u32,
+    seq_session: &crate::sql::guc::SeqSession,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &R,
+) -> Result<bool, SqlError> {
+    let Some(condition) = when.condition() else {
+        return Ok(true);
+    };
+    Ok(matches!(
+        eval_merge_expression(
+            condition,
+            storage,
+            txid,
+            seq_session,
+            arena,
+            params,
+            row,
+            None
+        )?,
+        Datum::Bool(true)
+    ))
+}
+
+/// A MERGE source as `SELECT * FROM <source>`, narrowed to the columns the
+/// statement reads when it names them all.
+struct MergeSource<'a> {
+    alias: &'a str,
+    members: MergeSourceMembers<'a>,
+    select: crate::sql::ast::Select<'a>,
+    def: crate::storage::RelationDefinition<'a>,
+}
+
+fn merge_source<'a>(
+    storage: &Storage,
+    statement: &'a crate::sql::ast::Merge<'a>,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Result<MergeSource<'a>, SqlError> {
+    let alias = statement
+        .source
+        .alias
+        .unwrap_or(if statement.source.table.is_empty() {
+            ""
+        } else {
+            statement.source.table
+        });
+    let source_from = crate::sql::ast::FromClause {
+        base: statement.source,
+        joins: &[],
+    };
+    // An unaliased parenthesized join's members follow its own columns.
+    let members = match (statement.source.alias, statement.source.join_members) {
+        (None, Some(members)) => members,
+        _ => &[],
+    };
+    let star = arena
+        .alloc_slice_with(1 + members.len(), |index| match index {
+            0 => SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN),
+            index => SelectItem::TableWildcard(members[index - 1].name),
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let source_all_select = crate::sql::ast::Select {
+        items: star,
+        distinct: false,
+        distinct_on: &[],
+        windows: &[],
+        from: Some(source_from),
+        where_clause: None,
+        group_by: &[],
+        grouping_set_quantifier: crate::sql::ast::GroupingSetQuantifier::All,
+        grouping_sets: &[],
+        having: None,
+        order_by: &[],
+        limit: None,
+        offset: None,
+        with_ties: false,
+        with: &[],
+        set_body: None,
+        locking: &[],
+        written: crate::sql::ast::WrittenQuery::PLAIN,
+    };
+    // Keep temporary source descriptions by value. Retaining full copies here
+    // would consume the fixed statement arena before selecting source rows.
+    let source_all_def = super::query::describe_derived_definition(
+        storage,
+        &source_all_select,
+        alias,
+        statement.source.col_alias,
+        txid,
+        arena,
+        outer,
+    )?;
+    let source_members = merge_source_members(storage, statement, &source_all_select, txid, arena)?;
+    let select = match merge_source_columns(statement, alias, &source_all_def) {
+        Some(columns) => {
+            let mut items =
+                [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_COLUMNS];
+            let mut count = 0usize;
+            for (index, column) in source_all_def
+                .columns()
+                .iter()
+                .take(u64::BITS as usize)
+                .enumerate()
+            {
+                if columns & (1u64 << index) == 0 {
+                    continue;
+                }
+                let expression = arena
+                    .alloc(Expr::Column {
+                        qualifier: Some(alias),
+                        name: column.name.as_str(),
+                    })
+                    .map_err(|_| super::query::arena_full_pub())?;
+                items[count] = SelectItem::Expr {
+                    expression,
+                    alias: Some(column.name.as_str()),
+                };
+                count += 1;
+            }
+            if count == 0 {
+                let expression = arena
+                    .alloc(Expr::Int(1))
+                    .map_err(|_| super::query::arena_full_pub())?;
+                items[0] = SelectItem::Expr {
+                    expression,
+                    alias: Some("__pos3ql_merge_source"),
+                };
+                count = 1;
+            }
+            let items = arena
+                .alloc_slice_copy(&items[..count])
+                .map_err(|_| super::query::arena_full_pub())?;
+            crate::sql::ast::Select {
+                items,
+                ..source_all_select
+            }
+        }
+        None => source_all_select,
+    };
+    let def = super::query::describe_derived_definition(
+        storage, &select, alias, None, txid, arena, outer,
+    )?;
+    Ok(MergeSource {
+        alias,
+        members: source_members,
+        select,
+        def,
+    })
+}
+
+/// Selects the MERGE source's rows exactly once. Evaluating it again to
+/// count first would repeat volatile effects and could observe a different
+/// foreign snapshot.
+fn merge_source_rows<'a>(
+    storage: &Storage,
+    txid: u32,
+    source: &MergeSource<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    outer: Option<&dyn ColumnLookup<'a>>,
+    seq_session: &crate::sql::guc::SeqSession,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    let mut n_source = 0usize;
+    let mut source_capacity = 0usize;
+    let mut source_rows_ptr: *mut &[u8] = core::ptr::null_mut();
+    let source_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
+    let source_outer = outer.map(crate::sql::eval::EnclosingRow);
+    super::query::select_into_rows(
+        storage,
+        txid,
+        &source.select,
+        arena,
+        params,
+        source_outer
+            .as_ref()
+            .map(|row| row as &dyn ColumnLookup<'_>),
+        Some(&source_sequences),
+        &mut |values| {
+            let encoded = encode_projected_pub(values, arena)?;
+            if n_source == source_capacity {
+                let next_capacity = if source_capacity == 0 {
+                    8
+                } else {
+                    source_capacity
+                        .checked_mul(2)
+                        .ok_or_else(super::query::arena_full_pub)?
+                };
+                let fresh = arena
+                    .alloc_slice_with(next_capacity, |_| &[][..])
+                    .map_err(|_| super::query::arena_full_pub())?;
+                if n_source != 0 {
+                    let previous =
+                        unsafe { core::slice::from_raw_parts(source_rows_ptr, n_source) };
+                    fresh[..n_source].copy_from_slice(previous);
+                }
+                source_rows_ptr = fresh.as_mut_ptr();
+                source_capacity = next_capacity;
+            }
+            unsafe { source_rows_ptr.add(n_source).write(encoded) };
+            n_source += 1;
+            Ok(())
+        },
+    )?;
+    Ok(if n_source == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(source_rows_ptr, n_source) }
+    })
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn merge_target<'a>(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    statement: &'a crate::sql::ast::Merge<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    services: &mut TriggerServices<'_>,
+    responder: &mut Responder,
     mut capture: Option<&mut super::ReturningCapture<'_>>,
     mut progress: Option<&mut RowProgress>,
     outer: Option<&dyn ColumnLookup<'a>>,
+    view_target: Option<MergeViewTarget<'a>>,
 ) -> Outcome {
+    let view_check = view_target.map(|target| target.check);
     let seq_session = services.seq_session;
     let coercion_txid = txn.txid;
     use crate::sql::ast::MergeActionRef as MergeAction;
@@ -76400,60 +80293,10 @@ pub(crate) fn merge<'a>(
     };
     let foreign_target = def.kind == crate::storage::TableKind::Foreign;
     let target_alias = statement.target_alias.or(Some(statement.target.name));
-    let mut update_columns = ColumnSet::EMPTY;
-    let mut insert_columns = ColumnSet::EMPTY;
-    for when in statement.whens {
-        match when.action() {
-            MergeAction::Update(assignments) => {
-                let mut assigned = ColumnSet::EMPTY;
-                for (name, expression) in assignments {
-                    let Some(column) = def.column_index(name) else {
-                        return sql_fail(undefined_column(name));
-                    };
-                    if assigned.contains(column) {
-                        return sql_fail(sql_err!(
-                            sqlstate::SYNTAX_ERROR,
-                            "multiple assignments to same column \"{}\"",
-                            name
-                        ));
-                    }
-                    if !matches!(expression, Expr::DefaultMarker)
-                        && let Err(error) = reject_generated_write(def, column)
-                    {
-                        return sql_fail(error);
-                    }
-                    assigned.insert(column);
-                    update_columns.insert(column);
-                }
-            }
-            MergeAction::Insert {
-                columns,
-                default_values,
-                ..
-            } if !default_values => {
-                if columns.is_empty() {
-                    insert_columns |= all_columns_mask(def);
-                } else {
-                    let mut assigned = ColumnSet::EMPTY;
-                    for name in columns {
-                        let Some(column) = def.column_index(name) else {
-                            return sql_fail(undefined_column(name));
-                        };
-                        if assigned.contains(column) {
-                            return sql_fail(sql_err!(
-                                sqlstate::SYNTAX_ERROR,
-                                "column \"{}\" specified more than once",
-                                name
-                            ));
-                        }
-                        assigned.insert(column);
-                        insert_columns.insert(column);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    let (update_columns, insert_columns) = match merge_written_columns(statement, def) {
+        Ok(columns) => columns,
+        Err(error) => return sql_fail(error),
+    };
     let reads_target = match (|| -> Result<ColumnSet, SqlError> {
         let mut columns = expression_dml_target_columns(
             statement.on,
@@ -76515,44 +80358,56 @@ pub(crate) fn merge<'a>(
         Ok(reads) => reads,
         Err(error) => return sql_fail(error),
     };
+    // A MERGE through a view checks its base table as the view's owner.
+    let privilege_role = match view_target
+        .map_or(DmlAuthorization::Invoker, |target| target.authorization)
+        .role(storage, txn.txid)
+    {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
+    };
     if has_delete
-        && let Err(error) = require_table_privilege(
+        && let Err(error) = require_table_privilege_as(
             storage,
             table_index,
             crate::storage::PrivilegeSet::DELETE,
+            privilege_role,
             txn.txid,
         )
     {
         return sql_fail(error);
     }
     if has_update
-        && let Err(error) = require_table_column_privilege(
+        && let Err(error) = require_table_column_privilege_as(
             storage,
             table_index,
             crate::storage::PrivilegeSet::UPDATE,
             update_columns,
+            privilege_role,
             txn.txid,
         )
     {
         return sql_fail(error);
     }
     if has_insert
-        && let Err(error) = require_table_column_privilege(
+        && let Err(error) = require_table_column_privilege_as(
             storage,
             table_index,
             crate::storage::PrivilegeSet::INSERT,
             insert_columns,
+            privilege_role,
             txn.txid,
         )
     {
         return sql_fail(error);
     }
     if !reads_target.is_empty()
-        && let Err(error) = require_table_column_privilege(
+        && let Err(error) = require_table_column_privilege_as(
             storage,
             table_index,
             crate::storage::PrivilegeSet::SELECT,
             reads_target,
+            privilege_role,
             txn.txid,
         )
     {
@@ -76576,15 +80431,7 @@ pub(crate) fn merge<'a>(
         return sql_fail(error);
     }
     let reads_target = !reads_target.is_empty();
-    let current_role = match storage.current_role_slot(txn.txid) {
-        Some(role) => role,
-        None => {
-            return sql_fail(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "current role is not present in the role catalog"
-            ));
-        }
-    };
+    let current_role = privilege_role;
     let select_security = if reads_target {
         match super::query::plan_row_security(
             storage,
@@ -76665,17 +80512,7 @@ pub(crate) fn merge<'a>(
     } else {
         None
     };
-    let mut merge_update_columns = ColumnSet::EMPTY;
-    for when in statement.whens {
-        if let MergeAction::Update(assignments) = when.action() {
-            for (name, _) in assignments {
-                let Some(column) = def.column_index(name) else {
-                    return sql_fail(undefined_column(name));
-                };
-                merge_update_columns.insert(column);
-            }
-        }
-    }
+    let merge_update_columns = update_columns;
     let merge_events = statement.whens.iter().fold(0u8, |events, when| {
         events
             | match when.action() {
@@ -76727,133 +80564,13 @@ pub(crate) fn merge<'a>(
         return sql_fail(error);
     }
     let target_alias = statement.target_alias.unwrap_or(statement.target.name);
-    let source_alias = statement
-        .source
-        .alias
-        .unwrap_or(if statement.source.table.is_empty() {
-            ""
-        } else {
-            statement.source.table
-        });
-
-    // Materialize the source as `SELECT * FROM <source>`: its column set (a
-    // synthesized def) and its rows.
-    let source_from = crate::sql::ast::FromClause {
-        base: statement.source,
-        joins: &[],
-    };
-    // An unaliased parenthesized join's members follow its own columns.
-    let members = match (statement.source.alias, statement.source.join_members) {
-        (None, Some(members)) => members,
-        _ => &[],
-    };
-    let star = match arena.alloc_slice_with(1 + members.len(), |index| match index {
-        0 => SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN),
-        index => SelectItem::TableWildcard(members[index - 1].name),
-    }) {
-        Ok(s) => &*s,
-        Err(_) => return sql_fail(super::query::arena_full_pub()),
-    };
-    let source_all_select = crate::sql::ast::Select {
-        items: star,
-        distinct: false,
-        distinct_on: &[],
-        windows: &[],
-        from: Some(source_from),
-        where_clause: None,
-        group_by: &[],
-        grouping_set_quantifier: crate::sql::ast::GroupingSetQuantifier::All,
-        grouping_sets: &[],
-        having: None,
-        order_by: &[],
-        limit: None,
-        offset: None,
-        with_ties: false,
-        with: &[],
-        set_body: None,
-        locking: &[],
-    };
-    // Keep temporary source descriptions by value. Retaining full copies here
-    // would consume the fixed statement arena before selecting source rows.
-    let source_all_def = match super::query::describe_derived_definition(
-        storage,
-        &source_all_select,
-        source_alias,
-        statement.source.col_alias,
-        txn.txid,
-        arena,
-        outer,
-    ) {
-        Ok(d) => d,
-        Err(e) => return sql_fail(e),
-    };
-    let source_members =
-        match merge_source_members(storage, statement, &source_all_select, txn.txid, arena) {
-            Ok(members) => members,
-            Err(error) => return sql_fail(error),
-        };
-    let source_select = match merge_source_columns(statement, source_alias, &source_all_def) {
-        Some(columns) => {
-            let mut items =
-                [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_COLUMNS];
-            let mut count = 0usize;
-            for (index, column) in source_all_def
-                .columns()
-                .iter()
-                .take(u64::BITS as usize)
-                .enumerate()
-            {
-                if columns & (1u64 << index) == 0 {
-                    continue;
-                }
-                let expression = match arena.alloc(Expr::Column {
-                    qualifier: Some(source_alias),
-                    name: column.name.as_str(),
-                }) {
-                    Ok(expression) => expression,
-                    Err(_) => return sql_fail(super::query::arena_full_pub()),
-                };
-                items[count] = SelectItem::Expr {
-                    expression,
-                    alias: Some(column.name.as_str()),
-                };
-                count += 1;
-            }
-            if count == 0 {
-                let expression = match arena.alloc(Expr::Int(1)) {
-                    Ok(expression) => expression,
-                    Err(_) => return sql_fail(super::query::arena_full_pub()),
-                };
-                items[0] = SelectItem::Expr {
-                    expression,
-                    alias: Some("__pos3ql_merge_source"),
-                };
-                count = 1;
-            }
-            let items = match arena.alloc_slice_copy(&items[..count]) {
-                Ok(items) => items,
-                Err(_) => return sql_fail(super::query::arena_full_pub()),
-            };
-            crate::sql::ast::Select {
-                items,
-                ..source_all_select
-            }
-        }
-        None => source_all_select,
-    };
-    let source_def = match super::query::describe_derived_definition(
-        storage,
-        &source_select,
-        source_alias,
-        None,
-        txn.txid,
-        arena,
-        outer,
-    ) {
-        Ok(definition) => definition,
+    let source = match merge_source(storage, statement, txn.txid, arena, outer) {
+        Ok(source) => source,
         Err(error) => return sql_fail(error),
     };
-    let source_def = &source_def;
+    let source_alias = source.alias;
+    let source_members = source.members;
+    let source_def = &source.def;
     if !statement.returning.is_empty() && !capturing && !resuming {
         let mark = arena.mark();
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
@@ -76883,66 +80600,31 @@ pub(crate) fn merge<'a>(
     // also when a resumed attempt selects them again after earlier rows
     // changed.
     let selection_snapshot = storage.dml_expression_snapshot(txn.command_id());
-    // Materialize the source exactly once. Re-evaluating it to count first
-    // would duplicate volatile effects and could observe a different foreign
-    // snapshot on the second pass.
-    let mut n_source = 0usize;
-    let mut source_capacity = 0usize;
-    let mut source_rows_ptr: *mut &[u8] = core::ptr::null_mut();
-    let source_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-    let source_outer = outer.map(crate::sql::eval::EnclosingRow);
-    if let Err(e) = super::query::select_into_rows(
+    let source_rows = match merge_source_rows(
         storage,
         txn.txid,
-        &source_select,
+        &source,
         arena,
         params,
-        source_outer
-            .as_ref()
-            .map(|row| row as &dyn ColumnLookup<'_>),
-        Some(&source_sequences),
-        &mut |values| {
-            let encoded = encode_projected_pub(values, arena)?;
-            if n_source == source_capacity {
-                let next_capacity = if source_capacity == 0 {
-                    8
-                } else {
-                    source_capacity
-                        .checked_mul(2)
-                        .ok_or_else(super::query::arena_full_pub)?
-                };
-                let fresh = arena
-                    .alloc_slice_with(next_capacity, |_| &[][..])
-                    .map_err(|_| super::query::arena_full_pub())?;
-                if n_source != 0 {
-                    let previous =
-                        unsafe { core::slice::from_raw_parts(source_rows_ptr, n_source) };
-                    fresh[..n_source].copy_from_slice(previous);
-                }
-                source_rows_ptr = fresh.as_mut_ptr();
-                source_capacity = next_capacity;
-            }
-            unsafe { source_rows_ptr.add(n_source).write(encoded) };
-            n_source += 1;
-            Ok(())
-        },
+        outer,
+        seq_session,
     ) {
-        return sql_fail(e);
-    }
-    let source_rows: &[&[u8]] = if n_source == 0 {
-        &[]
-    } else {
-        unsafe { core::slice::from_raw_parts(source_rows_ptr, n_source) }
+        Ok(rows) => rows,
+        Err(error) => return sql_fail(error),
+    };
+    let replication_role = match crate::sql::guc::active_session_replication_role() {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
     };
     let mut insert_transitions = if merge_events & TriggerEvents::INSERT != 0
         && transition_capture_required(
             storage,
             table_index,
             txn.txid,
-            txn.replication_apply,
+            replication_role,
             TriggerEvents::INSERT,
         ) {
-        match TransitionCapture::new(arena, 0, n_source) {
+        match Ok::<_, SqlError>(TransitionCapture::new(arena)) {
             Ok(capture) => Some(capture),
             Err(error) => return sql_fail(error),
         }
@@ -76964,6 +80646,22 @@ pub(crate) fn merge<'a>(
         Ok(leaves) => leaves,
         Err(error) => return sql_fail(error),
     };
+    // PostgreSQL's planner refuses a MERGE whose result relations include a
+    // foreign partition or child.
+    if !foreign_target
+        && let Some(&leaf) = leaves.iter().find(|&&leaf| {
+            storage.table_def(leaf, txn.txid).kind == crate::storage::TableKind::Foreign
+        })
+    {
+        return sql_fail(crate::sql::eval::with_detail(
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot execute MERGE on relation \"{}\"",
+                storage.table_def(leaf, txn.txid).name.as_str()
+            ),
+            format_args!("This operation is not supported for foreign tables."),
+        ));
+    }
     let mut n_target = 0usize;
     let mut foreign_rows: *mut Option<(crate::sql::foreign::RemoteTupleId, &'a [Datum<'a>])> =
         core::ptr::null_mut();
@@ -76979,6 +80677,7 @@ pub(crate) fn merge<'a>(
                 rowenc::decode(bytes, target_schema, &mut values)?;
                 if let Some(plan) = select_security {
                     let context = RowCtx {
+                        table_oid: None,
                         def: crate::storage::RelationDefinition::from_definition(def),
                         values: &values[..def.n_columns],
                         alias: None,
@@ -76996,6 +80695,18 @@ pub(crate) fn merge<'a>(
                     )? {
                         return Ok(());
                     }
+                }
+                if !merge_view_row_visible(
+                    view_target,
+                    def,
+                    &values[..def.n_columns],
+                    storage,
+                    txn.txid,
+                    seq_session,
+                    arena,
+                    params,
+                )? {
+                    return Ok(());
                 }
                 let owned = arena
                     .alloc_slice_copy(&values[..def.n_columns])
@@ -77180,6 +80891,7 @@ pub(crate) fn merge<'a>(
             layout.project(&vals, &mut logical);
             if let Some(plan) = select_security {
                 let context = RowCtx {
+                    table_oid: None,
                     def: crate::storage::RelationDefinition::from_definition(def),
                     values: &logical[..def.n_columns],
                     alias: None,
@@ -77198,6 +80910,20 @@ pub(crate) fn merge<'a>(
                     Ok(false) => continue,
                     Err(error) => return sql_fail(error),
                 }
+            }
+            match merge_view_row_visible(
+                view_target,
+                def,
+                &logical[..def.n_columns],
+                storage,
+                txn.txid,
+                seq_session,
+                arena,
+                params,
+            ) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => return sql_fail(error),
             }
             let owned = match arena.alloc_slice_copy(&vals[..row_definition.n_columns]) {
                 Ok(v) => &*v,
@@ -77219,30 +80945,38 @@ pub(crate) fn merge<'a>(
     // A matched target row can be acted on at most once by MERGE's cardinality
     // rule, so target cardinality is the exact bounded capture capacity for
     // UPDATE and DELETE transition relations.
+    let replication_role = match crate::sql::guc::active_session_replication_role() {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
+    };
     let mut update_transitions = if merge_events & TriggerEvents::UPDATE != 0
         && transition_capture_required(
             storage,
             table_index,
             txn.txid,
-            txn.replication_apply,
+            replication_role,
             TriggerEvents::UPDATE,
         ) {
-        match TransitionCapture::new(arena, n_target, n_target) {
+        match Ok::<_, SqlError>(TransitionCapture::new(arena)) {
             Ok(capture) => Some(capture),
             Err(error) => return sql_fail(error),
         }
     } else {
         None
     };
+    let replication_role = match crate::sql::guc::active_session_replication_role() {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
+    };
     let mut delete_transitions = if merge_events & TriggerEvents::DELETE != 0
         && transition_capture_required(
             storage,
             table_index,
             txn.txid,
-            txn.replication_apply,
+            replication_role,
             TriggerEvents::DELETE,
         ) {
-        match TransitionCapture::new(arena, n_target, 0) {
+        match Ok::<_, SqlError>(TransitionCapture::new(arena)) {
             Ok(capture) => Some(capture),
             Err(error) => return sql_fail(error),
         }
@@ -77262,6 +80996,10 @@ pub(crate) fn merge<'a>(
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
+    let view_defaults = match parse_view_defaults(view_check, def, arena, storage, txn.txid) {
+        Ok(defaults) => defaults,
+        Err(error) => return sql_fail(error),
+    };
 
     drop(selection_snapshot);
     // Row changes start here; a wait before them restarts the statement.
@@ -77274,8 +81012,9 @@ pub(crate) fn merge<'a>(
     let positions = (source_rows.len() + 1).saturating_mul(stride);
     let (first_position, mut affected_count, mut resumed_match) = match progress.as_deref() {
         Some(progress) => {
-            let resumed = match progress.resume_rows(positions, |position| {
-                selected_rows.get(position % stride).copied().flatten()
+            let resumed = match progress.resume_rows(|position| {
+                (position < positions)
+                    .then(|| selected_rows.get(position % stride).copied().flatten())
             }) {
                 Ok(resumed) => resumed,
                 Err(error) => return sql_fail(error),
@@ -77409,34 +81148,29 @@ pub(crate) fn merge<'a>(
                         }
                         // First satisfied WHEN NOT MATCHED clause (source columns only).
                         let source_ctx = RowCtx {
+                            table_oid: None,
                             def: *source_def,
                             values: sv,
                             alias: None,
                         };
-                        for when in statement.whens.iter().filter(|w| {
-                            matches!(
-                                w.kind(),
-                                crate::sql::ast::MergeMatchKind::NotMatchedByTarget
-                            )
+                        for when in statement.whens.iter().filter(|when| {
+                            when.kind() == crate::sql::ast::MergeMatchKind::NotMatchedByTarget
                         }) {
-                            if let Some(cond) = when.condition() {
-                                match eval_merge_expression(
-                                    cond,
-                                    storage,
-                                    txn.txid,
-                                    seq_session,
-                                    arena,
-                                    params,
-                                    &ProceduralMergeScope {
-                                        row: &source_ctx,
-                                        outer,
-                                    },
-                                    None,
-                                ) {
-                                    Ok(Datum::Bool(true)) => {}
-                                    Ok(_) => continue,
-                                    Err(e) => return sql_fail(e),
-                                }
+                            match merge_condition_holds(
+                                when,
+                                storage,
+                                txn.txid,
+                                seq_session,
+                                arena,
+                                params,
+                                &ProceduralMergeScope {
+                                    row: &source_ctx,
+                                    outer,
+                                },
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => continue,
+                                Err(error) => return sql_fail(error),
                             }
                             match when.action() {
                                 MergeAction::DoNothing => {}
@@ -77462,6 +81196,8 @@ pub(crate) fn merge<'a>(
                                         },
                                         &generated,
                                         &defaults,
+                                        view_check,
+                                        &view_defaults,
                                         services,
                                         arena,
                                         params,
@@ -77719,13 +81455,16 @@ pub(crate) fn merge<'a>(
                         };
                     }
                     // First satisfied clause for this candidate state.
-                    for when in statement.whens.iter().filter(|when| {
-                        matches!(
-                            (by_source_actions, when.kind()),
-                            (false, crate::sql::ast::MergeMatchKind::Matched)
-                                | (true, crate::sql::ast::MergeMatchKind::NotMatchedBySource)
-                        )
-                    }) {
+                    let candidate = if by_source_actions {
+                        crate::sql::ast::MergeMatchKind::NotMatchedBySource
+                    } else {
+                        crate::sql::ast::MergeMatchKind::Matched
+                    };
+                    for when in statement
+                        .whens
+                        .iter()
+                        .filter(|when| when.kind() == candidate)
+                    {
                         let action_security = match when.action() {
                             MergeAction::Update(_) => update_security,
                             MergeAction::Delete => delete_security,
@@ -77733,6 +81472,7 @@ pub(crate) fn merge<'a>(
                         };
                         if let Some(plan) = action_security {
                             let policy_row = RowCtx {
+                                table_oid: None,
                                 def: crate::storage::RelationDefinition::from_definition(def),
                                 values: pair_target,
                                 alias: None,
@@ -77759,24 +81499,21 @@ pub(crate) fn merge<'a>(
                                 Err(error) => return sql_fail(error),
                             }
                         }
-                        if let Some(cond) = when.condition() {
-                            match eval_merge_expression(
-                                cond,
-                                storage,
-                                txn.txid,
-                                seq_session,
-                                arena,
-                                params,
-                                &ProceduralMergeScope {
-                                    row: &lookup,
-                                    outer,
-                                },
-                                None,
-                            ) {
-                                Ok(Datum::Bool(true)) => {}
-                                Ok(_) => continue,
-                                Err(e) => return sql_fail(e),
-                            }
+                        match merge_condition_holds(
+                            when,
+                            storage,
+                            txn.txid,
+                            seq_session,
+                            arena,
+                            params,
+                            &ProceduralMergeScope {
+                                row: &lookup,
+                                outer,
+                            },
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(error) => return sql_fail(error),
                         }
                         let (row_target, row_definition) =
                             match definitions.selection(storage, target_tables[j], txn.txid) {
@@ -78002,10 +81739,8 @@ pub(crate) fn merge<'a>(
                                     if def.columns()[ci].default.is_generated()
                                         && !matches!(expression, Expr::DefaultMarker)
                                     {
-                                        return sql_fail(sql_err!(
-                                            sqlstate::GENERATED_ALWAYS,
-                                            "column \"{}\" can only be updated to DEFAULT",
-                                            def.columns()[ci].name.as_str()
+                                        return sql_fail(generated_update_error(
+                                            def.columns()[ci].name.as_str(),
                                         ));
                                     }
                                     let value = if matches!(expression, Expr::DefaultMarker) {
@@ -78178,6 +81913,7 @@ pub(crate) fn merge<'a>(
                                 new_layout.project(&persisted, &mut new_values);
                                 if let Some(plan) = update_check {
                                     let policy_row = RowCtx {
+                                        table_oid: None,
                                         def: crate::storage::RelationDefinition::from_definition(
                                             def,
                                         ),
@@ -78281,6 +82017,20 @@ pub(crate) fn merge<'a>(
                                     arena,
                                 ) {
                                     return sql_fail(e);
+                                }
+                                if let Err(error) = enforce_view_check(
+                                    view_check,
+                                    def,
+                                    &new_values[..def.n_columns],
+                                    ViewCheckContext {
+                                        storage,
+                                        txid: txn.txid,
+                                        arena,
+                                        params,
+                                        seq_session,
+                                    },
+                                ) {
+                                    return sql_fail(error);
                                 }
                                 if let Some(tuple_id) = target_remote_ids
                                     .as_deref()
@@ -78520,7 +82270,6 @@ pub(crate) fn merge<'a>(
             Some(progress),
             &rows_outcome,
             txn,
-            positions,
             [
                 insert_transitions.as_ref(),
                 update_transitions.as_ref(),
@@ -78710,7 +82459,8 @@ fn emit_merge_progress_returning<'a, Definition0: crate::storage::DefinitionBack
         Err(error) => {
             if let Some(progress) = progress
                 && progress.stops_for(&error)
-                && let Err(error) = progress.keep_returning(old, new, arena, &storage.row_work)
+                && let Err(error) =
+                    progress.keep_returning(old, new, None, arena, &storage.row_work)
             {
                 return sql_fail(error);
             }
@@ -78789,6 +82539,40 @@ fn lock_merge_row<'a>(
 
 /// The 21000 error PostgreSQL raises when a MERGE would affect a target row a
 /// second time.
+/// Whether a target row lies inside the view a MERGE writes through.
+#[expect(clippy::too_many_arguments, reason = "row evaluation context")]
+fn merge_view_row_visible<'a, Definition0: crate::storage::DefinitionBacking>(
+    view: Option<MergeViewTarget<'a>>,
+    definition: &crate::storage::TableDefinition<Definition0>,
+    values: &[Datum<'a>],
+    storage: &Storage,
+    txid: u32,
+    seq_session: &crate::sql::guc::SeqSession,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+) -> Result<bool, SqlError> {
+    let Some(filter) = view.and_then(|view| view.filter) else {
+        return Ok(true);
+    };
+    let row = RowCtx {
+        table_oid: None,
+        def: crate::storage::RelationDefinition::from_definition(definition),
+        values,
+        alias: None,
+    };
+    let catalog = super::query::storage_catalog(storage, arena, txid);
+    let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
+    let hooks = EvalHooks {
+        catalog: Some(&catalog),
+        sequences: Some(&sequences),
+        ..NO_HOOKS
+    };
+    Ok(matches!(
+        eval_full(filter, arena, params, &row, &hooks)?,
+        Datum::Bool(true)
+    ))
+}
+
 fn merge_cardinality() -> SqlError {
     sql_err!(
         sqlstate::CARDINALITY_VIOLATION,
@@ -78799,38 +82583,36 @@ fn merge_cardinality() -> SqlError {
 /// Applies a MERGE `WHEN NOT MATCHED THEN INSERT`: builds the row from the
 /// clause (values evaluated with the source row in scope), fills defaults and
 /// generated columns, and stores it.
-#[allow(clippy::too_many_arguments)]
-fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: ColumnLookup<'a>>(
-    storage: &mut Storage,
-    txn: &mut TxnState,
-    assignment_casts: AssignmentCasts<'a>,
-    logical_target: crate::storage::TableDefinitionTarget,
-    def: &'a crate::storage::TableDefinition<Definition0>,
+/// The values a MERGE `INSERT` action writes explicitly, with the columns
+/// it writes; `DEFAULT` entries and unlisted columns stay unset.
+#[expect(clippy::too_many_arguments, reason = "MERGE expression context")]
+fn merge_insert_values<
+    'a,
+    Definition0: crate::storage::DefinitionBacking,
+    Scope: ColumnLookup<'a>,
+>(
+    def: &crate::storage::TableDefinition<Definition0>,
     columns: &[&str],
     values: &[&'a Expr<'a>],
     default_values: bool,
     overriding: Overriding,
     source_ctx: &Scope,
-    generated: &[Option<&'a Expr<'a>>; MAX_COLUMNS],
-    defaults: &[Option<&'a Expr<'a>>; MAX_COLUMNS],
-    services: &mut TriggerServices<'_>,
+    assignment_casts: AssignmentCasts<'a>,
+    storage: &Storage,
+    txid: u32,
+    seq_session: &crate::sql::guc::SeqSession,
     arena: &'a Arena,
     params: &[Datum<'a>],
-    checks: &ParsedChecks,
-    row_security_check: Option<super::query::RowSecurityPlan<'a>>,
-    responder: &mut Responder,
-    transition_capture: Option<&mut TransitionCapture<'a>>,
-) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
-    let seq_session = services.seq_session;
-    let coercion_txid = txn.txid;
-    let table_index = logical_target.table();
+) -> Result<([Datum<'a>; MAX_COLUMNS], [bool; MAX_COLUMNS]), SqlError> {
     // Target columns for the supplied values: the named list, or all columns.
     let mut targets = [0usize; MAX_COLUMNS];
+    // Without a column list the values fill the leading columns, as in
+    // `INSERT`; analysis has rejected more values than columns.
     let n_targets = if columns.is_empty() {
         for (i, t) in targets.iter_mut().enumerate().take(def.n_columns) {
             *t = i;
         }
-        def.n_columns
+        values.len().min(def.n_columns)
     } else {
         for (i, name) in columns.iter().enumerate() {
             let Some(ci) = def.column_index(name) else {
@@ -78851,8 +82633,8 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
                 n_targets
             ));
         }
-        let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+        let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
+        let catalog = super::query::storage_catalog(storage, arena, txid);
         let hooks = super::eval::EvalHooks {
             catalog: Some(&catalog),
             sequences: Some(&seq),
@@ -78873,7 +82655,7 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
                 expression,
                 &def.columns()[targets[i]],
                 storage,
-                txn.txid,
+                txid,
                 arena,
                 params,
                 source_ctx,
@@ -78882,6 +82664,50 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
             explicit[targets[i]] = true;
         }
     }
+    Ok((row, explicit))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: ColumnLookup<'a>>(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    assignment_casts: AssignmentCasts<'a>,
+    logical_target: crate::storage::TableDefinitionTarget,
+    def: &'a crate::storage::TableDefinition<Definition0>,
+    columns: &[&str],
+    values: &[&'a Expr<'a>],
+    default_values: bool,
+    overriding: Overriding,
+    source_ctx: &Scope,
+    generated: &[Option<&'a Expr<'a>>; MAX_COLUMNS],
+    defaults: &[Option<&'a Expr<'a>>; MAX_COLUMNS],
+    view: Option<ViewCheck<'a>>,
+    view_defaults: &[Option<&'a Expr<'a>>; MAX_COLUMNS],
+    services: &mut TriggerServices<'_>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    checks: &ParsedChecks,
+    row_security_check: Option<super::query::RowSecurityPlan<'a>>,
+    responder: &mut Responder,
+    transition_capture: Option<&mut TransitionCapture<'a>>,
+) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
+    let seq_session = services.seq_session;
+    let coercion_txid = txn.txid;
+    let table_index = logical_target.table();
+    let (mut row, explicit) = merge_insert_values(
+        def,
+        columns,
+        values,
+        default_values,
+        overriding,
+        source_ctx,
+        assignment_casts,
+        storage,
+        txn.txid,
+        seq_session,
+        arena,
+        params,
+    )?;
     // Defaults + auto-increment + generated for the unset columns.
     {
         let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
@@ -78891,24 +82717,21 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
             sequences: Some(&seq),
             ..super::eval::NO_HOOKS
         };
-        for (i, col) in def.columns().iter().enumerate() {
+        for i in 0..def.columns().len() {
             if explicit[i] {
                 continue;
             }
-            if let Some(d) = col.default.constant() {
-                row[i] = super::enum_values::materialize(d.as_datum(), storage, txn.txid, arena)?;
-            } else if let Some(expr) = defaults[i] {
-                row[i] = eval_assignment(
-                    expr,
-                    col,
-                    storage,
-                    txn.txid,
-                    arena,
-                    crate::sql::eval::NO_PARAMS,
-                    &NoColumns,
-                    &hooks,
-                )?;
-            }
+            row[i] = insert_default_value(
+                storage,
+                txn.txid,
+                view,
+                def,
+                i,
+                defaults[i],
+                view_defaults[i],
+                arena,
+                &hooks,
+            )?;
         }
     }
     fill_auto_increment(
@@ -78977,6 +82800,7 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
                     arena,
                 )?;
                 let policy_row = RowCtx {
+                    table_oid: None,
                     def: crate::storage::RelationDefinition::from_definition(logical_definition),
                     values: logical_values,
                     alias: None,
@@ -79061,6 +82885,26 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
                     &row_arr[..def.n_columns],
                 )?;
             }
+            if view.is_some() {
+                let logical_values = partition_insert::logical_insert_values(
+                    mapping,
+                    logical_definition.n_columns,
+                    &row_arr[..def.n_columns],
+                    arena,
+                )?;
+                enforce_view_check(
+                    view,
+                    logical_definition,
+                    logical_values,
+                    ViewCheckContext {
+                        storage,
+                        txid: txn.txid,
+                        arena,
+                        params,
+                        seq_session,
+                    },
+                )?;
+            }
             fire_partition_row_triggers(
                 storage,
                 txn,
@@ -79126,6 +82970,7 @@ where
     let seq_session = services.seq_session;
     let coercion_txid = txn.txid;
     let logical_table_index = logical_target.table();
+
     match partition_insert::with_partition_insert_row(
         storage,
         logical_target,
@@ -79210,6 +83055,7 @@ where
                     Err(error) => return Ok(Err(error)),
                 };
                 let context = RowCtx {
+                    table_oid: None,
                     def: crate::storage::RelationDefinition::from_definition(logical_definition),
                     values: logical_values,
                     alias: None,
@@ -79342,6 +83188,7 @@ where
                                 txn,
                                 logical_definition,
                                 statement.alias,
+                                Some(logical_table_index),
                                 statement.returning,
                                 Some(old),
                                 Some(&updated[..logical_definition.n_columns]),
@@ -79469,6 +83316,7 @@ where
                         txn,
                         logical_definition,
                         statement.alias,
+                        Some(logical_table_index),
                         statement.returning,
                         None,
                         Some(logical_values),
@@ -79491,12 +83339,70 @@ where
     }
 }
 
+/// The defaults a rewrite rule's `NEW` takes for the columns an INSERT into
+/// the view `view_slot` leaves out, by view column: those of the views
+/// written through into it (`above`, outermost first), then its own.
+pub(crate) fn view_rule_defaults<'a>(
+    storage: &Storage,
+    view_slot: usize,
+    above: &'a [ViewInsertDefaults<'a>],
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<constraints::ParsedDefaults<'a>, SqlError> {
+    let definition = view_trigger_definition(storage, view_slot, txid, arena)?;
+    let check = instead_of_view_defaults(storage, view_slot, &definition, above, txid, arena)?;
+    let mut parsed = parse_view_defaults(Some(check), &definition, arena, storage, txid)?;
+    // A constant default is stored typed; the rule reads it as a literal.
+    for (index, column) in definition.columns().iter().enumerate() {
+        if parsed[index].is_some() {
+            continue;
+        }
+        let Some(default) = view_default_for(Some(check), &definition, index) else {
+            continue;
+        };
+        let (Some(constant), Some(source)) = (default.constant(), default.expression()) else {
+            continue;
+        };
+        let type_oid = storage
+            .routine_type_oid(column.ctype, column.user_type, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "view column default has an unknown type"
+                )
+            })?;
+        let source = arena
+            .alloc_str(source.as_str())
+            .map_err(|_| super::query::arena_full_pub())?;
+        let source = super::parser::parse_expr(source, arena)?;
+        let value = super::enum_values::materialize(constant.as_datum(), storage, txid, arena)?;
+        parsed[index] = Some(
+            arena
+                .alloc(Expr::BoundLiteral {
+                    value: crate::sql::ast::BoundLiteralValue::CachedDefault(encode_projected_pub(
+                        &[value],
+                        arena,
+                    )?),
+                    type_oid,
+                    type_mod: column.type_mod,
+                    collation: Some(column.collation),
+                    source,
+                })
+                .map(|value| &*value)
+                .map_err(|_| super::query::arena_full_pub())?,
+        );
+    }
+    Ok(parsed)
+}
+
 /// The view-column defaults an INSERT through an INSTEAD OF trigger applies
-/// to the columns it does not write.
+/// to the columns it does not write: those of the views written through
+/// into this one (`above`, outermost first), then the view's own.
 fn instead_of_view_defaults<'a>(
     storage: &Storage,
     view_slot: usize,
     definition: &crate::storage::TableDefView<'a>,
+    above: &'a [ViewInsertDefaults<'a>],
     txid: u32,
     arena: &'a Arena,
 ) -> Result<ViewCheck<'a>, SqlError> {
@@ -79509,16 +83415,19 @@ fn instead_of_view_defaults<'a>(
             .alloc_str(column.name.as_str())
             .map_err(|_| super::query::arena_full_pub())?;
     }
+    let own = ViewInsertDefaults {
+        base_columns,
+        columns: *view.columns_for(txid),
+        inputs: view.default_inputs_for(txid).detached_sections(arena)?,
+    };
+    let defaults = arena
+        .alloc_slice_with(above.len() + 1, |index| {
+            above.get(index).copied().unwrap_or(own)
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
     Ok(ViewCheck {
-        predicate: None,
-        view_name: arena
-            .alloc_str(view.name.as_str())
-            .map_err(|_| super::query::arena_full_pub())?,
-        defaults: ViewInsertDefaults {
-            base_columns,
-            columns: *view.columns_for(txid),
-            inputs: view.default_inputs_for(txid).detached_sections(arena)?,
-        },
+        checks: &[],
+        defaults,
     })
 }
 
@@ -79687,9 +83596,16 @@ pub(crate) fn instead_of_view_dml<'a>(
     responder: &mut Responder,
     mut capture: Option<&mut super::ReturningCapture<'_>>,
     mut progress: Option<&mut RowProgress>,
+    inherited: Option<ViewCheck<'a>>,
 ) -> Outcome {
     let seq_session = services.seq_session;
     let coercion_txid = txn.txid;
+    // The check options of the views written through into this one apply to
+    // the rows its triggers return.
+    let checks = inherited.map(|inherited| ViewCheck {
+        checks: inherited.checks,
+        defaults: &[],
+    });
     let assignment_casts =
         match prepare_dml_assignment_casts(statement, storage, txn.txid, arena, None) {
             Ok(casts) => casts,
@@ -79725,8 +83641,7 @@ pub(crate) fn instead_of_view_dml<'a>(
     if !storage
         .triggers_for_target(target, txn.txid)
         .any(|(_, trigger)| {
-            trigger.enabled_to(txn.txid).fires_for_origin()
-                && matches!(trigger.level, TriggerLevel::Row)
+            matches!(trigger.level, TriggerLevel::Row)
                 && matches!(trigger.timing, TriggerTiming::InsteadOf)
                 && trigger.events.contains(event)
         })
@@ -79894,8 +83809,14 @@ pub(crate) fn instead_of_view_dml<'a>(
             let targets = &targets[..target_count];
             // A column the statement leaves out or writes as DEFAULT takes the
             // view column's default, as PostgreSQL's rewriter supplies it.
-            let defaults = match instead_of_view_defaults(storage, view_slot, &def, txn.txid, arena)
-            {
+            let defaults = match instead_of_view_defaults(
+                storage,
+                view_slot,
+                &def,
+                inherited.map_or(&[], |inherited| inherited.defaults),
+                txn.txid,
+                arena,
+            ) {
                 Ok(defaults) => defaults,
                 Err(error) => return sql_fail(error),
             };
@@ -79998,6 +83919,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                                     txn,
                                     &def,
                                     insert.alias,
+                                    None,
                                     returning,
                                     None,
                                     saved.new,
@@ -80066,6 +83988,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 changed: affected,
                                 transitions: no_transitions,
                             },
+                            checks,
                         ) {
                             Ok(Ok(true)) => {}
                             Ok(Ok(false)) => continue,
@@ -80114,6 +84037,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                                     txn,
                                     &def,
                                     insert.alias,
+                                    None,
                                     returning,
                                     None,
                                     saved.new,
@@ -80201,6 +84125,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 changed: affected,
                                 transitions: no_transitions,
                             },
+                            checks,
                         ) {
                             Ok(Ok(true)) => {}
                             Ok(Ok(false)) => continue,
@@ -80273,6 +84198,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 txn,
                                 &def,
                                 update.alias,
+                                None,
                                 returning,
                                 saved.old,
                                 saved.new,
@@ -80297,6 +84223,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                         return sql_fail(error);
                     }
                     let context = RowCtx {
+                        table_oid: None,
                         def: crate::storage::RelationDefinition::from_definition(&def),
                         values: &old[..def.n_columns],
                         alias: update.alias,
@@ -80354,6 +84281,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 arena,
                                 values: &mut matched_from,
                             }),
+                            None,
                         ) {
                             Ok(matched) => matched,
                             Err(error) => return sql_fail(error),
@@ -80376,6 +84304,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                             match row_matches_values(
                                 storage,
                                 txn.txid,
+                                None,
                                 &def,
                                 update.alias,
                                 &old[..def.n_columns],
@@ -80433,6 +84362,20 @@ pub(crate) fn instead_of_view_dml<'a>(
                         Ok(false) => continue,
                         Err(error) => return sql_fail(error),
                     }
+                    if let Err(error) = enforce_view_check(
+                        checks,
+                        &def,
+                        new,
+                        ViewCheckContext {
+                            storage,
+                            txid: txn.txid,
+                            arena,
+                            params,
+                            seq_session,
+                        },
+                    ) {
+                        return sql_fail(error);
+                    }
                     if !returning.is_empty() {
                         match emit_row_returning(
                             progress.as_deref_mut(),
@@ -80446,6 +84389,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                             txn,
                             &def,
                             update.alias,
+                            None,
                             returning,
                             Some(&old[..def.n_columns]),
                             Some(new),
@@ -80530,6 +84474,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 txn,
                                 &def,
                                 delete.alias,
+                                None,
                                 returning,
                                 saved.old,
                                 saved.new,
@@ -80554,6 +84499,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                         return sql_fail(error);
                     }
                     let context = RowCtx {
+                        table_oid: None,
                         def: crate::storage::RelationDefinition::from_definition(&def),
                         values: &old[..def.n_columns],
                         alias: delete.alias,
@@ -80578,6 +84524,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                                 arena,
                                 values: &mut matched_from,
                             }),
+                            None,
                         ) {
                             Ok(matched) => matched,
                             Err(error) => return sql_fail(error),
@@ -80596,6 +84543,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                         match row_matches_values(
                             storage,
                             txn.txid,
+                            None,
                             &def,
                             delete.alias,
                             &old[..def.n_columns],
@@ -80644,6 +84592,7 @@ pub(crate) fn instead_of_view_dml<'a>(
                             txn,
                             &def,
                             delete.alias,
+                            None,
                             returning,
                             Some(&old[..def.n_columns]),
                             None,
@@ -80674,7 +84623,6 @@ pub(crate) fn instead_of_view_dml<'a>(
         progress,
         &outcome,
         txn,
-        selected,
         [None; row_progress::CAPTURES],
         &storage.row_work,
     ) {
@@ -80713,7 +84661,7 @@ fn view_rows_resumed(
 ) -> Result<(usize, u64), SqlError> {
     match progress {
         Some(progress) => progress
-            .resume_rows(selected, |_| None)
+            .resume_rows(|index| (index < selected).then_some(None))
             .map(|resumed| (resumed.first, resumed.changed)),
         None => Ok((0, 0)),
     }
@@ -80728,6 +84676,44 @@ fn materialize_view_rows<'a>(
     execution: TriggerQueryExecution<'_, '_, 'a>,
     pool: &std::sync::Arc<LeasePool>,
 ) -> Result<(MutableSlice<&'a [u8]>, Option<&'a Expr<'a>>), SqlError> {
+    let mut rows = pool.lease::<&[u8]>(0).map_err(|error| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "view row staging: {}",
+            error
+        )
+    })?;
+    let predicate = select_view_rows(
+        storage,
+        txid,
+        view_slot,
+        selection,
+        arena,
+        execution,
+        &mut |encoded| {
+            rows.push(encoded).map_err(|error| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "view row staging: {}",
+                    error
+                )
+            })
+        },
+    )?;
+    Ok((rows, predicate))
+}
+
+/// Runs the view's query as of `txid` and hands each encoded row to `sink`.
+/// Returns the part of the selection's predicate left to evaluate per row.
+fn select_view_rows<'a>(
+    storage: &Storage,
+    txid: u32,
+    view_slot: usize,
+    selection: ViewRowSelection<'_, 'a>,
+    arena: &'a Arena,
+    execution: TriggerQueryExecution<'_, '_, 'a>,
+    sink: &mut dyn FnMut(&'a [u8]) -> Result<(), SqlError>,
+) -> Result<Option<&'a Expr<'a>>, SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
     let query = storage.snapshot_view_query(view_slot, txid, arena)?;
     let path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
@@ -80755,13 +84741,6 @@ fn materialize_view_rows<'a>(
         txid,
         arena,
     )?;
-    let mut rows = pool.lease::<&[u8]>(0).map_err(|error| {
-        sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "view row staging: {}",
-            error
-        )
-    })?;
     super::query::select_into_rows(
         storage,
         txid,
@@ -80785,16 +84764,10 @@ fn materialize_view_rows<'a>(
                 .alloc_slice_with(rowenc::encoded_len(values), |_| 0u8)
                 .map_err(|_| super::query::arena_full_pub())?;
             rowenc::encode(values, encoded);
-            rows.push(&*encoded).map_err(|error| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "view row staging: {}",
-                    error
-                )
-            })
+            sink(&*encoded)
         },
     )?;
-    Ok((rows, predicate))
+    Ok(predicate)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -80849,6 +84822,7 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
     capture: &mut Option<&mut super::ReturningCapture<'_>>,
     progress: Option<&mut RowProgress>,
     position: ChangedRow,
+    checks: Option<ViewCheck<'a>>,
 ) -> Result<Result<bool, SqlError>, WireFull> {
     let seq_session = services.seq_session;
     let fired = match fire_view_row_trigger(
@@ -80869,6 +84843,20 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
     if !fired {
         return Ok(Ok(false));
     }
+    if let Err(error) = enforce_view_check(
+        checks,
+        definition,
+        values,
+        ViewCheckContext {
+            storage,
+            txid: txn.txid,
+            arena,
+            params,
+            seq_session,
+        },
+    ) {
+        return Ok(Err(error));
+    }
     if !returning.is_empty() {
         match emit_row_returning(
             progress,
@@ -80877,6 +84865,7 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
             txn,
             definition,
             alias,
+            None,
             returning,
             None,
             Some(values),
@@ -80892,6 +84881,145 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
         }
     }
     Ok(Ok(true))
+}
+
+/// A streamed `INSERT ... SELECT` source: the retained reader, the fixed
+/// arena block its state lives in, and the row read ahead of the writes.
+struct StreamedSource<'a> {
+    reader: super::query::RetainedSelect<'a>,
+    block: &'a Arena,
+    /// The next row: `None` at the source's end, `Some(None)` for a row only
+    /// filtered because an earlier attempt already wrote it.
+    next: Option<Option<&'a [Datum<'a>]>>,
+}
+
+/// The fixed block a streamed source's reader holds (a table scan's cursor
+/// buffers take about 128 KiB); the writes recycle the rest of the arena row
+/// by row. A source in an arena with less than twice this free
+/// materializes instead.
+const STREAMED_SOURCE_BLOCK: usize = 512 << 10;
+
+/// Opens a streamed source and reads its first row before the first row
+/// change, so a wait there restarts the statement and a sort or hash table
+/// that does not fit reports `plan_build_exhausted` before anything is
+/// written. `None` when the retained reader does not run the source.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a streamed source reads with the write's storage, snapshot and arenas"
+)]
+fn open_streamed_source<'a>(
+    select: &'a Select<'a>,
+    storage: &Storage,
+    txid: u32,
+    command: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    buffers: &mut crate::storage::RowCursorBuffers,
+    responder: &mut Responder<'_>,
+) -> Result<Option<StreamedSource<'a>>, SqlError> {
+    let block = arena
+        .alloc_front_block(STREAMED_SOURCE_BLOCK)
+        .map_err(|_| super::eval::arena_full())?;
+    let reader = super::query::without_routine_invocations(|| {
+        let _snapshot = storage.dml_expression_snapshot(command);
+        super::query::RetainedSelect::open_write_source(
+            storage, txid, select, params, block, responder,
+        )
+    })?;
+    let Some(mut reader) = reader else {
+        return Ok(None);
+    };
+    let next = next_streamed_row(
+        &mut reader,
+        storage,
+        txid,
+        command,
+        block,
+        buffers,
+        arena,
+        params,
+        true,
+    )?;
+    Ok(Some(StreamedSource {
+        reader,
+        block,
+        next,
+    }))
+}
+
+/// Reads a streamed source's next row under the statement's snapshot, its
+/// output values detached into `arena`: `None` at the end. A row an earlier
+/// attempt wrote is only filtered (`evaluate` false); the source reads
+/// repeatably, so skipping such rows by count finds the unfinished one.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a streamed source reads with the write's storage, snapshot and arenas"
+)]
+fn next_streamed_row<'a>(
+    reader: &mut super::query::RetainedSelect<'a>,
+    storage: &Storage,
+    txid: u32,
+    command: u32,
+    block: &'a Arena,
+    buffers: &mut crate::storage::RowCursorBuffers,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    evaluate: bool,
+) -> Result<Option<Option<&'a [Datum<'a>]>>, SqlError> {
+    let _snapshot = storage.dml_expression_snapshot(command);
+    let calls = super::query::active_invocation_position();
+    let row = super::query::without_routine_invocations(
+        || -> Result<Option<Option<&'a [Datum<'a>]>>, SqlError> {
+            loop {
+                let mark = arena.mark();
+                if !reader.prepare_statement_row(
+                    storage,
+                    txid,
+                    crate::sql::datetime::now_micros(),
+                    block,
+                    buffers,
+                    arena,
+                    params,
+                )? {
+                    return Ok(None);
+                }
+                let passes = reader.evaluate_statement_predicate(
+                    storage, txid, arena, params, None, None, arena,
+                )?;
+                if !passes || reader.skip_statement_row() {
+                    reader.finish_statement_row(block, false);
+                    // SAFETY: the filtered row's values were dropped.
+                    unsafe { arena.rewind_to(mark) };
+                    continue;
+                }
+                let values = if evaluate {
+                    let mut projected = crate::mem::arena::ArenaList::new(arena);
+                    for index in 0..reader.statement_items_len() {
+                        for value in reader.evaluate_statement_item(
+                            index, storage, txid, arena, params, None, None, arena,
+                        )? {
+                            projected
+                                .push(*value)
+                                .map_err(|_| super::eval::arena_full())?;
+                        }
+                    }
+                    Some(projected.as_slice())
+                } else {
+                    None
+                };
+                reader.finish_statement_row(block, true);
+                return Ok(Some(values));
+            }
+        },
+    );
+    if super::query::active_invocation_position() != calls {
+        // A source that reads repeatably calls no user routine.
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a streamed INSERT source called a routine"
+        ));
+    }
+    row
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -81295,12 +85423,52 @@ where
         }
     }
 
-    // Materialize source rows and their assignment conversions before writing:
-    // the source may read the table being inserted into. Each emitted source
-    // row converts before the next row runs; encoded values are already typed.
+    // The source reads the table as of the statement's start, also when it
+    // reads the table being inserted into, as in PostgreSQL. A source that
+    // the retained reader runs and that reads repeatably streams: it holds
+    // one source row at a time in a fixed block of the arena, and each row
+    // is written before the next is read. Any other source materializes its
+    // rows and their assignment conversions in the arena before writing,
+    // where exhaustion is the named `54000`; each emitted source row
+    // converts before the next row runs, so encoded values are typed.
     if let Some(sel) = statement.select {
+        let source_command = txn.command_id();
+        let stream_mark = arena.mark();
+        let mut stream = None;
+        if matches!(source, InsertSource::Statement)
+            && transition_relations.is_none()
+            && !capturing
+            && arena.remaining() >= 2 * STREAMED_SOURCE_BLOCK
+            && super::query::select_reads_repeatably(sel, storage, txn.txid)
+        {
+            let opened = open_streamed_source(
+                sel,
+                storage,
+                txn.txid,
+                source_command,
+                arena,
+                params,
+                services.row_buffers,
+                responder,
+            );
+            match opened {
+                Ok(opened) => stream = opened,
+                // A sort or hash table that does not fit: the source
+                // materializes in the arena instead, as a SELECT runs in the
+                // general executor.
+                Err(error) if error.is_plan_build_exhausted() => {}
+                Err(error) => return sql_fail(error),
+            }
+            if stream.is_none() {
+                // SAFETY: no reader or row of the rejected stream remains.
+                unsafe { arena.rewind_to(stream_mark) };
+            }
+        }
         let deferred;
-        let (rows_bytes, count): (&[&[u8]], usize) = if let InsertSource::MaterializedSelect {
+        let (rows_bytes, count): (&[&[u8]], usize) = if stream.is_some() {
+            deferred = None;
+            (&[], 0)
+        } else if let InsertSource::MaterializedSelect {
             rows,
             deferred: staged,
             ..
@@ -81355,6 +85523,9 @@ where
                 Ok(())
             };
             {
+                // A resumed attempt reads the source as the first one did,
+                // without the rows earlier attempts inserted.
+                let _snapshot = storage.dml_expression_snapshot(txn.command_id());
                 let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
                 if let Err(e) = super::query::select_into_rows_recycling(
                     storage,
@@ -81374,7 +85545,9 @@ where
         // Row changes start here; a wait before them restarts the statement.
         row_progress::enter_rows(progress.as_deref_mut());
         let resumed = match progress.as_deref() {
-            Some(progress) => match progress.resume_rows(count, |_| None) {
+            Some(progress) => match progress
+                .resume_rows(|index| (stream.is_some() || index < count).then_some(None))
+            {
                 Ok(resumed) => resumed,
                 Err(error) => return sql_fail(error),
             },
@@ -81398,14 +85571,18 @@ where
             Ok(g) => g,
             Err(e) => return sql_fail(e),
         };
+        let replication_role = match crate::sql::guc::active_session_replication_role() {
+            Ok(role) => role,
+            Err(error) => return sql_fail(error),
+        };
         let mut transition_capture = if transition_capture_required(
             storage,
             table_index,
             txn.txid,
-            txn.replication_apply,
+            replication_role,
             TriggerEvents::INSERT,
         ) {
-            match TransitionCapture::new(arena, 0, count).and_then(|mut capture| {
+            match Ok::<_, SqlError>(TransitionCapture::new(arena)).and_then(|mut capture| {
                 if let Some(saved) = resumed.transitions[0] {
                     capture.extend_saved(saved.restore(arena)?, arena)?;
                 }
@@ -81417,15 +85594,19 @@ where
         } else {
             None
         };
+        let replication_role = match crate::sql::guc::active_session_replication_role() {
+            Ok(role) => role,
+            Err(error) => return sql_fail(error),
+        };
         let mut conflict_transition_capture = if conflict_update_columns.is_some()
             && transition_capture_required(
                 storage,
                 table_index,
                 txn.txid,
-                txn.replication_apply,
+                replication_role,
                 TriggerEvents::UPDATE,
             ) {
-            match TransitionCapture::new(arena, count, count).and_then(|mut capture| {
+            match Ok::<_, SqlError>(TransitionCapture::new(arena)).and_then(|mut capture| {
                 if let Some(saved) = resumed.transitions[1] {
                     capture.extend_saved(saved.restore(arena)?, arena)?;
                 }
@@ -81439,8 +85620,15 @@ where
         };
         let mut inserted = resumed.changed;
         let first_row = resumed.first;
-        let rows_outcome = (|| -> Outcome {
-            for (index, bytes) in rows_bytes.iter().enumerate().skip(first_row) {
+        let mut write_row = |storage: &mut Storage,
+                             txn: &mut TxnState,
+                             services: &mut TriggerServices<'_>,
+                             responder: &mut Responder<'_>,
+                             index: usize,
+                             bytes: &'a [u8],
+                             streamed: Option<&'a [Datum<'a>]>|
+         -> Outcome {
+            {
                 match row_progress::start_row(
                     progress.as_deref_mut(),
                     index,
@@ -81473,6 +85661,7 @@ where
                             txn,
                             def,
                             statement.alias,
+                            Some(table_index),
                             statement.returning,
                             resumed.old,
                             resumed.new,
@@ -81486,45 +85675,53 @@ where
                             Ok(()) => inserted += 1,
                             Err(error) => return sql_fail(error),
                         }
-                        continue;
+                        return sql_ok();
                     }
                     Err(error) => return sql_fail(error),
                 }
-                let converted = match &deferred {
-                    Some(deferred) => {
-                        let source = match deferred_source_row(
-                            deferred,
-                            bytes,
-                            storage,
-                            txn.txid,
-                            seq_session,
-                            arena,
-                            params,
-                        )
-                        .and_then(|row| {
-                            coerce_insert_projection(
-                                row,
-                                !statement.values_defaults.is_empty(),
-                                def,
-                                &targets[..n_targets],
-                                source_assignment_casts.expect("SELECT has a cast plan"),
-                                statement.overriding,
-                                storage,
-                                txn.txid,
-                                arena,
-                                Some(&crate::sql::sequence::SeqEval::new(
-                                    storage,
-                                    seq_session,
-                                    coercion_txid,
-                                )),
+                // A streamed row converts here, inside its row: an
+                // assignment cast that calls a routine resumes at the row.
+                let converted = match (streamed, &deferred) {
+                    (Some(_), _) | (None, Some(_)) => {
+                        let source = match streamed
+                            .map_or_else(
+                                || {
+                                    deferred_source_row(
+                                        deferred.as_ref().expect("a deferred source"),
+                                        bytes,
+                                        storage,
+                                        txn.txid,
+                                        seq_session,
+                                        arena,
+                                        params,
+                                    )
+                                },
+                                Ok,
                             )
-                        }) {
+                            .and_then(|row| {
+                                coerce_insert_projection(
+                                    row,
+                                    !statement.values_defaults.is_empty(),
+                                    def,
+                                    &targets[..n_targets],
+                                    source_assignment_casts.expect("SELECT has a cast plan"),
+                                    statement.overriding,
+                                    storage,
+                                    txn.txid,
+                                    arena,
+                                    Some(&crate::sql::sequence::SeqEval::new(
+                                        storage,
+                                        seq_session,
+                                        coercion_txid,
+                                    )),
+                                )
+                            }) {
                             Ok(row) => row,
                             Err(error) => return sql_fail(error),
                         };
                         Some(source)
                     }
-                    None => None,
+                    (None, None) => None,
                 };
                 // A deferred source row holds hidden call columns past its
                 // written ones; its converted row has the written shape.
@@ -81640,12 +85837,74 @@ where
                 }
             }
             sql_ok()
-        })();
+        };
+        let rows_outcome = match stream.as_mut() {
+            None => (|| -> Outcome {
+                for (index, bytes) in rows_bytes.iter().enumerate().skip(first_row) {
+                    match write_row(storage, txn, services, responder, index, bytes, None)? {
+                        Ok(()) => {}
+                        Err(error) => return sql_fail(error),
+                    }
+                }
+                sql_ok()
+            })(),
+            Some(stream) => (|| -> Outcome {
+                let row_mark = arena.mark();
+                let mut index = 0;
+                while let Some(row) = stream.next.take() {
+                    if index >= first_row {
+                        let Some(values) = row else {
+                            return sql_fail(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "streamed INSERT source row was not evaluated"
+                            ));
+                        };
+                        match write_row(
+                            storage,
+                            txn,
+                            services,
+                            responder,
+                            index,
+                            &[],
+                            Some(values),
+                        )? {
+                            Ok(()) => {}
+                            Err(error) => return sql_fail(error),
+                        }
+                    }
+                    index += 1;
+                    // SAFETY: the row is written. What a write keeps across
+                    // rows (transition rows, the invocation log) lives in the
+                    // arena's persistent tail or outside the arena.
+                    unsafe { arena.rewind_to(row_mark) };
+                    stream.next = match next_streamed_row(
+                        &mut stream.reader,
+                        storage,
+                        txn.txid,
+                        source_command,
+                        stream.block,
+                        services.row_buffers,
+                        arena,
+                        params,
+                        index >= first_row,
+                    ) {
+                        Ok(next) => next,
+                        Err(error) => return sql_fail(error),
+                    };
+                }
+                if index < first_row {
+                    return sql_fail(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "a resumed write selected different rows"
+                    ));
+                }
+                sql_ok()
+            })(),
+        };
         if let Err(error) = row_progress::settle_rows(
             progress,
             &rows_outcome,
             txn,
-            count,
             [
                 transition_capture.as_ref(),
                 conflict_transition_capture.as_ref(),
@@ -81715,24 +85974,30 @@ where
     // `VALUES` rows are evaluated as they are written: row changes start here.
     row_progress::enter_rows(progress.as_deref_mut());
     let resumed = match progress.as_deref() {
-        Some(progress) => match progress.resume_rows(statement.rows.len(), |_| None) {
-            Ok(resumed) => resumed,
-            Err(error) => return sql_fail(error),
-        },
+        Some(progress) => {
+            match progress.resume_rows(|index| (index < statement.rows.len()).then_some(None)) {
+                Ok(resumed) => resumed,
+                Err(error) => return sql_fail(error),
+            }
+        }
         None => row_progress::ResumedRows {
             first: 0,
             changed: 0,
             transitions: [None; row_progress::CAPTURES],
         },
     };
+    let replication_role = match crate::sql::guc::active_session_replication_role() {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
+    };
     let mut transition_capture = if transition_capture_required(
         storage,
         table_index,
         txn.txid,
-        txn.replication_apply,
+        replication_role,
         TriggerEvents::INSERT,
     ) {
-        match TransitionCapture::new(arena, 0, statement.rows.len()).and_then(|mut capture| {
+        match Ok::<_, SqlError>(TransitionCapture::new(arena)).and_then(|mut capture| {
             if let Some(saved) = resumed.transitions[0] {
                 capture.extend_saved(saved.restore(arena)?, arena)?;
             }
@@ -81744,22 +86009,24 @@ where
     } else {
         None
     };
+    let replication_role = match crate::sql::guc::active_session_replication_role() {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
+    };
     let mut conflict_transition_capture = if conflict_update_columns.is_some()
         && transition_capture_required(
             storage,
             table_index,
             txn.txid,
-            txn.replication_apply,
+            replication_role,
             TriggerEvents::UPDATE,
         ) {
-        match TransitionCapture::new(arena, statement.rows.len(), statement.rows.len()).and_then(
-            |mut capture| {
-                if let Some(saved) = resumed.transitions[1] {
-                    capture.extend_saved(saved.restore(arena)?, arena)?;
-                }
-                Ok(capture)
-            },
-        ) {
+        match Ok::<_, SqlError>(TransitionCapture::new(arena)).and_then(|mut capture| {
+            if let Some(saved) = resumed.transitions[1] {
+                capture.extend_saved(saved.restore(arena)?, arena)?;
+            }
+            Ok(capture)
+        }) {
             Ok(capture) => Some(capture),
             Err(error) => return sql_fail(error),
         }
@@ -81805,6 +86072,7 @@ where
                         txn,
                         def,
                         statement.alias,
+                        Some(table_index),
                         statement.returning,
                         resumed.old,
                         resumed.new,
@@ -81969,7 +86237,6 @@ where
         progress,
         &rows_outcome,
         txn,
-        statement.rows.len(),
         [
             transition_capture.as_ref(),
             conflict_transition_capture.as_ref(),
@@ -82039,6 +86306,7 @@ fn emit_row_returning<Definition0: crate::storage::DefinitionBacking>(
     txn: &TxnState,
     def: &crate::storage::TableDefinition<Definition0>,
     alias: Option<&str>,
+    table: Option<usize>,
     returning: crate::sql::ast::Returning<'_>,
     old: Option<&[Datum]>,
     new: Option<&[Datum]>,
@@ -82063,11 +86331,20 @@ fn emit_row_returning<Definition0: crate::storage::DefinitionBacking>(
         return sql_fail(error);
     }
     let current = new.or(old).expect("a changed row has old or new values");
+    let joined_values = joined.as_ref().map(|joined| joined.values);
+    let table_oid = match table
+        .map(|table| returning_table_oid(storage, txn.txid, table, def, position.row, new))
+        .transpose()
+    {
+        Ok(oid) => oid,
+        Err(error) => return sql_fail(error),
+    };
     match emit_projected(
         storage,
         txn,
         def,
         alias,
+        table_oid,
         current,
         returning,
         old,
@@ -82083,7 +86360,8 @@ fn emit_row_returning<Definition0: crate::storage::DefinitionBacking>(
         Err(error) => {
             if let Some(progress) = progress
                 && progress.stops_for(&error)
-                && let Err(error) = progress.keep_returning(old, new, arena, &storage.row_work)
+                && let Err(error) =
+                    progress.keep_returning(old, new, joined_values, arena, &storage.row_work)
             {
                 return sql_fail(error);
             }
@@ -82092,12 +86370,37 @@ fn emit_row_returning<Definition0: crate::storage::DefinitionBacking>(
     }
 }
 
+/// The `tableoid` a changed row's `RETURNING` reads: the partition its new
+/// values route to, else the physical table it was selected from, else the
+/// written table itself.
+fn returning_table_oid(
+    storage: &Storage,
+    txid: u32,
+    table: usize,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    row: Option<PhysicalRow>,
+    new: Option<&[Datum]>,
+) -> Result<u32, SqlError> {
+    let physical = match (new, row) {
+        (Some(values), _) if def.partition.is_partitioned() => {
+            storage.partition_target(table, def, &values[..def.n_columns], txid)?
+        }
+        (
+            _,
+            Some(PhysicalRow::Local { table_index, .. } | PhysicalRow::Foreign { table_index, .. }),
+        ) => table_index,
+        (_, None) => table,
+    };
+    Ok(crate::sql::catalog::user_table_oid(storage, physical) as u32)
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
     storage: &Storage,
     txn: &TxnState,
     def: &crate::storage::TableDefinition<Definition0>,
     alias: Option<&str>,
+    table_oid: Option<u32>,
     current: &[Datum],
     returning: crate::sql::ast::Returning<'_>,
     old: Option<&[Datum]>,
@@ -82114,6 +86417,7 @@ fn emit_projected<Definition0: crate::storage::DefinitionBacking>(
     let context = ReturningLookup {
         definition: crate::storage::RelationDefinition::from_definition(def),
         target_alias: alias,
+        table_oid,
         current,
         old_name: returning.old_name(),
         old,
@@ -82704,7 +87008,9 @@ pub(crate) fn update<'a>(
         Ok(definition) => definition,
         Err(error) => return sql_fail(error),
     };
-    if let Err(error) = check_dml_literal_operands(statement.where_clause, def, arena) {
+    if let Err(error) =
+        check_dml_literal_operands(statement.where_clause, def, storage, txn.txid, arena)
+    {
         return sql_fail(error);
     }
     let authorization_role = match authorization.role(storage, txn.txid) {
@@ -82815,10 +87121,8 @@ pub(crate) fn update<'a>(
         if def.columns()[targets[a]].default.is_generated()
             && !matches!(expression, Expr::DefaultMarker)
         {
-            return sql_fail(sql_err!(
-                sqlstate::GENERATED_ALWAYS,
-                "column \"{}\" can only be updated to DEFAULT",
-                def.columns()[targets[a]].name.as_str()
+            return sql_fail(generated_update_error(
+                def.columns()[targets[a]].name.as_str(),
             ));
         }
     }
@@ -82965,14 +87269,40 @@ pub(crate) fn update<'a>(
         Ok(false) => Some(&Expr::Bool(false)),
         Err(error) => return sql_fail(error),
     };
-    let collect = if let Some(from) = statement.from {
+    // A resumed foreign selection continues without selecting again.
+    let resumed_selection = progress.as_deref().and_then(RowProgress::resumed_selection);
+    let collect = if let Some(selection) = resumed_selection {
+        resumed_foreign_matches(
+            storage,
+            table_index,
+            selection,
+            DmlCapture::Update {
+                command: txn.command_id(),
+            },
+            arena,
+            txn.txid,
+            scratch,
+        )
+    } else if let Some(from) = statement.from {
+        let target_hash = match super::query::target_hash_plan(
+            storage,
+            statement.table,
+            statement.alias,
+            from,
+            statement.where_clause,
+            txn.txid,
+            arena,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return sql_fail(error),
+        };
         if let Some(outer) = outer {
             collect_join_matches_with_transition(
                 storage,
                 table_index,
+                statement.inheritance,
                 def,
                 statement.alias,
-                schema,
                 from,
                 selection_where,
                 arena,
@@ -82984,15 +87314,16 @@ pub(crate) fn update<'a>(
                 DmlCapture::Update {
                     command: txn.command_id(),
                 },
+                target_hash,
                 outer,
             )
         } else {
             collect_join_matches(
                 storage,
                 table_index,
+                statement.inheritance,
                 def,
                 statement.alias,
-                schema,
                 from,
                 selection_where,
                 arena,
@@ -83004,12 +87335,14 @@ pub(crate) fn update<'a>(
                 DmlCapture::Update {
                     command: txn.command_id(),
                 },
+                target_hash,
             )
         }
     } else {
         collect_matches(
             storage,
             table_index,
+            statement.inheritance,
             statement.alias,
             txn.txid,
             schema,
@@ -83063,20 +87396,26 @@ pub(crate) fn update<'a>(
     row_progress::enter_rows(progress.as_deref_mut());
 
     let (first_row, mut updated, saved_transitions) = match progress.as_deref() {
-        Some(progress) => match progress.resume_rows(scratch.len(), |index| Some(scratch[index])) {
-            Ok(resume) => (resume.first, resume.changed, resume.transitions[0]),
-            Err(error) => return sql_fail(error),
-        },
+        Some(progress) => {
+            match progress.resume_rows(|index| scratch.get(index).map(|row| Some(*row))) {
+                Ok(resume) => (resume.first, resume.changed, resume.transitions[0]),
+                Err(error) => return sql_fail(error),
+            }
+        }
         None => (0, 0, None),
+    };
+    let replication_role = match crate::sql::guc::active_session_replication_role() {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
     };
     let mut transition_capture = if transition_capture_required(
         storage,
         table_index,
         txn.txid,
-        txn.replication_apply,
+        replication_role,
         TriggerEvents::UPDATE,
     ) {
-        match TransitionCapture::new(arena, scratch.len(), scratch.len()).and_then(|mut capture| {
+        match Ok::<_, SqlError>(TransitionCapture::new(arena)).and_then(|mut capture| {
             if let Some(saved) = saved_transitions {
                 capture.extend_saved(saved.restore(arena)?, arena)?;
             }
@@ -83135,10 +87474,22 @@ pub(crate) fn update<'a>(
             };
             if let Some(resumed) = resumed_returning {
                 // The row changed in an earlier attempt; only its RETURNING
-                // values remain. The joined row is not kept with the change.
-                if returning_from.is_some() {
-                    return sql_fail(retained_progress_required());
-                }
+                // values remain, with the joined row they read.
+                let joined = match (returning_from, resumed.joined) {
+                    (Some(from), Some(values)) => Some(JoinedReturningValues {
+                        table: statement.table,
+                        alias: statement.alias,
+                        from,
+                        values,
+                    }),
+                    (None, _) => None,
+                    (Some(_), None) => {
+                        return sql_fail(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "a resumed RETURNING row lost its joined row"
+                        ));
+                    }
+                };
                 match emit_row_returning(
                     progress.as_deref_mut(),
                     ChangedRow {
@@ -83155,10 +87506,11 @@ pub(crate) fn update<'a>(
                     txn,
                     def,
                     statement.alias,
+                    Some(table_index),
                     statement.returning,
                     resumed.old,
                     resumed.new,
-                    None,
+                    joined,
                     arena,
                     params,
                     responder,
@@ -83250,6 +87602,7 @@ pub(crate) fn update<'a>(
                 row_layout.project(&physical_old, &mut values);
                 let mut logical_new = values;
                 let context = RowCtx {
+                    table_oid: Some(crate::sql::catalog::user_table_oid(storage, row_table) as u32),
                     def: crate::storage::RelationDefinition::from_definition(def),
                     values: &values[..def.n_columns],
                     alias: statement.alias,
@@ -83601,6 +87954,7 @@ pub(crate) fn update<'a>(
                 new_layout.project(&persisted, new_values);
                 if let Some(plan) = row_security_check {
                     let context = RowCtx {
+                        table_oid: None,
                         def: crate::storage::RelationDefinition::from_definition(def),
                         values: &new_values[..def.n_columns],
                         alias: None,
@@ -83716,13 +88070,27 @@ pub(crate) fn update<'a>(
                 &*out
             };
             if let Some(tuple_id) = remote_tuple {
+                // The remote row in the foreign table's own columns (a child
+                // of the target may order them differently), and in the
+                // target's for triggers, transition tables and RETURNING.
                 let mut old_transition = [Datum::Null; MAX_COLUMNS];
-                if let Err(error) = rowenc::decode(row_bytes, row_schema, &mut old_transition) {
+                if let Err(error) = row_layout.decode_logical(row_bytes, &mut old_transition) {
                     return sql_fail(error);
                 }
-                let mut new_values = [Datum::Null; MAX_COLUMNS];
-                if let Err(error) = rowenc::decode(new_bytes, new_layout.schema, &mut new_values) {
+                let mut new_physical = [Datum::Null; MAX_COLUMNS];
+                if let Err(error) = rowenc::decode(new_bytes, new_layout.schema, &mut new_physical)
+                {
                     return sql_fail(error);
+                }
+                let mut remote_targets = [0usize; MAX_COLUMNS];
+                for (remote, &logical) in remote_targets
+                    .iter_mut()
+                    .zip(&targets[..statement.assignments.len()])
+                {
+                    *remote = match row_layout.columns.physical_column(logical) {
+                        Ok(column) => column,
+                        Err(error) => return sql_fail(error),
+                    };
                 }
                 let changed = match crate::sql::foreign::update_row(
                     storage,
@@ -83730,8 +88098,8 @@ pub(crate) fn update<'a>(
                     txn.txid,
                     crate::sql::foreign::RemoteUpdate {
                         tuple_id,
-                        target_columns: &targets[..statement.assignments.len()],
-                        values: &mut new_values[..def.n_columns],
+                        target_columns: &remote_targets[..statement.assignments.len()],
+                        values: &mut new_physical[..row_schema.len()],
                         render: responder.render_context(),
                     },
                     arena,
@@ -83754,6 +88122,8 @@ pub(crate) fn update<'a>(
                         "foreign row changed before UPDATE could lock it"
                     ));
                 }
+                let mut new_values = [Datum::Null; MAX_COLUMNS];
+                row_layout.project(&new_physical, &mut new_values);
                 if let Err(error) = fire_partition_row_triggers(
                     storage,
                     txn,
@@ -83800,6 +88170,7 @@ pub(crate) fn update<'a>(
                         txn,
                         def,
                         statement.alias,
+                        Some(table_index),
                         statement.returning,
                         Some(&old_transition[..def.n_columns]),
                         Some(&new_values[..def.n_columns]),
@@ -83978,6 +88349,7 @@ pub(crate) fn update<'a>(
                     txn,
                     def,
                     statement.alias,
+                    Some(table_index),
                     statement.returning,
                     Some(&logical_old[..def.n_columns]),
                     Some(&logical_new[..def.n_columns]),
@@ -84005,8 +88377,9 @@ pub(crate) fn update<'a>(
             Ok(Err(error))
                 if progress.stops_for(error) && txn.pending_write_completion.is_none() =>
             {
-                if let Err(error) = progress.interrupt(
-                    scratch.len(),
+                if let Err(error) = progress.interrupt_rows(
+                    scratch,
+                    &retained_rows,
                     [transition_capture.as_ref(), None, None],
                     &storage.row_work,
                 ) {
@@ -84051,19 +88424,21 @@ pub(crate) fn update<'a>(
 }
 
 /// The FROM items' values joined to a deleted row for `RETURNING` of
-/// `DELETE ... USING`, found as the row selection found them.
+/// `DELETE ... USING`: the USING row its selection retained.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the match repeats the row selection's explicit inputs"
+    reason = "the retained row is read with the selection's explicit inputs"
 )]
 fn delete_returning_from<'r, Definition0: crate::storage::DefinitionBacking>(
     storage: &Storage,
     txn: &TxnState,
     statement: &Delete<'r>,
     def: &crate::storage::TableDefinition<Definition0>,
-    old: &[Datum<'_>],
+    old: &[Datum<'r>],
+    retained: &DmlRowImages<'r>,
+    row: PhysicalRow,
     arena: &'r Arena,
-    params: &[Datum<'_>],
+    params: &[Datum<'r>],
     seq_session: &crate::sql::guc::SeqSession,
 ) -> Result<Option<JoinedReturningValues<'r, 'r>>, SqlError> {
     let Some(using) = statement.using.filter(|_| !statement.returning.is_empty()) else {
@@ -84075,36 +88450,31 @@ fn delete_returning_from<'r, Definition0: crate::storage::DefinitionBacking>(
     let _snapshot = storage.dml_expression_snapshot(txn.command_id());
     let mut values: &[Datum<'r>] = &[];
     let context = RowCtx {
+        table_oid: None,
         def: crate::storage::RelationDefinition::from_definition(def),
         values: old,
         alias: statement.alias,
     };
-    let found = super::query::first_from_match(
+    super::query::with_joined_from_row(
         storage,
         using,
         txid,
         statement.where_clause,
-        &[],
         arena,
         params,
-        &context,
-        &mut |_| Ok(()),
         Some(&crate::sql::sequence::SeqEval::new(
             storage,
             seq_session,
             txid,
         )),
+        &context,
+        retained.joined(row)?,
+        |_| Ok(()),
         Some(super::query::MatchedFromRow {
             arena,
             values: &mut values,
         }),
     )?;
-    if !found {
-        return Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "deleted row lost its USING match before RETURNING"
-        ));
-    }
     Ok(Some(JoinedReturningValues {
         table: statement.table,
         alias: statement.alias,
@@ -84190,7 +88560,9 @@ pub(crate) fn delete<'a>(
         Ok(definition) => definition,
         Err(error) => return sql_fail(error),
     };
-    if let Err(error) = check_dml_literal_operands(statement.where_clause, def, arena) {
+    if let Err(error) =
+        check_dml_literal_operands(statement.where_clause, def, storage, txn.txid, arena)
+    {
         return sql_fail(error);
     }
     let reads_target = match (|| -> Result<ColumnSet, SqlError> {
@@ -84341,14 +88713,41 @@ pub(crate) fn delete<'a>(
         Ok(false) => Some(&Expr::Bool(false)),
         Err(error) => return sql_fail(error),
     };
-    let collect = if let Some(using) = statement.using {
+    // A resumed foreign selection continues without selecting again.
+    let resumed_selection = progress.as_deref().and_then(RowProgress::resumed_selection);
+    let collect = if let Some(selection) = resumed_selection {
+        resumed_foreign_matches(
+            storage,
+            table_index,
+            selection,
+            DmlCapture::Delete {
+                command: txn.command_id(),
+                returning: !statement.returning.is_empty(),
+            },
+            arena,
+            txn.txid,
+            scratch,
+        )
+    } else if let Some(using) = statement.using {
+        let target_hash = match super::query::target_hash_plan(
+            storage,
+            statement.table,
+            statement.alias,
+            using,
+            statement.where_clause,
+            txn.txid,
+            arena,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return sql_fail(error),
+        };
         if let Some(outer) = outer {
             collect_join_matches_with_transition(
                 storage,
                 table_index,
+                statement.inheritance,
                 def,
                 statement.alias,
-                schema,
                 using,
                 selection_where,
                 arena,
@@ -84361,15 +88760,16 @@ pub(crate) fn delete<'a>(
                     command: txn.command_id(),
                     returning: !statement.returning.is_empty(),
                 },
+                target_hash,
                 outer,
             )
         } else {
             collect_join_matches(
                 storage,
                 table_index,
+                statement.inheritance,
                 def,
                 statement.alias,
-                schema,
                 using,
                 selection_where,
                 arena,
@@ -84382,12 +88782,14 @@ pub(crate) fn delete<'a>(
                     command: txn.command_id(),
                     returning: !statement.returning.is_empty(),
                 },
+                target_hash,
             )
         }
     } else {
         collect_matches(
             storage,
             table_index,
+            statement.inheritance,
             statement.alias,
             txn.txid,
             schema,
@@ -84435,10 +88837,12 @@ pub(crate) fn delete<'a>(
     // Row changes start here; a wait before them restarts the statement.
     row_progress::enter_rows(progress.as_deref_mut());
     let (first_row, mut deleted, saved_transitions) = match progress.as_deref() {
-        Some(progress) => match progress.resume_rows(scratch.len(), |index| Some(scratch[index])) {
-            Ok(resume) => (resume.first, resume.changed, resume.transitions[0]),
-            Err(error) => return sql_fail(error),
-        },
+        Some(progress) => {
+            match progress.resume_rows(|index| scratch.get(index).map(|row| Some(*row))) {
+                Ok(resume) => (resume.first, resume.changed, resume.transitions[0]),
+                Err(error) => return sql_fail(error),
+            }
+        }
         None => (0, 0, None),
     };
     if !statement.returning.is_empty() && !capturing && !resuming {
@@ -84472,14 +88876,18 @@ pub(crate) fn delete<'a>(
             Err(e) => return sql_fail(e),
         }
     }
+    let replication_role = match crate::sql::guc::active_session_replication_role() {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
+    };
     let mut transition_capture = if transition_capture_required(
         storage,
         table_index,
         txn.txid,
-        txn.replication_apply,
+        replication_role,
         TriggerEvents::DELETE,
     ) {
-        match TransitionCapture::new(arena, scratch.len(), 0).and_then(|mut capture| {
+        match Ok::<_, SqlError>(TransitionCapture::new(arena)).and_then(|mut capture| {
             if let Some(saved) = saved_transitions {
                 capture.extend_saved(saved.restore(arena)?, arena)?;
             }
@@ -84524,6 +88932,7 @@ pub(crate) fn delete<'a>(
                     txn,
                     def,
                     statement.alias,
+                    Some(table_index),
                     statement.returning,
                     resumed.old,
                     resumed.new,
@@ -84534,6 +88943,8 @@ pub(crate) fn delete<'a>(
                             statement,
                             def,
                             old,
+                            &retained_rows,
+                            scratch[i],
                             arena,
                             params,
                             seq_session,
@@ -84598,8 +89009,13 @@ pub(crate) fn delete<'a>(
                         "foreign row changed before DELETE could lock it"
                     ));
                 };
+                // The child's row in its own columns, then in the target's.
+                let foreign_layout = match retained_rows.layout(row_table) {
+                    Ok(layout) => layout,
+                    Err(error) => return sql_fail(error),
+                };
                 let mut old_values = [Datum::Null; MAX_COLUMNS];
-                if let Err(error) = rowenc::decode(old_row, schema, &mut old_values) {
+                if let Err(error) = foreign_layout.decode_logical(old_row, &mut old_values) {
                     return sql_fail(error);
                 }
                 if !match fire_partition_row_triggers(
@@ -84661,7 +89077,8 @@ pub(crate) fn delete<'a>(
                     ));
                 };
                 let mut old_transition = [Datum::Null; MAX_COLUMNS];
-                if let Err(error) = rowenc::decode(deleted_row, schema, &mut old_transition) {
+                if let Err(error) = foreign_layout.decode_logical(deleted_row, &mut old_transition)
+                {
                     return sql_fail(error);
                 }
                 if let Err(error) = fire_partition_row_triggers(
@@ -84704,6 +89121,7 @@ pub(crate) fn delete<'a>(
                         txn,
                         def,
                         statement.alias,
+                        Some(table_index),
                         statement.returning,
                         Some(&old_transition[..def.n_columns]),
                         None,
@@ -84713,6 +89131,8 @@ pub(crate) fn delete<'a>(
                             statement,
                             def,
                             &old_transition[..def.n_columns],
+                            &retained_rows,
+                            scratch[i],
                             arena,
                             params,
                             seq_session,
@@ -84856,6 +89276,7 @@ pub(crate) fn delete<'a>(
                     txn,
                     def,
                     statement.alias,
+                    Some(table_index),
                     statement.returning,
                     Some(&logical_old[..def.n_columns]),
                     None,
@@ -84865,6 +89286,8 @@ pub(crate) fn delete<'a>(
                         statement,
                         def,
                         &logical_old[..def.n_columns],
+                        &retained_rows,
+                        scratch[i],
                         arena,
                         params,
                         seq_session,
@@ -84890,8 +89313,9 @@ pub(crate) fn delete<'a>(
             Ok(Err(error))
                 if progress.stops_for(error) && txn.pending_write_completion.is_none() =>
             {
-                if let Err(error) = progress.interrupt(
-                    scratch.len(),
+                if let Err(error) = progress.interrupt_rows(
+                    scratch,
+                    &retained_rows,
                     [transition_capture.as_ref(), None, None],
                     &storage.row_work,
                 ) {
@@ -86305,7 +90729,10 @@ fn drop_column_constraints(
             remember(foreign_key.name)?;
             continue;
         }
-        for child_column in &mut foreign_key.columns[..foreign_key.n_cols] {
+        for child_column in foreign_key.columns[..foreign_key.n_cols]
+            .iter_mut()
+            .chain(&mut foreign_key.delete_set_cols[..foreign_key.n_delete_set_cols])
+        {
             if usize::from(*child_column) > column {
                 *child_column -= 1;
             }
@@ -86426,11 +90853,13 @@ fn rewritten_key_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
     for index in 0..new_def.exclusions().len() {
         if let Some(predicate) = expressions[crate::storage::MAX_CHECKS + index] {
             let left = RowCtx {
+                table_oid: None,
                 def: crate::storage::RelationDefinition::from_definition(new_def),
                 values: a,
                 alias: None,
             };
             let right = RowCtx {
+                table_oid: None,
                 def: crate::storage::RelationDefinition::from_definition(new_def),
                 values: b,
                 alias: None,
@@ -86886,6 +91315,10 @@ fn alter_table_trigger_enabled(
             return sql_fail(error);
         }
     }
+    match alter_foreign_key_trigger_modes(storage, wal, txn, table, trigger_target, mode, recurse) {
+        Ok(found) => matched |= found,
+        Err(error) => return sql_fail(error),
+    }
     if !matched && let crate::sql::ast::TriggerEnableTarget::Name(name) = trigger_target {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
@@ -86898,6 +91331,125 @@ fn alter_table_trigger_enabled(
         responder.command_complete(tag)?;
     }
     sql_ok()
+}
+
+/// Sets the firing mode of the foreign key RI triggers on `table` that
+/// `target` selects: `ALL` or one `RI_ConstraintTrigger_*` name, never
+/// `USER`. A referencing table owns its check triggers and a referenced table
+/// its action triggers; both live in the referencing table's definition.
+/// Only superusers may change these system triggers. Returns whether any
+/// trigger matched.
+fn alter_foreign_key_trigger_modes(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table: usize,
+    target: crate::sql::ast::TriggerEnableTarget<'_>,
+    mode: crate::storage::TriggerEnabled,
+    recurse: bool,
+) -> Result<bool, SqlError> {
+    use crate::storage::ForeignKeyTrigger;
+    // Without ONLY, a partitioned table's change reaches its partitions'
+    // cloned check triggers too, as PostgreSQL recurses.
+    let txid = txn.txid;
+    let owned = |owner: Option<usize>, storage: &Storage| {
+        owner.is_some_and(|owner| {
+            owner == table || (recurse && storage.partition_descends_from(owner, table, txid))
+        })
+    };
+    if matches!(target, crate::sql::ast::TriggerEnableTarget::User) {
+        return Ok(false);
+    }
+    let selected = |name: &str| match target {
+        crate::sql::ast::TriggerEnableTarget::Name(wanted) => name == wanted,
+        _ => true,
+    };
+    // PostgreSQL visits a table's triggers in name order and rejects the
+    // first system trigger a non-superuser selects.
+    let mut first: Option<SqlName> = None;
+    for child in 0..storage.table_count() {
+        if !storage.table(child).visible_to(txn.txid) {
+            continue;
+        }
+        let definition = storage.table_def(child, txn.txid);
+        for foreign_key in definition.fkeys() {
+            let parent = storage.find_visible(
+                foreign_key.parent_schema.as_str(),
+                foreign_key.parent.as_str(),
+                txn.txid,
+            );
+            for trigger in ForeignKeyTrigger::ALL {
+                let owner = match trigger {
+                    ForeignKeyTrigger::ActionDelete | ForeignKeyTrigger::ActionUpdate => parent,
+                    ForeignKeyTrigger::CheckInsert | ForeignKeyTrigger::CheckUpdate => Some(child),
+                };
+                let name = constraints::foreign_key_trigger_name(foreign_key, trigger)?;
+                if owner == Some(table)
+                    && selected(name.as_str())
+                    && first.is_none_or(|first| name.as_str() < first.as_str())
+                {
+                    first = Some(name);
+                }
+            }
+        }
+    }
+    let Some(first) = first else {
+        return Ok(false);
+    };
+    if storage
+        .current_role_slot(txn.txid)
+        .is_some_and(|role| !storage.role(role).attributes_to(txn.txid).superuser)
+    {
+        return Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied: \"{}\" is a system trigger",
+            first.as_str()
+        ));
+    }
+    for child in 0..storage.table_count() {
+        if !storage.table(child).visible_to(txn.txid) {
+            continue;
+        }
+        let (edit_target, definition) = storage.select_table_definition(child, txn.txid);
+        let mut next = TableDefBuilder::from_definition(&definition);
+        let mut changed = false;
+        for foreign_key in &mut next.fkeys[..next.n_fkeys] {
+            let parent = storage.find_visible(
+                foreign_key.parent_schema.as_str(),
+                foreign_key.parent.as_str(),
+                txn.txid,
+            );
+            for trigger in ForeignKeyTrigger::ALL {
+                let owner = match trigger {
+                    ForeignKeyTrigger::ActionDelete | ForeignKeyTrigger::ActionUpdate => parent,
+                    ForeignKeyTrigger::CheckInsert | ForeignKeyTrigger::CheckUpdate => Some(child),
+                };
+                let name = constraints::foreign_key_trigger_name(foreign_key, trigger)?;
+                if (owned(owner, storage)
+                    && (owner == Some(table)
+                        || matches!(target, crate::sql::ast::TriggerEnableTarget::All)))
+                    && selected(name.as_str())
+                    && foreign_key.trigger_enabled[trigger.ordinal()] != mode
+                {
+                    foreign_key.trigger_enabled[trigger.ordinal()] = mode;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            continue;
+        }
+        if child != table {
+            storage.lock_table(
+                txn.txid,
+                child,
+                crate::sql::ast::TableLockMode::ShareRowExclusive,
+                false,
+            )?;
+        }
+        stage_table_definition(storage, wal, txn, edit_target, definition, next)?;
+    }
+    Ok(true)
 }
 
 /// The name of the not-null constraint on `column` that `definition`
@@ -86976,6 +91528,27 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
                 "column \"{}\" has a different definition in partition \"{}\"",
                 expected.name.as_str(),
                 child.name.as_str()
+            ));
+        }
+        if let (Some(parent_kind), Some(child_kind)) =
+            (expected.default.generation(), actual.default.generation())
+            && parent_kind != child_kind
+        {
+            let name = |kind| match kind {
+                crate::storage::Generation::Stored => "STORED",
+                crate::storage::Generation::Virtual => "VIRTUAL",
+            };
+            return Err(crate::sql::error_position::with_detail(
+                sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "column \"{}\" inherits from generated column of different kind",
+                    expected.name.as_str()
+                ),
+                format_args!(
+                    "Parent column is {}, child column is {}.",
+                    name(parent_kind),
+                    name(child_kind)
+                ),
             ));
         }
         if expected.not_null.is_required() {
@@ -87255,6 +91828,7 @@ fn same_foreign_key_body(
         && left.parent == right.parent
         && left.parent_cols() == right.parent_cols()
         && left.on_delete == right.on_delete
+        && left.delete_set_cols() == right.delete_set_cols()
         && left.on_update == right.on_update
 }
 
@@ -90172,6 +94746,7 @@ fn alter_table_relation(
                 // A literal-only default folds to a constant; a call-bearing one
                 // is stored as text and evaluated per row — CREATE TABLE's path.
                 let default = match ddl::resolve_default(
+                    column,
                     Some(value),
                     Some(value_text),
                     ctype,
@@ -90421,12 +94996,26 @@ fn alter_table_relation(
                         statement.table.name
                     ));
                 }
+                if new_def.columns[i].default.is_virtual() && new_def.n_checks > 0 {
+                    return sql_fail(virtual_generated_alteration(
+                        "SET EXPRESSION",
+                        " in tables with check constraints",
+                        column,
+                        statement.table.name,
+                    ));
+                }
                 let expression =
                     match ddl::resolve_generated(expression_text, storage, txn.txid, arena) {
                         Ok(expression) => expression,
                         Err(error) => return sql_fail(error),
                     };
-                new_def.columns[i].default = crate::storage::ColumnDefault::Generated(expression);
+                // SET EXPRESSION keeps the column's generation kind.
+                let kind = new_def.columns[i]
+                    .default
+                    .generation()
+                    .unwrap_or(crate::storage::Generation::Stored);
+                new_def.columns[i].default =
+                    crate::storage::ColumnDefault::Generated { expression, kind };
                 renew_default_identity(&mut new_def, &def, source[i]);
                 if let Err(error) = expression_bindings::capture_column_expression_dependencies(
                     storage,
@@ -90468,6 +95057,14 @@ fn alter_table_relation(
                         "column \"{}\" of relation \"{}\" is not a generated column",
                         column,
                         statement.table.name
+                    ));
+                }
+                if new_def.columns[i].default.is_virtual() {
+                    return sql_fail(virtual_generated_alteration(
+                        "DROP EXPRESSION",
+                        "",
+                        column,
+                        statement.table.name,
                     ));
                 }
                 // PostgreSQL preserves the already-materialized datum. Only
@@ -90578,6 +95175,32 @@ fn alter_table_relation(
                 };
                 if let Err(error) = require_row_type_unaltered(storage, txn.txid, table_index) {
                     return sql_fail(error);
+                }
+                // PostgreSQL keeps a generation expression's input types fixed.
+                if let Some(generated) = new_def.columns().iter().find(|candidate| {
+                    candidate.default.is_generated()
+                        && candidate.default.expression().is_some_and(|text| {
+                            crate::sql::parser::parse_expr(text.as_str(), arena).is_ok_and(
+                                |expression| {
+                                    let mut reads = false;
+                                    expression
+                                        .for_each_column(&mut |name| reads |= name == *column);
+                                    reads
+                                },
+                            )
+                        })
+                }) {
+                    return sql_fail(crate::sql::error_position::with_detail(
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "cannot alter type of a column used by a generated column"
+                        ),
+                        format_args!(
+                            "Column \"{}\" is used by generated column \"{}\".",
+                            column,
+                            generated.name.as_str()
+                        ),
+                    ));
                 }
                 if let ColSource::Keep(original) | ColSource::Cast { orig: original, .. } =
                     source[i]
@@ -91126,8 +95749,9 @@ fn alter_table_relation(
             };
         }
     }
-    if generated_changed
-        && let Err(error) = crate::sql::exec::ddl::validate_generated_refs(&new_def, arena)
+    if (generated_changed || added_any)
+        && let Err(error) =
+            crate::sql::exec::ddl::validate_generated_refs(&new_def, None, storage, txn.txid, arena)
     {
         return sql_fail(error);
     }
@@ -91314,6 +95938,7 @@ fn alter_table_relation(
                             let cast_source = match using {
                                 Some(expr) => {
                                     let ctx = RowCtx {
+                                        table_oid: None,
                                         def: crate::storage::RelationDefinition::from_definition(
                                             &def,
                                         ),
@@ -92825,6 +97450,7 @@ fn row_matches<'a, Definition0: crate::storage::DefinitionBacking>(
             row_matches_values(
                 storage,
                 txid,
+                Some(table_index),
                 def,
                 alias,
                 &values,
@@ -92857,6 +97483,7 @@ fn row_matches<'a, Definition0: crate::storage::DefinitionBacking>(
             row_matches_values(
                 storage,
                 txid,
+                Some(table_index),
                 def,
                 alias,
                 &values,
@@ -92885,6 +97512,7 @@ fn row_matches<'a, Definition0: crate::storage::DefinitionBacking>(
 fn row_matches_values<'a, Definition0: crate::storage::DefinitionBacking>(
     storage: &Storage,
     txid: u32,
+    table: Option<usize>,
     def: &crate::storage::TableDefinition<Definition0>,
     alias: Option<&str>,
     values: &[Datum<'a>],
@@ -92896,6 +97524,7 @@ fn row_matches_values<'a, Definition0: crate::storage::DefinitionBacking>(
     transition: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<bool, SqlError> {
     let context = RowCtx {
+        table_oid: table.map(|table| crate::sql::catalog::user_table_oid(storage, table) as u32),
         def: crate::storage::RelationDefinition::from_definition(def),
         values: &values[..def.n_columns],
         alias,
@@ -92927,24 +97556,6 @@ fn row_matches_values<'a, Definition0: crate::storage::DefinitionBacking>(
     }
 }
 
-/// Resolves a writable target once into its physical leaves. The arena is
-/// statement-bounded and the catalog capacity is fixed at startup, so parent
-/// DML cannot create an unbounded work list.
-fn dml_leaf_slots<'a>(
-    storage: &Storage,
-    table_index: usize,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<&'a [usize], SqlError> {
-    dml_leaf_slots_for(
-        storage,
-        table_index,
-        crate::sql::ast::RelationInheritance::Descendants,
-        txid,
-        arena,
-    )
-}
-
 /// Resolves a writable target according to the parsed inheritance contract.
 /// `ONLY` remains a distinct state until this boundary, so an insert action can
 /// still use the logical target while match/update/delete scans use its chosen
@@ -92967,22 +97578,128 @@ fn dml_leaf_slots_for<'a>(
                 )
             });
     }
-    let slots = arena
-        .alloc_slice_with(storage.table_count(), |_| 0usize)
-        .map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "partition target list exceeds the statement arena"
+    relation_leaves_in_order(storage, table_index, txid, arena)
+}
+
+/// The rows a resumed write over a foreign table, or over a hierarchy with
+/// foreign children, continues with: the selection its interrupted attempt
+/// kept, with the joined `FROM` or `USING` rows and the local rows' stored
+/// images. The remote session and the local rows keep the earlier rows'
+/// changes, so selecting again would find their new versions or miss them.
+fn resumed_foreign_matches<'a>(
+    storage: &Storage,
+    table_index: usize,
+    selection: row_progress::KeptSelection<'_>,
+    capture: DmlCapture,
+    arena: &'a Arena,
+    txid: u32,
+    scratch: &mut DmlScratch,
+) -> Result<DmlRowImages<'a>, SqlError> {
+    let def = (*storage.table_def(table_index, txid)).clone();
+    let mut images = DmlRowImages::new(arena);
+    let mut stored = selection.images(arena)?.iter();
+    for row in selection.rows {
+        let (leaf, rowid) = match *row {
+            PhysicalRow::Local {
+                table_index, rowid, ..
+            } => (table_index, Some(rowid)),
+            PhysicalRow::Foreign { table_index, .. } => (table_index, None),
+        };
+        let physical = (*storage.table_def(leaf, txid)).clone();
+        images.capture_layout(leaf, &def, &physical, capture, arena, storage, txid)?;
+        if let Some(rowid) = rowid
+            && capture.needs_bytes(storage, table_index, leaf, txid)
+        {
+            let bytes = stored.next().ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "resumed DML row has no retained bytes"
+                )
+            })?;
+            images.push(leaf, rowid, retain_dml_bytes(arena, bytes)?)?;
+        }
+    }
+    if stored.next().is_some() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "resumed DML selection kept more row images than rows"
+        ));
+    }
+    scratch.clear();
+    scratch.extend_from_slice(selection.rows).map_err(|error| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "statement row selection: {}",
+            error
+        )
+    })?;
+    if let Some(joined) = selection.joined(arena)? {
+        for (row, joined) in selection.rows.iter().zip(joined) {
+            // The kept selection ends when the resumed row starts; the images
+            // live for the whole attempt.
+            let joined = arena.alloc_slice_copy(joined).map_err(|_| arena_full())?;
+            images.push_joined(*row, super::query::JoinedFromRow::from_bytes(joined))?;
+        }
+    }
+    images.finish()
+}
+
+/// Visits the remote rows of a foreign table that a write selects, alone or
+/// as a child of the target, with their values in the target's columns.
+#[expect(clippy::too_many_arguments, reason = "row pipeline plumbing")]
+fn visit_foreign_rows<'a>(
+    storage: &Storage,
+    table: usize,
+    layout: DmlTableLayout<'a>,
+    columns: usize,
+    txid: u32,
+    arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    visit: &mut impl FnMut(PhysicalRow, &[Datum<'a>]) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    crate::sql::foreign::visit_mutable_rows(
+        storage,
+        table,
+        txid,
+        arena,
+        &mut |tuple_id, row| {
+            let row = arena.alloc_slice_copy(row).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "foreign mutable-row scan exceeds the statement arena"
+                )
+            })?;
+            let mut physical = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(row, layout.schema, &mut physical)?;
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            layout.project(&physical, &mut values);
+            visit(
+                PhysicalRow::Foreign {
+                    table_index: table,
+                    tuple_id,
+                },
+                &values[..columns],
             )
-        })?;
-    let n = storage.relation_leaf_slots(table_index, txid, slots)?;
-    Ok(&slots[..n])
+        },
+        sequences,
+    )
+}
+
+fn push_selected(scratch: &mut DmlScratch, row: PhysicalRow) -> Result<(), SqlError> {
+    scratch.push(row).map_err(|error| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "statement row selection: {}",
+            error
+        )
+    })
 }
 
 #[expect(clippy::too_many_arguments, reason = "row pipeline plumbing")]
 pub(super) fn collect_matches<'a>(
     storage: &Storage,
     table_index: usize,
+    inheritance: crate::sql::ast::RelationInheritance,
     alias: Option<&str>,
     txid: u32,
     schema: &[ColType],
@@ -92999,56 +97716,10 @@ pub(super) fn collect_matches<'a>(
     scratch.clear();
     let mut images = DmlRowImages::new(arena);
     let def = (*storage.table_def(table_index, txid)).clone();
-    if def.kind == crate::storage::TableKind::Foreign {
-        images.capture_layout(table_index, &def, &def, capture, arena, storage, txid)?;
-        crate::sql::foreign::visit_mutable_rows(
-            storage,
-            table_index,
-            txid,
-            arena,
-            &mut |tuple_id, row| {
-                let row = arena.alloc_slice_copy(row).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "foreign mutable-row scan exceeds the statement arena"
-                    )
-                })?;
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(row, schema, &mut values)?;
-                if row_matches_values(
-                    storage,
-                    txid,
-                    &def,
-                    alias,
-                    &values,
-                    where_clause,
-                    arena,
-                    params,
-                    hooks,
-                    row_security,
-                    transition,
-                )? {
-                    scratch
-                        .push(PhysicalRow::Foreign {
-                            table_index,
-                            tuple_id,
-                        })
-                        .map_err(|error| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement row selection: {}",
-                                error
-                            )
-                        })?;
-                }
-                Ok(())
-            },
-            hooks.sequences,
-        )?;
-        scratch.sort_unstable_by_key(|row| row.sort_key());
-        return images.finish();
-    }
-    let indexed = if transition.is_none() && !storage.relation_has_descendants(table_index, txid) {
+    let indexed = if transition.is_none()
+        && def.kind != crate::storage::TableKind::Foreign
+        && !storage.relation_has_descendants(table_index, txid)
+    {
         super::query::dml_indexed_candidates(
             storage,
             table_index,
@@ -93063,7 +97734,44 @@ pub(super) fn collect_matches<'a>(
     } else {
         None
     };
-    for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
+    for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
+        // Each leaf's rows follow its physical order; leaves keep theirs.
+        let leaf_start = scratch.len();
+        let physical = (*storage.table_def(leaf, txid)).clone();
+        if physical.kind == crate::storage::TableKind::Foreign {
+            let layout =
+                images.capture_layout(leaf, &def, &physical, capture, arena, storage, txid)?;
+            visit_foreign_rows(
+                storage,
+                leaf,
+                layout,
+                def.n_columns,
+                txid,
+                arena,
+                hooks.sequences,
+                &mut |row, values| {
+                    if row_matches_values(
+                        storage,
+                        txid,
+                        Some(leaf),
+                        &def,
+                        alias,
+                        values,
+                        where_clause,
+                        arena,
+                        params,
+                        hooks,
+                        row_security,
+                        transition,
+                    )? {
+                        push_selected(scratch, row)?;
+                    }
+                    Ok(())
+                },
+            )?;
+            scratch[leaf_start..].sort_unstable_by_key(|row| row.sort_key());
+            continue;
+        }
         storage.record_serializable_read(txid, leaf);
         let access = indexed.as_ref().filter(|_| leaf == table_index);
         if access.is_none_or(|access| access.scan_executed()) {
@@ -93075,7 +97783,6 @@ pub(super) fn collect_matches<'a>(
                 crate::sql::datetime::now_micros(),
             )?;
         }
-        let physical = (*storage.table_def(leaf, txid)).clone();
         let layout = images.capture_layout(leaf, &def, &physical, capture, arena, storage, txid)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
         let mut visit = |rowid, state: crate::storage::RowRead<'_>| {
@@ -93133,12 +97840,25 @@ pub(super) fn collect_matches<'a>(
                 Ok(core::ops::ControlFlow::Continue(()))
             })?;
         }
+        // DML RETURNING follows each leaf's physical row order. The row map
+        // is hash-addressed, so restore the monotonic row identity assigned
+        // when the heap image was first appended before locks and writes
+        // begin.
+        scratch[leaf_start..].sort_unstable_by_key(|row| row.sort_key());
     }
-    // DML RETURNING follows the target table's physical row order. The row
-    // map is hash-addressed, so restore the monotonic row identity assigned
-    // when the heap image was first appended before locks and writes begin.
-    scratch.sort_unstable_by_key(|row| row.sort_key());
     images.finish()
+}
+
+/// The FROM item rows a target hash join offers the target row `target`.
+fn target_hash_candidates<'a>(
+    hash: Option<&super::query::TargetHash<'a>>,
+    storage: &Storage,
+    txid: u32,
+    target: &[Datum<'_>],
+    arena: &'a Arena,
+) -> Result<Option<&'a [u64]>, SqlError> {
+    hash.map(|hash| hash.candidates(storage, txid, target, arena))
+        .transpose()
 }
 
 /// Collects target rows that join at least one row of the extra `from` tables
@@ -93148,9 +97868,9 @@ pub(super) fn collect_matches<'a>(
 fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
     storage: &Storage,
     table_index: usize,
+    inheritance: crate::sql::ast::RelationInheritance,
     def: &crate::storage::TableDefinition<Definition0>,
     alias: Option<&str>,
-    schema: &[ColType],
     from: &super::ast::FromClause<'a>,
     where_clause: Option<&Expr<'a>>,
     arena: &'a Arena,
@@ -93160,95 +97880,104 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
     row_security: Option<super::query::RowSecurityPlan<'a>>,
     scratch: &mut DmlScratch,
     capture: DmlCapture,
+    target_hash: Option<super::query::TargetHashPlan>,
 ) -> Result<DmlRowImages<'a>, SqlError> {
     let _snapshot = storage.dml_expression_snapshot(capture.command());
     scratch.clear();
+    let hash = target_hash
+        .map(|plan| plan.build(storage, txid, arena))
+        .transpose()?;
     let mut images = DmlRowImages::new(arena);
-    if def.kind == crate::storage::TableKind::Foreign {
-        images.capture_layout(table_index, def, def, capture, arena, storage, txid)?;
-        crate::sql::foreign::visit_mutable_rows(
-            storage,
-            table_index,
-            txid,
-            arena,
-            &mut |tuple_id, row| {
-                let row = arena.alloc_slice_copy(row).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "foreign mutable-row scan exceeds the statement arena"
-                    )
-                })?;
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(row, schema, &mut values)?;
-                let context = RowCtx {
-                    def: crate::storage::RelationDefinition::from_definition(def),
-                    values: &values[..def.n_columns],
-                    alias,
-                };
-                if let Some(plan) = row_security
-                    && !super::query::row_security_passes(
-                        plan, &context, storage, txid, arena, params, hooks,
-                    )?
-                {
-                    return Ok(());
-                }
-                let row = PhysicalRow::Foreign {
-                    table_index,
-                    tuple_id,
-                };
-                let matched = if capture.retains_joined() {
-                    match super::query::joined_from_match(
-                        storage,
-                        from,
-                        txid,
-                        where_clause,
-                        arena,
-                        params,
-                        &context,
-                        None,
-                        arena,
-                    )? {
-                        Some(joined) => {
-                            images.push_joined(row, joined)?;
-                            true
-                        }
-                        None => false,
+    for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
+        let physical = (*storage.table_def(leaf, txid)).clone();
+        if physical.kind == crate::storage::TableKind::Foreign {
+            let layout =
+                images.capture_layout(leaf, def, &physical, capture, arena, storage, txid)?;
+            visit_foreign_rows(
+                storage,
+                leaf,
+                layout,
+                def.n_columns,
+                txid,
+                arena,
+                hooks.sequences,
+                &mut |row, values| {
+                    let context = RowCtx {
+                        table_oid: None,
+                        def: crate::storage::RelationDefinition::from_definition(def),
+                        values,
+                        alias,
+                    };
+                    if let Some(plan) = row_security
+                        && !super::query::row_security_passes(
+                            plan, &context, storage, txid, arena, params, hooks,
+                        )?
+                    {
+                        return Ok(());
                     }
-                } else {
-                    super::query::first_from_match(
-                        storage,
-                        from,
-                        txid,
-                        where_clause,
-                        &[],
-                        arena,
-                        params,
-                        &context,
-                        &mut |_| Ok(()),
-                        None,
-                        None,
-                    )?
-                };
-                if matched {
-                    scratch.push(row).map_err(|error| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "statement row selection: {}",
-                            error
-                        )
-                    })?;
-                }
-                Ok(())
-            },
-            hooks.sequences,
-        )?;
-        scratch.sort_unstable_by_key(|row| row.sort_key());
-        return images.finish();
-    }
-    for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
+                    let matched = if capture.retains_joined() {
+                        match super::query::joined_from_match(
+                            storage,
+                            from,
+                            txid,
+                            where_clause,
+                            arena,
+                            params,
+                            &context,
+                            None,
+                            target_hash_candidates(
+                                hash.as_ref(),
+                                storage,
+                                txid,
+                                context.values,
+                                arena,
+                            )?,
+                            arena,
+                        )? {
+                            Some(joined) => {
+                                images.push_joined(row, joined)?;
+                                true
+                            }
+                            None => false,
+                        }
+                    } else {
+                        super::query::first_from_match(
+                            storage,
+                            from,
+                            txid,
+                            where_clause,
+                            &[],
+                            arena,
+                            params,
+                            &context,
+                            &mut |_| Ok(()),
+                            None,
+                            None,
+                            target_hash_candidates(
+                                hash.as_ref(),
+                                storage,
+                                txid,
+                                context.values,
+                                arena,
+                            )?,
+                        )?
+                    };
+                    if matched {
+                        scratch.push(row).map_err(|error| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "statement row selection: {}",
+                                error
+                            )
+                        })?;
+                    }
+                    Ok(())
+                },
+            )?;
+            continue;
+        }
         storage.record_serializable_read(txid, leaf);
         storage.record_relation_scan(txid, leaf, None, 0, crate::sql::datetime::now_micros())?;
-        let physical = (*storage.table_def(leaf, txid)).clone();
         let layout = images.capture_layout(leaf, def, &physical, capture, arena, storage, txid)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
         storage.for_each_row_state(
@@ -93271,6 +98000,7 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                         let mut tv = [Datum::Null; MAX_COLUMNS];
                         layout.project(&physical, &mut tv);
                         let context = RowCtx {
+                            table_oid: None,
                             def: crate::storage::RelationDefinition::from_definition(def),
                             values: &tv[..def.n_columns],
                             alias,
@@ -93292,6 +98022,13 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                                 params,
                                 &context,
                                 None,
+                                target_hash_candidates(
+                                    hash.as_ref(),
+                                    storage,
+                                    txid,
+                                    context.values,
+                                    arena,
+                                )?,
                                 arena,
                             )?;
                             Ok(joined.is_some())
@@ -93308,6 +98045,13 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
                                 &mut |_| Ok(()),
                                 None,
                                 None,
+                                target_hash_candidates(
+                                    hash.as_ref(),
+                                    storage,
+                                    txid,
+                                    context.values,
+                                    arena,
+                                )?,
                             )
                         }
                     })();
@@ -93352,9 +98096,9 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
 fn collect_join_matches_with_transition<'a, Definition0: crate::storage::DefinitionBacking>(
     storage: &Storage,
     table_index: usize,
+    inheritance: crate::sql::ast::RelationInheritance,
     def: &crate::storage::TableDefinition<Definition0>,
     alias: Option<&str>,
-    schema: &[ColType],
     from: &super::ast::FromClause<'a>,
     where_clause: Option<&Expr<'a>>,
     arena: &'a Arena,
@@ -93364,100 +98108,109 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
     row_security: Option<super::query::RowSecurityPlan<'a>>,
     scratch: &mut DmlScratch,
     capture: DmlCapture,
+    target_hash: Option<super::query::TargetHashPlan>,
     outer: &dyn ColumnLookup<'a>,
 ) -> Result<DmlRowImages<'a>, SqlError> {
     let _snapshot = storage.dml_expression_snapshot(capture.command());
     scratch.clear();
+    let hash = target_hash
+        .map(|plan| plan.build(storage, txid, arena))
+        .transpose()?;
     let mut images = DmlRowImages::new(arena);
-    if def.kind == crate::storage::TableKind::Foreign {
-        images.capture_layout(table_index, def, def, capture, arena, storage, txid)?;
-        crate::sql::foreign::visit_mutable_rows(
-            storage,
-            table_index,
-            txid,
-            arena,
-            &mut |tuple_id, row| {
-                let row = arena.alloc_slice_copy(row).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "foreign mutable-row scan exceeds the statement arena"
-                    )
-                })?;
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(row, schema, &mut values)?;
-                let context = RowCtx {
-                    def: crate::storage::RelationDefinition::from_definition(def),
-                    values: &values[..def.n_columns],
-                    alias,
-                };
-                if let Some(plan) = row_security
-                    && !super::query::row_security_passes(
-                        plan, &context, storage, txid, arena, params, hooks,
-                    )?
-                {
-                    return Ok(());
-                }
-                let scope = JoinedTriggerDmlScope {
-                    row: &context,
-                    outer,
-                };
-                let row = PhysicalRow::Foreign {
-                    table_index,
-                    tuple_id,
-                };
-                let matched = if capture.retains_joined() {
-                    match super::query::joined_from_match(
-                        storage,
-                        from,
-                        txid,
-                        where_clause,
-                        arena,
-                        params,
-                        &scope,
-                        None,
-                        arena,
-                    )? {
-                        Some(joined) => {
-                            images.push_joined(row, joined)?;
-                            true
-                        }
-                        None => false,
+    for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
+        let physical = (*storage.table_def(leaf, txid)).clone();
+        if physical.kind == crate::storage::TableKind::Foreign {
+            let layout =
+                images.capture_layout(leaf, def, &physical, capture, arena, storage, txid)?;
+            visit_foreign_rows(
+                storage,
+                leaf,
+                layout,
+                def.n_columns,
+                txid,
+                arena,
+                hooks.sequences,
+                &mut |row, values| {
+                    let context = RowCtx {
+                        table_oid: None,
+                        def: crate::storage::RelationDefinition::from_definition(def),
+                        values,
+                        alias,
+                    };
+                    if let Some(plan) = row_security
+                        && !super::query::row_security_passes(
+                            plan, &context, storage, txid, arena, params, hooks,
+                        )?
+                    {
+                        return Ok(());
                     }
-                } else {
-                    super::query::first_from_match(
-                        storage,
-                        from,
-                        txid,
-                        where_clause,
-                        &[],
-                        arena,
-                        params,
-                        &scope,
-                        &mut |_| Ok(()),
-                        None,
-                        None,
-                    )?
-                };
-                if matched {
-                    scratch.push(row).map_err(|error| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "statement row selection: {}",
-                            error
-                        )
-                    })?;
-                }
-                Ok(())
-            },
-            hooks.sequences,
-        )?;
-        scratch.sort_unstable_by_key(|row| row.sort_key());
-        return images.finish();
-    }
-    for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
+                    let scope = JoinedTriggerDmlScope {
+                        row: &context,
+                        outer,
+                    };
+                    let matched = if capture.retains_joined() {
+                        match super::query::joined_from_match(
+                            storage,
+                            from,
+                            txid,
+                            where_clause,
+                            arena,
+                            params,
+                            &scope,
+                            None,
+                            target_hash_candidates(
+                                hash.as_ref(),
+                                storage,
+                                txid,
+                                context.values,
+                                arena,
+                            )?,
+                            arena,
+                        )? {
+                            Some(joined) => {
+                                images.push_joined(row, joined)?;
+                                true
+                            }
+                            None => false,
+                        }
+                    } else {
+                        super::query::first_from_match(
+                            storage,
+                            from,
+                            txid,
+                            where_clause,
+                            &[],
+                            arena,
+                            params,
+                            &scope,
+                            &mut |_| Ok(()),
+                            None,
+                            None,
+                            target_hash_candidates(
+                                hash.as_ref(),
+                                storage,
+                                txid,
+                                context.values,
+                                arena,
+                            )?,
+                        )?
+                    };
+                    if matched {
+                        scratch.push(row).map_err(|error| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "statement row selection: {}",
+                                error
+                            )
+                        })?;
+                    }
+                    Ok(())
+                },
+            )?;
+            continue;
+        }
         storage.record_serializable_read(txid, leaf);
         storage.record_relation_scan(txid, leaf, None, 0, crate::sql::datetime::now_micros())?;
-        let physical = (*storage.table_def(leaf, txid)).clone();
         let layout = images.capture_layout(leaf, def, &physical, capture, arena, storage, txid)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
         storage.for_each_row_state(
@@ -93478,6 +98231,7 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                         let mut values = [Datum::Null; MAX_COLUMNS];
                         layout.project(&physical, &mut values);
                         let context = RowCtx {
+                            table_oid: None,
                             def: crate::storage::RelationDefinition::from_definition(def),
                             values: &values[..def.n_columns],
                             alias,
@@ -93503,6 +98257,13 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                                 params,
                                 &scope,
                                 None,
+                                target_hash_candidates(
+                                    hash.as_ref(),
+                                    storage,
+                                    txid,
+                                    context.values,
+                                    arena,
+                                )?,
                                 arena,
                             )?;
                             Ok(joined.is_some())
@@ -93519,6 +98280,13 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
                                 &mut |_| Ok(()),
                                 None,
                                 None,
+                                target_hash_candidates(
+                                    hash.as_ref(),
+                                    storage,
+                                    txid,
+                                    context.values,
+                                    arena,
+                                )?,
                             )
                         }
                     })();
@@ -93954,6 +98722,8 @@ fn typed_assignment_path<'e, 'a: 'e>(
 fn check_dml_literal_operands<'a>(
     expression: Option<&'a Expr<'a>>,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     let Some(expression) = expression else {
@@ -93972,6 +98742,8 @@ fn check_dml_literal_operands<'a>(
             }),
             _ => None,
         },
+        storage,
+        txid,
         arena,
     )
 }
@@ -94824,6 +99596,7 @@ fn composite_storage_text<'a>(
         .alloc_slice_with(definition.physical_field_count(), |_| RecordField {
             name: "",
             type_oid: 0,
+            type_mod: -1,
             value: Datum::Null,
         })
         .map_err(|_| {
@@ -94985,6 +99758,7 @@ fn coerce_composite_value_inner<'a>(
         .alloc_slice_with(input.len(), |_| RecordField {
             name: "",
             type_oid: 0,
+            type_mod: -1,
             value: Datum::Null,
         })
         .map_err(|_| {
@@ -95304,6 +100078,7 @@ fn decode_composite_text_inner<'a>(
         .alloc_slice_with(definition.active_field_count(), |_| RecordField {
             name: "",
             type_oid: 0,
+            type_mod: -1,
             value: Datum::Null,
         })
         .map_err(|_| {
@@ -95987,7 +100762,8 @@ fn check_not_null<Definition0: crate::storage::DefinitionBacking>(
 ) -> Result<(), SqlError> {
     for (i, c) in def.columns().iter().enumerate() {
         if c.not_null.is_required() && values[i].is_null() {
-            let detail = constraints::failing_row_detail(&values[..def.columns().len()])?;
+            let detail =
+                constraints::failing_row_detail(def.columns(), &values[..def.columns().len()])?;
             crate::sql::eval::stash_object_diagnostic(
                 Some(detail.as_str()),
                 crate::sql::eval::ErrorObjects::table_column(
@@ -96428,15 +101204,14 @@ fn enforce_view_check<'a, Definition0: crate::storage::DefinitionBacking>(
     values: &[Datum<'a>],
     check_context: ViewCheckContext<'_, 'a, '_, '_>,
 ) -> Result<(), SqlError> {
-    let Some(ViewCheck {
-        predicate: Some(predicate),
-        view_name,
-        ..
-    }) = check
-    else {
+    let Some(check) = check else {
         return Ok(());
     };
+    if check.checks.is_empty() {
+        return Ok(());
+    }
     let row = RowCtx {
+        table_oid: None,
         def: crate::storage::RelationDefinition::from_definition(definition),
         values,
         alias: None,
@@ -96456,23 +101231,34 @@ fn enforce_view_check<'a, Definition0: crate::storage::DefinitionBacking>(
         sequences: Some(&sequences),
         ..NO_HOOKS
     };
-    if matches!(
-        eval_full(
-            predicate,
-            check_context.arena,
-            check_context.params,
-            &row,
-            &hooks,
-        )?,
-        Datum::Bool(true)
-    ) {
-        return Ok(());
+    for (view_name, predicate) in check.checks {
+        if matches!(
+            eval_full(
+                predicate,
+                check_context.arena,
+                check_context.params,
+                &row,
+                &hooks,
+            )?,
+            Datum::Bool(true)
+        ) {
+            continue;
+        }
+        let detail = constraints::failing_row_detail(
+            definition.columns(),
+            &values[..definition.columns().len()],
+        )?;
+        crate::sql::eval::stash_object_diagnostic(
+            Some(detail.as_str()),
+            crate::sql::eval::ErrorObjects::default(),
+        );
+        return Err(sql_err!(
+            sqlstate::WITH_CHECK_OPTION_VIOLATION,
+            "new row violates check option for view \"{}\"",
+            view_name
+        ));
     }
-    Err(sql_err!(
-        sqlstate::WITH_CHECK_OPTION_VIOLATION,
-        "new row violates check option for view \"{}\"",
-        view_name
-    ))
+    Ok(())
 }
 
 fn require_view_privilege_as(
@@ -96574,20 +101360,16 @@ fn view_privilege_definition<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<crate::storage::TableDefView<'a>, SqlError> {
+    // The stored column names suffice: describing the view's query would
+    // check SELECT on the relations it reads, which writing does not need.
     let definition = storage.view(view);
-    let mut descriptions = [super::types::ColDesc::new("", 0, 0); MAX_PROJ];
-    let count = super::catalog::describe_view(&definition, txid, arena, &mut descriptions)?;
-    if count > MAX_COLUMNS {
-        return Err(sql_err!(
-            sqlstate::TOO_MANY_COLUMNS,
-            "too many view columns"
-        ));
-    }
+    let names = definition.columns_for(txid).names();
+    let count = names.len();
     let columns = arena
         .alloc_slice_with(count, |_| ColumnMeta::EMPTY)
         .map_err(|_| super::query::arena_full_pub())?;
-    for (column, description) in columns.iter_mut().zip(&descriptions[..count]) {
-        column.name = crate::storage::SqlName::parse(description.name)?;
+    for (column, name) in columns.iter_mut().zip(names) {
+        column.name = *name;
     }
     Ok(crate::storage::TableDefView {
         schema: definition.schema_for(txid),
@@ -96599,6 +101381,170 @@ fn view_privilege_definition<'a>(
             .map_err(|_| super::query::arena_full_pub())?,
         ..crate::storage::TableDefView::empty()
     })
+}
+
+/// PostgreSQL checks each view below the written one as the role that
+/// checked the view above it: the upper view's owner, or that role again for
+/// a `security_invoker` upper view. Returns the authorization the base table
+/// is checked with.
+#[expect(clippy::too_many_arguments, reason = "privilege context")]
+pub(crate) fn require_nested_view_privileges(
+    storage: &Storage,
+    view: &super::query::UpdatableView<'_>,
+    written: &[ColumnSet],
+    write: super::query::ViewWrite,
+    authorization: DmlAuthorization,
+    statement: &crate::sql::ast::Stmt<'_>,
+    txid: u32,
+    arena: &Arena,
+) -> Result<DmlAuthorization, SqlError> {
+    use super::query::ViewWrite;
+    let reads = view.read_columns(view_dml_reads(
+        storage,
+        statement,
+        view.levels[0].slot,
+        txid,
+        arena,
+    )?);
+    let mut authorization = authorization;
+    for (index, level) in view.levels.iter().enumerate().skip(1) {
+        let role = authorization.role(storage, txid)?;
+        if !reads[index].is_empty() {
+            require_view_column_privilege_as(
+                storage,
+                level.slot,
+                crate::storage::PrivilegeSet::SELECT,
+                reads[index],
+                role,
+                txid,
+            )?;
+        }
+        match write {
+            ViewWrite::Insert | ViewWrite::MergeInsert => require_view_column_privilege_as(
+                storage,
+                level.slot,
+                crate::storage::PrivilegeSet::INSERT,
+                written[index],
+                role,
+                txid,
+            )?,
+            ViewWrite::Update | ViewWrite::MergeUpdate => require_view_column_privilege_as(
+                storage,
+                level.slot,
+                crate::storage::PrivilegeSet::UPDATE,
+                written[index],
+                role,
+                txid,
+            )?,
+            ViewWrite::Delete | ViewWrite::MergeDelete => require_view_privilege_as(
+                storage,
+                level.slot,
+                crate::storage::PrivilegeSet::DELETE,
+                role,
+                txid,
+            )?,
+            ViewWrite::CheckOption => {}
+        }
+        authorization = view_level_authorization(storage, level.slot, authorization, txid);
+    }
+    Ok(authorization)
+}
+
+fn view_level_authorization(
+    storage: &Storage,
+    view: usize,
+    authorization: DmlAuthorization,
+    txid: u32,
+) -> DmlAuthorization {
+    match storage.view(view).security_for(txid) {
+        crate::storage::ViewSecurity::Definer => DmlAuthorization::RuleOwner(storage.object_owner(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::View,
+                slot: view as u16,
+            },
+            txid,
+        ) as u16),
+        crate::storage::ViewSecurity::Invoker => authorization,
+    }
+}
+
+/// A MERGE into a view needs, on the view and on each view below it, the
+/// privilege of every action it can take.
+fn require_merge_view_privileges(
+    storage: &Storage,
+    original: &crate::sql::ast::Stmt<'_>,
+    statement: &crate::sql::ast::Merge<'_>,
+    view: &super::query::UpdatableView<'_>,
+    rewrite: &super::query::ViewRewrite<'_>,
+    txid: u32,
+    arena: &Arena,
+) -> Result<DmlAuthorization, SqlError> {
+    use super::query::ViewWrite;
+    let mut kinds = [false; 3];
+    for when in statement.whens {
+        match when.action() {
+            crate::sql::ast::MergeActionRef::Insert { .. } => kinds[0] = true,
+            crate::sql::ast::MergeActionRef::Update(_) => kinds[1] = true,
+            crate::sql::ast::MergeActionRef::Delete => kinds[2] = true,
+            crate::sql::ast::MergeActionRef::DoNothing => {}
+        }
+    }
+    let top = view.levels[0].slot;
+    let role = DmlAuthorization::Invoker.role(storage, txid)?;
+    let below = view_level_authorization(storage, top, DmlAuthorization::Invoker, txid);
+    let mut base = below;
+    for (present, write) in kinds.into_iter().zip([
+        ViewWrite::MergeInsert,
+        ViewWrite::MergeUpdate,
+        ViewWrite::MergeDelete,
+    ]) {
+        if !present {
+            continue;
+        }
+        match write {
+            ViewWrite::MergeDelete => require_view_privilege_as(
+                storage,
+                top,
+                crate::storage::PrivilegeSet::DELETE,
+                role,
+                txid,
+            )?,
+            _ => require_view_column_privilege_as(
+                storage,
+                top,
+                if write == ViewWrite::MergeInsert {
+                    crate::storage::PrivilegeSet::INSERT
+                } else {
+                    crate::storage::PrivilegeSet::UPDATE
+                },
+                rewrite.written[0],
+                role,
+                txid,
+            )?,
+        }
+        base = require_nested_view_privileges(
+            storage,
+            view,
+            &rewrite.written,
+            write,
+            below,
+            original,
+            txid,
+            arena,
+        )?;
+    }
+    let reads = view_dml_reads(storage, original, top, txid, arena)?;
+    if !reads.is_empty() {
+        require_view_column_privilege_as(
+            storage,
+            top,
+            crate::storage::PrivilegeSet::SELECT,
+            reads,
+            role,
+            txid,
+        )?;
+    }
+    Ok(base)
 }
 
 /// Checks the invoker's visible view privileges before its DML target is
@@ -96639,16 +101585,73 @@ pub(crate) fn require_view_dml_privileges(
         })
     };
     match statement {
-        crate::sql::ast::Stmt::Insert(insert) => {
+        crate::sql::ast::Stmt::Insert(insert) => require_view_column_privilege_as(
+            storage,
+            view,
+            crate::storage::PrivilegeSet::INSERT,
+            target_mask(insert.columns)?,
+            role,
+            txid,
+        )?,
+        crate::sql::ast::Stmt::Update(update) => {
+            let mut writes = ColumnSet::EMPTY;
+            for (name, _) in update.assignments {
+                writes |= target_mask(core::slice::from_ref(name))?;
+            }
             require_view_column_privilege_as(
                 storage,
                 view,
-                crate::storage::PrivilegeSet::INSERT,
-                target_mask(insert.columns)?,
+                crate::storage::PrivilegeSet::UPDATE,
+                writes,
                 role,
                 txid,
             )?;
-            let reads = returning_dml_target_columns(
+        }
+        crate::sql::ast::Stmt::Delete(_) => require_view_privilege_as(
+            storage,
+            view,
+            crate::storage::PrivilegeSet::DELETE,
+            role,
+            txid,
+        )?,
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view privilege target is not data-modifying"
+            ));
+        }
+    }
+    let reads = view_dml_reads(storage, statement, view, txid, arena)?;
+    if !reads.is_empty() {
+        require_view_column_privilege_as(
+            storage,
+            view,
+            crate::storage::PrivilegeSet::SELECT,
+            reads,
+            role,
+            txid,
+        )?;
+    }
+    Ok(view_level_authorization(storage, view, authorization, txid))
+}
+
+/// The columns of the view `view` a write through it reads: those its
+/// `WHERE`, assigned expressions, MERGE conditions and `RETURNING` name.
+pub(crate) fn view_dml_reads(
+    storage: &Storage,
+    statement: &crate::sql::ast::Stmt<'_>,
+    view: usize,
+    txid: u32,
+    arena: &Arena,
+) -> Result<ColumnSet, SqlError> {
+    let definition = view_privilege_definition(storage, view, txid, arena)?;
+    let expression_reads = |expression: &Expr<'_>, alias: Option<&str>| {
+        expression_dml_target_columns(expression, &definition, alias, storage, txid, arena)
+    };
+    let mut reads = ColumnSet::EMPTY;
+    match statement {
+        crate::sql::ast::Stmt::Insert(insert) => {
+            reads |= returning_dml_target_columns(
                 insert.returning,
                 &definition,
                 None,
@@ -96656,40 +101659,13 @@ pub(crate) fn require_view_dml_privileges(
                 txid,
                 arena,
             )?;
-            if !reads.is_empty() {
-                require_view_column_privilege_as(
-                    storage,
-                    view,
-                    crate::storage::PrivilegeSet::SELECT,
-                    reads,
-                    role,
-                    txid,
-                )?;
-            }
         }
         crate::sql::ast::Stmt::Update(update) => {
-            let mut writes = ColumnSet::EMPTY;
-            let mut reads = ColumnSet::EMPTY;
-            for (name, expression) in update.assignments {
-                writes |= target_mask(core::slice::from_ref(name))?;
-                reads |= expression_dml_target_columns(
-                    expression,
-                    &definition,
-                    update.alias,
-                    storage,
-                    txid,
-                    arena,
-                )?;
+            for (_, expression) in update.assignments {
+                reads |= expression_reads(expression, update.alias)?;
             }
             if let Some(expression) = update.where_clause {
-                reads |= expression_dml_target_columns(
-                    expression,
-                    &definition,
-                    update.alias,
-                    storage,
-                    txid,
-                    arena,
-                )?;
+                reads |= expression_reads(expression, update.alias)?;
             }
             reads |= returning_dml_target_columns(
                 update.returning,
@@ -96699,34 +101675,12 @@ pub(crate) fn require_view_dml_privileges(
                 txid,
                 arena,
             )?;
-            require_view_column_privilege_as(
-                storage,
-                view,
-                crate::storage::PrivilegeSet::UPDATE,
-                writes,
-                role,
-                txid,
-            )?;
-            if !reads.is_empty() {
-                require_view_column_privilege_as(
-                    storage,
-                    view,
-                    crate::storage::PrivilegeSet::SELECT,
-                    reads,
-                    role,
-                    txid,
-                )?;
-            }
         }
         crate::sql::ast::Stmt::Delete(delete) => {
-            require_view_privilege_as(
-                storage,
-                view,
-                crate::storage::PrivilegeSet::DELETE,
-                role,
-                txid,
-            )?;
-            let mut reads = returning_dml_target_columns(
+            if let Some(expression) = delete.where_clause {
+                reads |= expression_reads(expression, delete.alias)?;
+            }
+            reads |= returning_dml_target_columns(
                 delete.returning,
                 &definition,
                 delete.alias,
@@ -96734,44 +101688,40 @@ pub(crate) fn require_view_dml_privileges(
                 txid,
                 arena,
             )?;
-            if let Some(expression) = delete.where_clause {
-                reads |= expression_dml_target_columns(
-                    expression,
-                    &definition,
-                    delete.alias,
-                    storage,
-                    txid,
-                    arena,
-                )?;
-            }
-            if !reads.is_empty() {
-                require_view_column_privilege_as(
-                    storage,
-                    view,
-                    crate::storage::PrivilegeSet::SELECT,
-                    reads,
-                    role,
-                    txid,
-                )?;
-            }
         }
-        _ => {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "view privilege target is not data-modifying"
-            ));
+        crate::sql::ast::Stmt::Merge(merge) => {
+            let alias = merge.target_alias;
+            reads |= expression_reads(merge.on, alias)?;
+            for when in merge.whens {
+                if let Some(condition) = when.condition() {
+                    reads |= expression_reads(condition, alias)?;
+                }
+                match when.action() {
+                    crate::sql::ast::MergeActionRef::Update(assignments) => {
+                        for (_, expression) in assignments {
+                            reads |= expression_reads(expression, alias)?;
+                        }
+                    }
+                    crate::sql::ast::MergeActionRef::Insert { values, .. } => {
+                        for expression in values {
+                            reads |= expression_reads(expression, alias)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            reads |= returning_dml_target_columns(
+                merge.returning,
+                &definition,
+                alias,
+                storage,
+                txid,
+                arena,
+            )?;
         }
+        _ => {}
     }
-    Ok(match storage.view(view).security_for(txid) {
-        crate::storage::ViewSecurity::Definer => DmlAuthorization::RuleOwner(storage.object_owner(
-            crate::storage::AccessObject {
-                class: crate::storage::AccessClass::View,
-                slot: view as u16,
-            },
-            txid,
-        ) as u16),
-        crate::storage::ViewSecurity::Invoker => authorization,
-    })
+    Ok(reads)
 }
 
 /// Public view of the OID-to-ColType mapping for value-level renderers
@@ -97589,4 +102539,161 @@ fn expression_names_target<'a>(
         Ok(())
     });
     found
+}
+
+/// PostgreSQL's refusal of an `ALTER COLUMN` form for a virtual generated
+/// column.
+fn virtual_generated_alteration(
+    form: &str,
+    qualification: &str,
+    column: &str,
+    relation: &str,
+) -> SqlError {
+    crate::sql::error_position::with_detail(
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "ALTER TABLE / {} is not supported for virtual generated columns{}",
+            form,
+            qualification
+        ),
+        format_args!(
+            "Column \"{}\" of relation \"{}\" is a virtual generated column.",
+            column, relation
+        ),
+    )
+}
+
+/// Whether a rule action's `WITH` query names the rule's `OLD` or `NEW`
+/// row, which PostgreSQL rejects when the rule is created.
+mod rule_rows {
+    use crate::sql::ast::{Cte, Expr, FromClause, Select, SelectItem, SetTree, Stmt, TableRef};
+
+    pub(super) fn cte_reads(cte: &Cte<'_>, row: &str) -> bool {
+        match cte.dml {
+            Some(statement) => statement_reads(statement, row),
+            None => select_reads(cte.query, row),
+        }
+    }
+
+    fn statement_reads(statement: &Stmt<'_>, row: &str) -> bool {
+        match statement {
+            Stmt::Select(select) => select_reads(select, row),
+            Stmt::With { ctes, statement } => {
+                ctes.iter().any(|cte| cte_reads(cte, row)) || statement_reads(statement, row)
+            }
+            Stmt::Insert(insert) => {
+                insert
+                    .rows
+                    .iter()
+                    .any(|values| values.iter().any(|value| expression_reads(value, row)))
+                    || insert
+                        .select
+                        .is_some_and(|select| select_reads(select, row))
+                    || items_read(insert.returning.items, row)
+            }
+            Stmt::Update(update) => {
+                update
+                    .assignments
+                    .iter()
+                    .any(|(_, value)| expression_reads(value, row))
+                    || update.from.is_some_and(|from| from_reads(from, row))
+                    || update
+                        .where_clause
+                        .is_some_and(|condition| expression_reads(condition, row))
+                    || items_read(update.returning.items, row)
+            }
+            Stmt::Delete(delete) => {
+                delete.using.is_some_and(|from| from_reads(from, row))
+                    || delete
+                        .where_clause
+                        .is_some_and(|condition| expression_reads(condition, row))
+                    || items_read(delete.returning.items, row)
+            }
+            _ => false,
+        }
+    }
+
+    fn items_read(items: &[SelectItem<'_>], row: &str) -> bool {
+        items.iter().any(|item| match item {
+            SelectItem::Expr { expression, .. } => expression_reads(expression, row),
+            SelectItem::TableWildcard(name) => name.eq_ignore_ascii_case(row),
+            _ => false,
+        })
+    }
+
+    fn select_reads(select: &Select<'_>, row: &str) -> bool {
+        select.with.iter().any(|cte| cte_reads(cte, row))
+            || items_read(select.items, row)
+            || select
+                .from
+                .as_ref()
+                .is_some_and(|from| from_reads(from, row))
+            || select
+                .where_clause
+                .is_some_and(|condition| expression_reads(condition, row))
+            || select
+                .having
+                .is_some_and(|condition| expression_reads(condition, row))
+            || select.group_by.iter().any(|key| expression_reads(key, row))
+            || select
+                .distinct_on
+                .iter()
+                .any(|key| expression_reads(key, row))
+            || select
+                .order_by
+                .iter()
+                .any(|order| expression_reads(order.expression, row))
+            || select.set_body.is_some_and(|tree| tree_reads(tree, row))
+    }
+
+    fn tree_reads(tree: &SetTree<'_>, row: &str) -> bool {
+        match tree {
+            SetTree::Select(select) => select_reads(select, row),
+            SetTree::Op { left, right, .. } => tree_reads(left, row) || tree_reads(right, row),
+        }
+    }
+
+    fn from_reads(from: &FromClause<'_>, row: &str) -> bool {
+        item_reads(&from.base, row)
+            || from.joins.iter().any(|join| {
+                item_reads(&join.table, row)
+                    || join
+                        .on
+                        .is_some_and(|condition| expression_reads(condition, row))
+            })
+    }
+
+    fn item_reads(item: &TableRef<'_>, row: &str) -> bool {
+        item.subquery
+            .is_some_and(|select| select_reads(select, row))
+            || item
+                .func_args
+                .is_some_and(|args| args.iter().any(|argument| expression_reads(argument, row)))
+    }
+
+    fn expression_reads(expression: &Expr<'_>, row: &str) -> bool {
+        let found = match expression {
+            Expr::Column {
+                qualifier: Some(qualifier),
+                ..
+            } => qualifier.eq_ignore_ascii_case(row),
+            Expr::WholeRow(name) => name.eq_ignore_ascii_case(row),
+            Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => {
+                select_reads(select, row)
+            }
+            Expr::InSubquery { select, .. } | Expr::QuantifiedSubquery { select, .. } => {
+                select_reads(select, row)
+            }
+            _ => false,
+        };
+        if found {
+            return true;
+        }
+        let mut child_reads = false;
+        let _ = crate::sql::query::walk_children(expression, &mut |child| {
+            child_reads |= expression_reads(child, row);
+            Ok(())
+        });
+        child_reads
+    }
 }

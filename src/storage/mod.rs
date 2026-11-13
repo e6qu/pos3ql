@@ -989,7 +989,40 @@ pub enum ColumnDefault {
         expression: StackStr<DEFAULT_EXPR_MAX>,
     },
     Expression(StackStr<DEFAULT_EXPR_MAX>),
-    Generated(StackStr<DEFAULT_EXPR_MAX>),
+    Generated {
+        expression: StackStr<DEFAULT_EXPR_MAX>,
+        kind: Generation,
+    },
+}
+
+/// How a generated column holds its value. PostgreSQL 18 computes a
+/// `VIRTUAL` column when it is read and keeps a `STORED` one in the row. A
+/// generation expression reads only its own row and is immutable, so pos3ql
+/// keeps both kinds' values in the row; the kind decides what PostgreSQL
+/// exposes (`attgenerated`, trigger rows, error details) and which
+/// definitions are allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Generation {
+    Stored,
+    Virtual,
+}
+
+impl Generation {
+    /// `pg_attribute.attgenerated`.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Stored => b's',
+            Self::Virtual => b'v',
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            b's' => Some(Self::Stored),
+            b'v' => Some(Self::Virtual),
+            _ => None,
+        }
+    }
 }
 
 impl ColumnDefault {
@@ -1000,32 +1033,50 @@ impl ColumnDefault {
             Self::None => None,
             Self::Constant { expression, .. }
             | Self::Expression(expression)
-            | Self::Generated(expression) => Some(expression),
+            | Self::Generated { expression, .. } => Some(expression),
         }
     }
 
     pub const fn constant(&self) -> Option<&OwnedDatum> {
         match self {
             Self::Constant { value, .. } => Some(value),
-            Self::None | Self::Expression(_) | Self::Generated(_) => None,
+            Self::None | Self::Expression(_) | Self::Generated { .. } => None,
         }
     }
 
     pub const fn is_generated(self) -> bool {
-        matches!(self, Self::Generated(_))
+        matches!(self, Self::Generated { .. })
+    }
+
+    /// The generation kind of a generated column.
+    pub const fn generation(self) -> Option<Generation> {
+        match self {
+            Self::Generated { kind, .. } => Some(kind),
+            _ => None,
+        }
+    }
+
+    pub const fn is_virtual(self) -> bool {
+        matches!(
+            self,
+            Self::Generated {
+                kind: Generation::Virtual,
+                ..
+            }
+        )
     }
 
     pub const fn from_parts(
         value: Option<OwnedDatum>,
         expression: Option<StackStr<DEFAULT_EXPR_MAX>>,
-        generated: bool,
+        generation: Option<Generation>,
     ) -> Option<Self> {
-        match (value, expression, generated) {
-            (None, None, false) => Some(Self::None),
-            (Some(value), Some(expression), false) => Some(Self::Constant { value, expression }),
-            (Some(_), None, false) => None,
-            (None, Some(expression), false) => Some(Self::Expression(expression)),
-            (None, Some(expression), true) => Some(Self::Generated(expression)),
+        match (value, expression, generation) {
+            (None, None, None) => Some(Self::None),
+            (Some(value), Some(expression), None) => Some(Self::Constant { value, expression }),
+            (Some(_), None, None) => None,
+            (None, Some(expression), None) => Some(Self::Expression(expression)),
+            (None, Some(expression), Some(kind)) => Some(Self::Generated { expression, kind }),
             _ => None,
         }
     }
@@ -2132,9 +2183,19 @@ pub struct ForeignKey {
     pub parent_cols: [u16; MAX_INDEX_COLS],
     pub n_parent_cols: usize,
     pub on_delete: FkAction,
+    /// The referencing columns `ON DELETE SET NULL (...)` or `SET DEFAULT
+    /// (...)` changes, in written order (PostgreSQL's `confdelsetcols`);
+    /// none means every key column.
+    pub delete_set_cols: [u16; MAX_INDEX_COLS],
+    pub n_delete_set_cols: usize,
     pub on_update: FkAction,
     pub timing: ConstraintTiming,
     pub validation: ConstraintValidation,
+    /// The firing modes of the foreign key's four RI triggers, indexed by
+    /// [`ForeignKeyTrigger::ordinal`] (PostgreSQL's `tgenabled`): `ALTER
+    /// TABLE ... ENABLE/DISABLE TRIGGER` on the referencing or referenced
+    /// table changes them.
+    pub(crate) trigger_enabled: [TriggerEnabled; 4],
 }
 
 impl ForeignKey {
@@ -2148,13 +2209,24 @@ impl ForeignKey {
         parent_cols: [0u16; MAX_INDEX_COLS],
         n_parent_cols: 0,
         on_delete: FkAction::NoAction,
+        delete_set_cols: [0u16; MAX_INDEX_COLS],
+        n_delete_set_cols: 0,
         on_update: FkAction::NoAction,
         timing: ConstraintTiming::NotDeferrable,
         validation: ConstraintValidation::EnforcedValidated,
+        trigger_enabled: [TriggerEnabled::Origin; 4],
     };
+
+    pub(crate) const fn trigger_enabled(&self, trigger: ForeignKeyTrigger) -> TriggerEnabled {
+        self.trigger_enabled[trigger.ordinal()]
+    }
 
     pub fn columns(&self) -> &[u16] {
         &self.columns[..self.n_cols]
+    }
+
+    pub fn delete_set_cols(&self) -> &[u16] {
+        &self.delete_set_cols[..self.n_delete_set_cols]
     }
 
     pub fn parent_cols(&self) -> &[u16] {
@@ -4002,6 +4074,151 @@ impl CollationDef {
 
 pub(crate) const MAX_CATALOG_CREATION: u64 = 9_999_999;
 
+/// Text search objects initdb creates in every database: the default parser,
+/// five templates, the `simple` dictionary and configuration, then a Snowball
+/// dictionary and configuration for each of PostgreSQL's 29 languages
+/// (`snowball_create.sql`). The Snowball OIDs follow the PostgreSQL 18.6
+/// reference image, where initdb numbers them after the platform collations.
+pub(crate) const BUILTIN_TEXT_SEARCH_OBJECTS: usize = 8 + 2 * SNOWBALL_CONFIGURATIONS;
+// Database identity checks track the built-in objects in a `u128` bitmap.
+const _: () = assert!(BUILTIN_TEXT_SEARCH_OBJECTS <= 128);
+/// Slots the built-in objects of `postgres`, `template1` and `template0` take.
+pub(crate) const BUILTIN_TEXT_SEARCH_SLOTS: usize = 3 * BUILTIN_TEXT_SEARCH_OBJECTS;
+const SNOWBALL_CONFIGURATIONS: usize = 29;
+use crate::sql::catalog::{
+    DSNOWBALL_INIT_OID, DSNOWBALL_LEXIZE_OID, FIRST_SNOWBALL_DICTIONARY_OID, SNOWBALL_TEMPLATE_OID,
+};
+
+/// The languages with a built-in Snowball configuration, in initdb's order.
+pub(crate) fn builtin_snowball_languages()
+-> impl Iterator<Item = crate::sql::snowball::SnowballLanguage> {
+    crate::sql::snowball::SnowballLanguage::ALL
+        .iter()
+        .copied()
+        .filter(|language| *language != crate::sql::snowball::SnowballLanguage::Porter)
+}
+
+pub(crate) fn builtin_text_search_definition(ordinal: usize) -> Option<TextSearchDefinition> {
+    use crate::sql::snowball::{SnowballLanguage, StopwordList};
+    use core::fmt::Write as _;
+    let pg_catalog = SqlName::parse("pg_catalog").expect("builtin schema fits");
+    let name = |value: &str| SqlName::parse(value).expect("builtin name fits");
+    let template = |value, oid, kind| {
+        let (_, init, lexize) = TextSearchTemplateKind::ALL
+            .into_iter()
+            .find(|(candidate, ..)| *candidate == kind)
+            .expect("listed template kind");
+        TextSearchDefinition::Template {
+            schema: pg_catalog,
+            name: name(value),
+            oid,
+            init,
+            lexize,
+            kind,
+        }
+    };
+    let mut simple_mappings = TextSearchMappings::EMPTY;
+    for token in [
+        1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22,
+    ] {
+        simple_mappings.dictionaries[token - 1][0] = 3765;
+        simple_mappings.counts[token - 1] = 1;
+    }
+    Some(match ordinal {
+        0 => TextSearchDefinition::Parser {
+            schema: pg_catalog,
+            name: name("default"),
+            oid: 3722,
+            start: 3717,
+            gettoken: 3718,
+            end: 3719,
+            headline: 3720,
+            lextypes: 3721,
+        },
+        1 => template("simple", 3727, TextSearchTemplateKind::Simple),
+        2 => template("synonym", 3730, TextSearchTemplateKind::Synonym),
+        3 => template("ispell", 3733, TextSearchTemplateKind::Ispell),
+        4 => template("thesaurus", 3742, TextSearchTemplateKind::Thesaurus),
+        5 => template(
+            "snowball",
+            SNOWBALL_TEMPLATE_OID,
+            TextSearchTemplateKind::Snowball,
+        ),
+        6 => TextSearchDefinition::Dictionary {
+            schema: pg_catalog,
+            name: name("simple"),
+            oid: 3765,
+            owner: 10,
+            template: 3727,
+            options: StackStr::new(),
+            behavior: TextSearchDictionaryBehavior::SIMPLE,
+        },
+        7 => TextSearchDefinition::Configuration {
+            schema: pg_catalog,
+            name: name("simple"),
+            oid: 3748,
+            owner: 10,
+            parser: 3722,
+            mappings: simple_mappings,
+        },
+        _ => {
+            let index = (ordinal - 8) / 2;
+            let language = builtin_snowball_languages().nth(index)?;
+            let dictionary_oid = |language: SnowballLanguage| {
+                let index = builtin_snowball_languages()
+                    .position(|candidate| candidate == language)
+                    .expect("built-in language");
+                FIRST_SNOWBALL_DICTIONARY_OID + 2 * index as i32
+            };
+            let mut text = StackStr::<64>::new();
+            if (ordinal - 8).is_multiple_of(2) {
+                let stopwords = StopwordList::parse(language.name());
+                let mut options = StackStr::<512>::new();
+                let _ = write!(options, "language = '{}'", language.name());
+                if let Some(list) = stopwords {
+                    let _ = write!(options, ", stopwords = '{}'", list.name());
+                }
+                let _ = write!(text, "{}_stem", language.name());
+                TextSearchDefinition::Dictionary {
+                    schema: pg_catalog,
+                    name: name(text.as_str()),
+                    oid: dictionary_oid(language),
+                    owner: 10,
+                    template: SNOWBALL_TEMPLATE_OID,
+                    options,
+                    behavior: TextSearchDictionaryBehavior::Snowball {
+                        language,
+                        stopwords,
+                    },
+                }
+            } else {
+                // Hindi and Russian stem all-ASCII words as English.
+                let ascii = match language {
+                    SnowballLanguage::Hindi | SnowballLanguage::Russian => {
+                        SnowballLanguage::English
+                    }
+                    other => other,
+                };
+                let mut mappings = simple_mappings;
+                for token in [1usize, 11, 16] {
+                    mappings.dictionaries[token - 1][0] = dictionary_oid(ascii);
+                }
+                for token in [2usize, 10, 17] {
+                    mappings.dictionaries[token - 1][0] = dictionary_oid(language);
+                }
+                TextSearchDefinition::Configuration {
+                    schema: pg_catalog,
+                    name: name(language.name()),
+                    oid: dictionary_oid(language) + 1,
+                    owner: 10,
+                    parser: 3722,
+                    mappings,
+                }
+            }
+        }
+    })
+}
+
 #[derive(Clone, Copy)]
 enum TextSearchIdentity {
     Builtin { oid: i32, ordinal: u8 },
@@ -4020,22 +4237,18 @@ impl TextSearchIdentity {
             }
             return Ok(Self::Created(created));
         }
-        use crate::sql::ast::TextSearchObjectKind as Kind;
-        let ordinal = match (definition.kind(), definition.oid()) {
-            (Kind::Parser, 3722) => 0,
-            (Kind::Template, 3727) => 1,
-            (Kind::Template, 13_234) => 2,
-            (Kind::Dictionary, 3765) => 3,
-            (Kind::Dictionary, 13_247) => 4,
-            (Kind::Configuration, 3748) => 5,
-            (Kind::Configuration, 13_248) => 6,
-            _ => {
-                return Err(sql_err!(
+        let ordinal = (0..BUILTIN_TEXT_SEARCH_OBJECTS)
+            .find(|ordinal| {
+                builtin_text_search_definition(*ordinal).is_some_and(|builtin| {
+                    builtin.kind() == definition.kind() && builtin.oid() == definition.oid()
+                })
+            })
+            .ok_or_else(|| {
+                sql_err!(
                     sqlstate::DATA_EXCEPTION,
                     "stored text search object has no valid builtin or creation identity"
-                ));
-            }
-        };
+                )
+            })? as u8;
         Ok(Self::Builtin {
             oid: definition.oid(),
             ordinal,
@@ -4066,10 +4279,114 @@ fn text_search_lifetime_oid(
 pub(crate) const TEXT_SEARCH_TOKEN_TYPES: usize = 23;
 pub(crate) const TEXT_SEARCH_DICTIONARIES_PER_TOKEN: usize = 4;
 
+/// The dictionary kind a text search template's support routines implement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextSearchTemplateKind {
+    Simple,
+    Synonym,
+    Ispell,
+    Thesaurus,
+    Snowball,
+}
+
+impl TextSearchTemplateKind {
+    const ALL: [(Self, i32, i32); 5] = [
+        (Self::Simple, 3725, 3726),
+        (Self::Synonym, 3728, 3729),
+        (Self::Ispell, 3731, 3732),
+        (Self::Thesaurus, 3740, 3741),
+        (Self::Snowball, DSNOWBALL_INIT_OID, DSNOWBALL_LEXIZE_OID),
+    ];
+
+    /// The kind whose `init` and `lexize` routines these are; `init` is
+    /// optional for the simple template, as in PostgreSQL's catalog.
+    pub(crate) fn from_routines(init: i32, lexize: i32) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .find(|(kind, kind_init, kind_lexize)| {
+                lexize == *kind_lexize
+                    && (init == *kind_init || (init == 0 && *kind == Self::Simple))
+            })
+            .map(|(kind, ..)| *kind)
+    }
+
+    pub(crate) fn code(self) -> u8 {
+        Self::ALL
+            .iter()
+            .position(|(kind, ..)| *kind == self)
+            .expect("listed template kind") as u8
+    }
+
+    pub(crate) fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(code)).map(|(kind, ..)| *kind)
+    }
+}
+
+/// How a text search dictionary turns a token into lexemes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TextSearchDictionaryBehavior {
-    Simple { accept: bool },
-    EnglishStem,
+    Simple {
+        accept: bool,
+        stopwords: Option<crate::sql::snowball::StopwordList>,
+    },
+    Snowball {
+        language: crate::sql::snowball::SnowballLanguage,
+        stopwords: Option<crate::sql::snowball::StopwordList>,
+    },
+}
+
+impl TextSearchDictionaryBehavior {
+    pub(crate) const SIMPLE: Self = Self::Simple {
+        accept: true,
+        stopwords: None,
+    };
+
+    /// Stable encoding: kind, then accept or language, then stopword list.
+    pub(crate) fn code(self) -> [u8; 3] {
+        let stopwords = |list: Option<crate::sql::snowball::StopwordList>| {
+            list.map_or(0, |list| {
+                1 + crate::sql::snowball::StopwordList::ALL
+                    .iter()
+                    .position(|candidate| *candidate == list)
+                    .expect("listed stopword file") as u8
+            })
+        };
+        match self {
+            Self::Simple {
+                accept,
+                stopwords: list,
+            } => [0, u8::from(accept), stopwords(list)],
+            Self::Snowball {
+                language,
+                stopwords: list,
+            } => [
+                1,
+                crate::sql::snowball::SnowballLanguage::ALL
+                    .iter()
+                    .position(|candidate| *candidate == language)
+                    .expect("listed Snowball language") as u8,
+                stopwords(list),
+            ],
+        }
+    }
+
+    pub(crate) fn from_code(code: [u8; 3]) -> Option<Self> {
+        let stopwords = match code[2] {
+            0 => None,
+            list => Some(*crate::sql::snowball::StopwordList::ALL.get(usize::from(list) - 1)?),
+        };
+        match code[0] {
+            0 if code[1] <= 1 => Some(Self::Simple {
+                accept: code[1] == 1,
+                stopwords,
+            }),
+            1 => Some(Self::Snowball {
+                language: *crate::sql::snowball::SnowballLanguage::ALL.get(usize::from(code[1]))?,
+                stopwords,
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4103,7 +4420,7 @@ pub(crate) enum TextSearchDefinition {
         oid: i32,
         init: i32,
         lexize: i32,
-        behavior: TextSearchDictionaryBehavior,
+        kind: TextSearchTemplateKind,
     },
     Dictionary {
         schema: SqlName,
@@ -4159,18 +4476,8 @@ impl TextSearchDefinition {
                     && matches!(headline, 0 | 3720)
             }
             Self::Template {
-                init,
-                lexize,
-                behavior,
-                ..
-            } => matches!(
-                (init, lexize, behavior),
-                (
-                    0 | 3725,
-                    3726,
-                    TextSearchDictionaryBehavior::Simple { accept: true }
-                ) | (13_232, 13_233, TextSearchDictionaryBehavior::EnglishStem)
-            ),
+                init, lexize, kind, ..
+            } => TextSearchTemplateKind::from_routines(init, lexize) == Some(kind),
             Self::Dictionary { .. } => true,
             Self::Configuration { mappings, .. } => (0..TEXT_SEARCH_TOKEN_TYPES).all(|token| {
                 usize::from(mappings.counts[token]) <= TEXT_SEARCH_DICTIONARIES_PER_TOKEN
@@ -5290,7 +5597,12 @@ impl StoredDependencyIdentity {
             Self::Collation(_) => class == DependencyClass::Collation,
             Self::TextSearchConfigurationOid(oid) => {
                 class == DependencyClass::TextSearchConfiguration
-                    && (matches!(oid, 3748 | 13_248) || (700_000_001..=709_999_999).contains(&oid))
+                    && ((0..BUILTIN_TEXT_SEARCH_OBJECTS).any(|ordinal| {
+                        builtin_text_search_definition(ordinal).is_some_and(|builtin| {
+                            builtin.kind() == crate::sql::ast::TextSearchObjectKind::Configuration
+                                && builtin.oid() == oid
+                        })
+                    }) || (700_000_001..=709_999_999).contains(&oid))
             }
             Self::RoutineOid(oid) => {
                 class == DependencyClass::Routine
@@ -6068,12 +6380,13 @@ impl RuleEnabled {
         }
     }
 
-    pub(crate) const fn fires_for_origin(self) -> bool {
-        matches!(self, Self::Origin | Self::Always)
-    }
-
-    pub(crate) const fn fires_for_replication(self) -> bool {
-        matches!(self, Self::Replica | Self::Always)
+    /// PostgreSQL's firing test under `session_replication_role`.
+    pub(crate) const fn fires_in(self, role: crate::sql::guc::SessionReplicationRole) -> bool {
+        if role.is_replica() {
+            matches!(self, Self::Replica | Self::Always)
+        } else {
+            matches!(self, Self::Origin | Self::Always)
+        }
     }
 }
 
@@ -6425,6 +6738,8 @@ pub struct ViewOptions {
     pub security: ViewSecurity,
     pub security_barrier: ViewSecurityBarrier,
     pub check_option: Option<ViewCheckOption>,
+    /// Which statement wrote the query; not a reloption.
+    pub query_origin: ViewQueryOrigin,
     /// The options `pg_class.reloptions` lists; an explicit
     /// `security_invoker=false` is listed although it selects the default.
     pub order: ViewOptionOrder,
@@ -6435,19 +6750,21 @@ impl ViewOptions {
         security: ViewSecurity::Definer,
         security_barrier: ViewSecurityBarrier::Default,
         check_option: None,
+        query_origin: ViewQueryOrigin::View,
         order: ViewOptionOrder::EMPTY,
     };
 
-    pub const ENCODED_BYTES: usize = 3 + ViewOptionOrder::ENCODED_BYTES;
+    pub const ENCODED_BYTES: usize = 4 + ViewOptionOrder::ENCODED_BYTES;
 
-    /// The journal and checkpoint image: security, barrier and check option
-    /// codes, then the listed options.
+    /// The journal and checkpoint image: security, barrier, check option and
+    /// query-origin codes, then the listed options.
     pub fn encode(self) -> [u8; Self::ENCODED_BYTES] {
         let mut bytes = [0; Self::ENCODED_BYTES];
         bytes[0] = u8::from(self.security == ViewSecurity::Invoker);
         bytes[1] = self.security_barrier.code();
         bytes[2] = self.check_option.map_or(0, ViewCheckOption::code);
-        bytes[3..].copy_from_slice(&self.order.encode());
+        bytes[3] = self.query_origin.code();
+        bytes[4..].copy_from_slice(&self.order.encode());
         bytes
     }
 
@@ -6463,7 +6780,8 @@ impl ViewOptions {
                 0 => None,
                 code => Some(ViewCheckOption::from_code(code)?),
             },
-            order: ViewOptionOrder::decode(bytes[3..].try_into().ok()?)?,
+            query_origin: ViewQueryOrigin::from_code(bytes[3])?,
+            order: ViewOptionOrder::decode(bytes[4..].try_into().ok()?)?,
         };
         options.is_consistent().then_some(options)
     }
@@ -6677,6 +6995,33 @@ impl ViewOptionOrder {
         rest.order |= Self::kind_code(kind) << (2 * rest.names().count());
         rest.spellings[usize::from(Self::kind_code(kind)) - 1] = spelling;
         rest
+    }
+}
+
+/// Which statement wrote a view's query. PostgreSQL's `CREATE OR REPLACE
+/// RULE "_RETURN"` keeps the rule's `OLD` and `NEW` entries in the query's
+/// range table, so `pg_get_viewdef` qualifies every column it prints; a
+/// `CREATE VIEW` query has no such entries. Not a reloption.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewQueryOrigin {
+    View,
+    ReturnRule,
+}
+
+impl ViewQueryOrigin {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::View => 0,
+            Self::ReturnRule => 1,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::View),
+            1 => Some(Self::ReturnRule),
+            _ => None,
+        }
     }
 }
 
@@ -8282,6 +8627,58 @@ pub(crate) fn policy_oid(policy: &PolicyDef) -> i32 {
     OidBand::Policy.oid(policy.created_at)
 }
 
+impl Storage {
+    /// Resolves a durable trigger function reference (`schema`, `name`, no
+    /// arguments) from a journal or checkpoint: a built-in trigger function,
+    /// or a stored routine returning `trigger`. The error names the defect.
+    pub(crate) fn trigger_function_named(
+        &self,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Result<TriggerFunction, &'static str> {
+        if let Some(builtin) = BuiltinTriggerFunction::named(schema, name) {
+            return Ok(TriggerFunction::Builtin(builtin));
+        }
+        let slot = self
+            .routine_slot_by_signature(schema, name, &[], txid)
+            .ok_or("trigger function does not exist")?;
+        if !matches!(self.routine(slot).kind, RoutineKind::Trigger) {
+            return Err("trigger function is not trigger typed");
+        }
+        TriggerFunction::routine_slot(slot).map_err(|_| "trigger function slot is out of range")
+    }
+
+    /// The schema and name of the function a trigger runs, as `txid` sees
+    /// them.
+    pub(crate) fn trigger_function_name(
+        &self,
+        function: TriggerFunction,
+        txid: u32,
+    ) -> (SqlName, SqlName) {
+        match function {
+            TriggerFunction::Routine(slot) => {
+                let routine = self.routine(usize::from(slot));
+                (routine.schema_for(txid), routine.name_for(txid))
+            }
+            TriggerFunction::Builtin(builtin) => (
+                SqlName::parse("pg_catalog").expect("pg_catalog is a valid name"),
+                SqlName::parse(builtin.name()).expect("built-in trigger function names are valid"),
+            ),
+        }
+    }
+}
+
+/// The `pg_proc` OID of the function a trigger runs.
+pub(crate) fn trigger_function_oid(storage: &Storage, function: TriggerFunction, txid: u32) -> i32 {
+    match function {
+        TriggerFunction::Routine(slot) => {
+            routine_oid(&storage.routine_for(usize::from(slot), txid))
+        }
+        TriggerFunction::Builtin(builtin) => builtin.oid(),
+    }
+}
+
 pub(crate) fn routine_oid(routine: &RoutineDef) -> i32 {
     OidBand::Routine.oid(routine.created_at)
 }
@@ -8363,6 +8760,17 @@ impl RoutineParameterMode {
             3 => Some(Self::Variadic { default }),
             _ => None,
         }
+    }
+}
+
+/// The result column a routine's output parameter is, `output` counting
+/// its outputs from zero: its own name, or PostgreSQL's `columnN`.
+pub(crate) fn output_column_name(name: SqlName, output: usize) -> SqlName {
+    if name.as_str().is_empty() {
+        SqlName::parse(crate::stack_format!(24, "column{}", output + 1).as_str())
+            .expect("generated column name fits")
+    } else {
+        name
     }
 }
 
@@ -8574,32 +8982,15 @@ impl PolymorphicBinding {
         implicit: impl Fn(i32, i32) -> bool,
     ) -> Option<ResolvedPolymorphicBinding> {
         let inputs = &self.compatible_inputs[..self.compatible_count];
-        let compatible = match inputs.split_first() {
-            None => None,
-            Some((first, rest)) if rest.iter().all(|oid| oid == first) => Some(*first),
-            Some(_) => {
-                let mut selected = base(inputs[0]);
-                let mut selected_category = category(selected)?;
-                for input in &inputs[1..] {
-                    let input = base(*input);
-                    if input == selected {
-                        continue;
-                    }
-                    if category(input)? != selected_category {
-                        return None;
-                    }
-                    if !crate::sql::types::preferred_type_oid(selected)
-                        && implicit(selected, input)
-                        && !implicit(input, selected)
-                    {
-                        selected = input;
-                        selected_category = category(selected)?;
-                    }
+        let compatible = match inputs {
+            [] => None,
+            // Identical inputs are the common type whatever their category.
+            [first, rest @ ..] if rest.iter().all(|input| input == first) => Some(*first),
+            inputs => {
+                if inputs.iter().any(|input| category(base(*input)).is_none()) {
+                    return None;
                 }
-                inputs
-                    .iter()
-                    .all(|input| implicit(*input, selected))
-                    .then_some(selected)
+                Some(select_common_type_with(inputs, base, category, implicit).ok()?)
             }
         };
         if let (Some(range), Some(selected)) = (self.compatible_range_element, compatible)
@@ -8612,6 +9003,125 @@ impl PolymorphicBinding {
             simple_array: self.simple_array,
             compatible,
         })
+    }
+}
+
+/// Why PostgreSQL's `select_common_type` and the `coerce_to_common_type`
+/// check after it found no common type, with the index of the input it
+/// reports the error at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommonTypeFailure {
+    /// `%s types %s and %s cannot be matched`: the type chosen so far and
+    /// an input of another category.
+    Category {
+        selected: i32,
+        input: i32,
+        index: usize,
+    },
+    /// `%s could not convert type %s to %s`: an input with no implicit
+    /// conversion to the chosen type.
+    Conversion {
+        input: i32,
+        selected: i32,
+        index: usize,
+    },
+}
+
+/// PostgreSQL's `select_common_type` over input type OIDs (`unknown` for an
+/// untyped literal or NULL), followed by the implicit-conversion check each
+/// input gets. Identical inputs keep their type, a domain included;
+/// otherwise inputs are compared by base type, a later type replaces the
+/// choice only when the current one is not preferred and converts to it
+/// implicitly but not back, and all-unknown inputs are `text`.
+pub(crate) fn select_common_type_with(
+    inputs: &[i32],
+    base: impl Fn(i32) -> i32,
+    category: impl Fn(i32) -> Option<&'static str>,
+    implicit: impl Fn(i32, i32) -> bool,
+) -> Result<i32, CommonTypeFailure> {
+    use crate::sql::types::oid;
+    let Some((&first, rest)) = inputs.split_first() else {
+        return Ok(oid::TEXT);
+    };
+    if first != oid::UNKNOWN && rest.iter().all(|input| *input == first) {
+        return Ok(first);
+    }
+    let category = |type_oid| category(type_oid).unwrap_or("X");
+    let mut selected = base(first);
+    for (index, input) in inputs.iter().enumerate().skip(1) {
+        let input = base(*input);
+        if input == oid::UNKNOWN || input == selected {
+            continue;
+        }
+        if selected == oid::UNKNOWN {
+            selected = input;
+        } else if category(input) != category(selected) {
+            return Err(CommonTypeFailure::Category {
+                selected,
+                input,
+                index,
+            });
+        } else if !crate::sql::types::preferred_type_oid(selected)
+            && implicit(selected, input)
+            && !implicit(input, selected)
+        {
+            selected = input;
+        }
+    }
+    if selected == oid::UNKNOWN {
+        selected = oid::TEXT;
+    }
+    for (index, input) in inputs.iter().enumerate() {
+        if *input != oid::UNKNOWN && *input != selected && !implicit(*input, selected) {
+            return Err(CommonTypeFailure::Conversion {
+                input: *input,
+                selected,
+                index,
+            });
+        }
+    }
+    Ok(selected)
+}
+
+/// [`select_common_type_with`] for built-in types only, where no catalog
+/// cast or domain can take part.
+pub(crate) fn builtin_select_common_type(inputs: &[i32]) -> Result<i32, CommonTypeFailure> {
+    let builtin = |oid: i32| {
+        crate::sql::types::ColType::from_oid(oid).filter(|_| NamedTypeKind::from_oid(oid).is_none())
+    };
+    select_common_type_with(
+        inputs,
+        |oid| oid,
+        |oid| builtin(oid).map(crate::sql::types::type_category),
+        |from, to| {
+            from == to
+                || builtin(from)
+                    .zip(builtin(to))
+                    .is_some_and(|(from, to)| crate::sql::types::builtin_implicit_cast(from, to))
+        },
+    )
+}
+
+impl Storage {
+    /// [`select_common_type_with`] against the catalog: domains, casts and
+    /// user-defined types take part.
+    pub(crate) fn select_common_type(
+        &self,
+        inputs: &[i32],
+        txid: u32,
+    ) -> Result<i32, CommonTypeFailure> {
+        select_common_type_with(
+            inputs,
+            |oid| {
+                self.domain_base_type_for_oid(oid, txid)
+                    .map_or(oid, ColType::oid)
+            },
+            |oid| {
+                self.routine_result_for_oid(oid, txid)
+                    .map(|result| crate::sql::types::type_category(result.ctype))
+            },
+            |from, to| self.routine_implicit_cast(from, to, txid),
+        )
     }
 }
 
@@ -10560,7 +11070,7 @@ pub(crate) enum RoutineCallKind {
 }
 
 impl RoutineCallKind {
-    const fn accepts(self, kind: RoutineKind) -> bool {
+    pub(crate) const fn accepts(self, kind: RoutineKind) -> bool {
         match self {
             Self::Function => kind.function_result().is_some(),
             Self::Scalar => kind.function_result().is_some() && !kind.is_set_returning(),
@@ -11132,6 +11642,68 @@ impl TriggerTarget {
     }
 }
 
+/// The function a trigger runs: a stored routine, or one of PostgreSQL's
+/// built-in trigger functions in `pg_catalog`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TriggerFunction {
+    Routine(u16),
+    Builtin(BuiltinTriggerFunction),
+}
+
+impl TriggerFunction {
+    /// Builds a routine reference from a routine catalog slot.
+    pub(crate) fn routine_slot(slot: usize) -> Result<Self, SqlError> {
+        u16::try_from(slot).map(Self::Routine).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "routine slot exceeds trigger capacity"
+            )
+        })
+    }
+
+    pub(crate) const fn routine(self) -> Option<usize> {
+        match self {
+            Self::Routine(slot) => Some(slot as usize),
+            Self::Builtin(_) => None,
+        }
+    }
+}
+
+/// PostgreSQL's built-in trigger functions that pos3ql runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BuiltinTriggerFunction {
+    /// `suppress_redundant_updates_trigger()`: a `BEFORE UPDATE` row trigger
+    /// that skips an update whose new row is identical to the old one.
+    SuppressRedundantUpdates,
+}
+
+impl BuiltinTriggerFunction {
+    pub(crate) const fn oid(self) -> i32 {
+        match self {
+            Self::SuppressRedundantUpdates => 1291,
+        }
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::SuppressRedundantUpdates => "suppress_redundant_updates_trigger",
+        }
+    }
+
+    pub(crate) const fn from_oid(oid: i32) -> Option<Self> {
+        match oid {
+            1291 => Some(Self::SuppressRedundantUpdates),
+            _ => None,
+        }
+    }
+
+    /// The built-in trigger function `schema.name` names, if any.
+    pub(crate) fn named(schema: &str, name: &str) -> Option<Self> {
+        (schema == "pg_catalog" && name == Self::SuppressRedundantUpdates.name())
+            .then_some(Self::SuppressRedundantUpdates)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TriggerDef {
     pub(crate) database: DatabaseOid,
@@ -11139,7 +11711,7 @@ pub(crate) struct TriggerDef {
     pub(crate) name: SqlName,
     pub(crate) target: TriggerTarget,
     pub(crate) kind: TriggerKind,
-    pub(crate) function: u16,
+    pub(crate) function: TriggerFunction,
     pub(crate) timing: crate::sql::ast::TriggerTiming,
     pub(crate) level: crate::sql::ast::TriggerLevel,
     pub(crate) events: crate::sql::ast::TriggerEvents,
@@ -11162,7 +11734,7 @@ pub(crate) struct PendingTriggerDefinition {
 pub(crate) struct TriggerDefinition {
     pub(crate) name: SqlName,
     pub(crate) kind: TriggerKind,
-    pub(crate) function: u16,
+    pub(crate) function: TriggerFunction,
     pub(crate) timing: crate::sql::ast::TriggerTiming,
     pub(crate) level: crate::sql::ast::TriggerLevel,
     pub(crate) events: crate::sql::ast::TriggerEvents,
@@ -11203,12 +11775,13 @@ impl TriggerEnabled {
         }
     }
 
-    pub(crate) const fn fires_for_origin(self) -> bool {
-        matches!(self, Self::Origin | Self::Always)
-    }
-
-    pub(crate) const fn fires_for_replication(self) -> bool {
-        matches!(self, Self::Replica | Self::Always)
+    /// PostgreSQL's firing test under `session_replication_role`.
+    pub(crate) const fn fires_in(self, role: crate::sql::guc::SessionReplicationRole) -> bool {
+        if role.is_replica() {
+            matches!(self, Self::Replica | Self::Always)
+        } else {
+            matches!(self, Self::Origin | Self::Always)
+        }
     }
 }
 
@@ -11232,7 +11805,7 @@ pub(crate) struct TriggerSpec {
     pub(crate) name: SqlName,
     pub(crate) target: TriggerTarget,
     pub(crate) kind: TriggerKind,
-    pub(crate) function: usize,
+    pub(crate) function: TriggerFunction,
     pub(crate) timing: crate::sql::ast::TriggerTiming,
     pub(crate) level: crate::sql::ast::TriggerLevel,
     pub(crate) events: crate::sql::ast::TriggerEvents,
@@ -11453,7 +12026,7 @@ impl TriggerDef {
         name: SqlName::EMPTY,
         target: TriggerTarget::Table(u16::MAX),
         kind: TriggerKind::Ordinary,
-        function: u16::MAX,
+        function: TriggerFunction::Routine(u16::MAX),
         timing: crate::sql::ast::TriggerTiming::Before,
         level: crate::sql::ast::TriggerLevel::Row,
         events: crate::sql::ast::TriggerEvents::from_bits(1).expect("INSERT event is valid"),
@@ -15734,6 +16307,25 @@ pub(crate) fn replace_execution_path(path: PathContext) -> PathContext {
     EXECUTION_PATH.with(|current| current.replace(path))
 }
 
+std::thread_local! {
+    static NO_FORCE_ROW_SECURITY: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Restores the caller's row security forcing when dropped.
+pub(crate) struct NoForceRowSecurityScope(bool);
+
+impl Drop for NoForceRowSecurityScope {
+    fn drop(&mut self) {
+        NO_FORCE_ROW_SECURITY.with(|current| current.set(self.0));
+    }
+}
+
+/// Exempts a table's owner from `FORCE ROW LEVEL SECURITY` while the scope
+/// lives, as PostgreSQL's referential queries run (`SECURITY_NOFORCE_RLS`).
+pub(crate) fn enter_no_force_row_security() -> NoForceRowSecurityScope {
+    NoForceRowSecurityScope(NO_FORCE_ROW_SECURITY.with(|current| current.replace(true)))
+}
+
 fn execution_visibility() -> VisibilityContext {
     EXECUTION_VISIBILITY.with(Cell::get)
 }
@@ -18797,7 +19389,7 @@ fn rename_column_default_schema(
         ColumnDefault::None => Ok(false),
         ColumnDefault::Constant { expression, .. }
         | ColumnDefault::Expression(expression)
-        | ColumnDefault::Generated(expression) => {
+        | ColumnDefault::Generated { expression, .. } => {
             crate::sql::enum_values::checks::rename_default_schema(
                 expression, spans, old, new, arena,
             )
@@ -22728,93 +23320,24 @@ impl Storage {
                 .push(TextSearchDef::EMPTY)
                 .expect("sized to text search capacity");
         }
-        let pg_catalog = SqlName::parse("pg_catalog").expect("builtin schema fits");
-        let present = |definition| TextSearchDef {
-            database: DatabaseOid::POSTGRES,
-            created_at: 0,
-            definition,
-            pending: None,
-            ddl_state: CatalogDdlState::Present,
-        };
-        text_search_objects[0] = present(TextSearchDefinition::Parser {
-            schema: pg_catalog,
-            name: SqlName::parse("default").expect("builtin name fits"),
-            oid: 3722,
-            start: 3717,
-            gettoken: 3718,
-            end: 3719,
-            headline: 3720,
-            lextypes: 3721,
-        });
-        text_search_objects[1] = present(TextSearchDefinition::Template {
-            schema: pg_catalog,
-            name: SqlName::parse("simple").expect("builtin name fits"),
-            oid: 3727,
-            init: 3725,
-            lexize: 3726,
-            behavior: TextSearchDictionaryBehavior::Simple { accept: true },
-        });
-        text_search_objects[2] = present(TextSearchDefinition::Template {
-            schema: pg_catalog,
-            name: SqlName::parse("snowball").expect("builtin name fits"),
-            oid: 13_234,
-            init: 13_232,
-            lexize: 13_233,
-            behavior: TextSearchDictionaryBehavior::EnglishStem,
-        });
-        text_search_objects[3] = present(TextSearchDefinition::Dictionary {
-            schema: pg_catalog,
-            name: SqlName::parse("simple").expect("builtin name fits"),
-            oid: 3765,
-            owner: 10,
-            template: 3727,
-            options: StackStr::new(),
-            behavior: TextSearchDictionaryBehavior::Simple { accept: true },
-        });
-        text_search_objects[4] = present(TextSearchDefinition::Dictionary {
-            schema: pg_catalog,
-            name: SqlName::parse("english_stem").expect("builtin name fits"),
-            oid: 13_247,
-            owner: 10,
-            template: 13_234,
-            options: StackStr::from_str("language = 'english', stopwords = 'english'"),
-            behavior: TextSearchDictionaryBehavior::EnglishStem,
-        });
-        let mut simple_mappings = TextSearchMappings::EMPTY;
-        for token in [
-            1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22,
-        ] {
-            simple_mappings.dictionaries[token - 1][0] = 3765;
-            simple_mappings.counts[token - 1] = 1;
-        }
-        text_search_objects[5] = present(TextSearchDefinition::Configuration {
-            schema: pg_catalog,
-            name: SqlName::parse("simple").expect("builtin name fits"),
-            oid: 3748,
-            owner: 10,
-            parser: 3722,
-            mappings: simple_mappings,
-        });
-        let mut english_mappings = simple_mappings;
-        for token in [1usize, 2, 10, 11, 16, 17] {
-            english_mappings.dictionaries[token - 1][0] = 13_247;
-        }
-        text_search_objects[6] = present(TextSearchDefinition::Configuration {
-            schema: pg_catalog,
-            name: SqlName::parse("english").expect("builtin name fits"),
-            oid: 13_248,
-            owner: 10,
-            parser: 3722,
-            mappings: english_mappings,
-        });
-        for (database, offset) in [
-            (DatabaseOid::TEMPLATE1, 7usize),
-            (DatabaseOid::TEMPLATE0, 14usize),
-        ] {
-            for builtin in 0..7 {
-                let mut definition = text_search_objects[builtin];
-                definition.database = database;
-                text_search_objects[offset + builtin] = definition;
+        for (offset, database) in [
+            DatabaseOid::POSTGRES,
+            DatabaseOid::TEMPLATE1,
+            DatabaseOid::TEMPLATE0,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for ordinal in 0..BUILTIN_TEXT_SEARCH_OBJECTS {
+                text_search_objects[offset * BUILTIN_TEXT_SEARCH_OBJECTS + ordinal] =
+                    TextSearchDef {
+                        database,
+                        created_at: 0,
+                        definition: builtin_text_search_definition(ordinal)
+                            .expect("ordinal below the builtin count"),
+                        pending: None,
+                        ddl_state: CatalogDdlState::Present,
+                    };
             }
         }
         let mut event_triggers =
@@ -25881,16 +26404,18 @@ impl Storage {
                         )
                     }
                 };
-                let source_routine_oid =
-                    routine_oid(&self.routine(usize::from(definition.function)));
-                definition.function = self
-                    .routine_slot_by_oid(source_routine_oid, txid)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "template trigger routine was not cloned"
-                        )
-                    })? as u16;
+                if let TriggerFunction::Routine(source) = definition.function {
+                    let source_routine_oid = routine_oid(&self.routine(usize::from(source)));
+                    definition.function = TriggerFunction::routine_slot(
+                        self.routine_slot_by_oid(source_routine_oid, txid)
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "template trigger routine was not cloned"
+                                )
+                            })?,
+                    )?;
+                }
                 let mut trigger_catalog = self
                     .trigger_catalog
                     .lock()
@@ -28112,7 +28637,7 @@ impl Storage {
             AccessClass::Domain => self.domain(slot).visible_to(txid),
             AccessClass::Enum => self.enum_for(slot, txid).visible_to(txid),
             AccessClass::Index => self.index(slot).visible_to(txid),
-            AccessClass::Routine => self.routine(slot).visible_to(txid),
+            AccessClass::Routine => self.routine_visible_to(slot, txid),
             AccessClass::Composite => self.composite(slot).visible_to(txid),
             AccessClass::Tablespace => self.tablespace(slot).visible_to(txid),
             AccessClass::Statistics => self.extended_statistics(slot).visible_to(txid),
@@ -28162,7 +28687,7 @@ impl Storage {
             AccessClass::Domain => Some(self.domain(slot).database),
             AccessClass::Enum => Some(self.enum_for(slot, 0).database),
             AccessClass::Index => Some(self.index(slot).database),
-            AccessClass::Routine => Some(self.routine(slot).database),
+            AccessClass::Routine => Some(self.routine_database(slot)),
             AccessClass::Composite => Some(self.composite(slot).database),
             AccessClass::Statistics => Some(self.extended_statistics(slot).database),
             AccessClass::Extension => Some(self.extension(slot).database),
@@ -30025,6 +30550,34 @@ impl Storage {
                     }
                 },
             )
+    }
+
+    /// Whether the current role holds `required` on the parameter `name`:
+    /// as superuser, by grant, or with no role at all (internal work such as
+    /// logical replication apply).
+    pub(crate) fn current_role_has_parameter_privilege(
+        &self,
+        name: &str,
+        required: crate::sql::ast::ParameterPrivileges,
+        txid: u32,
+    ) -> bool {
+        self.current_role_slot(txid)
+            .is_none_or(|role| self.role_has_parameter_privilege(role, name, required, txid))
+    }
+
+    /// Whether `role` holds `required` on the parameter `name`, as superuser
+    /// or by grant.
+    pub(crate) fn role_has_parameter_privilege(
+        &self,
+        role: usize,
+        name: &str,
+        required: crate::sql::ast::ParameterPrivileges,
+        txid: u32,
+    ) -> bool {
+        self.role(role).attributes_to(txid).superuser
+            || crate::sql::ast::ParameterName::parse(name).is_some_and(|parameter| {
+                self.has_parameter_privilege(parameter, role, required, txid)
+            })
     }
 
     pub(crate) fn has_parameter_privilege(
@@ -38002,58 +38555,8 @@ impl Storage {
         Ok(true)
     }
 
-    /// Expands a logical relation through both ordinary inheritance and
-    /// partition attachment without allocating. A non-partitioned relation
-    /// contributes its own rows before its descendants; partitioned relations
-    /// contribute only their leaves. The caller supplies bounded storage sized
-    /// from the configured table catalog.
-    pub fn relation_leaf_slots(
-        &self,
-        root: usize,
-        txid: u32,
-        out: &mut [usize],
-    ) -> Result<usize, SqlError> {
-        fn visit(
-            storage: &Storage,
-            root: usize,
-            txid: u32,
-            out: &mut [usize],
-            n: &mut usize,
-        ) -> Result<(), SqlError> {
-            if out[..*n].contains(&root) {
-                return Ok(());
-            }
-            if !storage.table_def(root, txid).partition.is_partitioned() {
-                if *n == out.len() {
-                    return Err(sql_err!(
-                        crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "relation scan exceeds configured table capacity"
-                    ));
-                }
-                out[*n] = root;
-                *n += 1;
-            }
-            for child in 0..storage.table_count() {
-                if !storage.relation_visible_to_current_session(child, txid) {
-                    continue;
-                }
-                let child_def = storage.table_def(child, txid);
-                let partition_child = child_def.partition.attachment.is_some_and(|attachment| {
-                    usize::from(attachment.parent) == root && attachment.state.routable()
-                });
-                if !partition_child && !child_def.inheritance.contains(root) {
-                    continue;
-                }
-                visit(storage, child, txid, out, n)?;
-            }
-            Ok(())
-        }
-        let mut n = 0;
-        visit(self, root, txid, out, &mut n)?;
-        Ok(n)
-    }
-
-    /// Routes writes by partition bounds; scans use `relation_leaf_slots`.
+    /// Routes writes by partition bounds; scans and writes of a relation's
+    /// rows read its leaves through `sql::exec::relation_leaves_in_order`.
     pub fn partition_leaf_slots(
         &self,
         root: usize,
@@ -47721,6 +48224,28 @@ impl Storage {
         self.routine_at(slot).expect("routine slot is in range")
     }
 
+    /// Whether a routine slot is visible, read without copying its whole
+    /// definition, as catalog snapshots ask for every routine.
+    fn routine_visible_to(&self, slot: usize, txid: u32) -> bool {
+        self.routines
+            .lock()
+            .expect("routine catalog lock poisoned")
+            .get(slot)
+            .expect("routine slot is in range")
+            .visible_to(txid)
+    }
+
+    /// A routine's database, read without copying its whole definition, as
+    /// catalog snapshots ask for every routine's.
+    fn routine_database(&self, slot: usize) -> DatabaseOid {
+        self.routines
+            .lock()
+            .expect("routine catalog lock poisoned")
+            .get(slot)
+            .expect("routine slot is in range")
+            .database
+    }
+
     fn routine_at(&self, slot: usize) -> Option<RoutineDef> {
         self.routines
             .lock()
@@ -48149,6 +48674,48 @@ impl Storage {
     }
 
     /// Bind an already-owned definition without copying its reserved buffers.
+    /// Gives a PL/pgSQL routine's `record` inputs the named composite types
+    /// their arguments have, as PostgreSQL passes the actual argument type
+    /// to a `record` parameter: a NULL of such a type is then a row of that
+    /// type whose fields read NULL.
+    pub(crate) fn bind_record_arguments(
+        &self,
+        routine: &mut RoutineDef,
+        argument_type_oids: &[i32],
+        txid: u32,
+    ) {
+        if routine.language != RoutineLanguage::PlPgSql {
+            return;
+        }
+        for (input, oid) in argument_type_oids
+            .iter()
+            .enumerate()
+            .take(routine.argument_count)
+        {
+            if routine.arguments[input].ctype != ColType::Record
+                || routine.arguments[input].user_type.is_some()
+            {
+                continue;
+            }
+            let Some(concrete) = self
+                .routine_result_for_oid(*oid, txid)
+                .filter(|concrete| matches!(concrete.ctype, ColType::Composite(Some(_))))
+            else {
+                continue;
+            };
+            routine.arguments[input].ctype = concrete.ctype;
+            routine.arguments[input].user_type = concrete.user_type;
+            if let Some(parameter) = routine.parameters[..routine.parameter_count]
+                .iter_mut()
+                .filter(|parameter| parameter.mode.is_input())
+                .nth(input)
+            {
+                parameter.ctype = concrete.ctype;
+                parameter.user_type = concrete.user_type;
+            }
+        }
+    }
+
     pub(crate) fn bind_routine_call(
         &self,
         routine: &mut RoutineDef,
@@ -49159,7 +49726,8 @@ impl Storage {
         if attributes.superuser || attributes.bypass_row_level_security {
             return false;
         }
-        state.forced || self.object_owner(self.table_access_object(table, txid), txid) != role
+        (state.forced && !NO_FORCE_ROW_SECURITY.with(core::cell::Cell::get))
+            || self.object_owner(self.table_access_object(table, txid), txid) != role
     }
 
     pub(crate) fn policy_slot_on(&self, table: usize, name: &str, txid: u32) -> Option<usize> {
@@ -49829,12 +50397,7 @@ impl Storage {
             name: spec.name,
             target: spec.target,
             kind: spec.kind,
-            function: u16::try_from(spec.function).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "routine slot exceeds trigger capacity"
-                )
-            })?,
+            function: spec.function,
             timing: spec.timing,
             level: spec.level,
             events: spec.events,
@@ -50016,12 +50579,7 @@ impl Storage {
                 spec.name.as_str()
             ));
         }
-        let function = u16::try_from(spec.function).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "routine slot exceeds trigger capacity"
-            )
-        })?;
+        let function = spec.function;
         let prior = trigger.pending_definition;
         catalog.definitions[slot].pending_definition = Some(PendingTriggerDefinition {
             txid,
@@ -50186,12 +50744,7 @@ impl Storage {
             name: spec.name,
             target: spec.target,
             kind: spec.kind,
-            function: u16::try_from(spec.function).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "routine slot exceeds trigger capacity"
-                )
-            })?,
+            function: spec.function,
             timing: spec.timing,
             level: spec.level,
             events: spec.events,
@@ -50414,12 +50967,21 @@ impl Storage {
         &self,
         txid: u32,
     ) -> impl Iterator<Item = (usize, ExtendedStatisticsDef)> + '_ {
-        ExtendedStatisticsIter {
-            catalog: &self.extended_statistics_catalog,
-            next_slot: 0,
-        }
-        .filter(move |(_, statistics)| {
-            statistics.database == current_database() && statistics.visible_to(txid)
+        // Only the visible definitions are copied out of the catalog.
+        let mut next_slot = 0;
+        core::iter::from_fn(move || {
+            let catalog = self
+                .extended_statistics_catalog
+                .lock()
+                .expect("extended-statistics catalog lock poisoned");
+            loop {
+                let slot = next_slot;
+                let definition = catalog.definitions.get(slot)?;
+                next_slot += 1;
+                if definition.database == current_database() && definition.visible_to(txid) {
+                    return Some((slot, *definition));
+                }
+            }
         })
     }
 
@@ -56874,18 +57436,13 @@ impl Storage {
         &self,
         target: RuleTarget,
         event: RewriteEvent,
-        replication_apply: bool,
+        role: crate::sql::guc::SessionReplicationRole,
         txid: u32,
     ) -> impl Iterator<Item = (usize, RuleDef)> + '_ {
         self.rules_for(target, event, txid)
             .filter(move |(_, rule)| {
                 let definition = rule.definition_for(txid);
-                definition.is_view_return()
-                    || if replication_apply {
-                        definition.enabled.fires_for_replication()
-                    } else {
-                        definition.enabled.fires_for_origin()
-                    }
+                definition.is_view_return() || definition.enabled.fires_in(role)
             })
     }
 
@@ -57054,6 +57611,8 @@ impl Storage {
             RuleMetadataChange::Rename(_) | RuleMetadataChange::SetEnabled(_) => None,
         };
         let target = self.query_rule_target(selected.definition_for(txid).target, txid)?;
+        // Read before the catalog lock below; the relation's name lives there.
+        let (_, relation) = self.rule_target_names(selected.definition_for(txid).target, txid);
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
             type_contracts::CatalogPublicationInput::RuleMetadataEdit,
@@ -57157,7 +57716,9 @@ impl Storage {
         {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
-                "rule already exists for relation"
+                "rule \"{}\" for relation \"{}\" already exists",
+                definition.name.as_str(),
+                relation.as_str()
             ));
         }
         if matches!(change, RuleMetadataChange::Rename(_)) {
@@ -58399,12 +58960,22 @@ impl Storage {
         &self,
         txid: u32,
     ) -> impl Iterator<Item = (usize, OperatorFamilyDefinition)> + '_ {
-        OperatorFamilyIter {
-            catalog: &self.operator_catalog,
-            next_slot: 0,
-        }
-        .filter(move |(_, family)| family.database == current_database() && family.visible_to(txid))
-        .map(move |(slot, family)| (slot, family.definition_for(txid)))
+        // Only the visible families are copied out of the catalog.
+        let mut next_slot = 0;
+        core::iter::from_fn(move || {
+            let catalog = self
+                .operator_catalog
+                .lock()
+                .expect("operator catalog lock poisoned");
+            loop {
+                let slot = next_slot;
+                let family = catalog.families.get(slot)?;
+                next_slot += 1;
+                if family.database == current_database() && family.visible_to(txid) {
+                    return Some((slot, family.definition_for(txid)));
+                }
+            }
+        })
     }
 
     pub(crate) fn operator_family(&self, slot: usize) -> OperatorFamilyDef {

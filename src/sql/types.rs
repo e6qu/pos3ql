@@ -5078,6 +5078,9 @@ pub enum Datum<'a> {
 pub struct RecordField<'a> {
     pub name: &'a str,
     pub type_oid: i32,
+    /// The field's type modifier (`-1` for none), as PostgreSQL's record
+    /// tuple descriptors carry it from casts, query columns and row values.
+    pub type_mod: i32,
     pub value: Datum<'a>,
 }
 

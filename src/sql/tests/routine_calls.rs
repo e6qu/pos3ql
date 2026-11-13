@@ -2283,7 +2283,7 @@ fn saved_guc_values_preserve_raw_spelling_without_runtime_allocations() {
             "GUC_RAW,public"
         );
         {
-            let _scope = guc.enter_routine_configs(&configs).unwrap();
+            let _scope = guc.enter_unchecked_routine_configs(&configs).unwrap();
             assert_eq!(guc.get_owned("search_path").unwrap().as_str(), raw);
         }
         assert_eq!(
@@ -2321,7 +2321,7 @@ fn reset_xmloption_restores_the_connection_default_without_allocating() {
         assert!(guc.render().xml_document);
         guc.begin_transaction();
         {
-            let _scope = guc.enter_routine_configs(&configs).unwrap();
+            let _scope = guc.enter_unchecked_routine_configs(&configs).unwrap();
             guc.set_config("xmloption", Some("content"), false).unwrap();
         }
         assert_eq!(guc.get_owned("xmloption").unwrap().as_str(), "content");

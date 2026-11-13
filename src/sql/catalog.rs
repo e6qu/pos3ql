@@ -110,8 +110,19 @@ pub(crate) struct SynthTable<'a> {
 const FIRST_USER_OID: i32 = 16384;
 const PG_CATALOG_NS_OID: i32 = 11;
 const PG_TOAST_NS_OID: i32 = 99;
-// PostgreSQL 18.6 initdb image; capture: actions/runs/40192510296.
-const INFORMATION_SCHEMA_NS_OID: i32 = 13_293;
+/// initdb draws every OID it assigns after importing the platform's collations
+/// from one counter, so these objects' OIDs depend on the reference's locale
+/// and ICU set. They follow the pinned CI reference image (`postgres:18` on
+/// Debian trixie: three libc and 870 ICU 76 collations), where
+/// `snowball_create.sql`'s `dsnowball_init` is the first such object; a
+/// Homebrew build on macOS numbers the same objects 406 higher. Capture of
+/// `information_schema`: actions/runs/40192510296.
+pub(crate) const DSNOWBALL_INIT_OID: i32 = 13_232;
+pub(crate) const DSNOWBALL_LEXIZE_OID: i32 = DSNOWBALL_INIT_OID + 1;
+pub(crate) const SNOWBALL_TEMPLATE_OID: i32 = DSNOWBALL_INIT_OID + 2;
+/// Each Snowball dictionary is followed by its configuration.
+pub(crate) const FIRST_SNOWBALL_DICTIONARY_OID: i32 = DSNOWBALL_INIT_OID + 3;
+pub(crate) const INFORMATION_SCHEMA_NS_OID: i32 = DSNOWBALL_INIT_OID + 61;
 /// Well-known catalog OIDs, for `pg_description.classoid`.
 pub(crate) const PG_CLASS_OID: i32 = 1259;
 pub(crate) const PG_NAMESPACE_OID: i32 = 2615;
@@ -159,20 +170,20 @@ const ACCESS_METHODS: [(&str, i32, i32, &str, &str); 7] = [
 const INTERNAL_LANGUAGE_OID: i32 = 12;
 const C_LANGUAGE_OID: i32 = 13;
 const SQL_LANGUAGE_OID: i32 = 14;
-/// The `plpgsql` extension, language and handler OIDs of the PostgreSQL 18.6
-/// reference initdb whose routine rows `catalog_callable_signatures` records.
-pub(crate) const PLPGSQL_EXTENSION_OID: i32 = 14_049;
+/// The `plpgsql` extension, language and handler OIDs; initdb creates them
+/// last, after the collations (see `DSNOWBALL_INIT_OID`).
+pub(crate) const PLPGSQL_EXTENSION_OID: i32 = DSNOWBALL_INIT_OID + 411;
 /// The comment of the `plpgsql` extension package.
 const PLPGSQL_EXTENSION_COMMENT: &str = "PL/pgSQL procedural language";
-const PLPGSQL_CALL_HANDLER_OID: i32 = 14_050;
-const PLPGSQL_INLINE_HANDLER_OID: i32 = 14_051;
-const PLPGSQL_VALIDATOR_OID: i32 = 14_052;
+const PLPGSQL_CALL_HANDLER_OID: i32 = PLPGSQL_EXTENSION_OID + 1;
+const PLPGSQL_INLINE_HANDLER_OID: i32 = PLPGSQL_EXTENSION_OID + 2;
+const PLPGSQL_VALIDATOR_OID: i32 = PLPGSQL_EXTENSION_OID + 3;
 pub(crate) const PLPGSQL_HANDLER_OIDS: [i32; 3] = [
     PLPGSQL_CALL_HANDLER_OID,
     PLPGSQL_INLINE_HANDLER_OID,
     PLPGSQL_VALIDATOR_OID,
 ];
-pub(crate) const PLPGSQL_LANGUAGE_OID: i32 = 14_053;
+pub(crate) const PLPGSQL_LANGUAGE_OID: i32 = PLPGSQL_EXTENSION_OID + 4;
 /// `pg_proc.prolang` of a stored routine.
 pub(crate) const fn routine_language_oid(language: crate::storage::RoutineLanguage) -> i32 {
     match language {
@@ -498,6 +509,44 @@ mod callable_contract_tests {
     use super::*;
 
     #[test]
+    fn initdb_objects_after_collations_follow_one_numbering() {
+        let callable =
+            |oid| builtin_callable_by_oid(oid).map(|routine| (routine.schema, routine.name));
+        let routine = |oid| {
+            builtin_properties::ROUTINES
+                .iter()
+                .find(|routine| routine.oid == oid)
+                .map(|routine| routine.name)
+        };
+        for (oid, name) in [
+            (DSNOWBALL_INIT_OID, "dsnowball_init"),
+            (DSNOWBALL_LEXIZE_OID, "dsnowball_lexize"),
+            (PLPGSQL_CALL_HANDLER_OID, "plpgsql_call_handler"),
+            (PLPGSQL_INLINE_HANDLER_OID, "plpgsql_inline_handler"),
+            (PLPGSQL_VALIDATOR_OID, "plpgsql_validator"),
+        ] {
+            assert_eq!(callable(oid), Some(("pg_catalog", name)));
+            assert_eq!(routine(oid), Some(name));
+        }
+        assert_eq!(
+            callable(INFORMATION_SCHEMA_NS_OID + 1),
+            Some(("information_schema", "_pg_expandarray"))
+        );
+        for class in [PG_LANGUAGE_OID, PG_EXTENSION_OID] {
+            let object = if class == PG_LANGUAGE_OID {
+                PLPGSQL_LANGUAGE_OID
+            } else {
+                PLPGSQL_EXTENSION_OID
+            };
+            assert!(object_descriptions::OBJECT_DESCRIPTIONS.contains(&(
+                class,
+                object,
+                "PL/pgSQL procedural language"
+            )));
+        }
+    }
+
+    #[test]
     fn planner_procedures_match_every_callable_declaration() {
         let numeric = builtin_planner_procedure(1701).unwrap();
         assert_eq!(numeric.volatility, 0);
@@ -562,7 +611,11 @@ mod callable_contract_tests {
         for oid in [6183, 6184] {
             assert_eq!(builtin_planner_procedure(oid).unwrap().cost, 100.0);
         }
-        assert!(builtin_planner_procedure(13700).unwrap().forbidden);
+        assert!(
+            builtin_planner_procedure(INFORMATION_SCHEMA_NS_OID + 1)
+                .unwrap()
+                .forbidden
+        );
     }
 
     #[test]
@@ -578,6 +631,38 @@ mod callable_contract_tests {
             assert!(signature.required_arguments <= signature.arguments.len());
         }
     }
+}
+
+/// Whether every built-in function named `name` taking `argument_count`
+/// arguments is strict, so a call of it returns NULL for a NULL argument
+/// whichever overload it resolves to. False when there is none.
+pub(crate) fn builtin_overloads_strict(
+    storage: &Storage,
+    txid: u32,
+    name: &str,
+    argument_count: usize,
+) -> bool {
+    let first = builtin_properties::ROUTINES.partition_point(|routine| routine.name < name);
+    let mut any = false;
+    for routine in builtin_properties::ROUTINES[first..]
+        .iter()
+        .take_while(|routine| routine.name == name)
+        .filter(|routine| routine.argument_count == argument_count)
+    {
+        let Some(oid) = crate::storage::BuiltinRoutineOid::parse(routine.oid) else {
+            return false;
+        };
+        if !storage
+            .builtin_routine_state(oid, txid)
+            .attributes
+            .attributes
+            .strict
+        {
+            return false;
+        }
+        any = true;
+    }
+    any
 }
 
 const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
@@ -4870,6 +4955,165 @@ pub(crate) fn validate_enum_input_literal(
         .map_err(|_| super::query::arena_full_pub())?
 }
 
+/// An UNKNOWN literal converted to a built-in type, a domain over one, or an
+/// array of one runs that type's input routine during SQL analysis, as
+/// PostgreSQL's `coerce_type` does for constants: `nextval('missing')` and a
+/// dead `CASE` arm's `'abc'::integer` fail even when no row evaluates them.
+/// Enum literals have their own check; length and domain constraints remain
+/// runtime work, as in PostgreSQL.
+pub(crate) fn validate_literal_input(
+    storage: &Storage,
+    txid: u32,
+    text: &str,
+    target_oid: i32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let Some(target) = super::eval::constructor_type_from_oid(target_oid, &|oid| {
+        storage.domain_base_type_for_oid(oid, txid)
+    }) else {
+        return Ok(());
+    };
+    let builtin = (1..FIRST_USER_OID).contains(&target.oid())
+        && !matches!(
+            target,
+            ColType::Pseudo(_)
+                | ColType::Record
+                | ColType::Void
+                | ColType::Internal
+                | ColType::AnyArray
+                | ColType::PgDdlCommand
+        );
+    if !builtin {
+        return Ok(());
+    }
+    arena
+        .with_remaining_region(|scratch| {
+            let value = Datum::Text(text);
+            match target {
+                ColType::Array(element) if element.is_catalog_reference() => {
+                    let catalog = super::query::storage_catalog(storage, scratch, txid);
+                    super::eval::reg_array_cast(value, element, Some(&catalog), scratch)?;
+                }
+                ColType::Regtype => {
+                    let catalog = super::query::storage_catalog(storage, scratch, txid);
+                    super::eval::regtype_cast(value, Some(&catalog), scratch)?;
+                }
+                target if target.is_reg_object() => {
+                    let catalog = super::query::storage_catalog(storage, scratch, txid);
+                    super::eval::regobject_cast(value, target, Some(&catalog), scratch)?;
+                }
+                // An input the analysis cannot run here is reported by the
+                // evaluation that converts the literal.
+                target => match super::eval::cast_to(value, target, scratch) {
+                    Err(error) if error.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED => {}
+                    result => {
+                        result?;
+                    }
+                },
+            }
+            Ok(())
+        })
+        .map_err(|_| super::query::arena_full_pub())?
+}
+
+/// Runs [`validate_literal_input`] for each UNKNOWN literal a selected
+/// routine call passes.
+pub(crate) fn validate_call_literal_inputs(
+    storage: &Storage,
+    txid: u32,
+    selection: super::eval::RoutineCallSelection,
+    args: &[&super::ast::Expr<'_>],
+    argument_names: &[Option<&str>],
+    variadic: bool,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    use super::ast::Expr;
+    if !args.iter().any(|argument| matches!(argument, Expr::Str(_))) {
+        return Ok(());
+    }
+    let named = |index: usize| argument_names.get(index).copied().flatten();
+    match selection {
+        super::eval::RoutineCallSelection::Builtin { oid, .. } => {
+            let Some(routine) = builtin_callable_by_oid(oid) else {
+                return Ok(());
+            };
+            for (index, argument) in args.iter().enumerate() {
+                let Expr::Str(text) = argument else {
+                    continue;
+                };
+                let parameter = match named(index) {
+                    Some(name) => routine
+                        .argument_names
+                        .iter()
+                        .position(|written| *written == name),
+                    None => Some(index),
+                };
+                let Some(parameter) = parameter else {
+                    continue;
+                };
+                // Inputs spread over a variadic parameter take its element type.
+                let target = match routine.variadic_element {
+                    Some(element) if !variadic && parameter + 1 >= routine.arguments.len() => {
+                        element
+                    }
+                    _ => match routine.arguments.get(parameter) {
+                        Some(&declared) => declared,
+                        None => continue,
+                    },
+                };
+                validate_literal_input(storage, txid, text, target, arena)
+                    .map_err(|error| super::error_position::at_subject(error, text))?;
+            }
+        }
+        super::eval::RoutineCallSelection::Stored(slot) => {
+            let Some((_, mapping)) =
+                storage.routine_call_mapping(slot, argument_names, args.len(), variadic, txid)
+            else {
+                return Ok(());
+            };
+            let routine = storage.routine_for(slot, txid);
+            for (index, argument) in args.iter().enumerate() {
+                let Expr::Str(text) = argument else {
+                    continue;
+                };
+                let parameter = usize::from(mapping[index]);
+                let Some(declared) = routine.arguments().get(parameter) else {
+                    continue;
+                };
+                let variadic_input = routine
+                    .parameters()
+                    .iter()
+                    .filter(|parameter| parameter.mode.is_input())
+                    .nth(parameter)
+                    .is_some_and(|parameter| {
+                        matches!(
+                            parameter.mode,
+                            crate::storage::RoutineParameterMode::Variadic { .. }
+                        )
+                    });
+                let ctype = match declared.ctype {
+                    ColType::Array(element) if variadic_input && !variadic => element.to_coltype(),
+                    ctype => ctype,
+                };
+                if declared.user_type.is_some() && ctype == declared.ctype {
+                    // Domains and named types keep their own input routines.
+                    if let Some(target) =
+                        storage.routine_type_oid(declared.ctype, declared.user_type, txid)
+                    {
+                        validate_literal_input(storage, txid, text, target, arena)
+                            .map_err(|error| super::error_position::at_subject(error, text))?;
+                    }
+                    continue;
+                }
+                validate_literal_input(storage, txid, text, ctype.oid(), arena)
+                    .map_err(|error| super::error_position::at_subject(error, text))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_explicit_cast(
     storage: &Storage,
     txid: u32,
@@ -5551,86 +5795,6 @@ struct CatalogOperator {
     result: ColType,
     procedure_oid: i32,
 }
-
-/// Operators whose catalog signatures use PostgreSQL pseudo-types.  They are
-/// kept separate from the concrete evaluator lookup table: pretending
-/// `anyrange` is one concrete `ColType` would make overload resolution accept
-/// mismatched range subtypes.
-#[derive(Clone, Copy)]
-struct PolymorphicOperator {
-    oid: i32,
-    name: &'static str,
-    left_oid: i32,
-    right_oid: i32,
-}
-
-macro_rules! polymorphic_operator {
-    ($oid:literal, $name:literal, $left:literal, $right:literal) => {
-        PolymorphicOperator {
-            oid: $oid,
-            name: $name,
-            left_oid: $left,
-            right_oid: $right,
-        }
-    };
-}
-
-const POLYMORPHIC_RANGE_OPERATORS: &[PolymorphicOperator] = &[
-    polymorphic_operator!(2860, "=", 4537, 4537),
-    polymorphic_operator!(2861, "<>", 4537, 4537),
-    polymorphic_operator!(2862, "<", 4537, 4537),
-    polymorphic_operator!(2863, "<=", 4537, 4537),
-    polymorphic_operator!(2864, ">=", 4537, 4537),
-    polymorphic_operator!(2865, ">", 4537, 4537),
-    polymorphic_operator!(2866, "&&", 3831, 4537),
-    polymorphic_operator!(2867, "&&", 4537, 3831),
-    polymorphic_operator!(2868, "&&", 4537, 4537),
-    polymorphic_operator!(2869, "@>", 4537, 2283),
-    polymorphic_operator!(2870, "@>", 4537, 3831),
-    polymorphic_operator!(2871, "@>", 4537, 4537),
-    polymorphic_operator!(2872, "<@", 2283, 4537),
-    polymorphic_operator!(2873, "<@", 3831, 4537),
-    polymorphic_operator!(2874, "<@", 4537, 4537),
-    polymorphic_operator!(2875, "&<", 3831, 4537),
-    polymorphic_operator!(2876, "&<", 4537, 3831),
-    polymorphic_operator!(2877, "&<", 4537, 4537),
-    polymorphic_operator!(3585, "&>", 3831, 4537),
-    polymorphic_operator!(3882, "=", 3831, 3831),
-    polymorphic_operator!(3883, "<>", 3831, 3831),
-    polymorphic_operator!(3884, "<", 3831, 3831),
-    polymorphic_operator!(3885, "<=", 3831, 3831),
-    polymorphic_operator!(3886, ">=", 3831, 3831),
-    polymorphic_operator!(3887, ">", 3831, 3831),
-    polymorphic_operator!(3888, "&&", 3831, 3831),
-    polymorphic_operator!(3889, "@>", 3831, 2283),
-    polymorphic_operator!(3890, "@>", 3831, 3831),
-    polymorphic_operator!(3891, "<@", 2283, 3831),
-    polymorphic_operator!(3892, "<@", 3831, 3831),
-    polymorphic_operator!(3893, "<<", 3831, 3831),
-    polymorphic_operator!(3894, ">>", 3831, 3831),
-    polymorphic_operator!(3895, "&<", 3831, 3831),
-    polymorphic_operator!(3896, "&>", 3831, 3831),
-    polymorphic_operator!(3897, "-|-", 3831, 3831),
-    polymorphic_operator!(3898, "+", 3831, 3831),
-    polymorphic_operator!(3899, "-", 3831, 3831),
-    polymorphic_operator!(3900, "*", 3831, 3831),
-    polymorphic_operator!(4035, "&>", 4537, 3831),
-    polymorphic_operator!(4142, "&>", 4537, 4537),
-    polymorphic_operator!(4179, "-|-", 3831, 4537),
-    polymorphic_operator!(4180, "-|-", 4537, 3831),
-    polymorphic_operator!(4198, "-|-", 4537, 4537),
-    polymorphic_operator!(4392, "+", 4537, 4537),
-    polymorphic_operator!(4393, "-", 4537, 4537),
-    polymorphic_operator!(4394, "*", 4537, 4537),
-    polymorphic_operator!(4395, "<<", 3831, 4537),
-    polymorphic_operator!(4396, "<<", 4537, 3831),
-    polymorphic_operator!(4397, "<<", 4537, 4537),
-    polymorphic_operator!(4398, ">>", 3831, 4537),
-    polymorphic_operator!(4399, ">>", 4537, 3831),
-    polymorphic_operator!(4400, ">>", 4537, 4537),
-    polymorphic_operator!(4539, "@>", 3831, 4537),
-    polymorphic_operator!(4540, "<@", 4537, 3831),
-];
 
 macro_rules! catalog_operator {
     ($oid:literal, $name:literal, $left:expr, $right:expr, $result:expr, $procedure_oid:literal) => {
@@ -6649,7 +6813,9 @@ pub(super) const CATALOG_RELATIONS: &[&str] = &[
     "pg_wait_events",
 ];
 
-fn catalog_relation(name: &str) -> Option<crate::sql::catalog_metadata::CatalogRelation> {
+pub(crate) fn catalog_relation(
+    name: &str,
+) -> Option<crate::sql::catalog_metadata::CatalogRelation> {
     let relation = crate::sql::catalog_metadata::RELATIONS
         .iter()
         .copied()
@@ -8966,11 +9132,11 @@ pub(crate) fn schema_oid_by_written(storage: &Storage, txid: u32, written: &str)
 }
 
 pub(crate) fn role_oid_by_written(storage: &Storage, txid: u32, written: &str) -> Option<i32> {
+    // Free role slots have no identity; only visible roles can match.
     (0..storage.role_count()).find_map(|slot| {
-        let oid = storage.role_oid(slot);
-        let visible = storage.role_slot_by_oid(oid, txid)?;
-        identifier_spelling_matches(written, storage.role_name(visible, txid).as_str())
-            .then_some(oid)
+        let role = storage.role(slot);
+        (role.visible_to(txid) && identifier_spelling_matches(written, role.name_to(txid).as_str()))
+            .then(|| role.oid().get())
     })
 }
 
@@ -9205,11 +9371,15 @@ fn write_statistics_keys<const N: usize>(
             &deparse::Context {
                 storage,
                 txid,
+                arena,
+                dependencies: None,
                 table: Some(table),
                 parameters: &[],
                 joined: &[],
                 pretty: true,
+                qualify: false,
                 domain_value: None,
+                bare: None,
             },
             source.as_str(),
             deparse::Destination::Value,
@@ -9329,11 +9499,15 @@ pub(crate) fn extended_statistics_expressions_by_oid<'a>(
                 &deparse::Context {
                     storage,
                     txid,
+                    arena,
+                    dependencies: None,
                     table: Some(&table),
                     parameters: &[],
                     joined: &[],
                     pretty: false,
+                    qualify: false,
                     domain_value: None,
+                    bare: None,
                 },
                 expression.as_str(),
                 deparse::Destination::Value,
@@ -11430,13 +11604,6 @@ mod routine_name_tests {
                 operator.oid
             );
         }
-        for operator in super::POLYMORPHIC_RANGE_OPERATORS {
-            let row = row(operator.oid);
-            assert_eq!(
-                (row.1, row.5, row.6),
-                (operator.name, operator.left_oid, operator.right_oid)
-            );
-        }
     }
 
     #[test]
@@ -11759,6 +11926,14 @@ fn write_routine_type_name(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Name lookups `routine_oid_by_name` has made on this thread, which a
+    /// test reads to pin how often a statement repeats one.
+    pub(crate) static ROUTINE_NAME_LOOKUPS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+}
+
 /// Resolves the function catalog object types. `regproc` names a routine by
 /// unqualified name; `regprocedure` includes its complete argument signature.
 pub(crate) fn routine_oid_by_name(
@@ -11767,6 +11942,8 @@ pub(crate) fn routine_oid_by_name(
     written: &str,
     signature: bool,
 ) -> Result<Option<i32>, SqlError> {
+    #[cfg(test)]
+    ROUTINE_NAME_LOOKUPS.with(|lookups| lookups.set(lookups.get() + 1));
     let mut arguments = [crate::storage::RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
     let (name, argument_count) = if signature {
         let Some(parsed) = parse_routine_signature(written, storage, txid, &mut arguments) else {
@@ -11985,38 +12162,36 @@ pub(crate) fn operator_oid_by_name(
     let ambiguous = || {
         sql_err!(
             sqlstate::AMBIGUOUS_FUNCTION,
-            "more than one operator named \"{}\"",
+            "more than one operator named {}",
             written
         )
     };
+    // Every built-in `pg_operator` row takes part, as in PostgreSQL: a bare
+    // name must be unique, a signature names its operand types (0 is NONE).
     let builtin = || -> Result<Option<i32>, SqlError> {
-        let mut found = None;
-        if let Some((_, left_oid, right_oid)) = polymorphic_arguments {
-            for operator in POLYMORPHIC_RANGE_OPERATORS {
-                if identifier_spelling_matches(written_name, operator.name)
-                    && operator.left_oid == left_oid
-                    && operator.right_oid == right_oid
-                    && found.replace(operator.oid).is_some()
-                {
-                    return Err(ambiguous());
+        let wanted = match (polymorphic_arguments, arguments) {
+            (Some((_, left, right)), _) => Some((left, right)),
+            (None, Some(signature)) => {
+                let operand = |operand: Option<crate::storage::RoutineResult>| match operand {
+                    None => Some(0),
+                    Some(result) if result.user_type.is_none() => Some(result.ctype.oid()),
+                    Some(_) => None,
+                };
+                match (operand(signature.left), operand(signature.right)) {
+                    (Some(left), Some(right)) => Some((left, right)),
+                    _ => return Ok(None),
                 }
             }
-            return Ok(found);
-        }
-        for operator in CATALOG_OPERATORS {
-            let builtin_signature = crate::storage::OperatorSignature {
-                left: operator.left.map(crate::storage::RoutineResult::builtin),
-                right: operator.right.map(crate::storage::RoutineResult::builtin),
-            };
-            if !identifier_spelling_matches(written_name, operator.name)
-                || arguments.is_some_and(|signature| signature != builtin_signature)
+            (None, None) => None,
+        };
+        let mut found = None;
+        for row in &super::catalog_operator_rows::OPERATOR_ROWS {
+            if !identifier_spelling_matches(written_name, row.1)
+                || wanted.is_some_and(|operands| operands != (row.5, row.6))
             {
                 continue;
             }
-            // Most modeled evaluator rows are only one representative of an
-            // overloaded built-in name.  JSON path existence is PostgreSQL's
-            // sole built-in `@?`, so its bare regoper spelling is resolvable.
-            if (!signature && operator.name != "@?") || found.replace(operator.oid).is_some() {
+            if found.replace(row.0).is_some() {
                 return Err(ambiguous());
             }
         }
@@ -12432,11 +12607,15 @@ fn write_sql_body(
     let context = deparse::Context {
         storage,
         txid,
+        arena,
+        dependencies: None,
         table: None,
         parameters: routine.parameters(),
         joined: &[],
         pretty: false,
+        qualify: false,
         domain_value: None,
+        bare: None,
     };
     let dependencies = storage.snapshot_routine_dependencies_for(slot, txid, arena)?;
     let _formal = super::exec::enter_routine_parameter_types(
@@ -13010,11 +13189,15 @@ pub fn trigger_def_text<'a>(
                     &deparse::Context {
                         storage,
                         txid,
+                        arena,
+                        dependencies: None,
                         table: Some(&definition),
                         parameters: &[],
                         joined: &joined,
                         pretty,
+                        qualify: false,
                         domain_value: None,
+                        bare: None,
                     },
                     when.as_str(),
                     deparse::Destination::Condition,
@@ -13029,22 +13212,42 @@ pub fn trigger_def_text<'a>(
     output
         .write_str("EXECUTE FUNCTION ")
         .map_err(|_| super::eval::arena_full())?;
-    let routine = storage.routine_for(usize::from(trigger.function), txid);
+    // PostgreSQL qualifies the function only when its bare name would
+    // select another one.
+    let (schema, name, selected) = match trigger.function {
+        crate::storage::TriggerFunction::Routine(slot) => {
+            let routine = storage.routine_for(usize::from(slot), txid);
+            (
+                routine.schema,
+                routine.name,
+                crate::storage::RoutineCallSelection::Stored(usize::from(slot)),
+            )
+        }
+        crate::storage::TriggerFunction::Builtin(builtin) => (
+            crate::storage::SqlName::parse("pg_catalog").expect("pg_catalog is a valid name"),
+            crate::storage::SqlName::parse(builtin.name())
+                .expect("built-in trigger function names are valid"),
+            crate::storage::RoutineCallSelection::Builtin {
+                oid: builtin.oid(),
+                schema: "pg_catalog",
+            },
+        ),
+    };
     if storage.select_routine_call(
-        routine.name.as_str(),
+        name.as_str(),
         &[],
         &[],
         false,
         txid,
         crate::storage::RoutineCallKind::Trigger,
-    ) != crate::storage::RoutineCallSelection::Stored(usize::from(trigger.function))
+    ) != selected
     {
-        write_identifier(&mut output, routine.schema.as_str());
+        write_identifier(&mut output, schema.as_str());
         output
             .write_char('.')
             .map_err(|_| super::eval::arena_full())?;
     }
-    write_identifier(&mut output, routine.name.as_str());
+    write_identifier(&mut output, name.as_str());
     output
         .write_char('(')
         .map_err(|_| super::eval::arena_full())?;
@@ -13129,11 +13332,15 @@ fn write_routine_arguments(
             let context = deparse::Context {
                 storage,
                 txid,
+                arena,
+                dependencies: None,
                 table: None,
                 parameters: &[],
                 joined: &[],
                 pretty: false,
+                qualify: false,
                 domain_value: None,
+                bare: None,
             };
             let deparsed = match storage
                 .routine_type_oid(parameter.ctype, parameter.user_type, txid)
@@ -13583,16 +13790,20 @@ pub(crate) fn view_def_text_pretty<'a>(
         let query = arena
             .alloc_str(view.sql.as_str().trim().trim_end_matches(';'))
             .map_err(|_| arena_full())?;
-        if let Ok(select) = crate::sql::parser::parse_query(query, arena)
-            && let Some(deparsed) =
-                deparse::view_definition(storage, txid, select, None, names, layout, arena)?
-        {
-            return Ok(Some(deparsed));
-        }
-        return arena
-            .alloc_str_display(format_args!("{};", view.sql.as_str()))
-            .map(Some)
-            .map_err(|_| arena_full());
+        let select = crate::sql::parser::parse_query(query, arena)
+            .map_err(|_| undeparsable_view(name.as_str()))?;
+        return deparse::view_definition(
+            storage,
+            txid,
+            select,
+            None,
+            names,
+            layout,
+            crate::storage::ViewQueryOrigin::View,
+            arena,
+        )?
+        .map(Some)
+        .ok_or_else(|| undeparsable_view(name.as_str()));
     }
     let stored = rewrite::view_definition(storage, txid, oid, arena)?;
     if stored.is_some()
@@ -13611,26 +13822,61 @@ pub(crate) fn view_def_text_pretty<'a>(
             .alloc_str(query.sql.as_str())
             .map_err(|_| arena_full())?;
         let dependencies = query.dependencies.view();
-        if let Ok(select) = crate::sql::query::parse_stored_query(
+        // A transaction whose catalog snapshot predates the view's current
+        // query reads its own version's text, deparsed under current names.
+        let text = stored.expect("checked stored text");
+        let view_name = view.name_for(txid);
+        if text.strip_suffix(';') != Some(sql) {
+            let text = arena
+                .alloc_str(text.trim().trim_end_matches(';'))
+                .map_err(|_| arena_full())?;
+            let select = crate::sql::parser::parse_query(text, arena)
+                .map_err(|_| undeparsable_view(view_name.as_str()))?;
+            return deparse::view_definition(
+                storage,
+                txid,
+                select,
+                None,
+                names,
+                layout,
+                view.options_for(txid).query_origin,
+                arena,
+            )?
+            .map(Some)
+            .ok_or_else(|| undeparsable_view(view_name.as_str()));
+        }
+        let select = crate::sql::query::parse_stored_query(
             sql,
             query.input_source.unwrap_or(sql),
             storage,
             txid,
             dependencies,
             arena,
-        ) && let Some(deparsed) = deparse::view_definition(
+        )?;
+        return deparse::view_definition(
             storage,
             txid,
             select,
             Some(dependencies),
             names,
             layout,
+            view.options_for(txid).query_origin,
             arena,
-        )? {
-            return Ok(Some(deparsed));
-        }
+        )?
+        .map(Some)
+        .ok_or_else(|| undeparsable_view(view_name.as_str()));
     }
     Ok(stored)
+}
+
+/// A view whose query shape the deparser cannot print. Printing its stored
+/// text instead would show names and forms PostgreSQL does not.
+fn undeparsable_view(name: &str) -> SqlError {
+    sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "deparsing the query of view \"{}\" is not supported",
+        name
+    )
 }
 
 pub fn rule_def_text<'a>(
@@ -15152,6 +15398,7 @@ fn inherited_foreign_key_parent_oid(
                 && parent.parent == child.parent
                 && parent.parent_cols() == child.parent_cols()
                 && parent.on_delete == child.on_delete
+                && parent.delete_set_cols() == child.delete_set_cols()
                 && parent.on_update == child.on_update
         })
         .map_or(0, |constraint| constraint.oid())
@@ -15382,6 +15629,16 @@ pub fn constraint_def_text<'a>(
         }
         let _ = s.write_str(")");
         let _ = s.write_str(fk_action_suffix(fk.on_delete, "DELETE"));
+        if !fk.delete_set_cols().is_empty() {
+            let _ = s.write_str(" (");
+            for (k, &c) in fk.delete_set_cols().iter().enumerate() {
+                if k > 0 {
+                    let _ = s.write_str(", ");
+                }
+                write_identifier(&mut s, child.columns()[c as usize].name.as_str());
+            }
+            let _ = s.write_char(')');
+        }
         let _ = s.write_str(fk_action_suffix(fk.on_update, "UPDATE"));
         append_constraint_attributes(&mut s, fk.timing, fk.validation);
         return Ok(Some(alloc_rendered(
@@ -15421,11 +15678,15 @@ pub fn constraint_def_text<'a>(
             let context = deparse::Context {
                 storage,
                 txid,
+                arena,
+                dependencies: None,
                 table: Some(&table),
                 parameters: &[],
                 joined: &[],
                 pretty,
+                qualify: false,
                 domain_value: None,
+                bare: None,
             };
             match bound_table_expression_display(
                 &context,
@@ -15494,7 +15755,11 @@ pub fn constraint_def_text<'a>(
                 parameters: &[],
                 joined: &[],
                 pretty,
+                qualify: false,
                 domain_value: Some(domain_base_oid(storage, &domain, txid)),
+                bare: None,
+                arena,
+                dependencies: None,
             };
             match deparse::deparse(&context, expression, deparse::Destination::Condition, arena)? {
                 Some(deparsed) => {
@@ -15565,11 +15830,15 @@ pub fn constraint_def_text<'a>(
                     &deparse::Context {
                         storage,
                         txid,
+                        arena,
+                        dependencies: None,
                         table: Some(&table),
                         parameters: &[],
                         joined: &[],
                         pretty,
+                        qualify: false,
                         domain_value: None,
+                        bare: None,
                     },
                     expression,
                     deparse::Destination::Condition,
@@ -16332,11 +16601,15 @@ pub fn index_def_text<'a>(
                 &deparse::Context {
                     storage,
                     txid,
+                    arena,
+                    dependencies: None,
                     table: Some(&def),
                     parameters: &[],
                     joined: &[],
                     pretty,
+                    qualify: false,
                     domain_value: None,
+                    bare: None,
                 },
                 bound,
                 deparse::Destination::Condition,
@@ -16418,11 +16691,15 @@ fn index_expression_display<'a>(
         &deparse::Context {
             storage,
             txid,
+            arena,
+            dependencies: None,
             table: Some(table),
             parameters: &[],
             joined: &[],
             pretty,
+            qualify: false,
             domain_value: None,
+            bare: None,
         },
         expression,
         deparse::Destination::Value,
@@ -20526,7 +20803,15 @@ fn pg_constraint_values<'a>(
                 foreign_key_operator_array(storage, txid, info, &fk, 0, arena)?,
                 foreign_key_operator_array(storage, txid, info, &fk, 1, arena)?,
                 foreign_key_operator_array(storage, txid, info, &fk, 2, arena)?,
-                Datum::Null,
+                if fk.delete_set_cols().is_empty() {
+                    Datum::Null
+                } else {
+                    attnum_array(
+                        fk.delete_set_cols(),
+                        &storage.table_def(info.child_slot, txid),
+                        arena,
+                    )?
+                },
                 Datum::Null,
                 Datum::Null,
             ],
@@ -22028,7 +22313,14 @@ fn pg_attribute<'a>(
                         },
                         arena,
                     )?, // attidentity: always 'a' / by default 'd'
-                    text(if c.default.is_generated() { "s" } else { "" }, arena)?, // attgenerated
+                    text(
+                        match c.default.generation() {
+                            Some(crate::storage::Generation::Stored) => "s",
+                            Some(crate::storage::Generation::Virtual) => "v",
+                            None => "",
+                        },
+                        arena,
+                    )?, // attgenerated
                     text(
                         match c.storage {
                             crate::sql::ast::ColumnStorage::Plain => "p",
@@ -22627,7 +22919,11 @@ fn pg_attrdef<'a>(
                         parameters: &[],
                         joined: &[],
                         pretty: false,
+                        qualify: false,
                         domain_value: None,
+                        bare: None,
+                        arena,
+                        dependencies: None,
                     },
                     &table,
                     owner,
@@ -23668,7 +23964,14 @@ fn pg_trigger<'a>(
                 })
                 .map_or(0, |index| index.oid);
             let constraint_oid = foreign_key.oid();
+            // A partition's cloned constraint checks rows on the partition;
+            // the referenced table's actions belong to the parent constraint.
+            let cloned =
+                inherited_foreign_key_parent_oid(storage, txid, child_slot, foreign_key) != 0;
             for trigger in crate::storage::ForeignKeyTrigger::ALL {
+                if cloned && trigger.ordinal() < 2 {
+                    continue;
+                }
                 if count == rows.len() {
                     return Err(catalog_capacity_exceeded("pg_trigger"));
                 }
@@ -23704,7 +24007,12 @@ fn pg_trigger<'a>(
                         text(name.as_str(), arena)?,
                         Datum::Int4(function),
                         Datum::Int2(trigger_type),
-                        Datum::Bpchar("O"),
+                        Datum::Bpchar(match foreign_key.trigger_enabled(trigger) {
+                            crate::storage::TriggerEnabled::Origin => "O",
+                            crate::storage::TriggerEnabled::Replica => "R",
+                            crate::storage::TriggerEnabled::Always => "A",
+                            crate::storage::TriggerEnabled::Disabled => "D",
+                        }),
                         Datum::Bool(true),
                         Datum::Int4(constrained_relation),
                         Datum::Int4(parent_index),
@@ -23744,7 +24052,7 @@ fn pg_trigger<'a>(
                 view_oid(storage, slot)
             }
         };
-        let function = storage.routine(usize::from(trigger.function));
+        let function_oid = crate::storage::trigger_function_oid(storage, trigger.function, txid);
         let (constraint_oid, constraint_timing, referenced_oid) = match trigger.kind {
             crate::storage::TriggerKind::Ordinary => {
                 (0, crate::storage::ConstraintTiming::NotDeferrable, 0)
@@ -23830,7 +24138,7 @@ fn pg_trigger<'a>(
                 Datum::Int4(relation_oid),
                 Datum::Int4(0),
                 text(trigger.name_to(txid).as_str(), arena)?,
-                Datum::Int4(crate::storage::routine_oid(&function)),
+                Datum::Int4(function_oid),
                 Datum::Int2(trigger_type),
                 Datum::Bpchar(match trigger.enabled_to(txid) {
                     crate::storage::TriggerEnabled::Origin => "O",
@@ -25147,8 +25455,14 @@ fn text_search_regproc<'a>(oid: i32, arena: &'a Arena) -> Result<Datum<'a>, SqlE
         3721 => "prsd_lextype",
         3725 => "dsimple_init",
         3726 => "dsimple_lexize",
-        13_232 => "dsnowball_init",
-        13_233 => "dsnowball_lexize",
+        3728 => "dsynonym_init",
+        3729 => "dsynonym_lexize",
+        3731 => "dispell_init",
+        3732 => "dispell_lexize",
+        3740 => "thesaurus_init",
+        3741 => "thesaurus_lexize",
+        DSNOWBALL_INIT_OID => "dsnowball_init",
+        DSNOWBALL_LEXIZE_OID => "dsnowball_lexize",
         _ => {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -28412,7 +28726,10 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "synchronize_seqscans" => "on",
             "track_functions" => "none",
             "plpgsql.variable_conflict" => "error",
+            "session_replication_role" => "origin",
             "plpgsql.print_strict_params" => "off",
+            "plpgsql.check_asserts" => "on",
+            "plpgsql.extra_warnings" | "plpgsql.extra_errors" => "none",
             "TimeZone" => "UTC",
             "work_mem" => "4096",
             "transaction_isolation" => "read committed",
@@ -28426,6 +28743,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 | "event_triggers"
                 | "integer_datetimes"
                 | "plpgsql.print_strict_params"
+                | "plpgsql.check_asserts"
                 | "is_superuser"
                 | "row_security"
                 | "standard_conforming_strings"
@@ -28444,6 +28762,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 | "password_encryption"
                 | "track_functions"
                 | "plpgsql.variable_conflict"
+                | "session_replication_role"
                 | "xmloption"
         ) {
             "enum"
@@ -28477,7 +28796,10 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "postmaster"
         } else if matches!(
             name,
-            "event_triggers" | "track_functions" | "plpgsql.variable_conflict"
+            "event_triggers"
+                | "track_functions"
+                | "plpgsql.variable_conflict"
+                | "session_replication_role"
         ) {
             "superuser"
         } else {
@@ -28521,7 +28843,12 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         };
         let (reset_value, source) = crate::sql::eval::funcs::system::session_setting_metadata(name)
             .unwrap_or((value, "default"));
+        let planner = crate::sql::guc::planner_setting_metadata(name);
         let (boot, vartype, context, unit) = metadata(name);
+        let (boot, vartype) = match &planner {
+            Some(planner) => (planner.boot.as_str(), planner.vartype),
+            None => (boot, vartype),
+        };
         let base_value = |shown: &str| {
             crate::sql::guc::int_setting_base_value(name, shown).map_or_else(
                 || crate::util::StackStr::<256>::from_str(shown),
@@ -28543,17 +28870,23 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                     text(bounds[1].as_str(), arena)?,
                 )
             }
-            None => (Datum::Null, Datum::Null),
+            None => match planner.as_ref().and_then(|planner| planner.bounds) {
+                Some((min, max)) => (text(min.as_str(), arena)?, text(max.as_str(), arena)?),
+                None => (Datum::Null, Datum::Null),
+            },
         };
         let enum_names: &[&str] = match name {
+            _ if planner.is_some() => planner.as_ref().map_or(&[], |planner| planner.enum_names),
             "track_functions" => &["none", "pl", "all"],
             "plpgsql.variable_conflict" => &crate::sql::guc::VariableConflict::NAMES,
+            "session_replication_role" => &crate::sql::guc::SessionReplicationRole::NAMES,
             _ => &[],
         };
         let enum_values = if enum_names.is_empty() {
             Datum::Null
         } else {
             let mut values = [Datum::Null; 3];
+            debug_assert!(enum_names.len() <= values.len());
             for (value, name) in values.iter_mut().zip(enum_names) {
                 *value = text(name, arena)?;
             }
@@ -28573,22 +28906,43 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 },
                 text(
                     match name {
-                        "track_functions" => "Statistics / Monitoring",
-                        "plpgsql.variable_conflict" | "plpgsql.print_strict_params" => {
-                            "Customized Options"
+                        _ if planner.is_some() => {
+                            planner.as_ref().map_or("", |planner| planner.category)
                         }
+                        "track_functions" => "Statistics / Monitoring",
+                        "plpgsql.variable_conflict"
+                        | "plpgsql.print_strict_params"
+                        | "plpgsql.check_asserts"
+                        | "plpgsql.extra_warnings"
+                        | "plpgsql.extra_errors" => "Customized Options",
                         "work_mem" => "Resource Usage / Memory",
+                        "session_replication_role" => {
+                            "Client Connection Defaults / Statement Behavior"
+                        }
                         _ => "Client Connection Defaults",
                     },
                     arena,
                 )?,
                 text(
                     match name {
+                        _ if planner.is_some() => {
+                            planner.as_ref().map_or("", |planner| planner.description)
+                        }
                         "plpgsql.variable_conflict" => {
                             "Sets handling of conflicts between PL/pgSQL variable names and table column names."
                         }
+                        "session_replication_role" => {
+                            "Sets the session's behavior for triggers and rewrite rules."
+                        }
                         "plpgsql.print_strict_params" => {
                             "Print information about parameters in the DETAIL part of the error messages generated on INTO ... STRICT failures."
+                        }
+                        "plpgsql.check_asserts" => "Perform checks given in ASSERT statements.",
+                        "plpgsql.extra_warnings" => {
+                            "List of programming constructs that should produce a warning."
+                        }
+                        "plpgsql.extra_errors" => {
+                            "List of programming constructs that should produce an error."
                         }
                         _ => "",
                     },

@@ -3129,14 +3129,13 @@ pub(crate) fn binary<'a>(
                 | (Datum::TsQuery(query), Datum::TsVector(vector)) => {
                     (vector.as_str(), query.as_str())
                 }
-                (Datum::Text(document), Datum::TsQuery(query))
-                | (Datum::TsQuery(query), Datum::Text(document)) => {
-                    let vector = crate::sql::full_text::to_tsvector(
-                        crate::sql::full_text::TextSearchConfig::English,
-                        document,
-                        arena,
-                    )?;
-                    (vector, query.as_str())
+                (Datum::Text(_), Datum::TsQuery(_)) | (Datum::TsQuery(_), Datum::Text(_)) => {
+                    // The evaluator parses the text with the session's
+                    // configuration before it reaches this operator.
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "text @@ tsquery reached the operator without a text search configuration"
+                    ));
                 }
                 (left, right) => {
                     return Err(sql_err!(

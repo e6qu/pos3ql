@@ -28,3 +28,5 @@ unfinished work lives only in the [roadmap](../PLAN.md).
   investigations at fixed revisions.
 - Fixture generation: `tests/data/README.md`.
 - Third-party tests and checksums: `vendor/README.md` and `vendor/SHA256SUMS`.
+- Compiled-in third-party code and data, the Snowball stemmers and stopword
+  lists: [Snowball provenance](postgresql-18-compatibility.md#snowball-provenance).

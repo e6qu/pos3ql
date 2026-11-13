@@ -27,7 +27,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 30;
+pub(crate) const RECORD_VERSION: u8 = 32;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -270,7 +270,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 18;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 21;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -1195,6 +1195,7 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
         n += 2; // attstattarget
         n += 9; // attoptions presence byte plus two float4 bit patterns
         n += 2; // attstorage + attcompression
+        n += 1; // attgenerated
         // User-defined column: name, then a format marker and schema.
         if let Some(identity) = c.user_type {
             n += 1 + identity.storage_name().as_str().len();
@@ -1222,7 +1223,9 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
             + fk.parent.as_str().len()
             + 1
             + fk.n_parent_cols * 2
-            + 4;
+            + 8
+            + 1
+            + fk.n_delete_set_cols * 2;
     }
     // exclusion constraints
     n += 1;
@@ -1477,6 +1480,11 @@ fn append_table_payload<B: DefinitionBacking>(
         ok &= buffer.append(&[c.ctype.code(), flags]);
         ok &= buffer.append(&[c.not_null.code()]);
         ok &= buffer.append(&[u8::from(c.not_null_inheritable)]);
+        // The generation kind (`pg_attribute.attgenerated`), zero when none.
+        ok &= buffer.append(&[c
+            .default
+            .generation()
+            .map_or(0, crate::storage::Generation::code)]);
         ok &= name_bytes(
             buffer,
             def.not_null_names.as_ref()[column]
@@ -1537,7 +1545,15 @@ fn append_table_payload<B: DefinitionBacking>(
             fk.on_update.code(),
             fk.timing.code(),
             fk.validation.code(),
+            fk.trigger_enabled[0].code(),
+            fk.trigger_enabled[1].code(),
+            fk.trigger_enabled[2].code(),
+            fk.trigger_enabled[3].code(),
         ]);
+        ok &= buffer.append(&[fk.n_delete_set_cols as u8]);
+        for &c in fk.delete_set_cols() {
+            ok &= buffer.append(&c.to_le_bytes());
+        }
     }
     ok &= buffer.append(&[def.n_exclusions as u8]);
     for exclusion in def.exclusions() {
@@ -3696,9 +3712,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         common
             + match definition {
                 crate::storage::TextSearchDefinition::Parser { .. } => 20,
-                crate::storage::TextSearchDefinition::Template { .. } => 10,
+                crate::storage::TextSearchDefinition::Template { .. } => 9,
                 crate::storage::TextSearchDefinition::Dictionary { options, .. } => {
-                    8 + 1 + options.as_str().len() + 2
+                    8 + 1 + options.as_str().len() + 3
                 }
                 crate::storage::TextSearchDefinition::Configuration { mappings, .. } => {
                     8 + mappings
@@ -5222,12 +5238,6 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&[value.len() as u8])
                 && buffer.append(value.as_bytes())
         };
-        let behavior = |value| match value {
-            crate::storage::TextSearchDictionaryBehavior::Simple { accept } => {
-                [0, u8::from(accept)]
-            }
-            crate::storage::TextSearchDictionaryBehavior::EnglishStem => [1, 0],
-        };
         let mut ok = name(buffer, definition.schema().as_str())
             && name(buffer, definition.name().as_str())
             && buffer.append(&definition.oid().to_le_bytes());
@@ -5247,14 +5257,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     && buffer.append(&lextypes.to_le_bytes())
             }
             crate::storage::TextSearchDefinition::Template {
-                init,
-                lexize,
-                behavior: executable,
-                ..
+                init, lexize, kind, ..
             } => {
                 buffer.append(&init.to_le_bytes())
                     && buffer.append(&lexize.to_le_bytes())
-                    && buffer.append(&behavior(executable))
+                    && buffer.append(&[kind.code()])
             }
             crate::storage::TextSearchDefinition::Dictionary {
                 owner,
@@ -5266,7 +5273,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 buffer.append(&owner.to_le_bytes())
                     && buffer.append(&template.to_le_bytes())
                     && name(buffer, options.as_str())
-                    && buffer.append(&behavior(executable))
+                    && buffer.append(&executable.code())
             }
             crate::storage::TextSearchDefinition::Configuration {
                 owner,
@@ -8531,6 +8538,14 @@ fn decode_op_inner<'a>(
                     _ => return None,
                 };
                 at += 1;
+                let generation = match *payload.get(at)? {
+                    0 => None,
+                    code => Some(crate::storage::Generation::from_code(code)?),
+                };
+                at += 1;
+                if generation.is_some() != (meta[1] & 16 != 0) {
+                    return None;
+                }
                 let name = take_name(&mut at)?;
                 let not_null_name = if name.is_empty() {
                     None
@@ -8588,8 +8603,7 @@ fn decode_op_inner<'a>(
                 } else {
                     None
                 };
-                let default =
-                    ColumnDefault::from_parts(default_value, default_expr, meta[1] & 16 != 0)?;
+                let default = ColumnDefault::from_parts(default_value, default_expr, generation)?;
                 def.not_null_names[i] = not_null_name;
                 def.columns[i] = ColumnMeta {
                     name: SqlName::parse(col_name).ok()?,
@@ -8709,12 +8723,25 @@ fn decode_op_inner<'a>(
                     *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
                     at += 2;
                 }
-                let acts = payload.get(at..at + 4)?;
-                at += 4;
+                let acts = payload.get(at..at + 8)?;
+                at += 8;
                 fk.on_delete = FkAction::from_code(acts[0])?;
                 fk.on_update = FkAction::from_code(acts[1])?;
                 fk.timing = crate::storage::ConstraintTiming::from_code(acts[2])?;
                 fk.validation = crate::storage::ConstraintValidation::from_code(acts[3])?;
+                for (mode, &code) in fk.trigger_enabled.iter_mut().zip(&acts[4..]) {
+                    *mode = crate::storage::TriggerEnabled::from_code(code)?;
+                }
+                let n_set = *payload.get(at)? as usize;
+                at += 1;
+                if n_set > nc {
+                    return None;
+                }
+                fk.n_delete_set_cols = n_set;
+                for c in fk.delete_set_cols.iter_mut().take(n_set) {
+                    *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
+                    at += 2;
+                }
                 *slot = fk;
             }
             let n_exclusions = *payload.get(at)? as usize;
@@ -11575,14 +11602,10 @@ fn decode_op_inner<'a>(
                 Some(value)
             };
             let read_behavior = |at: &mut usize| {
-                let behavior = match (*payload.get(*at)?, *payload.get(*at + 1)?) {
-                    (0, accept @ 0..=1) => crate::storage::TextSearchDictionaryBehavior::Simple {
-                        accept: accept != 0,
-                    },
-                    (1, 0) => crate::storage::TextSearchDictionaryBehavior::EnglishStem,
-                    _ => return None,
-                };
-                *at += 2;
+                let behavior = crate::storage::TextSearchDictionaryBehavior::from_code(
+                    payload.get(*at..*at + 3)?.try_into().ok()?,
+                )?;
+                *at += 3;
                 Some(behavior)
             };
             let definition = match object_kind {
@@ -11602,7 +11625,12 @@ fn decode_op_inner<'a>(
                     oid,
                     init: read_i32(&mut at)?,
                     lexize: read_i32(&mut at)?,
-                    behavior: read_behavior(&mut at)?,
+                    kind: {
+                        let kind =
+                            crate::storage::TextSearchTemplateKind::from_code(*payload.get(at)?)?;
+                        at += 1;
+                        kind
+                    },
                 },
                 2 => {
                     let owner = read_i32(&mut at)?;
@@ -12773,7 +12801,7 @@ fn encoded_view_default_len(default: crate::storage::ColumnDefault) -> usize {
             1 + encoded_default_len(&Some(value)) + 2 + expression.as_str().len()
         }
         crate::storage::ColumnDefault::Expression(expression) => 1 + 2 + expression.as_str().len(),
-        crate::storage::ColumnDefault::Generated(_) => {
+        crate::storage::ColumnDefault::Generated { .. } => {
             unreachable!("view columns cannot carry generated expressions")
         }
     }
@@ -12909,7 +12937,7 @@ fn append_view_default(buffer: &mut FixedBuf, default: crate::storage::ColumnDef
                 && buffer.append(&(bytes.len() as u16).to_le_bytes())
                 && buffer.append(bytes)
         }
-        crate::storage::ColumnDefault::Generated(_) => {
+        crate::storage::ColumnDefault::Generated { .. } => {
             unreachable!("view columns cannot carry generated expressions")
         }
     }
@@ -12934,14 +12962,14 @@ fn decode_view_default(payload: &[u8], at: &mut usize) -> Option<crate::storage:
         0 => Some(crate::storage::ColumnDefault::NONE),
         1 => {
             let value = decode_default(payload, at)??;
-            crate::storage::ColumnDefault::from_parts(Some(value), Some(expression(at)?), false)
+            crate::storage::ColumnDefault::from_parts(Some(value), Some(expression(at)?), None)
         }
         2 | 3 => {
             let expression = expression(at)?;
             if (tag == 3) != crate::sql::enum_values::checks::is_bound(expression.as_str()) {
                 return None;
             }
-            crate::storage::ColumnDefault::from_parts(None, Some(expression), false)
+            crate::storage::ColumnDefault::from_parts(None, Some(expression), None)
         }
         _ => None,
     }
@@ -16048,6 +16076,32 @@ mod tests {
     }
 
     #[test]
+    fn table_payload_keeps_each_generated_column_kind() {
+        let mut definition = sample_def();
+        definition.columns[1].default = ColumnDefault::Generated {
+            expression: StackStr::from_str("upper(id::text)"),
+            kind: crate::storage::Generation::Virtual,
+        };
+        let mut budget = Budget::new(8192);
+        let mut payload = FixedBuf::new(&mut budget, "generated table payload", 4096).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(append_payload(
+                &mut payload,
+                &WalOp::CreateTable {
+                    identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
+                    definition: (&definition).into(),
+                }
+            ));
+            let (_, decoded, _) = decode_table_payload(payload.readable()).unwrap();
+            assert_eq!(
+                decoded.columns[1].default.generation(),
+                Some(crate::storage::Generation::Virtual)
+            );
+            assert_eq!(decoded.columns[0].default.generation(), None);
+        });
+    }
+
+    #[test]
     fn table_payload_rejects_versions_with_the_removed_increment_cache() {
         let definition = sample_def();
         let mut budget = Budget::new(8192);
@@ -16651,6 +16705,7 @@ mod tests {
             security: crate::storage::ViewSecurity::Invoker,
             security_barrier: crate::storage::ViewSecurityBarrier::Enabled,
             check_option: Some(crate::storage::ViewCheckOption::Cascaded),
+            query_origin: crate::storage::ViewQueryOrigin::ReturnRule,
             order: crate::storage::ViewOptionOrder::EMPTY
                 .with_last(
                     crate::sql::ast::ViewOptionName::CheckOption,

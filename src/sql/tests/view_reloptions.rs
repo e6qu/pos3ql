@@ -8,8 +8,18 @@ const EXPECTED: [&str; 3] = [
     "v3|{security_invoker=false}",
 ];
 
-/// The written option order and spellings, and an explicit
-/// `security_invoker=false`, survive journal replay and checkpoint recovery.
+// PostgreSQL 18.6 output for a view whose query `CREATE OR REPLACE RULE
+// "_RETURN"` wrote, and for virtual and stored generated columns.
+const RULE_VIEW: [&str; 2] = [
+    "{security_barrier=on,check_option=local}",
+    " SELECT vt.a\n   FROM vt\n  WHERE (vt.a > 0);",
+];
+const GENERATED: [&str; 4] = ["t|", "v|v", "s|s", "'dog':2 'run':1|12"];
+
+/// The written option order and spellings, an explicit
+/// `security_invoker=false`, a rule-written view query's origin, and
+/// generation kinds with their expression dependencies survive journal replay
+/// and checkpoint recovery.
 #[test]
 fn view_reloptions_order_survives_journal_and_checkpoint_recovery() {
     for checkpoint in [false, true] {
@@ -35,9 +45,18 @@ fn view_reloptions_order_survives_journal_and_checkpoint_recovery() {
                  CREATE VIEW v2 WITH (check_option=local, security_barrier) \
                    AS SELECT * FROM vt; \
                  ALTER VIEW v2 SET (security_invoker='yes', check_option=cascaded); \
-                 CREATE VIEW v3 WITH (security_invoker=false) AS SELECT * FROM vt",
+                 CREATE VIEW v3 WITH (security_invoker=false) AS SELECT * FROM vt; \
+                 CREATE VIEW v4 WITH (security_barrier=on) AS SELECT a FROM vt; \
+                 CREATE OR REPLACE RULE \"_RETURN\" AS ON SELECT TO v4 \
+                   DO INSTEAD SELECT a FROM vt WHERE a > 0; \
+                 ALTER VIEW v4 SET (check_option=local); \
+                 CREATE TABLE gt (t text, \
+                   v tsvector GENERATED ALWAYS AS (to_tsvector('english', t)) VIRTUAL, \
+                   s int GENERATED ALWAYS AS (length(t)) STORED); \
+                 INSERT INTO gt (t) VALUES ('running dogs')",
                 false,
             );
+            check_rule_view_and_generated(&mut session, &mut engine);
             assert_eq!(
                 data_rows(&session.success(&mut engine, query, false)),
                 EXPECTED
@@ -56,10 +75,30 @@ fn view_reloptions_order_survives_journal_and_checkpoint_recovery() {
                 data_rows(&session.success(&mut engine, query, false)),
                 EXPECTED
             );
+            check_rule_view_and_generated(&mut session, &mut engine);
         }
         std::fs::remove_dir_all(&config.data_dir).unwrap();
         crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     }
+}
+
+fn check_rule_view_and_generated(session: &mut ConfiguredTransactionSession, engine: &mut Engine) {
+    assert_eq!(
+        data_rows(&session.success(
+            engine,
+            "SELECT reloptions, pg_get_viewdef('v4') FROM pg_class WHERE relname = 'v4'",
+            false,
+        )),
+        [RULE_VIEW.join("|")]
+    );
+    let generated = data_rows(&session.success(
+        engine,
+        "SELECT attname, attgenerated FROM pg_attribute \
+         WHERE attrelid = 'gt'::regclass AND attnum > 0 ORDER BY attnum; \
+         SELECT v, s FROM gt",
+        false,
+    ));
+    assert_eq!(generated, GENERATED);
 }
 
 #[test]

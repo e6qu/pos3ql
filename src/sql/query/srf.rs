@@ -1215,6 +1215,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                         .alloc_slice_with(names.len(), |index| crate::sql::types::RecordField {
                             name: names[index],
                             type_oid: types[index].oid(),
+                            type_mod: -1,
                             value: Datum::Null,
                         })
                         .map_err(|_| arena_full())?;
@@ -1244,6 +1245,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                         .alloc_slice_with(fields.len(), |index| crate::sql::types::RecordField {
                             name: fields[index].0,
                             type_oid: fields[index].1.oid(),
+                            type_mod: -1,
                             value: Datum::Null,
                         })
                         .map_err(|_| arena_full())?;
@@ -1274,6 +1276,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                     .alloc_slice_with(4, |index| crate::sql::types::RecordField {
                         name: ["message", "detail", "hint", "sql_error_code"][index],
                         type_oid: crate::sql::types::oid::TEXT,
+                        type_mod: -1,
                         value: Datum::Null,
                     })
                     .map_err(|_| arena_full())?;
@@ -1394,6 +1397,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                         .alloc_slice_with(4, |index| crate::sql::types::RecordField {
                             name: PARTITION_TREE_COLUMNS[index].0,
                             type_oid: PARTITION_TREE_COLUMNS[index].1.oid(),
+                            type_mod: -1,
                             value: row[index],
                         })
                         .map_err(|_| arena_full())?;
@@ -1464,6 +1468,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                                 crate::sql::types::ArrElem::Int2.array_oid(),
                                 crate::sql::types::ArrElem::Text.array_oid(),
                             ][field],
+                            type_mod: -1,
                             value: row[field],
                         })
                         .map_err(|_| arena_full())?;
@@ -1525,6 +1530,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                     .alloc_slice_with(columns.len(), |_| crate::sql::types::RecordField {
                         name: "",
                         type_oid: 0,
+                        type_mod: -1,
                         value: Datum::Null,
                     })
                     .map_err(|_| arena_full())?;
@@ -1541,6 +1547,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                                     "routine result type is absent from the catalog"
                                 )
                             })?,
+                        type_mod: -1,
                         value: crate::sql::exec::decode_projected_col_record(
                             encoded, index, arena,
                         )?,
@@ -2281,7 +2288,9 @@ pub(super) fn preserve_projection_type_identities(
                 )
                 .map(|metadata| metadata.type_oid)
                 .ok_or_else(shape_error),
-            super::ResolvedColumn::Merged(_) => Ok(scope.output_type(entry).oid()),
+            super::ResolvedColumn::Merged(_) | super::ResolvedColumn::TableOid(_) => {
+                Ok(scope.output_type(entry).oid())
+            }
         }
     };
     let mut output = 0usize;
@@ -4270,6 +4279,9 @@ fn capture_table_func_routine(
             txid,
         )
         .ok_or_else(|| srf_signature_error(tref.table))?;
+    if let Some(error) = super::trigger_function_source_error(storage, slot, tref.table, txid) {
+        return Err(error);
+    }
     let routine = storage
         .function_for_captured_call(
             oid,
@@ -4279,6 +4291,112 @@ fn capture_table_func_routine(
             txid,
         )
         .ok_or_else(|| srf_signature_error(tref.table))?;
+    bind_column_definitions(tref, routine, storage, txid)
+}
+
+/// The column definition list a function in FROM was written with: the
+/// `__json_record_columns` call the parser keeps as its last argument.
+fn column_definition_list<'a>(tref: &TableRef<'a>) -> Option<&'a Expr<'a>> {
+    match tref.func_args?.last()? {
+        definitions @ Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name: "__json_record_columns",
+            ..
+        } => Some(definitions),
+        _ => None,
+    }
+}
+
+/// Checks a stored function's column definition list as PostgreSQL's
+/// `addRangeTableEntryForFunction` does, and makes a list's columns the
+/// result columns of a function returning `record`, which its body's rows
+/// must then match.
+fn bind_column_definitions(
+    tref: &TableRef<'_>,
+    mut routine: RoutineDef,
+    storage: &Storage,
+    txid: u32,
+) -> Result<RoutineDef, SqlError> {
+    let definitions = column_definition_list(tref);
+    // A function returning `record` (or `SETOF record`) without OUT
+    // parameters takes its columns from the list.
+    let record = match routine.kind {
+        crate::storage::RoutineKind::RecordFunction { .. } => true,
+        crate::storage::RoutineKind::Function { result }
+        | crate::storage::RoutineKind::SetFunction { result } => {
+            result.ctype == ColType::Record && result.user_type.is_none()
+        }
+        _ => false,
+    };
+    let syntax = |message: &'static str| sql_err!(sqlstate::SYNTAX_ERROR, "{}", message);
+    let Some(list) = definitions else {
+        if record && routine.result_column_count == 0 {
+            return Err(crate::sql::error_position::at_source_position(
+                syntax("a column definition list is required for functions returning \"record\""),
+                tref.func_source_position,
+            ));
+        }
+        return Ok(routine);
+    };
+    let Expr::Call {
+        args: entries,
+        source_position,
+        ..
+    } = list
+    else {
+        unreachable!("column definition list is a call");
+    };
+    if !record || routine.result_column_count != 0 {
+        let message = if routine.result_column_count != 0 {
+            "a column definition list is redundant for a function with OUT parameters"
+        } else {
+            "a column definition list is only allowed for functions returning \"record\""
+        };
+        return Err(crate::sql::error_position::at_source_position(
+            syntax(message),
+            *source_position,
+        ));
+    }
+    if entries.len() > routine.result_columns.len() {
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_COLUMNS,
+            "column definition lists can have at most {} entries",
+            routine.result_columns.len()
+        ));
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        let Expr::Call {
+            name: "__json_record_column",
+            args: [Expr::Str(name), Expr::Str(type_name), Expr::Int(_)],
+            ..
+        } = entry
+        else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid column definition list entry"
+            ));
+        };
+        if routine.result_columns[..index]
+            .iter()
+            .any(|column| column.name.as_str() == *name)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_COLUMN,
+                "column name \"{}\" specified more than once",
+                name
+            ));
+        }
+        let resolved = crate::sql::exec::resolve_routine_type(storage, txid, type_name)?;
+        routine.result_columns[index] = crate::storage::RoutineArgumentDef {
+            name: SqlName::parse(name)?,
+            ctype: resolved.ctype,
+            user_type: resolved.user_type,
+        };
+    }
+    routine.result_column_count = entries.len();
+    routine.kind = crate::storage::RoutineKind::RecordFunction {
+        set_returning: routine.kind.is_set_returning(),
+    };
     Ok(routine)
 }
 
@@ -4565,6 +4683,9 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             } else {
                 bound
             }
+        } else if selected.is_some() {
+            // A stored function's column definition list is not an input.
+            &written_args[..table_function_input_count(tref)]
         } else {
             written_args
         };
@@ -6044,7 +6165,9 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 .security_definer
                 .then(|| crate::sql::eval::funcs::system::enter_current_user(owner));
             let _config = (!routine.configs().is_empty())
-                .then(|| crate::sql::guc::enter_active_routine_configs(routine.configs()))
+                .then(|| {
+                    crate::sql::guc::enter_active_routine_configs(storage, txid, routine.configs())
+                })
                 .transpose()?;
             if invocations.is_some()
                 || super::with_active_routine_invocations(|context| context.is_some())
@@ -7156,8 +7279,11 @@ fn json_table_column_value<'a, C: ColumnLookup<'a>>(
                 hooks,
             );
         }
+        // `transformJsonTableColumn`: a written FORMAT, WRAPPER or QUOTES
+        // clause, or a non-scalar type, reads the value as `JSON_QUERY`.
         let query_semantics = *format == "json"
-            || *wrapper != "without"
+            || *wrapper != "unspecified"
+            || *quotes != "unspecified"
             || ColType::from_sql_name(type_name).is_some_and(|ctype| {
                 matches!(ctype, ColType::Json | ColType::Jsonb | ColType::Array(_))
             })

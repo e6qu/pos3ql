@@ -433,12 +433,16 @@ pub(super) struct UsingAlias<'d> {
 }
 
 /// A column name resolved against a query scope: a plain table column
-/// (table index, column index), or a USING/NATURAL-merged join column
-/// (index into `QueryScope::merged`).
+/// (table index, column index), a USING/NATURAL-merged join column (index
+/// into `QueryScope::merged`), or the `tableoid` system column of a stored
+/// relation's FROM item (its table index): the oid of the physical table
+/// that holds the row, which for a partition or inheritance tree is the
+/// leaf the row was read from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ResolvedColumn {
     Table(usize, usize),
     Merged(usize),
+    TableOid(usize),
 }
 
 pub(crate) fn materialized_definition<'a>(
@@ -666,6 +670,10 @@ pub struct QueryScope<'d> {
     /// Set while adding the right side of a `RIGHT` or `FULL` join, which
     /// may not read the join's other side even when `LATERAL`.
     right_of_outer_join: bool,
+    /// The rows of the first FROM item a hash join of a data-modifying
+    /// statement's target found for the current target row, in scan order.
+    /// The statement's conditions still decide each of them.
+    pub(crate) target_hash_candidates: Option<&'d [u64]>,
 }
 
 /// A table (or `USING` alias) inside an unaliased parenthesized join. Its
@@ -788,7 +796,9 @@ impl<'a> DerivedTableOuter<'_, '_, '_, 'a> {
             .siblings
             .find_column_in(0..self.preceding, qualifier, name)
         {
-            Ok(ResolvedColumn::Table(table, _)) => self.reachable(table),
+            Ok(ResolvedColumn::Table(table, _) | ResolvedColumn::TableOid(table)) => {
+                self.reachable(table)
+            }
             Ok(ResolvedColumn::Merged(merged)) => self.siblings.merged[merged]
                 .parts
                 .iter()
@@ -956,9 +966,23 @@ fn left_items<'s, 'd>(
 }
 
 impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
-    fn statement_subqueries(&self) -> &'a [crate::sql::eval::DeferredSubquery<'a>] {
+    fn suggest_columns(
+        &self,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        // The FROM items before the derived table are in the enclosing
+        // query already, reachable or not.
+        self.siblings
+            .suggest_columns_before(self.preceding, suggestion);
+        if let Some(enclosing) = self.enclosing {
+            enclosing.suggest_columns(suggestion);
+        }
+    }
+
+    fn statement_subqueries(&self) -> crate::sql::eval::StatementScope<'a> {
         self.enclosing
-            .map_or(&[], |enclosing| enclosing.statement_subqueries())
+            .map(|enclosing| enclosing.statement_subqueries())
+            .unwrap_or_default()
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
@@ -1209,6 +1233,13 @@ impl<'a> ColumnLookup<'a> for ResolverColumns<'_> {
 }
 
 impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
+    fn suggest_columns(
+        &self,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        self.0.suggest_columns(suggestion);
+    }
+
     fn whole_row_field_metadata(
         &self,
         table: &str,
@@ -1268,6 +1299,13 @@ impl<'a> ColumnLookup<'a> for OuterColumnTypes<'_, '_> {
 }
 
 impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
+    fn suggest_columns(
+        &self,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        self.0.suggest_columns(suggestion);
+    }
+
     fn whole_row_field_metadata(
         &self,
         table: &str,
@@ -1323,7 +1361,7 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
             ResolvedColumn::Table(table, column) => {
                 self.0.defs.get(table)?.columns.get(column)?.user_type
             }
-            ResolvedColumn::Merged(_) => None,
+            ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_) => None,
         }
     }
 
@@ -1519,6 +1557,7 @@ impl<'d> QueryScope<'d> {
             hidden_origins: &[],
             lateral_from: 0,
             right_of_outer_join: false,
+            target_hash_candidates: None,
         })
     }
 
@@ -1745,7 +1784,7 @@ impl<'d> QueryScope<'d> {
         for index in 0..inner.star_columns() {
             origins
                 .push(match inner.star_entry(index) {
-                    ResolvedColumn::Merged(_) => None,
+                    ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_) => None,
                     ResolvedColumn::Table(table, column) => Some(
                         arena
                             .alloc_str(inner.column_reference_name(table, column).0)
@@ -1843,7 +1882,7 @@ impl<'d> QueryScope<'d> {
         let mut origins = ArenaList::new(arena);
         for index in 0..visible {
             let origin = match inner.star_entry(index) {
-                ResolvedColumn::Merged(_) => None,
+                ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_) => None,
                 ResolvedColumn::Table(inner_table, inner_column) => {
                     let (qualifier, name) = inner.column_reference_name(inner_table, inner_column);
                     let columns = self
@@ -3270,6 +3309,12 @@ impl<'d> QueryScope<'d> {
                 let (first_part, prior_parts) = match left {
                     ResolvedColumn::Table(t, c) => (Some((t, c)), &[][..]),
                     ResolvedColumn::Merged(m) => (None, self.merged[m].parts),
+                    ResolvedColumn::TableOid(_) => {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "a join's output has a system column"
+                        ));
+                    }
                 };
                 let parts = scratch_arena
                     .alloc_slice_with(
@@ -3366,6 +3411,7 @@ impl<'d> QueryScope<'d> {
         match entry {
             ResolvedColumn::Table(t, c) => self.defs.column_name(t, c),
             ResolvedColumn::Merged(m) => self.merged[m].name,
+            ResolvedColumn::TableOid(_) => "tableoid",
         }
     }
 
@@ -3374,6 +3420,7 @@ impl<'d> QueryScope<'d> {
         match entry {
             ResolvedColumn::Table(t, c) => self.defs.get(t).expect("resolved").columns[c].ctype,
             ResolvedColumn::Merged(m) => self.merged[m].ctype,
+            ResolvedColumn::TableOid(_) => ColType::Oid,
         }
     }
 
@@ -3390,6 +3437,7 @@ impl<'d> QueryScope<'d> {
                     self.defs.get(table).expect("resolved").columns[column].collation
                 })
                 .unwrap_or(crate::sql::ast::Collation::None),
+            ResolvedColumn::TableOid(_) => crate::sql::ast::Collation::None,
         }
     }
 
@@ -3474,6 +3522,12 @@ impl<'d> QueryScope<'d> {
                     name: self.defs.column_name(t, c),
                 })
                 .map_err(|_| arena_full())?),
+            ResolvedColumn::TableOid(t) => Ok(&*arena
+                .alloc(Expr::Column {
+                    qualifier: Some(self.names[t]),
+                    name: "tableoid",
+                })
+                .map_err(|_| arena_full())?),
             ResolvedColumn::Merged(m) => {
                 let mc = &self.merged[m];
                 let args = arena
@@ -3528,6 +3582,17 @@ impl<'d> QueryScope<'d> {
         };
         match entry {
             ResolvedColumn::Table(table, index) => column(table, index),
+            ResolvedColumn::TableOid(table) => {
+                let qualifier = arena
+                    .alloc_str(self.names[table])
+                    .map_err(|_| arena_full())?;
+                Ok(&*arena
+                    .alloc(Expr::Column {
+                        qualifier: Some(qualifier),
+                        name: "tableoid",
+                    })
+                    .map_err(|_| arena_full())?)
+            }
             ResolvedColumn::Merged(merged) => {
                 let parts = self.merged[merged].parts;
                 let args = arena
@@ -3781,6 +3846,13 @@ impl<'d> QueryScope<'d> {
         self.storage.domain_base_type_for_oid(type_oid, self.txid)
     }
 
+    pub(crate) fn select_common_type(
+        &self,
+        inputs: &[i32],
+    ) -> Result<i32, crate::storage::CommonTypeFailure> {
+        self.storage.select_common_type(inputs, self.txid)
+    }
+
     pub fn func_scalar_type(&self, name: &str) -> Option<ColType> {
         self.func_scalar_column(name)
             .map(|column| self.output_type(column))
@@ -3808,6 +3880,29 @@ impl<'d> QueryScope<'d> {
         self.find_column_among(self.n, qualifier, name)
     }
 
+    /// [`Self::find_column`] for a caller that may still find the column
+    /// elsewhere or discards the error: a missing column's spelling
+    /// suggestion, which compares every visible column name, is built only
+    /// where the error is reported.
+    pub(crate) fn find_column_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ResolvedColumn, SqlError> {
+        self.find_column_among_unsuggested(self.n, qualifier, name)
+    }
+
+    /// [`Self::find_column_among`] without the spelling suggestion.
+    pub(crate) fn find_column_among_unsuggested(
+        &self,
+        visible: usize,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ResolvedColumn, SqlError> {
+        self.find_column_prefix(visible, qualifier, name)
+            .map_err(|error| crate::sql::error_position::column_reference(error, qualifier, name))
+    }
+
     /// [`Self::find_column`] over the first `visible` FROM items only: a
     /// `LATERAL` body reads just the items to its left, never its own or a
     /// later item's columns.
@@ -3817,8 +3912,89 @@ impl<'d> QueryScope<'d> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ResolvedColumn, SqlError> {
-        self.find_column_prefix(visible, qualifier, name)
-            .map_err(|error| crate::sql::error_position::column_reference(error, qualifier, name))
+        self.find_column_among_unsuggested(visible, qualifier, name)
+            .map_err(|error| self.suggested(error, qualifier, name))
+    }
+
+    /// A missing column's error with the spelling suggestion this scope's
+    /// FROM items offer, as it is reported.
+    pub(crate) fn suggested(
+        &self,
+        error: SqlError,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> SqlError {
+        if error.sqlstate.as_str() != crate::sql::eval::sqlstate::UNDEFINED_COLUMN {
+            return error;
+        }
+        let mut suggestion = crate::sql::column_suggestion::ColumnSuggestion::new(qualifier, name);
+        self.suggest_columns(&mut suggestion);
+        crate::sql::error_position::with_column_suggestion(error, &suggestion)
+    }
+
+    /// Offers every FROM item, a parenthesized join through its members, to
+    /// a missing column's spelling suggestion.
+    pub(crate) fn suggest_columns(
+        &self,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        self.suggest_columns_before(self.n, suggestion);
+    }
+
+    /// [`Self::suggest_columns`] for the first `end` FROM items.
+    pub(crate) fn suggest_columns_before(
+        &self,
+        end: usize,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        for table in 0..end.min(self.n) {
+            let Some(definition) = self.defs.get(table) else {
+                continue;
+            };
+            let mut members = self
+                .members
+                .iter()
+                .filter(|member| member.table == table)
+                .peekable();
+            if let Some((_, origins)) = self
+                .hidden_origins
+                .iter()
+                .find(|(entry, _)| *entry == table)
+            {
+                // An aliased parenthesized join: PostgreSQL searches the
+                // tables inside it, each with the merged USING columns.
+                let names = |member: &'d str| {
+                    origins
+                        .iter()
+                        .enumerate()
+                        .filter(move |(_, origin)| origin.is_none_or(|origin| origin == member))
+                        .map(|(column, _)| self.defs.column_name(table, column))
+                };
+                for (index, origin) in origins.iter().enumerate() {
+                    if let Some(member) = origin
+                        && !origins[..index].contains(&Some(member))
+                    {
+                        suggestion.relation(member, names(member));
+                    }
+                }
+                continue;
+            }
+            if members.peek().is_none() {
+                suggestion.relation(
+                    self.names[table],
+                    (0..definition.n_columns).map(|column| self.defs.column_name(table, column)),
+                );
+                continue;
+            }
+            for member in members {
+                suggestion.relation(
+                    member.name,
+                    definition.columns[member.first..member.first + member.n_columns]
+                        .iter()
+                        .map(|column| column.name.as_str()),
+                );
+            }
+        }
     }
 
     fn find_column_unpositioned(
@@ -3845,7 +4021,14 @@ impl<'d> QueryScope<'d> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ResolvedColumn, SqlError> {
-        self.find_relation_column(items, qualifier, name)
+        self.find_relation_column(items.clone(), qualifier, name)
+            .or_else(|error| {
+                if error.sqlstate == sqlstate::UNDEFINED_COLUMN && name == "tableoid" {
+                    self.find_table_oid(items, qualifier)?.ok_or(error)
+                } else {
+                    Err(error)
+                }
+            })
             .map_err(|error| {
                 if error.sqlstate == sqlstate::UNDEFINED_COLUMN
                     && self.names_system_column(qualifier, name)
@@ -3859,6 +4042,79 @@ impl<'d> QueryScope<'d> {
                     error
                 }
             })
+    }
+
+    /// The `tableoid` system column of the stored table among `items` that
+    /// `qualifier` names, or of the only stored table when unqualified.
+    /// `None` when no such table is in reach.
+    fn find_table_oid(
+        &self,
+        items: core::ops::Range<usize>,
+        qualifier: Option<&str>,
+    ) -> Result<Option<ResolvedColumn>, SqlError> {
+        let items = items.start..items.end.min(self.n);
+        match qualifier {
+            Some(qualifier) if self.using_alias(qualifier).is_some() => Ok(None),
+            Some(qualifier) => {
+                let Ok(source) = self.source(qualifier) else {
+                    return Ok(None);
+                };
+                Ok(
+                    (items.contains(&source.table) && self.stores_rows(source.table))
+                        .then_some(ResolvedColumn::TableOid(source.table)),
+                )
+            }
+            None => {
+                let mut found = None;
+                for table in items.filter(|&table| self.stores_rows(table)) {
+                    if found.is_some() {
+                        return Err(sql_err!(
+                            crate::sql::eval::sqlstate::AMBIGUOUS_COLUMN,
+                            "column reference \"tableoid\" is ambiguous"
+                        ));
+                    }
+                    found = Some(ResolvedColumn::TableOid(table));
+                }
+                Ok(found)
+            }
+        }
+    }
+
+    /// The oid of a stored FROM item's own table, the `tableoid` of every
+    /// row it reads itself.
+    pub(crate) fn relation_oid<'v>(&self, table: usize) -> Result<Datum<'v>, SqlError> {
+        if !self.stores_rows(table) {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "tableoid of a FROM item that stores no rows"
+            ));
+        }
+        Ok(Datum::Oid(
+            crate::sql::catalog::user_table_oid(self.storage, self.slots[table]) as u32,
+        ))
+    }
+
+    /// [`Self::relation_oid`] for a row whose values were flattened without
+    /// the leaf it came from: exact only for a table without descendants.
+    pub(crate) fn flat_relation_oid<'v>(&self, table: usize) -> Result<Datum<'v>, SqlError> {
+        if self
+            .storage
+            .relation_has_descendants(self.slots[table], self.txid)
+        {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "tableoid of an inheritance tree or partitioned table is not supported in this query"
+            ));
+        }
+        self.relation_oid(table)
+    }
+
+    /// Whether a FROM item reads a stored table (ordinary, partitioned or
+    /// foreign), whose rows carry a `tableoid`.
+    pub(crate) fn stores_rows(&self, table: usize) -> bool {
+        self.derived[table].is_none()
+            && self.slots[table] != usize::MAX
+            && self.defs.stored(table).is_some()
     }
 
     /// Whether `name` is a PostgreSQL system column of a relation the
@@ -3893,7 +4149,9 @@ impl<'d> QueryScope<'d> {
         let items = items.start..items.end.min(self.n);
         // A merged column is visible when every item it merges is.
         let entry_visible = |entry: ResolvedColumn| match entry {
-            ResolvedColumn::Table(table, _) => items.contains(&table),
+            ResolvedColumn::Table(table, _) | ResolvedColumn::TableOid(table) => {
+                items.contains(&table)
+            }
             ResolvedColumn::Merged(merged) => self.merged[merged]
                 .parts
                 .iter()

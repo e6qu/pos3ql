@@ -3983,7 +3983,7 @@ fn catalog_object_pools_follow_their_independent_startup_capacities() {
     config.max_publications = 11;
     config.max_collations = 12;
     config.max_conversions = 13;
-    config.max_text_search_objects = 27;
+    config.max_text_search_objects = BUILTIN_TEXT_SEARCH_SLOTS + 6;
     config.max_event_triggers = 14;
     config.max_tablespaces = 15;
     config.max_comments = 16;
@@ -4195,7 +4195,10 @@ fn catalog_object_pools_follow_their_independent_startup_capacities() {
         .expect("text catalog lock poisoned");
     assert_eq!(text_catalog.collations.len(), 12);
     assert_eq!(text_catalog.conversions.len(), 13);
-    assert_eq!(text_catalog.text_search_objects.len(), 27);
+    assert_eq!(
+        text_catalog.text_search_objects.len(),
+        BUILTIN_TEXT_SEARCH_SLOTS + 6
+    );
     drop(text_catalog);
     assert_eq!(storage.event_trigger_capacity(), 14);
     assert_eq!(
@@ -6513,7 +6516,7 @@ fn trigger_catalog_is_synchronized_and_startup_bounded() {
         name: SqlName::parse("trigger_full").unwrap(),
         target: TriggerTarget::Table(0),
         kind: TriggerKind::Ordinary,
-        function: 0,
+        function: TriggerFunction::Routine(0),
         timing: crate::sql::ast::TriggerTiming::Before,
         level: crate::sql::ast::TriggerLevel::Row,
         events: crate::sql::ast::TriggerEvents::from_bits(1).unwrap(),
@@ -7105,7 +7108,7 @@ fn text_catalog_is_synchronized_and_startup_bounded() {
     assert_send_sync::<TextSearchIter<'_>>();
 
     const WORKERS: usize = 4;
-    const BUILTINS: usize = 21;
+    const BUILTINS: usize = BUILTIN_TEXT_SEARCH_SLOTS;
     let mut config = test_config();
     config.max_collations = WORKERS;
     config.max_conversions = WORKERS;
@@ -7172,7 +7175,7 @@ fn text_catalog_is_synchronized_and_startup_bounded() {
     assert_eq!(storage.conversions_visible_to(0).count(), WORKERS);
     assert_eq!(
         storage.text_search_objects_visible_to(0).count(),
-        7 + WORKERS
+        BUILTIN_TEXT_SEARCH_OBJECTS + WORKERS
     );
     for (slot, definition) in storage.collations_visible_to(0) {
         assert_eq!(storage.collation(slot).definition.name, definition.name);
@@ -11078,20 +11081,33 @@ fn replication_slots_are_bounded_and_have_resume_positions() {
 fn column_default_encodes_one_execution_state() {
     let expression = StackStr::from_str("7");
     assert!(matches!(
-        ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), Some(expression), false),
+        ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), Some(expression), None),
         Some(ColumnDefault::Constant { .. })
     ));
     assert!(matches!(
-        ColumnDefault::from_parts(None, Some(expression), false),
+        ColumnDefault::from_parts(None, Some(expression), None),
         Some(ColumnDefault::Expression(_))
     ));
     assert!(matches!(
-        ColumnDefault::from_parts(None, Some(expression), true),
-        Some(ColumnDefault::Generated(_))
+        ColumnDefault::from_parts(None, Some(expression), Some(Generation::Virtual)),
+        Some(ColumnDefault::Generated {
+            kind: Generation::Virtual,
+            ..
+        })
     ));
-    assert!(ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), None, true).is_none());
-    assert!(ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), None, false).is_none());
-    assert!(ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), Some(expression), true).is_none());
+    assert!(
+        ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), None, Some(Generation::Stored))
+            .is_none()
+    );
+    assert!(ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), None, None).is_none());
+    assert!(
+        ColumnDefault::from_parts(
+            Some(OwnedDatum::Int4(7)),
+            Some(expression),
+            Some(Generation::Stored)
+        )
+        .is_none()
+    );
 }
 
 #[test]

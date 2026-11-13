@@ -3569,11 +3569,15 @@ fn capture_original_drops<'a>(
                 .conversion_slot_on_path(name.schema, name.name, txid)
                 .map(ObjectRef::Conversion),
         )?,
-        Stmt::DropTextSearch { kind, name, .. } => remember(
-            storage
-                .text_search_slot_on_path(*kind, name.schema, name.name, txid)
-                .map(ObjectRef::TextSearch),
-        )?,
+        Stmt::DropTextSearch { kind, names, .. } => {
+            for name in *names {
+                remember(
+                    storage
+                        .text_search_slot_on_path(*kind, name.schema, name.name, txid)
+                        .map(ObjectRef::TextSearch),
+                )?;
+            }
+        }
         Stmt::DropPolicy { policy, .. } => {
             if let Some(ObjectRef::Table(table)) = relation(policy.table) {
                 remember(

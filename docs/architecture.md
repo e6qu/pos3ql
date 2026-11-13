@@ -85,7 +85,7 @@ rows of a write (see below).
 
 **Writes restart before their row changes.** `INSERT ... SELECT`, `UPDATE`,
 `DELETE` and `MERGE`, at top level or as a statement of a `CALL` or `DO` body,
-first select their rows: `INSERT ... SELECT` materializes its source rows,
+first select their rows: `INSERT ... SELECT` opens its source (below),
 `UPDATE` and `DELETE` collect the target rows and lock each one, and `MERGE`
 joins its source and target. Nothing has changed yet, so a cold read or a row
 lock wait in this phase rolls the statement back to its start (row images,
@@ -115,19 +115,33 @@ in the scan, would select different rows, so such a write reads its rows
 synchronously and a lock wait runs it again from its first start. A wait inside a routine body run for a row keeps the body's progress
 and continues it.
 
-**AFTER events queue in one spilling log.** Every queued `AFTER ROW`
-trigger, constraint trigger and foreign key check is a record in the
-transaction's event log, fired at its statement's end (or at `SET
-CONSTRAINTS` and commit when deferred) as PostgreSQL's after-trigger queue
-does. A written row's foreign key checks, its own references and the NO
-ACTION and RESTRICT checks of keys it removes, wait beside the row until its
-`AFTER` triggers are queued and take their places among them by the name of
-PostgreSQL's `RI_ConstraintTrigger_c_<oid>`/`_a_<oid>` triggers. A referencing
-check reads the row's current version, so a row deleted before the check is
-not checked; a referenced check carries the old key, and NO ACTION passes
-when another row provides that key again. Checks see every change of their
-transaction, and those of a data-modifying `WITH` sub-statement wait for the
-end of the whole statement, so `WITH d AS (DELETE FROM p ...) INSERT INTO p
+**AFTER events queue in one spilling log.** Every queued `AFTER ROW` and
+`AFTER STATEMENT` trigger, constraint trigger, foreign key check and
+referential action is a record in the transaction's event log, fired at its
+statement's end (or at `SET CONSTRAINTS` and commit when deferred) as
+PostgreSQL's after-trigger queue does. A written row's foreign key events,
+its own references and the actions and checks of keys it removes, wait
+beside the row until its `AFTER` triggers are queued and take their places
+among them by the name of PostgreSQL's
+`RI_ConstraintTrigger_c_<oid>`/`_a_<oid>` triggers. A statement's `AFTER
+STATEMENT` triggers follow its row events. A referencing check reads the
+row's current version, so a row deleted before the check is not checked; a
+referenced check carries the old key, and NO ACTION passes when another row
+provides that key again. Checks see every change of their transaction.
+
+A `CASCADE`, `SET NULL` or `SET DEFAULT` action runs PostgreSQL's
+`ri_triggers.c` query (`DELETE FROM ONLY child WHERE $1 OPERATOR(pg_catalog.=)
+"col"`, `UPDATE ONLY child SET ...`) through the nested write path as the
+child's owner, so rules rewrite it and the child's `BEFORE` triggers fire.
+Its writes record the statement that ran the event as the owner of their
+`AFTER` events (`AfterEventOwner`): their row events, `AFTER STATEMENT`
+triggers and transition rows join the end of that statement's queue instead
+of firing at the action's end. Per statement, table and operation, the
+transaction keeps whether `BEFORE STATEMENT` triggers fired and which `AFTER
+STATEMENT` events are queued, so each fires once, after the last change, with
+the transition rows of all of them (PostgreSQL's `AfterTriggersTableData`).
+A data-modifying `WITH` sub-statement leaves its `AFTER` events to the main
+statement the same way, so `WITH d AS (DELETE FROM p ...) INSERT INTO p
 SELECT ...` passes as in PostgreSQL. The log is cut into 64 KiB pages:
 `deferred_trigger_bytes` of them stay in memory per connection and older
 pages move to the `trigger_event_spill_bytes` file shared by all
@@ -138,9 +152,10 @@ after it.
 
 **Work after a write's last row resumes too.** A top-level `INSERT`,
 `UPDATE`, `DELETE` or `MERGE` keeps its finished `AFTER` work across a
-wait: queued `AFTER ROW` events, then the transaction's immediate
+wait: its queued events in order, with the transaction's immediate
 constraint checks (deferrable unique and exclusion constraints in
-`IMMEDIATE` mode), then `AFTER STATEMENT` triggers. An event
+`IMMEDIATE` mode) before its first `AFTER STATEMENT` trigger and again after
+any events queued later. An event
 stays selected until it completes. A wait inside a PL/pgSQL trigger body
 keeps the body and continues at its waiting statement; a wait before the
 body starts runs the same event again, replaying its sequence values from
@@ -148,8 +163,9 @@ the event's start. Each event's reads yield until its own first effect
 (a write, sequence call or routine call in its body), after which the rest
 of that event reads synchronously; the next event yields again. A write in
 a `CALL` or `DO` body keeps its `AFTER` work the same way in the body's
-frame. The steps of a multi-step write (rule actions, data-modifying `WITH`)
-run their `AFTER` work inline and synchronously.
+frame. The steps of a multi-step write (rule actions) run their `AFTER` work
+inline and synchronously; a data-modifying `WITH` sub-statement's `AFTER`
+work runs with the main statement's.
 Cancellation, a statement or lock timeout, an error and
 the end of the transaction release the kept progress.
 
@@ -178,8 +194,12 @@ A multi-step statement inside another's step (a rule action whose target
 has rules of its own) keeps its steps one level deeper, up to
 `write_step_levels` levels (4 by default);
 a step that is resumed keeps the effects of the calls that ran before it
-resumed. Where a write cannot keep its rows (a foreign table, or a step
-that changed rows without row progress), a call after its first change
+resumed. A write to a foreign table, or to a partitioned or inherited table
+with foreign children, keeps its selected rows (with the local rows' stored
+images and the joined `FROM` or `USING` rows) instead of selecting them
+again, since the remote session keeps the earlier rows' changes. Where a
+write cannot keep its rows (a step that changed rows without row progress),
+a call after its first change
 fails with `0A000` instead of running after a rollback that would hide
 those changes; one level deeper than `write_step_levels` it fails with
 `54000`, naming the setting. Writes that rules rewrite into
@@ -202,7 +222,21 @@ from a query (`SELECT f()`): its writes' `AFTER` triggers can run DDL and
 call routines; a wait inside them restarts the statement, as any wait in
 such a call does.
 
-`INSERT ... SELECT` materializes its source first; an output item that
+**`INSERT ... SELECT` streams a repeatable source.** A source that calls
+no volatile built-in (`random()`, `nextval`, ...) and no user routine, and
+that the retained reader runs (see [retained plan tree](#retained-plan-tree);
+a single table the general executor would read through an index keeps that
+path), streams: it reads as of the statement's start, holds one source row
+at a time in a fixed 512 KiB block of the arena (an arena with less
+than 1 MiB free materializes the source instead), and
+each row is written before the next is read, so `INSERT INTO archive
+SELECT * FROM orders` copies any number of rows in fixed memory and a
+source reading its own target sees none of the new rows, as in PostgreSQL.
+Its reads keep no invocation-log receipts. A restarted attempt reads the
+source again and skips, by count, the rows earlier attempts wrote; the
+source reads the same rows each time, so the count finds the unfinished
+row. Any other source materializes first, in the work arena, where a
+source larger than the arena fails with `54000`; an output item there that
 calls a volatile user routine is split so that the source reads only its
 other parts, and the row phase runs the calls as each row is inserted, as
 PostgreSQL computes its output list.
@@ -263,8 +297,9 @@ first, below), CTEs that run once, row locking
 or row security, whose read position (one
 record per resident row of each table plus the query text) fits
 `result_stream_bytes`. A retained join uses inner, cross and `LEFT` joins,
-or one `RIGHT` or `FULL` join of two items whose right item is a table or
-`VALUES` list, whose `ON`/`USING` conditions are scalar, non-volatile and call no
+or one `RIGHT` or `FULL` join of two items, read as the general executor's
+hash join or, where it would not hash, as a nested loop whose right item is
+a table or `VALUES` list, whose `ON`/`USING` conditions are scalar, non-volatile and call no
 SQL-language routine; a join whose inner table the general executor would
 probe through an index for each outer row spools for `shape` instead. A
 sorted stream's keys and filter must be non-volatile and call no
@@ -479,7 +514,7 @@ their rows.
 nested in a query the statement runs again for each row (a correlated or
 `LATERAL` subquery, a set-operation branch, a function in `FROM`) has a slot
 in the statement arena's persistent tail, made when the statement prepares
-its subqueries (`nested_statement_slots` in `src/sql/query/subquery.rs`).
+its subqueries (`nested_statement_scope` in `src/sql/query/subquery.rs`).
 Every run of the query around it reaches the slot through the row it runs
 for (`ColumnLookup::statement_subqueries`), so `SELECT (SELECT x + (SELECT
 nextval('s')) FROM z WHERE x <= t.id) FROM t` calls `nextval` once. A slot is
@@ -489,7 +524,14 @@ copy, as PostgreSQL plans one subquery per copy. A correlated subquery is bound 
 types (`SubqueryBinding`): a scalar or `ARRAY` one keeps its result type, the
 executor that runs it and its aggregate states, which each outer row copies;
 an `EXISTS` one its executor; a row one its row type; an `IN`/`ANY`/`ALL` one
-its comparison collations and column types.
+its comparison collations and column types. A correlated subquery nested in
+a query the statement runs for each row is bound the first time that query
+runs, in a fixed 64 KiB workspace carved from the statement arena's
+persistent tail (`NestedBindings`), and every later run reuses the binding;
+the statement's scope carries the table of these bindings with its slots.
+Only sublinks written in the statement are kept there; one expanded from a
+view as its query runs is bound for that run. Filling the workspace fails
+the statement with SQLSTATE 54000.
 
 **Built: correlated subqueries where evaluation reaches them.** A query's
 correlated subqueries are deferred like its uncorrelated ones, without a
@@ -533,8 +575,9 @@ indexed join into a full nested loop: a two-table equality join the general
 executor would hash is read as a hash join that builds the same side, and a
 join it would probe through an index per outer row is not retained.
 
-**Built: `RIGHT` and `FULL` joins.** As in the general executor, a `RIGHT`
-or `FULL` join of two items is a nested loop over the left item that keeps
+**Built: `RIGHT` and `FULL` joins.** A `RIGHT` or `FULL` join of two items
+the general executor hashes is read as that hash join (below). Otherwise, as
+in the general executor, it is a nested loop over the left item that keeps
 one flag per row of the right item, in a `plan_build_bytes` lease that
 grows as the first left row's pass reads the right item. Each right row that
 passes `ON` sets its flag; a `FULL JOIN` also returns each unmatched left
@@ -552,7 +595,13 @@ bucket heads sized from the planner's row estimate, one entry per row, and
 the rows' columns in projected encoding. A wait during the build keeps the
 rows inserted so far and the table position. Each outer row hashes its keys
 and walks its bucket; equal keys are compared, then the `ON` condition runs,
-and a `LEFT JOIN` returns a NULL-extended row when nothing matched. A cursor
+and a preserved outer row returns NULL-extended when nothing matched. When
+the build side is preserved (a `FULL JOIN`, or a `RIGHT` or `LEFT JOIN`
+hashing its preserved side), the build also keeps rows whose key has a NULL,
+outside every bucket, and a flag per entry in a growing `plan_build_bytes`
+lease records a match once the whole `ON` condition holds; after the last
+outer row, the entries are read in build order and each unflagged row returns
+with the outer columns NULL. A cursor
 moving back rereads only its outer table: the build stays. A build that does
 not fit the free `plan_build_bytes` runs the statement the general executor's
 way instead (below), which builds the same table in statement memory
@@ -616,7 +665,7 @@ being built and are released when it is delivered.
 | Scan (built: table, literal list, generator calls, FROM-less row) | The read position and current row | Stream or cursor allocation |
 | Filter, projection, `LIMIT`/`OFFSET` (built) | The condition, items, and remaining counts | Node record |
 | Nested-loop join (built: inner, cross and `LEFT`; `RIGHT` and `FULL` of two items) | Each level's row bytes, position and matched flag; a flag per right row for `RIGHT`/`FULL` | The stream or cursor allocation, the right-row flags in `plan_build_bytes`; the inner source rewinds as scrollable cursors do |
-| Hash join (built: two tables, inner, cross and `LEFT`) | Build-side rows, entries and bucket heads | `plan_build_bytes` / `plan_build_leases`; exhaustion is `54000` naming them |
+| Hash join (built: two tables, inner, cross, `LEFT`, `RIGHT` and `FULL`) | Build-side rows, entries and bucket heads; a match flag per entry when the build side is preserved | `plan_build_bytes` / `plan_build_leases`; exhaustion is `54000` naming them |
 | Grouping (built: `GROUP BY`, `HAVING`, aggregates) | Each group's key, states and held values; or every input row's keys and aggregated columns, then each group's keys and results | `plan_build_bytes` |
 | `DISTINCT` (built: plain, as a grouping by the output list) | Each distinct output row | `plan_build_bytes` |
 | Sort (built: local mode, also for `DISTINCT ON`) | Sort keys, saved output and input columns of every row | `plan_build_bytes`; object-store mode: the external sorter's runs on the block grid (not built) |
@@ -684,6 +733,65 @@ finished run, and joins rewind their outer source. A tree containing a
 volatile function under a node that cannot evaluate rows again saves its
 outputs, as scrollable cursors over such shapes do now.
 
+### Write sub-statements that run as their rows are read
+
+*Design; not yet implemented (see PLAN.md, write phases).* PostgreSQL runs a
+data-modifying `WITH` query, a rule's action and an `INSERT ... SELECT`
+source as plan nodes the consuming statement pulls rows from. pos3ql runs
+the first two to completion first, which orders their `AFTER` events before
+the consumer's; a repeatable `INSERT ... SELECT` source already streams (see
+[execution model](#execution-model)), and one with volatile or routine calls
+still materializes.
+
+Every `AFTER` event of the statement, its sub-statements' included, already
+fires at the statement's end in the order the events were queued, as
+PostgreSQL's `AfterTriggerEndQuery` fires them. What differs is the queue
+order and the order of volatile calls. For example, `WITH w AS (INSERT INTO
+a ... RETURNING x) INSERT INTO b SELECT x FROM w` queues `a`'s row 1, `b`'s
+row 1, `a`'s row 2 and so on in PostgreSQL, and `a`'s statement event before
+`b`'s; pos3ql queues all of `a`'s events first. A data-modifying query that
+nothing reads already runs after the main statement, last one first, and
+its events already follow the main statement's.
+
+- **Producer nodes.** A data-modifying `WITH` query becomes a retained plan
+  node (see [retained plan tree](#retained-plan-tree)) whose step writes one
+  source row and yields its `RETURNING` row. The consumer pulls it like a
+  scan; an unreferenced query is drained after the main statement, last one
+  first, as PostgreSQL's `ExecPostprocessPlan` does. An `INSERT ... SELECT`
+  source with volatile or routine calls reads through the same node
+  interface instead of materializing, once it keeps its own invocation log
+  and sequence replay cursor. The
+  two go together: a write that consumes a producer only interleaves with
+  it once it pulls one source row per row it writes.
+- **Retained selections.** A producer's step cannot select its rows again
+  for every row it yields: under the restart model that costs one full
+  selection per produced row. Its scan is itself a retained node (the same
+  cursor-mode reader result streams use), and the write keeps the node's
+  position with its row progress, as a foreign table's write already keeps
+  its selected remote rows.
+- **Event order.** Each producer queues its `AFTER ROW` events in the
+  existing spilling event log as its rows are written, tagged with the
+  statement's depth and command, so they interleave with the consumer's in
+  PostgreSQL's order. Statement-level events stay queued at the producer's
+  end. No new memory class is needed: the log already spills to
+  `trigger_event_spill_bytes`.
+- **Separate logs per producer.** A wait or a routine call restarts the
+  statement at the unfinished row. Each producer keeps its own row progress
+  (changed rows, as for a top-level write) and its own routine invocation
+  log, so a restart replays neither another producer's calls nor its rows;
+  the consumer's progress records which producer row it last consumed.
+  Producers count against `write_step_levels`, and exhaustion stays the named
+  `54000`. The invocation log replays calls by position, so a source read
+  again after a restart replays its own log: sharing the write's log would
+  shift every later call once skipped rows stop evaluating theirs.
+- **Rule steps.** A rule action's AFTER work runs from the same completion
+  cursor as a top-level write's, so it yields instead of reading
+  synchronously. The suspended completion returns to the statement's
+  attempt loop, which records the step finished with its outputs (the step
+  progress a routine call already keeps) and starts another attempt; that
+  attempt skips the finished steps and runs the next one. (Foreign-table writes already keep their selected remote
+  rows across routine calls; see [execution model](#execution-model).)
+
 ### How saved state is owned
 
 A paused command must resume exactly where it stopped, without repeating
@@ -721,8 +829,8 @@ Further rules that apply to every saved owner:
 - **Unsupported restarts fail loudly.** A path that cannot save its progress
   returns `0A000` and rolls back rather than repeat a write — for example
   `SQL row expression requires retained write progress` for a routine call
-  after a SQL-language function's `MERGE` or data-modifying `WITH`, or a
-  foreign table's write, changed rows; or an unsaved volatile
+  after a SQL-language function's `MERGE` or data-modifying `WITH` changed
+  rows; or an unsaved volatile
   value such as `random()`. Contexts with no resumable executor reject advisory
   unlocks with `0A000`.
 - **Typed wait markers.** Internal waits use a typed marker, not a SQLSTATE.
@@ -744,9 +852,9 @@ releases the saved body.
 
 Write completion follows PostgreSQL's
 [write executor](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/executor/nodeModifyTable.c):
-drain row events, run AFTER statement triggers in order (MERGE runs them in
-DELETE, UPDATE, INSERT order; `INSERT ... ON CONFLICT DO UPDATE` runs UPDATE
-before INSERT), then return one completion. Direct table writes without rewrite
+queue AFTER statement triggers after the row events (MERGE queues them in
+DELETE, UPDATE, INSERT order; `INSERT ... ON CONFLICT DO UPDATE` queues UPDATE
+before INSERT), drain the queue, then return one completion. Direct table writes without rewrite
 rules hand that completion to a retained owner, so a waiting AFTER trigger
 resumes without redoing the insert, update or delete, and earlier `RETURNING`
 rows are kept. Nested INSERT, UPDATE and DELETE inside a trigger hand their
@@ -909,10 +1017,15 @@ reading one row is therefore not a fixed number of GET requests.
 
 Eligible two-source equality joins use a bounded hash build over tables,
 catalogs, derived results and external sort runs. Up to eight equality keys,
-NULL keys, duplicate matches, extra `ON` conditions and `LEFT JOIN` share that
-path. A build estimated beyond its fixed 32,768-entry ceiling, a lateral or
-partitioned source, or incompatible key types selects a nested-loop plan before
-execution; `EXPLAIN` reports the same choice.
+NULL keys, duplicate matches, extra `ON` conditions and `LEFT`, `RIGHT` and
+`FULL` joins share that path. An outer join hashes its nullable side when it
+fits, else its preserved side; a preserved build side keeps its NULL-key rows
+and one match flag per row, set when the whole join condition holds, and its
+unmatched rows return NULL-extended after the probe, in the build source's
+row order. A join whose fitting sides leave no build estimated within its fixed
+32,768-entry ceiling, a lateral or partitioned source, or incompatible key
+types selects a nested-loop plan before execution; `EXPLAIN` reports the same
+choice.
 
 Other joins run as a nested loop. A `WHERE` condition is checked at the first
 join level where all its sources are bound, including above a `LEFT JOIN` when

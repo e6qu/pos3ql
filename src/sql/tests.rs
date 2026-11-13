@@ -36,6 +36,7 @@ mod foreign_parent_admission;
 mod function_progress;
 mod geometric_casts;
 mod geometry_assignments;
+mod hash_outer_joins;
 mod index_expression_mutability;
 mod index_parent_ownership;
 mod indirect_execute_privileges;
@@ -56,6 +57,7 @@ mod polymorphic_resolution;
 mod predefined_roles;
 mod prepared_object_capacity;
 mod prepared_parameter_types;
+mod procedural_compatibility;
 mod procedural_expression_calls;
 mod procedural_progress;
 mod procedural_subtransactions;
@@ -84,6 +86,7 @@ mod shared_statistics;
 mod special_datetime_inputs;
 mod sql_function_results;
 mod stored_relation_sources;
+mod streamed_insert_sources;
 mod table_metadata_capacity;
 mod table_publication;
 mod transaction_publication;
@@ -1608,7 +1611,9 @@ fn attribute_default_oids_follow_default_lifetimes_through_journal_and_checkpoin
     const QUERIES: &str = "SELECT count(*) = 2 FROM ad_saved s JOIN pg_attrdef d ON d.oid = s.identity AND d.adrelid = s.relid AND d.adnum = s.num;
          SELECT count(DISTINCT oid) = 4 FROM pg_attrdef";
     const AFTER: &str = "ALTER VIEW ad_v ALTER a SET DEFAULT 6;
+         ALTER TABLE ad_t ALTER b DROP EXPRESSION;
          ALTER TABLE ad_t ALTER a TYPE bigint;
+         ALTER TABLE ad_t ALTER b SET DEFAULT 0;
          SELECT count(*) = 0 FROM ad_saved s JOIN pg_attrdef d ON d.oid = s.identity;
          SELECT count(DISTINCT oid) = 4 FROM pg_attrdef";
     for checkpoint in [false, true] {
@@ -13569,9 +13574,9 @@ fn rewrite_rule_set_queries_notify_recursion_and_command_counts() {
         "CREATE TABLE rule_set_source(id integer); \
          CREATE SEQUENCE rule_set_sequence; \
          CREATE RULE rule_set_action AS ON INSERT TO rule_set_source DO ALSO ( \
-           SELECT nextval('rule_set_sequence') WHERE NEW.id > 0 \
+           SELECT nextval('rule_set_sequence') WHERE true \
            UNION ALL \
-           SELECT nextval('rule_set_sequence') WHERE NEW.id < 0; \
+           SELECT nextval('rule_set_sequence') WHERE false; \
            NOTIFY rule_set_changed, 'rewritten'; \
          )",
     );
@@ -13580,6 +13585,16 @@ fn rewrite_rule_set_queries_notify_recursion_and_command_counts() {
         "{}",
         String::from_utf8_lossy(&setup)
     );
+    // A set operation's members belong to the action's query level, so they
+    // cannot read the rule's NEW row, as in PostgreSQL.
+    let member = run_as(
+        &mut engine,
+        &mut budget,
+        17,
+        "CREATE RULE rule_set_member AS ON INSERT TO rule_set_source DO ALSO \
+           SELECT 1 WHERE NEW.id > 0 UNION ALL SELECT 2",
+    );
+    assert_eq!(error_sqlstates(&member), ["42P10"]);
     let inserted = run_as(
         &mut engine,
         &mut budget,
@@ -13823,17 +13838,17 @@ fn rewrite_rules_expand_defaults_returning_and_on_conflict_contracts() {
         (
             "CREATE RULE missing_column AS ON INSERT TO rule_defaults \
              WHERE NEW.absent = 1 DO NOTHING",
-            "column \"absent\" does not exist",
+            "column new.absent does not exist",
         ),
         (
             "CREATE RULE invalid_old AS ON INSERT TO rule_defaults \
              DO ALSO INSERT INTO rule_default_log VALUES (OLD.id, NEW.label)",
-            "cannot use OLD",
+            "ON INSERT rule cannot use OLD",
         ),
         (
             "CREATE RULE invalid_new AS ON DELETE TO rule_defaults \
              DO ALSO INSERT INTO rule_default_log VALUES (NEW.id, OLD.label)",
-            "cannot use NEW",
+            "ON DELETE rule cannot use NEW",
         ),
         (
             "CREATE RULE conditional_notify AS ON INSERT TO rule_defaults \
@@ -13847,7 +13862,7 @@ fn rewrite_rules_expand_defaults_returning_and_on_conflict_contracts() {
             "{sql}: {}",
             String::from_utf8_lossy(&rejected)
         );
-        if expected.starts_with("cannot use") {
+        if expected.contains("rule cannot use") {
             assert_eq!(error_sqlstates(&rejected), ["42P17"], "{sql}");
         }
     }
@@ -18371,6 +18386,8 @@ fn finish_test_request(
         engine.pending_copy.is_none(),
         "streamed COPY needs caller-owned transaction state"
     );
+    // A refused COPY ends with the rollback its CopyDone causes.
+    let _ = engine.pending_copy_refusal.take();
     if transaction.is_active() {
         assert!(
             transaction.staged_commit().is_none(),
@@ -18435,6 +18452,7 @@ fn copy_line(
     engine.copy_row_line(
         setup,
         line,
+        &crate::sql::error_context::CopyFrame::new(1, false),
         super::CopyRowContext::new(
             txn,
             guc,
@@ -18465,6 +18483,7 @@ fn copy_binary_row(
     engine.copy_row_binary(
         setup,
         row,
+        &crate::sql::error_context::CopyFrame::new(1, true),
         super::CopyRowContext::new(
             txn,
             guc,
@@ -20022,7 +20041,15 @@ fn describe_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Ve
         let mut responder =
             Responder::for_describe(&mut buffer, crate::pg::respond::ResultFmt::ALL_TEXT);
         engine
-            .describe(sql_text, &arena, &transaction, None, &mut responder, &[])
+            .describe(
+                sql_text,
+                &arena,
+                &transaction,
+                None,
+                &GucState::new(),
+                &mut responder,
+                &[],
+            )
             .unwrap()
     };
     assert!(described, "{}", String::from_utf8_lossy(buffer.readable()));
@@ -23548,7 +23575,7 @@ fn maximum_statement_width_executes_before_and_after_object_cold_recovery() {
         assert_eq!(
             join_plan_rows
                 .iter()
-                .filter(|line| line.contains("Seq Scan on source_"))
+                .filter(|line| line.contains("Seq Scan on statement_lock_source source_"))
                 .count(),
             WIDTH,
             "{phase} join EXPLAIN: {}",
@@ -23579,8 +23606,8 @@ fn maximum_statement_width_executes_before_and_after_object_cold_recovery() {
             set_plan_rows
                 .iter()
                 .filter(|line| {
-                    line.contains("Seq Scan on set_left_")
-                        || line.contains("Seq Scan on set_right_")
+                    line.contains("Seq Scan on statement_lock_source set_left_")
+                        || line.contains("Seq Scan on statement_lock_source set_right_")
                 })
                 .count(),
             WIDTH * 2,
@@ -24119,62 +24146,27 @@ fn row_level_security_covers_views_merge_copy_partitions_and_saved_queries() {
     );
     assert_eq!(copy_data_rows(&copied), ["1\trls_client", "3\trls_client"]);
 
-    let mut copy_transition = copy_transition_scratch(&mut budget);
-    let mut send = crate::mem::FixedBuf::new(&mut budget, "rls copy send", 1 << 18).unwrap();
-    let mut arena = Arena::new(&mut budget, "rls copy sql", 1 << 18).unwrap();
-    let mut transaction = TxnState::new(&mut budget, 1024).unwrap();
-    let mut pool = test_pool(&mut budget);
-    let mut cursors = test_cursors(&mut budget);
-    let guc = GucState::new();
-    {
-        let mut responder = Responder::new(&mut send);
-        engine
-            .execute_simple(
-                "SET ROLE rls_client; COPY rls_target FROM STDIN",
-                &arena,
-                &mut transaction,
-                &mut pool,
-                &mut cursors,
-                &guc,
-                &mut responder,
-                1,
-            )
-            .unwrap();
-    }
-    let (copy, _deadline) = engine
-        .take_pending_copy()
-        .expect("COPY enters streaming mode");
-    arena.reset();
-    assert_eq!(
-        copy_line(
-            &mut engine,
-            &mut budget,
-            &copy,
-            &mut transaction,
-            &guc,
-            &arena,
-            b"4\trls_client\tcopy",
-            &mut copy_transition,
-        )
-        .unwrap(),
-        crate::sql::exec::CopyRowOutcome::Stored
-    );
-    finish_copy(
+    // PostgreSQL's DoCopy refuses COPY FROM when policies apply.
+    let copy_from = run_with(
         &mut engine,
         &mut budget,
-        &copy,
-        &mut transaction,
-        &guc,
-        &mut copy_transition,
-    )
-    .unwrap();
+        "SET ROLE rls_client; COPY rls_target FROM STDIN",
+    );
+    let copy_from = String::from_utf8_lossy(&copy_from);
+    assert!(
+        copy_from.contains("0A000")
+            && copy_from.contains("COPY FROM not supported with row-level security")
+            && copy_from.contains("Use INSERT statements instead."),
+        "{copy_from}"
+    );
+    assert!(engine.take_pending_copy().is_none());
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
             &mut budget,
             "SET ROLE rls_client; SELECT id FROM rls_target ORDER BY id"
         )),
-        ["1", "3", "4"]
+        ["1", "3"]
     );
 
     let row_security_off = run_with(
@@ -26164,7 +26156,7 @@ fn parameter_acls_are_typed_enforced_and_visible() {
     );
     assert!(
         String::from_utf8_lossy(&output)
-            .contains("permission denied to alter system configuration"),
+            .contains("permission denied to set parameter \"event_triggers\""),
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -28515,7 +28507,7 @@ fn supported_operator_catalog_aliases_preserve_identity() {
     let ambiguous = run_with(&mut engine, &mut budget, "SELECT '+'::regoper");
     let ambiguous = String::from_utf8_lossy(&ambiguous);
     assert!(
-        ambiguous.contains("more than one operator named \"+\""),
+        ambiguous.contains("more than one operator named +"),
         "{ambiguous}"
     );
     assert_eq!(
@@ -32849,7 +32841,6 @@ fn copy_to_relation_kinds_and_column_privileges_fail_before_streaming() {
         ("COPY copy_kind_sequence TO STDOUT", "42809"),
         ("COPY copy_kind_index TO STDOUT", "42809"),
         ("COPY copy_kind_empty TO STDOUT", "0A000"),
-        ("COPY copy_kind_saved FROM STDIN", "42809"),
         (
             "SET ROLE copy_kind_reader; COPY copy_kind_view TO STDOUT",
             "42501",
@@ -32873,6 +32864,10 @@ fn copy_to_relation_kinds_and_column_privileges_fail_before_streaming() {
         assert!(!message_types(&output).contains(&b'G'));
     }
     run_with(&mut engine, &mut budget, "RESET ROLE");
+    // PostgreSQL refuses a materialized view only once copy-in has begun.
+    let refused = run_with(&mut engine, &mut budget, "COPY copy_kind_saved FROM STDIN");
+    assert!(message_types(&refused).contains(&b'G'));
+    assert!(!message_types(&refused).contains(&b'E'));
     assert_eq!(
         copy_data_rows(&run_with(
             &mut engine,
@@ -38961,7 +38956,7 @@ fn derived_projection_retains_its_declared_collation() {
          JOIN posix_values ON projected.value = posix_values.value",
     );
     assert!(
-        String::from_utf8_lossy(&output).contains("42P21"),
+        String::from_utf8_lossy(&output).contains("42P22"),
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -38986,7 +38981,7 @@ fn recursive_cte_retains_its_declared_collation() {
          ON projected.value = posix_values.value",
     );
     assert!(
-        String::from_utf8_lossy(&output).contains("42P21"),
+        String::from_utf8_lossy(&output).contains("42P22"),
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -39032,7 +39027,7 @@ fn data_modifying_cte_retains_returning_collation() {
          ON projected.value = posix_values.value",
     );
     assert!(
-        String::from_utf8_lossy(&output).contains("42P21"),
+        String::from_utf8_lossy(&output).contains("42P22"),
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -39177,11 +39172,15 @@ fn hash_join_rejects_conflicting_column_collations() {
         "CREATE TABLE collation_left (value text COLLATE \"C\"); \
          CREATE TABLE collation_right (value text COLLATE \"POSIX\"); \
          CREATE INDEX collation_right_value ON collation_right (value); \
+         INSERT INTO collation_left VALUES ('a'); \
+         INSERT INTO collation_right VALUES ('a'); \
          SELECT * FROM collation_left AS left_value \
          JOIN collation_right AS right_value ON left_value.value = right_value.value",
     );
+    // Conflicting implicit collations leave `=` without one, which
+    // PostgreSQL reports when the comparison runs.
     assert!(
-        String::from_utf8_lossy(&output).contains("42P21"),
+        String::from_utf8_lossy(&output).contains("42P22"),
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -44260,6 +44259,24 @@ fn user_defined_aggregate_executes_typed_transition_final_and_ordering() {
             crate::sql::types::ColType::Array(crate::sql::types::ArrElem::Int4).oid(),
         ]
     );
+    // A zero-argument aggregate is typed by its declared result, not taken
+    // for a trigger function that a zero-argument call could also name.
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT aggregate_old_tick(*) FROM aggregate_input"
+        )),
+        [crate::sql::types::oid::INT8]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_typeof(aggregate_old_tick(*)) FROM aggregate_input"
+        )),
+        ["bigint"]
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
@@ -47630,8 +47647,9 @@ fn trigger_program_for_loop_validates_control_and_query_shape() {
            FOR EACH ROW EXECUTE FUNCTION trigger_for_width_program();
          INSERT INTO trigger_for_width_target VALUES (1, 2);",
     );
+    // A scalar loop variable takes the first column, as in PostgreSQL.
     assert!(
-        String::from_utf8_lossy(&wrong_width).contains("FOR query must return exactly one column"),
+        String::from_utf8_lossy(&wrong_width).contains("INSERT 0 1"),
         "{}",
         String::from_utf8_lossy(&wrong_width)
     );
@@ -54689,12 +54707,15 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
         "{settings:?}"
     );
     for (format, expected) in [
-        ("JSON", "\"Settings\":{\"search_path\":\"public\"}"),
+        (
+            "JSON",
+            "\"Settings\": {\n      \"search_path\": \"public\"\n    }",
+        ),
         (
             "XML",
-            "<Settings><search_path>public</search_path></Settings>",
+            "<Settings>\n      <search_path>public</search_path>\n    </Settings>",
         ),
-        ("YAML", "Settings:\n    search_path: \"public\""),
+        ("YAML", "Settings: \n    search_path: \"public\""),
     ] {
         let output = run_with(
             &mut engine,
@@ -54738,7 +54759,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
          DECLARE plan text; \
          BEGIN \
            EXECUTE 'EXPLAIN (SETTINGS, FORMAT JSON) SELECT * FROM ep' INTO STRICT plan; \
-           IF position('\"Settings\":{\"search_path\":\"public\"}' IN plan) = 0 THEN \
+           IF position('\"search_path\": \"public\"' IN plan) = 0 THEN \
              RETURN false; \
            END IF; \
            EXECUTE 'PREPARE ep_dynamic_generic(int) AS SELECT payload FROM ep WHERE id = $1'; \
@@ -54887,8 +54908,8 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
         "EXPLAIN (FORMAT JSON) SELECT 1",
     ));
     assert_eq!(json.len(), 1);
-    assert!(json[0].starts_with("[{\"Plan\":{"), "{json:?}");
-    assert!(json[0].contains("\"Node Type\":\"Result\""), "{json:?}");
+    assert!(json[0].starts_with("[\n  {\n    \"Plan\": {"), "{json:?}");
+    assert!(json[0].contains("\"Node Type\": \"Result\""), "{json:?}");
 
     let xml = data_rows(&run_with(
         &mut engine,
@@ -54903,7 +54924,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
         &mut budget,
         "EXPLAIN (FORMAT YAML) SELECT 1",
     ));
-    assert!(yaml[0].starts_with("- Plan:\n"), "{yaml:?}");
+    assert!(yaml[0].starts_with("- Plan: \n"), "{yaml:?}");
     assert!(yaml[0].contains("Node Type: \"Result\""), "{yaml:?}");
 
     // Structured renderers must preserve the plan tree rather than emitting
@@ -54914,16 +54935,18 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
         &mut budget,
         "EXPLAIN (FORMAT XML, SUMMARY OFF) SELECT payload FROM ep ORDER BY payload",
     ));
-    assert!(xml_tree[0].contains("<Plan><Node-Type>Sort</Node-Type>"));
-    assert!(xml_tree[0].contains("<Plans><Plan><Node-Type>Seq Scan</Node-Type>"));
+    assert!(xml_tree[0].contains("<Plan>\n      <Node-Type>Sort</Node-Type>"));
+    assert!(
+        xml_tree[0].contains("<Plans>\n        <Plan>\n          <Node-Type>Seq Scan</Node-Type>")
+    );
     assert!(!xml_tree[0].contains("<Node><Node-Type>"));
     let yaml_tree = data_rows(&run_with(
         &mut engine,
         &mut budget,
         "EXPLAIN (FORMAT YAML, SUMMARY OFF) SELECT payload FROM ep ORDER BY payload",
     ));
-    assert!(yaml_tree[0].contains("- Plan:\n    Node Type: \"Sort\""));
-    assert!(yaml_tree[0].contains("    Plans:\n      - Node Type: \"Seq Scan\""));
+    assert!(yaml_tree[0].contains("- Plan: \n    Node Type: \"Sort\""));
+    assert!(yaml_tree[0].contains("    Plans: \n      - Node Type: \"Seq Scan\""));
 
     // PostgreSQL includes the complete zero-valued runtime metric shape in
     // structured formats when BUFFERS or WAL is requested, unlike text.
@@ -54940,9 +54963,9 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
         &mut budget,
         "EXPLAIN (ANALYZE, BUFFERS, WAL, TIMING OFF, FORMAT JSON) SELECT payload FROM ep WHERE id = 2",
     ));
-    assert!(json_runtime[0].contains("\"Actual Rows\":1.00"));
-    assert!(json_runtime[0].contains("\"Shared Dirtied Blocks\":0"));
-    assert!(json_runtime[0].contains("\"WAL Records\":0"));
+    assert!(json_runtime[0].contains("\"Actual Rows\": 1.00"));
+    assert!(json_runtime[0].contains("\"Shared Dirtied Blocks\": 0"));
+    assert!(json_runtime[0].contains("\"WAL Records\": 0"));
     let yaml_runtime = data_rows(&run_with(
         &mut engine,
         &mut budget,
@@ -55189,7 +55212,7 @@ fn hash_join_decodes_derived_sources_and_preserves_left_join_semantics() {
             &format!("EXPLAIN {query}"),
         ));
         assert!(
-            plan.iter().any(|line| line.contains("Hash Join")),
+            plan.iter().any(|line| line.contains("Hash Left Join")),
             "{plan:?}"
         );
         assert_eq!(
@@ -55456,7 +55479,7 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
     );
     assert!(
         plan.iter()
-            .any(|row| row.contains("Index Scan using indexed_events_key on e")),
+            .any(|row| row.contains("Index Scan using indexed_events_key on indexed_events e")),
         "the reported inner scan must be the same parameterized path execution uses: {plan:?}"
     );
     assert!(
@@ -55505,7 +55528,7 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
     assert!(
         prepared
             .iter()
-            .any(|row| row.contains("Index Scan using indexed_events_key on e")),
+            .any(|row| row.contains("Index Scan using indexed_events_key on indexed_events e")),
         "{prepared:?}"
     );
 
@@ -55521,7 +55544,9 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
     // Before a checkpoint only the complete equality map is available; the
     // range correctly remains a sequential inner scan.
     assert!(
-        range_plan.iter().any(|row| row.contains("Seq Scan on e")),
+        range_plan
+            .iter()
+            .any(|row| row.contains("Seq Scan on indexed_events e")),
         "{range_plan:?}"
     );
 
@@ -55563,7 +55588,7 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
     assert_eq!(
         joined_dml_plan
             .iter()
-            .filter(|row| row.contains("Index Scan using indexed_events_key on e"))
+            .filter(|row| row.contains("Index Scan using indexed_events_key on indexed_events e"))
             .count(),
         2,
         "joined DML explanation must expose the parameterized source: {joined_dml_plan:?}"
@@ -55642,7 +55667,9 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
              AND e.event_id = p.wanted",
     ));
     assert!(
-        mixed_plan.iter().any(|row| row.contains("Seq Scan on e")),
+        mixed_plan
+            .iter()
+            .any(|row| row.contains("Seq Scan on indexed_events e")),
         "{mixed_plan:?}"
     );
     assert_eq!(
@@ -55772,7 +55799,7 @@ fn parameterized_range_join_reads_cold_object_index_generations() {
     assert!(
         exact_plan
             .iter()
-            .any(|row| row.contains("Index Scan using durable_events_key on e")),
+            .any(|row| row.contains("Index Scan using durable_events_key on durable_events e")),
         "{exact_plan:?}"
     );
     let plan = data_rows(&run_with(
@@ -55789,7 +55816,7 @@ fn parameterized_range_join_reads_cold_object_index_generations() {
     );
     assert!(
         plan.iter()
-            .any(|row| row.contains("Index Scan using durable_events_key on e")),
+            .any(|row| row.contains("Index Scan using durable_events_key on durable_events e")),
         "a cold equality-prefix range must retain the durable B-tree plan: {plan:?}"
     );
     assert!(
@@ -66988,13 +67015,13 @@ fn brin_indexes_drive_range_expression_dml_and_cold_object_scans() {
     assert!(
         indexed
             .iter()
-            .any(|row| { row.contains("Bitmap Index Scan using brin_events_active_category") }),
+            .any(|row| { row.contains("Bitmap Index Scan on brin_events_active_category") }),
         "{indexed:?}"
     );
     assert!(
         indexed
             .iter()
-            .any(|row| { row.contains("Bitmap Index Scan using brin_events_sequence") }),
+            .any(|row| { row.contains("Bitmap Index Scan on brin_events_sequence") }),
         "{indexed:?}"
     );
     assert!(
@@ -67125,7 +67152,7 @@ fn brin_indexes_drive_range_expression_dml_and_cold_object_scans() {
     );
     assert!(
         cold.iter()
-            .any(|row| { row.contains("Bitmap Index Scan using brin_events_sequence") }),
+            .any(|row| { row.contains("Bitmap Index Scan on brin_events_sequence") }),
         "{cold:?}"
     );
     assert!(cold.iter().any(|row| row == "1|3999|3999"), "{cold:?}");
@@ -68461,7 +68488,12 @@ fn gist_and_spgist_knn_ordering_covers_parameters_overlays_mvcc_and_cold_recover
              ORDER BY location <-> circle '<(0,0),1>' LIMIT 2",
     ));
     assert_eq!(
-        fallback.iter().filter(|row| row.contains("Sort")).count(),
+        fallback
+            .iter()
+            .filter(|row| row
+                .trim_start_matches([' ', '-', '>'])
+                .starts_with("Sort  "))
+            .count(),
         2,
         "unsupported ordering directions and right types retain the exact Sort path: {fallback:?}"
     );
@@ -68810,7 +68842,7 @@ fn gin_and_spgist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() 
         assert!(
             output
                 .iter()
-                .any(|row| row.contains(&format!("Bitmap Index Scan using {index}"))),
+                .any(|row| row.contains(&format!("Bitmap Index Scan on {index}"))),
             "{index}: {output:?}"
         );
     }
@@ -68928,7 +68960,7 @@ fn gin_and_spgist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() 
     );
     assert!(
         cold.iter()
-            .any(|row| row.contains("Bitmap Index Scan using search_rows_tags")),
+            .any(|row| row.contains("Bitmap Index Scan on search_rows_tags")),
         "{cold:?}"
     );
     assert!(
@@ -69412,11 +69444,19 @@ fn routine_setting_values_and_reset_values_share_one_bounded_definition() {
         },
     ];
     crate::mem::guard::forbid_alloc(|| {
-        guc.validate_setting_value("standard_conforming_strings", Some("on"))
+        guc.validate_setting_value(
+            guc::SettingAuthorization::unchecked("standard_conforming_strings"),
+            Some("on"),
+        )
+        .unwrap();
+        guc.validate_setting_value(
+            guc::SettingAuthorization::unchecked("xmloption"),
+            Some("document"),
+        )
+        .unwrap();
+        let scope = guc
+            .enter_unchecked_routine_configs(&configurations)
             .unwrap();
-        guc.validate_setting_value("xmloption", Some("document"))
-            .unwrap();
-        let scope = guc.enter_routine_configs(&configurations).unwrap();
         assert_eq!(guc.get_owned("xmloption").unwrap().as_str(), "document");
         assert_eq!(guc.reset_owned("xmloption").unwrap().as_str(), "content");
         assert_eq!(
@@ -70161,7 +70201,8 @@ fn configured_database_and_schema_capacities_survive_publication_and_object_cold
     let mut config = test_config("database-schema-capacities");
     config.max_databases = 3 + USER_DATABASES;
     config.max_schemas = 3 + USER_DATABASES + USER_SCHEMAS;
-    config.max_text_search_objects = 21 + 7 * USER_DATABASES;
+    config.max_text_search_objects = crate::storage::BUILTIN_TEXT_SEARCH_SLOTS
+        + crate::storage::BUILTIN_TEXT_SEARCH_OBJECTS * USER_DATABASES;
     config.wal_buffer_bytes = 4 << 20;
     config.checkpoint_manifest_bytes = 4 << 20;
     config.object_store_on = true;
@@ -70559,7 +70600,7 @@ fn startup_sized_metadata_catalogs_exhaust_and_survive_object_cold_recovery() {
     config.max_tables = 4;
     config.max_collations = COLLATIONS;
     config.max_conversions = CONVERSIONS;
-    config.max_text_search_objects = 21 + TEXT_DICTIONARIES;
+    config.max_text_search_objects = crate::storage::BUILTIN_TEXT_SEARCH_SLOTS + TEXT_DICTIONARIES;
     config.max_event_triggers = EVENT_TRIGGERS;
     config.max_tablespaces = 2 + TABLESPACES;
     config.max_comments = TABLESPACES;
@@ -70916,7 +70957,7 @@ fn brin_inclusion_indexes_execute_range_and_network_predicates() {
     assert!(
         indexed
             .iter()
-            .filter(|row| row.contains("Bitmap Index Scan using brin_areas_inclusion"))
+            .filter(|row| row.contains("Bitmap Index Scan on brin_areas_inclusion"))
             .count()
             >= 10,
         "{indexed:?}"
@@ -70951,7 +70992,7 @@ fn brin_inclusion_indexes_execute_range_and_network_predicates() {
     ));
     assert!(
         cold.iter()
-            .any(|row| row.contains("Bitmap Index Scan using brin_areas_inclusion")),
+            .any(|row| row.contains("Bitmap Index Scan on brin_areas_inclusion")),
         "{cold:?}"
     );
     assert!(cold.iter().any(|row| row == "2|matched"), "{cold:?}");
@@ -91075,10 +91116,17 @@ fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
     ));
     assert_eq!(rows, ["5|10|1|20|{1,2}|10|ready"]);
 
-    let rejected = run_with(&mut engine, &mut budget, "COPY copy_defaults FROM STDIN");
+    // `CopyGetAttnums`: a generated column takes no COPY data, so naming one
+    // fails at setup.
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY copy_defaults (input, doubled) FROM STDIN",
+    );
+    let rejected = String::from_utf8_lossy(&rejected);
     assert!(
-        String::from_utf8_lossy(&rejected).contains("428C9"),
-        "COPY targeting a generated column must fail at setup"
+        rejected.contains("42P10") && rejected.contains("is a generated column"),
+        "COPY naming a generated column must fail at setup: {rejected}"
     );
 }
 
@@ -91129,13 +91177,27 @@ fn copy_from_postgresql18_controls_preserve_typed_input_boundaries() {
     ));
     arena.reset();
     engine
-        .copy_match_header(&setup, b"id,note", &arena)
+        .copy_match_header(
+            &setup,
+            b"id,note",
+            &crate::sql::error_context::CopyFrame::new(1, false),
+            &arena,
+        )
         .expect("matching header");
     arena.reset();
     let bad_header = engine
-        .copy_match_header(&setup, b"note,id", &arena)
+        .copy_match_header(
+            &setup,
+            b"note,id",
+            &crate::sql::error_context::CopyFrame::new(1, false),
+            &arena,
+        )
         .expect_err("reordered header must fail");
     assert_eq!(bad_header.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
+    assert_eq!(
+        bad_header.message.as_str(),
+        "column name mismatch in header line field 1: got \"note\", expected \"id\""
+    );
     arena.reset();
     copy_line(
         &mut engine,
@@ -91160,8 +91222,10 @@ fn copy_from_postgresql18_controls_preserve_typed_input_boundaries() {
         &mut copy_transition,
     )
     .expect_err("bad integer must remain a typed conversion error");
-    assert!(crate::sql::exec::copy_ignorable_error(&conversion));
-    assert!(conversion.message.as_str().contains("COPY column \"id\""));
+    assert_eq!(
+        conversion.message.as_str(),
+        "invalid input syntax for type integer: \"not-an-integer\""
+    );
     finish_copy(
         &mut engine,
         &mut budget,
@@ -93415,6 +93479,7 @@ fn dml_target_bytes_survive_rollback_table_reuse_and_storage_removal() {
         crate::sql::exec::collect_matches(
             &engine.storage,
             table,
+            crate::sql::ast::RelationInheritance::Descendants,
             None,
             session.transaction.txid,
             &[ColType::Int4, ColType::Text],
@@ -94011,6 +94076,7 @@ fn view_metadata_never_reserves_execution_locks_for_idle_or_active_transactions(
                     &session.arena,
                     &session.transaction,
                     Some(&session.cursors),
+                    &session.guc,
                     &mut responder,
                     &[],
                 ))
@@ -94029,13 +94095,20 @@ fn view_metadata_never_reserves_execution_locks_for_idle_or_active_transactions(
         for (name, expected) in [("metadata_writable", true), ("metadata_literal", false)] {
             session.arena.reset();
             assert_eq!(
-                crate::mem::guard::forbid_alloc(|| query::view_is_auto_updatable(
-                    &engine.storage,
-                    "public",
-                    name,
-                    session.transaction.txid,
-                    &session.arena,
-                ))
+                crate::mem::guard::forbid_alloc(|| {
+                    let Some(crate::storage::ResolvedRelation::View(slot)) = engine
+                        .storage
+                        .resolve_relation(Some("public"), name, session.transaction.txid)
+                    else {
+                        panic!("view {name} resolves");
+                    };
+                    query::view_is_auto_updatable(
+                        &engine.storage,
+                        slot,
+                        session.transaction.txid,
+                        &session.arena,
+                    )
+                })
                 .unwrap(),
                 expected
             );
@@ -94583,12 +94656,12 @@ fn subscription_copy_transition_values_survive_worker_rewinds_and_abort() {
         let setup = apply
             .start_copy_table(&mut engine, schema, table, &columns)
             .unwrap();
-        apply.copy_line(&mut engine, &setup, b"1\tone").unwrap();
+        apply.copy_line(&mut engine, &setup, b"1\tone", 1).unwrap();
         let oversized = [b'x'; 80];
         let mut line = [b'0'; 82];
         line[..2].copy_from_slice(b"2\t");
         line[2..].copy_from_slice(&oversized);
-        let error = apply.copy_line(&mut engine, &setup, &line).unwrap_err();
+        let error = apply.copy_line(&mut engine, &setup, &line, 1).unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert!(error.message.as_str().contains("copy_transition_bytes"));
         apply.stop(&mut engine);
@@ -94604,8 +94677,8 @@ fn subscription_copy_transition_values_survive_worker_rewinds_and_abort() {
         let setup = apply
             .start_copy_table(&mut engine, schema, table, &columns)
             .unwrap();
-        apply.copy_line(&mut engine, &setup, b"1\tone").unwrap();
-        apply.copy_line(&mut engine, &setup, b"2\ttwo").unwrap();
+        apply.copy_line(&mut engine, &setup, b"1\tone", 1).unwrap();
+        apply.copy_line(&mut engine, &setup, b"2\ttwo", 1).unwrap();
         apply.finish_copy_table(&mut engine, &setup).unwrap();
         apply.finish_bootstrap(&mut engine, 41).unwrap();
     });
@@ -94630,7 +94703,7 @@ fn subscription_copy_transition_values_survive_worker_rewinds_and_abort() {
         let setup = apply
             .start_copy_table(&mut engine, schema, table, &columns)
             .unwrap();
-        apply.copy_line(&mut engine, &setup, b"3\tnew").unwrap();
+        apply.copy_line(&mut engine, &setup, b"3\tnew", 1).unwrap();
         apply.finish_copy_table(&mut engine, &setup).unwrap();
         apply.stop(&mut engine);
         apply.unbind();
@@ -97824,11 +97897,21 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                 );
                 if binary {
                     engine
-                        .copy_row_binary(&setup, &[0, 1, 0, 0, 0, 4, 0, 0, 0, id], context)
+                        .copy_row_binary(
+                            &setup,
+                            &[0, 1, 0, 0, 0, 4, 0, 0, 0, id],
+                            &crate::sql::error_context::CopyFrame::new(1, true),
+                            context,
+                        )
                         .unwrap();
                 } else {
                     engine
-                        .copy_row_line(&setup, if id == 7 { b"7" } else { b"8" }, context)
+                        .copy_row_line(
+                            &setup,
+                            if id == 7 { b"7" } else { b"8" },
+                            &crate::sql::error_context::CopyFrame::new(1, false),
+                            context,
+                        )
                         .unwrap();
                 }
             });
@@ -102083,6 +102166,87 @@ mod relation_input_granularity;
 mod row_progress;
 
 #[test]
+fn foreign_key_trigger_modes_survive_journal_and_checkpoint_recovery() {
+    let mut config = test_config("foreign-key-trigger-modes");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("foreign-key-trigger-modes-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let modes = "SELECT c.relname, t.tgenabled FROM pg_trigger t \
+                   JOIN pg_class c ON c.oid = t.tgrelid \
+                  WHERE t.tgname LIKE 'RI_%' ORDER BY c.relname, t.tgenabled";
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE fk_mode_parent (id integer PRIMARY KEY); \
+         CREATE TABLE fk_mode_child (id integer, parent integer REFERENCES fk_mode_parent); \
+         CREATE ROLE fk_mode_owner; \
+         ALTER TABLE fk_mode_child OWNER TO fk_mode_owner; \
+         SET ROLE fk_mode_owner; \
+         ALTER TABLE fk_mode_child DISABLE TRIGGER USER;",
+    );
+    let text = String::from_utf8_lossy(&created);
+    assert!(!text.contains("ERROR"), "{text}");
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE fk_mode_owner; ALTER TABLE fk_mode_child DISABLE TRIGGER ALL",
+    );
+    let text = String::from_utf8_lossy(&rejected);
+    assert!(text.contains("C42501\0"), "{text}");
+    assert!(text.contains("is a system trigger"), "{text}");
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "RESET ROLE; \
+         ALTER TABLE fk_mode_child DISABLE TRIGGER ALL; \
+         DO $$DECLARE t name; BEGIN \
+           FOR t IN SELECT tgname FROM pg_trigger \
+                     WHERE tgrelid = 'fk_mode_parent'::regclass AND tgname LIKE 'RI_%' LOOP \
+             EXECUTE format('ALTER TABLE fk_mode_parent ENABLE ALWAYS TRIGGER %I', t); \
+           END LOOP; END$$; \
+         INSERT INTO fk_mode_child VALUES (1, 9);",
+    );
+    let text = String::from_utf8_lossy(&created);
+    assert!(!text.contains("ERROR"), "{text}");
+    let expected = [
+        "fk_mode_child|D",
+        "fk_mode_child|D",
+        "fk_mode_parent|A",
+        "fk_mode_parent|A",
+    ];
+    let journaled = run_with(&mut engine, &mut budget, modes);
+    assert_eq!(data_rows(&journaled), expected);
+    drop(engine);
+
+    let mut replay_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut replayed, &mut replay_budget, modes)),
+        expected
+    );
+    assert!(replayed.checkpoint().unwrap());
+    drop(replayed);
+
+    let mut restarted_budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let recovered = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        &format!("{modes}; SELECT count(*) FROM fk_mode_child"),
+    );
+    let mut rows = expected.to_vec();
+    rows.push("1");
+    assert_eq!(data_rows(&recovered), rows);
+    drop(restarted);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
 fn pseudo_type_columns_fail_like_postgresql() {
     let config = test_config("pseudo-type-columns");
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
@@ -102176,4 +102340,39 @@ fn spilled_grouping_keys_read_enclosing_aggregates() {
             ["2"]
         );
     }
+}
+
+/// `DROP SCHEMA ... CASCADE` journals a view's triggers as dropped before the
+/// view itself, so recovery can still resolve each trigger's target.
+#[test]
+fn schema_drop_journals_view_triggers_before_their_view() {
+    let config = test_config("schema-drop-view-triggers");
+    {
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(
+            &mut engine,
+            "CREATE SCHEMA s; CREATE TABLE s.t (a int); \
+             CREATE VIEW s.v AS SELECT * FROM s.t; \
+             CREATE FUNCTION s.tf() RETURNS trigger LANGUAGE plpgsql \
+               AS $$BEGIN RETURN NEW; END$$; \
+             CREATE TRIGGER g INSTEAD OF INSERT ON s.v FOR EACH ROW EXECUTE FUNCTION s.tf(); \
+             DROP SCHEMA s CASCADE",
+            false,
+        );
+        drop(session);
+        drop(engine);
+    }
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM pg_namespace WHERE nspname = 's'",
+            false
+        )),
+        ["0"]
+    );
 }

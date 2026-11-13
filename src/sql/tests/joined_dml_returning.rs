@@ -270,3 +270,255 @@ fn parenthesized_joins_keep_unaliased_members_addressable() {
         );
     });
 }
+
+#[test]
+fn joined_dml_hashes_its_from_item_as_postgresql() {
+    with_engine("joined-dml-hash", |engine, budget| {
+        for sql in [
+            "CREATE TABLE h (id int, v int, note text)",
+            "CREATE TABLE k (id bigint, w int, tag text)",
+            "INSERT INTO h SELECT g, g % 7, 'n' || g FROM generate_series(1, 50) g",
+            "INSERT INTO k SELECT g % 10, g, 't' || g FROM generate_series(1, 40) g",
+            "INSERT INTO k VALUES (NULL, 1, 'null key')",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        let explain = run_with(
+            engine,
+            budget,
+            "EXPLAIN (COSTS OFF) UPDATE h SET note = k.tag FROM k \
+             WHERE h.v = k.id AND h.id > k.w AND k.w > 20",
+        );
+        assert_eq!(
+            data_rows(&explain),
+            [
+                "Update on h",
+                "  ->  Hash Join",
+                "        Hash Cond: (h.v = k.id)",
+                "        Join Filter: (h.id > k.w)",
+                "        ->  Seq Scan on h",
+                "        ->  Hash",
+                "              ->  Seq Scan on k",
+                "                    Filter: (w > 20)",
+            ]
+        );
+        // Each hash chain lists later rows first, as PostgreSQL's does, so a
+        // target row joining several FROM rows keeps the last one scanned.
+        let before = crate::sql::query::target_hash_builds();
+        let output = run_with(
+            engine,
+            budget,
+            "UPDATE h SET note = k.tag FROM k WHERE h.v = k.id AND k.w > 20 \
+             AND h.id < 4 RETURNING h.id, h.note, k.w",
+        );
+        assert_eq!(sorted_rows(&output), ["1|t31|31", "2|t32|32", "3|t33|33"]);
+        let output = run_with(
+            engine,
+            budget,
+            "DELETE FROM h USING k WHERE h.v = k.id AND k.tag LIKE 't3%' \
+             AND h.id IN (3, 10) RETURNING h.id, k.tag",
+        );
+        assert_eq!(sorted_rows(&output), ["10|t33", "3|t33"]);
+        assert_eq!(crate::sql::query::target_hash_builds() - before, 2);
+        // A non-default implicit collation beats the database default; two
+        // different ones leave the comparison without a collation.
+        for sql in [
+            "CREATE TABLE cc (k text COLLATE \"C\")",
+            "CREATE TABLE cp (k text COLLATE \"POSIX\")",
+            "INSERT INTO cc VALUES ('t1')",
+            "INSERT INTO cp VALUES ('t1')",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        assert_eq!(
+            diagnostics(&run_with(
+                engine,
+                budget,
+                "UPDATE cc SET k = k.tag FROM k WHERE cc.k = k.tag",
+            )),
+            ["UPDATE 1"]
+        );
+        assert_eq!(
+            diagnostics(&run_with(
+                engine,
+                budget,
+                "UPDATE cc SET k = 'x' FROM cp WHERE cc.k = cp.k",
+            )),
+            [
+                "ERROR 42P22 could not determine which collation to use for string comparison \
+                 hint: Use the COLLATE clause to set the collation explicitly."
+            ]
+        );
+    });
+}
+
+#[test]
+fn explain_analyze_runs_a_rewritten_statement_once_and_plans_each_query() {
+    with_engine("explain-analyze-rewritten", |engine, budget| {
+        for sql in [
+            "CREATE TABLE rw_source (a int, b text)",
+            "CREATE TABLE rw_log (a int, b text)",
+            "CREATE RULE rw_log_insert AS ON INSERT TO rw_source \
+             DO ALSO INSERT INTO rw_log VALUES (new.a, new.b)",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        let explain = run_with(
+            engine,
+            budget,
+            "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) \
+             INSERT INTO rw_source VALUES (1, 'x')",
+        );
+        assert_eq!(
+            data_rows(&explain),
+            [
+                "Insert on rw_source (actual rows=0.00 loops=1)",
+                "  ->  Result",
+                "",
+                "Insert on rw_log (actual rows=0.00 loops=1)",
+                "  ->  Result",
+            ]
+        );
+        let rows = run_with(
+            engine,
+            budget,
+            "SELECT (SELECT count(*) FROM rw_source), (SELECT count(*) FROM rw_log)",
+        );
+        assert_eq!(data_rows(&rows), ["1|1"]);
+        let json = run_with(
+            engine,
+            budget,
+            "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF, FORMAT JSON) \
+             INSERT INTO rw_source VALUES (2, 'y')",
+        );
+        let document = data_rows(&json).concat();
+        assert_eq!(document.matches("\"Operation\": \"Insert\"").count(), 2);
+        assert_eq!(document.matches("\"Triggers\": [").count(), 2);
+    });
+}
+
+#[test]
+fn explain_refuses_rewritten_queries_it_cannot_plan() {
+    with_engine("explain-rewritten-refusals", |engine, budget| {
+        for sql in [
+            "CREATE TABLE rr_t (a int, b int)",
+            "CREATE TABLE rr_log (a int)",
+            "CREATE VIEW rr_v AS SELECT a, b FROM rr_t",
+            "CREATE RULE rr_v_insert AS ON INSERT TO rr_v DO INSTEAD \
+             INSERT INTO rr_t VALUES (new.a, new.b)",
+            "CREATE RULE rr_t_insert AS ON INSERT TO rr_t DO ALSO \
+             INSERT INTO rr_log VALUES (new.a)",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        let refused =
+            "ERROR 0A000 EXPLAIN of a statement a rewrite rule changes is not supported for";
+        for (sql, what) in [
+            (
+                "EXPLAIN (COSTS OFF) INSERT INTO rr_v VALUES (1, 2)",
+                "a statement on a view",
+            ),
+            (
+                "EXPLAIN (COSTS OFF) INSERT INTO rr_t SELECT max(a), 1 FROM rr_log",
+                "an INSERT of an aggregated or ordered query",
+            ),
+        ] {
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, sql)),
+                [format!("{refused} {what}")],
+                "{sql}"
+            );
+        }
+        run_with(
+            engine,
+            budget,
+            "CREATE RULE rr_log_insert AS ON INSERT TO rr_log DO ALSO \
+             INSERT INTO rr_v VALUES (new.a, 0)",
+        );
+        assert_eq!(
+            diagnostics(&run_with(
+                engine,
+                budget,
+                "EXPLAIN (COSTS OFF) INSERT INTO rr_log VALUES (1)"
+            )),
+            [format!(
+                "{refused} an action on a view or on a relation with rules"
+            )]
+        );
+    });
+}
+
+#[test]
+fn joined_dml_hashes_the_first_of_several_from_items() {
+    with_engine("joined-dml-hash-several", |engine, budget| {
+        for sql in [
+            "CREATE TABLE hm (id int, v int, note text)",
+            "CREATE TABLE km (id int, w int)",
+            "CREATE TABLE um (k int, z text)",
+            "INSERT INTO hm SELECT g, g, 'n' FROM generate_series(1, 40) g",
+            "INSERT INTO km SELECT g, g + 100 FROM generate_series(1, 40) g",
+            "INSERT INTO um SELECT g + 100, 'z' || g FROM generate_series(1, 40) g",
+        ] {
+            run_with(engine, budget, sql);
+        }
+        let before = crate::sql::query::target_hash_builds();
+        let output = run_with(
+            engine,
+            budget,
+            "UPDATE hm SET note = um.z FROM km JOIN um ON km.w = um.k \
+             WHERE hm.v = km.id AND hm.id <= 3 RETURNING hm.id, hm.note",
+        );
+        assert_eq!(sorted_rows(&output), ["1|z1", "2|z2", "3|z3"]);
+        assert_eq!(crate::sql::query::target_hash_builds() - before, 1);
+        let explain = run_with(
+            engine,
+            budget,
+            "EXPLAIN (COSTS OFF) DELETE FROM hm USING km JOIN um ON km.w = um.k \
+             WHERE hm.v = km.id",
+        );
+        assert_eq!(
+            data_rows(&explain),
+            [
+                "Delete on hm",
+                "  ->  Nested Loop",
+                "        Join Filter: (km.w = um.k)",
+                "        ->  Hash Join",
+                "              Hash Cond: (hm.v = km.id)",
+                "              ->  Seq Scan on hm",
+                "              ->  Hash",
+                "                    ->  Seq Scan on km",
+                "        ->  Materialize",
+                "              ->  Seq Scan on um",
+            ]
+        );
+    });
+}
+
+#[test]
+fn update_from_returning_routine_call_resumes_with_the_joined_row() {
+    with_engine("update-from-returning-call", |engine, budget| {
+        setup(engine, budget);
+        run_with(
+            engine,
+            budget,
+            "CREATE FUNCTION note(v text) RETURNS text LANGUAGE plpgsql \
+             AS $$BEGIN RETURN v || '!'; END$$",
+        );
+        // Each RETURNING call stops the write after its row changed; the
+        // next attempt keeps the row and the FROM row it joined.
+        let output = run_with(
+            engine,
+            budget,
+            "UPDATE t SET b = note(s.c) FROM s WHERE t.a = s.a \
+             RETURNING t.a, t.b, note(s.c || t.b), s.d",
+        );
+        assert_eq!(sorted_rows(&output), ["1|p!|pp!!|10.00", "2|q!|qq!!|20.00"]);
+        let output = run_with(
+            engine,
+            budget,
+            "DELETE FROM t USING s WHERE t.a = s.a RETURNING t.a, note(s.c), s.d",
+        );
+        assert_eq!(sorted_rows(&output), ["1|p!|10.00", "2|q!|20.00"]);
+        assert!(data_rows(&run_with(engine, budget, "SELECT * FROM t")).is_empty());
+    });
+}

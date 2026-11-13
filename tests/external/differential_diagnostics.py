@@ -40,13 +40,20 @@ def normalize_diagnostics(stderr, diagnostics, copy_positions, *, input_diagnost
     result = []
     current = None
     auxiliary = False
+    in_context = False
 
     def finish():
         if current is None or current["severity"] in ("NOTICE", "WARNING"):
             return
-        record = {key: value for key, value in current.items() if key != "message"}
+        record = {key: value for key, value in current.items()
+                  if key not in ("message", "context")}
         if diagnostics == "verbose":
             record["message"] = "\n".join(current["message"])
+            # Other CONTEXT lines (routine frames) are not compared yet; a
+            # COPY line names the input line, column and value an error is about.
+            copy_context = [line for line in current["context"] if line.startswith("COPY ")]
+            if copy_context:
+                record["copy_context"] = copy_context
         result.append(record)
 
     lines = stderr.split("\n")
@@ -75,17 +82,24 @@ def normalize_diagnostics(stderr, diagnostics, copy_positions, *, input_diagnost
                 "severity": severity,
                 "sqlstate": None if state is None else state[1],
                 "message": message,
+                "context": [],
             }
             auxiliary = False
+            in_context = False
         elif line.startswith("psql:") or current is None:
             finish()
             current = None
             result.append({"client": line})
         elif AUXILIARY.match(line):
             auxiliary = True
+            in_context = line.startswith("CONTEXT:")
+            if in_context:
+                current["context"].append(line[len("CONTEXT:"):].lstrip(" "))
             if line.startswith("LOCATION:"):
                 finish()
                 current = None
+        elif in_context:
+            current["context"].append(line)
         elif not auxiliary:
             current["message"].append(line)
     finish()

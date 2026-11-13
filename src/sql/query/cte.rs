@@ -2553,6 +2553,9 @@ pub(crate) fn check_rule_insert_values<'a>(
             joins: &[],
         })
         .map_err(|_| arena_full())?;
+    // A view the source names (a write through a view into a ruled view)
+    // reads through its query.
+    let from = expand_from_schema(from, storage, txid, arena)?;
     let scope = super::QueryScope::resolve_schema(storage, from, txid, arena, None)?;
     super::validate_dml_assignment_casts(
         statement,

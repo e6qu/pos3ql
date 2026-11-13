@@ -1866,7 +1866,6 @@ pub(super) fn attach_constraints(
                         def.name.as_str()
                     ));
                 }
-                let (indices, n) = resolve_cols(def, columns)?;
                 attach_fkey(
                     storage,
                     def,
@@ -1883,6 +1882,7 @@ pub(super) fn attach_constraints(
                     arena,
                 )?;
                 // The referenced key is checked first, as PostgreSQL does.
+                let (indices, n) = resolve_cols(def, columns)?;
                 reject_virtual_columns(def, &indices[..n], "foreign key constraints")?;
             }
             TableConstraint::Exclusion {

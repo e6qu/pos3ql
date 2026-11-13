@@ -621,8 +621,9 @@ for side in reference pos3ql; do
     -v ON_ERROR_STOP=1 -f "$EXT/foreign-row-progress.sql" \
     > "$WORK/foreign_row_progress_$side.out" 2>&1 || echo "status $?" >> "$WORK/foreign_row_progress_$side.out"
 done
+# The reference must run the whole script: no error and no failed status.
 if diff -u "$WORK/foreign_row_progress_reference.out" "$WORK/foreign_row_progress_pos3ql.out" \
-  && [[ "$(tail -1 "$WORK/foreign_row_progress_reference.out")" == 0 ]]; then
+  && ! grep -Eq '^(status |psql:.*ERROR)' "$WORK/foreign_row_progress_reference.out"; then
   ok "foreign writes keep changed rows across routine calls"
 else
   bad "foreign write row progress"

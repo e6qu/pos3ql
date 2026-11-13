@@ -369,3 +369,41 @@ fn rows_from_views_print_postgresql_layout() {
         )]
     );
 }
+
+/// A text search configuration an expression binds to its OID prints by
+/// name (outputs captured from PostgreSQL 18.6).
+#[test]
+fn bound_text_search_configurations_print_by_name() {
+    let (mut engine, mut budget) = test_engine();
+    rows(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA od; \
+         CREATE TEXT SEARCH CONFIGURATION od.documents (COPY = english); \
+         CREATE TABLE od.sd (id int, body text, \
+           terms tsvector GENERATED ALWAYS AS (to_tsvector('od.documents', body)) STORED, \
+           c bool CHECK (to_tsvector('english', body) @@ 'x'::tsquery OR true)); \
+         CREATE VIEW od.v AS SELECT to_tsvector('od.documents', body) FROM od.sd",
+    );
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'od.sd'::regclass"
+        ),
+        ["to_tsvector('od.documents'::regconfig, body)"]
+    );
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+             WHERE conrelid = 'od.sd'::regclass AND contype = 'c'"
+        ),
+        ["CHECK (((to_tsvector('english'::regconfig, body) @@ '''x'''::tsquery) OR true))"]
+    );
+    assert_eq!(
+        rows(&mut engine, &mut budget, "SELECT pg_get_viewdef('od.v')"),
+        [" SELECT to_tsvector('od.documents'::regconfig, body) AS to_tsvector\n   FROM od.sd;"]
+    );
+}

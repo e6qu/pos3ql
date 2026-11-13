@@ -728,6 +728,8 @@ fn outer_hash_quals<'a>(
     let context = crate::sql::catalog::deparse::Context {
         storage,
         txid,
+        arena,
+        dependencies: None,
         table: None,
         parameters: &[],
         joined,

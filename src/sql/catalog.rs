@@ -14681,8 +14681,6 @@ fn write_routine_type_name(
     Ok(())
 }
 
-/// Resolves the function catalog object types. `regproc` names a routine by
-/// unqualified name; `regprocedure` includes its complete argument signature.
 #[cfg(test)]
 thread_local! {
     /// Name lookups `routine_oid_by_name` has made on this thread, which a
@@ -14691,6 +14689,8 @@ thread_local! {
         const { core::cell::Cell::new(0) };
 }
 
+/// Resolves the function catalog object types. `regproc` names a routine by
+/// unqualified name; `regprocedure` includes its complete argument signature.
 pub(crate) fn routine_oid_by_name(
     storage: &Storage,
     txid: u32,

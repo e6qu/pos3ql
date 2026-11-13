@@ -8788,6 +8788,13 @@ pub(crate) fn check_literal_operands_typed<'a>(
             let (Some(ctype), Some(symbol)) = (infer(other), operator.operator_name()) else {
                 return Ok(());
             };
+            // Object-identifier types compare with the `oid` operators, so the
+            // literal converts to `oid`, not to the other operand's type.
+            let ctype = if ctype == ColType::Regtype || ctype.is_reg_object() {
+                ColType::Oid
+            } else {
+                ctype
+            };
             let (known, unknown) = (Some(ctype.oid()), Some(super::types::oid::UNKNOWN));
             let inputs = if left {
                 super::catalog::builtin_operator_input_oids(symbol, unknown, known)
@@ -9030,6 +9037,7 @@ pub(super) fn convert_literal<'a>(
                 | ColType::Timestamptz
                 | ColType::Interval
                 | ColType::Uuid
+                | ColType::Oid
         )
     }) else {
         return Ok(());

@@ -569,6 +569,9 @@ pub enum TransactionTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingSyntax {
     DecodedValue,
+    /// Several comma-separated items, joined with `", "`, for a parameter
+    /// that accepts a list only once PL/pgSQL has loaded.
+    DecodedList,
     Default,
     FromCurrent,
     TimeZone,

@@ -1410,12 +1410,30 @@ pub(crate) fn dml_parameter_scope_query<'a>(
     Ok(Some(&*select))
 }
 
+/// The derived relation rule actions read the triggering statement through.
+const TRANSITION_SOURCE_ALIAS: &str = "__pos3ql_rule_transition";
+
 #[derive(Clone, Copy)]
 pub(crate) struct RuleTransitionSource<'a> {
     pub source: TableRef<'a>,
     pub names: &'a [&'a str],
     pub old: &'a [&'a Expr<'a>],
     pub new: &'a [&'a Expr<'a>],
+    /// The rows of the `UPDATE ... FROM` or `DELETE ... USING` items beside
+    /// the rule's relation, which the triggering statement's RETURNING list
+    /// can read.
+    pub sources: &'a [RuleReturningSource<'a>],
+}
+
+/// One `FROM` or `USING` item of the triggering statement, as a rule's
+/// action reads it: its whole row, a column of the transition relation.
+#[derive(Clone, Copy)]
+pub(crate) struct RuleReturningSource<'a> {
+    /// The name the statement exposes it under.
+    pub name: &'a str,
+    pub row: &'a Expr<'a>,
+    /// The item's relation, whose columns name its row's fields.
+    pub item: TableRef<'a>,
 }
 
 #[derive(Clone, Copy)]
@@ -1572,7 +1590,13 @@ pub(crate) fn restrict_rule_original<'a>(
 /// Turns the original DML input into one derived relation. Rule actions scan
 /// that relation once, preserving statement-level behavior while OLD/NEW are
 /// ordinary typed column references rather than magic evaluator states.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the transition reads the statement's input against the target's columns"
+)]
 pub(crate) fn rule_transition_source<'a>(
+    storage: &Storage,
+    txid: u32,
     statement: &'a Stmt<'a>,
     columns: &'a [&'a str],
     types: &'a [RuleTransitionType<'a>],
@@ -1580,6 +1604,10 @@ pub(crate) fn rule_transition_source<'a>(
     force_defaults: &[bool],
     arena: &'a Arena,
 ) -> Result<RuleTransitionSource<'a>, SqlError> {
+    let mut sources = [None; MAX_PROJ];
+    let mut source_count = 0usize;
+    let mut source_items =
+        [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_PROJ];
     if columns.len() > crate::storage::MAX_COLUMNS {
         return Err(sql_err!(
             sqlstate::TOO_MANY_COLUMNS,
@@ -1592,9 +1620,7 @@ pub(crate) fn rule_transition_source<'a>(
             "rewrite transition type shape does not match its columns"
         ));
     }
-    let source_alias = arena
-        .alloc_str("__pos3ql_rule_transition")
-        .map_err(|_| arena_full())?;
+    let source_alias = TRANSITION_SOURCE_ALIAS;
     let mut old = [&Expr::Null; crate::storage::MAX_COLUMNS];
     let mut new = [&Expr::Null; crate::storage::MAX_COLUMNS];
     let mut items = [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_PROJ];
@@ -1621,6 +1647,32 @@ pub(crate) fn rule_transition_source<'a>(
         Ok(())
     };
 
+    // A FROM or USING item's whole row, which RETURNING reads through the
+    // transition relation.
+    let mut add_source =
+        |item: TableRef<'a>, index: usize| -> Result<RuleReturningSource<'a>, SqlError> {
+            let name = item.alias.unwrap_or(item.table);
+            let alias = crate::stack_format!(63, "__pos3ql_src_{}", index);
+            let alias = arena.alloc_str(alias.as_str()).map_err(|_| arena_full())?;
+            source_items[index] = SelectItem::Expr {
+                expression: arena
+                    .alloc(Expr::WholeRow(name))
+                    .map(|expression| &*expression)
+                    .map_err(|_| arena_full())?,
+                alias: Some(alias),
+            };
+            Ok(RuleReturningSource {
+                name,
+                row: arena
+                    .alloc(Expr::Column {
+                        qualifier: Some(source_alias),
+                        name: alias,
+                    })
+                    .map(|expression| &*expression)
+                    .map_err(|_| arena_full())?,
+                item,
+            })
+        };
     let select = match statement {
         Stmt::Update(update) => {
             let target_qualifier = update.alias.unwrap_or(update.table.name);
@@ -1647,9 +1699,28 @@ pub(crate) fn rule_transition_source<'a>(
                     &mut new,
                 )?;
             }
+            if !update.returning.is_empty() {
+                for item in rule_returning_items_of(update.from) {
+                    let row = add_source(item, source_count)?;
+                    sources[source_count] = Some(row);
+                    source_count += 1;
+                }
+            }
+            if item_count + source_count > MAX_PROJ {
+                return Err(sql_err!(
+                    sqlstate::TOO_MANY_COLUMNS,
+                    "rewrite relation is too wide"
+                ));
+            }
             rule_select(
                 arena
-                    .alloc_slice_copy(&items[..item_count])
+                    .alloc_slice_with(item_count + source_count, |index| {
+                        items
+                            .get(index)
+                            .filter(|_| index < item_count)
+                            .copied()
+                            .unwrap_or_else(|| source_items[index - item_count])
+                    })
                     .map_err(|_| arena_full())?,
                 Some(from),
                 update.where_clause,
@@ -1669,9 +1740,28 @@ pub(crate) fn rule_transition_source<'a>(
                     .map_err(|_| arena_full())?;
                 add_output("old", column, old_expression, &mut old)?;
             }
+            if !delete.returning.is_empty() {
+                for item in rule_returning_items_of(delete.using) {
+                    let row = add_source(item, source_count)?;
+                    sources[source_count] = Some(row);
+                    source_count += 1;
+                }
+            }
+            if item_count + source_count > MAX_PROJ {
+                return Err(sql_err!(
+                    sqlstate::TOO_MANY_COLUMNS,
+                    "rewrite relation is too wide"
+                ));
+            }
             rule_select(
                 arena
-                    .alloc_slice_copy(&items[..item_count])
+                    .alloc_slice_with(item_count + source_count, |index| {
+                        items
+                            .get(index)
+                            .filter(|_| index < item_count)
+                            .copied()
+                            .unwrap_or_else(|| source_items[index - item_count])
+                    })
                     .map_err(|_| arena_full())?,
                 Some(from),
                 delete.where_clause,
@@ -1679,17 +1769,15 @@ pub(crate) fn rule_transition_source<'a>(
         }
         Stmt::Insert(insert) => {
             let input_columns = if insert.columns.is_empty() {
-                if insert.select.is_none() {
-                    let width = insert.rows.first().map_or(0, |row| row.len());
-                    columns.get(..width).ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::SYNTAX_ERROR,
-                            "INSERT has more expressions than target columns"
-                        )
-                    })?
-                } else {
-                    columns
-                }
+                // A query's columns fill the first target columns, as a
+                // VALUES row's do.
+                let width = super::dependencies::insert_source_width(insert, storage, txid, arena)?;
+                columns.get(..width).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "INSERT has more expressions than target columns"
+                    )
+                })?
             } else {
                 insert.columns
             };
@@ -1840,6 +1928,10 @@ pub(crate) fn rule_transition_source<'a>(
         view_access: None,
         join_members: None,
     };
+    let mut collected = ArenaList::new(arena);
+    for source in sources[..source_count].iter().flatten() {
+        collected.push(*source).map_err(|_| arena_full())?;
+    }
     Ok(RuleTransitionSource {
         source,
         names: columns,
@@ -1849,7 +1941,21 @@ pub(crate) fn rule_transition_source<'a>(
         new: arena
             .alloc_slice_copy(&new[..columns.len()])
             .map_err(|_| arena_full())?,
+        sources: collected.as_slice(),
     })
+}
+
+/// The `FROM` or `USING` items whose rows a rule's RETURNING list can read:
+/// each named table, function or subquery. A parenthesized join's members
+/// are not separately addressable.
+fn rule_returning_items_of<'a>(
+    from: Option<&'a FromClause<'a>>,
+) -> impl Iterator<Item = TableRef<'a>> + 'a {
+    from.into_iter()
+        .flat_map(|from| {
+            core::iter::once(from.base).chain(from.joins.iter().map(|join| join.table))
+        })
+        .filter(|item| item.join_members.is_none())
 }
 
 /// The relation a rule fires on, as the triggering statement's RETURNING
@@ -1863,6 +1969,62 @@ pub(crate) struct RuleReturningRelation<'a> {
     pub columns: &'a [&'a str],
     /// `UPDATE ... FROM` or `DELETE ... USING` sources beside the relation.
     pub other_sources: bool,
+    /// Those of the sources the list can read, all of them unless one is a
+    /// parenthesized join.
+    pub sources: &'a [RuleReturningSource<'a>],
+}
+
+/// The column names of a rule RETURNING list's source, when they can be
+/// described.
+fn rule_source_columns<'a>(
+    source: RuleReturningSource<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Option<&'a [&'a str]> {
+    let items = arena
+        .alloc_slice_copy(&[SelectItem::Wildcard(
+            crate::sql::ast::SourcePosition::UNKNOWN,
+        )])
+        .ok()?;
+    let select = arena
+        .alloc(rule_select(
+            items,
+            Some(FromClause {
+                base: source.item,
+                joins: &[],
+            }),
+            None,
+        ))
+        .ok()?;
+    let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
+    let count = crate::sql::error_position::preserving_pending(|| {
+        super::describe_select(
+            select,
+            storage,
+            txid,
+            arena,
+            &mut columns,
+            crate::sql::exec::DescriptionTarget::Sql,
+            None,
+        )
+    })
+    .ok()?;
+    let names = arena.alloc_slice_with(count, |_| "").ok()?;
+    for (name, column) in names.iter_mut().zip(&columns[..count]) {
+        *name = arena.alloc_str(column.name).ok()?;
+    }
+    Some(&*names)
+}
+
+/// Rewrites a RETURNING expression's references to the triggering
+/// statement's `FROM` or `USING` items into fields of their rows.
+struct RuleSourceFailure(SqlError);
+
+impl From<crate::mem::arena::ArenaFull> for RuleSourceFailure {
+    fn from(_: crate::mem::arena::ArenaFull) -> Self {
+        Self(arena_full())
+    }
 }
 
 fn rule_returning_unsupported() -> SqlError {
@@ -1870,6 +2032,102 @@ fn rule_returning_unsupported() -> SqlError {
         sqlstate::FEATURE_NOT_SUPPORTED,
         "RETURNING through a rule's RETURNING list can reference only the rule's relation"
     )
+}
+
+/// A reference to one of the `sources` an outer reference reads, as a field
+/// of its row (or the row, for its whole-row reference); `None` for a name
+/// the sources do not provide. `relation` holds the rewritten relation's
+/// columns: an unqualified name both provide is ambiguous. `outer_qualifier`
+/// and `outer_name` tell whether a name reaches past the scopes entered.
+fn source_reference<'a>(
+    expression: &'a Expr<'a>,
+    relation: &[&str],
+    sources: &[OuterRow<'a>],
+    outer_qualifier: &dyn Fn(&str) -> bool,
+    outer_name: &mut dyn FnMut(&str) -> Result<bool, SqlError>,
+    arena: &'a Arena,
+) -> Result<Option<&'a Expr<'a>>, SqlError> {
+    if sources.is_empty() {
+        return Ok(None);
+    }
+    let source = |name: &str| sources.iter().find(|source| source.name == name);
+    let field = |row: &'a Expr<'a>, name: &'a str| {
+        arena
+            .alloc(Expr::Field {
+                base: row,
+                field: name,
+            })
+            .map(|expression| Some(&*expression))
+            .map_err(|_| arena_full())
+    };
+    match *expression {
+        Expr::Column {
+            qualifier: Some(qualifier),
+            name,
+        } if outer_qualifier(qualifier) => {
+            let Some(source) = source(qualifier) else {
+                return Ok(None);
+            };
+            if source
+                .columns
+                .is_some_and(|columns| !columns.contains(&name))
+            {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column {}.{} does not exist",
+                    qualifier,
+                    name
+                ));
+            }
+            field(source.row, name)
+        }
+        Expr::WholeRow(name) if outer_qualifier(name) => Ok(source(name).map(|source| source.row)),
+        Expr::Column {
+            qualifier: None,
+            name,
+        } => {
+            if !outer_name(name)? {
+                return Ok(None);
+            }
+            // The sources with a column `name`; `None` when one cannot be
+            // described.
+            let providers = sources.iter().try_fold(0usize, |count, source| {
+                source
+                    .columns
+                    .map(|columns| count + usize::from(columns.contains(&name)))
+            });
+            match (relation.contains(&name), providers) {
+                (true, Some(0)) => Ok(None),
+                (_, None) => Err(rule_returning_unsupported()),
+                (true, Some(_)) | (false, Some(2..)) => Err(sql_err!(
+                    sqlstate::AMBIGUOUS_COLUMN,
+                    "column reference \"{}\" is ambiguous",
+                    name
+                )),
+                (false, Some(1)) => {
+                    let provider = sources
+                        .iter()
+                        .find(|source| {
+                            source
+                                .columns
+                                .is_some_and(|columns| columns.contains(&name))
+                        })
+                        .expect("one source provides the column");
+                    field(provider.row, name)
+                }
+                // A source's bare name is its whole row.
+                (false, Some(_)) => match source(name) {
+                    Some(source) => Ok(Some(source.row)),
+                    None => Err(sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        name
+                    )),
+                },
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 /// A rule action's RETURNING entries, one expression per entry, with `*` and
@@ -1965,6 +2223,7 @@ pub(crate) fn rule_returning_entries<'a>(
 pub(crate) fn rule_returning_items<'a>(
     outer: Returning<'a>,
     relation: RuleReturningRelation<'a>,
+    action: &'a Stmt<'a>,
     entries: &'a [&'a Expr<'a>],
     storage: &Storage,
     txid: u32,
@@ -1980,6 +2239,71 @@ pub(crate) fn rule_returning_items<'a>(
         .alloc_slice_copy(&[relation.name, outer.old_name(), outer.new_name()])
         .map_err(|_| arena_full())?;
     let known = |qualifier: &str| names.contains(&qualifier);
+    // `old` and `new` read the action's images of its entries.
+    let images = arena
+        .alloc_slice_copy(&[
+            rule_returning_image(
+                outer.old_name(),
+                action,
+                entries,
+                true,
+                storage,
+                txid,
+                arena,
+            )?,
+            rule_returning_image(
+                outer.new_name(),
+                action,
+                entries,
+                false,
+                storage,
+                txid,
+                arena,
+            )?,
+        ])
+        .map_err(|_| arena_full())?;
+    let mut items: ArenaList<'a, SelectItem<'a>> = ArenaList::new(arena);
+    let expand =
+        |items: &mut ArenaList<'a, SelectItem<'a>>, qualifier: &str| -> Result<(), SqlError> {
+            let columns = images
+                .iter()
+                .find(|image| image.name == qualifier)
+                .map_or(entries, |image| image.columns);
+            for (index, name) in relation.columns.iter().enumerate() {
+                items
+                    .push(SelectItem::Expr {
+                        expression: columns[index],
+                        alias: Some(name),
+                    })
+                    .map_err(|_| arena_full())?;
+            }
+            Ok(())
+        };
+    // The sources can be read when each FROM or USING item is one.
+    let readable = relation.other_sources && !relation.sources.is_empty();
+    let source = |name: &str| {
+        relation
+            .sources
+            .iter()
+            .find(|source| source.name == name)
+            .copied()
+    };
+    let mut described = [None; MAX_PROJ];
+    for (slot, item) in described.iter_mut().zip(relation.sources) {
+        *slot = rule_source_columns(*item, storage, txid, arena);
+    }
+    let described = &described[..relation.sources.len()];
+    let sources: &'a [OuterRow<'a>] = if readable {
+        arena
+            .alloc_slice_with(relation.sources.len(), |index| OuterRow {
+                name: relation.sources[index].name,
+                row: relation.sources[index].row,
+                columns: described[index],
+            })
+            .map_err(|_| arena_full())?
+    } else {
+        &[]
+    };
     let context = Subst {
         ctes: &[],
         materialized: &[],
@@ -1997,30 +2321,40 @@ pub(crate) fn rule_returning_items<'a>(
             exposed_columns: relation.columns,
             base_columns: &[],
             projected_columns: Some(entries),
-            projected_aliases: &names[1..],
+            projected_aliases: images,
+            sources,
+            inner_froms: &[],
         }),
         rule_transition: None,
         recursive_state: None,
         execution: None,
         shallow: false,
     };
-    let mut items: ArenaList<'a, SelectItem<'a>> = ArenaList::new(arena);
-    let expand = |items: &mut ArenaList<'a, SelectItem<'a>>| -> Result<(), SqlError> {
-        for (index, name) in relation.columns.iter().enumerate() {
-            items
-                .push(SelectItem::Expr {
-                    expression: entries[index],
-                    alias: Some(name),
-                })
-                .map_err(|_| arena_full())?;
-        }
-        Ok(())
+    let push_source_star = |items: &mut ArenaList<'a, SelectItem<'a>>,
+                            source: RuleReturningSource<'a>|
+     -> Result<(), SqlError> {
+        items
+            .push(SelectItem::RecordStar(source.row))
+            .map_err(|_| arena_full())
     };
     for item in outer.items {
         match item {
-            SelectItem::Wildcard(_) if !relation.other_sources => expand(&mut items)?,
-            SelectItem::TableWildcard(qualifier) if known(qualifier) => expand(&mut items)?,
-            SelectItem::TableWildcard(qualifier) if !relation.other_sources => {
+            SelectItem::Wildcard(_) if !relation.other_sources => expand(&mut items, "")?,
+            SelectItem::Wildcard(_) if readable => {
+                expand(&mut items, "")?;
+                for source in relation.sources {
+                    push_source_star(&mut items, *source)?;
+                }
+            }
+            SelectItem::TableWildcard(qualifier) if known(qualifier) => {
+                expand(&mut items, qualifier)?
+            }
+            SelectItem::TableWildcard(qualifier)
+                if let Some(source) = source(qualifier).filter(|_| readable) =>
+            {
+                push_source_star(&mut items, source)?;
+            }
+            SelectItem::TableWildcard(qualifier) if !relation.other_sources || readable => {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_TABLE,
                     "missing FROM-clause entry for table \"{}\"",
@@ -2028,13 +2362,35 @@ pub(crate) fn rule_returning_items<'a>(
                 ));
             }
             SelectItem::Expr { expression, alias } => {
-                // Substitution does not follow a subquery's own scope.
-                if expression.contains_subquery() {
-                    return Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "subqueries in RETURNING are not supported through a rule's RETURNING list"
-                    ));
-                }
+                let written = expression;
+                // References to the sources read their rows' fields; an
+                // unqualified name is the relation's or one source's column.
+                // Subqueries are rewritten with the relation's columns below,
+                // in their own scopes.
+                let expression = if readable {
+                    crate::sql::ast::rewrite_expression(expression, arena, &mut |node| {
+                        if let Expr::Column {
+                            qualifier: None,
+                            name,
+                        } = node
+                            && names[1..].contains(name)
+                        {
+                            return Ok(None);
+                        }
+                        source_reference(
+                            node,
+                            relation.columns,
+                            sources,
+                            &|qualifier| !known(qualifier),
+                            &mut |_| Ok(true),
+                            arena,
+                        )
+                        .map_err(RuleSourceFailure)
+                    })
+                    .map_err(|RuleSourceFailure(error)| error)?
+                } else {
+                    expression
+                };
                 let mut invalid = None;
                 expression.for_each_column_reference(&mut |qualifier, name| {
                     if invalid.is_some() {
@@ -2043,7 +2399,10 @@ pub(crate) fn rule_returning_items<'a>(
                     let column = relation.columns.contains(&name);
                     invalid = match qualifier {
                         None if column => None,
+                        // A bare `old` or `new` is its image's whole row.
+                        None if names[1..].contains(&name) => None,
                         Some(qualifier) if known(qualifier) && column => None,
+                        Some(qualifier) if qualifier == TRANSITION_SOURCE_ALIAS => None,
                         _ if relation.other_sources => Some(rule_returning_unsupported()),
                         None => Some(sql_err!(
                             sqlstate::UNDEFINED_COLUMN,
@@ -2066,13 +2425,15 @@ pub(crate) fn rule_returning_items<'a>(
                 if let Some(error) = invalid {
                     return Err(error);
                 }
-                if let Expr::WholeRow(_) = expression {
+                if let Expr::WholeRow(qualifier) = expression
+                    && !names[1..].contains(qualifier)
+                {
                     return Err(rule_returning_unsupported());
                 }
                 items
                     .push(SelectItem::Expr {
                         expression: subst_expr(expression, context, arena)?,
-                        alias: Some(alias.unwrap_or(crate::sql::exec::derived_name(expression))),
+                        alias: Some(alias.unwrap_or(crate::sql::exec::derived_name(written))),
                     })
                     .map_err(|_| arena_full())?;
             }
@@ -2851,6 +3212,8 @@ pub(crate) fn filter_view_rows<'a>(
         base_columns: &[],
         projected_columns: Some(projected),
         projected_aliases: &[],
+        sources: &[],
+        inner_froms: &[],
     };
     let context = Subst {
         ctes: &[],
@@ -3054,6 +3417,8 @@ fn filter_set_view_conjunct<'a>(
                 base_columns: &[],
                 projected_columns: None,
                 projected_aliases: &[],
+                sources: &[],
+                inner_froms: &[],
             };
             if !view_predicate_columns_safe(predicate, qualifier, &matching_types[..count]) {
                 return Ok(None);
@@ -3275,6 +3640,8 @@ pub(super) fn substitute_relation_columns<'a>(
             base_columns: names,
             projected_columns: Some(projected),
             projected_aliases: &[],
+            sources: &[],
+            inner_froms: &[],
         }),
         rule_transition: None,
         recursive_state: None,
@@ -3414,6 +3781,8 @@ pub fn rewrite_view_dml<'a>(
             base_columns: mapped,
             projected_columns: Some(projected),
             projected_aliases: &[],
+            sources: &[],
+            inner_froms: &[],
         }),
         rule_transition: None,
         recursive_state: None,
@@ -4435,9 +4804,248 @@ struct ViewQualifier<'a> {
     exposed_columns: &'a [&'a str],
     base_columns: &'a [&'a str],
     projected_columns: Option<&'a [&'a Expr<'a>]>,
-    /// Further names that reach the projected columns (a RETURNING list's
-    /// `old` and `new` spellings).
-    projected_aliases: &'a [&'a str],
+    /// Further names that reach images of the projected columns (a rule
+    /// RETURNING list's `old` and `new`).
+    projected_aliases: &'a [ProjectedImage<'a>],
+    /// Rows beside the rewritten relation that references also read: a rule
+    /// RETURNING list's `FROM` or `USING` items, whose columns become fields
+    /// of their rows.
+    sources: &'a [OuterRow<'a>],
+    /// The FROM clauses of the subqueries entered below the rewritten
+    /// statement. A name one of them binds (an alias, or a column of one of
+    /// its items) is theirs, so the rewrite leaves it alone there.
+    inner_froms: &'a [&'a FromClause<'a>],
+}
+
+/// Another version of a rewrite's projected columns, read under `name`.
+#[derive(Clone, Copy)]
+struct ProjectedImage<'a> {
+    name: &'a str,
+    columns: &'a [&'a Expr<'a>],
+    /// The whole row, NULL when the image is absent.
+    row: &'a Expr<'a>,
+}
+
+/// The `old` (`old_image`) or `new` image of a rule action's RETURNING
+/// entries, named `name` in the triggering statement: each entry with its
+/// references to the action's target read from that image, as
+/// PostgreSQL's `rewriteRuleAction` gives the entries the image's
+/// `varreturningtype`. An `INSERT` action has no old image and a `DELETE`
+/// action no new one; reading them yields NULL.
+fn rule_returning_image<'a>(
+    name: &'a str,
+    action: &'a Stmt<'a>,
+    entries: &'a [&'a Expr<'a>],
+    old_image: bool,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<ProjectedImage<'a>, SqlError> {
+    let (returning, table, alias, present) = match action {
+        Stmt::Insert(insert) => (insert.returning, insert.table, None, !old_image),
+        Stmt::Update(update) => (update.returning, update.table, update.alias, true),
+        Stmt::Delete(delete) => (delete.returning, delete.table, delete.alias, old_image),
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "rule RETURNING action is not INSERT, UPDATE or DELETE"
+            ));
+        }
+    };
+    let Some(crate::storage::ResolvedRelation::Table(slot)) =
+        storage.resolve_relation(table.schema, table.name, txid)
+    else {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "RETURNING old or new through a rule action that does not write a table is not supported"
+        ));
+    };
+    let definition = storage.table_def(slot, txid);
+    let visible = alias.unwrap_or(table.name);
+    let image = if old_image {
+        returning.old_name()
+    } else {
+        returning.new_name()
+    };
+    let columns = arena
+        .alloc_slice_with(entries.len(), |_| &Expr::Null as &Expr)
+        .map_err(|_| arena_full())?;
+    for (slot, entry) in columns.iter_mut().zip(entries) {
+        *slot = crate::sql::ast::rewrite_expression(entry, arena, &mut |node| {
+            Ok::<_, crate::mem::arena::ArenaFull>(match *node {
+                Expr::Column { qualifier, name }
+                    if qualifier.is_none_or(|qualifier| qualifier == visible)
+                        && definition.column_index(name).is_some() =>
+                {
+                    Some(&*arena.alloc(Expr::Column {
+                        qualifier: Some(image),
+                        name,
+                    })?)
+                }
+                _ => None,
+            })
+        })
+        .map_err(|_| arena_full())?;
+    }
+    let row = &*arena
+        .alloc(Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name: "row",
+            bound_oid: None,
+            bound_strict: None,
+            source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+            args: columns,
+            argument_names: &[],
+            variadic: false,
+            star: false,
+            distinct: false,
+            order_by: &[],
+            over: None,
+            filter: None,
+        })
+        .map_err(|_| arena_full())?;
+    // An absent image is a NULL row of the entries' type.
+    let row = if present {
+        row
+    } else {
+        let whens = arena
+            .alloc_slice_copy(&[(&Expr::Bool(false) as &Expr, row)])
+            .map_err(|_| arena_full())?;
+        &*arena
+            .alloc(Expr::Case {
+                operand: None,
+                whens,
+                otherwise: None,
+                origin: crate::sql::ast::CaseOrigin::Written,
+            })
+            .map_err(|_| arena_full())?
+    };
+    Ok(ProjectedImage { name, columns, row })
+}
+
+/// A row an outer reference reads through its fields.
+#[derive(Clone, Copy)]
+struct OuterRow<'a> {
+    name: &'a str,
+    row: &'a Expr<'a>,
+    /// Its column names, when they can be described.
+    columns: Option<&'a [&'a str]>,
+}
+
+impl<'a> ViewQualifier<'a> {
+    /// Whether a qualified reference reaches past the subqueries entered.
+    fn outer_qualifier(&self, qualifier: &str) -> bool {
+        !self
+            .inner_froms
+            .iter()
+            .any(|from| from_shadows_qualifier(from, qualifier))
+    }
+
+    /// Whether an unqualified name reaches past the subqueries entered: no
+    /// item of their FROM clauses has such a column.
+    fn outer_name(
+        &self,
+        name: &str,
+        context: Subst<'_, 'a, '_, '_>,
+        arena: &'a Arena,
+    ) -> Result<bool, SqlError> {
+        for from in self.inner_froms {
+            for item in
+                core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table))
+            {
+                if from_item_columns(item, context, arena)?.contains(&name) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Entering a subquery with `from`: its names shadow the rewrite's.
+    fn entering(self, from: &'a FromClause<'a>, arena: &'a Arena) -> Result<Self, SqlError> {
+        let inner_froms = arena
+            .alloc_slice_with(self.inner_froms.len() + 1, |index| {
+                self.inner_froms.get(index).copied().unwrap_or(from)
+            })
+            .map_err(|_| arena_full())?;
+        Ok(Self {
+            inner_froms,
+            ..self
+        })
+    }
+}
+
+/// The column names a FROM item exposes to unqualified references.
+fn from_item_columns<'a>(
+    item: &'a TableRef<'a>,
+    context: Subst<'_, 'a, '_, '_>,
+    arena: &'a Arena,
+) -> Result<&'a [&'a str], SqlError> {
+    let describe = |select: &'a Select<'a>| -> Result<&'a [&'a str], SqlError> {
+        let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
+        let count = super::describe_select(
+            select,
+            context.storage,
+            context.txid,
+            arena,
+            &mut columns,
+            crate::sql::exec::DescriptionTarget::Sql,
+            None,
+        )?;
+        let names = arena
+            .alloc_slice_with(count, |_| "")
+            .map_err(|_| arena_full())?;
+        for (name, column) in names.iter_mut().zip(&columns[..count]) {
+            *name = arena.alloc_str(column.name).map_err(|_| arena_full())?;
+        }
+        Ok(&*names)
+    };
+    let cte = (item.schema.is_none() && item.subquery.is_none() && item.func_args.is_none())
+        .then(|| context.ctes.iter().find(|(name, _, _)| *name == item.table))
+        .flatten();
+    let names = match cte {
+        Some((_, query, columns)) => {
+            let described = describe(query)?;
+            let renames = if columns.is_empty() {
+                item.col_alias.unwrap_or(&[])
+            } else {
+                columns
+            };
+            let names = arena
+                .alloc_slice_copy(described)
+                .map_err(|_| arena_full())?;
+            for (name, rename) in names.iter_mut().zip(renames) {
+                *name = rename;
+            }
+            if !columns.is_empty()
+                && let Some(aliases) = item.col_alias
+            {
+                for (name, rename) in names.iter_mut().zip(aliases) {
+                    *name = rename;
+                }
+            }
+            &*names
+        }
+        None => {
+            let items = arena
+                .alloc_slice_copy(&[SelectItem::Wildcard(
+                    crate::sql::ast::SourcePosition::UNKNOWN,
+                )])
+                .map_err(|_| arena_full())?;
+            let select = arena
+                .alloc(rule_select(
+                    items,
+                    Some(FromClause {
+                        base: *item,
+                        joins: &[],
+                    }),
+                    None,
+                ))
+                .map_err(|_| arena_full())?;
+            describe(select)?
+        }
+    };
+    Ok(names)
 }
 
 #[derive(Clone, Copy)]
@@ -6945,10 +7553,9 @@ fn subst_select_body<'a>(
     mut context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
-    if let (Some(qualifier), Some(from)) = (context.qualifier, s.from)
-        && from_shadows_qualifier(&from, qualifier.from)
-    {
-        context.qualifier = None;
+    // The subquery's own FROM items bind the names they provide.
+    if let (Some(qualifier), Some(from)) = (context.qualifier, s.from.as_ref()) {
+        context.qualifier = Some(qualifier.entering(from, arena)?);
     }
     let from = match &s.from {
         Some(f) => Some(subst_from(f, context, arena)?),
@@ -8267,14 +8874,36 @@ fn subst_expr<'a>(
     context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
+    let image_name = |rewrite: ViewQualifier<'_>| {
+        matches!(e, Expr::Column { qualifier: None, name }
+            if rewrite.projected_aliases.iter().any(|image| image.name == *name))
+    };
+    if let Some(rewrite) = context.qualifier
+        && !image_name(rewrite)
+        && let Some(source) = source_reference(
+            e,
+            rewrite.exposed_columns,
+            rewrite.sources,
+            &|qualifier| rewrite.outer_qualifier(qualifier),
+            &mut |name| rewrite.outer_name(name, context, arena),
+            arena,
+        )?
+    {
+        return Ok(source);
+    }
     if let Some(rewrite) = context.qualifier
         && let Some(projected) = rewrite.projected_columns
     {
         let name = match e {
-            Expr::Column { qualifier, name }
-                if qualifier.is_none_or(|written| {
-                    written == rewrite.from || rewrite.projected_aliases.contains(&written)
-                }) =>
+            Expr::Column {
+                qualifier: Some(written),
+                name,
+            } if rewrite.outer_qualifier(written) && *written == rewrite.from => Some(*name),
+            Expr::Column {
+                qualifier: None,
+                name,
+            } if rewrite.exposed_columns.contains(name)
+                && rewrite.outer_name(name, context, arena)? =>
             {
                 Some(*name)
             }
@@ -8282,7 +8911,12 @@ fn subst_expr<'a>(
                 schema,
                 table,
                 name,
-            } if *table == rewrite.from && Some(*schema) == rewrite.from_schema => Some(*name),
+            } if *table == rewrite.from
+                && Some(*schema) == rewrite.from_schema
+                && rewrite.outer_qualifier(table) =>
+            {
+                Some(*name)
+            }
             _ => None,
         };
         if let Some(name) = name
@@ -8293,13 +8927,58 @@ fn subst_expr<'a>(
         {
             return Ok(projected[index]);
         }
-        // A whole-row reference reads every projected column.
-        let whole_row = match e {
-            Expr::WholeRow(qualifier) => *qualifier == rewrite.from,
+        // `old` and `new` read their images.
+        let image = match e {
+            Expr::Column {
+                qualifier: Some(written),
+                name,
+            } if rewrite.outer_qualifier(written) => rewrite
+                .projected_aliases
+                .iter()
+                .find(|image| image.name == *written)
+                .map(|image| (image, Some(*name))),
+            Expr::WholeRow(written) if rewrite.outer_qualifier(written) => rewrite
+                .projected_aliases
+                .iter()
+                .find(|image| image.name == *written)
+                .map(|image| (image, None)),
             Expr::Column {
                 qualifier: None,
                 name,
-            } => *name == rewrite.from,
+            } if !rewrite.exposed_columns.contains(name) => {
+                match rewrite
+                    .projected_aliases
+                    .iter()
+                    .find(|image| image.name == *name)
+                {
+                    Some(image) if rewrite.outer_name(name, context, arena)? => Some((image, None)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        match image {
+            Some((image, Some(name))) => {
+                if let Some(index) = rewrite
+                    .exposed_columns
+                    .iter()
+                    .position(|known| *known == name)
+                {
+                    return Ok(image.columns[index]);
+                }
+            }
+            Some((image, None)) => return Ok(image.row),
+            None => {}
+        }
+        // A whole-row reference reads every projected column.
+        let whole_row = match e {
+            Expr::WholeRow(qualifier) => {
+                *qualifier == rewrite.from && rewrite.outer_qualifier(qualifier)
+            }
+            Expr::Column {
+                qualifier: None,
+                name,
+            } => *name == rewrite.from && rewrite.outer_name(name, context, arena)?,
             _ => false,
         };
         if whole_row && projected.len() == rewrite.exposed_columns.len() {
@@ -8673,26 +9352,32 @@ fn subst_expr<'a>(
                         name
                     ));
                 }
-                Expr::Column {
-                    qualifier: match (*qualifier, context.qualifier) {
-                        (Some(written), Some(rewrite)) if written == rewrite.from => {
-                            Some(rewrite.to)
-                        }
-                        _ => *qualifier,
+                let reaches = match (*qualifier, context.qualifier) {
+                    (Some(written), Some(rewrite)) => {
+                        written == rewrite.from && rewrite.outer_qualifier(written)
+                    }
+                    (None, Some(rewrite)) => {
+                        rewrite.exposed_columns.contains(name)
+                            && rewrite.outer_name(name, context, arena)?
+                    }
+                    (_, None) => false,
+                };
+                match context.qualifier {
+                    Some(rewrite) if reaches => Expr::Column {
+                        qualifier: qualifier.map(|_| rewrite.to),
+                        name: view_base_column(rewrite.exposed_columns, rewrite.base_columns, name),
                     },
-                    name: match context.qualifier {
-                        Some(rewrite)
-                            if qualifier.is_none_or(|written| written == rewrite.from) =>
-                        {
-                            view_base_column(rewrite.exposed_columns, rewrite.base_columns, name)
-                        }
-                        _ => name,
+                    _ => Expr::Column {
+                        qualifier: *qualifier,
+                        name,
                     },
                 }
             }
         }
         Expr::WholeRow(qualifier) => Expr::WholeRow(match context.qualifier {
-            Some(rewrite) if *qualifier == rewrite.from => rewrite.to,
+            Some(rewrite) if *qualifier == rewrite.from && rewrite.outer_qualifier(qualifier) => {
+                rewrite.to
+            }
             _ => qualifier,
         }),
         Expr::SchemaColumn {
@@ -8700,11 +9385,13 @@ fn subst_expr<'a>(
             table,
             name,
         } => match context.qualifier {
-            Some(rewrite) if *table == rewrite.from => Expr::SchemaColumn {
-                schema: rewrite.to_schema,
-                table: rewrite.to,
-                name: view_base_column(rewrite.exposed_columns, rewrite.base_columns, name),
-            },
+            Some(rewrite) if *table == rewrite.from && rewrite.outer_qualifier(table) => {
+                Expr::SchemaColumn {
+                    schema: rewrite.to_schema,
+                    table: rewrite.to,
+                    name: view_base_column(rewrite.exposed_columns, rewrite.base_columns, name),
+                }
+            }
             _ => Expr::SchemaColumn {
                 schema,
                 table,

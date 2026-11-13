@@ -52,6 +52,8 @@ trait EnclosingColumns {
 /// so a reference that resolves nowhere may belong to it.
 struct EnclosingLevel<'s, 'd, 'a> {
     scope: Option<&'s super::QueryScope<'d>>,
+    /// A RETURNING list's `old` and `new` names and the target they read.
+    returning: Option<([&'s str; 2], &'s str)>,
     parent: Option<&'s dyn EnclosingColumns>,
     /// Columns its subqueries read before the level's own relations are
     /// recorded, which the level marks once they are.
@@ -68,6 +70,10 @@ impl EnclosingColumns for EnclosingLevel<'_, '_, '_> {
     ) -> Result<bool, SqlError> {
         let Some(scope) = self.scope else {
             return Ok(true);
+        };
+        let qualifier = match (qualifier, self.returning) {
+            (Some(written), Some((aliases, target))) if aliases.contains(&written) => Some(target),
+            _ => qualifier,
         };
         if let Ok(resolved) =
             crate::sql::error_position::preserving_pending(|| scope.find_column(qualifier, name))
@@ -863,11 +869,12 @@ fn collect_statement(
     let no_excluded: Option<(usize, crate::storage::RelationDefinition<'_>)> = None;
     macro_rules! collect_expr {
         ($expression:expr, $scope:expr, $excluded:expr) => {{
-            collect_expression(
+            collect_dml_expression(
                 $expression,
+                $scope,
+                None,
                 storage,
                 txid,
-                CteNames::EMPTY,
                 dependencies,
                 arena,
                 context,
@@ -1375,6 +1382,46 @@ fn collect_dml_routine_calls_with_output<'a>(
     Ok(())
 }
 
+/// Collects a data-modifying statement's expression, whose subqueries'
+/// outer references name the statement's own relations (`scope`).
+#[expect(clippy::too_many_arguments, reason = "dependency collection context")]
+fn collect_dml_expression<'a>(
+    expression: &'a Expr<'a>,
+    scope: Option<&super::QueryScope<'_>>,
+    returning: Option<([&str; 2], &str)>,
+    storage: &Storage,
+    txid: u32,
+    dependencies: &mut StoredQueryDependencies,
+    arena: &Arena,
+    context: CollectionContext<'_>,
+) -> Result<(), SqlError> {
+    let level = EnclosingLevel {
+        scope,
+        returning,
+        parent: context.enclosing,
+        deferred: core::cell::RefCell::new(crate::mem::arena::ArenaList::new(arena)),
+    };
+    collect_expression(
+        expression,
+        storage,
+        txid,
+        CteNames::EMPTY,
+        dependencies,
+        arena,
+        CollectionContext {
+            enclosing: Some(&level),
+            ..context
+        },
+    )?;
+    // The statement's relations are recorded with its own references.
+    for &(class, slot, column) in level.deferred.borrow().as_slice() {
+        if dependencies.depends_on(class, slot) {
+            dependencies.mark_referenced_column(class, slot, column)?;
+        }
+    }
+    Ok(())
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "RETURNING dependency collection needs the explicit DML analysis boundary"
@@ -1391,16 +1438,17 @@ fn collect_returning_expression<'a>(
     arena: &Arena,
     context: CollectionContext<'a>,
 ) -> Result<(), SqlError> {
-    collect_expression(
+    let aliases = [returning.old_name(), returning.new_name()];
+    collect_dml_expression(
         expression,
+        Some(scope),
+        Some((aliases, target_qualifier)),
         storage,
         txid,
-        CteNames::EMPTY,
         dependencies,
         arena,
         context,
     )?;
-    let aliases = [returning.old_name(), returning.new_name()];
     record_column_references(
         expression,
         scope,
@@ -3077,6 +3125,7 @@ fn collect_select<'a>(
         };
         let level = EnclosingLevel {
             scope: level_scope.as_ref(),
+            returning: None,
             parent: context.enclosing,
             deferred: core::cell::RefCell::new(crate::mem::arena::ArenaList::new(arena)),
         };
@@ -3402,6 +3451,10 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
 
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
         self.storage.domain_base_type_for_oid(type_oid, self.txid)
+    }
+
+    fn select_common_type(&self, inputs: &[i32]) -> Result<i32, crate::storage::CommonTypeFailure> {
+        self.storage.select_common_type(inputs, self.txid)
     }
 
     fn validate_explicit_cast(

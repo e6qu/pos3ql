@@ -57,6 +57,9 @@ pub(super) enum NotAutoUpdatable {
     NotSingleRelation,
     /// Checked for statements that assign columns.
     NoUpdatableColumns,
+    /// The view has a conditional `DO INSTEAD` rule for the event and no
+    /// unconditional one or `INSTEAD OF` trigger.
+    ConditionalInsteadRule,
 }
 
 impl NotAutoUpdatable {
@@ -84,6 +87,9 @@ impl NotAutoUpdatable {
             }
             Self::NoUpdatableColumns => {
                 "Views that have no updatable columns are not automatically updatable."
+            }
+            Self::ConditionalInsteadRule => {
+                "Views with conditional DO INSTEAD rules are not automatically updatable."
             }
         }
     }
@@ -237,6 +243,10 @@ pub struct UpdatableView<'a> {
     pub levels: &'a [ViewLevel<'a>],
     /// The written view's columns, read over the base relation.
     projected: &'a [&'a Expr<'a>],
+    /// The view the levels write into when it is written with its own
+    /// `INSTEAD OF` triggers or rewrite rules rather than through its base
+    /// relation, as PostgreSQL's rewriter then targets it: `base` names it.
+    pub base_view: Option<usize>,
 }
 
 impl<'a> UpdatableView<'a> {
@@ -345,6 +355,117 @@ impl<'a> UpdatableView<'a> {
                     columns: level.defaults,
                     inputs: level.default_inputs,
                 }
+            })
+            .map_err(|_| arena_full())?;
+        Ok(crate::sql::exec::ViewCheck { checks, defaults })
+    }
+
+    /// [`Self::view_check`] of a write that reached the written view through
+    /// views above it, whose check options and defaults (`inherited`, over
+    /// the written view's columns) PostgreSQL's rewriter carried down: they
+    /// are composed over the base relation and follow this view's own, the
+    /// checks after the inner views' and the defaults before them.
+    pub(crate) fn view_check_within(
+        &self,
+        view_name: &'a str,
+        inherited: Option<crate::sql::exec::ViewCheck<'a>>,
+        storage: &Storage,
+        txid: u32,
+        arena: &'a Arena,
+    ) -> Result<crate::sql::exec::ViewCheck<'a>, SqlError> {
+        let own = self.view_check(storage, txid, arena)?;
+        let Some(inherited) = inherited else {
+            return Ok(own);
+        };
+        let columns = self.columns();
+        let projected = self.projected_over(self.base.name, storage, txid, arena)?;
+        let lifted = arena
+            .alloc_slice_with(inherited.checks.len(), |_| ("", &Expr::Null as &Expr))
+            .map_err(|_| arena_full())?;
+        for (target, (name, predicate)) in lifted.iter_mut().zip(inherited.checks) {
+            *target = (
+                name,
+                super::cte::substitute_relation_columns(
+                    predicate, view_name, None, columns, projected, storage, txid, arena,
+                )?,
+            );
+        }
+        let checks = arena
+            .alloc_slice_with(own.checks.len() + lifted.len(), |index| {
+                own.checks
+                    .get(index)
+                    .copied()
+                    .unwrap_or_else(|| lifted[index - own.checks.len()])
+            })
+            .map_err(|_| arena_full())?;
+        let mut defaults = [None; MAX_VIEW_LEVELS * 2];
+        let mut count = 0usize;
+        for level in inherited.defaults {
+            let base_columns = arena
+                .alloc_slice_with(level.base_columns.len(), |_| "")
+                .map_err(|_| arena_full())?;
+            for (index, (target, name)) in
+                base_columns.iter_mut().zip(level.base_columns).enumerate()
+            {
+                if name.is_empty()
+                    || level.columns.default_at(index).is_none_or(|default| {
+                        matches!(default, crate::storage::ColumnDefault::None)
+                    })
+                {
+                    continue;
+                }
+                let Some(position) = columns.iter().position(|column| column == name) else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "view default target is absent from view \"{}\"",
+                        view_name
+                    ));
+                };
+                let base = self.base_column(position);
+                if base.is_empty() {
+                    // The default writes a column this view computes.
+                    let error = sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cannot insert into column \"{}\" of view \"{}\"",
+                        name,
+                        view_name
+                    );
+                    crate::sql::eval::stash_full_diagnostic(crate::sql::eval::Diagnostic {
+                        detail: Some(crate::util::StackStr::from_str(
+                            "View columns that are not columns of their base relation are not updatable.",
+                        )),
+                        hint: None,
+                        objects: crate::sql::eval::ErrorObjects::default(),
+                    });
+                    return Err(error);
+                }
+                *target = base;
+            }
+            if count == defaults.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "views written through nest too deeply"
+                ));
+            }
+            defaults[count] = Some(crate::sql::exec::ViewInsertDefaults {
+                base_columns,
+                ..*level
+            });
+            count += 1;
+        }
+        for level in own.defaults {
+            if count == defaults.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "views written through nest too deeply"
+                ));
+            }
+            defaults[count] = Some(*level);
+            count += 1;
+        }
+        let defaults = arena
+            .alloc_slice_with(count, |index| {
+                defaults[index].expect("collected default level")
             })
             .map_err(|_| arena_full())?;
         Ok(crate::sql::exec::ViewCheck { checks, defaults })
@@ -559,11 +680,41 @@ pub fn resolve_view_for_dml<'a>(
     else {
         return Ok(None);
     };
-    let view = resolve_updatable_view(storage, slot, txid, arena, Some(write))?;
+    let view = resolve_updatable_view(storage, slot, txid, arena, Some(write), None)?;
     if let Some(reason) = view.levels[0].blocked {
         return Err(reason.error(write, view.levels[0].name));
     }
     Ok(Some(view))
+}
+
+/// [`resolve_view_for_dml`] for a `MERGE` whose actions write with the
+/// trigger events in `events`: the levels stop at a view PostgreSQL's
+/// rewriter then targets with the MERGE, one with an `INSTEAD OF` row
+/// trigger for any of those events or with a rewrite rule.
+pub fn resolve_view_for_merge<'a>(
+    storage: &Storage,
+    name: QualName,
+    txid: u32,
+    arena: &'a Arena,
+    events: u8,
+) -> Result<Option<UpdatableView<'a>>, SqlError> {
+    let Some(crate::storage::ResolvedRelation::View(slot)) =
+        storage.resolve_relation(name.schema, name.name, txid)
+    else {
+        return Ok(None);
+    };
+    let write = ViewWrite::MergeUpdate;
+    let view = resolve_updatable_view(storage, slot, txid, arena, Some(write), Some(events))?;
+    if let Some(reason) = view.levels[0].blocked {
+        return Err(reason.error(write, view.levels[0].name));
+    }
+    Ok(Some(view))
+}
+
+/// PostgreSQL's error for writing a view through its conditional `DO
+/// INSTEAD` rules alone: the rest of the write cannot reach the view's base.
+pub fn conditional_instead_view_error(view: &str, write: ViewWrite) -> SqlError {
+    NotAutoUpdatable::ConditionalInsteadRule.error(write, view)
 }
 
 /// The error for writing a built-in view whose query reads a function, as
@@ -582,7 +733,7 @@ pub fn view_is_auto_updatable(
     txid: u32,
     arena: &Arena,
 ) -> Result<bool, SqlError> {
-    let view = resolve_updatable_view(storage, slot, txid, arena, None)?;
+    let view = resolve_updatable_view(storage, slot, txid, arena, None, None)?;
     Ok(view.blocked().is_none())
 }
 
@@ -595,7 +746,7 @@ pub fn view_column_is_updatable(
     txid: u32,
     arena: &Arena,
 ) -> Result<bool, SqlError> {
-    let view = resolve_updatable_view(storage, slot, txid, arena, None)?;
+    let view = resolve_updatable_view(storage, slot, txid, arena, None, None)?;
     Ok(view.blocked().is_none()
         && view.levels[0]
             .base_columns
@@ -624,12 +775,14 @@ fn resolve_updatable_view<'a>(
     txid: u32,
     arena: &'a Arena,
     write: Option<ViewWrite>,
+    merge_events: Option<u8>,
 ) -> Result<UpdatableView<'a>, SqlError> {
     let check_columns = write.is_none_or(ViewWrite::checks_columns);
     let mut raw: [Option<RawLevel<'a>>; MAX_VIEW_LEVELS] = [None; MAX_VIEW_LEVELS];
     let mut count = 0usize;
     let mut view_slot = slot;
     let mut base = None;
+    let mut base_view = None;
     loop {
         if count == MAX_VIEW_LEVELS {
             let view = storage.view(view_slot);
@@ -644,18 +797,30 @@ fn resolve_updatable_view<'a>(
         count += 1;
         match below {
             Below::Blocked => break,
-            Below::View(inner) => {
+            Below::View {
+                slot: inner,
+                columns,
+            } => {
                 if let Some(write) = write
-                    && view_writes_itself(storage, inner, write, txid)
+                    && view_writes_itself(storage, inner, write, merge_events, txid)
                 {
-                    let outer = storage.view(view_slot);
-                    let inner = storage.view(inner);
-                    return Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "writing through view \"{}\" into view \"{}\", which has INSTEAD OF triggers or rewrite rules, is not supported",
-                        outer.name_for(txid).as_str(),
-                        inner.name_for(txid).as_str()
+                    let definition = storage.view(inner);
+                    let schema = arena
+                        .alloc_str(definition.schema_for(txid).as_str())
+                        .map_err(|_| arena_full())?;
+                    let name = arena
+                        .alloc_str(definition.name_for(txid).as_str())
+                        .map_err(|_| arena_full())?;
+                    base = Some((
+                        QualName {
+                            schema: Some(schema),
+                            name,
+                        },
+                        crate::sql::ast::RelationInheritance::Descendants,
+                        columns,
                     ));
+                    base_view = Some(inner);
+                    break;
                 }
                 view_slot = inner;
             }
@@ -690,6 +855,7 @@ fn resolve_updatable_view<'a>(
             base_column_names: &[],
             levels,
             projected: &[],
+            base_view: None,
         });
     };
     // Compose from the innermost level outwards: each level's expressions
@@ -761,12 +927,41 @@ fn resolve_updatable_view<'a>(
         base_column_names,
         levels,
         projected,
+        base_view,
     })
 }
 
 /// Whether PostgreSQL would write the view in `slot` with its own INSTEAD OF
-/// triggers or rewrite rules rather than through its base relation.
-fn view_writes_itself(storage: &Storage, slot: usize, write: ViewWrite, txid: u32) -> bool {
+/// triggers or rewrite rules rather than through its base relation. A
+/// `MERGE` (`merge_events`) stops at any trigger for its actions' events and
+/// at any rule, which refuses it there.
+fn view_writes_itself(
+    storage: &Storage,
+    slot: usize,
+    write: ViewWrite,
+    merge_events: Option<u8>,
+    txid: u32,
+) -> bool {
+    if let Some(events) = merge_events {
+        let target = crate::storage::RuleTarget::View(slot as u16);
+        return storage.triggers_for_view(slot, txid).any(|(_, trigger)| {
+            matches!(trigger.level, crate::sql::ast::TriggerLevel::Row)
+                && matches!(trigger.timing, crate::sql::ast::TriggerTiming::InsteadOf)
+                && [
+                    crate::sql::ast::TriggerEvents::INSERT,
+                    crate::sql::ast::TriggerEvents::UPDATE,
+                    crate::sql::ast::TriggerEvents::DELETE,
+                ]
+                .into_iter()
+                .any(|event| events & event != 0 && trigger.events.contains(event))
+        }) || [
+            crate::storage::RewriteEvent::Insert,
+            crate::storage::RewriteEvent::Update,
+            crate::storage::RewriteEvent::Delete,
+        ]
+        .into_iter()
+        .any(|event| storage.rules_for(target, event, txid).next().is_some());
+    }
     let (event, rule_event) = match write {
         ViewWrite::Insert | ViewWrite::MergeInsert => (
             crate::sql::ast::TriggerEvents::INSERT,
@@ -798,7 +993,10 @@ fn view_writes_itself(storage: &Storage, slot: usize, write: ViewWrite, txid: u3
 
 enum Below<'a> {
     Blocked,
-    View(usize),
+    View {
+        slot: usize,
+        columns: &'a [&'a str],
+    },
     Table {
         name: QualName<'a>,
         inheritance: crate::sql::ast::RelationInheritance,
@@ -936,7 +1134,13 @@ fn resolve_level<'a>(
             for (target, column) in names.iter_mut().zip(inner_columns.names()) {
                 *target = arena.alloc_str(column.as_str()).map_err(|_| arena_full())?;
             }
-            (Below::View(inner), &*names)
+            (
+                Below::View {
+                    slot: inner,
+                    columns: names,
+                },
+                &*names,
+            )
         }
         Some(crate::storage::ResolvedRelation::Table(table)) => {
             let definition = storage.table_def(table, txid);

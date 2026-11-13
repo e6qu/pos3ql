@@ -99,8 +99,9 @@ mod view_write;
 pub(crate) use cte::{CteReader, dml_cte_runs_after, select_relations, set_query_relations};
 pub(crate) use cte::{bind_stored_level_expression, captured_type_oid};
 pub use view_write::{
-    UpdatableView, ViewRewrite, ViewWrite, and_where, function_view_write_error,
-    resolve_view_for_dml, view_column_is_updatable, view_is_auto_updatable,
+    UpdatableView, ViewRewrite, ViewWrite, and_where, conditional_instead_view_error,
+    function_view_write_error, resolve_view_for_dml, resolve_view_for_merge,
+    view_column_is_updatable, view_is_auto_updatable,
 };
 mod dependencies;
 mod procedural_names;
@@ -122,10 +123,10 @@ mod pullup;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
 pub(crate) use cte::{
-    RuleInsertTarget, RuleReturningRelation, RuleTransitionType, attach_rule_source,
-    check_rule_condition_aggregates, check_rule_insert_values, describe_stored_set_query,
-    dml_parameter_scope_query, expand_set_tree, expand_stored_query, expand_stored_query_exec,
-    expand_stored_rule_action_exec, expand_stored_rule_expression_exec,
+    RuleInsertTarget, RuleReturningRelation, RuleReturningSource, RuleTransitionType,
+    attach_rule_source, check_rule_condition_aggregates, check_rule_insert_values,
+    describe_stored_set_query, dml_parameter_scope_query, expand_set_tree, expand_stored_query,
+    expand_stored_query_exec, expand_stored_rule_action_exec, expand_stored_rule_expression_exec,
     expand_stored_statement_exec, restrict_rule_original, rule_original_transition,
     rule_relation_ref, rule_returning_entries, rule_returning_items, rule_select,
     rule_transition_source,
@@ -1420,7 +1421,11 @@ impl RoutineCallContract<'_> {
         if crate::storage::routine_oid(routine) != self.oid
             || routine.argument_count != self.arguments.len()
             || routine.parameter_count != self.parameters.len()
-            || routine.result_column_count != self.result_columns.len()
+            || (routine.result_column_count != self.result_columns.len()
+                // A column definition list gives a `record` function its
+                // result columns.
+                && !(routine.result_column_count == 0
+                    && matches!(self.result, RoutineCallResult::Record { .. })))
         {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -1441,6 +1446,7 @@ impl RoutineCallContract<'_> {
             RoutineCallResult::Table => crate::storage::RoutineKind::TableFunction,
         };
         routine.result_columns[..self.result_columns.len()].copy_from_slice(self.result_columns);
+        routine.result_column_count = self.result_columns.len();
         Ok(())
     }
 }
@@ -3405,6 +3411,8 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     "routine input types do not match its captured signature"
                 )
             })?;
+        self.storage
+            .bind_record_arguments(declared, &input_type_oids[..input_count], self.txid);
         let routine = &*declared;
         for (input_index, argument) in routine.arguments().iter().enumerate() {
             for (call_index, expression) in arguments.iter().enumerate() {
@@ -7674,6 +7682,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
 
     fn compatible_element_oid(&self, inputs: &[(bool, i32)]) -> Option<i32> {
         self.storage.compatible_element_oid(inputs, self.txid)
+    }
+
+    fn select_common_type(&self, inputs: &[i32]) -> Result<i32, crate::storage::CommonTypeFailure> {
+        self.storage.select_common_type(inputs, self.txid)
     }
 
     fn user_type_identity_oid(
@@ -15510,6 +15522,10 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
         self.0.domain_base_type(type_oid)
     }
 
+    fn select_common_type(&self, inputs: &[i32]) -> Result<i32, crate::storage::CommonTypeFailure> {
+        self.0.select_common_type(inputs)
+    }
+
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         let entry = self.0.find_column(qualifier, name)?;
         Ok(self.0.output_type(entry))
@@ -15728,6 +15744,10 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
 
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
         self.storage.domain_base_type_for_oid(type_oid, self.txid)
+    }
+
+    fn select_common_type(&self, inputs: &[i32]) -> Result<i32, crate::storage::CommonTypeFailure> {
+        self.storage.select_common_type(inputs, self.txid)
     }
 
     fn named_type_oid(&self, type_name: &str) -> Option<i32> {

@@ -612,36 +612,27 @@ SQL/JSON result types) are reported when the statement would run. In a
 `SELECT`, an unknown relation, a modifier's unknown type and an output column
 written before the failing modifier are reported first, as PostgreSQL's
 analysis order finds them; in other statements the modifier error comes first.
-Before a session first runs PL/pgSQL, PostgreSQL does not know the
-`plpgsql.*` parameters (`SHOW plpgsql.variable_conflict` fails with `42704`,
-`SET` stores a placeholder that loading converts and `pg_settings` lists only
-placeholders); pos3ql knows them from startup. PL/pgSQL's extra checks
-(`shadowed_variables`, `too_many_rows`, `strict_multi_assignment` in
-`plpgsql.extra_warnings` and `plpgsql.extra_errors`) fail with `0A000`.
 Writes to catalog views other than `pg_settings`, and to system catalogs,
-fail with `42P01`. A write through a view on another view that writes the
-lower view with its own `INSTEAD OF` trigger or rewrite rule fails with
-`0A000` (`writing through view "v2" into view "v1", which has INSTEAD OF
-triggers or rewrite rules, is not supported`); PostgreSQL rewrites onto the
-lower view and fires its trigger or rule.
-A constant assigned to a PL/pgSQL variable (`v := 'abcdefgh'` for
-`varchar(5)`) that fails the variable's modifier reports `LINE`/`QUERY`
-instead of PostgreSQL's `PL/pgSQL assignment` context; an immutable call
-(`upper('abcdefgh')`) misses that context for variables and `NEW` fields; and
-`NEW.n := 'zz'` for an `integer` field lacks PostgreSQL's `LINE`/`QUERY`.
-`ROW(...)::t` for a table's row type fails
-with `42846`, and `COALESCE` of two different tables' rows is accepted where
-PostgreSQL fails with `42846` (`COALESCE could not convert type b to a`).
-A field selection error (`(1).x`) has no cursor position.
-A `RETURNING` list routed through a rule's `RETURNING` list reads the rule's
-relation only: `UPDATE v ... FROM o RETURNING o.label`, `*` beside `FROM` or
-`USING` sources, and subqueries in that list fail with `0A000` where
-PostgreSQL evaluates them. A missing field of a PL/pgSQL record variable read in a `DO`
-body (`RAISE NOTICE '%', r.nope`) carries a position where PostgreSQL names
-the expression in `CONTEXT`. Selecting a field of a named composite cast to
-`record` (`(ROW(1, 2)::t::record).id`) fails as an unknown field. Reading a
-field of a NULL `record` parameter names the expression in `CONTEXT`, which
-PostgreSQL omits because it raises the error while evaluating, not planning.
+fail with `42P01`.
+A subquery reading `old` or `new` in the `RETURNING` list of a write through
+a view with an `INSTEAD OF` trigger or a rule (`UPDATE v ... RETURNING
+(SELECT old.label)`) fails with `42P01`: analysis of the view write resolves
+the subquery's outer references without the list's `old` and `new` names.
+Column-not-found errors carry no `Perhaps you meant` hint.
+An error inside a statement or expression of a PL/pgSQL body is positioned
+in it (`QUERY` and `LINE`), except at a name the lexer folded (`OLD.n`,
+`NOSUCH`) or a `$n` beyond the routine's parameters, which report no
+position: the statement's parsed names keep no map to the text. A rule
+created inside one (`CREATE RULE ... WHERE OLD.nosuch > 0`) also words its
+error `column "nosuch" does not exist` where PostgreSQL says `column
+old.nosuch does not exist`. A `$n` beyond the routine's parameters in a
+statement that reads no rows (`PERFORM $1 FROM empty_table` in a `DO`
+body) is accepted: it fails only when evaluated, where PostgreSQL's
+analysis rejects it.
+A field of an anonymous row passed to a PL/pgSQL `record` parameter that the
+row lacks (`f((1, 'y'))` reading `r.a`) fails with `42P01` (`missing
+FROM-clause entry for table "r"`) where PostgreSQL reports `record "r" has no
+field "a"`.
 `PREPARE p(t1) AS UPDATE t SET c = $1` with a parameter type the column
 cannot take is accepted until it runs, and the error it then reports (also
 from a cascaded `ON UPDATE CASCADE` between two composite types) has no

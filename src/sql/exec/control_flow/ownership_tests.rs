@@ -299,7 +299,7 @@ fn parse_owned_program<'a>(
     pool: &std::sync::Arc<LeasePool>,
     kind: PlpgsqlProgramKind,
 ) -> Result<(ParsedTriggerProgram<'a>, CompiledProgram<'a>), SqlError> {
-    ProgramSource::capture(text, kind, pool)?.parse(parsing, None)
+    ProgramSource::capture(text, kind, 0, pool)?.parse(parsing, None)
 }
 
 #[test]
@@ -612,6 +612,7 @@ fn active_numeric_positions_and_values_rebind_after_syntax_storage_is_replaced()
     let source = ProgramSource::capture(
         original.alloc_str(SOURCE).unwrap(),
         PlpgsqlProgramKind::Anonymous,
+        0,
         &pool,
     )
     .unwrap();
@@ -825,6 +826,7 @@ fn row_loop_resources_release_once_on_pop_and_owner_drop() {
                     TriggerForRows {
                         values: &[Datum::Text("owned row")],
                         empty: Datum::Null,
+                        width: 1,
                     },
                 )
                 .unwrap();
@@ -949,7 +951,7 @@ fn positions_resolve_the_same_source_after_original_parse_storage_is_released() 
     let replacement_parsing = Arena::new(&mut budget, "replacement syntax", 1 << 14).unwrap();
     let source = crate::mem::guard::forbid_alloc(|| {
         let text = parsing.alloc_str(SOURCE).unwrap();
-        ProgramSource::capture(text, PlpgsqlProgramKind::Anonymous, &pool).unwrap()
+        ProgramSource::capture(text, PlpgsqlProgramKind::Anonymous, 0, &pool).unwrap()
     });
     parsing.reset();
     let saved = crate::mem::guard::forbid_alloc(|| {
@@ -975,6 +977,7 @@ fn positions_resolve_the_same_source_after_original_parse_storage_is_released() 
         let replaced = ProgramSource::capture(
             "BEGIN WHILE false LOOP NULL; END LOOP; END",
             PlpgsqlProgramKind::Anonymous,
+            0,
             &pool,
         )
         .unwrap();
@@ -1021,6 +1024,7 @@ fn source_owners_outlive_input_and_syntax_arenas_but_reject_replacement_images()
     let source = ProgramSource::capture(
         input.alloc_str(SOURCE).unwrap(),
         PlpgsqlProgramKind::Anonymous,
+        0,
         &pool,
     )
     .unwrap();
@@ -1039,9 +1043,10 @@ fn source_owners_outlive_input_and_syntax_arenas_but_reject_replacement_images()
     crate::mem::guard::forbid_alloc(|| {
         input.alloc_slice_with(1024, |_| 0xffu8).unwrap();
         drop(input);
-        let other = ProgramSource::capture(SOURCE, PlpgsqlProgramKind::Anonymous, &pool).unwrap();
+        let other =
+            ProgramSource::capture(SOURCE, PlpgsqlProgramKind::Anonymous, 0, &pool).unwrap();
         let other_kind =
-            ProgramSource::capture(SOURCE, PlpgsqlProgramKind::Trigger, &pool).unwrap();
+            ProgramSource::capture(SOURCE, PlpgsqlProgramKind::Trigger, 0, &pool).unwrap();
         for replacement in [&other, &other_kind] {
             assert_eq!(
                 retained.require_source(replacement).unwrap_err().sqlstate,
@@ -1089,6 +1094,7 @@ fn source_capture_and_parse_failures_preserve_live_frames_and_return_capacity() 
         let error = ProgramSource::capture(
             core::str::from_utf8(&large).unwrap(),
             PlpgsqlProgramKind::Anonymous,
+            0,
             &small,
         )
         .err()
@@ -1099,6 +1105,7 @@ fn source_capture_and_parse_failures_preserve_live_frames_and_return_capacity() 
         let source = ProgramSource::capture(
             "BEGIN LOOP NULL; END LOOP; END",
             PlpgsqlProgramKind::Anonymous,
+            0,
             &pool,
         )
         .unwrap();
@@ -1111,9 +1118,10 @@ fn source_capture_and_parse_failures_preserve_live_frames_and_return_capacity() 
         }
         let free = pool.lease::<u8>(4096).err().unwrap().free_bytes;
         let held = pool.lease::<u8>(64).unwrap();
-        let error = ProgramSource::capture("BEGIN NULL; END", PlpgsqlProgramKind::Anonymous, &pool)
-            .err()
-            .unwrap();
+        let error =
+            ProgramSource::capture("BEGIN NULL; END", PlpgsqlProgramKind::Anonymous, 0, &pool)
+                .err()
+                .unwrap();
         assert_eq!(error.sqlstate, "54000");
         assert!(error.message.as_str().contains("0 available leases"));
         drop(held);
@@ -1125,7 +1133,7 @@ fn source_capture_and_parse_failures_preserve_live_frames_and_return_capacity() 
         assert_eq!(retained.slots[0].as_ref().unwrap().next, 1);
         for text in ["BEGIN", "", "DECLARE", "DECLARE value integer"] {
             let invalid =
-                ProgramSource::capture(text, PlpgsqlProgramKind::Anonymous, &pool).unwrap();
+                ProgramSource::capture(text, PlpgsqlProgramKind::Anonymous, 0, &pool).unwrap();
             assert_eq!(
                 invalid.parse(&parsing, None).err().unwrap().sqlstate,
                 "42601"
@@ -1474,8 +1482,13 @@ fn constant_validation_uses_the_innermost_handler_or_counter_binding() {
                         variable_conflict: parsed.variable_conflict,
                         print_strict_params: parsed.print_strict_params,
                     };
-                    let result =
-                        validate_plpgsql_variable_uses(&program, false, &|_| None, scratch);
+                    let result = validate_plpgsql_variable_uses(
+                        &program,
+                        parsed.locals,
+                        false,
+                        &|_| None,
+                        scratch,
+                    );
                     match expected {
                         Some(state) => assert_eq!(result.unwrap_err().sqlstate, state, "{source}"),
                         None => result.unwrap(),

@@ -4055,7 +4055,9 @@ impl Engine {
                         guc.transaction_reset_owned(name).unwrap_or(value);
                     sources[setting_count] = txn.setting_source(name).unwrap_or("default");
                     setting_count += 1;
-                } else if let Some(value) = guc.get_owned(name) {
+                } else if !guc.is_placeholder(name)
+                    && let Some(value) = guc.get_owned(name)
+                {
                     names[setting_count] = name;
                     values[setting_count] = value;
                     reset_values[setting_count] = guc.reset_owned(name).unwrap_or(value);
@@ -10587,7 +10589,9 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        if let Err(error) = guc::SettingAuthorization::set(&self.storage, name, txn.txid) {
+        if let Err(error) =
+            guc::SettingAuthorization::set_in_session(&self.storage, guc, name, txn.txid)
+        {
             return Ok(Err(error));
         }
         if local && !txn.is_explicit() {
@@ -10618,6 +10622,13 @@ impl Engine {
             guc::publish_active_setting(guc, name);
             responder.command_complete("SET")?;
             return Ok(Ok(()));
+        }
+        if syntax == ast::SettingSyntax::DecodedList && !guc.accepts_list(name) {
+            return Ok(Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "SET {} takes only one argument",
+                name
+            )));
         }
         let characteristics = match syntax {
             ast::SettingSyntax::DecodedValue => guc.current_transaction_value(name, Some(value)),
@@ -10654,7 +10665,7 @@ impl Engine {
             value
         };
         let changed = match syntax {
-            ast::SettingSyntax::DecodedValue => {
+            ast::SettingSyntax::DecodedValue | ast::SettingSyntax::DecodedList => {
                 guc.set_config(name, Some(value), local).map(|_| ())
             }
             ast::SettingSyntax::Default => guc.set_config(name, None, local).map(|_| ()),
@@ -10717,7 +10728,8 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if let Some(name) = name
-            && let Err(error) = guc::SettingAuthorization::set(&self.storage, name, txn.txid)
+            && let Err(error) =
+                guc::SettingAuthorization::set_in_session(&self.storage, guc, name, txn.txid)
         {
             return Ok(Err(error));
         }
@@ -15280,7 +15292,8 @@ impl Engine {
                         )?;
                         return Ok(false);
                     };
-                    let name = match arena.alloc_str(parameter.name.as_str()) {
+                    let name = crate::storage::output_column_name(parameter.name, count);
+                    let name = match arena.alloc_str(name.as_str()) {
                         Ok(name) => name,
                         Err(_) => {
                             responder.error(
@@ -15844,6 +15857,47 @@ impl Engine {
         progress: Option<&mut exec::RowProgress>,
         connection_id: i32,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        Self::execute_data_modification_within(
+            storage,
+            scratch,
+            arena,
+            statement,
+            authorization,
+            txn,
+            params,
+            guc,
+            cursors,
+            row_buffers,
+            responder,
+            capture,
+            progress,
+            connection_id,
+            None,
+        )
+    }
+
+    /// [`Self::execute_data_modification`] of a statement a write through
+    /// views rewrote onto a view that writes itself: `inherited` holds the
+    /// check options and defaults of the views written through, over the
+    /// target view's columns.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn execute_data_modification_within<'a, 'capture>(
+        storage: &mut Storage,
+        scratch: &mut exec::DmlScratch,
+        arena: &'a Arena,
+        statement: &'a Stmt<'a>,
+        authorization: exec::DmlAuthorization,
+        txn: &mut TxnState,
+        params: &[Datum<'a>],
+        guc: &GucState,
+        cursors: &mut cursor::CursorPool,
+        row_buffers: &mut crate::storage::RowCursorBuffers,
+        responder: &mut Responder,
+        capture: Option<&'capture mut ReturningCapture<'capture>>,
+        progress: Option<&mut exec::RowProgress>,
+        connection_id: i32,
+        inherited: Option<exec::ViewCheck<'a>>,
+    ) -> Result<Result<(), SqlError>, WireFull> {
         if let Err(error) =
             query::validate_dml_assignment_casts(statement, storage, txn.txid, arena, None)
         {
@@ -15892,6 +15946,8 @@ impl Engine {
                     responder,
                     capture,
                     progress,
+                    connection_id,
+                    inherited,
                 );
             }
         };
@@ -15917,6 +15973,8 @@ impl Engine {
                     responder,
                     capture,
                     progress,
+                    connection_id,
+                    inherited,
                 );
             }
         };
@@ -15979,6 +16037,8 @@ impl Engine {
                 responder,
                 capture,
                 progress,
+                connection_id,
+                inherited,
             );
         }
         let rule_owner = match u16::try_from(storage.object_owner(target.access_object(), txn.txid))
@@ -16130,6 +16190,18 @@ impl Engine {
                 (columns, types)
             }
             crate::storage::RuleTarget::View(slot) => {
+                if matches!(statement, Stmt::Insert(_)) {
+                    rule_defaults = match exec::view_rule_defaults(
+                        storage,
+                        usize::from(slot),
+                        inherited.map_or(&[], |inherited| inherited.defaults),
+                        txn.txid,
+                        arena,
+                    ) {
+                        Ok(defaults) => defaults,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                }
                 let mut descriptions = [ColDesc::new("", 0, 0); MAX_PROJ];
                 let count = match catalog::describe_view(
                     &storage.view(usize::from(slot)),
@@ -16190,6 +16262,8 @@ impl Engine {
             }
         };
         let transition = match query::rule_transition_source(
+            storage,
+            txn.txid,
             statement,
             columns,
             transition_types,
@@ -16246,6 +16320,42 @@ impl Engine {
                         "You need an unconditional ON {} DO INSTEAD rule with a RETURNING clause.",
                         command
                     ),
+                )));
+            }
+        }
+        // A view written only through conditional INSTEAD rules leaves the
+        // rest of the write to its base, which PostgreSQL refuses.
+        if let crate::storage::RuleTarget::View(view) = target
+            && !suppress_original
+            && storage
+                .firing_rules_for(target, event, guc.session_replication_role(), txn.txid)
+                .any(|(_, rule)| {
+                    let definition = rule.definition_for(txn.txid);
+                    definition.mode == crate::storage::RewriteMode::Instead
+                        && definition.condition.is_some()
+                })
+        {
+            let trigger_event = match event {
+                crate::storage::RewriteEvent::Insert => ast::TriggerEvents::INSERT,
+                crate::storage::RewriteEvent::Update => ast::TriggerEvents::UPDATE,
+                _ => ast::TriggerEvents::DELETE,
+            };
+            if !storage
+                .triggers_for_view(usize::from(view), txn.txid)
+                .any(|(_, trigger)| {
+                    matches!(trigger.level, ast::TriggerLevel::Row)
+                        && matches!(trigger.timing, ast::TriggerTiming::InsteadOf)
+                        && trigger.events.contains(trigger_event)
+                })
+            {
+                let write = match event {
+                    crate::storage::RewriteEvent::Insert => query::ViewWrite::Insert,
+                    crate::storage::RewriteEvent::Update => query::ViewWrite::Update,
+                    _ => query::ViewWrite::Delete,
+                };
+                return Ok(Err(query::conditional_instead_view_error(
+                    relation.name,
+                    write,
                 )));
             }
         }
@@ -16382,6 +16492,8 @@ impl Engine {
                             responder,
                             capture.take(),
                             progress.as_deref_mut(),
+                            connection_id,
+                            inherited,
                         )
                     })?;
                     if let Err(error) = outcome {
@@ -16561,7 +16673,13 @@ impl Engine {
                     };
                     let action = if use_returning {
                         match Self::rule_action_with_returning(
-                            storage, statement, columns, action, txn.txid, arena,
+                            storage,
+                            statement,
+                            columns,
+                            transition.sources,
+                            action,
+                            txn.txid,
+                            arena,
                         ) {
                             Ok(action) => action,
                             Err(error) => return Ok(Err(error)),
@@ -16657,6 +16775,8 @@ impl Engine {
                             responder,
                             capture.take(),
                             progress.as_deref_mut(),
+                            connection_id,
+                            inherited,
                         )
                     })?;
                     if let Err(error) = outcome {
@@ -16702,26 +16822,21 @@ impl Engine {
         storage: &Storage,
         statement: &'a Stmt<'a>,
         columns: &'a [&'a str],
+        sources: &'a [query::RuleReturningSource<'a>],
         action: &'a Stmt<'a>,
         txid: u32,
         arena: &'a Arena,
     ) -> Result<&'a Stmt<'a>, SqlError> {
-        let (outer, table, alias, other_sources) = match statement {
-            Stmt::Insert(insert) => (insert.returning, insert.table, None, false),
-            Stmt::Update(update) => (
-                update.returning,
-                update.table,
-                update.alias,
-                update.from.is_some(),
-            ),
-            Stmt::Delete(delete) => (
-                delete.returning,
-                delete.table,
-                delete.alias,
-                delete.using.is_some(),
-            ),
+        let (outer, table, alias, from) = match statement {
+            Stmt::Insert(insert) => (insert.returning, insert.table, None, None),
+            Stmt::Update(update) => (update.returning, update.table, update.alias, update.from),
+            Stmt::Delete(delete) => (delete.returning, delete.table, delete.alias, delete.using),
             _ => unreachable!("rewrite input is data-modifying"),
         };
+        let other_sources = from.is_some();
+        // The list reads the sources when each FROM or USING item is one.
+        let items = from.map_or(0, |from| 1 + from.joins.len());
+        let sources = if sources.len() == items { sources } else { &[] };
         let entries = query::rule_returning_entries(action, storage, txid, arena)?;
         let items = query::rule_returning_items(
             outer,
@@ -16730,7 +16845,9 @@ impl Engine {
                 schema: alias.is_none().then_some(table.schema).flatten(),
                 columns,
                 other_sources,
+                sources,
             },
+            action,
             entries,
             storage,
             txid,
@@ -16921,6 +17038,8 @@ impl Engine {
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
         progress: Option<&mut exec::RowProgress>,
+        connection_id: i32,
+        inherited: Option<exec::ViewCheck<'a>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if let Err(error) =
             query::validate_dml_assignment_casts(statement, storage, txn.txid, arena, None)
@@ -16970,6 +17089,8 @@ impl Engine {
                 responder,
                 capture,
                 progress,
+                connection_id,
+                inherited,
             );
         };
         let event = match statement {
@@ -16999,6 +17120,8 @@ impl Engine {
                 responder,
                 capture,
                 progress,
+                connection_id,
+                inherited,
             );
         }
         // A resumed attempt continues rows whose statement triggers ran.
@@ -17032,6 +17155,8 @@ impl Engine {
                 responder,
                 capture,
                 progress,
+                connection_id,
+                inherited,
             )
         })?;
         let affected = responder.take_affected_rows().unwrap_or(0);
@@ -17116,7 +17241,7 @@ impl Engine {
     fn execute_data_modification_inner<'a, 'capture>(
         storage: &mut Storage,
         scratch: &mut exec::DmlScratch,
-        arena: &Arena,
+        arena: &'a Arena,
         statement: &'a Stmt<'a>,
         authorization: exec::DmlAuthorization,
         txn: &mut TxnState,
@@ -17127,6 +17252,8 @@ impl Engine {
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
         progress: Option<&mut exec::RowProgress>,
+        connection_id: i32,
+        inherited: Option<exec::ViewCheck<'a>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let authorization = match match statement {
             Stmt::Insert(insert) => storage
@@ -17207,6 +17334,7 @@ impl Engine {
                         responder,
                         capture,
                         progress,
+                        inherited,
                     );
                 }
                 let (insert, view_check, authorization) = match query::resolve_view_for_dml(
@@ -17244,10 +17372,43 @@ impl Engine {
                             Ok(authorization) => authorization,
                             Err(error) => return Ok(Err(error)),
                         };
-                        match view.view_check(storage, txn.txid, arena) {
-                            Ok(check) => (rewritten, Some(check), authorization),
+                        let check = match view.view_check_within(
+                            insert.table.name,
+                            inherited,
+                            storage,
+                            txn.txid,
+                            arena,
+                        ) {
+                            Ok(check) => check,
                             Err(error) => return Ok(Err(error)),
+                        };
+                        if view.base_view.is_some() {
+                            // The levels write into a view with its own
+                            // triggers or rules, as PostgreSQL's rewriter
+                            // then rewrites the write on that view.
+                            let rewritten = match arena.alloc(Stmt::Insert(*rewritten)) {
+                                Ok(rewritten) => &*rewritten,
+                                Err(_) => return Ok(Err(query::arena_full_pub())),
+                            };
+                            return Self::execute_data_modification_within(
+                                storage,
+                                scratch,
+                                arena,
+                                rewritten,
+                                authorization,
+                                txn,
+                                params,
+                                guc,
+                                cursors,
+                                row_buffers,
+                                responder,
+                                capture,
+                                progress,
+                                connection_id,
+                                Some(check),
+                            );
                         }
+                        (rewritten, Some(check), authorization)
                     }
                     Ok(None) => (insert, None, authorization),
                     Err(error) => return Ok(Err(error)),
@@ -17294,6 +17455,7 @@ impl Engine {
                         responder,
                         capture,
                         progress,
+                        inherited,
                     );
                 }
                 let (update, view_check, authorization) = match query::resolve_view_for_dml(
@@ -17331,10 +17493,43 @@ impl Engine {
                             Ok(authorization) => authorization,
                             Err(error) => return Ok(Err(error)),
                         };
-                        match view.view_check(storage, txn.txid, arena) {
-                            Ok(check) => (rewritten, Some(check), authorization),
+                        let check = match view.view_check_within(
+                            update.table.name,
+                            inherited,
+                            storage,
+                            txn.txid,
+                            arena,
+                        ) {
+                            Ok(check) => check,
                             Err(error) => return Ok(Err(error)),
+                        };
+                        if view.base_view.is_some() {
+                            // The levels write into a view with its own
+                            // triggers or rules, as PostgreSQL's rewriter
+                            // then rewrites the write on that view.
+                            let rewritten = match arena.alloc(Stmt::Update(*rewritten)) {
+                                Ok(rewritten) => &*rewritten,
+                                Err(_) => return Ok(Err(query::arena_full_pub())),
+                            };
+                            return Self::execute_data_modification_within(
+                                storage,
+                                scratch,
+                                arena,
+                                rewritten,
+                                authorization,
+                                txn,
+                                params,
+                                guc,
+                                cursors,
+                                row_buffers,
+                                responder,
+                                capture,
+                                progress,
+                                connection_id,
+                                Some(check),
+                            );
                         }
+                        (rewritten, Some(check), authorization)
                     }
                     Ok(None) => (update, None, authorization),
                     Err(error) => return Ok(Err(error)),
@@ -17379,6 +17574,7 @@ impl Engine {
                         responder,
                         capture,
                         progress,
+                        inherited,
                     );
                 }
                 let (delete, authorization) = match query::resolve_view_for_dml(
@@ -17403,7 +17599,7 @@ impl Engine {
                         let Stmt::Delete(rewritten) = rewrite.statement else {
                             unreachable!("delete rewrite keeps its statement kind")
                         };
-                        match exec::require_nested_view_privileges(
+                        let authorization = match exec::require_nested_view_privileges(
                             storage,
                             &view,
                             &rewrite.written,
@@ -17413,9 +17609,34 @@ impl Engine {
                             txn.txid,
                             arena,
                         ) {
-                            Ok(authorization) => (rewritten, authorization),
+                            Ok(authorization) => authorization,
                             Err(error) => return Ok(Err(error)),
+                        };
+                        if view.base_view.is_some() {
+                            // A DELETE has no check options or defaults.
+                            let rewritten = match arena.alloc(Stmt::Delete(*rewritten)) {
+                                Ok(rewritten) => &*rewritten,
+                                Err(_) => return Ok(Err(query::arena_full_pub())),
+                            };
+                            return Self::execute_data_modification_within(
+                                storage,
+                                scratch,
+                                arena,
+                                rewritten,
+                                authorization,
+                                txn,
+                                params,
+                                guc,
+                                cursors,
+                                row_buffers,
+                                responder,
+                                capture,
+                                progress,
+                                connection_id,
+                                None,
+                            );
                         }
+                        (rewritten, authorization)
                     }
                     Ok(None) => (delete, authorization),
                     Err(error) => return Ok(Err(error)),
@@ -19020,6 +19241,7 @@ impl Engine {
                 guc,
                 arena,
                 check_body,
+                responder,
             ))
         })();
         let role = eval::funcs::system::current_user_owned();
@@ -19859,6 +20081,8 @@ impl Engine {
             };
         }
         if routine.language == crate::storage::RoutineLanguage::PlPgSql {
+            let txid = txn.txid;
+            guc.load_plpgsql(responder, &|name| self.may_set_parameter(name, txid))?;
             let (instance, conflict) = match self.plpgsql_instance_owner(
                 routine,
                 pending.input_collation,
@@ -20573,6 +20797,8 @@ impl Engine {
             }
             let mut run = || {
                 if routine.language == crate::storage::RoutineLanguage::PlPgSql {
+                    let txid = txn.txid;
+                    guc.load_plpgsql(responder, &|name| self.may_set_parameter(name, txid))?;
                     let mut output_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
                     let (instance, conflict) = match self.plpgsql_instance_owner(
                         routine,
@@ -20652,8 +20878,10 @@ impl Engine {
                                     )));
                                 }
                             };
+                            let name =
+                                crate::storage::output_column_name(parameter.name, output_index);
                             description[output_index] = ColDesc::new(
-                                match arena.alloc_str(parameter.name.as_str()) {
+                                match arena.alloc_str(name.as_str()) {
                                     Ok(name) => name,
                                     Err(_) => return Ok(Err(eval::arena_full())),
                                 },
@@ -20947,8 +21175,10 @@ impl Engine {
                                         )));
                                     }
                                 };
+                                let name =
+                                    crate::storage::output_column_name(parameter.name, index);
                                 description[index] = ColDesc::new(
-                                    match arena.alloc_str(parameter.name.as_str()) {
+                                    match arena.alloc_str(name.as_str()) {
                                         Ok(name) => name,
                                         Err(_) => return Ok(Err(eval::arena_full())),
                                     },
@@ -21304,7 +21534,8 @@ impl Engine {
             Stmt::CreateRoutine(routine) => routine.language == ast::RoutineLanguage::PlPgSql,
             _ => false,
         } {
-            guc.load_plpgsql(responder)?;
+            let txid = txn.txid;
+            guc.load_plpgsql(responder, &|name| self.may_set_parameter(name, txid))?;
         }
         let result = self.execute_stmt_loaded(
             statement,
@@ -21319,9 +21550,16 @@ impl Engine {
             timeout_entry,
         );
         if guc::take_plpgsql_use() {
-            guc.load_plpgsql(responder)?;
+            let txid = txn.txid;
+            guc.load_plpgsql(responder, &|name| self.may_set_parameter(name, txid))?;
         }
         result
+    }
+
+    /// Whether the current role may set the superuser-only parameter `name`.
+    fn may_set_parameter(&self, name: &str, txid: u32) -> bool {
+        self.storage
+            .current_role_has_parameter_privilege(name, ast::ParameterPrivileges::SET, txid)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -27428,7 +27666,7 @@ impl Engine {
         for &name in SETTING_NAMES {
             if let Some(value) = self
                 .fixed_setting_for(name, txn)
-                .or_else(|| guc.get_owned(name))
+                .or_else(|| (!guc.is_placeholder(name)).then(|| guc.get_owned(name))?)
             {
                 emit(name, value.as_str())?;
             }

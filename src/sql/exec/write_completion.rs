@@ -270,6 +270,9 @@ pub(super) enum NestedWriteOutput {
         /// A dynamic statement's `USING` values, which a `STRICT` failure
         /// lists after the write resumes.
         arguments: local_values::SavedValues,
+        /// The columns of the row `values` came from, which an `INTO`
+        /// assignment's field-count check compares after the write resumes.
+        source_width: usize,
     },
     NoResult,
 }
@@ -290,6 +293,7 @@ impl PendingNestedWrite {
     pub(super) fn save_output(
         &mut self,
         values: Option<&[Datum<'_>]>,
+        source_width: usize,
         rows: u64,
         arguments: &[Datum<'_>],
         pool: &std::sync::Arc<LeasePool>,
@@ -310,6 +314,7 @@ impl PendingNestedWrite {
                     values: saved,
                     rows,
                     arguments: saved_arguments,
+                    source_width,
                 }
             }
             None => NestedWriteOutput::NoResult,
@@ -662,7 +667,7 @@ fn run_selected_firing<'run>(
         return Ok(None);
     }
     let mut firing = prepare_trigger_firing(
-        &context,
+        &mut context,
         &trigger,
         TriggerRelationIdentity {
             target: crate::storage::TriggerTarget::Table(selected.table),

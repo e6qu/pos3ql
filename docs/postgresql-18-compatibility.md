@@ -287,6 +287,16 @@ Syntax and errors:
   and `USER` leaves them alone. A view's
   `INSTEAD OF` trigger that does not fire leaves the row unwritten without an
   error.
+- Writing through an automatically updatable view into a view below it that
+  has its own `INSTEAD OF` trigger or rewrite rule for the write writes that
+  view, as PostgreSQL's rewriter does: with `v2` selecting `a AS x, b * 2 AS
+  b2` from trigger view `v1`, `INSERT INTO v2 (x) VALUES (3) RETURNING *`
+  fires `v1`'s trigger with `(3, NULL)` and returns the row it returns, and
+  the check options of the views above apply to that row. Their column
+  defaults reach `v1`'s trigger and rules' `NEW`. A conditional `DO INSTEAD`
+  rule without an unconditional one or a trigger fails with `55000` (`Views
+  with conditional DO INSTEAD rules are not automatically updatable.`), and
+  `MERGE` into a relation with rules fails with `0A000`.
 - A trigger's `NEW` and `OLD` have the table's row type in every firing. One
   without a row (`OLD` in an `INSERT` trigger, `NEW` in a `DELETE` trigger,
   both in a statement trigger) is NULL, and so are its fields; a field the
@@ -333,6 +343,22 @@ Syntax and errors:
   initialized in order each time it is entered, outside its own exception
   handlers. `END outer` and `END LOOP outer` must repeat the label (`end label
   "b" differs from block's label "a"`).
+- A routine's parameters are PL/pgSQL variables under their names and as
+  `$1`, `$2`, ... in declaration order, output parameters included, so
+  `$1` sees an assignment made through the parameter's name and `$2 := 'x'`
+  sets an unnamed `OUT` parameter. `a ALIAS FOR $1` (or for a parameter's
+  name, an earlier variable, `label.x`, or a trigger's `NEW` and `OLD`)
+  declares another name for the same variable: `a := a + 1` changes `$1`.
+  An alias of a name that is not declared fails when the routine is created
+  (`variable "$2" does not exist`).
+- `FOR a, b IN SELECT ...` (or `EXECUTE`, or a data change with
+  `RETURNING`) assigns each row's columns to the listed scalar variables in
+  order: missing columns are NULL, extra ones ignored, and a loop without
+  rows leaves them all NULL. A single scalar variable takes the first column.
+  `strict_multi_assignment` reports a count mismatch. Integer and cursor
+  loops take one variable (`integer FOR loop must have only one target
+  variable`), and a record in the list fails (`"r" is not a scalar
+  variable`).
 - A name in a PL/pgSQL statement that is both a variable and a column is
   ambiguous, as in PostgreSQL: with parameter `a`, `UPDATE t SET b = 1/(a-15)`
   fails with `42702` (`column reference "a" is ambiguous`, detail `It could
@@ -342,18 +368,35 @@ Syntax and errors:
   setting `plpgsql.variable_conflict = use_column`, reads the column instead;
   `use_variable` reads the variable everywhere, so with variable `a = 2`,
   `SELECT sum(a) FROM t` adds 2 per row and `GROUP BY a` makes one group.
-  PL/pgSQL's settings (`plpgsql.variable_conflict`,
-  `plpgsql.print_strict_params`, `plpgsql.check_asserts`,
-  `plpgsql.extra_warnings`, `plpgsql.extra_errors`) exist from startup.
 - PL/pgSQL "loads" in a session the first time the session runs or creates
-  PL/pgSQL code, as PostgreSQL loads its library: placeholders named
-  `plpgsql.anything` (for example from `SET plpgsql.foo = 'x'`) are then
-  removed with `WARNING: invalid configuration parameter name "plpgsql.foo",
-  removing it`, and a later `SET plpgsql.bar = 'y'` fails with `42602`
-  (`"plpgsql" is a reserved prefix.`). `plpgsql.check_asserts = off` skips
-  `ASSERT` statements. PL/pgSQL's extra checks are not implemented:
-  `plpgsql.extra_warnings` and `plpgsql.extra_errors` accept only `none`, and
-  any other valid value fails with `0A000`.
+  PL/pgSQL code, as PostgreSQL loads its library. Until then its settings
+  (`plpgsql.variable_conflict`, `plpgsql.print_strict_params`,
+  `plpgsql.check_asserts`, `plpgsql.extra_warnings`, `plpgsql.extra_errors`)
+  are unknown: `SHOW plpgsql.variable_conflict` fails with `42704`, `SET`
+  stores any value as a placeholder and `pg_settings` lists none of them.
+  Loading turns each placeholder into the setting at every transaction
+  level; a value the setting rejects (`SET plpgsql.variable_conflict =
+  'bogus'`), or that the role could not set, is dropped with PostgreSQL's
+  warning (`invalid value for parameter ...` with its hint). Other
+  placeholders named `plpgsql.anything` are then removed with `WARNING:
+  invalid configuration parameter name "plpgsql.foo", removing it`, and a
+  later `SET plpgsql.bar = 'y'` fails with `42602` (`"plpgsql" is a reserved
+  prefix.`). A rejected value warns once for the session's own `SET` and
+  once for each transaction level (`SAVEPOINT`) that assigned it, even to the
+  same value. `ALTER SYSTEM` changes no session: before loading it stores any
+  `plpgsql.*` value unchecked, and `ALTER SYSTEM RESET plpgsql.foo` (like
+  `ALTER ROLE ... RESET`) removes a setting under the reserved prefix.
+  `plpgsql.check_asserts = off` skips `ASSERT` statements.
+- PL/pgSQL's extra checks follow `plpgsql.extra_warnings` (a `WARNING`) and
+  `plpgsql.extra_errors` (an `ERROR`, which wins), each `none`, `all` or a
+  list such as `too_many_rows, strict_multi_assignment`.
+  `shadowed_variables` reports a declaration that hides a parameter, `found`,
+  a trigger variable, a loop variable or an enclosing block's variable, when
+  `CREATE FUNCTION` or `CREATE PROCEDURE` checks the body. `too_many_rows`
+  reports a `SELECT ... INTO` without `STRICT` that finds a second row (its
+  `ROW_COUNT` is then 2). `strict_multi_assignment` reports a row stored into
+  a different number of variables or record fields, once per missing source
+  and once for extra columns, as `SELECT 1, 2 INTO a` does.
 - A PL/pgSQL function keeps the `plpgsql.variable_conflict` and
   `plpgsql.print_strict_params` values it was compiled under, as PostgreSQL's
   per-session function cache does: the creating session compiles it at

@@ -4291,6 +4291,112 @@ fn capture_table_func_routine(
             txid,
         )
         .ok_or_else(|| srf_signature_error(tref.table))?;
+    bind_column_definitions(tref, routine, storage, txid)
+}
+
+/// The column definition list a function in FROM was written with: the
+/// `__json_record_columns` call the parser keeps as its last argument.
+fn column_definition_list<'a>(tref: &TableRef<'a>) -> Option<&'a Expr<'a>> {
+    match tref.func_args?.last()? {
+        definitions @ Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name: "__json_record_columns",
+            ..
+        } => Some(definitions),
+        _ => None,
+    }
+}
+
+/// Checks a stored function's column definition list as PostgreSQL's
+/// `addRangeTableEntryForFunction` does, and makes a list's columns the
+/// result columns of a function returning `record`, which its body's rows
+/// must then match.
+fn bind_column_definitions(
+    tref: &TableRef<'_>,
+    mut routine: RoutineDef,
+    storage: &Storage,
+    txid: u32,
+) -> Result<RoutineDef, SqlError> {
+    let definitions = column_definition_list(tref);
+    // A function returning `record` (or `SETOF record`) without OUT
+    // parameters takes its columns from the list.
+    let record = match routine.kind {
+        crate::storage::RoutineKind::RecordFunction { .. } => true,
+        crate::storage::RoutineKind::Function { result }
+        | crate::storage::RoutineKind::SetFunction { result } => {
+            result.ctype == ColType::Record && result.user_type.is_none()
+        }
+        _ => false,
+    };
+    let syntax = |message: &'static str| sql_err!(sqlstate::SYNTAX_ERROR, "{}", message);
+    let Some(list) = definitions else {
+        if record && routine.result_column_count == 0 {
+            return Err(crate::sql::error_position::at_source_position(
+                syntax("a column definition list is required for functions returning \"record\""),
+                tref.func_source_position,
+            ));
+        }
+        return Ok(routine);
+    };
+    let Expr::Call {
+        args: entries,
+        source_position,
+        ..
+    } = list
+    else {
+        unreachable!("column definition list is a call");
+    };
+    if !record || routine.result_column_count != 0 {
+        let message = if routine.result_column_count != 0 {
+            "a column definition list is redundant for a function with OUT parameters"
+        } else {
+            "a column definition list is only allowed for functions returning \"record\""
+        };
+        return Err(crate::sql::error_position::at_source_position(
+            syntax(message),
+            *source_position,
+        ));
+    }
+    if entries.len() > routine.result_columns.len() {
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_COLUMNS,
+            "column definition lists can have at most {} entries",
+            routine.result_columns.len()
+        ));
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        let Expr::Call {
+            name: "__json_record_column",
+            args: [Expr::Str(name), Expr::Str(type_name), Expr::Int(_)],
+            ..
+        } = entry
+        else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid column definition list entry"
+            ));
+        };
+        if routine.result_columns[..index]
+            .iter()
+            .any(|column| column.name.as_str() == *name)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_COLUMN,
+                "column name \"{}\" specified more than once",
+                name
+            ));
+        }
+        let resolved = crate::sql::exec::resolve_routine_type(storage, txid, type_name)?;
+        routine.result_columns[index] = crate::storage::RoutineArgumentDef {
+            name: SqlName::parse(name)?,
+            ctype: resolved.ctype,
+            user_type: resolved.user_type,
+        };
+    }
+    routine.result_column_count = entries.len();
+    routine.kind = crate::storage::RoutineKind::RecordFunction {
+        set_returning: routine.kind.is_set_returning(),
+    };
     Ok(routine)
 }
 
@@ -4577,6 +4683,9 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             } else {
                 bound
             }
+        } else if selected.is_some() {
+            // A stored function's column definition list is not an input.
+            &written_args[..table_function_input_count(tref)]
         } else {
             written_args
         };

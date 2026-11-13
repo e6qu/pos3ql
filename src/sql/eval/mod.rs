@@ -1650,6 +1650,13 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
             .and_then(|catalog| catalog.domain_base_type(type_oid))
     }
 
+    fn select_common_type(&self, inputs: &[i32]) -> Result<i32, crate::storage::CommonTypeFailure> {
+        match self.catalog {
+            Some(catalog) => catalog.select_common_type(inputs),
+            None => crate::storage::builtin_select_common_type(inputs),
+        }
+    }
+
     fn operator_first_argument_type(
         &self,
         name: &str,
@@ -3482,6 +3489,10 @@ pub trait CatalogAccess {
     /// `(is_array, type_oid)`, or `None` when PostgreSQL finds none.
     fn compatible_element_oid(&self, inputs: &[(bool, i32)]) -> Option<i32> {
         crate::storage::builtin_compatible_element_oid(inputs)
+    }
+    /// PostgreSQL's `select_common_type` over input type OIDs.
+    fn select_common_type(&self, inputs: &[i32]) -> Result<i32, crate::storage::CommonTypeFailure> {
+        crate::storage::builtin_select_common_type(inputs)
     }
     /// Resolves a durable schema-qualified identity without reparsing it as
     /// SQL text.
@@ -6151,8 +6162,53 @@ pub fn eval_full<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     eval_full_unpositioned(expression, arena, params, row, hooks).map_err(|error| {
         let error = complete_function_mismatch(error, expression, row, hooks);
+        let error = literal_operand_error(error, expression, arena, row);
         crate::sql::error_position::expression_error(error, expression)
     })
+}
+
+/// Positions a data error at an operator's untyped literal operand when the
+/// literal itself fails input as the other operand's type, as PostgreSQL
+/// converts it while analysing the operator (`1 + 'x'`). An error the
+/// operator raises from valid inputs (`1 / '0'`) keeps no position.
+fn literal_operand_error<'a>(
+    error: SqlError,
+    expression: &Expr<'a>,
+    arena: &'a Arena,
+    row: &impl ColumnLookup<'a>,
+) -> SqlError {
+    let Expr::Binary { left, right, .. } = expression else {
+        return error;
+    };
+    if !error.sqlstate.as_str().starts_with("22") {
+        return error;
+    }
+    let (literal, other) = match (*left, *right) {
+        (Expr::Str(literal), other) | (other, Expr::Str(literal))
+            if !matches!(other, Expr::Str(_)) =>
+        {
+            (literal, other)
+        }
+        _ => return error,
+    };
+    let Some(target) = static_type(other, row) else {
+        return error;
+    };
+    if matches!(target, ColType::Text | ColType::Pseudo(_) | ColType::Record) {
+        return error;
+    }
+    let mark = arena.mark();
+    let fails_alike = crate::sql::error_position::preserving_pending(|| {
+        cast_to(Datum::Text(literal), target, arena)
+            .is_err_and(|input| input.sqlstate == error.sqlstate && input.message == error.message)
+    });
+    // The probe's value is discarded with its scratch.
+    unsafe { arena.rewind_to(mark) };
+    if fails_alike {
+        crate::sql::error_position::at_subject(error, literal)
+    } else {
+        error
+    }
 }
 
 /// Completes the signature of a [`function_argument_mismatch`] raised by a

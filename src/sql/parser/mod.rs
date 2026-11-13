@@ -195,6 +195,13 @@ pub(crate) fn keyword_category(word: &str) -> Option<Keyword> {
     })
 }
 
+/// A function source's parenthesized list after its alias.
+enum FunctionColumnList<'a> {
+    Aliases(&'a [&'a str]),
+    /// The call's arguments followed by its column definition list.
+    Definitions(&'a [&'a Expr<'a>]),
+}
+
 /// Whether `word` is a keyword PostgreSQL refuses in a `ColId` position — a
 /// column name, a table name, or a FROM-item alias. Its two reserved categories
 /// are rejected there; the unreserved ones are accepted — `begin`, `values` and
@@ -974,6 +981,36 @@ pub(crate) fn parse_type_name<'a>(
     Ok(parsed)
 }
 
+/// [`parse_type_name`] for a PL/pgSQL declaration's type: text after a
+/// complete type name is PostgreSQL's syntax error at its first token.
+pub(crate) fn parse_declared_type_name<'a>(
+    sql: &'a str,
+    arena: &'a Arena,
+) -> Result<(&'a str, i32), super::eval::SqlError> {
+    let to_sql = |m: &str| super::eval::SqlError {
+        sqlstate: super::eval::SqlState::known(super::eval::sqlstate::SYNTAX_ERROR),
+        message: crate::stack_format!(192, "invalid type name: {}", m),
+    };
+    let mut parser = Parser::new(sql, arena).map_err(|e| to_sql(e.message.as_str()))?;
+    let parsed = parser
+        .type_name_mod()
+        .map_err(|e| to_sql(e.message.as_str()))?;
+    if parser.peeked != Tok::Eof {
+        let token = sql
+            .get(parser.peek_at..parser.lexer.token_end())
+            .unwrap_or_default();
+        return Err(super::error_position::at_subject(
+            crate::sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "syntax error at or near \"{}\"",
+                token
+            ),
+            token,
+        ));
+    }
+    Ok(parsed)
+}
+
 #[cfg(test)]
 pub(crate) fn parse_expression<'a>(
     sql: &'a str,
@@ -1012,6 +1049,67 @@ pub(crate) fn parse_expression_list<'a>(
         Ok(expressions.as_slice())
     };
     parse().map_err(|error| super::parse_error_to_sql(&error))
+}
+
+/// The names a PL/pgSQL body's `$n` references take: `$n` is the routine's
+/// `n`th parameter, a variable like any other. Their storage identifies a
+/// reference written as `$n` rather than as the quoted identifier `"$n"`.
+static POSITIONAL_NAMES: [&str; crate::storage::MAX_ROUTINE_ARGUMENTS] = [
+    "$1", "$2", "$3", "$4", "$5", "$6", "$7", "$8", "$9", "$10", "$11", "$12", "$13", "$14", "$15",
+    "$16", "$17", "$18", "$19", "$20", "$21", "$22", "$23", "$24", "$25", "$26", "$27", "$28",
+    "$29", "$30", "$31", "$32", "$33", "$34", "$35", "$36", "$37", "$38", "$39", "$40", "$41",
+    "$42", "$43", "$44", "$45", "$46", "$47", "$48", "$49", "$50", "$51", "$52", "$53", "$54",
+    "$55", "$56", "$57", "$58", "$59", "$60", "$61", "$62", "$63", "$64", "$65", "$66", "$67",
+    "$68", "$69", "$70", "$71", "$72", "$73", "$74", "$75", "$76", "$77", "$78", "$79", "$80",
+    "$81", "$82", "$83", "$84", "$85", "$86", "$87", "$88", "$89", "$90", "$91", "$92", "$93",
+    "$94", "$95", "$96", "$97", "$98", "$99", "$100",
+];
+
+std::thread_local! {
+    /// How many `$n` references name procedural variables in the text being
+    /// parsed: a PL/pgSQL body's routine parameters.
+    static PROCEDURAL_POSITIONALS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Parses with `$1` to `$count` read as the PL/pgSQL variables of those
+/// names, as PostgreSQL's `plpgsql_param_ref` resolves them; a larger `$n`
+/// stays a parameter, which reports that it does not exist.
+pub(crate) fn with_procedural_positionals<R>(count: u32, parse: impl FnOnce() -> R) -> R {
+    struct Restore(u32);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PROCEDURAL_POSITIONALS.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(PROCEDURAL_POSITIONALS.with(|slot| slot.replace(count)));
+    parse()
+}
+
+/// The variable name a procedural `$n` reference reads, while one is parsed.
+fn procedural_positional(number: u32) -> Option<&'static str> {
+    let count = PROCEDURAL_POSITIONALS.with(core::cell::Cell::get);
+    (number <= count).then(|| positional_name(number)).flatten()
+}
+
+/// How many `$n` references name procedural variables in the text being
+/// parsed.
+pub(crate) fn procedural_positionals() -> u32 {
+    PROCEDURAL_POSITIONALS.with(core::cell::Cell::get)
+}
+
+/// The variable name of parameter `$number`.
+fn positional_name(number: u32) -> Option<&'static str> {
+    usize::try_from(number)
+        .ok()
+        .and_then(|number| number.checked_sub(1))
+        .and_then(|index| POSITIONAL_NAMES.get(index).copied())
+}
+
+/// Whether `name` is a `$n` reference parsed as a procedural variable.
+pub(crate) fn is_positional_reference(name: &str) -> bool {
+    POSITIONAL_NAMES
+        .iter()
+        .any(|positional| core::ptr::eq(positional.as_ptr(), name.as_ptr()))
 }
 
 impl<'a> Parser<'a> {
@@ -2509,17 +2607,22 @@ impl<'a> Parser<'a> {
                 } else {
                     let numeric_timezone = name.eq_ignore_ascii_case("timezone")
                         && matches!(self.peeked, Tok::Num(_) | Tok::Op("+") | Tok::Op("-"));
-                    match self.configuration_value_list(name, true)? {
-                        RoutineConfigValue::Default => ("DEFAULT", SettingSyntax::Default),
-                        RoutineConfigValue::Value(value) => (
+                    match self.configuration_values(name, true, true)? {
+                        (RoutineConfigValue::Default, _) => ("DEFAULT", SettingSyntax::Default),
+                        (RoutineConfigValue::Value(value), items) => (
                             value,
                             if numeric_timezone {
                                 SettingSyntax::TimeZone
+                            } else if items > 1
+                                && !name.eq_ignore_ascii_case("search_path")
+                                && !name.eq_ignore_ascii_case("datestyle")
+                            {
+                                SettingSyntax::DecodedList
                             } else {
                                 SettingSyntax::DecodedValue
                             },
                         ),
-                        RoutineConfigValue::Current => {
+                        (RoutineConfigValue::Current, _) => {
                             unreachable!("FROM CURRENT is separate syntax")
                         }
                     }
@@ -4158,8 +4261,10 @@ impl<'a> Parser<'a> {
             table,
             "json_to_record" | "jsonb_to_record" | "json_to_recordset" | "jsonb_to_recordset"
         ) && func_args.is_some();
+        let mut bare_as = false;
         let alias = if self.eat_ident("as")? {
-            if json_to_record && self.peeked == Tok::Op("(") {
+            if func_args.is_some() && self.peeked == Tok::Op("(") {
+                bare_as = true;
                 None
             } else {
                 Some(self.col_ident("alias")?)
@@ -4174,13 +4279,19 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let col_alias = if json_to_record && self.peeked == Tok::Op("(") {
-            func_args = Some(self.json_record_column_definitions(
-                func_args.expect("record function has arguments"),
-            )?);
-            None
-        } else {
-            self.column_alias_list()?
+        // A function's list names its columns, or defines them with types
+        // (a column definition list, kept as the call's last argument).
+        let col_alias = match func_args {
+            Some(args) if self.peeked == Tok::Op("(") => {
+                match self.function_column_list(args, json_to_record, bare_as)? {
+                    FunctionColumnList::Aliases(names) => Some(names),
+                    FunctionColumnList::Definitions(args) => {
+                        func_args = Some(args);
+                        None
+                    }
+                }
+            }
+            _ => self.column_alias_list()?,
         };
         let sample = if func_args.is_none() && self.eat_ident("tablesample")? {
             Some(self.table_sample()?)
@@ -4395,31 +4506,63 @@ impl<'a> Parser<'a> {
         self.plain_call("__xml_table_columns", columns.as_slice())
     }
 
-    fn json_record_column_definitions(
+    /// A function's parenthesized column list: aliases (`f() AS t(a, b)`),
+    /// or a column definition list (`f() AS t(a int, b text)`), which
+    /// returns the call's arguments followed by `__json_record_columns`
+    /// holding one `__json_record_column(name, type, type modifier)` per
+    /// column.
+    fn function_column_list(
         &mut self,
         function_args: &'a [&'a Expr<'a>],
-    ) -> Result<&'a [&'a Expr<'a>], ParseError> {
-        if function_args.len() != 1 {
+        json_to_record: bool,
+        definitions_only: bool,
+    ) -> Result<FunctionColumnList<'a>, ParseError> {
+        self.expect_op("(")?;
+        let list_at = self.peek_at;
+        let first = self.col_ident("column alias")?;
+        if matches!(self.peeked, Tok::Op(",") | Tok::Op(")")) {
+            // `AS (...)` without a name is only a column definition list.
+            if definitions_only {
+                return Err(self.syntax_error_here());
+            }
+            let mut columns = ArenaList::new(self.arena);
+            self.push(&mut columns, first)?;
+            while self.eat_op(",")? {
+                let column = self.col_ident("column alias")?;
+                self.push(&mut columns, column)?;
+            }
+            self.expect_op(")")?;
+            return Ok(FunctionColumnList::Aliases(columns.as_slice()));
+        }
+        if json_to_record && function_args.len() != 1 {
             return Err(self.err_here("JSON record conversion takes one JSON argument"));
         }
-        self.expect_op("(")?;
         let mut definitions = ArenaList::new(self.arena);
+        let mut name = first;
         loop {
-            let name = self.col_ident("record column name")?;
             let (type_name, type_mod) = self.type_name_mod()?;
-            let name = self.arena_expr(Expr::Str(name))?;
+            let name_expr = self.arena_expr(Expr::Str(name))?;
             let type_name = self.arena_expr(Expr::Str(type_name))?;
             let type_mod = self.arena_expr(Expr::Int(i64::from(type_mod)))?;
             let definition =
-                self.plain_call("__json_record_column", &[name, type_name, type_mod])?;
+                self.plain_call("__json_record_column", &[name_expr, type_name, type_mod])?;
             self.push(&mut definitions, definition)?;
             if !self.eat_op(",")? {
                 break;
             }
+            name = self.col_ident("record column name")?;
         }
         self.expect_op(")")?;
-        let definitions = self.plain_call("__json_record_columns", definitions.as_slice())?;
-        self.arena_slice(&[function_args[0], definitions])
+        // Positioned at the list's first column, where PostgreSQL reports
+        // a list the function does not take.
+        let definitions =
+            self.plain_call_at("__json_record_columns", definitions.as_slice(), list_at)?;
+        let mut args = ArenaList::new(self.arena);
+        for argument in function_args {
+            self.push(&mut args, *argument)?;
+        }
+        self.push(&mut args, definitions)?;
+        Ok(FunctionColumnList::Definitions(args.as_slice()))
     }
 
     fn json_table_columns(&mut self, depth: u16) -> Result<&'a Expr<'a>, ParseError> {
@@ -10067,8 +10210,22 @@ impl<'a> Parser<'a> {
         name: &str,
         allow_list: bool,
     ) -> Result<RoutineConfigValue<'a>, ParseError> {
+        self.configuration_values(name, allow_list, false)
+            .map(|(value, _)| value)
+    }
+
+    /// A configuration value and how many list items it has. A `SET` of
+    /// `plpgsql.extra_warnings` or `plpgsql.extra_errors` (`deferred_lists`)
+    /// keeps a list for execution, which accepts it only once PL/pgSQL has
+    /// loaded and defined them as list parameters.
+    fn configuration_values(
+        &mut self,
+        name: &str,
+        allow_list: bool,
+        deferred_lists: bool,
+    ) -> Result<(RoutineConfigValue<'a>, usize), ParseError> {
         if self.eat_ident("default")? {
-            return Ok(RoutineConfigValue::Default);
+            return Ok((RoutineConfigValue::Default, 0));
         }
         let mut bytes = ArenaList::new(self.arena);
         let mut count = 0;
@@ -10139,7 +10296,11 @@ impl<'a> Parser<'a> {
             if !allow_list {
                 return Err(self.syntax_error_here());
             }
-            if !name.eq_ignore_ascii_case("search_path") && !name.eq_ignore_ascii_case("datestyle")
+            if !name.eq_ignore_ascii_case("search_path")
+                && !name.eq_ignore_ascii_case("datestyle")
+                && !(deferred_lists
+                    && (name.eq_ignore_ascii_case("plpgsql.extra_warnings")
+                        || name.eq_ignore_ascii_case("plpgsql.extra_errors")))
             {
                 return Err(ParseError {
                     at: self.peek_at,
@@ -10156,8 +10317,12 @@ impl<'a> Parser<'a> {
                 });
             }
         }
-        Ok(RoutineConfigValue::Value(
-            core::str::from_utf8(bytes.as_slice()).expect("decoded configuration value is UTF-8"),
+        Ok((
+            RoutineConfigValue::Value(
+                core::str::from_utf8(bytes.as_slice())
+                    .expect("decoded configuration value is UTF-8"),
+            ),
+            count,
         ))
     }
 

@@ -163,10 +163,26 @@ pub(crate) fn with_column_suggestion(
             message_hash,
             position: known.and_then(|known| known.position),
             hint: None,
-            note: suggestion.hint().map(AnalysisNote::Suggestion),
+            note: {
+                let mut suggestion = *suggestion;
+                crate::sql::column_suggestion::offer_set_branches(&mut suggestion);
+                suggestion.hint().map(AnalysisNote::Suggestion)
+            },
         }))
     });
     error
+}
+
+/// Whether `error` already carries a detail, hint or suggestion.
+fn has_pending_note(error: &SqlError) -> bool {
+    let message_hash = message_hash(&error.message);
+    PENDING.with(|pending| {
+        pending.get().is_some_and(|known| {
+            known.sqlstate == error.sqlstate
+                && known.message_hash == message_hash
+                && (known.note.is_some() || known.hint.is_some())
+        })
+    })
 }
 
 fn note_text(text: core::fmt::Arguments<'_>) -> crate::util::StackStr<NOTE_BYTES> {
@@ -902,7 +918,17 @@ pub(crate) fn column_reference(error: SqlError, qualifier: Option<&str>, name: &
             | sqlstate::AMBIGUOUS_COLUMN
             | sqlstate::GROUPING_ERROR
     ) {
-        at_reference(error, qualifier.unwrap_or(name))
+        let error = at_reference(error, qualifier.unwrap_or(name));
+        // A reference no FROM item answers still searches the earlier
+        // branches of an enclosing set operation for a suggestion.
+        if crate::sql::column_suggestion::set_branches_in_reach() && !has_pending_note(&error) {
+            with_column_suggestion(
+                error,
+                &crate::sql::column_suggestion::ColumnSuggestion::new(qualifier, name),
+            )
+        } else {
+            error
+        }
     } else {
         error
     }

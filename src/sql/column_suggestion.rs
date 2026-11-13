@@ -25,6 +25,7 @@ struct Candidate {
 }
 
 /// PostgreSQL's `FuzzyAttrMatchState` for one missing column reference.
+#[derive(Clone, Copy)]
 pub struct ColumnSuggestion<'n> {
     qualifier: Option<&'n str>,
     name: &'n str,
@@ -168,6 +169,53 @@ pub(crate) fn missing_relation_column(
         relation,
         columns,
     )
+}
+
+std::thread_local! {
+    /// The earlier branches of the set operation whose later branch is being
+    /// analysed, as `(name, columns)` pairs that outlive the analysis.
+    static SET_BRANCHES: core::cell::Cell<Option<(*const SetBranch<'static>, usize)>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// A set-operation branch as PostgreSQL's parent query names it in its range
+/// table: `*SELECT* n` with the branch's output column names.
+pub(crate) type SetBranch<'a> = (&'a str, &'a [&'a str]);
+
+/// Runs the analysis of a set operation's later branch with the `branches`
+/// before it in reach of a missing column's spelling suggestion: PostgreSQL
+/// adds each analysed branch to the parent query's range table, which the
+/// suggestion searches after the branch's own FROM items.
+pub(crate) fn with_set_branches<R>(branches: &[SetBranch<'_>], run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<(*const SetBranch<'static>, usize)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SET_BRANCHES.with(|current| current.set(self.0));
+        }
+    }
+    let installed = (
+        branches.as_ptr().cast::<SetBranch<'static>>(),
+        branches.len(),
+    );
+    let _restore = Restore(SET_BRANCHES.with(|current| current.replace(Some(installed))));
+    run()
+}
+
+/// Whether a set operation's earlier branches are in reach.
+pub(crate) fn set_branches_in_reach() -> bool {
+    SET_BRANCHES.with(core::cell::Cell::get).is_some()
+}
+
+/// Offers the earlier set-operation branches in reach to `suggestion`.
+pub(crate) fn offer_set_branches(suggestion: &mut ColumnSuggestion<'_>) {
+    let Some((branches, count)) = SET_BRANCHES.with(core::cell::Cell::get) else {
+        return;
+    };
+    // SAFETY: `with_set_branches` keeps the slice borrowed while installed.
+    let branches = unsafe { core::slice::from_raw_parts(branches, count) };
+    for (relation, columns) in branches {
+        suggestion.relation(relation, columns.iter().copied());
+    }
 }
 
 /// Levenshtein distance in characters with unit costs, as PostgreSQL's

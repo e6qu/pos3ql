@@ -1579,14 +1579,15 @@ use numeric_loops::NumericLoopFrames;
 pub(crate) use projected::{
     ProjectedValue, compare_projected_key, compare_projected_prefix, compare_projected_rows,
     compare_projected_values, decode_projected_row_into, encode_projected_by_into,
-    encode_projected_into, encode_projected_persistent_pub, pack_projected_rows,
-    pack_projected_rows_into, projected_row_len, projected_row_len_by, projected_row_width,
-    projected_rows_len, unpack_projected_rows,
+    encode_projected_into, encode_projected_persistent_pub, pack_projected_rows, projected_row_len,
+    projected_row_len_by, projected_row_width, unpack_projected_rows,
 };
 pub use projected::{
     decode_projected_col_record, decode_projected_pub, decode_projected_value,
     encode_projected_pub, projected_prefix_len, projected_value_len, sort_dedup_projected,
 };
+#[cfg(test)]
+pub(crate) use projected::{pack_projected_rows_into, projected_rows_len};
 
 mod ddl;
 mod dependency_report;
@@ -81006,13 +81007,12 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
 }
 
 /// A streamed `INSERT ... SELECT` source: the retained reader, the fixed
-/// arena block its state lives in, and the row read ahead of the writes.
+/// arena block its state lives in, and whether its next row is already
+/// read (a sorted, grouped or subquery source reads its first row at open).
 struct StreamedSource<'a> {
     reader: super::query::RetainedSelect<'a>,
     block: &'a Arena,
-    /// The next row: `None` at the source's end, `Some(None)` for a row only
-    /// filtered because an earlier attempt already wrote it.
-    next: Option<Option<&'a [Datum<'a>]>>,
+    prepared: bool,
 }
 
 /// The fixed block a streamed source's reader holds (a table scan's cursor
@@ -81021,10 +81021,13 @@ struct StreamedSource<'a> {
 /// materializes instead.
 const STREAMED_SOURCE_BLOCK: usize = 512 << 10;
 
-/// Opens a streamed source and reads its first row before the first row
-/// change, so a wait there restarts the statement and a sort or hash table
-/// that does not fit reports `plan_build_exhausted` before anything is
-/// written. `None` when the retained reader does not run the source.
+/// Opens a streamed source before the first row change. A source that
+/// sorts, groups or runs subqueries reads its first row here, so a sort or
+/// hash table that does not fit reports `plan_build_exhausted` before
+/// anything is written; any other source reads each row inside the row
+/// that writes it, as PostgreSQL's ModifyTable pulls its source row after
+/// the previous row. `None` when the retained reader does not run the
+/// source.
 #[expect(
     clippy::too_many_arguments,
     reason = "a streamed source reads with the write's storage, snapshot and arenas"
@@ -81051,97 +81054,106 @@ fn open_streamed_source<'a>(
     let Some(mut reader) = reader else {
         return Ok(None);
     };
-    let next = next_streamed_row(
-        &mut reader,
+    let _snapshot = storage.dml_expression_snapshot(command);
+    reader.build_tables(
         storage,
         txid,
-        command,
+        crate::sql::datetime::now_micros(),
         block,
         buffers,
         arena,
-        params,
-        true,
     )?;
+    let prepared = reader.prepares_ahead()
+        && reader.prepare_statement_row(
+            storage,
+            txid,
+            crate::sql::datetime::now_micros(),
+            block,
+            buffers,
+            arena,
+            params,
+        )?;
     Ok(Some(StreamedSource {
         reader,
         block,
-        next,
+        prepared,
     }))
 }
 
 /// Reads a streamed source's next row under the statement's snapshot, its
 /// output values detached into `arena`: `None` at the end. A row an earlier
-/// attempt wrote is only filtered (`evaluate` false); the source reads
-/// repeatably, so skipping such rows by count finds the unfinished one.
+/// attempt wrote is only filtered (`evaluate` false); the rows the source
+/// reads are repeatable, so skipping such rows by count finds the
+/// unfinished one. Output calls run as the row is written, under the
+/// write's invocation log: a row that runs again replays them from where
+/// it started.
 #[expect(
     clippy::too_many_arguments,
     reason = "a streamed source reads with the write's storage, snapshot and arenas"
 )]
 fn next_streamed_row<'a>(
-    reader: &mut super::query::RetainedSelect<'a>,
+    stream: &mut StreamedSource<'a>,
     storage: &Storage,
     txid: u32,
     command: u32,
-    block: &'a Arena,
     buffers: &mut crate::storage::RowCursorBuffers,
     arena: &'a Arena,
     params: &[Datum<'a>],
     evaluate: bool,
+    sequences: &dyn super::eval::SequenceAccess,
 ) -> Result<Option<Option<&'a [Datum<'a>]>>, SqlError> {
     let _snapshot = storage.dml_expression_snapshot(command);
-    let calls = super::query::active_invocation_position();
-    let row = super::query::without_routine_invocations(
-        || -> Result<Option<Option<&'a [Datum<'a>]>>, SqlError> {
-            loop {
-                let mark = arena.mark();
-                if !reader.prepare_statement_row(
+    let reader = &mut stream.reader;
+    loop {
+        let mark = arena.mark();
+        if !core::mem::take(&mut stream.prepared)
+            && !reader.prepare_statement_row(
+                storage,
+                txid,
+                crate::sql::datetime::now_micros(),
+                stream.block,
+                buffers,
+                arena,
+                params,
+            )?
+        {
+            return Ok(None);
+        }
+        let passes = super::query::without_routine_invocations(|| {
+            reader.evaluate_statement_predicate(storage, txid, arena, params, None, None, arena)
+        })?;
+        if !passes || reader.skip_statement_row() {
+            reader.finish_statement_row(stream.block, false);
+            // SAFETY: the filtered row's values were dropped.
+            unsafe { arena.rewind_to(mark) };
+            continue;
+        }
+        let values = if evaluate {
+            let mut projected = crate::mem::arena::ArenaList::new(arena);
+            for index in 0..reader.statement_items_len() {
+                let values = reader.evaluate_statement_item(
+                    index,
                     storage,
                     txid,
-                    crate::sql::datetime::now_micros(),
-                    block,
-                    buffers,
                     arena,
                     params,
-                )? {
-                    return Ok(None);
-                }
-                let passes = reader.evaluate_statement_predicate(
-                    storage, txid, arena, params, None, None, arena,
+                    Some(sequences),
+                    None,
+                    arena,
                 )?;
-                if !passes || reader.skip_statement_row() {
-                    reader.finish_statement_row(block, false);
-                    // SAFETY: the filtered row's values were dropped.
-                    unsafe { arena.rewind_to(mark) };
-                    continue;
+                for value in values {
+                    projected
+                        .push(*value)
+                        .map_err(|_| super::eval::arena_full())?;
                 }
-                let values = if evaluate {
-                    let mut projected = crate::mem::arena::ArenaList::new(arena);
-                    for index in 0..reader.statement_items_len() {
-                        for value in reader.evaluate_statement_item(
-                            index, storage, txid, arena, params, None, None, arena,
-                        )? {
-                            projected
-                                .push(*value)
-                                .map_err(|_| super::eval::arena_full())?;
-                        }
-                    }
-                    Some(projected.as_slice())
-                } else {
-                    None
-                };
-                reader.finish_statement_row(block, true);
-                return Ok(Some(values));
             }
-        },
-    );
-    if super::query::active_invocation_position() != calls {
-        // A source that reads repeatably calls no user routine.
-        return Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "a streamed INSERT source called a routine"
-        ));
+            Some(projected.as_slice())
+        } else {
+            None
+        };
+        reader.finish_statement_row(stream.block, true);
+        return Ok(Some(values));
     }
-    row
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -81539,21 +81551,28 @@ where
 
     // The source reads the table as of the statement's start, also when it
     // reads the table being inserted into, as in PostgreSQL. A source that
-    // the retained reader runs and that reads repeatably streams: it holds
-    // one source row at a time in a fixed block of the arena, and each row
-    // is written before the next is read. Any other source materializes its
-    // rows and their assignment conversions in the arena before writing,
-    // where exhaustion is the named `54000`; each emitted source row
-    // converts before the next row runs, so encoded values are typed.
+    // the retained reader runs streams when the rows it reads are
+    // repeatable: it holds one source row at a time in a fixed block of the
+    // arena, and each row reads its source row and evaluates its output
+    // (calls included, when the write keeps row progress) before it is
+    // written. Any other source materializes its rows and their assignment
+    // conversions in the arena before writing, where exhaustion is the
+    // named `54000`; each emitted source row converts before the next row
+    // runs, so encoded values are typed.
     if let Some(sel) = statement.select {
         let source_command = txn.command_id();
         let stream_mark = arena.mark();
         let mut stream = None;
+        let producing = progress
+            .as_deref()
+            .is_some_and(row_progress::RowProgress::producing);
         if matches!(source, InsertSource::Statement)
             && transition_relations.is_none()
-            && !capturing
+            && (!capturing || producing)
             && arena.remaining() >= 2 * STREAMED_SOURCE_BLOCK
-            && super::query::select_reads_repeatably(sel, storage, txn.txid)
+            && (super::query::select_reads_repeatably(sel, storage, txn.txid)
+                || progress.is_some()
+                    && super::query::select_streams_with_calls(sel, storage, txn.txid))
         {
             let opened = open_streamed_source(
                 sel,
@@ -81577,6 +81596,13 @@ where
                 // SAFETY: no reader or row of the rejected stream remains.
                 unsafe { arena.rewind_to(stream_mark) };
             }
+        }
+        if stream.is_none()
+            && let Some(progress) = progress.as_deref_mut()
+        {
+            // A materialized source runs its calls again in every step, so a
+            // data-modifying `WITH` query over one runs whole in one step.
+            progress.stop_producing();
         }
         let deferred;
         let (rows_bytes, count): (&[&[u8]], usize) = if stream.is_some() {
@@ -81734,15 +81760,48 @@ where
         };
         let mut inserted = resumed.changed;
         let first_row = resumed.first;
+        // A streamed source's row is read inside its row, after the row's
+        // start: a call or a data-modifying `WITH` query's step there runs
+        // the row again, and its end leaves the started row empty.
+        let source_ended = core::cell::Cell::new(false);
         let mut write_row = |storage: &mut Storage,
                              txn: &mut TxnState,
                              services: &mut TriggerServices<'_>,
                              responder: &mut Responder<'_>,
                              index: usize,
                              bytes: &'a [u8],
-                             streamed: Option<&'a [Datum<'a>]>|
+                             mut stream: Option<&mut StreamedSource<'a>>|
          -> Outcome {
             {
+                let streaming = stream.is_some();
+                let mut read_source =
+                    |storage: &Storage,
+                     services: &mut TriggerServices<'_>,
+                     evaluate: bool|
+                     -> Result<Option<Option<&'a [Datum<'a>]>>, SqlError> {
+                        let Some(stream) = stream.as_deref_mut() else {
+                            return Ok(None);
+                        };
+                        let sequences =
+                            crate::sql::sequence::SeqEval::new(storage, seq_session, coercion_txid);
+                        match next_streamed_row(
+                            stream,
+                            storage,
+                            coercion_txid,
+                            source_command,
+                            services.row_buffers,
+                            arena,
+                            params,
+                            evaluate,
+                            &sequences,
+                        )? {
+                            Some(row) => Ok(Some(row)),
+                            None => {
+                                source_ended.set(true);
+                                Ok(None)
+                            }
+                        }
+                    };
                 match row_progress::start_row(
                     progress.as_deref_mut(),
                     index,
@@ -81759,6 +81818,18 @@ where
                 ) {
                     Ok(None) => {}
                     Ok(Some(resumed)) => {
+                        if streaming {
+                            match read_source(storage, services, false) {
+                                Ok(Some(_)) => {}
+                                Ok(None) => {
+                                    return sql_fail(sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "a resumed write selected different rows"
+                                    ));
+                                }
+                                Err(error) => return sql_fail(error),
+                            }
+                        }
                         match emit_row_returning(
                             progress.as_deref_mut(),
                             ChangedRow {
@@ -81793,6 +81864,21 @@ where
                     }
                     Err(error) => return sql_fail(error),
                 }
+                let streamed = if streaming {
+                    match read_source(storage, services, true) {
+                        Ok(Some(Some(values))) => Some(values),
+                        Ok(Some(None)) => {
+                            return sql_fail(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "streamed INSERT source row was not evaluated"
+                            ));
+                        }
+                        Ok(None) => return sql_ok(),
+                        Err(error) => return sql_fail(error),
+                    }
+                } else {
+                    None
+                };
                 // A streamed row converts here, inside its row: an
                 // assignment cast that calls a routine resumes at the row.
                 let converted = match (streamed, &deferred) {
@@ -81964,53 +82050,56 @@ where
             })(),
             Some(stream) => (|| -> Outcome {
                 let row_mark = arena.mark();
-                let mut index = 0;
-                while let Some(row) = stream.next.take() {
-                    if index >= first_row {
-                        let Some(values) = row else {
+                // The rows an earlier attempt wrote are read again without
+                // evaluating their output.
+                for _ in 0..first_row {
+                    let sequences =
+                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                    match next_streamed_row(
+                        stream,
+                        storage,
+                        txn.txid,
+                        source_command,
+                        services.row_buffers,
+                        arena,
+                        params,
+                        false,
+                        &sequences,
+                    ) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
                             return sql_fail(sql_err!(
                                 sqlstate::INTERNAL_ERROR,
-                                "streamed INSERT source row was not evaluated"
+                                "a resumed write selected different rows"
                             ));
-                        };
-                        match write_row(
-                            storage,
-                            txn,
-                            services,
-                            responder,
-                            index,
-                            &[],
-                            Some(values),
-                        )? {
-                            Ok(()) => {}
-                            Err(error) => return sql_fail(error),
                         }
+                        Err(error) => return sql_fail(error),
+                    }
+                    // SAFETY: the skipped row's values were dropped.
+                    unsafe { arena.rewind_to(row_mark) };
+                }
+                let mut index = first_row;
+                loop {
+                    match write_row(
+                        storage,
+                        txn,
+                        services,
+                        responder,
+                        index,
+                        &[],
+                        Some(&mut *stream),
+                    )? {
+                        Ok(()) => {}
+                        Err(error) => return sql_fail(error),
+                    }
+                    if source_ended.get() {
+                        break;
                     }
                     index += 1;
                     // SAFETY: the row is written. What a write keeps across
                     // rows (transition rows, the invocation log) lives in the
                     // arena's persistent tail or outside the arena.
                     unsafe { arena.rewind_to(row_mark) };
-                    stream.next = match next_streamed_row(
-                        &mut stream.reader,
-                        storage,
-                        txn.txid,
-                        source_command,
-                        stream.block,
-                        services.row_buffers,
-                        arena,
-                        params,
-                        index >= first_row,
-                    ) {
-                        Ok(next) => next,
-                        Err(error) => return sql_fail(error),
-                    };
-                }
-                if index < first_row {
-                    return sql_fail(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "a resumed write selected different rows"
-                    ));
                 }
                 sql_ok()
             })(),
@@ -82344,6 +82433,20 @@ where
                 Ok(false) => {}
                 Err(error) => return sql_fail(error),
             }
+        }
+        if let Err(error) = row_progress::end_rows(
+            progress.as_deref_mut(),
+            statement.rows.len(),
+            inserted,
+            row_progress::capture_lengths([
+                transition_capture.as_ref(),
+                conflict_transition_capture.as_ref(),
+                None,
+            ]),
+            txn,
+            responder,
+        ) {
+            return sql_fail(error);
         }
         sql_ok()
     })();

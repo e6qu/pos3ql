@@ -90,6 +90,7 @@ mod type_dependent_routines;
 mod type_input_binding;
 mod type_input_positions;
 mod virtual_search_path;
+mod write_producers;
 mod write_progress;
 
 #[test]

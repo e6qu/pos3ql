@@ -86,8 +86,8 @@ pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 mod cte;
 mod view_write;
 pub(crate) use cte::captured_type_oid;
-pub(crate) use cte::select_reads_repeatably;
 pub(crate) use cte::{CteReader, dml_cte_runs_after, select_relations, set_query_relations};
+pub(crate) use cte::{select_reads_repeatably, select_streams_with_calls};
 pub use view_write::{
     UpdatableView, ViewRewrite, ViewWrite, and_where, function_view_write_error,
     resolve_view_for_dml, view_column_is_updatable, view_is_auto_updatable,
@@ -1020,18 +1020,31 @@ pub(crate) struct TriggerCall {
     pub rows: u64,
 }
 
-/// A data-modifying `WITH` query whose rows were first read. It runs at the
-/// invocation ordinal of that read; calls it makes take the ordinals after it.
+/// A data-modifying `WITH` query a read needs more rows of. It runs as
+/// PostgreSQL's ModifyTable node does under a CTE scan: one step writes
+/// source rows until it returns one row, so the reader and the query
+/// interleave row by row. Calls the query makes take a log of their own.
 #[derive(Clone, Copy)]
 pub(crate) struct PendingWriteQuery {
     with: (usize, usize),
     pub index: usize,
     params: (usize, usize),
-    pub ordinal: usize,
+    /// The row the read needs, or `None` for every row.
+    pub row: Option<usize>,
 }
 
 impl PendingWriteQuery {
-    fn key(&self) -> (usize, usize) {
+    /// Runs the remaining steps of a query to its end.
+    pub(crate) fn drain(source: &super::ast::WriteQuerySource<'_>) -> Self {
+        Self {
+            with: (source.with.as_ptr() as usize, source.with.len()),
+            index: source.index,
+            params: source.params,
+            row: None,
+        }
+    }
+
+    pub(crate) fn key(&self) -> (usize, usize) {
         (self.with.0, self.index)
     }
 
@@ -1050,15 +1063,55 @@ impl PendingWriteQuery {
     }
 }
 
-/// A completed data-modifying `WITH` query and its rows.
+/// The journal region (sequence values and statement effects) one step of
+/// a data-modifying `WITH` query consumed.
 #[derive(Clone, Copy)]
-struct WriteQueryResult {
+pub(crate) struct StepRegion {
+    start: Option<super::sequence::StatementReplayStart>,
+    end: super::sequence::StatementReplayCursor,
+}
+
+impl StepRegion {
+    /// Ends the region a step that started at `start` consumed.
+    pub(crate) fn finish(
+        start: Option<super::sequence::StatementReplayStart>,
+        scratch: &Arena,
+    ) -> Result<Self, SqlError> {
+        Ok(Self {
+            start,
+            end: super::sequence::finish_replay_cursor(start, scratch)?,
+        })
+    }
+
+    /// A reader reading the step's row again replays past the region.
+    fn skip(self) -> Result<(), SqlError> {
+        super::sequence::skip_replay_region(self.start, self.end)
+    }
+}
+
+/// One row a data-modifying `WITH` query returned, kept in the statement
+/// arena's retained tail with the region of the step that returned it.
+#[derive(Clone, Copy)]
+struct ProducedRow {
+    image: crate::mem::arena::FrozenArenaSliceHandle<u8>,
+    region: StepRegion,
+}
+
+/// A data-modifying `WITH` query the statement runs as its rows are read:
+/// the rows it returned so far, and its write's row progress between steps.
+pub(crate) struct WriteProducer {
     key: (usize, usize),
-    /// The invocation log whose read ran the query, and that read's ordinal.
-    owner: u64,
-    ordinal: usize,
-    rows: OwnedRoutineResult,
-    replay: super::sequence::StatementReplayCursor,
+    /// Taken by the step that runs the query.
+    progress: Option<super::exec::RowProgress>,
+    rows: crate::mem::arena::RetainedList<ProducedRow>,
+    /// The region of the step that found the query's end.
+    end: Option<StepRegion>,
+}
+
+/// What a reader of a data-modifying `WITH` query finds at one position.
+pub(crate) enum ProducedRead<'q> {
+    Row(&'q [u8]),
+    End,
 }
 
 /// What a scan needs to run a deferred ordinary `WITH` query.
@@ -1154,6 +1207,45 @@ pub(crate) fn read_deferred_cte<'a>(
         core::sync::atomic::Ordering::Relaxed,
     );
     Ok(kept)
+}
+
+/// Ends the attempt of a data-modifying `WITH` query's step at the start of
+/// the row after the one it returned, as ModifyTable returns each row to its
+/// reader before reading its next source row.
+pub(crate) fn producer_yield() -> SqlError {
+    with_active_routine_invocations(|context| {
+        if let Some((invocations, _)) = context {
+            invocations.produced.set(true);
+        }
+    });
+    sql_err!(
+        sqlstate::INTERNAL_ROUTINE_INVOCATION,
+        "data-modifying WITH query returned its row"
+    )
+}
+
+/// Reads row `index` of a data-modifying `WITH` query for the running
+/// attempt, or makes the query's next step the attempt's pending call.
+pub(crate) fn read_write_query_row<'a>(
+    source: &super::ast::WriteQuerySource<'_>,
+    index: usize,
+    arena: &'a Arena,
+) -> Result<ProducedRead<'a>, SqlError> {
+    with_active_routine_invocations(|context| {
+        let Some((invocations, statement_arena)) = context else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "data-modifying WITH query \"{}\" was read outside its statement",
+                source.with[source.index].name
+            ));
+        };
+        invocations.require_arena(statement_arena)?;
+        // The rows live in the statement arena's retained tail, which outlives
+        // every reader of the statement.
+        let statement_arena: &'a Arena = unsafe { &*core::ptr::from_ref(statement_arena) };
+        let _ = arena;
+        invocations.read_produced_row(source, index, statement_arena)
+    })
 }
 
 /// Reads a data-modifying `WITH` query's rows for the running statement
@@ -1584,8 +1676,12 @@ pub(crate) struct RoutineInvocationState {
     results: RefCell<RoutineResults>,
     /// Identifies this log across relocation.
     id: u64,
-    writes: RefCell<crate::mem::arena::RetainedList<WriteQueryResult>>,
-    /// The address of the log holding `writes` for a write query's run;
+    /// The data-modifying `WITH` queries this statement runs as their rows
+    /// are read: `write_step_levels` records, leased at the first.
+    producers: RefCell<Option<crate::mem::lease_pool::MutableSlice<WriteProducer>>>,
+    /// A step's write returned its row and ended the attempt there.
+    produced: Cell<bool>,
+    /// The address of the log holding `producers` for a write query's run;
     /// zero for the statement's own log.
     writes_root: Cell<usize>,
     /// The statement reads data-modifying `WITH` queries, so any attempt may
@@ -1869,7 +1965,8 @@ impl RoutineInvocationState {
                 next.set(id.wrapping_add(1));
                 id
             }),
-            writes: RefCell::new(crate::mem::arena::RetainedList::new()),
+            producers: RefCell::new(None),
+            produced: Cell::new(false),
             writes_root: Cell::new(0),
             reads_writes: Cell::new(false),
             inputs: input_progress::RoutineInputs::new(),
@@ -1903,19 +2000,33 @@ impl RoutineInvocationState {
         child
     }
 
-    fn write_query(
+    /// Reads row `index` of a data-modifying `WITH` query, or its end. A row
+    /// the query has not returned yet makes its next step the attempt's
+    /// pending call.
+    fn read_produced_row<'query>(
         &self,
-        arena: &Arena,
-        key: (usize, usize),
-    ) -> Result<Option<WriteQueryResult>, SqlError> {
-        self.writes
-            .borrow()
-            .with_slice(arena, |writes| {
-                writes.iter().find(|write| write.key == key).copied()
-            })
-            .map_err(|_| inactive_pending_call())
+        source: &super::ast::WriteQuerySource<'_>,
+        index: usize,
+        statement_arena: &'query Arena,
+    ) -> Result<ProducedRead<'query>, SqlError> {
+        self.require_arena(statement_arena)?;
+        let key = (source.with.as_ptr() as usize, source.index);
+        let found = self.write_table().produced(statement_arena, key, index)?;
+        match found {
+            Some(Some(row)) => {
+                row.region.skip()?;
+                let bytes = statement_arena
+                    .retained_slice(row.image)
+                    .map_err(|_| inactive_pending_call())?;
+                Ok(ProducedRead::Row(bytes))
+            }
+            Some(None) => Ok(ProducedRead::End),
+            None => Err(self.pend_write_query(source, Some(index), statement_arena)),
+        }
     }
 
+    /// Every row of a data-modifying `WITH` query, once it has run to its
+    /// end; until then, its remaining steps are the attempt's pending call.
     fn resolve_write_query<'query>(
         &self,
         source: &super::ast::WriteQuerySource<'_>,
@@ -1924,56 +2035,70 @@ impl RoutineInvocationState {
     ) -> Result<&'query [&'query [u8]], SqlError> {
         self.require_arena(statement_arena)?;
         let key = (source.with.as_ptr() as usize, source.index);
-        let next = self.next.get();
-        if let Some(write) = self.write_table().write_query(statement_arena, key)? {
-            // A query first read here takes its ordinal in this log, and its
-            // first read in each attempt skips the sequence values it used. A
-            // query first read inside another query's run was skipped with it.
-            if write.owner == self.id {
-                if next == write.ordinal {
-                    self.next.set(next + 1);
-                    super::sequence::restore_replay_cursor(
-                        write.replay,
-                        super::sequence::ReplayInputPosition::KeepConsumed,
-                    )?;
-                } else if next < write.ordinal {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "data-modifying WITH query replay changed order"
-                    ));
-                }
-            }
-            let OwnedRoutineResult::Rows(rows) = write.rows else {
-                return Err(inactive_pending_call());
-            };
-            // The rows stay in the statement arena's retained tail until the
-            // statement ends, after every query that reads them; only the
-            // row index is built in the reading query's memory.
-            let statement_arena: &'query Arena = unsafe { &*core::ptr::from_ref(statement_arena) };
-            return rows.rows(statement_arena, query_arena);
+        let table = self.write_table();
+        if !table.producer_finished(statement_arena, key)? {
+            return Err(self.pend_write_query(source, None, statement_arena));
         }
-        self.next.set(next + 1);
-        self.pending_replay
-            .set(super::sequence::begin_replay_cursor()?);
-        self.pending.set(Some(PendingRoutineInvocation {
-            constant_arguments: false,
-            plan_owner: super::type_input_plans::owner()?,
-            source_position: None,
-            input_collation: super::ast::Collation::None,
-            access: super::eval::RoutineCallAccess::Caller,
-            target: PendingRoutineTarget::WriteQuery(PendingWriteQuery {
-                with: (source.with.as_ptr() as usize, source.with.len()),
-                index: source.index,
-                params: source.params,
-                ordinal: next,
-            }),
-            arguments: PendingRoutineInvocation::capture_arguments(&[], statement_arena)?,
-            argument_count: 0,
-        }));
-        Err(sql_err!(
-            sqlstate::INTERNAL_ROUTINE_INVOCATION,
-            "data-modifying WITH query is pending"
-        ))
+        let mut rows = ArenaList::new(query_arena);
+        let mut index = 0;
+        while let Some(Some(row)) = table.produced(statement_arena, key, index)? {
+            row.region.skip()?;
+            // The rows stay in the statement arena's retained tail until the
+            // statement ends, after every query that reads them.
+            let bytes: &'query [u8] = unsafe {
+                &*core::ptr::from_ref(
+                    statement_arena
+                        .retained_slice(row.image)
+                        .map_err(|_| inactive_pending_call())?,
+                )
+            };
+            rows.push(bytes).map_err(|_| arena_full())?;
+            index += 1;
+        }
+        if let Some(Some(end)) = table.producer_end(statement_arena, key)? {
+            end.skip()?;
+        }
+        Ok(rows.as_slice())
+    }
+
+    fn pend_write_query(
+        &self,
+        source: &super::ast::WriteQuerySource<'_>,
+        row: Option<usize>,
+        statement_arena: &Arena,
+    ) -> SqlError {
+        let pending = (|| {
+            self.pending_replay
+                .set(super::sequence::begin_replay_cursor()?);
+            self.pending.set(Some(PendingRoutineInvocation {
+                constant_arguments: false,
+                plan_owner: super::type_input_plans::owner()?,
+                source_position: None,
+                input_collation: super::ast::Collation::None,
+                access: super::eval::RoutineCallAccess::Caller,
+                target: PendingRoutineTarget::WriteQuery(PendingWriteQuery {
+                    with: (source.with.as_ptr() as usize, source.with.len()),
+                    index: source.index,
+                    params: source.params,
+                    row,
+                }),
+                arguments: PendingRoutineInvocation::capture_arguments(&[], statement_arena)?,
+                argument_count: 0,
+            }));
+            Ok::<_, SqlError>(())
+        })();
+        match pending {
+            Ok(()) => sql_err!(
+                sqlstate::INTERNAL_ROUTINE_INVOCATION,
+                "data-modifying WITH query is pending"
+            ),
+            Err(error) => error,
+        }
+    }
+
+    /// Whether the step's write ended its attempt after the row it returned.
+    pub(crate) fn take_produced(&self) -> bool {
+        self.produced.replace(false)
     }
 
     /// The sequence position where the pending call was first reached.
@@ -1981,45 +2106,169 @@ impl RoutineInvocationState {
         self.pending_replay.take()
     }
 
-    /// Records a finished write query at the ordinal of the read that ran it.
-    pub(crate) fn complete_write_query(
+    /// `Some(Some(row))` for a returned row, `Some(None)` past the last row of
+    /// a query that ended, and `None` for a row not returned yet.
+    fn produced(
         &self,
-        write: PendingWriteQuery,
-        rows: crate::mem::arena::FrozenArenaSliceHandle<u8>,
-        replay: Option<super::sequence::StatementReplayStart>,
         arena: &Arena,
-        scratch: &Arena,
-    ) -> Result<(), SqlError> {
-        self.require_arena(arena)?;
-        if self.results.borrow().len() != write.ordinal {
-            return Err(inactive_pending_call());
+        key: (usize, usize),
+        index: usize,
+    ) -> Result<Option<Option<ProducedRow>>, SqlError> {
+        let producers = self.producers.borrow();
+        let Some(producer) = producers
+            .as_ref()
+            .and_then(|producers| producers.iter().find(|producer| producer.key == key))
+        else {
+            return Ok(None);
+        };
+        if let Some(row) = producer
+            .rows
+            .get(arena, index)
+            .map_err(|_| inactive_pending_call())?
+        {
+            return Ok(Some(Some(row)));
         }
-        let replay = super::sequence::finish_replay_cursor(replay, scratch)?;
-        let rows = OwnedRoutineResult::from_row_image(rows);
-        self.results
-            .borrow_mut()
-            .push(
-                arena,
-                RoutineInvocationResult {
-                    value: rows,
-                    replay,
-                },
-            )
-            .map_err(invocation_results::directory_error)?;
-        self.write_table()
-            .writes
-            .borrow_mut()
-            .push(
-                arena,
-                WriteQueryResult {
-                    key: write.key(),
-                    owner: self.id,
-                    ordinal: write.ordinal,
-                    rows,
-                    replay,
-                },
-            )
-            .map_err(invocation_results::directory_error)
+        Ok(producer.end.map(|_| None))
+    }
+
+    fn producer_finished(&self, arena: &Arena, key: (usize, usize)) -> Result<bool, SqlError> {
+        Ok(self.producer_end(arena, key)?.is_some())
+    }
+
+    fn producer_end(
+        &self,
+        _arena: &Arena,
+        key: (usize, usize),
+    ) -> Result<Option<Option<StepRegion>>, SqlError> {
+        Ok(self.producers.borrow().as_ref().and_then(|producers| {
+            producers
+                .iter()
+                .find(|producer| producer.key == key)
+                .and_then(|producer| producer.end.map(Some))
+        }))
+    }
+
+    /// The number of rows the query returned, and whether it ended.
+    pub(crate) fn producer_state(&self, key: (usize, usize)) -> (usize, bool) {
+        let producers = self.write_table().producers.borrow();
+        producers
+            .as_ref()
+            .and_then(|producers| producers.iter().find(|producer| producer.key == key))
+            .map_or((0, false), |producer| {
+                (producer.rows.len(), producer.end.is_some())
+            })
+    }
+
+    /// Takes the write progress of a query's next step, starting the query
+    /// with `start` at its first step. At most `levels` queries run at once.
+    pub(crate) fn take_producer_progress(
+        &self,
+        key: (usize, usize),
+        pool: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+        levels: usize,
+        start: impl FnOnce() -> Result<super::exec::RowProgress, SqlError>,
+    ) -> Result<super::exec::RowProgress, SqlError> {
+        let table = self.write_table();
+        let mut producers = table.producers.borrow_mut();
+        if producers.is_none() {
+            *producers = Some(pool.lease::<WriteProducer>(levels).map_err(|error| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "data-modifying WITH query progress: {}",
+                    error
+                )
+            })?);
+        }
+        let producers = producers.as_mut().expect("producer records leased");
+        if let Some(producer) = producers.iter_mut().find(|producer| producer.key == key) {
+            return producer.progress.take().ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "a data-modifying WITH query read itself while it ran"
+                )
+            });
+        }
+        if producers.len() == levels {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "data-modifying WITH queries running as their rows are read exceed the {} write_step_levels",
+                levels
+            ));
+        }
+        producers
+            .push(WriteProducer {
+                key,
+                progress: None,
+                rows: crate::mem::arena::RetainedList::new(),
+                end: None,
+            })
+            .map_err(|error| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "data-modifying WITH query progress: {}",
+                    error
+                )
+            })?;
+        start()
+    }
+
+    fn producer_mut<R>(
+        &self,
+        key: (usize, usize),
+        change: impl FnOnce(&mut WriteProducer) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
+        let mut producers = self.write_table().producers.borrow_mut();
+        let producer = producers
+            .as_mut()
+            .and_then(|producers| producers.iter_mut().find(|producer| producer.key == key))
+            .ok_or_else(inactive_pending_call)?;
+        change(producer)
+    }
+
+    /// Records a row a step returned, with the journal region it consumed.
+    pub(crate) fn add_produced_row(
+        &self,
+        key: (usize, usize),
+        row: &[u8],
+        region: StepRegion,
+        arena: &Arena,
+    ) -> Result<(), SqlError> {
+        self.producer_mut(key, |producer| {
+            let image = arena
+                .retain_slice_with(row.len(), |index| row[index])
+                .map_err(|_| arena_full())?;
+            let image = arena
+                .freeze_retained_slice(image)
+                .map_err(|_| inactive_pending_call())?;
+            producer
+                .rows
+                .push(arena, ProducedRow { image, region })
+                .map_err(invocation_results::directory_error)
+        })
+    }
+
+    /// Records that the query ended in a step that consumed `region`.
+    pub(crate) fn finish_producer(
+        &self,
+        key: (usize, usize),
+        region: StepRegion,
+    ) -> Result<(), SqlError> {
+        self.producer_mut(key, |producer| {
+            producer.end = Some(region);
+            Ok(())
+        })
+    }
+
+    /// Gives back the write progress a step took.
+    pub(crate) fn return_producer_progress(
+        &self,
+        key: (usize, usize),
+        progress: super::exec::RowProgress,
+    ) -> Result<(), SqlError> {
+        self.producer_mut(key, |producer| {
+            producer.progress = Some(progress);
+            Ok(())
+        })
     }
 
     pub(crate) fn require_arena(&self, arena: &Arena) -> Result<(), SqlError> {

@@ -79,6 +79,10 @@ struct RowStart {
 
 struct RowResume {
     start: RowStart,
+    /// A data-modifying `WITH` query's step ended at this row's start after
+    /// returning its row: the next step starts the row afresh, so it does
+    /// not replay from where this one stood.
+    fresh: bool,
     transitions: [Option<transition_rows::SavedTransitionRows>; CAPTURES],
     /// The changed row's old and new values, for its `RETURNING` stage.
     returning: Option<transition_rows::SavedTransitionRows>,
@@ -213,8 +217,6 @@ pub(crate) struct StepRecord<'r> {
 /// The steps an interrupted attempt kept, decoded in the statement arena.
 pub(crate) struct ResumedSteps<'a> {
     pub(crate) finished: &'a [StepRecord<'a>],
-    /// Output rows the unfinished step had captured from its kept rows.
-    pub(crate) captured: &'a [&'a [u8]],
 }
 
 pub(crate) struct RowProgress {
@@ -250,6 +252,11 @@ pub(crate) struct RowProgress {
     /// Where the statement's first attempt started: its `AFTER` triggers
     /// belong there, and a run from the start rolls back to it.
     start: Option<(StatementMark, crate::pg::overflow::OutputMark)>,
+    /// A data-modifying `WITH` query's step: the changed-row count at which
+    /// a row's start ends the attempt, the step having returned its row.
+    produce_until: Option<u64>,
+    /// The attempt ended at a row's start for that reason.
+    produced: bool,
 }
 
 impl RowProgress {
@@ -276,7 +283,39 @@ impl RowProgress {
             attempt_effects: 0,
             rows_resumable: false,
             start: None,
+            produce_until: None,
+            produced: false,
         })
+    }
+
+    /// Makes this the progress of a data-modifying `WITH` query's step that
+    /// returns one row: the attempt ends at the start of the first row after
+    /// `changed` rows changed.
+    pub(crate) fn produce_until(&mut self, changed: u64) {
+        self.produce_until = Some(changed);
+    }
+
+    /// Whether this is a data-modifying `WITH` query's step returning one row.
+    pub(crate) fn producing(&self) -> bool {
+        self.produce_until.is_some()
+    }
+
+    /// The step runs its write to the end instead.
+    pub(crate) fn stop_producing(&mut self) {
+        self.produce_until = None;
+    }
+
+    /// A step's attempt starts at `mark`: a row an earlier step ended at
+    /// before starting it rolls back to there, not to that step's end.
+    pub(crate) fn restart_fresh_row(
+        &mut self,
+        mark: StatementMark,
+        output: crate::pg::overflow::OutputMark,
+    ) {
+        if let Some(resume) = self.resume.as_mut().filter(|resume| resume.fresh) {
+            resume.start.mark = mark;
+            resume.start.output = output;
+        }
     }
 
     /// Records where an attempt starts and returns where the first one did.
@@ -325,6 +364,7 @@ impl RowProgress {
         self.steps_exhausted = false;
         self.attempt_effects = query::unreplayable_effect_epoch();
         self.rows_resumable = false;
+        self.produced = false;
         for level in self.steps.iter_mut() {
             level.running = false;
         }
@@ -492,16 +532,15 @@ impl RowProgress {
         self.state = None;
     }
 
-    /// Saves the finished steps' outputs, and the rows the unfinished step
-    /// captured, when an attempt stops for a routine call.
+    /// Saves the finished steps' outputs when an attempt stops for a
+    /// routine call.
     pub(crate) fn keep_steps(
         &mut self,
         finished: &[StepRecord<'_>],
-        captured: &[&[u8]],
         arena: &Arena,
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<(), SqlError> {
-        self.keep_steps_at(self.implicit_level, finished, captured, arena, pool)
+        self.keep_steps_at(self.implicit_level, finished, arena, pool)
     }
 
     /// [`Self::keep_steps`] at a claimed `level`.
@@ -509,7 +548,6 @@ impl RowProgress {
         &mut self,
         level: usize,
         finished: &[StepRecord<'_>],
-        captured: &[&[u8]],
         arena: &Arena,
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<(), SqlError> {
@@ -519,47 +557,20 @@ impl RowProgress {
                 "a write kept a different number of finished steps"
             ));
         }
-        // Captured rows belong to rows the unfinished step keeps; a step that
-        // runs again from its start captures them again. Rows a deeper
-        // statement keeps belong to that statement's own step.
-        let deepest = self.steps[level + 1..]
-            .iter()
-            .all(|deeper| deeper.start.is_none());
-        let captured = if self.resume.is_some() && deepest {
-            captured
-        } else {
-            &[]
-        };
         let mark = arena.mark();
         let saved = (|| {
             let full = |_| crate::sql::query::arena_full_pub();
-            let total = finished
-                .iter()
-                .map(|step| step.rows.len())
-                .sum::<usize>()
-                .checked_add(captured.len())
-                .ok_or_else(crate::sql::query::arena_full_pub)?;
+            let total = finished.iter().map(|step| step.rows.len()).sum::<usize>();
             let mut rows = arena.alloc_slice_with(total, |_| &[][..]).map_err(full)?;
             let mut at = 0;
-            for step in finished
-                .iter()
-                .map(|step| step.rows)
-                .chain(core::iter::once(captured))
-            {
+            for step in finished.iter().map(|step| step.rows) {
                 rows[at..at + step.len()].copy_from_slice(step);
                 at += step.len();
             }
             let counts = arena
-                .alloc_slice_with(finished.len() + 1, |_| &[][..])
+                .alloc_slice_with(finished.len(), |_| &[][..])
                 .map_err(full)?;
-            for (count, step) in
-                counts
-                    .iter_mut()
-                    .zip(finished.iter().copied().chain(core::iter::once(StepRecord {
-                        rows: captured,
-                        affected: 0,
-                    })))
-            {
+            for (count, step) in counts.iter_mut().zip(finished.iter().copied()) {
                 *count = encode_projected_pub(
                     &[
                         Datum::Int8(
@@ -586,16 +597,8 @@ impl RowProgress {
         Ok(())
     }
 
-    /// The steps an interrupted attempt kept, copied into `arena`; `None`
-    /// before any attempt stopped after a finished step or kept rows.
-    pub(crate) fn resumed_steps<'a>(
-        &self,
-        arena: &'a Arena,
-    ) -> Result<Option<ResumedSteps<'a>>, SqlError> {
-        self.resumed_steps_at(self.implicit_level, arena)
-    }
-
-    /// [`Self::resumed_steps`] at a claimed `level`.
+    /// The steps an interrupted attempt kept at a claimed `level`, copied
+    /// into `arena`; `None` before any attempt stopped after a finished step.
     pub(crate) fn resumed_steps_at<'a>(
         &self,
         level: usize,
@@ -619,7 +622,7 @@ impl RowProgress {
                 _ => Err(changed_steps()),
             }
         };
-        let (captured_counts, finished_counts) = rows.new.split_last().ok_or_else(changed_steps)?;
+        let finished_counts = rows.new;
         let records = arena
             .alloc_slice_with(finished_counts.len(), |_| StepRecord {
                 rows: &[],
@@ -633,17 +636,10 @@ impl RowProgress {
             record.affected = count(counts, 1)? as u64;
             at += length;
         }
-        let captured_length = count(captured_counts, 0)?;
-        let captured = copied
-            .get(at..at + captured_length)
-            .ok_or_else(changed_steps)?;
-        if at + captured_length != copied.len() || records.len() > self.steps[level].finished {
+        if at != copied.len() || records.len() > self.steps[level].finished {
             return Err(changed_steps());
         }
-        Ok(Some(ResumedSteps {
-            finished: records,
-            captured,
-        }))
+        Ok(Some(ResumedSteps { finished: records }))
     }
 
     /// Whether this attempt continues rows an earlier attempt changed.
@@ -671,8 +667,9 @@ impl RowProgress {
     /// Called where the selection starts, after statement-level triggers.
     /// A resumed attempt replays from the same position as the first one.
     pub(super) fn enter_selection(&mut self) -> Result<(), SqlError> {
+        // A data-modifying `WITH` query's next step selects afresh.
         match self.selection {
-            Some(point) if self.resume.is_some() => point.seek(),
+            Some(point) if self.resume.as_ref().is_some_and(|resume| !resume.fresh) => point.seek(),
             _ => {
                 self.selection = Some(ReplayPoint::capture()?);
                 Ok(())
@@ -698,13 +695,18 @@ impl RowProgress {
                 transitions: [None; CAPTURES],
             });
         };
-        if !row_at(resume.start.index).is_some_and(|row| same_row(row, resume.start.row)) {
+        let row = row_at(resume.start.index);
+        // A step that ended after its write's last row resumes at the end.
+        let at_end = resume.fresh && resume.start.row.is_none() && row.is_none();
+        if !at_end && !row.is_some_and(|row| same_row(row, resume.start.row)) {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "a resumed write selected different rows"
             ));
         }
-        resume.start.point.seek()?;
+        if !resume.fresh {
+            resume.start.point.seek()?;
+        }
         Ok(ResumedRows {
             first: resume.start.index,
             changed: resume.start.changed,
@@ -1096,6 +1098,7 @@ impl RowProgress {
         }
         self.resume = Some(RowResume {
             start,
+            fresh: core::mem::take(&mut self.produced),
             transitions,
             returning,
             state: self.state.take(),
@@ -1244,7 +1247,35 @@ pub(super) fn start_row<'a>(
         return Ok(Some(resumed));
     }
     progress.begin_row(index, row, changed, transitions, txn, responder)?;
+    if progress.produce_until.is_some_and(|until| changed >= until) {
+        // A data-modifying `WITH` query's step returned its row: its reader
+        // reads it before this row reads its source.
+        progress.produced = true;
+        return Err(query::producer_yield());
+    }
     Ok(None)
+}
+
+/// After a write's last row: the step of a data-modifying `WITH` query that
+/// returned its row ends at index `index`, past the rows, so its reader
+/// reads the row before the query finds its end, as in PostgreSQL.
+pub(super) fn end_rows(
+    progress: Option<&mut RowProgress>,
+    index: usize,
+    changed: u64,
+    transitions: CaptureLengths,
+    txn: &TxnState,
+    responder: &Responder<'_>,
+) -> Result<(), SqlError> {
+    let Some(progress) = progress else {
+        return Ok(());
+    };
+    if !progress.produce_until.is_some_and(|until| changed >= until) {
+        return Ok(());
+    }
+    progress.begin_row(index, None, changed, transitions, txn, responder)?;
+    progress.produced = true;
+    Err(query::producer_yield())
 }
 
 /// After a write's row phase: an attempt that stopped for a routine call

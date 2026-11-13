@@ -4870,6 +4870,38 @@ pub(crate) fn select_reads_repeatably(select: &Select<'_>, storage: &Storage, tx
     })
 }
 
+/// Whether an `INSERT ... SELECT` source streams although its output list
+/// calls volatile or user routines: everything that decides which rows it
+/// reads stays repeatable, so an attempt that skips the rows already
+/// written reads the same rows without evaluating their output again, and
+/// each written row evaluates its output as PostgreSQL's ModifyTable pulls
+/// it. Ordering or `DISTINCT` would evaluate output ahead of its row.
+pub(crate) fn select_streams_with_calls(select: &Select<'_>, storage: &Storage, txid: u32) -> bool {
+    if !select.order_by.is_empty()
+        || !select.group_by.is_empty()
+        || !select.grouping_sets.is_empty()
+        || select.having.is_some()
+        || select.distinct
+        || !select.distinct_on.is_empty()
+        || !select.windows.is_empty()
+        || !select.with.is_empty()
+        || select.set_body.is_some()
+        || !select.locking.is_empty()
+    {
+        return false;
+    }
+    let calls = |name: &str, arity: usize| {
+        super::super::ast::is_volatile_function(name)
+            || storage.has_non_aggregate_routine_candidate(name, arity, txid)
+            || storage.has_aggregate_routine_candidate(name, arity, txid)
+    };
+    let rest = Select {
+        items: &[],
+        ..*select
+    };
+    !select_contains_function(&rest, &calls)
+}
+
 pub(super) fn select_contains_volatile(select: &Select<'_>, storage: &Storage, txid: u32) -> bool {
     select_contains_function(select, &|name, arguments| {
         super::super::ast::is_volatile_function(name)

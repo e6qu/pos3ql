@@ -133,6 +133,13 @@ enum RetainedSource<'a> {
         kinds: &'a [super::generator::GeneratorKind],
         generator: Option<super::generator::FunctionRows<'a>>,
     },
+    /// A data-modifying `WITH` query read as it runs: each row past the
+    /// ones it returned runs its next step, as PostgreSQL's CTE scan pulls
+    /// its ModifyTable node. `next` is `usize::MAX` once closed.
+    Produced {
+        source: crate::sql::ast::WriteQuerySource<'a>,
+        next: usize,
+    },
     /// The queries of a `UNION ALL`, read one after another as PostgreSQL's
     /// Append node does; each row is coerced to the combined column types.
     Append {
@@ -155,6 +162,7 @@ impl<'a> RetainedSource<'a> {
                     generator.rewind();
                 }
             }
+            Self::Produced { next, .. } => *next = 0,
             Self::Append { .. } => {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -173,6 +181,7 @@ impl<'a> RetainedSource<'a> {
             Self::Generated { generator, .. } => {
                 *generator = Some(super::generator::FunctionRows::finished());
             }
+            Self::Produced { next, .. } => *next = usize::MAX,
             Self::Append { branches, next, .. } => *next = branches.len(),
         }
     }
@@ -1597,6 +1606,20 @@ fn next_source_row<'a>(
             .expect("generator starts with the cursor's first fetch")
             .next_encoded(state_arena)
             .map(|row| row.map(RetainedRow::Literal)),
+        RetainedSource::Produced { source, next } => {
+            if *next == usize::MAX {
+                return Ok(None);
+            }
+            // A row not returned yet ends this read with the query's next
+            // step pending; the same read runs again after it.
+            match super::read_write_query_row(source, *next, state_arena)? {
+                super::ProducedRead::Row(bytes) => {
+                    *next += 1;
+                    Ok(Some(RetainedRow::Literal(bytes)))
+                }
+                super::ProducedRead::End => Ok(None),
+            }
+        }
         RetainedSource::Append { .. } => Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
             "appended rows are read through their plan"
@@ -2929,11 +2952,23 @@ impl<'a> RetainedSelect<'a> {
         let generated = from
             .filter(|from| from.joins.is_empty() && from.base.is_function_source())
             .and_then(|from| retained_function_source(&from.base, storage, txid, arena));
+        // A data-modifying `WITH` query a statement reads as it runs.
+        let produced = from
+            .filter(|from| {
+                from.joins.is_empty()
+                    && from.base.sample.is_none()
+                    && mode == RetainedMode::Statement
+            })
+            .and_then(|from| from.base.cte)
+            .and_then(|cte| match cte.source {
+                crate::sql::ast::MaterializedCteSource::Write(source) => Some(source),
+                _ => None,
+            });
         if from.is_some_and(|from| {
             !from.joins.is_empty()
                 || from.base.is_function_source() && generated.is_none()
                 || from.base.subquery.is_some() && !literals && appended.is_none()
-                || from.base.cte.is_some()
+                || from.base.cte.is_some() && produced.is_none()
                 || from.base.sample.is_some()
                 || matches!(
                     storage.resolve_relation(from.base.schema, from.base.table, txid),
@@ -2959,6 +2994,7 @@ impl<'a> RetainedSelect<'a> {
             && (mode == RetainedMode::Statement
                 || literals
                 || generated.is_some()
+                || produced.is_some()
                 || from.is_none())
             || self_sorts && (locks || from.is_none())
         {
@@ -3007,6 +3043,7 @@ impl<'a> RetainedSelect<'a> {
                     || !literals
                         && generated.is_none()
                         && appended.is_none()
+                        && produced.is_none()
                         && (scope.derived[0].is_some() || scope.slots[0] == usize::MAX)
                 {
                     return Ok(None);
@@ -3076,9 +3113,9 @@ impl<'a> RetainedSelect<'a> {
             }
         }
         let binding_columns = Some(&columns);
-        let table = if let Some(from) =
-            from.filter(|_| !literals && generated.is_none() && appended.is_none())
-        {
+        let table = if let Some(from) = from.filter(|_| {
+            !literals && generated.is_none() && appended.is_none() && produced.is_none()
+        }) {
             let table = scope.slots[0];
             let definition = scope.defs.stored(0).expect("resolved physical source");
             if definition.kind != crate::storage::TableKind::Local
@@ -3353,6 +3390,11 @@ impl<'a> RetainedSelect<'a> {
                 function: &from.base,
                 kinds: generated,
                 generator: eliminated.then(super::generator::FunctionRows::finished),
+            }
+        } else if let Some(source) = produced {
+            RetainedSource::Produced {
+                source,
+                next: if eliminated { usize::MAX } else { 0 },
             }
         } else if literals {
             let rows = scope.derived[0].expect("literal derived source owns encoded rows");
@@ -3984,6 +4026,12 @@ impl<'a> RetainedSelect<'a> {
         // The caller has emitted or dropped every evaluation value of the
         // row.
         self.plan.release(state_arena);
+    }
+
+    /// Whether the reader reads its whole input or runs subqueries at its
+    /// first row, where a build that does not fit is reported.
+    pub(crate) fn prepares_ahead(&self) -> bool {
+        self.plan.sort().is_some() || self.plan.group().is_some() || !self.sublinks.is_empty()
     }
 
     /// Whether the statement's RowDescription still waits for its first

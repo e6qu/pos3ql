@@ -1,6 +1,7 @@
 //! A real wait transfers typed invocation receipts out of temporary query memory.
 
 use super::*;
+use crate::mem::arena::RetainedList;
 
 impl OwnedRoutineCallContract {
     fn relocate(self, source: &Arena, target: &Arena) -> Result<Self, SqlError> {
@@ -57,14 +58,59 @@ impl RoutineInvocationState {
         reason = "failed relocation returns the original invocation owner"
     )]
     pub(crate) fn relocate(self, source: &Arena, target: &Arena) -> Result<Self, (Self, SqlError)> {
-        let copied = self.copy_receipts(source, target);
+        let copied = self
+            .copy_receipts(source, target)
+            .and_then(|output| Ok((output, self.copy_produced_rows(source, target)?)));
         match copied {
-            Ok(mut output) => {
+            Ok((mut output, mut rows)) => {
                 output.suspended = RefCell::new(self.suspended.into_inner());
+                let mut producers = self.producers.into_inner();
+                if let Some(producers) = producers.as_mut() {
+                    for (producer, rows) in producers.iter_mut().zip(rows.iter_mut()) {
+                        producer.rows = core::mem::replace(rows, RetainedList::new());
+                    }
+                }
+                output.producers = RefCell::new(producers);
                 Ok(output)
             }
             Err(error) => Err((self, error)),
         }
+    }
+
+    /// The rows each data-modifying `WITH` query returned, copied to `target`.
+    fn copy_produced_rows(
+        &self,
+        source: &Arena,
+        target: &Arena,
+    ) -> Result<[RetainedList<ProducedRow>; crate::config::Config::MAX_WRITE_STEP_LEVELS], SqlError>
+    {
+        let mut copied = core::array::from_fn(|_| RetainedList::new());
+        let producers = self.producers.borrow();
+        for (producer, rows) in producers
+            .iter()
+            .flat_map(|producers| producers.iter())
+            .zip(copied.iter_mut())
+        {
+            for index in 0..producer.rows.len() {
+                let row = producer
+                    .rows
+                    .get(source, index)
+                    .map_err(|_| inactive_pending_call())?
+                    .ok_or_else(inactive_pending_call)?;
+                let bytes = source
+                    .retained_slice(row.image)
+                    .map_err(|_| inactive_pending_call())?;
+                let image = target
+                    .retain_slice_with(bytes.len(), |index| bytes[index])
+                    .map_err(|_| arena_full())?;
+                let image = target
+                    .freeze_retained_slice(image)
+                    .map_err(|_| inactive_pending_call())?;
+                rows.push(target, ProducedRow { image, ..row })
+                    .map_err(invocation_results::directory_error)?;
+            }
+        }
+        Ok(copied)
     }
 
     fn copy_receipts(&self, source: &Arena, target: &Arena) -> Result<Self, SqlError> {
@@ -92,24 +138,6 @@ impl RoutineInvocationState {
                     RoutineInvocationResult {
                         value,
                         replay: saved.replay,
-                    },
-                )
-                .map_err(invocation_results::directory_error)?;
-        }
-        let writes = self.writes.borrow();
-        for index in 0..writes.len() {
-            let write = writes
-                .get(source, index)
-                .map_err(|_| inactive_pending_call())?
-                .ok_or_else(inactive_pending_call)?;
-            output
-                .writes
-                .borrow_mut()
-                .push(
-                    target,
-                    WriteQueryResult {
-                        rows: write.rows.relocate(source, target)?,
-                        ..write
                     },
                 )
                 .map_err(invocation_results::directory_error)?;

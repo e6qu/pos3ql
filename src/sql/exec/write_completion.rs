@@ -342,7 +342,6 @@ impl PendingNestedWrite {
             depth: command.trigger_depth(),
             retained: prior.is_some_and(|boundary| boundary.retained),
             statement_end: false,
-            step: false,
         });
         let result = self.completion.poll(&mut TriggerExecContext {
             host: context.host.reborrow(),
@@ -390,9 +389,6 @@ struct WriteCompletionState {
     command: u32,
     depth: u16,
     boundary: super::super::txn::StatementMark,
-    /// For one step of a rule-rewritten statement: whether its rule loop
-    /// recorded the step finished.
-    step: Option<bool>,
     /// The statement's sequence replay position where the selected event
     /// started: an event that runs again replays its own calls from here.
     event_replay: Option<sequence::StatementReplayStart>,
@@ -405,7 +401,7 @@ impl SuspendedWriteCompletion {
         context: &mut TriggerExecContext<'_, '_, '_>,
         target: crate::storage::TriggerTarget,
         transitions: TransitionRowSets<'_>,
-        boundary: super::super::txn::WriteCompletionBoundary,
+        boundary: super::super::txn::StatementMark,
     ) -> Result<Self, SqlError> {
         let mut state = context
             .storage()
@@ -438,8 +434,7 @@ impl SuspendedWriteCompletion {
                 transaction: context.txn.txid,
                 command: context.txn.command_id(),
                 depth: context.txn.trigger_depth(),
-                boundary: boundary.mark,
-                step: boundary.step.then_some(false),
+                boundary,
                 event_replay: sequence::begin_replay_cursor()?,
             })
             .map_err(control_flow::execution_full)?;
@@ -448,26 +443,6 @@ impl SuspendedWriteCompletion {
 
     pub(crate) fn boundary(&self) -> super::super::txn::StatementMark {
         self.state[0].boundary
-    }
-
-    /// Whether the completion belongs to one step of a rule-rewritten
-    /// statement, which runs another attempt for its later steps once the
-    /// completion ends.
-    pub(crate) fn step(&self) -> bool {
-        self.state[0].step.is_some()
-    }
-
-    /// The step's row count, the first time its rule loop asks: the loop
-    /// records the step finished and the completion replies with its count
-    /// only, the statement's command tag following its last step.
-    pub(crate) fn claim_step(&mut self) -> Option<u64> {
-        let state = &mut self.state[0];
-        if state.step != Some(false) {
-            return None;
-        }
-        state.step = Some(true);
-        state.cursor.reply = CompletionReply::CountOnly;
-        Some(state.cursor.completion.rows())
     }
 
     pub(super) fn poll(&mut self, context: &mut TriggerExecContext<'_, '_, '_>) -> Outcome {
@@ -586,7 +561,6 @@ pub(in crate::sql) fn resume(
         depth: txn.trigger_depth(),
         retained: true,
         statement_end: true,
-        step: false,
     });
     let result = completion.poll(&mut TriggerExecContext {
         host: PlpgsqlExecHost::Routine {
@@ -1001,7 +975,7 @@ impl WriteCompletion {
                 &mut context,
                 target,
                 transitions,
-                boundary,
+                boundary.mark,
             ) {
                 Ok(pending) => pending,
                 Err(error) => return sql_fail(error),

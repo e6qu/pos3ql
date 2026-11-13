@@ -138,14 +138,19 @@ is owned.
   sub-statements still reads synchronously); a
   statement whose restarts repeat downloads without progress reads the rest
   synchronously (`statement_restart_waits`), so it finishes with empty
-  caches. The `AFTER` work of a top-level rule-rewritten write's steps
-  yields: the step stays finished and the statement continues with the steps
-  after it. The `AFTER` work (foreign key checks included) of a data-modifying
-  `WITH` main statement's steps, of rule steps nested in a routine body, and
+  caches. The `AFTER` work (foreign key checks included) of those steps and
   of writes inside functions called from a restartable statement still reads
-  synchronously: giving those a step completion needs the same step record in
-  their enclosing write's attempt loop, which a routine body's write and the
-  `WITH` statement's steps do not hand to it yet. A data-modifying `WITH`
+  synchronously: a step's foreign key check that waited resumed the step at a
+  completion position past its last row and then waited again without a new
+  GET, a loop the download bound does not see. Handing a rule step's `AFTER`
+  work to the attempt loop (a completion boundary per step that marks the
+  step finished, `RuleSteps::finish` and `keep_steps_at` on suspension, then
+  another attempt that skips finished steps and replays from the point after
+  that work) runs the steps after it in a new attempt; there a rule action
+  that evaluates the original statement's source again (`INSERT INTO t
+  SELECT f(g) ...` under `DO ALSO INSERT ... VALUES (NEW.a * 10)`) lost the
+  notices of its second calls of `f` in fixture 334, a cause not yet
+  isolated, so the change was not kept. A data-modifying `WITH`
   `INSERT` runs as its rows are read, as PostgreSQL's CTE scan pulls its
   ModifyTable node (`src/sql/driven_insert.rs`): each read past the rows it
   returned runs one more step, which writes source rows until one returns a

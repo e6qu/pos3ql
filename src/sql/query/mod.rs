@@ -1682,9 +1682,6 @@ pub(crate) struct RoutineInvocationState {
     pub(super) execution: RoutineExecution,
     unowned_values: Cell<bool>,
     next: Cell<usize>,
-    /// Where each attempt starts replaying: past the calls of steps that
-    /// finished before an attempt ran their `AFTER` work.
-    first: Cell<usize>,
     pending: Cell<Option<PendingRoutineInvocation>>,
     pending_replay: Cell<Option<super::sequence::StatementReplayStart>>,
     /// The transaction's effects when the pending trigger firing started.
@@ -1972,7 +1969,6 @@ impl RoutineInvocationState {
             execution,
             unowned_values: Cell::new(false),
             next: Cell::new(0),
-            first: Cell::new(0),
             pending: Cell::new(None),
             pending_replay: Cell::new(None),
             pending_firing: Cell::new(None),
@@ -2335,12 +2331,6 @@ impl RoutineInvocationState {
         })
     }
 
-    /// Later attempts start replay where this one stands: the steps before
-    /// were finished and their calls are not evaluated again.
-    pub(crate) fn begin_attempts_here(&self) {
-        self.first.set(self.next.get());
-    }
-
     pub(crate) fn require_arena(&self, arena: &Arena) -> Result<(), SqlError> {
         if self.owner != arena.identity() {
             return Err(inactive_pending_call());
@@ -2359,7 +2349,7 @@ impl RoutineInvocationState {
     }
 
     pub(crate) fn begin_attempt(&self) {
-        self.next.set(self.first.get());
+        self.next.set(0);
         self.pending.set(None);
         self.pending_firing.set(None);
         self.inputs.begin_attempt();

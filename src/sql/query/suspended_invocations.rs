@@ -121,7 +121,6 @@ impl RoutineInvocationState {
         let output = Self::new(target, self.execution);
         output.unowned_values.set(self.unowned_values.get());
         output.next.set(self.next.get());
-        output.first.set(self.first.get());
         output.pending.set(
             self.pending
                 .get()

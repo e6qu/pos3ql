@@ -159,7 +159,6 @@ fn run<'a>(
         depth: context.txn.trigger_depth(),
         retained: true,
         statement_end: false,
-        step: false,
     });
     context.txn.running_procedures = context
         .txn

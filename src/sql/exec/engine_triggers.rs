@@ -300,7 +300,6 @@ fn run_pending_firing<'w, Definition0: crate::storage::DefinitionBacking>(
         depth: txn.trigger_depth(),
         retained: true,
         statement_end: false,
-        step: false,
     });
     let mut context = TriggerExecContext {
         host: PlpgsqlExecHost::Routine {

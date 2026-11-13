@@ -544,7 +544,6 @@ impl SqlExecution {
             depth: context.txn.trigger_depth(),
             retained: self.policy == query::RoutineExecution::Retained,
             statement_end: false,
-            step: false,
         });
         let name = self.source.name;
         let inlining = self.source.inlining(&parsed.program);

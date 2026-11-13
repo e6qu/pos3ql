@@ -479,10 +479,11 @@ per-element expression text in the constraint's journal and checkpoint
 records, element evaluation in the conflict scan, `indkey` 0 and `indexprs`
 in `pg_index`, and handling of every path that copies or renumbers
 exclusion columns (`LIKE`, inheritance, partition attach, `DROP COLUMN`,
-column renames). A deferred unique or exclusion constraint that fails when an
-implicit transaction commits reports its error after the statement's
-`CommandComplete` (psql prints `INSERT 0 1` and then the error), where
-PostgreSQL commits before sending the last statement's `CommandComplete`. A statement's own catalog scans, including those through views, read the
+column renames). A deferred unique or exclusion check that fails at commit runs before
+or after the row's deferred constraint triggers by a separate queue, where
+PostgreSQL fires it among them in trigger-name order
+(`PK_ConstraintTrigger`, `Unique_ConstraintTrigger`), so a deferred trigger's
+notice can precede the error that PostgreSQL reports first. A statement's own catalog scans, including those through views, read the
 catalog as the statement began (images built at its start), so `SELECT mk(g),
 (SELECT count(*) FROM pg_class WHERE relname LIKE 'made_%') FROM
 generate_series(1, 3) g`, where `mk` creates a table, counts none, as
@@ -543,9 +544,7 @@ whole-row reference to a table (`SELECT t FROM t`) is typed `record`, where
 PostgreSQL types it as the table's row type `t`, so comparing one with an
 untyped literal (`WHERE t = '(1,a)'`) fails with `42883` where PostgreSQL
 reports `0A000`; whole-row index keys (`CREATE INDEX ON t ((t))`) do have the
-row type. An index scan on such a key needs a constant operand
-(`'(1,a)'::t`): `ROW(1, 'a')::t` is a call the planner does not fold, so it
-scans the table where PostgreSQL uses the index. A row constructor casts to a table's row type
+row type. A row constructor casts to a table's row type
 (`ROW(1, 'a')::t`) but not to a view's, and an array of a table's row type
 (`ARRAY[ROW(1, 'a')::t]`) fails with `0A000`, where PostgreSQL accepts both.
 A PL/pgSQL variable declared with a view's row type (`r v;` or

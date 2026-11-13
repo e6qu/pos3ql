@@ -356,6 +356,48 @@ fn whole_row_constraints_and_indexes_name_depend_and_print_like_postgresql() {
         ),
         vec!["CREATE INDEX wr_row ON public.wr USING btree ((wr.*))"]
     );
+    // A row constructor cast to the row type is a constant, so it can probe
+    // the whole-row key like the literal form, as PostgreSQL folds it.
+    rows(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX wr_row ON wr ((wr)); \
+         INSERT INTO wr SELECT g, 'x' || g FROM generate_series(1, 50) g",
+    );
+    for predicate in ["wr = '(7,x7)'::wr", "wr = ROW(7, 'x7')::wr"] {
+        assert_eq!(
+            rows(
+                &mut engine,
+                &mut budget,
+                &format!("EXPLAIN (COSTS OFF) SELECT a FROM wr WHERE {predicate}"),
+            ),
+            vec!["Index Scan using wr_row on wr"],
+            "{predicate}"
+        );
+        assert_eq!(
+            rows(
+                &mut engine,
+                &mut budget,
+                &format!("SELECT a FROM wr WHERE {predicate}"),
+            ),
+            vec!["7"],
+            "{predicate}"
+        );
+    }
+    // A routine call in the constructor is evaluated per row instead.
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "EXPLAIN (COSTS OFF) SELECT a FROM wr WHERE wr = ROW(abs(-7), 'x7')::wr",
+        ),
+        vec!["Seq Scan on wr"]
+    );
+    rows(
+        &mut engine,
+        &mut budget,
+        "DROP INDEX wr_row; DELETE FROM wr",
+    );
     rows(&mut engine, &mut budget, "ALTER TABLE wr RENAME TO wr2");
     assert_eq!(
         rows(

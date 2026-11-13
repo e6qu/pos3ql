@@ -4661,6 +4661,34 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         )
     }
 
+    fn validate_literal_input(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
+        crate::sql::catalog::validate_literal_input(
+            self.storage,
+            self.txid,
+            text,
+            target_oid,
+            self.routine_workspace,
+        )
+    }
+
+    fn validate_call_literal_inputs(
+        &self,
+        selection: crate::sql::eval::RoutineCallSelection,
+        args: &[&crate::sql::ast::Expr<'_>],
+        argument_names: &[Option<&str>],
+        variadic: bool,
+    ) -> Result<(), SqlError> {
+        crate::sql::catalog::validate_call_literal_inputs(
+            self.storage,
+            self.txid,
+            selection,
+            args,
+            argument_names,
+            variadic,
+            self.routine_workspace,
+        )
+    }
+
     fn validate_explicit_cast(
         &self,
         source: i32,
@@ -8581,6 +8609,13 @@ pub(crate) fn check_literal_operands_typed<'a>(
         let Some(ctype) = infer(other) else {
             return Ok(());
         };
+        // Object-identifier types compare with the `oid` operators, so the
+        // literal converts to `oid`, not to the other operand's type.
+        let ctype = if ctype == ColType::Regtype || ctype.is_reg_object() {
+            ColType::Oid
+        } else {
+            ctype
+        };
         let numeric = matches!(
             ctype,
             ColType::Int2
@@ -8598,6 +8633,7 @@ pub(crate) fn check_literal_operands_typed<'a>(
                     | ColType::Timestamp
                     | ColType::Timestamptz
                     | ColType::Uuid
+                    | ColType::Oid
             );
         if !(if arithmetic { numeric } else { comparable }) {
             return Ok(());
@@ -15187,6 +15223,34 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
             self.txid,
             text,
             target_oid,
+            self.arena,
+        )
+    }
+
+    fn validate_literal_input(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
+        crate::sql::catalog::validate_literal_input(
+            self.storage,
+            self.txid,
+            text,
+            target_oid,
+            self.arena,
+        )
+    }
+
+    fn validate_call_literal_inputs(
+        &self,
+        selection: crate::sql::eval::RoutineCallSelection,
+        args: &[&crate::sql::ast::Expr<'_>],
+        argument_names: &[Option<&str>],
+        variadic: bool,
+    ) -> Result<(), SqlError> {
+        crate::sql::catalog::validate_call_literal_inputs(
+            self.storage,
+            self.txid,
+            selection,
+            args,
+            argument_names,
+            variadic,
             self.arena,
         )
     }

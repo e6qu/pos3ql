@@ -660,6 +660,34 @@ impl ColTypeResolver for CatalogCols<'_> {
         )
     }
 
+    fn validate_literal_input(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
+        crate::sql::catalog::validate_literal_input(
+            self.storage,
+            self.txid,
+            text,
+            target_oid,
+            self.arena,
+        )
+    }
+
+    fn validate_call_literal_inputs(
+        &self,
+        selection: crate::sql::eval::RoutineCallSelection,
+        args: &[&crate::sql::ast::Expr<'_>],
+        argument_names: &[Option<&str>],
+        variadic: bool,
+    ) -> Result<(), SqlError> {
+        crate::sql::catalog::validate_call_literal_inputs(
+            self.storage,
+            self.txid,
+            selection,
+            args,
+            argument_names,
+            variadic,
+            self.arena,
+        )
+    }
+
     fn is_empty_scope(&self) -> bool {
         self.definition.is_none()
     }
@@ -2041,6 +2069,25 @@ pub trait ColTypeResolver {
             sqlstate::FEATURE_NOT_SUPPORTED,
             "enum input validation requires a catalog"
         ))
+    }
+
+    /// Runs a built-in type's input routine on an UNKNOWN literal
+    /// during analysis. A scope without a catalog leaves the check to the
+    /// evaluation that converts the literal.
+    fn validate_literal_input(&self, _text: &str, _target_oid: i32) -> Result<(), SqlError> {
+        Ok(())
+    }
+
+    /// [`Self::validate_literal_input`] for the UNKNOWN literals
+    /// a selected routine call passes.
+    fn validate_call_literal_inputs(
+        &self,
+        _selection: crate::sql::eval::RoutineCallSelection,
+        _args: &[&Expr<'_>],
+        _argument_names: &[Option<&str>],
+        _variadic: bool,
+    ) -> Result<(), SqlError> {
+        Ok(())
     }
 
     /// True only when no relation scope can answer a column reference.
@@ -4785,6 +4832,11 @@ pub(crate) fn visit_array_constructor_conversions(
             {
                 columns.validate_enum_input_literal(text, target_oid)?;
             }
+            if let Expr::Str(text) = item {
+                columns
+                    .validate_literal_input(text, target_oid)
+                    .map_err(|error| crate::sql::error_position::at_subject(error, text))?;
+            }
             visit(infer_routine_argument_oid(item, columns)?, target_oid)?;
         }
     }
@@ -5385,6 +5437,16 @@ fn infer_type_unpositioned(
     }
     let of = |t: ColType| (t.oid(), t.typlen());
     let selected = selected_call(expression, columns)?;
+    if let Some(selection) = selected
+        && let Expr::Call {
+            args,
+            argument_names,
+            variadic,
+            ..
+        } = expression
+    {
+        columns.validate_call_literal_inputs(selection, args, argument_names, *variadic)?;
+    }
     if let Expr::Call {
         kind: crate::sql::ast::CallKind::SqlSyntax,
         name,
@@ -5750,6 +5812,11 @@ fn infer_type_unpositioned(
                 {
                     columns.validate_enum_input_literal(text, target_oid)?;
                 }
+                if let Expr::Str(text) = operand {
+                    columns
+                        .validate_literal_input(text, target_oid)
+                        .map_err(|error| crate::sql::error_position::at_subject(error, text))?;
+                }
                 let source_oid =
                     if matches!(*operand, Expr::Array(_)) && matches!(target, ColType::Array(_)) {
                         target_oid
@@ -5781,7 +5848,10 @@ fn infer_type_unpositioned(
                 None => (oid::UNKNOWN, -2),
             }
         }
-        Expr::IsNull { .. } => of(ColType::Bool),
+        Expr::IsNull { operand, .. } => {
+            infer_type_res(operand, columns)?;
+            of(ColType::Bool)
+        }
         Expr::InList { operand, list, .. } => {
             let left_oid = infer_type_res(operand, columns)?.0;
             let left = coltype_of_oid(left_oid);

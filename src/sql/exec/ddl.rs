@@ -531,33 +531,55 @@ pub(super) fn resolve_default(
         let source_oid =
             crate::sql::eval::expression_type_identity(expression, &NoColumns, &hooks)?
                 .routine_argument_oid();
-        let v = match ctype {
-            ColType::Array(crate::sql::types::ArrElem::Domain { .. })
-                if source_oid == ctype.oid() =>
-            {
-                v
-            }
-            ColType::Enum(slot) => super::coerce_enum_value(v, slot, storage, txid, arena)?,
-            ColType::Array(
-                element @ (crate::sql::types::ArrElem::Enum(_)
-                | crate::sql::types::ArrElem::Domain { .. }),
-            ) => super::coerce_user_type_array(v, element, storage, txid, arena, None)?,
-            ColType::Array(element) if element.is_catalog_reference() => {
-                let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
-                crate::sql::eval::reg_array_cast(v, element, Some(&catalog), arena)?
-            }
-            target if target.is_reg_object() => {
-                let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
-                crate::sql::eval::regobject_cast(v, target, Some(&catalog), arena)?
-            }
-            _ => cast_to(v, ctype, arena)?,
-        };
+        // A literal converts with the column type's input routine, reported
+        // at the literal.
+        let v = (|| -> Result<_, SqlError> {
+            Ok(match ctype {
+                ColType::Array(crate::sql::types::ArrElem::Domain { .. })
+                    if source_oid == ctype.oid() =>
+                {
+                    v
+                }
+                ColType::Enum(slot) => super::coerce_enum_value(v, slot, storage, txid, arena)?,
+                ColType::Array(
+                    element @ (crate::sql::types::ArrElem::Enum(_)
+                    | crate::sql::types::ArrElem::Domain { .. }),
+                ) => super::coerce_user_type_array(v, element, storage, txid, arena, None)?,
+                ColType::Array(element) if element.is_catalog_reference() => {
+                    let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+                    crate::sql::eval::reg_array_cast(v, element, Some(&catalog), arena)?
+                }
+                target if target.is_reg_object() => {
+                    let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+                    crate::sql::eval::regobject_cast(v, target, Some(&catalog), arena)?
+                }
+                _ => cast_to(v, ctype, arena)?,
+            })
+        })()
+        .map_err(|error| crate::sql::error_position::at_expression(error, expression))?;
         let v = apply_typmod(v, ctype, type_mod, arena)?;
         return Ok(ColumnDefault::Constant {
             value: OwnedDatum::from_datum(&v)?,
             expression: store_default_text(default_text)?,
         });
     }
+    // The expression is analysed when the column is defined: its functions
+    // resolve and its literals run their inputs.
+    let mark = arena.mark();
+    let analysed = super::infer_type_res(
+        expression,
+        &super::CatalogCols {
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        },
+    );
+    // Only the verdict leaves; analysis scratch is discarded.
+    unsafe { arena.rewind_to(mark) };
+    analysed?;
     let source = store_default_text(default_text)?;
     Ok(ColumnDefault::Expression(
         crate::sql::enum_values::checks::bind_default::<{ crate::storage::DEFAULT_EXPR_MAX }>(

@@ -4949,6 +4949,165 @@ pub(crate) fn validate_enum_input_literal(
         .map_err(|_| super::query::arena_full_pub())?
 }
 
+/// An UNKNOWN literal converted to a built-in type, a domain over one, or an
+/// array of one runs that type's input routine during SQL analysis, as
+/// PostgreSQL's `coerce_type` does for constants: `nextval('missing')` and a
+/// dead `CASE` arm's `'abc'::integer` fail even when no row evaluates them.
+/// Enum literals have their own check; length and domain constraints remain
+/// runtime work, as in PostgreSQL.
+pub(crate) fn validate_literal_input(
+    storage: &Storage,
+    txid: u32,
+    text: &str,
+    target_oid: i32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let Some(target) = super::eval::constructor_type_from_oid(target_oid, &|oid| {
+        storage.domain_base_type_for_oid(oid, txid)
+    }) else {
+        return Ok(());
+    };
+    let builtin = (1..FIRST_USER_OID).contains(&target.oid())
+        && !matches!(
+            target,
+            ColType::Pseudo(_)
+                | ColType::Record
+                | ColType::Void
+                | ColType::Internal
+                | ColType::AnyArray
+                | ColType::PgDdlCommand
+        );
+    if !builtin {
+        return Ok(());
+    }
+    arena
+        .with_remaining_region(|scratch| {
+            let value = Datum::Text(text);
+            match target {
+                ColType::Array(element) if element.is_catalog_reference() => {
+                    let catalog = super::query::storage_catalog(storage, scratch, txid);
+                    super::eval::reg_array_cast(value, element, Some(&catalog), scratch)?;
+                }
+                ColType::Regtype => {
+                    let catalog = super::query::storage_catalog(storage, scratch, txid);
+                    super::eval::regtype_cast(value, Some(&catalog), scratch)?;
+                }
+                target if target.is_reg_object() => {
+                    let catalog = super::query::storage_catalog(storage, scratch, txid);
+                    super::eval::regobject_cast(value, target, Some(&catalog), scratch)?;
+                }
+                // An input the analysis cannot run here is reported by the
+                // evaluation that converts the literal.
+                target => match super::eval::cast_to(value, target, scratch) {
+                    Err(error) if error.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED => {}
+                    result => {
+                        result?;
+                    }
+                },
+            }
+            Ok(())
+        })
+        .map_err(|_| super::query::arena_full_pub())?
+}
+
+/// Runs [`validate_literal_input`] for each UNKNOWN literal a selected
+/// routine call passes.
+pub(crate) fn validate_call_literal_inputs(
+    storage: &Storage,
+    txid: u32,
+    selection: super::eval::RoutineCallSelection,
+    args: &[&super::ast::Expr<'_>],
+    argument_names: &[Option<&str>],
+    variadic: bool,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    use super::ast::Expr;
+    if !args.iter().any(|argument| matches!(argument, Expr::Str(_))) {
+        return Ok(());
+    }
+    let named = |index: usize| argument_names.get(index).copied().flatten();
+    match selection {
+        super::eval::RoutineCallSelection::Builtin { oid, .. } => {
+            let Some(routine) = builtin_callable_by_oid(oid) else {
+                return Ok(());
+            };
+            for (index, argument) in args.iter().enumerate() {
+                let Expr::Str(text) = argument else {
+                    continue;
+                };
+                let parameter = match named(index) {
+                    Some(name) => routine
+                        .argument_names
+                        .iter()
+                        .position(|written| *written == name),
+                    None => Some(index),
+                };
+                let Some(parameter) = parameter else {
+                    continue;
+                };
+                // Inputs spread over a variadic parameter take its element type.
+                let target = match routine.variadic_element {
+                    Some(element) if !variadic && parameter + 1 >= routine.arguments.len() => {
+                        element
+                    }
+                    _ => match routine.arguments.get(parameter) {
+                        Some(&declared) => declared,
+                        None => continue,
+                    },
+                };
+                validate_literal_input(storage, txid, text, target, arena)
+                    .map_err(|error| super::error_position::at_subject(error, text))?;
+            }
+        }
+        super::eval::RoutineCallSelection::Stored(slot) => {
+            let Some((_, mapping)) =
+                storage.routine_call_mapping(slot, argument_names, args.len(), variadic, txid)
+            else {
+                return Ok(());
+            };
+            let routine = storage.routine_for(slot, txid);
+            for (index, argument) in args.iter().enumerate() {
+                let Expr::Str(text) = argument else {
+                    continue;
+                };
+                let parameter = usize::from(mapping[index]);
+                let Some(declared) = routine.arguments().get(parameter) else {
+                    continue;
+                };
+                let variadic_input = routine
+                    .parameters()
+                    .iter()
+                    .filter(|parameter| parameter.mode.is_input())
+                    .nth(parameter)
+                    .is_some_and(|parameter| {
+                        matches!(
+                            parameter.mode,
+                            crate::storage::RoutineParameterMode::Variadic { .. }
+                        )
+                    });
+                let ctype = match declared.ctype {
+                    ColType::Array(element) if variadic_input && !variadic => element.to_coltype(),
+                    ctype => ctype,
+                };
+                if declared.user_type.is_some() && ctype == declared.ctype {
+                    // Domains and named types keep their own input routines.
+                    if let Some(target) =
+                        storage.routine_type_oid(declared.ctype, declared.user_type, txid)
+                    {
+                        validate_literal_input(storage, txid, text, target, arena)
+                            .map_err(|error| super::error_position::at_subject(error, text))?;
+                    }
+                    continue;
+                }
+                validate_literal_input(storage, txid, text, ctype.oid(), arena)
+                    .map_err(|error| super::error_position::at_subject(error, text))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_explicit_cast(
     storage: &Storage,
     txid: u32,
@@ -5630,86 +5789,6 @@ struct CatalogOperator {
     result: ColType,
     procedure_oid: i32,
 }
-
-/// Operators whose catalog signatures use PostgreSQL pseudo-types.  They are
-/// kept separate from the concrete evaluator lookup table: pretending
-/// `anyrange` is one concrete `ColType` would make overload resolution accept
-/// mismatched range subtypes.
-#[derive(Clone, Copy)]
-struct PolymorphicOperator {
-    oid: i32,
-    name: &'static str,
-    left_oid: i32,
-    right_oid: i32,
-}
-
-macro_rules! polymorphic_operator {
-    ($oid:literal, $name:literal, $left:literal, $right:literal) => {
-        PolymorphicOperator {
-            oid: $oid,
-            name: $name,
-            left_oid: $left,
-            right_oid: $right,
-        }
-    };
-}
-
-const POLYMORPHIC_RANGE_OPERATORS: &[PolymorphicOperator] = &[
-    polymorphic_operator!(2860, "=", 4537, 4537),
-    polymorphic_operator!(2861, "<>", 4537, 4537),
-    polymorphic_operator!(2862, "<", 4537, 4537),
-    polymorphic_operator!(2863, "<=", 4537, 4537),
-    polymorphic_operator!(2864, ">=", 4537, 4537),
-    polymorphic_operator!(2865, ">", 4537, 4537),
-    polymorphic_operator!(2866, "&&", 3831, 4537),
-    polymorphic_operator!(2867, "&&", 4537, 3831),
-    polymorphic_operator!(2868, "&&", 4537, 4537),
-    polymorphic_operator!(2869, "@>", 4537, 2283),
-    polymorphic_operator!(2870, "@>", 4537, 3831),
-    polymorphic_operator!(2871, "@>", 4537, 4537),
-    polymorphic_operator!(2872, "<@", 2283, 4537),
-    polymorphic_operator!(2873, "<@", 3831, 4537),
-    polymorphic_operator!(2874, "<@", 4537, 4537),
-    polymorphic_operator!(2875, "&<", 3831, 4537),
-    polymorphic_operator!(2876, "&<", 4537, 3831),
-    polymorphic_operator!(2877, "&<", 4537, 4537),
-    polymorphic_operator!(3585, "&>", 3831, 4537),
-    polymorphic_operator!(3882, "=", 3831, 3831),
-    polymorphic_operator!(3883, "<>", 3831, 3831),
-    polymorphic_operator!(3884, "<", 3831, 3831),
-    polymorphic_operator!(3885, "<=", 3831, 3831),
-    polymorphic_operator!(3886, ">=", 3831, 3831),
-    polymorphic_operator!(3887, ">", 3831, 3831),
-    polymorphic_operator!(3888, "&&", 3831, 3831),
-    polymorphic_operator!(3889, "@>", 3831, 2283),
-    polymorphic_operator!(3890, "@>", 3831, 3831),
-    polymorphic_operator!(3891, "<@", 2283, 3831),
-    polymorphic_operator!(3892, "<@", 3831, 3831),
-    polymorphic_operator!(3893, "<<", 3831, 3831),
-    polymorphic_operator!(3894, ">>", 3831, 3831),
-    polymorphic_operator!(3895, "&<", 3831, 3831),
-    polymorphic_operator!(3896, "&>", 3831, 3831),
-    polymorphic_operator!(3897, "-|-", 3831, 3831),
-    polymorphic_operator!(3898, "+", 3831, 3831),
-    polymorphic_operator!(3899, "-", 3831, 3831),
-    polymorphic_operator!(3900, "*", 3831, 3831),
-    polymorphic_operator!(4035, "&>", 4537, 3831),
-    polymorphic_operator!(4142, "&>", 4537, 4537),
-    polymorphic_operator!(4179, "-|-", 3831, 4537),
-    polymorphic_operator!(4180, "-|-", 4537, 3831),
-    polymorphic_operator!(4198, "-|-", 4537, 4537),
-    polymorphic_operator!(4392, "+", 4537, 4537),
-    polymorphic_operator!(4393, "-", 4537, 4537),
-    polymorphic_operator!(4394, "*", 4537, 4537),
-    polymorphic_operator!(4395, "<<", 3831, 4537),
-    polymorphic_operator!(4396, "<<", 4537, 3831),
-    polymorphic_operator!(4397, "<<", 4537, 4537),
-    polymorphic_operator!(4398, ">>", 3831, 4537),
-    polymorphic_operator!(4399, ">>", 4537, 3831),
-    polymorphic_operator!(4400, ">>", 4537, 4537),
-    polymorphic_operator!(4539, "@>", 3831, 4537),
-    polymorphic_operator!(4540, "<@", 4537, 3831),
-];
 
 macro_rules! catalog_operator {
     ($oid:literal, $name:literal, $left:expr, $right:expr, $result:expr, $procedure_oid:literal) => {
@@ -9065,11 +9144,11 @@ pub(crate) fn schema_oid_by_written(storage: &Storage, txid: u32, written: &str)
 }
 
 pub(crate) fn role_oid_by_written(storage: &Storage, txid: u32, written: &str) -> Option<i32> {
+    // Free role slots have no identity; only visible roles can match.
     (0..storage.role_count()).find_map(|slot| {
-        let oid = storage.role_oid(slot);
-        let visible = storage.role_slot_by_oid(oid, txid)?;
-        identifier_spelling_matches(written, storage.role_name(visible, txid).as_str())
-            .then_some(oid)
+        let role = storage.role(slot);
+        (role.visible_to(txid) && identifier_spelling_matches(written, role.name_to(txid).as_str()))
+            .then(|| role.oid().get())
     })
 }
 
@@ -11458,13 +11537,6 @@ mod routine_name_tests {
                 operator.oid
             );
         }
-        for operator in super::POLYMORPHIC_RANGE_OPERATORS {
-            let row = row(operator.oid);
-            assert_eq!(
-                (row.1, row.5, row.6),
-                (operator.name, operator.left_oid, operator.right_oid)
-            );
-        }
     }
 
     #[test]
@@ -12013,38 +12085,36 @@ pub(crate) fn operator_oid_by_name(
     let ambiguous = || {
         sql_err!(
             sqlstate::AMBIGUOUS_FUNCTION,
-            "more than one operator named \"{}\"",
+            "more than one operator named {}",
             written
         )
     };
+    // Every built-in `pg_operator` row takes part, as in PostgreSQL: a bare
+    // name must be unique, a signature names its operand types (0 is NONE).
     let builtin = || -> Result<Option<i32>, SqlError> {
-        let mut found = None;
-        if let Some((_, left_oid, right_oid)) = polymorphic_arguments {
-            for operator in POLYMORPHIC_RANGE_OPERATORS {
-                if identifier_spelling_matches(written_name, operator.name)
-                    && operator.left_oid == left_oid
-                    && operator.right_oid == right_oid
-                    && found.replace(operator.oid).is_some()
-                {
-                    return Err(ambiguous());
+        let wanted = match (polymorphic_arguments, arguments) {
+            (Some((_, left, right)), _) => Some((left, right)),
+            (None, Some(signature)) => {
+                let operand = |operand: Option<crate::storage::RoutineResult>| match operand {
+                    None => Some(0),
+                    Some(result) if result.user_type.is_none() => Some(result.ctype.oid()),
+                    Some(_) => None,
+                };
+                match (operand(signature.left), operand(signature.right)) {
+                    (Some(left), Some(right)) => Some((left, right)),
+                    _ => return Ok(None),
                 }
             }
-            return Ok(found);
-        }
-        for operator in CATALOG_OPERATORS {
-            let builtin_signature = crate::storage::OperatorSignature {
-                left: operator.left.map(crate::storage::RoutineResult::builtin),
-                right: operator.right.map(crate::storage::RoutineResult::builtin),
-            };
-            if !identifier_spelling_matches(written_name, operator.name)
-                || arguments.is_some_and(|signature| signature != builtin_signature)
+            (None, None) => None,
+        };
+        let mut found = None;
+        for row in &super::catalog_operator_rows::OPERATOR_ROWS {
+            if !identifier_spelling_matches(written_name, row.1)
+                || wanted.is_some_and(|operands| operands != (row.5, row.6))
             {
                 continue;
             }
-            // Most modeled evaluator rows are only one representative of an
-            // overloaded built-in name.  JSON path existence is PostgreSQL's
-            // sole built-in `@?`, so its bare regoper spelling is resolvable.
-            if (!signature && operator.name != "@?") || found.replace(operator.oid).is_some() {
+            if found.replace(row.0).is_some() {
                 return Err(ambiguous());
             }
         }

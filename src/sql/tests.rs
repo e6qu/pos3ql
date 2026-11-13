@@ -18293,6 +18293,8 @@ fn finish_test_request(
         engine.pending_copy.is_none(),
         "streamed COPY needs caller-owned transaction state"
     );
+    // A refused COPY ends with the rollback its CopyDone causes.
+    let _ = engine.pending_copy_refusal.take();
     if transaction.is_active() {
         assert!(
             transaction.staged_commit().is_none(),
@@ -28264,7 +28266,7 @@ fn supported_operator_catalog_aliases_preserve_identity() {
     let ambiguous = run_with(&mut engine, &mut budget, "SELECT '+'::regoper");
     let ambiguous = String::from_utf8_lossy(&ambiguous);
     assert!(
-        ambiguous.contains("more than one operator named \"+\""),
+        ambiguous.contains("more than one operator named +"),
         "{ambiguous}"
     );
     assert_eq!(
@@ -32598,7 +32600,6 @@ fn copy_to_relation_kinds_and_column_privileges_fail_before_streaming() {
         ("COPY copy_kind_sequence TO STDOUT", "42809"),
         ("COPY copy_kind_index TO STDOUT", "42809"),
         ("COPY copy_kind_empty TO STDOUT", "0A000"),
-        ("COPY copy_kind_saved FROM STDIN", "42809"),
         (
             "SET ROLE copy_kind_reader; COPY copy_kind_view TO STDOUT",
             "42501",
@@ -32622,6 +32623,10 @@ fn copy_to_relation_kinds_and_column_privileges_fail_before_streaming() {
         assert!(!message_types(&output).contains(&b'G'));
     }
     run_with(&mut engine, &mut budget, "RESET ROLE");
+    // PostgreSQL refuses a materialized view only once copy-in has begun.
+    let refused = run_with(&mut engine, &mut budget, "COPY copy_kind_saved FROM STDIN");
+    assert!(message_types(&refused).contains(&b'G'));
+    assert!(!message_types(&refused).contains(&b'E'));
     assert_eq!(
         copy_data_rows(&run_with(
             &mut engine,

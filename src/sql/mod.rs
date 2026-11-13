@@ -704,6 +704,9 @@ pub struct Engine {
     /// it, switches into copy-in mode, and feeds data lines back through
     /// [`Engine::copy_row_line`] until CopyDone.
     pending_copy: Option<(exec::CopySetup, i64)>,
+    /// A COPY FROM refused once the client sends its data (see
+    /// [`exec::CopyRefusal`]).
+    pending_copy_refusal: Option<(exec::CopyRefusal, i64)>,
     /// A promoted statement's source range and plan owner, taken by the
     /// connection to reopen it as a result stream.
     pending_result_stream: Option<PendingResultStream>,
@@ -5101,6 +5104,7 @@ impl Engine {
             cache_capacity_generation: 0,
             cache_capacity_failure: None,
             pending_copy: None,
+            pending_copy_refusal: None,
             pending_result_stream: None,
             wal_upload: config.wal_upload && config.object_store_on,
             result_stream_bytes: config.result_stream_bytes,
@@ -11738,6 +11742,10 @@ impl Engine {
     /// takes it and enters copy-in mode.
     pub fn take_pending_copy(&mut self) -> Option<(exec::CopySetup, i64)> {
         self.pending_copy.take()
+    }
+
+    pub fn take_pending_copy_refusal(&mut self) -> Option<(exec::CopyRefusal, i64)> {
+        self.pending_copy_refusal.take()
     }
 
     pub(crate) fn take_pending_result_stream(&mut self) -> Option<PendingResultStream> {
@@ -24074,7 +24082,21 @@ impl Engine {
                         },
                     );
                 }
-                let mut setup = match exec::copy_begin(&self.storage, c, txn.txid) {
+                // PostgreSQL enters copy-in before it refuses these targets.
+                let refused = match exec::copy_from_refusal(&self.storage, c, txn.txid) {
+                    Ok(refused) => refused,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if let Some(refused) = refused {
+                    if let Err(error) = self.ensure_txn(txn, txn.mode, guc) {
+                        return Ok(Err(error));
+                    }
+                    responder.copy_in_response(refused.n_targets, refused.binary)?;
+                    self.pending_copy_refusal =
+                        Some((refused.refusal, query::statement_deadline()));
+                    return Ok(Ok(()));
+                }
+                let mut setup = match exec::copy_begin(&self.storage, c, txn.txid, arena) {
                     Ok(s) => s,
                     Err(e) => return Ok(Err(e)),
                 };
@@ -24124,6 +24146,19 @@ impl Engine {
                     // transaction, and the command tag waits for CopyDone.
                     if let Err(error) = self.ensure_txn(txn, txn.mode, guc) {
                         return Ok(Err(error));
+                    }
+                    if self
+                        .storage
+                        .matview_slot_for_table(setup.table_index, txn.txid)
+                        .is_some()
+                    {
+                        let name = self.storage.table_def(setup.table_index, txn.txid).name;
+                        responder.copy_in_response(setup.n_targets, setup.fmt.binary)?;
+                        self.pending_copy_refusal = Some((
+                            exec::CopyRefusal::MaterializedView(name),
+                            query::statement_deadline(),
+                        ));
+                        return Ok(Ok(()));
                     }
                     if let Err(error) = self.copy_start(&setup, txn, guc, cursors, arena, responder)
                     {

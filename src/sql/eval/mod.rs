@@ -1485,6 +1485,24 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
             .validate_enum_input_literal(text, target_oid)
     }
 
+    fn validate_literal_input(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
+        self.catalog.map_or(Ok(()), |catalog| {
+            catalog.validate_literal_input(text, target_oid)
+        })
+    }
+
+    fn validate_call_literal_inputs(
+        &self,
+        selection: RoutineCallSelection,
+        args: &[&Expr<'_>],
+        argument_names: &[Option<&str>],
+        variadic: bool,
+    ) -> Result<(), SqlError> {
+        self.catalog.map_or(Ok(()), |catalog| {
+            catalog.validate_call_literal_inputs(selection, args, argument_names, variadic)
+        })
+    }
+
     fn validate_explicit_cast(
         &self,
         source: i32,
@@ -2267,6 +2285,25 @@ pub trait CatalogAccess {
             sqlstate::FEATURE_NOT_SUPPORTED,
             "enum input validation requires a catalog"
         ))
+    }
+
+    /// Runs a built-in type's input routine on an UNKNOWN literal
+    /// during analysis. A scope without a catalog leaves the check to the
+    /// evaluation that converts the literal.
+    fn validate_literal_input(&self, _text: &str, _target_oid: i32) -> Result<(), SqlError> {
+        Ok(())
+    }
+
+    /// [`Self::validate_literal_input`] for the UNKNOWN literals
+    /// a selected routine call passes.
+    fn validate_call_literal_inputs(
+        &self,
+        _selection: RoutineCallSelection,
+        _args: &[&super::ast::Expr<'_>],
+        _argument_names: &[Option<&str>],
+        _variadic: bool,
+    ) -> Result<(), SqlError> {
+        Ok(())
     }
 
     fn validate_explicit_cast(
@@ -13294,6 +13331,81 @@ pub(crate) fn cross_database_catalog_reference(
     None
 }
 
+/// PostgreSQL's `parseNameAndArgTypes` for `regprocedure` and `regoperator`
+/// input: the name, a parenthesized comma-separated list of existing types
+/// (`NONE` too for an operator). Returns the number of argument types.
+fn signature_argument_count(
+    written: &str,
+    allow_none: bool,
+    catalog: &dyn CatalogAccess,
+    arena: &Arena,
+) -> Result<usize, SqlError> {
+    let invalid =
+        |message: &'static str| sql_err!(sqlstate::INVALID_TEXT_REPRESENTATION, "{}", message);
+    let space = |byte: u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' | b'\x0b');
+    let bytes = written.as_bytes();
+    let mut quoted = false;
+    let open = bytes
+        .iter()
+        .position(|&byte| {
+            if byte == b'"' {
+                quoted = !quoted;
+            }
+            byte == b'(' && !quoted
+        })
+        .ok_or_else(|| invalid("expected a left parenthesis"))?;
+    if written[..open]
+        .trim_matches(|c: char| c.is_ascii() && space(c as u8))
+        .is_empty()
+    {
+        return Err(invalid("invalid name syntax"));
+    }
+    let arguments = written[open + 1..].trim_end_matches(|c: char| c.is_ascii() && space(c as u8));
+    let arguments = arguments
+        .strip_suffix(')')
+        .ok_or_else(|| invalid("expected a right parenthesis"))?;
+    let mut count = 0usize;
+    let mut rest = arguments;
+    let mut after_comma = false;
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_ascii() && space(c as u8));
+        if rest.is_empty() {
+            if after_comma {
+                return Err(invalid("expected a type name"));
+            }
+            break;
+        }
+        let (mut quoted, mut depth, mut end) = (false, 0i32, rest.len());
+        for (at, byte) in rest.bytes().enumerate() {
+            match byte {
+                b'"' => quoted = !quoted,
+                b',' if !quoted && depth == 0 => {
+                    end = at;
+                    break;
+                }
+                b'(' | b'[' if !quoted => depth += 1,
+                b')' | b']' if !quoted => depth -= 1,
+                _ => {}
+            }
+        }
+        if quoted || depth != 0 {
+            return Err(invalid("improper type name"));
+        }
+        let type_name = rest[..end].trim_end_matches(|c: char| c.is_ascii() && space(c as u8));
+        after_comma = end < rest.len();
+        rest = if after_comma { &rest[end + 1..] } else { "" };
+        if !(allow_none && type_name.eq_ignore_ascii_case("none")) {
+            regtype_cast(Datum::Text(type_name), Some(catalog), arena)?;
+        }
+        count += 1;
+        // PostgreSQL's FUNC_MAX_ARGS.
+        if count > 100 {
+            return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "too many arguments"));
+        }
+    }
+    Ok(count)
+}
+
 pub(crate) fn regobject_cast<'a>(
     value: Datum<'a>,
     target: ColType,
@@ -13381,24 +13493,54 @@ pub(crate) fn regobject_cast<'a>(
                             name
                         )
                     })?,
-                    ColType::Regproc | ColType::Regprocedure => catalog
-                        .routine_oid(name, target == ColType::Regprocedure)?
-                        .ok_or_else(|| {
+                    ColType::Regprocedure => {
+                        signature_argument_count(name, false, catalog, arena)?;
+                        catalog.routine_oid(name, true)?.ok_or_else(|| {
                             sql_err!(
                                 sqlstate::UNDEFINED_FUNCTION,
                                 "function \"{}\" does not exist",
                                 name
                             )
-                        })?,
-                    ColType::Regoper | ColType::Regoperator => catalog
-                        .operator_oid(name, target == ColType::Regoperator)?
-                        .ok_or_else(|| {
+                        })?
+                    }
+                    ColType::Regoperator => {
+                        match signature_argument_count(name, true, catalog, arena)? {
+                            2 => {}
+                            1 => {
+                                return Err(crate::sql::error_position::with_hint(
+                                    sql_err!(sqlstate::UNDEFINED_PARAMETER, "missing argument"),
+                                    "Use NONE to denote the missing argument of a unary operator.",
+                                ));
+                            }
+                            _ => {
+                                return Err(crate::sql::error_position::with_hint(
+                                    sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "too many arguments"),
+                                    "Provide two argument types for operator.",
+                                ));
+                            }
+                        }
+                        catalog.operator_oid(name, true)?.ok_or_else(|| {
                             sql_err!(
                                 sqlstate::UNDEFINED_FUNCTION,
-                                "operator \"{}\" does not exist",
+                                "operator does not exist: {}",
                                 name
                             )
-                        })?,
+                        })?
+                    }
+                    ColType::Regproc => catalog.routine_oid(name, false)?.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "function \"{}\" does not exist",
+                            name
+                        )
+                    })?,
+                    ColType::Regoper => catalog.operator_oid(name, false)?.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "operator does not exist: {}",
+                            name
+                        )
+                    })?,
                     ColType::Regconfig | ColType::Regdictionary => {
                         let (schema, unqualified) =
                             name.rsplit_once('.')

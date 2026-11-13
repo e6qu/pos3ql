@@ -548,9 +548,7 @@ queries have not run (`0A000`). A protocol-level `Parse` message checks only
 syntax and parameter types, so analysis errors (`SELECT current_date + $1`,
 `SELECT 1 WHERE 'x'`) arrive at `Bind` or `Execute` where PostgreSQL reports
 them at `Parse`, and `pg_prepared_statements` lists only SQL `PREPARE`
-statements, not protocol ones. `PREPARE` checks a `SELECT` without `FROM` and
-the types of every query, but constant inputs of a query with `FROM`
-(`SELECT 'a'::int FROM t`) are converted when it runs.
+statements, not protocol ones.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,
 SQL/JSON result types) are reported when the statement would run. In a
@@ -575,10 +573,11 @@ A user table's `tableoid` system column fails with `0A000`
 expose it. COPY to or from a server file or program,
 `COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
 RETURNING` a non-JSON, non-string type are rejected with `0A000`.
-A string literal passed to a `regclass` parameter (`nextval('missing')`) is
-resolved when a row evaluates it, so a missing relation is not reported for a
-query or `COPY ... WHERE` that evaluates no row; PostgreSQL resolves it while
-analyzing the statement.
+`COPY FROM` into a view with an `INSTEAD OF INSERT` trigger fails with
+`0A000` where PostgreSQL inserts each row through the trigger, and a refused
+`COPY FROM` into a view or sequence does not validate its options before
+copy-in. A scalar function used as a `FROM` item (`FROM t, nextval('s') x`)
+fails with `0A000` `table function "nextval" is not supported`.
 A view
 dropped by the cascade of a function, sequence, collation, operator, text
 search object or type (`DROP FUNCTION f CASCADE` where view `v` calls `f`)

@@ -471,6 +471,9 @@ pub struct Conn {
     /// A COPY FROM STDIN in flight: the connection is in copy-in mode, and
     /// frontend messages are CopyData/CopyDone/CopyFail until it ends.
     copy: Option<CopyInProgress>,
+    /// A COPY FROM STDIN refused in copy-in mode: its data is discarded and
+    /// the refusal answers CopyDone or CopyFail, as PostgreSQL's does.
+    copy_refused: Option<RefusedCopy>,
     /// Staging for one COPY data row (rows split across CopyData messages).
     copy_buf: FixedBuf,
     /// The `CONTEXT` of the error that failed the current COPY FROM, kept
@@ -667,6 +670,7 @@ impl Conn {
                 config.max_tables,
             )?,
             copy: None,
+            copy_refused: None,
             copy_buf: FixedBuf::new(budget, "copy_line", config.copy_line_bytes)?,
             copy_error_context: FixedBuf::new(
                 budget,
@@ -748,6 +752,7 @@ impl Conn {
         self.replication_completion_pending = false;
         self.replication_publications.clear();
         self.copy = None;
+        self.copy_refused = None;
         self.copy_buf.clear();
         self.copy_transition_scratch.clear();
         self.phase = Phase::Startup;
@@ -775,6 +780,7 @@ impl Conn {
         self.held_notifications.clear();
         self.publication_hold = None;
         self.copy = None;
+        self.copy_refused = None;
         self.copy_buf.clear();
         self.copy_transition_scratch.clear();
         // Drop the TLS session (inside its scope, so the pool is credited)
@@ -981,15 +987,14 @@ impl Conn {
         // The next Query starts at its first statement.
         self.resume_statement = 0;
         self.respool_statement = None;
-        let extended = self.copy.as_ref().map_or_else(
-            || {
-                !matches!(
-                    self.recv.readable().first().copied(),
-                    Some(wire::FMSG_QUERY | wire::FMSG_FUNCTION_CALL)
-                )
-            },
-            |copy| copy.extended,
-        );
+        let extended = match (&self.copy, &self.copy_refused) {
+            (Some(copy), _) => copy.extended,
+            (None, Some(refused)) => refused.extended,
+            (None, None) => !matches!(
+                self.recv.readable().first().copied(),
+                Some(wire::FMSG_QUERY | wire::FMSG_FUNCTION_CALL)
+            ),
+        };
         let parked_sync = self.recv.readable().first() == Some(&wire::FMSG_SYNC);
         // The parked Query/Execute remains at the front of `recv`. Consume
         // only that message: an extended client commonly pipelines Sync
@@ -1012,7 +1017,7 @@ impl Conn {
         crate::sql::sequence::finish_statement(self.guc.seq_session());
         self.txn.release_retained_write();
         engine.cancel_backend_wait(self.id);
-        if self.copy.take().is_some() {
+        if self.copy.take().is_some() || self.copy_refused.take().is_some() {
             engine.copy_abort(&mut self.txn, &self.guc);
             self.copy_transition_scratch.clear();
         } else if self.txn.commit_admission().is_some() {
@@ -2281,6 +2286,17 @@ impl Conn {
             return step;
         }
 
+        if let Some(refused) = &self.copy_refused {
+            engine.bind_query_connection(self.id);
+            let _deadline_scope = crate::sql::query::enter_deadline_scope();
+            self.txn.restore_statement_deadline(refused.deadline);
+            let step = self.process_refused_copy_message(engine, msg_type);
+            if !matches!(step, Step::Close) {
+                self.recv.consume(total);
+            }
+            return step;
+        }
+
         if let Some(copy) = &self.copy {
             engine.bind_query_connection(self.id);
             let _deadline_scope = crate::sql::query::enter_deadline_scope();
@@ -2693,6 +2709,13 @@ impl Conn {
                 Step::Continue
             }
             wire::FMSG_COPY_DONE => self.copy_finish(engine),
+            // PostgreSQL has already reported a failed COPY's error, so the
+            // client's CopyFail ends it without another.
+            wire::FMSG_COPY_FAIL
+                if self.copy.as_ref().is_some_and(|copy| copy.failed.is_some()) =>
+            {
+                self.copy_finish(engine)
+            }
             wire::FMSG_COPY_FAIL => {
                 let message = MsgIn::new(&self.recv.readable()[5..total])
                     .cstr()
@@ -2738,6 +2761,40 @@ impl Conn {
                     self.phase = Phase::SkipToSync;
                 }
                 let sent = if extended {
+                    sent
+                } else {
+                    sent.and_then(|()| responder.ready_for_query(self.txn.status_byte()))
+                };
+                if sent.is_err() {
+                    Step::Close
+                } else {
+                    Step::Continue
+                }
+            }
+        }
+    }
+
+    /// Frontend traffic for a refused COPY FROM STDIN: data is discarded and
+    /// the end of the copy reports the refusal.
+    fn process_refused_copy_message(&mut self, engine: &mut Engine, msg_type: u8) -> Step {
+        match msg_type {
+            wire::FMSG_COPY_DATA | wire::FMSG_SYNC | wire::FMSG_FLUSH => Step::Continue,
+            wire::FMSG_TERMINATE => Step::Close,
+            _ => {
+                let refused = self.copy_refused.take().expect("in refused copy-in mode");
+                engine.copy_abort(&mut self.txn, &self.guc);
+                self.finish_lock_wait();
+                if !self.txn.is_active() {
+                    self.cursors.on_rollback();
+                }
+                engine.finish_backend_statement(&self.txn, self.id);
+                let error = refused.refusal.error();
+                let mut responder = output(&mut self.send, &mut self.overflow);
+                let sent = responder.error(error.sqlstate, error.message.as_str());
+                if refused.extended {
+                    self.phase = Phase::SkipToSync;
+                }
+                let sent = if refused.extended {
                     sent
                 } else {
                     sent.and_then(|()| responder.ready_for_query(self.txn.status_byte()))
@@ -4342,7 +4399,9 @@ impl Conn {
                 }
             });
             if transport_failed {
-                if engine.take_pending_copy().is_some() {
+                if engine.take_pending_copy().is_some()
+                    | engine.take_pending_copy_refusal().is_some()
+                {
                     engine.copy_abort(&mut self.txn, &self.guc);
                 }
                 return Step::Close;
@@ -4434,6 +4493,7 @@ impl Conn {
                 };
             }
             let pending_copy = engine.take_pending_copy();
+            let pending_refusal = engine.take_pending_copy_refusal();
             if !matches!(
                 result,
                 Ok(crate::sql::ExtendedExecutionStatus::Blocked { .. })
@@ -4451,14 +4511,14 @@ impl Conn {
             match result {
                 Ok(crate::sql::ExtendedExecutionStatus::Complete(true)) => {
                     self.finish_lock_wait();
-                    if pending_copy.is_none() {
+                    if pending_copy.is_none() && pending_refusal.is_none() {
                         engine.finish_backend_statement(&self.txn, self.id);
                     }
                 }
                 Ok(crate::sql::ExtendedExecutionStatus::Complete(false)) => {
                     self.finish_lock_wait();
                     engine.finish_backend_statement(&self.txn, self.id);
-                    if pending_copy.is_some() {
+                    if pending_copy.is_some() || pending_refusal.is_some() {
                         engine.copy_abort(&mut self.txn, &self.guc);
                         self.copy_transition_scratch.clear();
                     }
@@ -4502,12 +4562,33 @@ impl Conn {
                     return Step::Parked;
                 }
                 Err(WireFull) => {
-                    if pending_copy.is_some() {
+                    if pending_copy.is_some() || pending_refusal.is_some() {
                         engine.copy_abort(&mut self.txn, &self.guc);
                         self.copy_transition_scratch.clear();
                     }
                     return Step::Close;
                 }
+            }
+            if let Some((refusal, deadline)) = pending_refusal {
+                if paged {
+                    let portal = &mut self.portals[portal_slot];
+                    let bytes_ok =
+                        spooled_output(&mut self.send, &mut self.overflow, engine.result_spool())
+                            .raw(portal.result.readable())
+                            .is_ok();
+                    portal.result.clear();
+                    if !bytes_ok {
+                        engine.copy_abort(&mut self.txn, &self.guc);
+                        return Step::Close;
+                    }
+                }
+                self.copy_refused = Some(RefusedCopy {
+                    refusal,
+                    deadline,
+                    extended: true,
+                });
+                self.copy_buf.clear();
+                return Step::Continue;
             }
             if let Some((setup, deadline)) = pending_copy {
                 if paged {
@@ -4776,6 +4857,16 @@ impl Conn {
                 // A COPY FROM STDIN holds its query cycle open: the
                 // connection enters copy-in mode and ReadyForQuery waits
                 // for CopyDone.
+                if let Some((refusal, deadline)) = engine.take_pending_copy_refusal() {
+                    self.copy_refused = Some(RefusedCopy {
+                        refusal,
+                        deadline,
+                        extended: false,
+                    });
+                    self.copy_buf.clear();
+                    self.recv.consume(total);
+                    return Step::Continue;
+                }
                 if let Some((setup, deadline)) = engine.take_pending_copy() {
                     let header_pending =
                         !matches!(setup.fmt.header, crate::sql::ast::CopyHeader::None);
@@ -4832,7 +4923,9 @@ impl Conn {
                 // Even the private output reserve is full: end the statement
                 // with an explicit error after the queued output.
                 self.sqlprep.clear_request_type_inputs();
-                if engine.take_pending_copy().is_some() {
+                if engine.take_pending_copy().is_some()
+                    | engine.take_pending_copy_refusal().is_some()
+                {
                     engine.copy_abort(&mut self.txn, &self.guc);
                     self.copy_transition_scratch.clear();
                 }
@@ -6497,6 +6590,12 @@ enum Step {
 /// The connection half of a COPY FROM STDIN: the engine's setup, the rows
 /// stored so far, the first error (data after it drains unparsed, as
 /// PostgreSQL does), and whether the classic `\.` end marker was seen.
+struct RefusedCopy {
+    refusal: crate::sql::exec::CopyRefusal,
+    deadline: i64,
+    extended: bool,
+}
+
 struct CopyInProgress {
     setup: crate::sql::exec::CopySetup,
     deadline: i64,

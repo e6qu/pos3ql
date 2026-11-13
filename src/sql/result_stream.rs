@@ -284,7 +284,7 @@ impl Engine {
         if let Some(sql) = copy.query {
             return Ok(sql);
         }
-        let setup = exec::copy_begin(&self.storage, copy, txid)?;
+        let setup = exec::copy_begin(&self.storage, copy, txid, arena)?;
         exec::copy_select_text(&self.storage, &setup, txid, arena)
     }
 

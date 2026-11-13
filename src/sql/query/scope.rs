@@ -208,7 +208,7 @@ fn prebuild_function_bodies(
                 .alloc_str_display(format_args!("SELECT {body}"))
                 .map_err(|_| arena_full())?,
             crate::storage::RoutineBodyKind::String | crate::storage::RoutineBodyKind::Atomic => {
-                &*arena.alloc_str(body).map_err(|_| arena_full())?
+                arena.alloc_str(body).map_err(|_| arena_full())?
             }
         };
         bodies.push(text).map_err(|_| arena_full())

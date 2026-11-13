@@ -7976,11 +7976,7 @@ fn scan_source_mode<'a>(
                         .lookup(qualifier, name)?,
                     KeyProbe::Constant(expression) => {
                         let value = crate::sql::eval::eval_full(
-                            expression,
-                            arena,
-                            params,
-                            &NoColumns,
-                            hooks,
+                            expression, arena, params, &NoColumns, hooks,
                         )?;
                         let ctype = scope
                             .defs

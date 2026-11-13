@@ -965,6 +965,36 @@ pub(crate) fn parse_type_name<'a>(
     Ok(parsed)
 }
 
+/// [`parse_type_name`] for a PL/pgSQL declaration's type: text after a
+/// complete type name is PostgreSQL's syntax error at its first token.
+pub(crate) fn parse_declared_type_name<'a>(
+    sql: &'a str,
+    arena: &'a Arena,
+) -> Result<(&'a str, i32), super::eval::SqlError> {
+    let to_sql = |m: &str| super::eval::SqlError {
+        sqlstate: super::eval::SqlState::known(super::eval::sqlstate::SYNTAX_ERROR),
+        message: crate::stack_format!(192, "invalid type name: {}", m),
+    };
+    let mut parser = Parser::new(sql, arena).map_err(|e| to_sql(e.message.as_str()))?;
+    let parsed = parser
+        .type_name_mod()
+        .map_err(|e| to_sql(e.message.as_str()))?;
+    if parser.peeked != Tok::Eof {
+        let token = sql
+            .get(parser.peek_at..parser.lexer.token_end())
+            .unwrap_or_default();
+        return Err(super::error_position::at_subject(
+            crate::sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "syntax error at or near \"{}\"",
+                token
+            ),
+            token,
+        ));
+    }
+    Ok(parsed)
+}
+
 #[cfg(test)]
 pub(crate) fn parse_expression<'a>(
     sql: &'a str,
@@ -1003,6 +1033,67 @@ pub(crate) fn parse_expression_list<'a>(
         Ok(expressions.as_slice())
     };
     parse().map_err(|error| super::parse_error_to_sql(&error))
+}
+
+/// The names a PL/pgSQL body's `$n` references take: `$n` is the routine's
+/// `n`th parameter, a variable like any other. Their storage identifies a
+/// reference written as `$n` rather than as the quoted identifier `"$n"`.
+static POSITIONAL_NAMES: [&str; crate::storage::MAX_ROUTINE_ARGUMENTS] = [
+    "$1", "$2", "$3", "$4", "$5", "$6", "$7", "$8", "$9", "$10", "$11", "$12", "$13", "$14", "$15",
+    "$16", "$17", "$18", "$19", "$20", "$21", "$22", "$23", "$24", "$25", "$26", "$27", "$28",
+    "$29", "$30", "$31", "$32", "$33", "$34", "$35", "$36", "$37", "$38", "$39", "$40", "$41",
+    "$42", "$43", "$44", "$45", "$46", "$47", "$48", "$49", "$50", "$51", "$52", "$53", "$54",
+    "$55", "$56", "$57", "$58", "$59", "$60", "$61", "$62", "$63", "$64", "$65", "$66", "$67",
+    "$68", "$69", "$70", "$71", "$72", "$73", "$74", "$75", "$76", "$77", "$78", "$79", "$80",
+    "$81", "$82", "$83", "$84", "$85", "$86", "$87", "$88", "$89", "$90", "$91", "$92", "$93",
+    "$94", "$95", "$96", "$97", "$98", "$99", "$100",
+];
+
+std::thread_local! {
+    /// How many `$n` references name procedural variables in the text being
+    /// parsed: a PL/pgSQL body's routine parameters.
+    static PROCEDURAL_POSITIONALS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Parses with `$1` to `$count` read as the PL/pgSQL variables of those
+/// names, as PostgreSQL's `plpgsql_param_ref` resolves them; a larger `$n`
+/// stays a parameter, which reports that it does not exist.
+pub(crate) fn with_procedural_positionals<R>(count: u32, parse: impl FnOnce() -> R) -> R {
+    struct Restore(u32);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PROCEDURAL_POSITIONALS.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(PROCEDURAL_POSITIONALS.with(|slot| slot.replace(count)));
+    parse()
+}
+
+/// The variable name a procedural `$n` reference reads, while one is parsed.
+fn procedural_positional(number: u32) -> Option<&'static str> {
+    let count = PROCEDURAL_POSITIONALS.with(core::cell::Cell::get);
+    (number <= count).then(|| positional_name(number)).flatten()
+}
+
+/// How many `$n` references name procedural variables in the text being
+/// parsed.
+pub(crate) fn procedural_positionals() -> u32 {
+    PROCEDURAL_POSITIONALS.with(core::cell::Cell::get)
+}
+
+/// The variable name of parameter `$number`.
+fn positional_name(number: u32) -> Option<&'static str> {
+    usize::try_from(number)
+        .ok()
+        .and_then(|number| number.checked_sub(1))
+        .and_then(|index| POSITIONAL_NAMES.get(index).copied())
+}
+
+/// Whether `name` is a `$n` reference parsed as a procedural variable.
+pub(crate) fn is_positional_reference(name: &str) -> bool {
+    POSITIONAL_NAMES
+        .iter()
+        .any(|positional| core::ptr::eq(positional.as_ptr(), name.as_ptr()))
 }
 
 impl<'a> Parser<'a> {

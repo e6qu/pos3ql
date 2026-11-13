@@ -53,6 +53,7 @@ mod polymorphic_resolution;
 mod predefined_roles;
 mod prepared_object_capacity;
 mod prepared_parameter_types;
+mod procedural_compatibility;
 mod procedural_expression_calls;
 mod procedural_progress;
 mod procedural_subtransactions;

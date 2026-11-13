@@ -7696,6 +7696,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.storage.compatible_element_oid(inputs, self.txid)
     }
 
+    fn select_common_type(&self, inputs: &[i32]) -> Result<i32, crate::storage::CommonTypeFailure> {
+        self.storage.select_common_type(inputs, self.txid)
+    }
+
     fn user_type_identity_oid(
         &self,
         identity: crate::storage::UserTypeName,
@@ -14976,6 +14980,10 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
         self.0.domain_base_type(type_oid)
     }
 
+    fn select_common_type(&self, inputs: &[i32]) -> Result<i32, crate::storage::CommonTypeFailure> {
+        self.0.select_common_type(inputs)
+    }
+
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         let entry = self.0.find_column(qualifier, name)?;
         Ok(self.0.output_type(entry))
@@ -15185,6 +15193,10 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
 
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
         self.storage.domain_base_type_for_oid(type_oid, self.txid)
+    }
+
+    fn select_common_type(&self, inputs: &[i32]) -> Result<i32, crate::storage::CommonTypeFailure> {
+        self.storage.select_common_type(inputs, self.txid)
     }
 
     fn named_type_oid(&self, type_name: &str) -> Option<i32> {

@@ -3556,6 +3556,13 @@ impl<'d> QueryScope<'d> {
         self.storage.domain_base_type_for_oid(type_oid, self.txid)
     }
 
+    pub(crate) fn select_common_type(
+        &self,
+        inputs: &[i32],
+    ) -> Result<i32, crate::storage::CommonTypeFailure> {
+        self.storage.select_common_type(inputs, self.txid)
+    }
+
     pub fn func_scalar_type(&self, name: &str) -> Option<ColType> {
         self.func_scalar_column(name)
             .map(|column| self.output_type(column))

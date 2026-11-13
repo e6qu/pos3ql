@@ -15139,7 +15139,8 @@ impl Engine {
                         )?;
                         return Ok(false);
                     };
-                    let name = match arena.alloc_str(parameter.name.as_str()) {
+                    let name = crate::storage::output_column_name(parameter.name, count);
+                    let name = match arena.alloc_str(name.as_str()) {
                         Ok(name) => name,
                         Err(_) => {
                             responder.error(
@@ -20672,8 +20673,10 @@ impl Engine {
                                     )));
                                 }
                             };
+                            let name =
+                                crate::storage::output_column_name(parameter.name, output_index);
                             description[output_index] = ColDesc::new(
-                                match arena.alloc_str(parameter.name.as_str()) {
+                                match arena.alloc_str(name.as_str()) {
                                     Ok(name) => name,
                                     Err(_) => return Ok(Err(eval::arena_full())),
                                 },
@@ -20967,8 +20970,10 @@ impl Engine {
                                         )));
                                     }
                                 };
+                                let name =
+                                    crate::storage::output_column_name(parameter.name, index);
                                 description[index] = ColDesc::new(
-                                    match arena.alloc_str(parameter.name.as_str()) {
+                                    match arena.alloc_str(name.as_str()) {
                                         Ok(name) => name,
                                         Err(_) => return Ok(Err(eval::arena_full())),
                                     },

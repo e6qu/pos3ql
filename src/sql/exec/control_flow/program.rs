@@ -8,11 +8,15 @@ use crate::mem::lease_pool::SharedSlice;
 pub(in crate::sql::exec) struct ProgramSource {
     bytes: SharedSlice<u8>,
     kind: PlpgsqlProgramKind,
+    /// How many parameters the text names `$1` onwards.
+    positionals: u32,
 }
 
 impl PartialEq for ProgramSource {
     fn eq(&self, other: &Self) -> bool {
-        self.kind == other.kind && SharedSlice::ptr_eq(&self.bytes, &other.bytes)
+        self.kind == other.kind
+            && self.positionals == other.positionals
+            && SharedSlice::ptr_eq(&self.bytes, &other.bytes)
     }
 }
 impl Eq for ProgramSource {}
@@ -21,6 +25,7 @@ impl ProgramSource {
     pub(in crate::sql::exec) fn capture(
         text: &str,
         kind: PlpgsqlProgramKind,
+        positionals: u32,
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<Self, SqlError> {
         let mut bytes = pool.lease(text.len()).map_err(source_full)?;
@@ -31,6 +36,7 @@ impl ProgramSource {
         Ok(Self {
             bytes: bytes.freeze(),
             kind,
+            positionals,
         })
     }
 
@@ -50,9 +56,9 @@ impl ProgramSource {
         })?;
         let program = match written {
             Some(written) => crate::sql::error_position::with_copied_source(written, text, || {
-                parse_plpgsql_program(text, parsing, self.kind)
+                parse_routine_program(text, parsing, self.kind, self.positionals)
             }),
-            None => parse_plpgsql_program(text, parsing, self.kind),
+            None => parse_routine_program(text, parsing, self.kind, self.positionals),
         }?;
         let code = CompiledProgram::new(self.clone(), text, program.body, program.locals, parsing)?;
         Ok((program, code))

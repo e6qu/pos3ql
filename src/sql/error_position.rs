@@ -668,6 +668,48 @@ pub(crate) fn expression_error(
         } if state == sqlstate::UNDEFINED_FUNCTION && message.starts_with("operator ") => {
             annotated(error, source_position.get(), UNARY_OPERATOR_HINT)
         }
+        Expr::Param(_) if state == sqlstate::UNDEFINED_PARAMETER => {
+            at_expression(error, expression)
+        }
+        // A named row type without the field is reported where the row got
+        // its type: a cast's `::`, or its literal; a cast to `record`
+        // changes nothing.
+        Expr::Field { base, .. }
+            if state == sqlstate::UNDEFINED_COLUMN
+                && message.contains("\" not found in data type ") =>
+        {
+            let mut typed = *base;
+            while let Expr::Cast {
+                operand, type_name, ..
+            } = typed
+                && type_name.eq_ignore_ascii_case("record")
+            {
+                typed = operand;
+            }
+            match typed {
+                Expr::Cast {
+                    operand: Expr::Str(literal),
+                    ..
+                } => at_subject(error, literal),
+                Expr::Cast {
+                    source_position, ..
+                } => at_parsed_offset(error, source_position.get()),
+                _ => at_expression(error, typed),
+            }
+        }
+        // A field selection PostgreSQL cannot resolve is reported at its
+        // base expression.
+        Expr::Field { base, field }
+            if (state == sqlstate::WRONG_OBJECT_TYPE
+                && message.starts_with("column notation ."))
+                || (state == sqlstate::UNDEFINED_COLUMN
+                    && (message.starts_with("could not identify column ")
+                        || message.ends_with(
+                            crate::stack_format!(80, ".{} does not exist", field).as_str(),
+                        ))) =>
+        {
+            at_expression(error, base)
+        }
         _ => error,
     }
 }

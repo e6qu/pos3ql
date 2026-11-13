@@ -1,0 +1,72 @@
+-- PL/pgSQL ALIAS FOR declarations and $n parameter references: an alias
+-- shares its variable (a parameter by number or name, an earlier variable,
+-- or a trigger's NEW and OLD), and $n is the parameter's variable, so it
+-- sees assignments made through the parameter's name.
+CREATE SCHEMA plpgsql_aliases;
+SET search_path = plpgsql_aliases, public;
+CREATE FUNCTION f1(p int) RETURNS text LANGUAGE plpgsql AS $$ BEGIN p := p + 1; RETURN $1::text || ' ' || p; END $$;
+SELECT f1(1);
+CREATE FUNCTION f2(int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN $1 := $1 + 1; RETURN $1; END $$;
+SELECT f2(1);
+CREATE FUNCTION f3(int) RETURNS int LANGUAGE plpgsql AS $$ DECLARE a ALIAS FOR $1; BEGIN a := a + 10; RETURN $1; END $$;
+SELECT f3(1);
+CREATE FUNCTION f4(int) RETURNS int LANGUAGE plpgsql AS $$ DECLARE a ALIAS FOR $2; BEGIN RETURN 1; END $$;
+CREATE FUNCTION f5(int) RETURNS int LANGUAGE plpgsql AS $$ DECLARE a ALIAS FOR nope; BEGIN RETURN 1; END $$;
+CREATE FUNCTION f6(int) RETURNS int LANGUAGE plpgsql AS $$ DECLARE x int := 3; BEGIN DECLARE a ALIAS FOR x; BEGIN a := 7; END; RETURN x; END $$;
+SELECT f6(1);
+CREATE FUNCTION f7(int) RETURNS int LANGUAGE plpgsql AS $$ <<o>> DECLARE x int := 3; BEGIN DECLARE a ALIAS FOR o.x; x int := 4; BEGIN RETURN a; END; END $$;
+SELECT f7(1);
+CREATE FUNCTION f8(int) RETURNS int LANGUAGE plpgsql AS $$ DECLARE a ALIAS FOR $1; b ALIAS FOR a; BEGIN RETURN b; END $$;
+SELECT f8(5);
+CREATE FUNCTION fa(int, text) RETURNS text LANGUAGE plpgsql AS $$ DECLARE a ALIAS FOR $1; b ALIAS FOR $2; BEGIN RETURN a || b; END $$;
+SELECT fa(1, 'z');
+CREATE FUNCTION fb(p int) RETURNS int LANGUAGE plpgsql AS $$ DECLARE q ALIAS FOR p; BEGIN q := q + 1; RETURN q; END $$;
+SELECT fb(4);
+CREATE TABLE tt (n int, s text);
+CREATE FUNCTION tf() RETURNS trigger LANGUAGE plpgsql AS $$ DECLARE nr ALIAS FOR new; o ALIAS FOR old; BEGIN nr.n := nr.n * 2; RAISE NOTICE '% %', TG_OP, o; RETURN nr; END $$;
+CREATE TRIGGER t1 BEFORE INSERT OR UPDATE ON tt FOR EACH ROW EXECUTE FUNCTION tf();
+INSERT INTO tt VALUES (2, 'a');
+UPDATE tt SET s = 'b';
+SELECT * FROM tt;
+CREATE FUNCTION f9(int) RETURNS int LANGUAGE plpgsql AS $$ DECLARE a CONSTANT ALIAS FOR $1; BEGIN RETURN a; END $$;
+CREATE FUNCTION f10(int) RETURNS int LANGUAGE plpgsql AS $$ DECLARE a ALIAS FOR $1; BEGIN RETURN (SELECT a + 1); END $$;
+SELECT f10(5);
+CREATE FUNCTION f11(INOUT x int) LANGUAGE plpgsql AS $$ DECLARE a ALIAS FOR x; BEGIN a := a * 3; END $$;
+SELECT f11(5);
+DO $$ DECLARE x int := 1; a ALIAS FOR x; BEGIN a := 5; RAISE NOTICE '%', x; END $$;
+DO $$ DECLARE a ALIAS FOR $1; BEGIN NULL; END $$;
+DO $$ DECLARE r record; a ALIAS FOR r; BEGIN SELECT 1 AS q INTO a; RAISE NOTICE '%', r.q; END $$;
+DO $$ DECLARE x int := 1; a ALIAS FOR x; BEGIN FOR a IN 1..2 LOOP RAISE NOTICE '% %', a, x; END LOOP; END $$;
+CREATE FUNCTION f12(int, int) RETURNS int LANGUAGE plpgsql AS $$ DECLARE a ALIAS FOR $1; BEGIN RETURN a + $2; END $$;
+SELECT f12(1, 2);
+CREATE FUNCTION f13(int) RETURNS int LANGUAGE plpgsql AS $$ DECLARE a ALIAS FOR $1; BEGIN SELECT 9 INTO a; RETURN $1; END $$;
+SELECT f13(1);
+CREATE FUNCTION f14(int) RETURNS int LANGUAGE plpgsql AS $$ DECLARE a ALIAS FOR $1; BEGIN RETURN f14.a; END $$;
+SELECT f14(1);
+CREATE FUNCTION f15(int) RETURNS int LANGUAGE plpgsql AS $$ <<b>> DECLARE a ALIAS FOR $1; BEGIN RETURN b.a; END $$;
+SELECT f15(1);
+CREATE FUNCTION f16(int) RETURNS int LANGUAGE plpgsql AS $$ DECLARE a ALIAS FOR $1; BEGIN EXECUTE 'SELECT $1' INTO a USING a + 1; RETURN a; END $$;
+SELECT f16(1);
+CREATE FUNCTION f17(OUT int, OUT text) LANGUAGE plpgsql AS $$ BEGIN $1 := 4; $2 := 'four'; END $$;
+SELECT * FROM f17();
+CREATE PROCEDURE p1(INOUT int, INOUT x text) LANGUAGE plpgsql AS $$ DECLARE a ALIAS FOR $1; BEGIN a := a + 1; $2 := x || '!'; END $$;
+CALL p1(1, 'p');
+-- $n beyond the parameters is no variable.
+CREATE FUNCTION g1(int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN $3; END $$;
+SELECT g1(1);
+DO $$ BEGIN RAISE NOTICE '%', $1; END $$;
+CREATE FUNCTION g3(int) RETURNS text LANGUAGE plpgsql AS $$ DECLARE r record; BEGIN SELECT $1 INTO r; RETURN row_to_json(r)::text; END $$;
+SELECT g3(4);
+CREATE FUNCTION g5(p int) RETURNS int LANGUAGE plpgsql AS $$ DECLARE c CURSOR FOR SELECT $1 + 1; v int; BEGIN p := 10; OPEN c; FETCH c INTO v; RETURN v; END $$;
+SELECT g5(4);
+CREATE FUNCTION g6(int) RETURNS int LANGUAGE plpgsql AS $$ DECLARE v int; BEGIN EXECUTE 'SELECT $1 * 2' INTO v USING $1; RETURN v; END $$;
+SELECT g6(4);
+CREATE FUNCTION g7(int) RETURNS SETOF int LANGUAGE plpgsql AS $$ BEGIN RETURN QUERY SELECT x FROM generate_series(1, $1) AS x WHERE x > $1 - 2; END $$;
+SELECT * FROM g7(4);
+CREATE TABLE gt (id int);
+CREATE FUNCTION g8(int) RETURNS int LANGUAGE plpgsql AS $$ DECLARE n int; BEGIN INSERT INTO gt VALUES ($1), ($1 + 1); FOR n IN UPDATE gt SET id = id * 10 WHERE id > $1 RETURNING id LOOP RAISE NOTICE '%', n; END LOOP; SELECT count(*) INTO n FROM gt WHERE id >= $1; RETURN n; END $$;
+SELECT g8(3);
+-- A DECLARE whose type is followed by more words.
+DO $$ DECLARE x int bar; BEGIN NULL; END $$;
+DO $$ DECLARE x varchar(3) y; BEGIN NULL; END $$;
+DROP SCHEMA plpgsql_aliases CASCADE;

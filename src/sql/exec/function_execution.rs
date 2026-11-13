@@ -33,14 +33,12 @@ impl ReturnBinding {
         storage: &Storage,
         transaction: u32,
     ) -> Result<Self, SqlError> {
-        let local = |name: SqlName| {
-            (!name.as_str().is_empty())
-                .then(|| {
-                    locals
-                        .iter()
-                        .position(|declaration| declaration.name == name)
-                })
-                .flatten()
+        let parameters = routine.parameters();
+        let local = |parameter: &crate::storage::RoutineParameterDef| {
+            let index = parameters
+                .iter()
+                .position(|candidate| core::ptr::eq(candidate, parameter))?;
+            parameter_slot(locals, index, parameter)
         };
         match kind {
             PlpgsqlProgramKind::Function => Ok(Self::Value),
@@ -52,19 +50,19 @@ impl ReturnBinding {
                     .iter()
                     .filter(|parameter| parameter.mode.is_output());
                 if matches!(routine.kind, crate::storage::RoutineKind::Function { .. }) {
-                    return Ok(Self::OutputValue(
-                        outputs.next().and_then(|parameter| local(parameter.name)),
-                    ));
+                    return Ok(Self::OutputValue(outputs.next().and_then(local)));
                 }
                 let count = outputs.clone().count();
                 let mut fields = storage
                     .execution_control
                     .lease(count)
                     .map_err(control_flow::execution_full)?;
-                for parameter in outputs {
+                for (index, parameter) in outputs.enumerate() {
                     fields
                         .push_reserved(OutputField {
-                            name: parameter.name,
+                            // An unnamed output is `columnN`, numbered among
+                            // the outputs.
+                            name: crate::storage::output_column_name(parameter.name, index),
                             type_oid: storage
                                 .routine_type_oid(parameter.ctype, parameter.user_type, transaction)
                                 .ok_or_else(|| {
@@ -73,7 +71,7 @@ impl ReturnBinding {
                                         "PL/pgSQL output type is absent from the type catalog"
                                     )
                                 })?,
-                            local: local(parameter.name),
+                            local: local(parameter),
                         })
                         .map_err(control_flow::execution_full)?;
                 }
@@ -231,6 +229,9 @@ struct FunctionBinding {
     print_strict_params: bool,
     fresh_snapshots: bool,
     parameters: SharedSlice<RoutineArgumentDef>,
+    /// Every parameter, outputs included, which lay out the call's first
+    /// variables.
+    all_parameters: SharedSlice<RoutineParameterDef>,
     inputs: local_values::SavedValues,
     returns: ReturnBinding,
     result_type: RoutineArgumentDef,
@@ -362,6 +363,8 @@ impl FunctionBinding {
             input_owner: self.input_owner,
             input_collation: self.input_collation,
             input_sites,
+            positionals: u32::try_from(self.all_parameters.len())
+                .expect("routine parameter capacity fits u32"),
             variable_conflict: self.variable_conflict,
             print_strict_params: self.print_strict_params,
             fresh_snapshots: self.fresh_snapshots,
@@ -568,7 +571,7 @@ impl SuspendedFunctionState {
             Ok(formal) => formal,
             Err(error) => return Err((frame, error)),
         };
-        let seeded = match seeded_arguments(&self.binding.parameters, inputs, arena) {
+        let seeded = match seeded_arguments(&self.binding.all_parameters, inputs, arena) {
             Ok(seeded) => seeded,
             Err(error) => return Err((frame, error)),
         };
@@ -694,25 +697,14 @@ fn run_body<'a>(
 }
 
 fn seeded_arguments<'a>(
-    parameters: &[RoutineArgumentDef],
+    parameters: &[RoutineParameterDef],
     inputs: &[Datum<'a>],
     arena: &'a Arena,
 ) -> Result<&'a [Datum<'a>], SqlError> {
-    let count = parameters
-        .iter()
-        .filter(|parameter| !parameter.name.as_str().is_empty())
-        .count();
     let seeded = arena
-        .alloc_slice_with(count, |_| Datum::Null)
+        .alloc_slice_with(parameter_variable_count(parameters), |_| Datum::Null)
         .map_err(|_| super::super::query::arena_full_pub())?;
-    for (destination, (_, value)) in seeded.iter_mut().zip(
-        parameters
-            .iter()
-            .zip(inputs)
-            .filter(|(parameter, _)| !parameter.name.as_str().is_empty()),
-    ) {
-        *destination = *value;
-    }
+    seed_routine_parameters(parameters, inputs, seeded)?;
     Ok(seeded)
 }
 
@@ -750,67 +742,48 @@ pub(crate) fn execute<'a>(
     let (program, code) = compile_plpgsql_execution(
         routine.body.as_str(),
         kind,
+        super::routine_positionals(routine),
         &engine.storage,
         transaction.txid,
         arena,
         &|name| routine_parameter_type(routine, name),
     )?;
     let set_returning = kind == PlpgsqlProgramKind::SetFunction;
-    let inputs_named = routine
-        .arguments()
-        .iter()
-        .filter(|argument| !argument.name.as_str().is_empty())
-        .count();
     let output_count = if set_returning {
         routine.result_column_count
     } else {
         0
     };
-    let output_names = if set_returning {
-        output_count
-    } else {
-        routine
-            .parameters()
-            .iter()
-            .filter(|parameter| parameter.mode.is_output())
-            .count()
-    };
-    let capacity = inputs_named
-        .checked_add(output_names)
+    let parameter_variables = parameter_variable_count(routine.parameters());
+    let capacity = parameter_variables
+        .checked_add(output_count)
         .and_then(|count| count.checked_add(program.locals.len()))
         .ok_or_else(super::super::query::arena_full_pub)?;
     let declarations = arena
         .alloc_slice_with(capacity, |_| empty_plpgsql_local())
         .map_err(|_| super::super::query::arena_full_pub())?;
     let mut seeded =
-        allocate_plpgsql_local_values(&engine.storage.execution_control, inputs_named)?;
-    let mut count = 0;
-    for (index, argument) in routine.arguments().iter().enumerate() {
-        if argument.name.as_str().is_empty() {
-            continue;
-        }
-        declarations[count] = TriggerLocalDecl {
-            label: Some(routine.name),
-            scope: PlpgsqlScope::Invocation,
-            name: argument.name,
-            ctype: argument.ctype,
-            user_type: argument.user_type,
-            type_mod: -1,
-            record_shape: None,
-            constant: false,
-            not_null: false,
-        };
-        seeded[count] = inputs[index];
-        count += 1;
-    }
-    let seeded_count = count;
-    let mut add_output = |output: RoutineArgumentDef| {
+        allocate_plpgsql_local_values(&engine.storage.execution_control, parameter_variables)?;
+    let mut count = declare_routine_parameters(routine, declarations)?;
+    let seeded_count = seed_routine_parameters(routine.parameters(), inputs, &mut seeded)?;
+    // A `RETURNS TABLE` function's columns are variables too; output
+    // parameters already are.
+    let table_columns = if routine
+        .parameters()
+        .iter()
+        .any(|parameter| parameter.mode.is_output())
+    {
+        0
+    } else {
+        output_count
+    };
+    for output in &routine.result_columns[..table_columns] {
         if output.name.as_str().is_empty()
             || declarations[..count]
                 .iter()
                 .any(|prior| prior.name == output.name)
         {
-            return;
+            continue;
         }
         declarations[count] = TriggerLocalDecl {
             label: Some(routine.name),
@@ -818,29 +791,9 @@ pub(crate) fn execute<'a>(
             name: output.name,
             ctype: output.ctype,
             user_type: output.user_type,
-            type_mod: -1,
-            record_shape: None,
-            constant: false,
-            not_null: false,
+            ..empty_plpgsql_local()
         };
         count += 1;
-    };
-    if set_returning {
-        for output in &routine.result_columns[..output_count] {
-            add_output(*output);
-        }
-    } else {
-        for output in routine
-            .parameters()
-            .iter()
-            .filter(|parameter| parameter.mode.is_output())
-        {
-            add_output(RoutineArgumentDef {
-                name: output.name,
-                ctype: output.ctype,
-                user_type: output.user_type,
-            });
-        }
     }
     for local in program.locals {
         declarations[count] = *local;
@@ -898,18 +851,26 @@ pub(crate) fn execute<'a>(
         let indices = arena
             .alloc_slice_with(output_count, |_| 0)
             .map_err(|_| super::super::query::arena_full_pub())?;
+        let mut output_parameters = routine
+            .parameters()
+            .iter()
+            .enumerate()
+            .filter(|(_, parameter)| parameter.mode.is_output());
         for (index, output) in routine.result_columns[..output_count].iter().enumerate() {
-            indices[index] = locals
-                .iter()
-                .position(|local| local.name == output.name)
-                .filter(|_| !output.name.as_str().is_empty())
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INVALID_FUNCTION_DEFINITION,
-                        "set-returning output \"{}\" needs a name",
-                        output.name.as_str()
-                    )
-                })?;
+            let slot = match output_parameters.next() {
+                Some((position, parameter)) => parameter_slot(locals, position, parameter),
+                None => locals
+                    .iter()
+                    .position(|local| local.name == output.name)
+                    .filter(|_| !output.name.as_str().is_empty()),
+            };
+            indices[index] = slot.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "set-returning output \"{}\" needs a name",
+                    output.name.as_str()
+                )
+            })?;
         }
         execution
             .status
@@ -1038,6 +999,10 @@ fn suspend_call(
         .execution_control
         .copy_slice(routine.arguments())
         .map_err(control_flow::execution_full)?;
+    let all_parameters = storage
+        .execution_control
+        .copy_slice(routine.parameters())
+        .map_err(control_flow::execution_full)?;
     let mut saved_inputs = local_values::SavedValues::new(&storage.row_work)?;
     saved_inputs.replace(inputs)?;
     let environment = SavedCallEnvironment::capture(environment, &storage.execution_control)?;
@@ -1056,6 +1021,7 @@ fn suspend_call(
                 print_strict_params: invocation.print_strict_params,
                 fresh_snapshots: invocation.fresh_snapshots,
                 parameters,
+                all_parameters,
                 inputs: saved_inputs,
                 returns,
                 result_type: declared_result(routine)?,

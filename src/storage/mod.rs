@@ -7907,6 +7907,17 @@ impl RoutineParameterMode {
     }
 }
 
+/// The result column a routine's output parameter is, `output` counting
+/// its outputs from zero: its own name, or PostgreSQL's `columnN`.
+pub(crate) fn output_column_name(name: SqlName, output: usize) -> SqlName {
+    if name.as_str().is_empty() {
+        SqlName::parse(crate::stack_format!(24, "column{}", output + 1).as_str())
+            .expect("generated column name fits")
+    } else {
+        name
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RoutineParameterDef {
     pub name: SqlName,
@@ -8115,32 +8126,13 @@ impl PolymorphicBinding {
         implicit: impl Fn(i32, i32) -> bool,
     ) -> Option<ResolvedPolymorphicBinding> {
         let inputs = &self.compatible_inputs[..self.compatible_count];
-        let compatible = match inputs.split_first() {
-            None => None,
-            Some((first, rest)) if rest.iter().all(|oid| oid == first) => Some(*first),
-            Some(_) => {
-                let mut selected = base(inputs[0]);
-                let mut selected_category = category(selected)?;
-                for input in &inputs[1..] {
-                    let input = base(*input);
-                    if input == selected {
-                        continue;
-                    }
-                    if category(input)? != selected_category {
-                        return None;
-                    }
-                    if !crate::sql::types::preferred_type_oid(selected)
-                        && implicit(selected, input)
-                        && !implicit(input, selected)
-                    {
-                        selected = input;
-                        selected_category = category(selected)?;
-                    }
+        let compatible = match inputs {
+            [] => None,
+            inputs => {
+                if inputs.iter().any(|input| category(base(*input)).is_none()) {
+                    return None;
                 }
-                inputs
-                    .iter()
-                    .all(|input| implicit(*input, selected))
-                    .then_some(selected)
+                Some(select_common_type_with(inputs, base, category, implicit).ok()?)
             }
         };
         if let (Some(range), Some(selected)) = (self.compatible_range_element, compatible)
@@ -8153,6 +8145,125 @@ impl PolymorphicBinding {
             simple_array: self.simple_array,
             compatible,
         })
+    }
+}
+
+/// Why PostgreSQL's `select_common_type` and the `coerce_to_common_type`
+/// check after it found no common type, with the index of the input it
+/// reports the error at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommonTypeFailure {
+    /// `%s types %s and %s cannot be matched`: the type chosen so far and
+    /// an input of another category.
+    Category {
+        selected: i32,
+        input: i32,
+        index: usize,
+    },
+    /// `%s could not convert type %s to %s`: an input with no implicit
+    /// conversion to the chosen type.
+    Conversion {
+        input: i32,
+        selected: i32,
+        index: usize,
+    },
+}
+
+/// PostgreSQL's `select_common_type` over input type OIDs (`unknown` for an
+/// untyped literal or NULL), followed by the implicit-conversion check each
+/// input gets. Identical inputs keep their type, a domain included;
+/// otherwise inputs are compared by base type, a later type replaces the
+/// choice only when the current one is not preferred and converts to it
+/// implicitly but not back, and all-unknown inputs are `text`.
+pub(crate) fn select_common_type_with(
+    inputs: &[i32],
+    base: impl Fn(i32) -> i32,
+    category: impl Fn(i32) -> Option<&'static str>,
+    implicit: impl Fn(i32, i32) -> bool,
+) -> Result<i32, CommonTypeFailure> {
+    use crate::sql::types::oid;
+    let Some((&first, rest)) = inputs.split_first() else {
+        return Ok(oid::TEXT);
+    };
+    if first != oid::UNKNOWN && rest.iter().all(|input| *input == first) {
+        return Ok(first);
+    }
+    let category = |type_oid| category(type_oid).unwrap_or("X");
+    let mut selected = base(first);
+    for (index, input) in inputs.iter().enumerate().skip(1) {
+        let input = base(*input);
+        if input == oid::UNKNOWN || input == selected {
+            continue;
+        }
+        if selected == oid::UNKNOWN {
+            selected = input;
+        } else if category(input) != category(selected) {
+            return Err(CommonTypeFailure::Category {
+                selected,
+                input,
+                index,
+            });
+        } else if !crate::sql::types::preferred_type_oid(selected)
+            && implicit(selected, input)
+            && !implicit(input, selected)
+        {
+            selected = input;
+        }
+    }
+    if selected == oid::UNKNOWN {
+        selected = oid::TEXT;
+    }
+    for (index, input) in inputs.iter().enumerate() {
+        if *input != oid::UNKNOWN && *input != selected && !implicit(*input, selected) {
+            return Err(CommonTypeFailure::Conversion {
+                input: *input,
+                selected,
+                index,
+            });
+        }
+    }
+    Ok(selected)
+}
+
+/// [`select_common_type_with`] for built-in types only, where no catalog
+/// cast or domain can take part.
+pub(crate) fn builtin_select_common_type(inputs: &[i32]) -> Result<i32, CommonTypeFailure> {
+    let builtin = |oid: i32| {
+        crate::sql::types::ColType::from_oid(oid).filter(|_| NamedTypeKind::from_oid(oid).is_none())
+    };
+    select_common_type_with(
+        inputs,
+        |oid| oid,
+        |oid| builtin(oid).map(crate::sql::types::type_category),
+        |from, to| {
+            from == to
+                || builtin(from)
+                    .zip(builtin(to))
+                    .is_some_and(|(from, to)| crate::sql::types::builtin_implicit_cast(from, to))
+        },
+    )
+}
+
+impl Storage {
+    /// [`select_common_type_with`] against the catalog: domains, casts and
+    /// user-defined types take part.
+    pub(crate) fn select_common_type(
+        &self,
+        inputs: &[i32],
+        txid: u32,
+    ) -> Result<i32, CommonTypeFailure> {
+        select_common_type_with(
+            inputs,
+            |oid| {
+                self.domain_base_type_for_oid(oid, txid)
+                    .map_or(oid, ColType::oid)
+            },
+            |oid| {
+                self.routine_result_for_oid(oid, txid)
+                    .map(|result| crate::sql::types::type_category(result.ctype))
+            },
+            |from, to| self.routine_implicit_cast(from, to, txid),
+        )
     }
 }
 

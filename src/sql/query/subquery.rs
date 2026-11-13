@@ -3662,6 +3662,10 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
         self.catalog.domain_base_type(type_oid)
     }
 
+    fn select_common_type(&self, inputs: &[i32]) -> Result<i32, crate::storage::CommonTypeFailure> {
+        self.catalog.select_common_type(inputs)
+    }
+
     fn named_type_oid(&self, type_name: &str) -> Option<i32> {
         self.catalog.named_type_oid(type_name)
     }

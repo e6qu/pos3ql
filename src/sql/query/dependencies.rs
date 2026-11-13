@@ -3285,6 +3285,10 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         self.storage.domain_base_type_for_oid(type_oid, self.txid)
     }
 
+    fn select_common_type(&self, inputs: &[i32]) -> Result<i32, crate::storage::CommonTypeFailure> {
+        self.storage.select_common_type(inputs, self.txid)
+    }
+
     fn validate_explicit_cast(
         &self,
         source_oid: i32,

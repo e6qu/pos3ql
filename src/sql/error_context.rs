@@ -239,6 +239,18 @@ impl Frame for PlpgsqlCompilationFrame<'_> {
     }
 }
 
+/// A PL/pgSQL declaration's type that does not parse, as PostgreSQL's
+/// `parse_datatype` names it.
+pub(crate) struct PlpgsqlTypeNameFrame<'a> {
+    pub(crate) text: &'a str,
+}
+
+impl Frame for PlpgsqlTypeNameFrame<'_> {
+    fn write_line(&self, out: &mut dyn Write, _positioned: bool) -> fmt::Result {
+        write!(out, "invalid type name \"{}\"", self.text)
+    }
+}
+
 struct Node {
     frame: *const (dyn Frame + 'static),
     previous: *const Node,

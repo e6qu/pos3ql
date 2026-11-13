@@ -1412,14 +1412,11 @@ impl CustomNames {
             })
     }
 
-    /// The slot of a custom parameter, defining it as PostgreSQL's
-    /// placeholder when first named.
-    fn define(&self, name: &str) -> Result<usize, SqlError> {
-        if let Some(slot) = self.find(name) {
-            return Ok(slot);
-        }
+    /// Whether `name` could become a placeholder: PostgreSQL's
+    /// `assignable_custom_variable_name`.
+    fn check_assignable(&self, name: &str) -> Result<(), SqlError> {
         validate_custom_name(name)?;
-        if self.plpgsql_loaded.get() && has_plpgsql_prefix(name) {
+        if self.reserved(name) {
             crate::sql::eval::stash_diagnostic(
                 Some(StackStr::from_str("\"plpgsql\" is a reserved prefix.")),
                 None,
@@ -1430,6 +1427,26 @@ impl CustomNames {
                 name
             ));
         }
+        Ok(())
+    }
+
+    fn reserved(&self, name: &str) -> bool {
+        self.plpgsql_loaded.get() && has_plpgsql_prefix(name)
+    }
+
+    /// A custom parameter the session knows neither as a parameter nor as a
+    /// placeholder.
+    fn unknown(&self, name: &str) -> bool {
+        self.is_custom(name) && self.find(name).is_none()
+    }
+
+    /// The slot of a custom parameter, defining it as PostgreSQL's
+    /// placeholder when first named.
+    fn define(&self, name: &str) -> Result<usize, SqlError> {
+        if let Some(slot) = self.find(name) {
+            return Ok(slot);
+        }
+        self.check_assignable(name)?;
         let count = self.count.get();
         if count == CUSTOM_PARAMETER_SLOTS {
             return Err(sql_err!(
@@ -1459,6 +1476,24 @@ fn is_custom_name(name: &str) -> bool {
 /// PostgreSQL's `valid_custom_variable_name`. PostgreSQL reserves a
 /// prefix only once the extension owning it loads; pos3ql loads none.
 fn validate_custom_name(name: &str) -> Result<(), SqlError> {
+    if valid_custom_name(name) {
+        return Ok(());
+    }
+    crate::sql::eval::stash_diagnostic(
+        Some(StackStr::from_str(
+            "Custom parameter names must be two or more simple identifiers separated by dots.",
+        )),
+        None,
+    );
+    Err(sql_err!(
+        sqlstate::INVALID_NAME,
+        "invalid configuration parameter name \"{}\"",
+        name
+    ))
+}
+
+/// PostgreSQL's `valid_custom_variable_name`.
+fn valid_custom_name(name: &str) -> bool {
     let mut separated = false;
     let mut part_start = true;
     let mut valid = true;
@@ -1478,21 +1513,9 @@ fn validate_custom_name(name: &str) -> Result<(), SqlError> {
             break;
         }
     }
-    if !valid || part_start || !separated {
-        crate::sql::eval::stash_diagnostic(
-            Some(StackStr::from_str(
-                "Custom parameter names must be two or more simple identifiers separated by dots.",
-            )),
-            None,
-        );
-        return Err(sql_err!(
-            sqlstate::INVALID_NAME,
-            "invalid configuration parameter name \"{}\"",
-            name
-        ));
-    }
-    Ok(())
+    valid && !part_start && separated
 }
+
 /// Each custom parameter slot owns one mask bit after the built-in ones.
 const GUC_SETTING_COUNT: usize = GUC_BUILTIN_SETTING_COUNT + CUSTOM_PARAMETER_SLOTS;
 const GUC_ALL: GucMask = GucMask::MAX >> (GucMask::BITS as usize - GUC_SETTING_COUNT);
@@ -1501,13 +1524,46 @@ const GUC_ALL: GucMask = GucMask::MAX >> (GucMask::BITS as usize - GUC_SETTING_C
 struct SettingActions {
     next: u64,
     session: [u64; GUC_SETTING_COUNT],
+    /// `SET LOCAL` stamps from their own counter, so a level that changed a
+    /// setting only locally is still known to have changed it.
+    local_next: u64,
+    local: [u64; GUC_SETTING_COUNT],
 }
 
 impl SettingActions {
     const EMPTY: Self = Self {
         next: 0,
         session: [0; GUC_SETTING_COUNT],
+        local_next: 0,
+        local: [0; GUC_SETTING_COUNT],
     };
+
+    fn record_local(&mut self, mask: GucMask) -> Result<(), SqlError> {
+        let next = self.local_next.checked_add(1).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "local setting assignment counter exhausted"
+            )
+        })?;
+        for (index, action) in self.local.iter_mut().enumerate() {
+            if mask & (1 << index) != 0 {
+                *action = next;
+            }
+        }
+        self.local_next = next;
+        Ok(())
+    }
+
+    /// Whether setting `index` was assigned since `session` and `local`
+    /// were saved.
+    fn changed_since(
+        &self,
+        index: usize,
+        session: &[u64; GUC_SETTING_COUNT],
+        local: &[u64; GUC_SETTING_COUNT],
+    ) -> bool {
+        self.session[index] != session[index] || self.local[index] != local[index]
+    }
 
     fn record_session(&mut self, mask: GucMask) -> Result<(), SqlError> {
         let next = self.next.checked_add(1).ok_or_else(|| {
@@ -1785,6 +1841,8 @@ fn finish_setting_change(
 ) -> Result<(), SqlError> {
     if !local {
         state.actions.record_session(bit)?;
+    } else if state.transaction.active {
+        state.actions.record_local(bit)?;
     }
     state.current = values;
     if !state.transaction.active {
@@ -1814,6 +1872,7 @@ struct GucSavepoint {
     current_overrides: GucMask,
     session_overrides: GucMask,
     session_actions: [u64; GUC_SETTING_COUNT],
+    local_actions: [u64; GUC_SETTING_COUNT],
 }
 
 pub(crate) struct StatementSettings {
@@ -1828,6 +1887,7 @@ struct GucTransaction {
     start_overrides: GucMask,
     session_overrides: GucMask,
     start_actions: [u64; GUC_SETTING_COUNT],
+    start_local_actions: [u64; GUC_SETTING_COUNT],
     savepoints: Vec<Option<GucSavepoint>>,
     savepoint_count: usize,
 }
@@ -1971,6 +2031,7 @@ impl GucState {
                 current_overrides: state.session_overrides,
                 session_overrides: state.transaction.session_overrides,
                 session_actions: state.actions.session,
+                local_actions: state.actions.local,
             },
             random: self.random.get(),
         }
@@ -1984,6 +2045,7 @@ impl GucState {
             state.session_overrides = mark.values.current_overrides;
             state.transaction.session_overrides = mark.values.session_overrides;
             state.actions.session = mark.values.session_actions;
+            state.actions.local = mark.values.local_actions;
         }
         self.random.set(mark.random);
         ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(self.render()));
@@ -2000,6 +2062,7 @@ impl GucState {
             && state.session_overrides == mark.values.current_overrides
             && state.transaction.session_overrides == mark.values.session_overrides
             && state.actions.session == mark.values.session_actions
+            && state.actions.local == mark.values.local_actions
             && self.random.get() == mark.random
     }
 
@@ -2063,6 +2126,7 @@ impl GucState {
         destination.transaction.start_overrides = source.transaction.start_overrides;
         destination.transaction.session_overrides = source.transaction.session_overrides;
         destination.transaction.start_actions = source.transaction.start_actions;
+        destination.transaction.start_local_actions = source.transaction.start_local_actions;
         destination.transaction.savepoints.fill(None);
         let count = source.transaction.savepoint_count;
         destination.transaction.savepoints[..count]
@@ -2297,6 +2361,7 @@ impl GucState {
                     start_overrides: 0,
                     session_overrides: 0,
                     start_actions: [0; GUC_SETTING_COUNT],
+                    start_local_actions: [0; GUC_SETTING_COUNT],
                     savepoints,
                     savepoint_count: 0,
                 },
@@ -2882,6 +2947,7 @@ impl GucState {
         state.transaction.session = current;
         state.transaction.start_overrides = state.session_overrides;
         state.transaction.start_actions = state.actions.session;
+        state.transaction.start_local_actions = state.actions.local;
         state.transaction.session_overrides = state.session_overrides;
         state.transaction.savepoint_count = 0;
     }
@@ -2905,6 +2971,7 @@ impl GucState {
         state.current = state.transaction.start;
         state.session_overrides = state.transaction.start_overrides;
         state.actions.session = state.transaction.start_actions;
+        state.actions.local = state.transaction.start_local_actions;
         state.transaction.active = false;
         state.transaction.savepoint_count = 0;
     }
@@ -2925,6 +2992,7 @@ impl GucState {
             current_overrides: state.session_overrides,
             session_overrides: state.transaction.session_overrides,
             session_actions: state.actions.session,
+            local_actions: state.actions.local,
         });
         state.transaction.savepoint_count += 1;
     }
@@ -2948,6 +3016,7 @@ impl GucState {
         state.session_overrides = savepoint.current_overrides;
         state.transaction.session_overrides = savepoint.session_overrides;
         state.actions.session = savepoint.session_actions;
+        state.actions.local = savepoint.local_actions;
         state.transaction.savepoint_count = index + 1;
     }
 
@@ -3016,18 +3085,6 @@ impl GucState {
         Ok(value)
     }
 
-    pub(crate) fn validate_system_reset(
-        &self,
-        authorization: SettingAuthorization<'_>,
-    ) -> Result<(), SqlError> {
-        match read_only_parameter_context(authorization.name) {
-            Some(ReadOnlyParameterContext::Startup) => Ok(()),
-            Some(ReadOnlyParameterContext::Internal) | None => {
-                self.validate_setting_value(authorization, None)
-            }
-        }
-    }
-
     /// Checks a value (or a reset when `None`) for an authorized parameter
     /// without changing the session.
     pub(crate) fn validate_setting_value(
@@ -3038,7 +3095,39 @@ impl GucState {
         self.check_setting_value(authorization.name, value)
     }
 
+    /// Checks an `ALTER SYSTEM` value, which changes no session: an unknown
+    /// custom parameter's value cannot be checked and gets no placeholder,
+    /// and resetting one with a valid name is allowed even under a reserved
+    /// prefix, so such settings can be removed.
+    pub(crate) fn validate_system_setting(
+        &self,
+        authorization: SettingAuthorization<'_>,
+        value: Option<&str>,
+    ) -> Result<(), SqlError> {
+        let name = authorization.name;
+        if !self.custom.unknown(name) {
+            return match (value, read_only_parameter_context(name)) {
+                (None, Some(ReadOnlyParameterContext::Startup)) => Ok(()),
+                _ => self.check_setting_value(name, value),
+            };
+        }
+        if value.is_none() && valid_custom_name(name) {
+            return Ok(());
+        }
+        self.custom.check_assignable(name)
+    }
+
     fn check_setting_value(&self, name: &str, value: Option<&str>) -> Result<(), SqlError> {
+        // Resetting an unknown setting under a reserved prefix is allowed,
+        // as PostgreSQL's `validate_option_array_item` allows it, so a
+        // stored setting can still be removed; it defines no placeholder.
+        if value.is_none()
+            && self.custom.unknown(name)
+            && valid_custom_name(name)
+            && self.custom.reserved(name)
+        {
+            return Ok(());
+        }
         let state = self.store.borrow();
         let mut values = state.current;
         change_setting(&mut values, &state.defaults, &self.custom, name, value)
@@ -3234,45 +3323,55 @@ fn adopt_placeholder(
             adopt(values, &defaults, true, warn)
         }
     };
-    // Each nesting level's value is the one the next level's savepoint
-    // saved, and the innermost's is the current value. A level holds its own
-    // value when it differs from the level outside it; the transaction's own
-    // level also when a SET inside it repeated the session value.
-    let mut outer = state.transaction.start.custom[slot];
-    let mut first = true;
-    let set_in_transaction = state.transaction.session_overrides & placeholder != 0;
+    // PostgreSQL reapplies the committed session value when a session `SET`
+    // gave it (it is not the reset value), then the value of each nesting
+    // level that assigned the parameter, whatever the value. A savepoint's
+    // saved value is the value of the level around it, and the innermost
+    // level's value is the current one.
+    let stamp = GUC_BUILTIN_SETTING_COUNT + slot;
     if state.transaction.active {
-        let adopted = level(&mut state.transaction.start, false)?;
+        let session_set = state.transaction.start_overrides & placeholder != 0;
+        let adopted = level(&mut state.transaction.start, session_set)?;
         transfer(&mut state.transaction.start_overrides, adopted);
         let adopted = level(&mut state.transaction.session, false)?;
         transfer(&mut state.transaction.session_overrides, adopted);
+        let mut level_start = (
+            state.transaction.start_actions,
+            state.transaction.start_local_actions,
+        );
         for savepoint in state.transaction.savepoints[..state.transaction.savepoint_count]
             .iter_mut()
             .flatten()
         {
             let adopted = level(&mut savepoint.session, false)?;
             transfer(&mut savepoint.session_overrides, adopted);
-            let raw = savepoint.current.custom[slot];
-            let warn = raw != outer || first && set_in_transaction;
-            outer = raw;
-            first = false;
-            let adopted = level(&mut savepoint.current, warn)?;
+            let assigned = savepoint.session_actions[stamp] != level_start.0[stamp]
+                || savepoint.local_actions[stamp] != level_start.1[stamp];
+            level_start = (savepoint.session_actions, savepoint.local_actions);
+            let adopted = level(&mut savepoint.current, assigned)?;
             transfer(&mut savepoint.current_overrides, adopted);
         }
+        let assigned = state
+            .actions
+            .changed_since(stamp, &level_start.0, &level_start.1);
+        let adopted = level(&mut state.current, assigned)?;
+        transfer(&mut state.session_overrides, adopted);
+    } else {
+        let session_set = state.session_overrides & placeholder != 0;
+        let adopted = level(&mut state.current, session_set)?;
+        transfer(&mut state.session_overrides, adopted);
     }
-    let raw = state.current.custom[slot];
-    let warn = raw != outer || state.transaction.active && first && set_in_transaction;
-    let adopted = level(&mut state.current, warn)?;
-    transfer(&mut state.session_overrides, adopted);
     let index = bit.trailing_zeros() as usize;
-    let custom_index = GUC_BUILTIN_SETTING_COUNT + slot;
-    state.actions.session[index] = state.actions.session[custom_index];
-    state.transaction.start_actions[index] = state.transaction.start_actions[custom_index];
+    state.actions.session[index] = state.actions.session[stamp];
+    state.actions.local[index] = state.actions.local[stamp];
+    state.transaction.start_actions[index] = state.transaction.start_actions[stamp];
+    state.transaction.start_local_actions[index] = state.transaction.start_local_actions[stamp];
     for savepoint in state.transaction.savepoints[..state.transaction.savepoint_count]
         .iter_mut()
         .flatten()
     {
-        savepoint.session_actions[index] = savepoint.session_actions[custom_index];
+        savepoint.session_actions[index] = savepoint.session_actions[stamp];
+        savepoint.local_actions[index] = savepoint.local_actions[stamp];
     }
     Ok(())
 }

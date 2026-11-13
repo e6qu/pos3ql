@@ -27,6 +27,8 @@ pub(super) struct Site<'a> {
     pub position: usize,
     pub text: &'a str,
     pub exception_variables: bool,
+    /// How many routine parameters the text names `$1` onwards.
+    pub positionals: u32,
 }
 
 struct Capture<'a> {
@@ -122,6 +124,7 @@ fn record_with(
                 position: start,
                 text,
                 exception_variables,
+                positionals: super::parser::procedural_positionals(),
             })
             .map_err(|_| super::query::arena_full_pub())
     })
@@ -155,6 +158,20 @@ fn invalid_source() -> SqlError {
 }
 
 pub(super) fn parse<'a>(
+    site: Site<'a>,
+    storage: &crate::storage::Storage,
+    txid: u32,
+    row: &dyn super::eval::ColumnLookup<'a>,
+    relations: Option<&'a [(&'a str, &'a super::ast::MaterializedCte<'a>)]>,
+    arena: &'a Arena,
+    dependencies: Option<&mut crate::storage::StoredQueryDependencies>,
+) -> Result<super::parser::Parser<'a>, SqlError> {
+    super::parser::with_procedural_positionals(site.positionals, || {
+        parse_site(site, storage, txid, row, relations, arena, dependencies)
+    })
+}
+
+fn parse_site<'a>(
     site: Site<'a>,
     storage: &crate::storage::Storage,
     txid: u32,

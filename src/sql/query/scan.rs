@@ -7413,6 +7413,13 @@ fn scan_source_mode<'a>(
         let hash_loop = nodes.hash.start();
         let build_loop = nodes.build.start();
         let mut buckets_len = (build_count * 2).next_power_of_two().max(16);
+        let original_buckets = buckets_len;
+        // Every array the table allocates, those it outgrows included.
+        let table_bytes = |entries: usize, buckets: usize| {
+            entries * (core::mem::size_of::<HashEntry<'_>>() + core::mem::size_of::<u32>())
+                + buckets * core::mem::size_of::<u32>()
+        };
+        let mut allocated = table_bytes(build_count, buckets_len);
         let mut entries = arena
             .alloc_slice_with(build_count, |_| EMPTY_HASH_ENTRY)
             .map_err(|_| arena_full())?;
@@ -7470,6 +7477,7 @@ fn scan_source_mode<'a>(
                         .alloc_slice_with(grown, |_| u32::MAX)
                         .map_err(|_| arena_full())?;
                     buckets_len = (grown * 2).next_power_of_two().max(16);
+                    allocated += table_bytes(grown, buckets_len);
                     buckets = arena
                         .alloc_slice_with(buckets_len, |_| u32::MAX)
                         .map_err(|_| arena_full())?;
@@ -7605,6 +7613,11 @@ fn scan_source_mode<'a>(
         let entries = &mut entries[..n];
         let next = &*next;
         let buckets = &*buckets;
+        nodes.hash.hash_table(instrument::HashTable {
+            buckets: buckets_len,
+            original_buckets,
+            bytes: allocated,
+        });
         drop(build_loop);
         drop(hash_loop);
         let _probe_loop = nodes.probe.start();

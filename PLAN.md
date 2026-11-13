@@ -577,16 +577,18 @@ evaluation, set operations, derived tables, `VALUES` lists, a write's target
 scan, an `INSERT`'s source query or `VALUES` rows, and a query without FROM
 (its one-row `Result`, with a non-constant `WHERE` as its `One-Time Filter`,
 and the `ProjectSet` that expands set-returning calls, which also appears
-over scans), in all four formats. A query without FROM drops sort, grouping
+over scans), in all four formats. A hash join's `Hash` node reports the table pos3ql
+built: its bucket count (and the count it started with when it grew), one
+batch, and the bytes of its arrays as `Memory Usage`, which differ from
+PostgreSQL's allocator figures. A query without FROM drops sort, grouping
 and distinct keys that are planner constants, as PostgreSQL does (a constant
 `DISTINCT` becomes a `Limit`). Conditions print coerced numeric literals as
 the constants the planner folds them into (`'2'::double precision`). Times are measured
 per loop, to the first row and to the end; in pos3ql's push-based executor a
 node's time also includes the work of the nodes reading its rows. Not yet
 shown: subplans and InitPlans (a condition with a subquery prints no
-`Filter`), semi joins, the `Sort Method`, hash `Buckets`/`Batches`/`Memory
-Usage`, aggregate and `Materialize` storage lines that PostgreSQL measures in
-its own allocator, per-node `Buffers` and `WAL` (reported on the top node
+`Filter`), semi joins, the `Sort Method`, aggregate and `Materialize`
+storage lines that PostgreSQL measures in its own allocator, per-node `Buffers` and `WAL` (reported on the top node
 only), trigger time lines, an index-only scan's `Heap Fetches` and a bitmap
 heap scan's `Heap Blocks`. A node of a path the executor does not count (a
 data-modifying `WITH`, a joined `UPDATE` or `DELETE`, `MERGE`) prints no actual figures, except the top node, which reports the

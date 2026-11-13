@@ -4871,6 +4871,15 @@ fn text_line(node: &PlanNode, options: ExplainOptions, actual: NodeActual) -> St
     line
 }
 
+/// The hash table a `Hash` node built while `EXPLAIN ANALYZE` ran: pos3ql
+/// builds it in one batch, in the arrays whose bytes it reports.
+fn hash_table(actual: NodeActual) -> Option<query::instrument::HashTable> {
+    match actual {
+        NodeActual::Ran(counters) => counters.hash,
+        NodeActual::Unmeasured | NodeActual::NeverExecuted => None,
+    }
+}
+
 /// The count of rows `label`'s qualification of `node` removed, when
 /// PostgreSQL shows one.
 fn removed_count(
@@ -4957,6 +4966,27 @@ pub(super) fn visit_text_rows<E>(
                 let _ = write!(line, "{removed_label}: {removed:.0}");
                 emit(line.as_str())?;
             }
+        }
+        if let Some(table) = hash_table(node_actual) {
+            let mut line = StackStr::<256>::new();
+            for _ in 0..property_indent(node.depth) {
+                let _ = write!(line, " ");
+            }
+            let memory = table.bytes.div_ceil(1024);
+            if table.original_buckets == table.buckets {
+                let _ = write!(
+                    line,
+                    "Buckets: {}  Batches: 1  Memory Usage: {memory}kB",
+                    table.buckets
+                );
+            } else {
+                let _ = write!(
+                    line,
+                    "Buckets: {} (originally {})  Batches: 1 (originally 1)  Memory Usage: {memory}kB",
+                    table.buckets, table.original_buckets
+                );
+            }
+            emit(line.as_str())?;
         }
         if node.constant_false {
             let mut filter = StackStr::<64>::new();
@@ -5685,6 +5715,13 @@ fn structured_node(
     }
     if node.constant_false {
         document.text("One-Time Filter", "false");
+    }
+    if let Some(table) = hash_table(node_actual) {
+        document.number("Hash Buckets", table.buckets);
+        document.number("Original Hash Buckets", table.original_buckets);
+        document.number("Hash Batches", 1);
+        document.number("Original Hash Batches", 1);
+        document.number("Peak Memory Usage", table.bytes.div_ceil(1024));
     }
     for (label, text) in node.shown_qualifications(options.verbose) {
         document.text(label.text(), text);

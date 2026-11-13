@@ -135,6 +135,17 @@ pub(crate) struct NodeCounters {
     /// returned none.
     pub(crate) startup_nanos: u64,
     pub(crate) total_nanos: u64,
+    /// A hash node's table, when it built one.
+    pub(crate) hash: Option<HashTable>,
+}
+
+/// The hash table a `Hash` node built: its final and first bucket counts
+/// and the bytes its arrays took, every array it outgrew included.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct HashTable {
+    pub(crate) buckets: usize,
+    pub(crate) original_buckets: usize,
+    pub(crate) bytes: usize,
 }
 
 /// One plan node's counters while the statement runs.
@@ -159,6 +170,7 @@ impl Slot {
                 join_filtered: 0,
                 startup_nanos: 0,
                 total_nanos: 0,
+                hash: None,
             },
             open: 0,
             started: None,
@@ -370,6 +382,19 @@ impl Node {
             {
                 slot.first_row = Some(elapsed_nanos(started));
             }
+        });
+    }
+
+    /// Records the hash table the node built; a later build of a rescan
+    /// replaces it, keeping the largest memory use, as PostgreSQL keeps its
+    /// peak.
+    pub(crate) fn hash_table(self, table: HashTable) {
+        self.with(|slot, _| {
+            let bytes = slot
+                .counters
+                .hash
+                .map_or(table.bytes, |held| held.bytes.max(table.bytes));
+            slot.counters.hash = Some(HashTable { bytes, ..table });
         });
     }
 

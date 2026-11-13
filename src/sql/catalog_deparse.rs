@@ -556,6 +556,29 @@ impl Context<'_> {
         }
     }
 
+    /// A function argument: unlike an operator operand, whose cross-type
+    /// operators (`int24pl`, `float48pl`) take it as it is, every coercion
+    /// to the parameter type is printed (`int4range(a, b::integer)` for a
+    /// `smallint` column).
+    fn write_argument(
+        &self,
+        expression: &Expr<'_>,
+        expected: Option<i32>,
+        output: &mut Output<'_>,
+    ) -> Result<(), SqlError> {
+        if matches!(expression, Expr::Str(_) | Expr::Null) {
+            return self.literal(expression, expected.unwrap_or(oid::TEXT), output);
+        }
+        match (self.type_of(expression)?, expected) {
+            (Some(natural), Some(expected)) if natural != expected => {
+                self.wrapped(expression, None, Parent::Cast, true, output)?;
+                output.push("::")?;
+                self.type_name(expected, output)
+            }
+            _ => self.write(expression, expected, output),
+        }
+    }
+
     fn open(&self, output: &mut Output<'_>) -> Result<(), SqlError> {
         if self.pretty {
             Ok(())
@@ -1119,7 +1142,7 @@ impl Context<'_> {
                     if index != 0 {
                         output.push(", ")?;
                     }
-                    self.write(argument, Some(parameter_oids[index]), output)?;
+                    self.write_argument(argument, Some(parameter_oids[index]), output)?;
                 }
                 output.push(")")
             }
@@ -1142,7 +1165,7 @@ impl Context<'_> {
                     let expected = (crate::storage::PolymorphicType::from_oid(*parameter)
                         .is_none())
                     .then_some(*parameter);
-                    self.write(argument, expected, output)?;
+                    self.write_argument(argument, expected, output)?;
                 }
                 output.push(")")
             }

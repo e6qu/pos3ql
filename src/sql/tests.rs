@@ -39913,6 +39913,363 @@ fn exclusion_constraints_enforce_predicates_and_transaction_modes() {
 }
 
 #[test]
+fn exclusion_constraint_expression_elements_match_postgresql() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 256).unwrap();
+    let mut run = |sql: &str| run_txn_bytes(&mut engine, &mut budget, &mut txn, sql);
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).to_string();
+    run(
+        "CREATE TABLE excl_expression (a int, b int, r int4range, active boolean, \
+           EXCLUDE USING gist (int4range(a, b) WITH &&), \
+           EXCLUDE USING gist ((r * '[1,10)'::int4range) WITH &&, int4range(a, b, '[]') WITH -|-) \
+             WHERE (active))",
+    );
+    let catalog = run(
+        "SELECT conname, pg_get_constraintdef(oid), pg_get_constraintdef(oid, true), \
+                conkey, conexclop \
+           FROM pg_constraint WHERE conrelid = 'excl_expression'::regclass ORDER BY conname; \
+         SELECT indexrelid::regclass, indkey, indexprs IS NOT NULL, pg_get_indexdef(indexrelid) \
+           FROM pg_index WHERE indrelid = 'excl_expression'::regclass ORDER BY 1; \
+         SELECT objid::regclass, refobjsubid, deptype FROM pg_depend \
+          WHERE refobjid = 'excl_expression'::regclass AND classid = 'pg_class'::regclass \
+            AND deptype = 'a' ORDER BY 1, 2; \
+         SELECT attname FROM pg_attribute WHERE attrelid = 'excl_expression_expr_int4range_excl'::regclass \
+          ORDER BY attnum",
+    );
+    assert_eq!(
+        data_rows(&catalog),
+        [
+            "excl_expression_expr_int4range_excl|EXCLUDE USING gist (((r * '[1,10)'::int4range)) WITH &&, int4range(a, b, '[]'::text) WITH -|-) WHERE (active)|EXCLUDE USING gist ((r * '[1,10)'::int4range) WITH &&, int4range(a, b, '[]'::text) WITH -|-) WHERE (active)|{0,0}|{3888,3897}",
+            "excl_expression_int4range_excl|EXCLUDE USING gist (int4range(a, b) WITH &&)|EXCLUDE USING gist (int4range(a, b) WITH &&)|{0}|{3888}",
+            "excl_expression_int4range_excl|0|t|CREATE INDEX excl_expression_int4range_excl ON public.excl_expression USING gist (int4range(a, b))",
+            "excl_expression_expr_int4range_excl|0 0|t|CREATE INDEX excl_expression_expr_int4range_excl ON public.excl_expression USING gist (((r * '[1,10)'::int4range)), int4range(a, b, '[]'::text)) WHERE active",
+            "excl_expression_int4range_excl|1|a",
+            "excl_expression_int4range_excl|2|a",
+            "excl_expression_expr_int4range_excl|1|a",
+            "excl_expression_expr_int4range_excl|2|a",
+            "excl_expression_expr_int4range_excl|3|a",
+            "excl_expression_expr_int4range_excl|4|a",
+            "expr",
+            "int4range",
+        ],
+        "{}",
+        text(&catalog)
+    );
+    run("INSERT INTO excl_expression VALUES (1, 3, NULL, false)");
+    let conflict = text(&run(
+        "INSERT INTO excl_expression VALUES (2, 4, NULL, false)",
+    ));
+    assert!(conflict.contains("23P01"), "{conflict}");
+    assert!(
+        conflict.contains(
+            "Key (int4range(a, b))=([2,4)) conflicts with existing key (int4range(a, b))=([1,3))."
+        ),
+        "{conflict}"
+    );
+    // A NULL element conflicts with nothing; int4range(NULL, 9) is not NULL.
+    let unbounded = text(&run(
+        "INSERT INTO excl_expression VALUES (NULL, 9, NULL, false)",
+    ));
+    assert!(unbounded.contains("23P01"), "{unbounded}");
+    run("INSERT INTO excl_expression VALUES (5, 5, NULL, false), (5, 5, NULL, false)");
+    // Empty ranges overlap nothing; only rows the predicate admits meet the
+    // second constraint.
+    run("INSERT INTO excl_expression VALUES (10, 12, '[1,4)', true)");
+    let adjacent = text(&run(
+        "INSERT INTO excl_expression VALUES (13, 14, '[3,5)', true)",
+    ));
+    assert!(adjacent.contains("23P01"), "{adjacent}");
+    assert!(
+        adjacent.contains("Key ((r * '[1,10)'::int4range), int4range(a, b, '[]'::text))=([3,5), [13,15)) conflicts with existing key ((r * '[1,10)'::int4range), int4range(a, b, '[]'::text))=([1,4), [10,13))."),
+        "{adjacent}"
+    );
+    run("INSERT INTO excl_expression VALUES (13, 14, '[3,5)', false)");
+    let build = text(&run(
+        "ALTER TABLE excl_expression ADD EXCLUDE USING gist (int4range(a, a, '[]') WITH &&)",
+    ));
+    assert!(build.contains("23P01"), "{build}");
+    assert!(
+        build.contains("could not create exclusion constraint"),
+        "{build}"
+    );
+    for (sql, sqlstate) in [
+        (
+            "ALTER TABLE excl_expression ADD EXCLUDE USING gist (int4range(z, 2) WITH &&)",
+            "42703",
+        ),
+        (
+            "ALTER TABLE excl_expression ADD EXCLUDE USING gist (now() WITH =)",
+            "42P17",
+        ),
+        (
+            "ALTER TABLE excl_expression ADD EXCLUDE USING gist (r + r WITH &&)",
+            "42601",
+        ),
+        (
+            "ALTER TABLE excl_expression ADD EXCLUDE USING gist ((r) DESC WITH &&)",
+            "0A000",
+        ),
+        (
+            "ALTER TABLE excl_expression ADD EXCLUDE USING gist ((r) COLLATE \"C\" WITH &&)",
+            "42804",
+        ),
+        (
+            "ALTER TABLE excl_expression ADD EXCLUDE USING gist (lower(r) WITH =)",
+            "42704",
+        ),
+    ] {
+        let failed = text(&run(sql));
+        assert!(failed.contains(sqlstate), "{sql}: {failed}");
+    }
+}
+
+#[test]
+fn exclusion_constraint_expression_elements_follow_column_changes() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 256).unwrap();
+    let mut run = |sql: &str| run_txn_bytes(&mut engine, &mut budget, &mut txn, sql);
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).to_string();
+    run("CREATE TABLE excl_follow (a int, b int, c int, \
+           EXCLUDE USING gist (int4range(a, b) WITH &&) DEFERRABLE INITIALLY DEFERRED); \
+         CREATE TABLE excl_follow_like (LIKE excl_follow INCLUDING ALL)");
+    let defs = |run: &mut dyn FnMut(&str) -> Vec<u8>, table: &str| {
+        data_rows(&run(&format!(
+            "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint \
+              WHERE conrelid = '{table}'::regclass"
+        )))
+    };
+    assert_eq!(
+        defs(&mut run, "excl_follow_like"),
+        [
+            "excl_follow_like_int4range_excl|EXCLUDE USING gist (int4range(a, b) WITH &&) DEFERRABLE INITIALLY DEFERRED"
+        ]
+    );
+    run("ALTER TABLE excl_follow RENAME COLUMN a TO start_at");
+    assert_eq!(
+        defs(&mut run, "excl_follow"),
+        [
+            "excl_follow_int4range_excl|EXCLUDE USING gist (int4range(start_at, b) WITH &&) DEFERRABLE INITIALLY DEFERRED"
+        ]
+    );
+    // A dropped column before the element's columns leaves their names.
+    run("ALTER TABLE excl_follow DROP COLUMN c");
+    let retyped = text(&run("ALTER TABLE excl_follow ALTER COLUMN b TYPE bigint"));
+    assert!(retyped.contains("42883"), "{retyped}");
+    run("ALTER TABLE excl_follow ALTER COLUMN b TYPE smallint");
+    assert_eq!(
+        defs(&mut run, "excl_follow"),
+        [
+            "excl_follow_int4range_excl|EXCLUDE USING gist (int4range(start_at, (b)::integer) WITH &&) DEFERRABLE INITIALLY DEFERRED"
+        ]
+    );
+    run("BEGIN");
+    run("INSERT INTO excl_follow VALUES (1, 3), (2, 4)");
+    let deferred = text(&run("COMMIT"));
+    assert!(deferred.contains("23P01"), "{deferred}");
+    let restricted = text(&run("ALTER TABLE excl_follow DROP COLUMN b"));
+    assert!(restricted.contains("2BP01"), "{restricted}");
+    assert!(
+        restricted.contains("constraint excl_follow_int4range_excl on table excl_follow depends on column b of table excl_follow"),
+        "{restricted}"
+    );
+    let cascaded = text(&run("ALTER TABLE excl_follow DROP COLUMN b CASCADE"));
+    assert!(
+        cascaded.contains(
+            "drop cascades to constraint excl_follow_int4range_excl on table excl_follow"
+        ),
+        "{cascaded}"
+    );
+    assert!(defs(&mut run, "excl_follow").is_empty());
+}
+
+#[test]
+fn partitioned_exclusion_constraint_expression_elements_clone_to_partitions() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 256).unwrap();
+    let mut run = |sql: &str| run_txn_bytes(&mut engine, &mut budget, &mut txn, sql);
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).to_string();
+    run("CREATE TABLE excl_parent (a int, b int, p int4range) PARTITION BY LIST (p)");
+    let missing = text(&run(
+        "ALTER TABLE excl_parent ADD EXCLUDE USING gist (int4range(a, b) WITH &&)",
+    ));
+    assert!(missing.contains("0A000"), "{missing}");
+    assert!(
+        missing.contains("EXCLUDE constraint on table \"excl_parent\" lacks column \"p\" which is part of the partition key."),
+        "{missing}"
+    );
+    let unequal = text(&run(
+        "ALTER TABLE excl_parent ADD EXCLUDE USING gist (p WITH &&)",
+    ));
+    assert!(
+        unequal.contains(
+            "cannot match partition key to index on column \"p\" using non-equal operator \"&&\""
+        ),
+        "{unequal}"
+    );
+    run(
+        "ALTER TABLE excl_parent ADD EXCLUDE USING gist ((p) WITH =, int4range(a, b) WITH &&); \
+         CREATE TABLE excl_child PARTITION OF excl_parent FOR VALUES IN ('[1,2)'); \
+         CREATE TABLE excl_attached (b int, a int, p int4range); \
+         ALTER TABLE excl_parent ATTACH PARTITION excl_attached FOR VALUES IN ('[2,3)')",
+    );
+    let catalog = run(
+        "SELECT conrelid::regclass, conname, pg_get_constraintdef(oid), conparentid <> 0 \
+           FROM pg_constraint WHERE contype = 'x' ORDER BY 1, 2",
+    );
+    assert_eq!(
+        data_rows(&catalog),
+        [
+            "excl_parent|excl_parent_p_int4range_excl|EXCLUDE USING gist (p WITH =, int4range(a, b) WITH &&)|f",
+            "excl_child|excl_child_p_int4range_excl|EXCLUDE USING gist (p WITH =, int4range(a, b) WITH &&)|t",
+            "excl_attached|excl_attached_p_int4range_excl|EXCLUDE USING gist (p WITH =, int4range(a, b) WITH &&)|t",
+        ],
+        "{}",
+        text(&catalog)
+    );
+    run("INSERT INTO excl_parent VALUES (1, 5, '[2,3)')");
+    let conflict = text(&run("INSERT INTO excl_parent VALUES (3, 7, '[2,3)')"));
+    assert!(conflict.contains("23P01"), "{conflict}");
+    run("INSERT INTO excl_parent VALUES (3, 7, '[1,2)')");
+    // A constraint added to a populated partitioned table is built on each
+    // existing partition.
+    run(
+        "CREATE TABLE excl_populated (a int, b int, p int4range) PARTITION BY LIST (p); \
+         CREATE TABLE excl_populated_1 PARTITION OF excl_populated FOR VALUES IN ('[1,2)'); \
+         INSERT INTO excl_populated VALUES (1, 5, '[1,2)'), (3, 7, '[1,2)')",
+    );
+    let build = text(&run(
+        "ALTER TABLE excl_populated ADD EXCLUDE USING gist (p WITH =, int4range(a, b) WITH &&)",
+    ));
+    assert!(
+        build.contains(
+            "could not create exclusion constraint \"excl_populated_1_p_int4range_excl\""
+        ),
+        "{build}"
+    );
+    run("DELETE FROM excl_populated WHERE a = 3; \
+         ALTER TABLE excl_populated ADD EXCLUDE USING gist (p WITH =, int4range(a, b) WITH &&)");
+    let conflict = text(&run("INSERT INTO excl_populated VALUES (2, 3, '[1,2)')"));
+    assert!(
+        conflict.contains("excl_populated_1_p_int4range_excl"),
+        "{conflict}"
+    );
+}
+
+#[test]
+fn exclusion_constraints_arbitrate_on_conflict_do_nothing() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 256).unwrap();
+    let mut run = |sql: &str| run_txn_bytes(&mut engine, &mut budget, &mut txn, sql);
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).to_string();
+    run("CREATE TABLE excl_arbiter (a int, b int, \
+           CONSTRAINT excl_arbiter_span EXCLUDE USING gist (int4range(a, b) WITH &&) \
+             WHERE (a > 0)); \
+         CREATE TABLE excl_arbiter_deferred (r int4range, \
+           CONSTRAINT excl_arbiter_deferred_r EXCLUDE USING gist (r WITH &&) DEFERRABLE); \
+         INSERT INTO excl_arbiter VALUES (1, 5)");
+    assert_eq!(
+        data_rows(&run(
+            "INSERT INTO excl_arbiter VALUES (2, 3), (6, 7) ON CONFLICT DO NOTHING RETURNING a; \
+             INSERT INTO excl_arbiter VALUES (6, 9), (9, 10), (-2, 3) \
+               ON CONFLICT ON CONSTRAINT excl_arbiter_span DO NOTHING RETURNING a"
+        )),
+        ["6", "9", "-2"]
+    );
+    for (sql, sqlstate, message) in [
+        (
+            "INSERT INTO excl_arbiter VALUES (2, 3) \
+               ON CONFLICT ON CONSTRAINT excl_arbiter_span DO UPDATE SET b = 4",
+            "42809",
+            "ON CONFLICT DO UPDATE not supported with exclusion constraints",
+        ),
+        (
+            "INSERT INTO excl_arbiter_deferred VALUES ('[1,2)') ON CONFLICT DO NOTHING",
+            "55000",
+            "ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters",
+        ),
+        (
+            "INSERT INTO excl_arbiter_deferred VALUES ('[1,2)') \
+               ON CONFLICT ON CONSTRAINT excl_arbiter_deferred_r DO NOTHING",
+            "55000",
+            "ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters",
+        ),
+    ] {
+        let failed = text(&run(sql));
+        assert!(
+            failed.contains(sqlstate) && failed.contains(message),
+            "{sql}: {failed}"
+        );
+    }
+}
+
+#[test]
+fn exclusion_constraint_expression_elements_survive_journal_and_checkpoint_recovery() {
+    for checkpoint in [false, true] {
+        let name = format!("exclusion-expression-cold-{checkpoint}");
+        let mut config = test_config(&name);
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.object_store_bucket = format!("{name}-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        const DEFINITIONS: &str = "SELECT conname, pg_get_constraintdef(oid), conkey \
+             FROM pg_constraint WHERE conrelid = 'excl_cold'::regclass";
+        let before;
+        {
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            session.success(
+                &mut engine,
+                "CREATE TABLE excl_cold (room int, s date, e date, \
+                   CONSTRAINT excl_cold_booking EXCLUDE USING gist \
+                     (int4range(room, room, '[]') WITH =, daterange(s, e) WITH &&) \
+                     WHERE (room > 0)); \
+                 INSERT INTO excl_cold VALUES (1, '2024-01-01', '2024-01-05')",
+                false,
+            );
+            before = data_rows(&session.success(&mut engine, DEFINITIONS, true));
+            assert_eq!(
+                before,
+                [
+                    "excl_cold_booking|EXCLUDE USING gist (int4range(room, room, '[]'::text) WITH =, daterange(s, e) WITH &&) WHERE ((room > 0))|{0,0}"
+                ]
+            );
+            if checkpoint {
+                assert!(engine.checkpoint().unwrap());
+            }
+            engine.commit_wal().unwrap();
+        }
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        {
+            let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+            let mut cold = Engine::new(&config, &mut budget).unwrap();
+            let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+            assert_eq!(
+                data_rows(&session.success(&mut cold, DEFINITIONS, true)),
+                before
+            );
+            assert_eq!(
+                error_sqlstates(&session.execute(
+                    &mut cold,
+                    "INSERT INTO excl_cold VALUES (1, '2024-01-04', '2024-01-08')",
+                    true
+                )),
+                ["23P01"]
+            );
+            session.success(
+                &mut cold,
+                "INSERT INTO excl_cold VALUES (2, '2024-01-04', '2024-01-08')",
+                false,
+            );
+        }
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+}
+
+#[test]
 fn column_rename_rebinds_table_owned_constraint_expressions() {
     let (mut engine, mut budget) = test_engine();
     let mut txn = TxnState::new(&mut budget, 256).unwrap();
@@ -40091,13 +40448,15 @@ fn on_conflict_never_uses_a_deferrable_constraint_or_plain_index_name() {
         &mut txn,
         "INSERT INTO arbiter_rules VALUES (1, 1)",
     );
+    // Without a target every unique constraint arbitrates, and PostgreSQL
+    // refuses the deferrable one before checking any row.
     let untargeted = run_txn(
         &mut engine,
         &mut budget,
         &mut txn,
         "INSERT INTO arbiter_rules VALUES (1, 2) ON CONFLICT DO NOTHING",
     );
-    assert!(untargeted.contains("23505"), "{untargeted}");
+    assert!(untargeted.contains("55000"), "{untargeted}");
 }
 
 #[test]

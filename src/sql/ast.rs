@@ -2967,6 +2967,14 @@ pub struct IndexColumn<'a> {
     pub nulls_order_specified: bool,
 }
 
+/// One `EXCLUDE` element as written: an index element (a column, a function
+/// call or a parenthesized expression) and the operator after `WITH`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExclusionElementSpec<'a> {
+    pub key: IndexColumn<'a>,
+    pub operator: &'a str,
+}
+
 /// The relation class selected by REINDEX. Other PostgreSQL forms require
 /// global/catalog state this engine does not expose as a user relation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4310,12 +4318,10 @@ pub enum TableConstraint<'a> {
     Exclusion {
         source_position: SourcePosition,
         name: Option<&'a str>,
-        columns: &'a [&'a str],
         /// The access method enforcing the constraint (`USING`, B-tree by
         /// default).
         method: IndexAccessMethod,
-        /// Each element's operator as written.
-        operators: &'a [&'a str],
+        elements: &'a [ExclusionElementSpec<'a>],
         predicate: Option<&'a Expr<'a>>,
         predicate_text: Option<&'a str>,
         timing: ConstraintTiming,

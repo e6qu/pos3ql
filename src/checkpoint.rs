@@ -6096,7 +6096,7 @@ impl Checkpointer {
                     def.fkeys[i] = fk;
                     def.n_fkeys += 1;
                 }
-                Some("excl2") => {
+                Some("excl3") => {
                     let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("excl outside table"));
                     };
@@ -6114,13 +6114,28 @@ impl Checkpointer {
                         .ok_or(CheckpointSetupError::Corrupt("bad excl timing"))?;
                     exclusion.method = crate::sql::ast::IndexAccessMethod::from_code(method)
                         .ok_or(CheckpointSetupError::Corrupt("bad excl method"))?;
-                    exclusion.n_cols = n_cols;
-                    for position in 0..n_cols {
-                        exclusion.columns[position] = parse_field(words.next(), "excl col")?;
+                    for _ in 0..n_cols {
+                        // `c COLUMN` or `e HEX_EXPRESSION`, then the operator.
+                        let expression;
+                        let element = match words.next() {
+                            Some("c") => crate::storage::ExclusionElement::Column(parse_field(
+                                words.next(),
+                                "excl col",
+                            )?),
+                            Some("e") => {
+                                expression = decode_hex_name(words.next().ok_or(
+                                    CheckpointSetupError::Corrupt("excl expression missing"),
+                                )?)?;
+                                crate::storage::ExclusionElement::Expression(expression.as_str())
+                            }
+                            _ => return Err(CheckpointSetupError::Corrupt("bad excl element")),
+                        };
                         let operator: i32 = parse_field(words.next(), "excl operator")?;
-                        exclusion.operators[position] =
-                            crate::storage::ExclusionOperator::from_oid(operator)
-                                .ok_or(CheckpointSetupError::Corrupt("bad excl operator"))?;
+                        let operator = crate::storage::ExclusionOperator::from_oid(operator)
+                            .ok_or(CheckpointSetupError::Corrupt("bad excl operator"))?;
+                        exclusion.push(element, operator).map_err(|_| {
+                            CheckpointSetupError::Corrupt("excl expression too long")
+                        })?;
                     }
                     exclusion.name = sql_name(&decode_hex_name(
                         words
@@ -11201,14 +11216,26 @@ impl Checkpointer {
             }
             for exclusion in definition.exclusions() {
                 use core::fmt::Write;
-                let mut elements = StackStr::<{ 24 * crate::storage::MAX_INDEX_COLS }>::new();
-                for position in 0..exclusion.n_cols {
-                    let _ = write!(
-                        elements,
-                        "{} {} ",
-                        exclusion.columns[position],
-                        exclusion.operators[position].oid()
-                    );
+                let mut elements = StackStr::<
+                    {
+                        24 * crate::storage::MAX_INDEX_COLS
+                            + 2 * crate::storage::EXCLUSION_EXPRESSIONS_MAX
+                    },
+                >::new();
+                for (element, operator) in exclusion.elements().zip(exclusion.operators()) {
+                    match element {
+                        crate::storage::ExclusionElement::Column(column) => {
+                            let _ = write!(elements, "c {column} ");
+                        }
+                        crate::storage::ExclusionElement::Expression(text) => {
+                            let _ = write!(elements, "e ");
+                            for byte in text.as_bytes() {
+                                let _ = write!(elements, "{byte:02x}");
+                            }
+                            let _ = write!(elements, " ");
+                        }
+                    }
+                    let _ = write!(elements, "{} ", operator.oid());
                 }
                 let mut hex_name = StackStr::<130>::new();
                 for byte in exclusion.name.as_str().as_bytes() {
@@ -11232,10 +11259,10 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "excl2 {} {} {} {}{} {}",
+                        "excl3 {} {} {} {}{} {}",
                         exclusion.timing.code(),
                         exclusion.method.code(),
-                        exclusion.n_cols,
+                        exclusion.len(),
                         elements.as_str(),
                         hex_name.as_str(),
                         predicate.as_str()

@@ -961,6 +961,47 @@ pub(super) fn dependencies<'a>(
             .index_parent_oid
             .map(|parent| [(parent, b'P'), (index.table_oid, b'S')]);
         if index.constraint_identity.is_some() {
+            // A constraint index depends on its constraint instead of its
+            // simple key columns; `index_create` still records the columns
+            // its expressions, then its predicate, use.
+            if index.is_exclusion {
+                let table = storage.table_def(index.table_slot, transaction);
+                let mut expressions = crate::storage::ColumnSet::EMPTY;
+                for position in 0..index.n_cols {
+                    if let Some(source) =
+                        super::index_expression_source(storage, index, position, transaction)
+                    {
+                        let source = arena
+                            .alloc_str(source.as_str())
+                            .map_err(|_| crate::sql::eval::arena_full())?;
+                        let expression = crate::sql::parser::parse_expr(source, arena)?;
+                        expressions |=
+                            super::super::exec::check_referenced_columns(expression, &table)?;
+                    }
+                }
+                let mut predicate = crate::storage::ColumnSet::EMPTY;
+                if let Some(source) = index.predicate {
+                    let source = arena
+                        .alloc_str(source.as_str())
+                        .map_err(|_| crate::sql::eval::arena_full())?;
+                    let expression = crate::sql::parser::parse_expr(source, arena)?;
+                    predicate = super::super::exec::check_referenced_columns(expression, &table)?;
+                }
+                for referenced in [expressions, predicate] {
+                    for column in 0..table.n_columns {
+                        if referenced.contains(column) {
+                            push(
+                                super::PG_CLASS_OID,
+                                index.oid,
+                                super::PG_CLASS_OID,
+                                index.table_oid,
+                                i32::from(table.attribute_number(column)),
+                                b'a',
+                            )?;
+                        }
+                    }
+                }
+            }
             for (referenced, kind) in partition_edges.into_iter().flatten() {
                 push(
                     super::PG_CLASS_OID,

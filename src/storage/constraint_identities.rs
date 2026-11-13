@@ -870,8 +870,12 @@ mod tests {
             definition.uniques[0].n_cols = 2;
             definition.n_exclusions = 1;
             definition.exclusions[0].name = SqlName::parse("value_exclusion").unwrap();
-            definition.exclusions[0].columns[0] = 1;
-            definition.exclusions[0].n_cols = 1;
+            definition.exclusions[0]
+                .push(
+                    super::super::ExclusionElement::Column(1),
+                    super::super::ExclusionOperator::from_oid(3882).unwrap(),
+                )
+                .unwrap();
             let slot = storage.create_table(definition).unwrap();
             let position = CatalogPosition::new(slot, storage.table(slot).created_at()).unwrap();
             let mut replacement =

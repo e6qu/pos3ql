@@ -787,10 +787,12 @@ or index depends normally on what it names, and a generation expression
 internally on its column. `DROP ... RESTRICT` of a named object therefore
 fails listing them, and `CASCADE` drops the CHECK constraints, clears the
 defaults, drops the generated columns and drops the indexes (after the drop
-that removed the object, in one statement). Exclusion predicates, statistics
-expressions, trigger conditions and domain constraints still store plain text;
-renaming or moving a routine or type such an expression names is refused with
-`0A000`, as is renaming an enum label any stored expression spells.
+that removed the object, in one statement). Exclusion constraint elements
+and predicates, statistics expressions, trigger conditions and domain
+constraints still store plain text; an exclusion element or predicate that
+names a user-defined function, operator or type is refused with `0A000`,
+renaming or moving a routine or type one of the others names is refused with
+`0A000`, and so is renaming an enum label any stored expression spells.
 
 ### Catalog reads within a statement
 

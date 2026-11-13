@@ -9244,20 +9244,34 @@ impl<'a> Parser<'a> {
             IndexAccessMethod::Btree
         };
         self.expect_op("(")?;
-        let mut columns = ArenaList::new(self.arena);
-        let mut operators = ArenaList::new(self.arena);
+        let mut elements = ArenaList::new(self.arena);
         loop {
-            if self.peeked == Tok::Op("(") || self.lookahead(1)? == Tok::Op("(") {
-                let mut error =
-                    self.err_here("exclusion constraint elements must be columns, not expressions");
-                error.sqlstate = sqlstate::FEATURE_NOT_SUPPORTED;
-                return Err(error);
-            }
-            let column = self.col_ident("exclusion column")?;
-            self.push(&mut columns, column)?;
+            let key = self.exclusion_element()?;
             self.expect_ident("with")?;
-            let operator = self.any_op_token()?;
-            self.push(&mut operators, operator)?;
+            let operator = if self.eat_ident("operator")? {
+                // `OPERATOR(op)` and `OPERATOR(pg_catalog.op)` name the
+                // operator explicitly.
+                self.expect_op("(")?;
+                if let Tok::Ident(schema) = self.peeked {
+                    if !schema.eq_ignore_ascii_case("pg_catalog") {
+                        let mut error = self
+                            .err_here("exclusion operators outside pg_catalog are not supported");
+                        error.sqlstate = sqlstate::FEATURE_NOT_SUPPORTED;
+                        return Err(error);
+                    }
+                    self.advance()?;
+                    self.expect_op(".")?;
+                }
+                let operator = self.any_op_token()?;
+                self.expect_op(")")?;
+                operator
+            } else {
+                self.any_op_token()?
+            };
+            self.push(
+                &mut elements,
+                crate::sql::ast::ExclusionElementSpec { key, operator },
+            )?;
             if !self.eat_op(",")? {
                 break;
             }
@@ -9278,11 +9292,89 @@ impl<'a> Parser<'a> {
             source_position,
             name,
             method,
-            columns: columns.as_slice(),
-            operators: operators.as_slice(),
+            elements: elements.as_slice(),
             predicate,
             predicate_text,
             timing,
+        })
+    }
+
+    /// PostgreSQL's `index_elem` inside `EXCLUDE (...)`: a column, a
+    /// function call (`func_expr_windowless`) or a parenthesized expression,
+    /// then the optional collation, operator class and ordering.
+    fn exclusion_element(&mut self) -> Result<crate::sql::ast::IndexColumn<'a>, ParseError> {
+        let start = self.peek_at;
+        let (expression, expression_text) = if self.eat_op("(")? {
+            let inner = self.peek_at;
+            let expression = self.expression(0)?;
+            let text = self.text[inner..self.peek_at].trim_end();
+            self.expect_op(")")?;
+            (expression, index_expression_source(expression, text))
+        } else if matches!(self.lookahead(1)?, Tok::Op("(" | ".")) {
+            let expression = self.prefix()?;
+            if !matches!(expression, Expr::Call { .. } | Expr::Cast { .. }) {
+                return Err(self.syntax_error_here());
+            }
+            (expression, self.text[start..self.peek_at].trim_end())
+        } else {
+            let name = self.col_ident("exclusion column")?;
+            let expression = self.arena_expr(Expr::Column {
+                qualifier: None,
+                name,
+            })?;
+            (expression, name)
+        };
+        let column = match expression {
+            Expr::Column {
+                qualifier: None,
+                name,
+            } => Some(*name),
+            _ => None,
+        };
+        let collation = if self.eat_ident("collate")? {
+            Some(self.collation_name()?)
+        } else {
+            None
+        };
+        let operator_class = match self.peeked {
+            Tok::Ident(word)
+                if !["with", "asc", "desc", "nulls"]
+                    .iter()
+                    .any(|keyword| word.eq_ignore_ascii_case(keyword)) =>
+            {
+                Some(self.qual_name("operator class")?)
+            }
+            _ => None,
+        };
+        let (descending, ordering_specified) = if self.eat_ident("asc")? {
+            (false, true)
+        } else if self.eat_ident("desc")? {
+            (true, true)
+        } else {
+            (false, false)
+        };
+        let nulls_order_specified = self.eat_ident("nulls")?;
+        let nulls_first = if nulls_order_specified {
+            if self.eat_ident("first")? {
+                true
+            } else {
+                self.expect_ident("last")?;
+                false
+            }
+        } else {
+            descending
+        };
+        Ok(crate::sql::ast::IndexColumn {
+            column,
+            expression,
+            expression_text,
+            collation,
+            operator_class,
+            operator_class_options: crate::sql::ast::IndexOperatorClassOptions::DEFAULT,
+            descending,
+            ordering_specified,
+            nulls_first,
+            nulls_order_specified,
         })
     }
 

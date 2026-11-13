@@ -121,8 +121,13 @@ Other payload rules:
   another partition. Other bits are rejected. Recovery and restored prepared
   transactions keep the move flag, so a statement that waited for the row
   fails with PostgreSQL's `40001` instead of skipping it.
-- **Table definition payload** is version 17: version byte, ten-byte catalog
-  position, name, then the definition. Other versions are rejected.
+- **Table definition payload** is version 18: version byte, ten-byte catalog
+  position, name, then the definition. Other versions are rejected. Version 18
+  writes each exclusion constraint element as a tag byte, `0` with a two-byte
+  column position or `1` with a two-byte length and that many bytes of
+  canonical UTF-8 expression text, then the four-byte operator OID. An unknown
+  tag, invalid UTF-8, a span past the record or more than 256 bytes of
+  expression text in one constraint is rejected.
 - **Domain payload** uses marker 251; earlier layouts are rejected. A mandatory
   checked-default input section follows the constraint identities (an empty
   section is explicit).
@@ -173,6 +178,7 @@ inserts a missing writer.
 | `inline_key_name ATTRIBUTE HEX_NAME` | One per active inline primary or unique key. |
 | `constraint_identity POSITION CREATED_AT` | Table constraint identities in the [canonical order](#constraints-and-keys). |
 | `ukey` | Starts with the unique-key mode tag. |
+| `excl3` | Timing, method and element count, then per element `c COLUMN` or `e HEX_EXPRESSION` followed by the operator OID, then the hexadecimal name and predicate (`-` for none). Other element tags, over-long expression text and the earlier `excl2` record are rejected. |
 | `dom7`, `enm3`, `cmp2` | Domain, enum and composite types; written before the required `types_end`. Later type records or a missing/duplicate `types_end` are rejected. |
 | `nsp` | Creation stamp, database-owner flag (`0`/`1`), hexadecimal name. Stamp zero is an initial public schema. |
 | `pub` | Creation stamp after the owner, before the flags. |
@@ -356,7 +362,7 @@ detached partition CHECKs, and domain CHECK and NOT NULL constraints each have a
 creation identity. Renames preserve it; replacing a backing index changes
 `conindid` but not the constraint identifier, comments or dependencies.
 
-Table payload v17 and domain marker 251 append one four-byte little-endian
+Table payload v18 and domain marker 251 append one four-byte little-endian
 identity per constraint and column default. Table order: CHECKs, foreign keys,
 live attributes by stable attribute number (NOT NULL, then the default or
 generation expression, each when present), detached partition CHECK, named
@@ -369,9 +375,9 @@ the saved counter, or shared by distinct tables or domains in one database.
 | Rule | Format |
 |---|---|
 | Per-kind capacity | 64 table constraints per kind, 64 domain checks; journal counts are bytes; the 65th returns `54000` |
-| Unique-key mode | Tag `0` NULLs distinct, `1` primary key, `2` `NULLS NOT DISTINCT`; other tags rejected. v17 stores tag, key-column count and timing as three bytes before positions |
+| Unique-key mode | Tag `0` NULLs distinct, `1` primary key, `2` `NULLS NOT DISTINCT`; other tags rejected. v18 stores tag, key-column count and timing as three bytes before positions |
 | Constraint-created indexes | Own stamp; stored beside stable attribute numbers within the 512-byte column metadata bound |
-| Inline key names | Chosen once at admission (63-byte limit, no split UTF-8, collision suffix); v17 stores two-byte attribute number plus bounded name per key |
+| Inline key names | Chosen once at admission (63-byte limit, no split UTF-8, collision suffix); v18 stores two-byte attribute number plus bounded name per key |
 | NOT NULL names | Stored for columns and domains; renaming `orders` keeps `orders_id_not_null` |
 | Deferred uniqueness | Stored; every current index-option section is required |
 

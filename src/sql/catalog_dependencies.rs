@@ -904,7 +904,7 @@ pub(crate) fn for_each_dependency(
 
 /// The catalog identity a stored query dependency names, or `None` for one
 /// recorded by name only.
-fn stored_reference(
+pub(super) fn stored_reference(
     storage: &Storage,
     txid: u32,
     dependency: &crate::storage::StoredQueryDependency,
@@ -1123,11 +1123,54 @@ fn relation_dependencies(
             let Some(default) = definition.attribute_default_oid(column_index) else {
                 continue;
             };
+            // A generation expression is internal to its column, and depends
+            // normally on the columns it reads, as `StoreAttrDefault` records.
+            let generated = column.default.is_generated();
             visit(DependencyEdge {
                 dependent: ObjectAddress::new(PG_ATTRDEF_OID, default, 0),
                 referenced: ObjectAddress::new(PG_CLASS_OID, relation, attribute),
-                kind: b'a',
+                kind: if generated { b'i' } else { b'a' },
             })?;
+            if generated
+                && let Some(source) = column.default.expression().map(|source| source.as_str())
+            {
+                let mark = arena.mark();
+                let read = crate::sql::parser::parse_expr(source, arena).and_then(|expression| {
+                    crate::sql::exec::check_referenced_columns(expression, &definition)
+                });
+                // SAFETY: the column set is a value; nothing borrows the parse.
+                unsafe { arena.rewind_to(mark) };
+                let read = read?;
+                for other in 0..definition.n_columns {
+                    if read.contains(other) {
+                        visit(DependencyEdge {
+                            dependent: ObjectAddress::new(PG_ATTRDEF_OID, default, 0),
+                            referenced: ObjectAddress::new(
+                                PG_CLASS_OID,
+                                relation,
+                                i32::from(definition.attribute_number(other)),
+                            ),
+                            kind: b'n',
+                        })?;
+                    }
+                }
+            }
+            let owner = crate::storage::ExpressionOwner::Column(column.name);
+            if definition
+                .expression_dependencies_of(owner)
+                .next()
+                .is_some()
+            {
+                captured_expression_edges(
+                    storage,
+                    txid,
+                    &definition,
+                    owner,
+                    ObjectAddress::new(PG_ATTRDEF_OID, default, 0),
+                    visit,
+                )?;
+                continue;
+            }
             let mark = arena.mark();
             let mut references = [(0, 0); crate::storage::MAX_STORED_QUERY_DEPENDENCIES];
             let count = crate::sql::exec::column_default_dependencies(
@@ -1161,6 +1204,51 @@ fn relation_dependencies(
                 })?;
             }
         }
+        // A CHECK constraint depends normally on what its expression names.
+        for check in definition.checks() {
+            captured_expression_edges(
+                storage,
+                txid,
+                &definition,
+                crate::storage::ExpressionOwner::Check(check.name),
+                ObjectAddress::new(super::PG_CONSTRAINT_OID, check.oid(), 0),
+                visit,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The normal dependencies of a table expression on the objects it was bound
+/// to when written, each once.
+fn captured_expression_edges<B: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    txid: u32,
+    definition: &crate::storage::TableDefinition<B>,
+    owner: crate::storage::ExpressionOwner,
+    dependent: ObjectAddress,
+    visit: &mut dyn FnMut(DependencyEdge) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    let mut references = [(0, 0); crate::storage::MAX_TABLE_EXPRESSION_DEPENDENCIES];
+    let mut count = 0;
+    for dependency in definition.expression_dependencies_of(owner) {
+        let Ok(bound) = storage.rebound_stored_query_dependency(dependency, txid) else {
+            continue;
+        };
+        if let Some(reference) = stored_reference(storage, txid, &bound)
+            .filter(|(_, object)| *object >= crate::storage::FIRST_NORMAL_OBJECT_ID)
+            && !references[..count].contains(&reference)
+        {
+            references[count] = reference;
+            count += 1;
+        }
+    }
+    for (class, object) in &references[..count] {
+        visit(DependencyEdge {
+            dependent,
+            referenced: ObjectAddress::new(*class, *object, 0),
+            kind: b'n',
+        })?;
     }
     Ok(())
 }

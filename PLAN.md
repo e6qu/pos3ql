@@ -473,20 +473,17 @@ TRUE/FALSE`, `CASE`, casts, SQL value functions, positional calls of
 built-in and user-defined functions, `ROW(...)` and whole-row references;
 other expressions (subqueries, named-argument calls, `$n` parameters and
 array constructors outside a quantified comparison) are still printed as
-stored. Column defaults, CHECK and exclusion predicates, index keys and
-predicates, statistics expressions, trigger `WHEN` conditions, domain
-constraints keep routine and type names as SQL text, so renaming or moving a
-routine or type one of them names, or renaming an enum value it casts to,
-fails with `0A000` (PostgreSQL stores them bound by OID and follows the
-rename); views, rules, policies and SQL-standard routine bodies are bound and
-follow it. Those expressions also resolve unqualified names under the
-session's search path when they run, so `CHECK (f(v) > 0)` created with
-`search_path = s` fails with `42883` once the path lacks `s`. Binding them
-means storing, with each expression, the dependency list captured under the
-creator's path (as `stored_query_dependencies` does for views and policies),
-binding it with `bind_stored_expression` wherever it is evaluated or printed,
-journaling and checkpointing that list with its owner, and then dropping the
-rename refusals. Renaming an enum value that a cast literal in a SQL-standard routine
+stored. CHECK constraints, column defaults and generation expressions, and
+index keys and predicates are bound to the routines, operators, types and
+collations they named when written (see
+[stored expressions](docs/architecture.md#stored-expressions)): a later
+search path, rename or schema move changes nothing, and dropping a named
+object reports and cascades to them. Exclusion predicates, statistics
+expressions, trigger `WHEN` conditions and domain constraints still keep
+routine and type names as SQL text, so renaming or moving a routine or type
+one of them names fails with `0A000`, as does renaming an enum value any
+stored expression casts to; binding them follows the same dependency-list
+pattern. Renaming an enum value that a cast literal in a SQL-standard routine
 body spells (`RETURN 'a'::e`) leaves the body spelling the old label, so the
 call fails with `22P02`. An index key whose value is a whole row
 (`CREATE INDEX ON t ((t))`) fails with `0A000`: evaluation yields an anonymous

@@ -967,8 +967,28 @@ fn enforce_expression_index_uniqueness<'a>(
         return Ok(());
     }
     let violation = || {
+        // `pg_get_indexdef_columns`: each expression key deparsed from its
+        // binding.
+        let mut displays = [None; crate::storage::MAX_INDEX_COLS];
+        for (position, display) in displays.iter_mut().enumerate().take(columns.len()) {
+            if let (Some(expression), Some(source)) =
+                (expressions[position], expression_texts[position])
+            {
+                match crate::sql::catalog::index_key_display(
+                    storage,
+                    txid,
+                    table_index,
+                    expression,
+                    source,
+                    arena,
+                ) {
+                    Ok(text) => *display = Some(text),
+                    Err(error) => return error,
+                }
+            }
+        }
         let names = columns.iter().enumerate().map(|(position, column)| {
-            expression_texts[position].unwrap_or(def.columns()[*column as usize].name.as_str())
+            displays[position].unwrap_or(def.columns()[*column as usize].name.as_str())
         });
         let values = keys[..columns.len()].iter().copied();
         duplicate_key_error(duplicate, name, def, &mut { names }, &mut { values })
@@ -1717,10 +1737,14 @@ fn check_index_tuple_sizes_inner(
             })? as u16;
         }
         if let Some(source) = index.predicate {
-            let source = arena
-                .alloc_str(source.as_str())
-                .map_err(|_| crate::sql::eval::arena_full())?;
-            let predicate = crate::sql::parser::parse_expr(source, arena)?;
+            let predicate = super::expression_bindings::bound_index_expression(
+                source.as_str(),
+                storage,
+                &index,
+                crate::storage::ExpressionOwner::IndexPredicate,
+                txid,
+                arena,
+            )?;
             if !index_predicate_matches(storage, txid, def, values, predicate, arena)? {
                 continue;
             }
@@ -1728,10 +1752,14 @@ fn check_index_tuple_sizes_inner(
         let mut expressions = [None; crate::storage::MAX_INDEX_COLS];
         for (position, source) in index.expressions[..index.n_cols].iter().enumerate() {
             if let Some(source) = source {
-                let source = arena
-                    .alloc_str(source.as_str())
-                    .map_err(|_| crate::sql::eval::arena_full())?;
-                expressions[position] = Some(crate::sql::parser::parse_expr(source, arena)?);
+                expressions[position] = Some(super::expression_bindings::bound_index_expression(
+                    source.as_str(),
+                    storage,
+                    &index,
+                    crate::storage::ExpressionOwner::IndexKey(position as u8),
+                    txid,
+                    arena,
+                )?);
             }
         }
         let key = index_key_values(
@@ -1902,7 +1930,14 @@ pub fn check_unique_indexes(
                     .alloc_str(source.as_str())
                     .map_err(|_| crate::sql::eval::arena_full())?;
                 expression_texts[position] = Some(source);
-                expressions[position] = Some(crate::sql::parser::parse_expr(source, arena)?);
+                expressions[position] = Some(super::expression_bindings::bound_index_expression(
+                    source,
+                    storage,
+                    &index,
+                    crate::storage::ExpressionOwner::IndexKey(position as u8),
+                    txid,
+                    arena,
+                )?);
             }
         }
         let resolved = resolve_index_operator_classes(&index)?;
@@ -1926,10 +1961,14 @@ pub fn check_unique_indexes(
             let predicate = index
                 .predicate
                 .map(|source| {
-                    let source = arena
-                        .alloc_str(source.as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?;
-                    crate::sql::parser::parse_expr(source, arena)
+                    super::expression_bindings::bound_index_expression(
+                        source.as_str(),
+                        storage,
+                        &index,
+                        crate::storage::ExpressionOwner::IndexPredicate,
+                        txid,
+                        arena,
+                    )
                 })
                 .transpose()?;
             let mut classes = [crate::storage::IndexOperatorClass::Btree(
@@ -1963,7 +2002,14 @@ pub fn check_unique_indexes(
             continue;
         }
         if let Some(predicate) = index.predicate {
-            let expression = crate::sql::parser::parse_expr(predicate.as_str(), arena)?;
+            let expression = super::expression_bindings::bound_index_expression(
+                predicate.as_str(),
+                storage,
+                &index,
+                crate::storage::ExpressionOwner::IndexPredicate,
+                txid,
+                arena,
+            )?;
             enforce_partial_index_uniqueness(
                 storage,
                 table_index,
@@ -2012,6 +2058,8 @@ pub(crate) type ParsedChecks<'a> =
 /// Re-parses every stored CHECK predicate once per statement into the arena.
 pub(crate) fn parse_checks<'a>(
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<ParsedChecks<'a>, SqlError> {
     let mut out: ParsedChecks<'a> =
@@ -2020,7 +2068,14 @@ pub(crate) fn parse_checks<'a>(
         let source = arena
             .alloc_str(c.expression.as_str())
             .map_err(|_| crate::sql::eval::arena_full())?;
-        out[i] = Some(crate::sql::parser::parse_expr(source, arena)?);
+        out[i] = Some(super::expression_bindings::bind_table_expression(
+            crate::sql::parser::parse_expr(source, arena)?,
+            storage,
+            def,
+            crate::storage::ExpressionOwner::Check(c.name),
+            txid,
+            arena,
+        )?);
     }
     for (index, exclusion) in def.exclusions().iter().enumerate() {
         if let Some(predicate) = &exclusion.predicate {
@@ -2079,7 +2134,7 @@ pub(crate) fn parse_defaults<'a>(
                     arena,
                 )?
             };
-            out[i] = Some(crate::sql::parser::parse_expression_with_type_inputs(
+            let parsed = crate::sql::parser::parse_expression_with_type_inputs(
                 text,
                 inputs,
                 arena,
@@ -2099,6 +2154,14 @@ pub(crate) fn parse_defaults<'a>(
                             }))
                     })
                 },
+            )?;
+            out[i] = Some(super::expression_bindings::bind_table_expression(
+                parsed,
+                storage,
+                def,
+                crate::storage::ExpressionOwner::Column(c.name),
+                txid,
+                arena,
             )?);
         }
     }
@@ -2127,7 +2190,7 @@ pub(crate) fn parse_generated<'a>(
                 .binary_search_by_key(&section, |(section, _)| *section)
                 .ok()
                 .map_or(&[][..], |index| input_sections[index].1);
-            out[i] = Some(crate::sql::parser::parse_expression_with_type_inputs(
+            let parsed = crate::sql::parser::parse_expression_with_type_inputs(
                 source,
                 inputs,
                 arena,
@@ -2147,6 +2210,14 @@ pub(crate) fn parse_generated<'a>(
                             }))
                     })
                 },
+            )?;
+            out[i] = Some(super::expression_bindings::bind_table_expression(
+                parsed,
+                storage,
+                def,
+                crate::storage::ExpressionOwner::Column(c.name),
+                txid,
+                arena,
             )?);
         }
     }
@@ -3278,7 +3349,14 @@ pub(crate) fn validate_check_constraint(
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let read = storage.validation_read();
-    let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
+    let expression = super::expression_bindings::bind_table_expression(
+        crate::sql::parser::parse_expr(check.expression.as_str(), arena)?,
+        storage,
+        definition,
+        crate::storage::ExpressionOwner::Check(check.name),
+        txid,
+        arena,
+    )?;
     let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {
         catalog: Some(&catalog),
@@ -4278,7 +4356,7 @@ pub(crate) fn fire_foreign_key_action(
         }
         let new_child = &new_child[..cdef.n_columns];
         check_not_null(&cdef, new_child)?;
-        let checks = parse_checks(&cdef, arena)?;
+        let checks = parse_checks(&cdef, storage, txn.txid, arena)?;
         enforce_row_constraints(
             storage,
             child_index,

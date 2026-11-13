@@ -25386,6 +25386,17 @@ impl Engine {
                 return Ok(Err(error));
             }
         }
+        if let Err(error) = exec::drop_dangling_table_expressions(
+            &mut self.storage,
+            &mut self.wal,
+            txn,
+            &mut self.dml_scratch,
+            guc.seq_session(),
+            arena,
+            responder,
+        ) {
+            return Ok(Err(error));
+        }
         responder.command_complete("DROP EXTENSION")?;
         Ok(Ok(()))
     }
@@ -30966,6 +30977,7 @@ fn apply_wal_op(
             expressions,
             unique,
             definition,
+            expression_dependencies,
         } => {
             let mut stored_expressions = [None; crate::storage::MAX_INDEX_COLS];
             for (index, expression) in expressions.into_iter().enumerate() {
@@ -30973,43 +30985,43 @@ fn apply_wal_op(
                     .map(crate::storage::index_expression_stackstr)
                     .transpose()?;
             }
-            let slot = storage.create_index(
-                crate::storage::IndexDef {
-                    database: storage.current_database_oid(),
-                    created_at,
-                    schema: crate::storage::SqlName::parse(schema)?,
-                    name: crate::storage::SqlName::parse(name)?,
-                    pending_name: None,
-                    table: crate::storage::SqlName::parse(table)?,
-                    relation,
-                    table_binding: None,
-                    pending_table: None,
-                    method,
-                    ownership: crate::storage::Ownership::BOOTSTRAP,
-                    columns,
-                    expressions: stored_expressions,
-                    include_columns,
-                    collations,
-                    explicit_collations,
-                    operator_classes,
-                    resolved_operator_classes,
-                    operator_class_options,
-                    descending,
-                    nulls_first,
-                    n_cols,
-                    n_include_cols,
-                    nulls_not_distinct,
-                    predicate: predicate
-                        .map(crate::storage::index_predicate_stackstr)
-                        .transpose()?,
-                    unique,
-                    mutable: definition,
-                    pending_definition: None,
-                    ddl_state: crate::storage::CatalogDdlState::Present,
-                    pending_parent_drop_txid: None,
-                },
-                0,
-            )?;
+            let mut index = crate::storage::IndexDef {
+                database: storage.current_database_oid(),
+                created_at,
+                schema: crate::storage::SqlName::parse(schema)?,
+                name: crate::storage::SqlName::parse(name)?,
+                pending_name: None,
+                table: crate::storage::SqlName::parse(table)?,
+                relation,
+                table_binding: None,
+                pending_table: None,
+                method,
+                ownership: crate::storage::Ownership::BOOTSTRAP,
+                columns,
+                expressions: stored_expressions,
+                include_columns,
+                collations,
+                explicit_collations,
+                operator_classes,
+                resolved_operator_classes,
+                operator_class_options,
+                descending,
+                nulls_first,
+                n_cols,
+                n_include_cols,
+                nulls_not_distinct,
+                predicate: predicate
+                    .map(crate::storage::index_predicate_stackstr)
+                    .transpose()?,
+                unique,
+                mutable: definition,
+                pending_definition: None,
+                ddl_state: crate::storage::CatalogDdlState::Present,
+                pending_parent_drop_txid: None,
+                ..crate::storage::IndexDef::EMPTY
+            };
+            index.restore_expression_dependencies(expression_dependencies.entries())?;
+            let slot = storage.create_index(index, 0)?;
             storage.commit_index_create(slot)?;
         }
         WalOp::BrinMaintenance {

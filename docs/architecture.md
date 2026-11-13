@@ -711,6 +711,40 @@ entries on the SQL execution thread. A paused call releases its entry and
 re-admits it on resume, so another client's calls are not counted as its
 children. Exhaustion returns `54000` naming the function timing stack.
 
+### Stored expressions
+
+PostgreSQL stores a CHECK constraint, a column default or generation
+expression, and an index key expression or predicate as an analyzed tree that
+names functions, operators, types and collations by OID. pos3ql stores the
+SQL text and, beside it, the dependency list captured when the expression was
+written: each entry pairs the spelling used with the object it resolved to
+under the creator's `search_path`. Before an expression runs, is printed
+(`pg_get_constraintdef`, `pg_get_expr`, `pg_get_indexdef`, `\d`) or describes
+a key, its text is bound to those objects under their current names. So with
+`search_path = app` at creation, `CHECK (score(a) > 0)` keeps calling
+`app.score` after the path changes, after `ALTER FUNCTION app.score RENAME TO
+rank` (printed as `app.rank(a)`), and after `ALTER SCHEMA app RENAME TO core`.
+
+| Owner | Where the list lives | Limit |
+|---|---|---|
+| CHECK constraints, defaults, generated columns | The table definition, frozen into `table_metadata_bytes` | 64 entries per table |
+| Index keys and predicate | The index definition | 16 entries per index |
+
+Each single expression also respects `max_stored_query_dependencies_per_object`.
+Exceeding a limit returns `54000`. Sequence references are not in the list:
+`nextval('s')` keeps its regclass literal, which sequence renames already
+maintain.
+
+The lists produce `pg_depend` rows as PostgreSQL's do: a constraint, default
+or index depends normally on what it names, and a generation expression
+internally on its column. `DROP ... RESTRICT` of a named object therefore
+fails listing them, and `CASCADE` drops the CHECK constraints, clears the
+defaults, drops the generated columns and drops the indexes (after the drop
+that removed the object, in one statement). Exclusion predicates, statistics
+expressions, trigger conditions and domain constraints still store plain text;
+renaming or moving a routine or type such an expression names is refused with
+`0A000`, as is renaming an enum label any stored expression spells.
+
 ### Statement preparation
 
 Function calls bind their selected function, argument mapping and declared

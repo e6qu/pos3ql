@@ -5989,6 +5989,27 @@ impl Checkpointer {
                     def.uniques[i] = uk;
                     def.n_uniques += 1;
                 }
+                Some("xdep") => {
+                    let Some((_, _, def, _)) = pending_def.as_mut() else {
+                        return Err(CheckpointSetupError::Corrupt("xdep outside table"));
+                    };
+                    if def.n_expression_dependencies
+                        >= crate::storage::MAX_TABLE_EXPRESSION_DEPENDENCIES
+                    {
+                        return Err(CheckpointSetupError::Corrupt("too many xdep lines"));
+                    }
+                    let bytes = decode_manifest_hex_bytes(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("xdep bytes missing"))?,
+                    )?;
+                    let mut at = 0;
+                    let entry = crate::wal::decode_expression_dependency(&bytes, &mut at)
+                        .filter(|entry| at == bytes.len() && entry.owner.belongs_to_table())
+                        .ok_or(CheckpointSetupError::Corrupt("bad xdep"))?;
+                    def.expression_dependencies[def.n_expression_dependencies] = entry;
+                    def.n_expression_dependencies += 1;
+                }
                 Some("chk2") => {
                     let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("chk outside table"));
@@ -9452,6 +9473,34 @@ impl Checkpointer {
                             *range = parse_field(words.next(), "idx unsummarized range")?;
                         }
                     }
+                    let mut expression_dependencies = [crate::storage::ExpressionDependency::EMPTY;
+                        crate::storage::MAX_INDEX_EXPRESSION_DEPENDENCIES];
+                    let mut n_expression_dependencies = 0usize;
+                    if words.clone().next() == Some("xd") {
+                        let _ = words.next();
+                        n_expression_dependencies =
+                            parse_field(words.next(), "idx expression dependency count")?;
+                        if n_expression_dependencies == 0
+                            || n_expression_dependencies > expression_dependencies.len()
+                        {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "bad idx expression dependency count",
+                            ));
+                        }
+                        for entry in &mut expression_dependencies[..n_expression_dependencies] {
+                            let bytes = decode_manifest_hex_bytes(words.next().ok_or(
+                                CheckpointSetupError::Corrupt("idx expression dependency missing"),
+                            )?)?;
+                            let mut at = 0;
+                            *entry = crate::wal::decode_expression_dependency(&bytes, &mut at)
+                                .filter(|entry| {
+                                    at == bytes.len() && !entry.owner.belongs_to_table()
+                                })
+                                .ok_or(CheckpointSetupError::Corrupt(
+                                    "bad idx expression dependency",
+                                ))?;
+                        }
+                    }
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("trailing idx fields"));
                     }
@@ -9549,6 +9598,8 @@ impl Checkpointer {
                                 pending_definition: None,
                                 ddl_state: crate::storage::CatalogDdlState::Present,
                                 pending_parent_drop_txid: None,
+                                expression_dependencies,
+                                n_expression_dependencies: n_expression_dependencies as u8,
                             },
                             0,
                         )
@@ -11091,6 +11142,21 @@ impl Checkpointer {
                         hex_name.as_str(),
                         hexpr.as_str()
                     ),
+                )?;
+            }
+            // `xdep <hex>`: one expression dependency in its journal encoding.
+            for entry in definition.expression_dependencies() {
+                let mut bytes = [0u8; crate::wal::EXPRESSION_DEPENDENCY_BYTES];
+                let length = crate::wal::expression_dependency_bytes(entry, &mut bytes)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "expression dependency exceeds its manifest line"
+                        )
+                    })?;
+                write_manifest(
+                    &mut self.manifest_output,
+                    format_args!("xdep {}", ManifestInputBytes(&bytes[..length])),
                 )?;
             }
             // `fkey <ncols> <c..> <nparent> <p..> <actions> <timing> <validation> <names>`
@@ -13137,7 +13203,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "idx {} {} {} {} {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {} {} {} gb{} bo{} gi{},{}{}",
+                    "idx {} {} {} {} {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {} {} {} gb{} bo{} gi{},{}{}{}",
                     index.created_at,
                     match index.relation {
                         crate::storage::IndexRelationSource::Table => 0,
@@ -13186,6 +13252,7 @@ impl Checkpointer {
                     fastupdate,
                     gin_pending_list_limit.as_str(),
                     maintenance_suffix.as_str(),
+                    ManifestIndexDependencies(index.expression_dependencies()),
                 ),
             )?;
         }
@@ -19666,6 +19733,26 @@ impl core::fmt::Display for ManifestDependencies<'_> {
 }
 
 struct ManifestInputBytes<'a>(&'a [u8]);
+
+/// ` xd <count> <hex>...`: an index's expression dependencies in their
+/// journal encoding, or nothing when it has none.
+struct ManifestIndexDependencies<'a>(&'a [crate::storage::ExpressionDependency]);
+
+impl core::fmt::Display for ManifestIndexDependencies<'_> {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0.is_empty() {
+            return Ok(());
+        }
+        write!(output, " xd {}", self.0.len())?;
+        for entry in self.0 {
+            let mut bytes = [0u8; crate::wal::EXPRESSION_DEPENDENCY_BYTES];
+            let length = crate::wal::expression_dependency_bytes(entry, &mut bytes)
+                .ok_or(core::fmt::Error)?;
+            write!(output, " {}", ManifestInputBytes(&bytes[..length]))?;
+        }
+        Ok(())
+    }
+}
 
 impl core::fmt::Display for ManifestInputBytes<'_> {
     fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

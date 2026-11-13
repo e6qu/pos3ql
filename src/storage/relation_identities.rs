@@ -145,6 +145,7 @@ impl Storage {
         declared: Option<&super::ConstraintDeclarationOrder>,
     ) -> Result<(), SqlError> {
         Self::validate_inline_key_names(definition)?;
+        definition.prune_expression_dependencies();
         self.reserve_constraint_identities(definition, declared)?;
         definition.has_toast |= definition
             .columns()

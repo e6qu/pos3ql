@@ -1602,6 +1602,14 @@ pub(super) fn attach_constraints(
                 }
                 def.checks[def.n_checks] = c;
                 def.n_checks += 1;
+                super::expression_bindings::capture_expression_dependencies(
+                    storage,
+                    def,
+                    crate::storage::ExpressionOwner::Check(c.name),
+                    c.expression.as_str(),
+                    txid,
+                    arena,
+                )?;
             }
             TableConstraint::ForeignKey {
                 source_position: _,

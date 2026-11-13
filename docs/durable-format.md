@@ -164,6 +164,7 @@ inserts a missing writer.
 | `vw15` | View position and stamp, return-rule position and stamp, encoded query, the security, barrier and check-option codes, the `reloptions` list as hexadecimal (order code, then each option's written value: length and eight padded bytes), then each column by ordinal: name, checked default, `pg_attrdef` stamp (zero without a default), type OID, type length, type modifier and collation code. |
 | `hidx <table-slot> <0-or-1>` | Required once per table, including tables without indexes. The large-object page table requires `0`. |
 | `col4` | Hexadecimal column name and NOT NULL constraint name (empty when nullable). Extra fields are rejected. |
+| `xdep <hex>` | One [expression dependency](#expression-dependencies) of the preceding table, in its journal encoding; at most 64 per table. Index owners are rejected. |
 | `attributes2` | Entry count and each attribute entry as sixteen hex digits. |
 | `implicit_index POSITION CREATED_AT` | Constraint-created index identities, including the current TOAST index. |
 | `inline_key_name ATTRIBUTE HEX_NAME` | One per active inline primary or unique key. |
@@ -174,6 +175,7 @@ inserts a missing writer.
 | `pub` | Creation stamp after the owner, before the flags. |
 | `pacl` | Parameter permissions; an empty row differs from removal. |
 | `brtn` | Built-in routine attributes in the preceding `dbctx` database: OID, five attribute codes, cost and rows bits, then the journal record's settings bytes in hex (at most 6,180 characters). `own` and `acl` records for class 20 name the routine OID. |
+| `idx` | Index definition; a trailing `xd <count> <hex>...` lists its [expression dependencies](#expression-dependencies) (1–16), omitted when it has none. Table owners are rejected. |
 | `ptx` | Prepared transaction; owner as decimal role identifier. |
 | `rol` | Role identifier, catalog slot, encoded name and attributes. Never written for the predefined roles, which are bootstrap facts. |
 | `rmem` | Position, stamp, role/member/grantor identifiers, option flags. Every live membership is listed, so restoring a manifest first removes the initdb memberships a fresh catalog starts with. |
@@ -369,6 +371,24 @@ the saved counter, or shared by distinct tables or domains in one database.
 | Inline key names | Chosen once at admission (63-byte limit, no split UTF-8, collision suffix); v17 stores two-byte attribute number plus bounded name per key |
 | NOT NULL names | Stored for columns and domains; renaming `orders` keeps `orders_id_not_null` |
 | Deferred uniqueness | Stored; every current index-option section is required |
+
+### Expression dependencies
+
+The objects a CHECK constraint, column default or generation expression, or
+index key or predicate was bound to when written. Table payloads append a
+one-byte count and the entries after the constraint identities; index journal
+records append marker `0xa7`, a one-byte count and the entries after the
+definition. Each entry:
+
+| Field | Encoding |
+|---|---|
+| Owner | `1` CHECK constraint, `2` column (each followed by a length-prefixed name), `3` index key (followed by its one-byte position), `4` index predicate |
+| Class | One byte, as in stored-query dependencies |
+| Identity | Length-prefixed key as stored-query dependencies write it (routine, operator and text search configuration OIDs, type and collation identities) |
+| Names | Four length-prefixed names: current schema and name, then the spelling the expression used |
+
+An entry is at most 512 bytes; the slot is bound again on use. Unknown owner
+codes, classes or identity keys are rejected.
 
 ### Indexes
 

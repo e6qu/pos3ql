@@ -10111,11 +10111,31 @@ fn index_expression_source(
     if !info.expression_keys[position] {
         return None;
     }
+    info_index(storage, info, txid)?.expressions[position]
+}
+
+fn info_index(storage: &Storage, info: &IdxInfo, txid: u32) -> Option<crate::storage::IndexDef> {
     let table = storage.table_def(info.table_slot, txid);
     storage
         .indexes_for(table.schema.as_str(), table.name.as_str(), txid)
-        .find(|index| index.name_for(txid).as_str() == info.name.as_str())?
-        .expressions[position]
+        .find(|index| index.name_for(txid).as_str() == info.name.as_str())
+}
+
+/// The stored text of `owner` in the index `info` describes, bound to the
+/// objects it was written against under their current names.
+fn bound_index_source<'a>(
+    storage: &Storage,
+    info: &IdxInfo,
+    owner: crate::storage::ExpressionOwner,
+    source: &str,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a super::ast::Expr<'a>, SqlError> {
+    let index = info_index(storage, info, txid)
+        .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "index definition is absent"))?;
+    super::exec::expression_bindings::bound_index_expression(
+        source, storage, &index, owner, txid, arena,
+    )
 }
 
 /// Materializes every visible index in the statement arena. This is sized from
@@ -15233,6 +15253,32 @@ pub(crate) fn builtin_family_has_operator(family: i32, method: i32, operator: i3
         .any(|row| row.1 == family && row.5 == "s" && row.6 == operator && row.7 == method)
 }
 
+/// A table's stored expression deparsed after binding it to the objects it
+/// was written against, under their current names; `None` when the deparser
+/// does not cover its shape.
+fn bound_table_expression_display<'a>(
+    context: &deparse::Context<'_>,
+    table: &crate::storage::TableDef,
+    owner: crate::storage::ExpressionOwner,
+    source: &str,
+    destination: deparse::Destination,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let source = arena.alloc_str(source).map_err(|_| arena_full())?;
+    let Ok(expression) = crate::sql::parser::parse_expr(source, arena) else {
+        return Ok(None);
+    };
+    let bound = super::exec::expression_bindings::bind_table_expression(
+        expression,
+        context.storage,
+        table,
+        owner,
+        context.txid,
+        arena,
+    )?;
+    deparse::deparse_expression(context, bound, destination, arena)
+}
+
 /// `pg_type.typbasetype` of a domain: its parent domain or its base type.
 fn domain_base_oid(storage: &Storage, domain: &crate::storage::DomainDef, txid: u32) -> i32 {
     match domain.base_domain {
@@ -15350,8 +15396,10 @@ pub fn constraint_def_text<'a>(
                 pretty,
                 domain_value: None,
             };
-            match deparse::deparse(
+            match bound_table_expression_display(
                 &context,
+                &table,
+                crate::storage::ExpressionOwner::Check(check.name),
                 check.expression.as_str(),
                 deparse::Destination::Condition,
                 arena,
@@ -16108,10 +16156,19 @@ pub fn index_def_text<'a>(
                                 "index expression source is absent"
                             )
                         })?;
+                    let bound = bound_index_source(
+                        storage,
+                        info,
+                        crate::storage::ExpressionOwner::IndexKey(position as u8),
+                        expression.as_str(),
+                        txid,
+                        arena,
+                    )?;
                     return Ok(Some(index_expression_display(
                         storage,
                         txid,
                         &def,
+                        bound,
                         expression.as_str(),
                         pretty,
                         arena,
@@ -16154,10 +16211,19 @@ pub fn index_def_text<'a>(
                             "index expression source is absent"
                         )
                     })?;
+                let bound = bound_index_source(
+                    storage,
+                    info,
+                    crate::storage::ExpressionOwner::IndexKey(k as u8),
+                    expression.as_str(),
+                    txid,
+                    arena,
+                )?;
                 let _ = s.write_str(index_expression_display(
                     storage,
                     txid,
                     &def,
+                    bound,
                     expression.as_str(),
                     pretty,
                     arena,
@@ -16196,7 +16262,15 @@ pub fn index_def_text<'a>(
         }
         write_index_storage_options(&mut s, info.explicit_definition);
         if let Some(predicate) = info.predicate {
-            let deparsed = deparse::deparse(
+            let bound = bound_index_source(
+                storage,
+                info,
+                crate::storage::ExpressionOwner::IndexPredicate,
+                predicate.as_str(),
+                txid,
+                arena,
+            )?;
+            let deparsed = deparse::deparse_expression(
                 &deparse::Context {
                     storage,
                     txid,
@@ -16206,7 +16280,7 @@ pub fn index_def_text<'a>(
                     pretty,
                     domain_value: None,
                 },
-                predicate.as_str(),
+                bound,
                 deparse::Destination::Condition,
                 arena,
             )?;
@@ -16255,6 +16329,20 @@ fn index_attribute_names(
     Ok(names)
 }
 
+/// An expression key as a unique violation's detail names it, from its bound
+/// form `expression` (stored as `source`) on table `table`.
+pub(crate) fn index_key_display<'a>(
+    storage: &Storage,
+    txid: u32,
+    table: usize,
+    expression: &'a super::ast::Expr<'a>,
+    source: &str,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let table = storage.table_def(table, txid);
+    index_expression_display(storage, txid, &table, expression, source, true, arena)
+}
+
 /// `pg_get_indexdef_worker`: an expression key is parenthesized unless it
 /// looks like a function call. A shape the deparser cannot type keeps its
 /// canonical source spelling.
@@ -16262,13 +16350,13 @@ fn index_expression_display<'a>(
     storage: &Storage,
     txid: u32,
     table: &crate::storage::TableDef,
+    expression: &'a super::ast::Expr<'a>,
     source: &str,
     pretty: bool,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
     use core::fmt::Write;
-    let expression = super::parser::parse_expr(source, arena)?;
-    let deparsed = deparse::deparse(
+    let deparsed = deparse::deparse_expression(
         &deparse::Context {
             storage,
             txid,
@@ -16278,7 +16366,7 @@ fn index_expression_display<'a>(
             pretty,
             domain_value: None,
         },
-        source,
+        expression,
         deparse::Destination::Value,
         arena,
     )?;
@@ -21518,7 +21606,14 @@ fn index_collations<'a>(
         } else if info.expression_keys[position] {
             let source = index_expression_source(storage, info, position, txid)
                 .expect("expression index has source");
-            let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
+            let expression = bound_index_source(
+                storage,
+                info,
+                crate::storage::ExpressionOwner::IndexKey(position as u8),
+                source.as_str(),
+                txid,
+                arena,
+            )?;
             let catalog = super::query::storage_catalog(storage, arena, txid);
             resolved_expression_collation(expression, &TableColumnTypes(&table), Some(&catalog))?
         } else {
@@ -21543,7 +21638,14 @@ fn index_operator_classes<'a>(
         } else if info.expression_keys[position] {
             let source = index_expression_source(storage, info, position, txid)
                 .expect("expression index has source");
-            let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
+            let expression = bound_index_source(
+                storage,
+                info,
+                crate::storage::ExpressionOwner::IndexKey(position as u8),
+                source.as_str(),
+                txid,
+                arena,
+            )?;
             let (oid, _) =
                 super::exec::infer_type_catalog(expression, Some(&table), storage, txid, arena)?;
             super::exec::catalog_column_type(storage, txid, oid)
@@ -22005,8 +22107,14 @@ fn pg_attribute<'a>(
                 .then(|| index_expression_source(storage, info, attribute, txid))
                 .flatten();
             let (name, ctype, type_oid, type_mod, collation) = if let Some(source) = expression {
-                let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
-                let expression = crate::sql::parser::parse_expr(source, arena)?;
+                let expression = bound_index_source(
+                    storage,
+                    info,
+                    crate::storage::ExpressionOwner::IndexKey(attribute as u8),
+                    source.as_str(),
+                    txid,
+                    arena,
+                )?;
                 let (type_oid, type_mod) = super::exec::infer_type_catalog(
                     expression,
                     Some(&table),
@@ -22390,7 +22498,7 @@ fn pg_attrdef<'a>(
         let table = storage.table_def(slot, txid);
         let relid = user_table_oid(storage, slot);
         for (ci, c) in table.columns().iter().enumerate() {
-            let Some(text_expr) = super::enum_values::default_expression(
+            let Some(mut text_expr) = super::enum_values::default_expression(
                 &c.default,
                 Some(c.ctype),
                 storage,
@@ -22400,6 +22508,30 @@ fn pg_attrdef<'a>(
             else {
                 continue;
             };
+            // An expression bound to catalog objects prints their current
+            // names.
+            let owner = crate::storage::ExpressionOwner::Column(c.name);
+            if table.expression_dependencies_of(owner).next().is_some()
+                && let Some(expression) = c.default.expression()
+                && let Some(bound) = bound_table_expression_display(
+                    &deparse::Context {
+                        storage,
+                        txid,
+                        table: Some(&table),
+                        parameters: &[],
+                        joined: &[],
+                        pretty: false,
+                        domain_value: None,
+                    },
+                    &table,
+                    owner,
+                    expression.as_str(),
+                    deparse::Destination::Assignment(catalog_column_type_oid(storage, c, txid)?),
+                    arena,
+                )?
+            {
+                text_expr = bound;
+            }
             if n == out.len() {
                 return Err(catalog_capacity_exceeded("pg_attrdef"));
             }

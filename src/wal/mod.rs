@@ -1256,8 +1256,167 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
         .sum::<usize>();
     n += def.table_index_identities().count() * 8;
     n += def.constraint_identities().count() * crate::storage::ConstraintIdentity::ENCODED_BYTES;
+    n += 1 + def
+        .expression_dependencies()
+        .iter()
+        .map(expression_dependency_len)
+        .sum::<usize>();
     n += 4 + def.type_inputs.as_ref().bytes().len();
     n
+}
+
+/// An index's expression dependencies in a journal record: the entries
+/// being journaled, or the encoded entries of a decoded record.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ExpressionDependencyList<'a> {
+    Entries(&'a [crate::storage::ExpressionDependency]),
+    Encoded { count: u8, bytes: &'a [u8] },
+}
+
+impl<'a> ExpressionDependencyList<'a> {
+    fn encoded_len(&self) -> usize {
+        1 + match self {
+            Self::Entries(entries) => entries.iter().map(expression_dependency_len).sum(),
+            Self::Encoded { bytes, .. } => bytes.len(),
+        }
+    }
+
+    fn append(&self, buffer: &mut FixedBuf) -> bool {
+        match self {
+            Self::Entries(entries) => {
+                u8::try_from(entries.len()).is_ok_and(|count| buffer.append(&[count]))
+                    && entries
+                        .iter()
+                        .all(|entry| append_expression_dependency(buffer, entry))
+            }
+            Self::Encoded { count, bytes } => buffer.append(&[*count]) && buffer.append(bytes),
+        }
+    }
+
+    fn decode(payload: &'a [u8], at: &mut usize) -> Option<Self> {
+        let count = *payload.get(*at)?;
+        *at += 1;
+        let start = *at;
+        for _ in 0..count {
+            decode_expression_dependency(payload, at)?;
+        }
+        Some(Self::Encoded {
+            count,
+            bytes: &payload[start..*at],
+        })
+    }
+
+    /// The entries, in journal order.
+    pub(crate) fn entries(self) -> impl Iterator<Item = crate::storage::ExpressionDependency> + 'a {
+        let (entries, count, bytes): (&'a [crate::storage::ExpressionDependency], u8, &'a [u8]) =
+            match self {
+                Self::Entries(entries) => (entries, 0, &[]),
+                Self::Encoded { count, bytes } => (&[], count, bytes),
+            };
+        let mut at = 0;
+        entries
+            .iter()
+            .copied()
+            .chain((0..count).map_while(move |_| decode_expression_dependency(bytes, &mut at)))
+    }
+}
+
+fn expression_dependency_len(entry: &crate::storage::ExpressionDependency) -> usize {
+    expression_dependency_bytes(entry, &mut [0; EXPRESSION_DEPENDENCY_BYTES])
+        .unwrap_or(usize::MAX / 4)
+}
+
+fn append_expression_dependency(
+    buffer: &mut FixedBuf,
+    entry: &crate::storage::ExpressionDependency,
+) -> bool {
+    let mut bytes = [0; EXPRESSION_DEPENDENCY_BYTES];
+    expression_dependency_bytes(entry, &mut bytes)
+        .is_some_and(|length| buffer.append(&bytes[..length]))
+}
+
+/// The most bytes one encoded expression dependency takes.
+pub(crate) const EXPRESSION_DEPENDENCY_BYTES: usize = 512;
+
+/// The journal encoding of one expression dependency: its owner, class,
+/// identity key and the four names (current and as written). The slot is
+/// bound again on use.
+pub(crate) fn expression_dependency_bytes(
+    entry: &crate::storage::ExpressionDependency,
+    output: &mut [u8; EXPRESSION_DEPENDENCY_BYTES],
+) -> Option<usize> {
+    struct Writer<'o> {
+        output: &'o mut [u8; EXPRESSION_DEPENDENCY_BYTES],
+        length: usize,
+    }
+    impl Writer<'_> {
+        fn bytes(&mut self, bytes: &[u8]) -> Option<()> {
+            self.output
+                .get_mut(self.length..self.length + bytes.len())?
+                .copy_from_slice(bytes);
+            self.length += bytes.len();
+            Some(())
+        }
+        fn name(&mut self, text: &str) -> Option<()> {
+            self.bytes(&[u8::try_from(text.len()).ok()?])?;
+            self.bytes(text.as_bytes())
+        }
+    }
+    let mut writer = Writer { output, length: 0 };
+    writer.bytes(&[entry.owner.code()])?;
+    match entry.owner {
+        crate::storage::ExpressionOwner::Check(owner)
+        | crate::storage::ExpressionOwner::Column(owner) => writer.name(owner.as_str())?,
+        crate::storage::ExpressionOwner::IndexKey(position) => writer.bytes(&[position])?,
+        crate::storage::ExpressionOwner::IndexPredicate => {}
+    }
+    writer.bytes(&[entry.class as u8])?;
+    writer.name(entry.identity.storage_key().as_str())?;
+    writer.name(entry.schema.as_str())?;
+    writer.name(entry.name.as_str())?;
+    writer.name(entry.referenced_schema.as_str())?;
+    writer.name(entry.referenced_name.as_str())?;
+    Some(writer.length)
+}
+
+pub(crate) fn decode_expression_dependency(
+    payload: &[u8],
+    at: &mut usize,
+) -> Option<crate::storage::ExpressionDependency> {
+    let code = *payload.get(*at)?;
+    *at += 1;
+    let owner = match code {
+        1 => crate::storage::ExpressionOwner::Check(
+            SqlName::parse(stored_dependency_name(payload, at)?).ok()?,
+        ),
+        2 => crate::storage::ExpressionOwner::Column(
+            SqlName::parse(stored_dependency_name(payload, at)?).ok()?,
+        ),
+        3 => {
+            let position = *payload.get(*at)?;
+            *at += 1;
+            crate::storage::ExpressionOwner::IndexKey(position)
+        }
+        4 => crate::storage::ExpressionOwner::IndexPredicate,
+        _ => return None,
+    };
+    let class = DependencyClass::from_code(*payload.get(*at)?)?;
+    *at += 1;
+    let identity =
+        StoredDependencyIdentity::from_storage(class, stored_dependency_name(payload, at)?)?;
+    let mut names = [SqlName::EMPTY; 4];
+    for name in &mut names {
+        *name = SqlName::parse(stored_dependency_name(payload, at)?).ok()?;
+    }
+    Some(crate::storage::ExpressionDependency {
+        owner,
+        class,
+        identity,
+        schema: names[0],
+        name: names[1],
+        referenced_schema: names[2],
+        referenced_name: names[3],
+    })
 }
 
 fn append_table_payload<B: DefinitionBacking>(
@@ -1433,6 +1592,10 @@ fn append_table_payload<B: DefinitionBacking>(
             return false;
         };
         ok &= buffer.append(&identity.to_le_bytes());
+    }
+    ok &= buffer.append(&[def.expression_dependencies().len() as u8]);
+    for entry in def.expression_dependencies() {
+        ok &= append_expression_dependency(buffer, entry);
     }
     let inputs = def.type_inputs.as_ref().bytes();
     ok &= u32::try_from(inputs.len()).is_ok()
@@ -1863,6 +2026,8 @@ pub(crate) enum WalOp<'a> {
         predicate: Option<&'a str>,
         unique: bool,
         definition: crate::storage::IndexMutableDefinition,
+        /// What the key expressions and predicate were bound to.
+        expression_dependencies: ExpressionDependencyList<'a>,
     },
     /// Absolute unsummarized-range state for one BRIN index. Maintenance is
     /// nontransactional, so a later commit can durably publish work left by a
@@ -3918,6 +4083,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             n_include_cols,
             expressions,
             operator_class_options,
+            expression_dependencies,
             ..
         } => {
             crate::storage::IndexRelationSource::ENCODED_BYTES
@@ -3975,6 +4141,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + 8
                 + 6
+                + 1
+                + expression_dependencies.encoded_len()
         }
         WalOp::BrinMaintenance { range_count, .. } => 8 + 4 + 8 + 1 + usize::from(*range_count) * 8,
         WalOp::AlterIndexDefinition {
@@ -5733,6 +5901,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             predicate,
             unique,
             definition,
+            expression_dependencies,
         } => {
             let mut ok = buffer.append(&created_at.to_le_bytes())
                 && buffer.append(&relation.encode())
@@ -5857,6 +6026,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok &= buffer.append(&[0xaa, method.code()]);
             ok &= buffer.append(&[0xa8]);
             ok && append_index_definition(buffer, *definition)
+                && buffer.append(&[0xa7])
+                && expression_dependencies.append(buffer)
         }
         WalOp::BrinMaintenance {
             index_created_at,
@@ -8669,6 +8840,16 @@ fn decode_op_inner<'a>(
                 identity.created_at(),
             )
             .ok()?;
+            let dependencies = usize::from(*payload.get(at)?);
+            at += 1;
+            if dependencies > crate::storage::MAX_TABLE_EXPRESSION_DEPENDENCIES {
+                return None;
+            }
+            for slot in &mut def.expression_dependencies[..dependencies] {
+                *slot = decode_expression_dependency(payload, &mut at)
+                    .filter(|entry| entry.owner.belongs_to_table())?;
+            }
+            def.n_expression_dependencies = dependencies;
             for (position, identity) in def.table_index_identities().enumerate() {
                 if def
                     .table_index_identities()
@@ -10160,6 +10341,11 @@ fn decode_op_inner<'a>(
             }
             at += 1;
             let definition = decode_index_definition(payload, &mut at)?;
+            if *payload.get(at)? != 0xa7 {
+                return None;
+            }
+            at += 1;
+            let expression_dependencies = ExpressionDependencyList::decode(payload, &mut at)?;
             (at == payload.len()).then_some(WalOp::CreateIndex {
                 relation,
                 created_at,
@@ -10183,6 +10369,7 @@ fn decode_op_inner<'a>(
                 predicate,
                 unique,
                 definition,
+                expression_dependencies,
             })
         }),
         KIND_BRIN_MAINTENANCE => decode_large_op(|| {
@@ -17220,6 +17407,7 @@ mod tests {
                     predicate: None,
                     unique: true,
                     definition: crate::storage::IndexMutableDefinition::DEFAULT,
+                    expression_dependencies: ExpressionDependencyList::Entries(&[]),
                 };
                 let result = append_record(&mut buffer, 2, &operation);
                 if missing || n_cols > MAX_INDEX_COLS || n_include_cols > MAX_INDEX_COLS {
@@ -17279,6 +17467,7 @@ mod tests {
             predicate: None,
             unique: true,
             definition: crate::storage::IndexMutableDefinition::DEFAULT,
+            expression_dependencies: ExpressionDependencyList::Entries(&[]),
         };
         let length = encoded_payload_len(&operation);
         let mut budget = Budget::new(length);
@@ -17333,6 +17522,7 @@ mod tests {
                 clustered: true,
                 ..crate::storage::IndexMutableDefinition::DEFAULT
             },
+            expression_dependencies: ExpressionDependencyList::Entries(&[]),
         };
         let mut budget = Budget::new(4096);
         let mut payload = FixedBuf::new(
@@ -17437,6 +17627,7 @@ mod tests {
             predicate: None,
             unique: false,
             definition: crate::storage::IndexMutableDefinition::DEFAULT,
+            expression_dependencies: ExpressionDependencyList::Entries(&[]),
         };
         let mut bytes = [0; 4096];
         let payload = encode_catalog_operation(&operation, &mut bytes);
@@ -17491,6 +17682,7 @@ mod tests {
                 },
                 ..crate::storage::IndexMutableDefinition::DEFAULT
             },
+            expression_dependencies: ExpressionDependencyList::Entries(&[]),
         };
         let mut bytes = [0; 4096];
         let payload = encode_catalog_operation(&operation, &mut bytes);
@@ -17568,6 +17760,7 @@ mod tests {
                     options,
                     ..crate::storage::IndexMutableDefinition::DEFAULT
                 },
+                expression_dependencies: ExpressionDependencyList::Entries(&[]),
             };
             let mut bytes = [0; 4096];
             let payload = encode_catalog_operation(&operation, &mut bytes);

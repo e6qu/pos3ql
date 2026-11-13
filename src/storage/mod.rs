@@ -79,6 +79,11 @@ pub(crate) use catalog_sources::{
     SessionIdentity, SessionRole,
 };
 mod constraint_identities;
+mod expression_dependencies;
+pub(crate) use expression_dependencies::{
+    ExpressionDependency, ExpressionOwner, MAX_INDEX_EXPRESSION_DEPENDENCIES,
+    MAX_TABLE_EXPRESSION_DEPENDENCIES, too_many_expression_dependencies,
+};
 mod inline_key_names;
 mod key_name_admission;
 mod restored_key_names;
@@ -2089,6 +2094,10 @@ pub struct TableDefinition<B: DefinitionBacking> {
     pub n_fkeys: usize,
     pub exclusions: B::Slice<ExclusionConstraint, MAX_EXCLUSIONS>,
     pub n_exclusions: usize,
+    /// What the CHECK constraints and column expressions were bound to.
+    pub(crate) expression_dependencies:
+        B::Slice<ExpressionDependency, MAX_TABLE_EXPRESSION_DEPENDENCIES>,
+    pub(crate) n_expression_dependencies: usize,
     /// PostgreSQL retains a table's TOAST relation after the last toastable
     /// column is dropped. This catalog bit records that irreversible creation.
     pub has_toast: bool,
@@ -2597,6 +2606,7 @@ impl<B: DefinitionBacking> TableDefinition<B> {
             n_checks: self.n_checks,
             n_fkeys: self.n_fkeys,
             n_exclusions: self.n_exclusions,
+            n_expression_dependencies: self.n_expression_dependencies,
             has_toast: self.has_toast,
             toast_index_identity: self.toast_index_identity,
             has_rules: self.has_rules,
@@ -2619,6 +2629,8 @@ impl<B: DefinitionBacking> TableDefinition<B> {
             checks: &self.checks.as_ref()[..self.n_checks],
             fkeys: &self.fkeys.as_ref()[..self.n_fkeys],
             exclusions: &self.exclusions.as_ref()[..self.n_exclusions],
+            expression_dependencies: &self.expression_dependencies.as_ref()
+                [..self.n_expression_dependencies],
             attributes: column_attributes::ColumnAttributes {
                 count: self.attributes.count,
                 slots: &self.attributes.slots.as_ref()[..usize::from(self.attributes.count)],
@@ -2824,6 +2836,9 @@ impl TableDefBuilder {
         result.fkeys[..source.n_fkeys].copy_from_slice(&source.fkeys.as_ref()[..source.n_fkeys]);
         result.exclusions[..source.n_exclusions]
             .copy_from_slice(&source.exclusions.as_ref()[..source.n_exclusions]);
+        result.n_expression_dependencies = source.n_expression_dependencies;
+        result.expression_dependencies[..source.n_expression_dependencies]
+            .copy_from_slice(source.expression_dependencies());
         result.attributes =
             column_attributes::ColumnAttributes::from_attributes(&source.attributes);
         result
@@ -2842,6 +2857,7 @@ impl TableDefBuilder {
             || self.n_checks > MAX_CHECKS
             || self.n_fkeys > MAX_FKEYS
             || self.n_exclusions > MAX_EXCLUSIONS
+            || self.n_expression_dependencies > MAX_TABLE_EXPRESSION_DEPENDENCIES
         {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
@@ -2868,6 +2884,7 @@ impl TableDefBuilder {
             n_checks: self.n_checks,
             n_fkeys: self.n_fkeys,
             n_exclusions: self.n_exclusions,
+            n_expression_dependencies: self.n_expression_dependencies,
             has_toast: self.has_toast,
             toast_index_identity: self.toast_index_identity,
             has_rules: self.has_rules,
@@ -2906,6 +2923,9 @@ impl TableDefBuilder {
                 .map_err(exhausted)?,
             exclusions: pool
                 .copy_slice(&self.exclusions[..self.n_exclusions])
+                .map_err(exhausted)?,
+            expression_dependencies: pool
+                .copy_slice(&self.expression_dependencies[..self.n_expression_dependencies])
                 .map_err(exhausted)?,
             attributes: column_attributes::ColumnAttributes {
                 count: self.attributes.count,
@@ -2947,6 +2967,9 @@ impl TableDefBuilder {
             n_fkeys: 0,
             exclusions: [ExclusionConstraint::EMPTY; MAX_EXCLUSIONS],
             n_exclusions: 0,
+            expression_dependencies: [ExpressionDependency::EMPTY;
+                MAX_TABLE_EXPRESSION_DEPENDENCIES],
+            n_expression_dependencies: 0,
             has_toast: false,
             toast_index_identity: None,
             has_rules: false,
@@ -2991,6 +3014,8 @@ impl TableDef {
             n_fkeys: 0,
             exclusions: crate::mem::lease_pool::SharedSlice::EMPTY,
             n_exclusions: 0,
+            expression_dependencies: crate::mem::lease_pool::SharedSlice::EMPTY,
+            n_expression_dependencies: 0,
             has_toast: false,
             toast_index_identity: None,
             has_rules: false,
@@ -3034,6 +3059,8 @@ impl TableDefView<'_> {
             n_fkeys: 0,
             exclusions: &[],
             n_exclusions: 0,
+            expression_dependencies: &[],
+            n_expression_dependencies: 0,
             has_toast: false,
             toast_index_identity: None,
             has_rules: false,
@@ -13014,6 +13041,9 @@ pub struct IndexDef {
     pub(crate) pending_definition: Option<PendingIndexDefinition>,
     pub ddl_state: CatalogDdlState,
     pub(crate) pending_parent_drop_txid: Option<u32>,
+    /// What the key expressions and predicate were bound to when written.
+    pub(crate) expression_dependencies: [ExpressionDependency; MAX_INDEX_EXPRESSION_DEPENDENCIES],
+    pub(crate) n_expression_dependencies: u8,
 }
 
 impl IndexDef {
@@ -13048,6 +13078,8 @@ impl IndexDef {
         pending_definition: None,
         ddl_state: CatalogDdlState::Absent,
         pending_parent_drop_txid: None,
+        expression_dependencies: [ExpressionDependency::EMPTY; MAX_INDEX_EXPRESSION_DEPENDENCIES],
+        n_expression_dependencies: 0,
     };
 
     /// Whether `txid` sees this index exist.
@@ -21636,7 +21668,7 @@ impl Storage {
         Ok(rebound)
     }
 
-    fn rebound_stored_query_dependency(
+    pub(crate) fn rebound_stored_query_dependency(
         &self,
         mut dependency: StoredQueryDependency,
         txid: u32,
@@ -38607,7 +38639,14 @@ impl Storage {
         let key = if let Some(created_at) = enforcer.index_created_at {
             index = selection.index(self, created_at)?;
             if let Some(source) = index.predicate {
-                let predicate = crate::sql::parser::parse_expr(source.as_str(), arena)?;
+                let predicate = crate::sql::exec::expression_bindings::bound_index_expression(
+                    source.as_str(),
+                    self,
+                    &index,
+                    ExpressionOwner::IndexPredicate,
+                    evaluation_txid,
+                    arena,
+                )?;
                 if !crate::sql::exec::constraints::index_predicate_matches(
                     self,
                     evaluation_txid,
@@ -38622,8 +38661,16 @@ impl Storage {
             let mut expressions = [None; MAX_INDEX_COLS];
             for (position, source) in index.expressions.iter().enumerate().take(index.n_cols) {
                 if let Some(source) = source {
-                    expressions[position] =
-                        Some(crate::sql::parser::parse_expr(source.as_str(), arena)?);
+                    expressions[position] = Some(
+                        crate::sql::exec::expression_bindings::bound_index_expression(
+                            source.as_str(),
+                            self,
+                            &index,
+                            ExpressionOwner::IndexKey(position as u8),
+                            evaluation_txid,
+                            arena,
+                        )?,
+                    );
                 }
             }
             crate::sql::exec::constraints::index_key_values(
@@ -41029,7 +41076,14 @@ impl Storage {
                         None => table_definition.columns[columns[position] as usize].ctype,
                         Some(source) => {
                             let expression =
-                                crate::sql::parser::parse_expr(source.as_str(), &arena)?;
+                                crate::sql::exec::expression_bindings::bound_index_expression(
+                                    source.as_str(),
+                                    self,
+                                    &index,
+                                    ExpressionOwner::IndexKey(position as u8),
+                                    txid.unwrap_or(0),
+                                    &arena,
+                                )?;
                             want[n_want].dependency_mask |=
                                 crate::sql::exec::check_referenced_columns(
                                     expression,

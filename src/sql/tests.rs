@@ -71862,6 +71862,112 @@ fn reindex_preserves_indexed_access_after_checkpoint_and_cold_restart() {
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
+/// CHECK constraints, defaults, generation expressions and index keys and
+/// predicates stay bound to the routine they named when written, across WAL
+/// replay and a checkpoint, under a later search path and rename.
+#[test]
+fn bound_table_expressions_survive_replay_and_checkpoint() {
+    let mut config = test_config("bound-expression-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("bound-expression-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let no_error = |output: &[u8]| {
+        let text = String::from_utf8_lossy(output);
+        assert!(!text.contains("ERROR"), "{text}");
+    };
+    let expected = |engine: &mut Engine, budget: &mut Budget| {
+        assert_eq!(
+            data_rows(&run_with(
+                engine,
+                budget,
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+                 WHERE conrelid = 'bound_rows'::regclass AND contype = 'c'; \
+                 SELECT pg_get_indexdef('bound_rows_key'::regclass); \
+                 SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef \
+                 WHERE adrelid = 'bound_rows'::regclass ORDER BY adnum",
+            )),
+            [
+                "CHECK ((bound_moved.renamed(a) > 0))",
+                "CREATE INDEX bound_rows_key ON public.bound_rows USING btree \
+                 (bound_moved.renamed(a)) WHERE (bound_moved.renamed(b) > 0)",
+                "bound_moved.renamed(5)",
+                "bound_moved.renamed(a)",
+            ]
+        );
+    };
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    no_error(&run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA bound_schema; \
+         CREATE FUNCTION bound_schema.f(int) RETURNS int LANGUAGE sql IMMUTABLE RETURN $1 + 1; \
+         SET search_path = bound_schema, public; \
+         CREATE TABLE public.bound_rows (a int CHECK (f(a) > 0), b int DEFAULT f(5), \
+         g int GENERATED ALWAYS AS (f(a)) STORED); \
+         CREATE INDEX bound_rows_key ON public.bound_rows (f(a)) WHERE f(b) > 0; \
+         RESET search_path; \
+         ALTER FUNCTION bound_schema.f(int) RENAME TO renamed; \
+         ALTER SCHEMA bound_schema RENAME TO bound_moved",
+    ));
+    engine.commit_wal().unwrap();
+    drop(engine);
+
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    expected(&mut engine, &mut budget);
+    no_error(&run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO bound_rows (a) VALUES (3)",
+    ));
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "INSERT INTO bound_rows (a) VALUES (-3)"
+        ))
+        .contains("23514")
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    expected(&mut engine, &mut budget);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT a, b, g FROM bound_rows"
+        )),
+        ["3|6|4"]
+    );
+    no_error(&run_with(
+        &mut engine,
+        &mut budget,
+        "DROP FUNCTION bound_moved.renamed(int) CASCADE",
+    ));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_constraint WHERE conrelid = 'bound_rows'::regclass; \
+             SELECT count(*) FROM pg_index WHERE indrelid = 'bound_rows'::regclass; \
+             SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_attribute \
+             WHERE attrelid = 'bound_rows'::regclass AND attnum > 0 AND NOT attisdropped",
+        )),
+        ["0", "0", "a,b"]
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
 #[test]
 fn cluster_selection_survives_checkpoint_and_cold_restart() {
     let mut config = test_config("cluster-recovery");

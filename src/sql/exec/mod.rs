@@ -211,7 +211,7 @@ impl<'arena> DmlRowImages<'arena> {
             })
             .map_err(|_| arena_full())?;
         let (checks, generated) = if matches!(capture, DmlCapture::Update { .. }) {
-            let checks = parse_checks(physical, arena)?;
+            let checks = parse_checks(physical, storage, txid, arena)?;
             let generated = if physical
                 .columns()
                 .iter()
@@ -1490,6 +1490,7 @@ pub use projected::{
 
 mod ddl;
 mod dependency_report;
+pub(crate) mod expression_bindings;
 use ddl::{add_unique_key, attach_constraints, auto_key_name, build_column, build_def};
 pub(crate) use ddl::{check_referenced_columns, visit_expression_variables};
 
@@ -2033,6 +2034,13 @@ fn create_table_kind(
                     Err(error) => return sql_fail(error),
                 };
             def.columns[column].auto_increment = false;
+        }
+    }
+    for column in 0..def.n_columns {
+        if let Err(error) = expression_bindings::capture_column_expression_dependencies(
+            storage, &mut def, column, txn.txid, arena,
+        ) {
+            return sql_fail(error);
         }
     }
     let declared = constraint_declaration_order(&def, statement);
@@ -5816,6 +5824,9 @@ struct CopiedIndex {
     unique: bool,
     source_schema: SqlName,
     source_name: SqlName,
+    expression_dependencies:
+        [crate::storage::ExpressionDependency; crate::storage::MAX_INDEX_EXPRESSION_DEPENDENCIES],
+    n_expression_dependencies: u8,
 }
 
 impl CopiedIndex {
@@ -5841,6 +5852,9 @@ impl CopiedIndex {
         unique: false,
         source_schema: SqlName::EMPTY,
         source_name: SqlName::EMPTY,
+        expression_dependencies: [crate::storage::ExpressionDependency::EMPTY;
+            crate::storage::MAX_INDEX_EXPRESSION_DEPENDENCIES],
+        n_expression_dependencies: 0,
     };
 }
 
@@ -5911,6 +5925,8 @@ fn copy_like_indexes<Definition0: crate::storage::DefinitionBacking>(
                 unique: index.unique,
                 source_schema: index.schema,
                 source_name: index.name_for(txn.txid),
+                expression_dependencies: index.expression_dependencies,
+                n_expression_dependencies: index.n_expression_dependencies,
             };
         }
         let source = source_def;
@@ -5964,6 +5980,8 @@ fn copy_like_indexes<Definition0: crate::storage::DefinitionBacking>(
                     pending_definition: None,
                     ddl_state: crate::storage::CatalogDdlState::Present,
                     pending_parent_drop_txid: None,
+                    expression_dependencies: index.expression_dependencies,
+                    n_expression_dependencies: index.n_expression_dependencies,
                 },
                 txn.txid,
             )?;
@@ -6582,19 +6600,25 @@ fn find_conflict<'a, Definition0: crate::storage::DefinitionBacking>(
         let mut expressions = [None; crate::storage::MAX_INDEX_COLS];
         for (position, source) in index.expressions.iter().enumerate().take(index.n_cols) {
             if let Some(source) = source {
-                let source = arena
-                    .alloc_str(source.as_str())
-                    .map_err(|_| crate::sql::eval::arena_full())?;
-                expressions[position] = Some(crate::sql::parser::parse_expr(source, arena)?);
+                expressions[position] = Some(expression_bindings::bound_index_expression(
+                    source.as_str(),
+                    storage,
+                    &index,
+                    crate::storage::ExpressionOwner::IndexKey(position as u8),
+                    txid,
+                    arena,
+                )?);
             }
         }
         let predicate = match index.predicate {
-            Some(source) => {
-                let source = arena
-                    .alloc_str(source.as_str())
-                    .map_err(|_| crate::sql::eval::arena_full())?;
-                Some(crate::sql::parser::parse_expr(source, arena)?)
-            }
+            Some(source) => Some(expression_bindings::bound_index_expression(
+                source.as_str(),
+                storage,
+                &index,
+                crate::storage::ExpressionOwner::IndexPredicate,
+                txid,
+                arena,
+            )?),
             None => None,
         };
         partial[next_partial] = Some(PartialArbiter {
@@ -13802,6 +13826,11 @@ pub(crate) fn drop_owned(
             }
         }
     }
+    if let Err(error) =
+        drop_dangling_table_expressions(storage, wal, txn, scratch, seq_session, arena, responder)
+    {
+        return sql_fail(error);
+    }
     responder.command_complete("DROP OWNED")?;
     sql_ok()
 }
@@ -15509,7 +15538,7 @@ pub(crate) fn drop_schema(
             dependency_report::report_drop(storage, txn.txid, originals, cascade, arena, responder)
         })()
     };
-    run_reported_drop(report, responder, |responder| {
+    let outcome = run_reported_drop(report, responder, |responder| {
         let selected_schema = temporary.or_else(|| {
             slots[..n_slots]
                 .first()
@@ -17551,7 +17580,17 @@ pub(crate) fn drop_schema(
         }
         responder.command_complete("DROP SCHEMA")?;
         sql_ok()
-    })
+    });
+    finish_expression_cascade(
+        outcome,
+        storage,
+        wal,
+        txn,
+        scratch,
+        seq_session,
+        arena,
+        responder,
+    )
 }
 
 fn remove_schema_from_publications(
@@ -44280,7 +44319,7 @@ pub(crate) fn drop_text_search(
         arena,
         responder,
     );
-    run_reported_drop(report, responder, |responder| {
+    let outcome = run_reported_drop(report, responder, |responder| {
         if let Err(error) = drop_text_search_slot(
             storage,
             wal,
@@ -44303,7 +44342,17 @@ pub(crate) fn drop_text_search(
             }
         })?;
         sql_ok()
-    })
+    });
+    finish_expression_cascade(
+        outcome,
+        storage,
+        wal,
+        txn,
+        scratch,
+        seq_session,
+        arena,
+        responder,
+    )
 }
 
 pub fn alter_collation(
@@ -44509,7 +44558,7 @@ pub(crate) fn drop_collation(
         arena,
         responder,
     );
-    run_reported_drop(report, responder, |responder| {
+    let outcome = run_reported_drop(report, responder, |responder| {
         drop_collation_slot(
             storage,
             wal,
@@ -44521,7 +44570,17 @@ pub(crate) fn drop_collation(
             seq_session,
             responder,
         )
-    })
+    });
+    finish_expression_cascade(
+        outcome,
+        storage,
+        wal,
+        txn,
+        scratch,
+        seq_session,
+        arena,
+        responder,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -45212,7 +45271,7 @@ pub(crate) fn drop_operators(
             responder,
         )
     })();
-    run_reported_drop(report, responder, |responder| {
+    let outcome = run_reported_drop(report, responder, |responder| {
         for identity in identities {
             let (slot, _) = match resolve_operator_identity(storage, txn.txid, *identity) {
                 Ok(found) => found,
@@ -45343,7 +45402,17 @@ pub(crate) fn drop_operators(
         }
         responder.command_complete("DROP OPERATOR")?;
         sql_ok()
-    })
+    });
+    finish_expression_cascade(
+        outcome,
+        storage,
+        wal,
+        txn,
+        scratch,
+        seq_session,
+        arena,
+        responder,
+    )
 }
 
 fn empty_operator_family(
@@ -50404,7 +50473,7 @@ pub(crate) fn drop_routine(
             responder,
         )
     })();
-    run_reported_drop(report, responder, |responder| {
+    let outcome = run_reported_drop(report, responder, |responder| {
         for target_index in 0..target_count {
             let identity = identity_at(target_index);
             // A target found above and missing now was already dropped by this
@@ -50770,7 +50839,17 @@ pub(crate) fn drop_routine(
             crate::sql::ast::RoutineTargetKind::Either => "DROP ROUTINE",
         })?;
         sql_ok()
-    })
+    });
+    finish_expression_cascade(
+        outcome,
+        storage,
+        wal,
+        txn,
+        scratch,
+        seq_session,
+        arena,
+        responder,
+    )
 }
 
 pub fn create_view(
@@ -56682,6 +56761,193 @@ fn remove_sequence_column_defaults(
     Ok(())
 }
 
+/// Completes a `DROP` that succeeded: the CHECK constraints, defaults and
+/// generated columns whose bound dependencies it removed go too, as the
+/// dependency report's `CASCADE` listed them (`RESTRICT` already failed).
+#[allow(clippy::too_many_arguments)]
+fn finish_expression_cascade(
+    outcome: Outcome,
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
+    if !matches!(outcome, Ok(Ok(()))) {
+        return outcome;
+    }
+    match drop_dangling_table_expressions(storage, wal, txn, scratch, seq_session, arena, responder)
+    {
+        Ok(()) => outcome,
+        Err(error) => sql_fail(error),
+    }
+}
+
+/// Removes every table expression and index one of whose bound dependencies
+/// no longer exists. A generation expression cannot outlive its column, so
+/// the column is dropped, as PostgreSQL's internal dependency does.
+pub(crate) fn drop_dangling_table_expressions(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    seq_session: &crate::sql::guc::SeqSession,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Result<(), SqlError> {
+    use crate::storage::ExpressionOwner;
+    let dangling_index = |storage: &Storage, slot: usize, txid: u32| -> Result<bool, SqlError> {
+        let Some(index) = storage.index_visible_to(slot, txid) else {
+            return Ok(false);
+        };
+        for entry in index.expression_dependencies() {
+            match storage.rebound_stored_query_dependency(entry.dependency(), txid) {
+                Ok(_) => {}
+                Err(error) if error.sqlstate == sqlstate::UNDEFINED_OBJECT => return Ok(true),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
+    };
+    // Every dangling index (a partitioned index's partitions' too) leaves
+    // the catalog before any is finished, and before any table changes, so
+    // nothing evaluates a dangling index expression.
+    let dangling = arena
+        .alloc_slice_with(storage.index_count(), |_| None::<(usize, SqlName, SqlName)>)
+        .map_err(|_| arena_full())?;
+    for slot in (0..storage.index_count()).rev() {
+        if !dangling_index(storage, slot, txn.txid)? {
+            continue;
+        }
+        let Some(index) = storage.index_visible_to(slot, txn.txid) else {
+            continue;
+        };
+        let (schema, name) = (index.schema, index.name_for(txn.txid));
+        let dropped = storage
+            .drop_index(schema.as_str(), name.as_str(), txn.txid)?
+            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?;
+        if let Err(error) =
+            txn.record_ddl(storage, super::txn::DdlUndo::IndexDropped(dropped as u32))
+        {
+            storage.rollback_index_drop(dropped, txn.txid);
+            return Err(error);
+        }
+        dangling[slot] = Some((dropped, schema, name));
+    }
+    for (dropped, schema, name) in dangling.iter().rev().flatten() {
+        finish_index_drop(storage, wal, txn, *dropped, *schema, *name)?;
+    }
+    for table in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(table, txn.txid) {
+            continue;
+        }
+        let (target, current) = storage.select_table_definition(table, txn.txid);
+        let dangling = |owner: ExpressionOwner| -> Result<bool, SqlError> {
+            for dependency in current.expression_dependencies_of(owner) {
+                match storage.rebound_stored_query_dependency(dependency, txn.txid) {
+                    Ok(_) => {}
+                    Err(error) if error.sqlstate == sqlstate::UNDEFINED_OBJECT => return Ok(true),
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(false)
+        };
+        let mut replacement = TableDefBuilder::from_definition(&current);
+        let mut changed = false;
+        let mut kept = 0;
+        for index in 0..replacement.n_checks {
+            let check = replacement.checks[index];
+            if dangling(ExpressionOwner::Check(check.name))? {
+                changed = true;
+                continue;
+            }
+            replacement.checks[kept] = check;
+            kept += 1;
+        }
+        replacement.n_checks = kept;
+        let mut generated = [SqlName::EMPTY; MAX_COLUMNS];
+        let mut n_generated = 0;
+        for column in &mut replacement.columns[..replacement.n_columns] {
+            if column.default.expression().is_none()
+                || !dangling(ExpressionOwner::Column(column.name))?
+            {
+                continue;
+            }
+            if column.default.is_generated() {
+                generated[n_generated] = column.name;
+                n_generated += 1;
+                continue;
+            }
+            column.default = crate::storage::ColumnDefault::NONE;
+            column.auto_increment = false;
+            changed = true;
+        }
+        if changed {
+            replacement.prune_expression_dependencies();
+            refresh_table_type_inputs(storage, &current, &mut replacement, &[], txn.txid, arena)?;
+            storage.lock_object(
+                txn.txid,
+                crate::storage::ObjectLockTarget::Table(table),
+                crate::sql::ast::TableLockMode::AccessExclusive,
+                false,
+            )?;
+            let mut mapping = [None; MAX_COLUMNS];
+            let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
+            for (column, metadata) in current.columns().iter().enumerate() {
+                mapping[column] = Some(metadata.name);
+                wal_mapping[column] = column as u16;
+            }
+            txn.write_table_definition(
+                storage,
+                target,
+                replacement,
+                &mapping,
+                false,
+                crate::storage::ColumnSet::EMPTY,
+            )?;
+            if current.persistence != crate::storage::RelationPersistence::Temporary {
+                let lsn = storage.bump_lsn();
+                wal.stage_reserved(
+                    txn.txid,
+                    lsn,
+                    &WalOp::BeginTableRewrite {
+                        previous_schema: current.schema.as_str(),
+                        previous_name: current.name.as_str(),
+                        preserve_rows: true,
+                        column_mapping: wal_mapping,
+                    },
+                )?;
+                let lsn = storage.bump_lsn();
+                wal.stage_reserved(
+                    txn.txid,
+                    lsn,
+                    &WalOp::CreateTable {
+                        identity: storage.table_position(table),
+                        definition: (&*storage.table_def(table, txn.txid)).into(),
+                    },
+                )?;
+            }
+        }
+        if n_generated != 0 {
+            cascade_drop_type_column(
+                storage,
+                wal,
+                txn,
+                scratch,
+                current.schema,
+                current.name,
+                &generated[..n_generated],
+                arena,
+                seq_session,
+                responder,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// DROP SEQUENCE [IF EXISTS].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn drop_sequence(
@@ -57752,7 +58018,7 @@ pub(crate) fn drop_domain(
             responder,
         )
     })();
-    run_reported_drop(report, responder, |responder| {
+    let outcome = run_reported_drop(report, responder, |responder| {
         let selected = match arena.alloc_slice_with(storage.domain_count(), |_| false) {
             Ok(values) => values,
             Err(_) => return sql_fail(arena_full()),
@@ -57817,7 +58083,17 @@ pub(crate) fn drop_domain(
         }
         responder.command_complete("DROP DOMAIN")?;
         sql_ok()
-    })
+    });
+    finish_expression_cascade(
+        outcome,
+        storage,
+        wal,
+        txn,
+        scratch,
+        seq_session,
+        arena,
+        responder,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -59164,7 +59440,7 @@ pub(crate) fn drop_type(
             responder,
         )
     })();
-    run_reported_drop(report, responder, |responder| {
+    let outcome = run_reported_drop(report, responder, |responder| {
         for name in names {
             let slot = match name.schema {
                 Some(schema) => storage.enum_slot(schema, name.name, txn.txid),
@@ -59379,7 +59655,17 @@ pub(crate) fn drop_type(
         }
         responder.command_complete("DROP TYPE")?;
         sql_ok()
-    })
+    });
+    finish_expression_cascade(
+        outcome,
+        storage,
+        wal,
+        txn,
+        scratch,
+        seq_session,
+        arena,
+        responder,
+    )
 }
 
 fn composite_field_uses_enum(storage: &Storage, enum_slot: usize, txid: u32) -> Option<usize> {
@@ -62626,6 +62912,10 @@ fn rewrite_table_owned_column_references(
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let from = definition.columns[column].name;
+    definition.rename_expression_owner(
+        crate::storage::ExpressionOwner::Column(from),
+        crate::storage::ExpressionOwner::Column(to),
+    );
     let rename = CompositeFieldRename { from, to };
     let current = definition.clone();
     let mut renamed = current.clone();
@@ -66519,7 +66809,7 @@ pub fn create_index(
         Ok(tablespace) => tablespace,
         Err(error) => return sql_fail(error),
     };
-    let def = IndexDef {
+    let mut def = IndexDef {
         database: storage.current_database_oid(),
         created_at: 0,
         schema: tdef.schema,
@@ -66571,7 +66861,13 @@ pub fn create_index(
         pending_definition: None,
         ddl_state: crate::storage::CatalogDdlState::Present,
         pending_parent_drop_txid: None,
+        ..IndexDef::EMPTY
     };
+    if let Err(error) = expression_bindings::capture_index_expression_dependencies(
+        storage, &mut def, &tdef, txn.txid, arena,
+    ) {
+        return sql_fail(error);
+    }
     // Register first so the UNIQUE validation below sees this index; on any
     // failure the registration is rolled back.
     let slot = match storage.create_index(def, txn.txid) {
@@ -66865,6 +67161,9 @@ fn journal_index_creation(
                 predicate: index.predicate.as_ref().map(|text| text.as_str()),
                 unique: index.unique,
                 definition: index.mutable_for(txn.txid),
+                expression_dependencies: crate::wal::ExpressionDependencyList::Entries(
+                    index.expression_dependencies(),
+                ),
             },
         )?;
     }
@@ -71562,7 +71861,7 @@ pub(crate) fn copy_row(
             def.columns()[setup.targets[n_fields]].name.as_str()
         ));
     }
-    let checks = parse_checks(def, arena)?;
+    let checks = parse_checks(def, storage, txn.txid, arena)?;
     let default_exprs = parse_defaults(def, arena, storage, txn.txid)?;
     let generated_exprs = parse_generated(def, arena, storage, txn.txid)?;
     let mut values = [Datum::Null; MAX_COLUMNS];
@@ -71682,7 +71981,7 @@ pub(crate) fn copy_row_binary(
             setup.n_targets
         ));
     }
-    let checks = parse_checks(def, arena)?;
+    let checks = parse_checks(def, storage, txn.txid, arena)?;
     let default_exprs = parse_defaults(def, arena, storage, txn.txid)?;
     let generated_exprs = parse_generated(def, arena, storage, txn.txid)?;
     let mut values = [Datum::Null; MAX_COLUMNS];
@@ -71808,7 +72107,7 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
             let checks = if target == logical_table {
                 checks
             } else {
-                leaf_checks = parse_checks(physical, arena)?;
+                leaf_checks = parse_checks(physical, storage, txn.txid, arena)?;
                 &leaf_checks
             };
             let leaf_generated;
@@ -72060,7 +72359,7 @@ fn apply_replication_insert_values<'arena, Definition0: crate::storage::Definiti
     context: &mut ReplicationTriggerContext<'_, '_>,
 ) -> Result<(), SqlError> {
     let table_index = logical_target.table();
-    let checks = parse_checks(definition, arena)?;
+    let checks = parse_checks(definition, storage, txn.txid, arena)?;
     let generated = parse_generated(definition, arena, storage, txn.txid)?;
     partition_insert::with_partition_insert_row(
         storage,
@@ -72075,7 +72374,7 @@ fn apply_replication_insert_values<'arena, Definition0: crate::storage::Definiti
             let checks = if target_table == table_index {
                 &checks
             } else {
-                leaf_checks = parse_checks(definition, arena)?;
+                leaf_checks = parse_checks(definition, storage, txn.txid, arena)?;
                 &leaf_checks
             };
             let leaf_generated;
@@ -72680,7 +72979,7 @@ pub(crate) fn apply_replication_update(
     }
     let mut new_values = old_values;
     mapping.overlay(&logical_new, &mut new_values);
-    let checks = parse_checks(definition, arena)?;
+    let checks = parse_checks(definition, storage, txn.txid, arena)?;
     let generated = parse_generated(definition, arena, storage, txn.txid)?;
     if !fire_partition_row_triggers(
         storage,
@@ -76453,7 +76752,7 @@ pub(crate) fn merge<'a>(
         None
     };
 
-    let checks = match parse_checks(def, arena) {
+    let checks = match parse_checks(def, storage, txn.txid, arena) {
         Ok(c) => c,
         Err(e) => return sql_fail(e),
     };
@@ -78138,7 +78437,7 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
             let checks = if target_table == table_index {
                 checks
             } else {
-                leaf_checks = parse_checks(def, arena)?;
+                leaf_checks = parse_checks(def, storage, txn.txid, arena)?;
                 &leaf_checks
             };
             let leaf_generated;
@@ -78343,7 +78642,7 @@ where
             let checks = if table_index == logical_table_index {
                 checks
             } else {
-                leaf_checks = match parse_checks(definition, arena) {
+                leaf_checks = match parse_checks(definition, storage, txn.txid, arena) {
                     Ok(checks) => checks,
                     Err(error) => return Ok(Err(error)),
                 };
@@ -80193,7 +80492,7 @@ where
     ) {
         return sql_fail(error);
     }
-    let checks = match parse_checks(def, arena) {
+    let checks = match parse_checks(def, storage, txn.txid, arena) {
         Ok(c) => c,
         Err(e) => return sql_fail(e),
     };
@@ -84470,7 +84769,7 @@ fn validate_all_rows<Definition0: crate::storage::DefinitionBacking>(
         }
     }
     let new_def = &validated;
-    let checks = parse_checks(new_def, arena)?;
+    let checks = parse_checks(new_def, storage, txid, arena)?;
     let mut schema = [ColType::Bool; MAX_COLUMNS];
     new_def.schema(&mut schema);
     for candidate in 0..storage.table_count() {
@@ -85117,7 +85416,12 @@ fn rename_stored_constraint(def: &mut TableDefBuilder, from: &str, to: SqlName) 
         .iter_mut()
         .find(|constraint| constraint.name.as_str() == from)
     {
+        let from = constraint.name;
         constraint.name = to;
+        def.rename_expression_owner(
+            crate::storage::ExpressionOwner::Check(from),
+            crate::storage::ExpressionOwner::Check(to),
+        );
         return true;
     }
     if let Some(constraint) = def.uniques[..def.n_uniques]
@@ -86682,7 +86986,7 @@ fn alter_partition_attachment(
         }
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         parent_def.schema(&mut schema);
-        let parent_checks = match parse_checks(&parent_def, arena) {
+        let parent_checks = match parse_checks(&parent_def, storage, txn.txid, arena) {
             Ok(checks) => checks,
             Err(error) => return sql_fail(error),
         };
@@ -88796,6 +89100,15 @@ fn alter_table_relation(
                 let index = new_def.n_columns;
                 new_def.columns[index] = meta;
                 new_def.n_columns += 1;
+                if let Err(error) = expression_bindings::capture_column_expression_dependencies(
+                    storage,
+                    &mut new_def,
+                    index,
+                    txn.txid,
+                    arena,
+                ) {
+                    return sql_fail(error);
+                }
                 if let Some(name) = c.not_null_name {
                     let name = match SqlName::parse(name) {
                         Ok(name) => name,
@@ -89045,6 +89358,15 @@ fn alter_table_relation(
                 };
                 new_def.columns[i].default = default;
                 renew_default_identity(&mut new_def, &def, source[i]);
+                if let Err(error) = expression_bindings::capture_column_expression_dependencies(
+                    storage,
+                    &mut new_def,
+                    i,
+                    txn.txid,
+                    arena,
+                ) {
+                    return sql_fail(error);
+                }
                 if let Err(error) =
                     record_table_input_override(&mut input_overrides, i, value_text, arena)
                 {
@@ -89279,6 +89601,15 @@ fn alter_table_relation(
                     };
                 new_def.columns[i].default = crate::storage::ColumnDefault::Generated(expression);
                 renew_default_identity(&mut new_def, &def, source[i]);
+                if let Err(error) = expression_bindings::capture_column_expression_dependencies(
+                    storage,
+                    &mut new_def,
+                    i,
+                    txn.txid,
+                    arena,
+                ) {
+                    return sql_fail(error);
+                }
                 if let Err(error) =
                     record_table_input_override(&mut input_overrides, i, expression_text, arena)
                 {
@@ -90062,7 +90393,7 @@ fn alter_table_relation(
             foreign_key.validation = crate::storage::ConstraintValidation::NotEnforced;
         }
     }
-    let checks = match parse_checks(&rewrite_validation_def, arena) {
+    let checks = match parse_checks(&rewrite_validation_def, storage, txn.txid, arena) {
         Ok(c) => c,
         Err(e) => return sql_fail(e),
     };

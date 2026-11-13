@@ -47668,6 +47668,48 @@ impl Storage {
     }
 
     /// Bind an already-owned definition without copying its reserved buffers.
+    /// Gives a PL/pgSQL routine's `record` inputs the named composite types
+    /// their arguments have, as PostgreSQL passes the actual argument type
+    /// to a `record` parameter: a NULL of such a type is then a row of that
+    /// type whose fields read NULL.
+    pub(crate) fn bind_record_arguments(
+        &self,
+        routine: &mut RoutineDef,
+        argument_type_oids: &[i32],
+        txid: u32,
+    ) {
+        if routine.language != RoutineLanguage::PlPgSql {
+            return;
+        }
+        for (input, oid) in argument_type_oids
+            .iter()
+            .enumerate()
+            .take(routine.argument_count)
+        {
+            if routine.arguments[input].ctype != ColType::Record
+                || routine.arguments[input].user_type.is_some()
+            {
+                continue;
+            }
+            let Some(concrete) = self
+                .routine_result_for_oid(*oid, txid)
+                .filter(|concrete| matches!(concrete.ctype, ColType::Composite(Some(_))))
+            else {
+                continue;
+            };
+            routine.arguments[input].ctype = concrete.ctype;
+            routine.arguments[input].user_type = concrete.user_type;
+            if let Some(parameter) = routine.parameters[..routine.parameter_count]
+                .iter_mut()
+                .filter(|parameter| parameter.mode.is_input())
+                .nth(input)
+            {
+                parameter.ctype = concrete.ctype;
+                parameter.user_type = concrete.user_type;
+            }
+        }
+    }
+
     pub(crate) fn bind_routine_call(
         &self,
         routine: &mut RoutineDef,

@@ -3373,6 +3373,8 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     "routine input types do not match its captured signature"
                 )
             })?;
+        self.storage
+            .bind_record_arguments(declared, &input_type_oids[..input_count], self.txid);
         let routine = &*declared;
         for (input_index, argument) in routine.arguments().iter().enumerate() {
             for (call_index, expression) in arguments.iter().enumerate() {

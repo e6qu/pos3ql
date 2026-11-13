@@ -557,9 +557,10 @@ An error inside a statement or expression of a PL/pgSQL body is positioned
 in it (`QUERY` and `LINE`), except at a name the lexer folded (`OLD.n`,
 `NOSUCH`) or a `$n` beyond the routine's parameters, which report no
 position: the statement's parsed names keep no map to the text.
-A NULL row of a named type passed to a PL/pgSQL `record` parameter
-(`f(NULL::t)`) is an unassigned record whose field reads fail with `55000`,
-where PostgreSQL reads the type's fields as NULL.
+A field of an anonymous row passed to a PL/pgSQL `record` parameter that the
+row lacks (`f((1, 'y'))` reading `r.a`) fails with `42P01` (`missing
+FROM-clause entry for table "r"`) where PostgreSQL reports `record "r" has no
+field "a"`.
 `PREPARE p(t1) AS UPDATE t SET c = $1` with a parameter type the column
 cannot take is accepted until it runs, and the error it then reports (also
 from a cascaded `ON UPDATE CASCADE` between two composite types) has no

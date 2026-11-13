@@ -1297,16 +1297,57 @@ impl<'a> IndexAccessPlan<'a> {
         self.method
     }
 
-    pub(crate) const fn is_exact(&self) -> bool {
-        self.exact
-    }
-
-    pub(crate) const fn binding(&self) -> usize {
-        self.binding
-    }
-
     pub(crate) const fn index_name(&self) -> StackStr<64> {
         self.index_name
+    }
+
+    /// Whether a scan of table `slot` reads through this access instead of
+    /// sequentially: the one choice execution and EXPLAIN share. `ordered`
+    /// marks an access that also supplies the requested row order. A
+    /// disabled method (`enable_indexscan`, `enable_bitmapscan`,
+    /// `enable_seqscan`) loses to an enabled one and is kept only when both
+    /// are disabled, as PostgreSQL's disabled-node counting does.
+    pub(crate) fn chosen_for_scan(
+        &self,
+        storage: &Storage,
+        slot: usize,
+        definition: &TableDef,
+        txid: u32,
+        ordered: bool,
+    ) -> bool {
+        use crate::sql::ast::IndexAccessMethod;
+        let expected_rows = self.expected_rows(storage, slot, definition, txid);
+        let rows = storage.planning_row_estimate(slot);
+        let selective = match self.method {
+            IndexAccessMethod::Brin => expected_rows.saturating_mul(8) <= rows,
+            IndexAccessMethod::Gist | IndexAccessMethod::Gin | IndexAccessMethod::SpGist => {
+                expected_rows.saturating_mul(4) <= rows
+            }
+            _ => self.exact && storage.value_binding_cache_complete(slot, self.binding),
+        };
+        let preferred = ordered
+            || selective
+            || !storage.sequential_spill_scan_is_cheaper(slot, expected_rows, txid);
+        let methods = crate::sql::guc::planner_methods();
+        let enabled = if self.uses_bitmap() {
+            methods.bitmapscan
+        } else {
+            methods.indexscan
+        };
+        if preferred {
+            enabled || !methods.seqscan
+        } else {
+            enabled && !methods.seqscan
+        }
+    }
+
+    /// Whether this access runs as a bitmap heap scan: BRIN and GIN
+    /// produce candidate row sets, not ordered index entries.
+    pub(crate) const fn uses_bitmap(&self) -> bool {
+        matches!(
+            self.method,
+            crate::sql::ast::IndexAccessMethod::Brin | crate::sql::ast::IndexAccessMethod::Gin
+        )
     }
 
     pub(crate) fn expected_rows(
@@ -2564,7 +2605,14 @@ pub(crate) fn parameterized_index_access_plan<'a>(
     outer_available: bool,
     arena: &'a Arena,
 ) -> Result<Option<IndexAccessPlan<'a>>, SqlError> {
-    if scope.n > MAX_OPTIMIZED_JOIN_TABLES || depth >= scope.n || (depth == 0 && !outer_available) {
+    // A disabled index scan leaves the inner relation to a sequential scan
+    // unless sequential scans are disabled as well.
+    let methods = crate::sql::guc::planner_methods();
+    if scope.n > MAX_OPTIMIZED_JOIN_TABLES
+        || depth >= scope.n
+        || (depth == 0 && !outer_available)
+        || (!methods.indexscan && methods.seqscan)
+    {
         return Ok(None);
     }
     let table = order[depth];
@@ -2722,30 +2770,7 @@ pub(crate) fn parameterized_index_access_plan<'a>(
         .defs
         .stored(table)
         .expect("physical table has definition");
-    let expected_rows = plan.expected_rows(storage, slot, definition, txid);
-    let resident_exact = !matches!(
-        plan.method,
-        crate::sql::ast::IndexAccessMethod::Brin
-            | crate::sql::ast::IndexAccessMethod::Gist
-            | crate::sql::ast::IndexAccessMethod::Gin
-            | crate::sql::ast::IndexAccessMethod::SpGist
-    ) && plan.exact
-        && storage.value_binding_cache_complete(slot, plan.binding);
-    let selective_brin = plan.method == crate::sql::ast::IndexAccessMethod::Brin
-        && expected_rows.saturating_mul(8) <= storage.planning_row_estimate(slot);
-    let selective_gist = plan.method == crate::sql::ast::IndexAccessMethod::Gist
-        && expected_rows.saturating_mul(4) <= storage.planning_row_estimate(slot);
-    let selective_gin = plan.method == crate::sql::ast::IndexAccessMethod::Gin
-        && expected_rows.saturating_mul(4) <= storage.planning_row_estimate(slot);
-    let selective_spgist = plan.method == crate::sql::ast::IndexAccessMethod::SpGist
-        && expected_rows.saturating_mul(4) <= storage.planning_row_estimate(slot);
-    if !resident_exact
-        && !selective_brin
-        && !selective_gist
-        && !selective_gin
-        && !selective_spgist
-        && storage.sequential_spill_scan_is_cheaper(slot, expected_rows, txid)
-    {
+    if !plan.chosen_for_scan(storage, slot, definition, txid, false) {
         return Ok(None);
     }
     Ok(Some(plan))
@@ -2770,7 +2795,11 @@ pub(crate) fn ordered_index_access_plan<'a>(
     order: &'a [OrderBy<'a>],
     arena: &'a Arena,
 ) -> Result<Option<OrderedIndexAccessPlan<'a>>, SqlError> {
+    // With index scans disabled the result is sorted after another scan,
+    // unless every scan is disabled (`enable_seqscan` too).
+    let methods = crate::sql::guc::planner_methods();
     if order.is_empty()
+        || (!methods.indexscan && methods.seqscan)
         || order.len() > MAX_INDEX_COLS
         || scope.n != 1
         || scope.derived[0].is_some()
@@ -3522,31 +3551,7 @@ fn indexed_candidates_for_plan<'a>(
 ) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
     let index_oid = ordered_plan.map_or(plan.index_oid, |ordered| ordered.index_oid);
     let statistics = storage.capture_index_statistics(txid, slot, index_oid)?;
-    let expected_rows = plan.expected_rows(storage, slot, definition, txid);
-    let selective_brin = plan.method == crate::sql::ast::IndexAccessMethod::Brin
-        && expected_rows.saturating_mul(8) <= storage.planning_row_estimate(slot);
-    let selective_gist = plan.method == crate::sql::ast::IndexAccessMethod::Gist
-        && expected_rows.saturating_mul(4) <= storage.planning_row_estimate(slot);
-    let selective_gin = plan.method == crate::sql::ast::IndexAccessMethod::Gin
-        && expected_rows.saturating_mul(4) <= storage.planning_row_estimate(slot);
-    let selective_spgist = plan.method == crate::sql::ast::IndexAccessMethod::SpGist
-        && expected_rows.saturating_mul(4) <= storage.planning_row_estimate(slot);
-    let resident_exact = !matches!(
-        plan.method,
-        crate::sql::ast::IndexAccessMethod::Brin
-            | crate::sql::ast::IndexAccessMethod::Gist
-            | crate::sql::ast::IndexAccessMethod::Gin
-            | crate::sql::ast::IndexAccessMethod::SpGist
-    ) && plan.exact
-        && storage.value_binding_cache_complete(slot, plan.binding);
-    if ordered_plan.is_none()
-        && !resident_exact
-        && !selective_brin
-        && !selective_gist
-        && !selective_gin
-        && !selective_spgist
-        && storage.sequential_spill_scan_is_cheaper(slot, expected_rows, txid)
-    {
+    if !plan.chosen_for_scan(storage, slot, definition, txid, ordered_plan.is_some()) {
         return Ok(None);
     }
 
@@ -5963,8 +5968,9 @@ impl HashJoinPlan<'_> {
 }
 
 /// Selects the hash implementation only when its fixed build table and
-/// equi-key representation can execute this join exactly. Every other shape
-/// selects the ordinary nested-loop implementation before execution.
+/// equi-key representation can execute this join exactly and hash joins are
+/// enabled. Every other shape selects the ordinary nested-loop
+/// implementation before execution.
 pub(crate) fn select_hash_join_plan<'a>(
     storage: &Storage,
     scope: &QueryScope<'a>,
@@ -5974,22 +5980,26 @@ pub(crate) fn select_hash_join_plan<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<HashJoinPlan<'a>>, SqlError> {
-    if scope.n != 2 || from.joins.len() != 1 {
+    // `enable_hashjoin = off` leaves the join to a nested loop; pos3ql has
+    // no merge join for PostgreSQL's usual alternative.
+    if scope.n != 2 || from.joins.len() != 1 || !crate::sql::guc::planner_methods().hashjoin {
         return Ok(None);
     }
+    // An indexed nested loop wins unless nested loops are disabled.
     for depth in 1..scope.n {
-        if parameterized_index_access_plan(
-            storage,
-            scope,
-            from,
-            where_clause,
-            order,
-            depth,
-            txid,
-            false,
-            arena,
-        )?
-        .is_some()
+        if crate::sql::guc::planner_methods().nestloop
+            && parameterized_index_access_plan(
+                storage,
+                scope,
+                from,
+                where_clause,
+                order,
+                depth,
+                txid,
+                false,
+                arena,
+            )?
+            .is_some()
         {
             return Ok(None);
         }

@@ -15,6 +15,10 @@ use super::ast::{TransactionCharacteristics, TransactionIsolation};
 use super::datetime::{DateFormat, DateStyle, FieldOrder, IntervalStyle};
 use super::eval::SqlError;
 
+mod planner;
+
+pub(crate) use planner::{PlannerMethods, format_g};
+
 /// Maximum stored byte length of a session search path. The resolver's
 /// entry bound is derived from this value, so a byte-valid path cannot overrun
 /// a narrower effective-path array.
@@ -786,6 +790,7 @@ struct GucValues {
     track_functions: TrackFunctions,
     plpgsql_variable_conflict: VariableConflict,
     plpgsql_print_strict_params: bool,
+    planner: planner::PlannerValues,
 }
 
 /// `plpgsql.variable_conflict` and a PL/pgSQL body's `#variable_conflict`:
@@ -839,9 +844,13 @@ impl TrackFunctions {
 /// rather than every session presentation setting.
 #[derive(Clone, Copy)]
 pub(crate) struct PlannerSettings {
-    entries: [PlannerSetting; 1],
+    entries: [PlannerSetting; PLANNER_EXPLAIN_SETTINGS],
     count: usize,
 }
+
+/// `search_path`, `work_mem` and the planner settings: the PostgreSQL
+/// `GUC_EXPLAIN` parameters pos3ql has.
+const PLANNER_EXPLAIN_SETTINGS: usize = 2 + planner::PLANNER_SETTING_COUNT;
 
 #[derive(Clone, Copy)]
 pub(crate) struct PlannerSetting {
@@ -854,7 +863,7 @@ impl PlannerSettings {
         entries: [PlannerSetting {
             name: "",
             value: StackStr::new(),
-        }],
+        }; PLANNER_EXPLAIN_SETTINGS],
         count: 0,
     };
 
@@ -913,7 +922,8 @@ impl GucValues {
             password_encryption,
             track_functions,
             plpgsql_variable_conflict,
-            plpgsql_print_strict_params
+            plpgsql_print_strict_params,
+            planner
         )
     }
 
@@ -948,6 +958,7 @@ impl GucValues {
             track_functions: TrackFunctions::None,
             plpgsql_variable_conflict: VariableConflict::Error,
             plpgsql_print_strict_params: false,
+            planner: planner::PlannerValues::DEFAULTS,
         };
         let _ = write!(values.datestyle, "ISO, MDY");
         let _ = write!(values.timezone, "UTC");
@@ -959,53 +970,77 @@ impl GucValues {
     }
 }
 
-const GUC_DATESTYLE: u32 = 1 << 0;
-const GUC_INTERVALSTYLE: u32 = 1 << 1;
-const GUC_TIMEZONE: u32 = 1 << 2;
-const GUC_CLIENT_ENCODING: u32 = 1 << 3;
-const GUC_APPLICATION_NAME: u32 = 1 << 4;
-const GUC_SEARCH_PATH: u32 = 1 << 5;
-const GUC_DEFAULT_TABLESPACE: u32 = 1 << 6;
-const GUC_CLIENT_MIN_MESSAGES: u32 = 1 << 7;
-const GUC_EXTRA_FLOAT_DIGITS: u32 = 1 << 8;
-const GUC_LOCK_TIMEOUT: u32 = 1 << 9;
-const GUC_STATEMENT_TIMEOUT: u32 = 1 << 10;
-const GUC_ROW_SECURITY: u32 = 1 << 11;
-const GUC_BYTEA_OUTPUT: u32 = 1 << 12;
-const GUC_CHECK_FUNCTION_BODIES: u32 = 1 << 13;
-const GUC_DEFAULT_TRANSACTION_ISOLATION: u32 = 1 << 14;
-const GUC_DEFAULT_TRANSACTION_READ_ONLY: u32 = 1 << 15;
-const GUC_DEFAULT_TRANSACTION_DEFERRABLE: u32 = 1 << 16;
-const GUC_STANDARD_CONFORMING_STRINGS: u32 = 1 << 17;
-const GUC_XML_OPTION: u32 = 1 << 18;
-const GUC_DEFAULT_TABLE_ACCESS_METHOD: u32 = 1 << 19;
-const GUC_SYNCHRONIZE_SEQSCANS: u32 = 1 << 20;
-const GUC_IDLE_IN_TRANSACTION_SESSION_TIMEOUT: u32 = 1 << 21;
-const GUC_TRANSACTION_TIMEOUT: u32 = 1 << 22;
-const GUC_EVENT_TRIGGERS: u32 = 1 << 23;
-const GUC_DEFAULT_TEXT_SEARCH_CONFIG: u32 = 1 << 24;
-const GUC_PASSWORD_ENCRYPTION: u32 = 1 << 25;
-const GUC_LC_MONETARY: u32 = 1 << 26;
-const GUC_TRACK_FUNCTIONS: u32 = 1 << 27;
-const GUC_PLPGSQL_VARIABLE_CONFLICT: u32 = 1 << 28;
-const GUC_WORK_MEM: u32 = 1 << 29;
-const GUC_PLPGSQL_PRINT_STRICT_PARAMS: u32 = 1 << 30;
-const GUC_SETTING_COUNT: usize = 31;
-const GUC_ALL: u32 = (1 << GUC_SETTING_COUNT) - 1;
+const GUC_DATESTYLE: GucMask = 1 << 0;
+const GUC_INTERVALSTYLE: GucMask = 1 << 1;
+const GUC_TIMEZONE: GucMask = 1 << 2;
+const GUC_CLIENT_ENCODING: GucMask = 1 << 3;
+const GUC_APPLICATION_NAME: GucMask = 1 << 4;
+const GUC_SEARCH_PATH: GucMask = 1 << 5;
+const GUC_DEFAULT_TABLESPACE: GucMask = 1 << 6;
+const GUC_CLIENT_MIN_MESSAGES: GucMask = 1 << 7;
+const GUC_EXTRA_FLOAT_DIGITS: GucMask = 1 << 8;
+const GUC_LOCK_TIMEOUT: GucMask = 1 << 9;
+const GUC_STATEMENT_TIMEOUT: GucMask = 1 << 10;
+const GUC_ROW_SECURITY: GucMask = 1 << 11;
+const GUC_BYTEA_OUTPUT: GucMask = 1 << 12;
+const GUC_CHECK_FUNCTION_BODIES: GucMask = 1 << 13;
+const GUC_DEFAULT_TRANSACTION_ISOLATION: GucMask = 1 << 14;
+const GUC_DEFAULT_TRANSACTION_READ_ONLY: GucMask = 1 << 15;
+const GUC_DEFAULT_TRANSACTION_DEFERRABLE: GucMask = 1 << 16;
+const GUC_STANDARD_CONFORMING_STRINGS: GucMask = 1 << 17;
+const GUC_XML_OPTION: GucMask = 1 << 18;
+const GUC_DEFAULT_TABLE_ACCESS_METHOD: GucMask = 1 << 19;
+const GUC_SYNCHRONIZE_SEQSCANS: GucMask = 1 << 20;
+const GUC_IDLE_IN_TRANSACTION_SESSION_TIMEOUT: GucMask = 1 << 21;
+const GUC_TRANSACTION_TIMEOUT: GucMask = 1 << 22;
+const GUC_EVENT_TRIGGERS: GucMask = 1 << 23;
+const GUC_DEFAULT_TEXT_SEARCH_CONFIG: GucMask = 1 << 24;
+const GUC_PASSWORD_ENCRYPTION: GucMask = 1 << 25;
+const GUC_LC_MONETARY: GucMask = 1 << 26;
+const GUC_TRACK_FUNCTIONS: GucMask = 1 << 27;
+const GUC_PLPGSQL_VARIABLE_CONFLICT: GucMask = 1 << 28;
+const GUC_WORK_MEM: GucMask = 1 << 29;
+const GUC_PLPGSQL_PRINT_STRICT_PARAMS: GucMask = 1 << 30;
+/// The first planner setting's bit; the rest follow in table order.
+const GUC_PLANNER_FIRST: usize = 31;
+const GUC_SETTING_COUNT: usize = GUC_PLANNER_FIRST + planner::PLANNER_SETTING_COUNT;
+const GUC_ALL: GucMask = (1 << GUC_SETTING_COUNT) - 1;
+
+/// One bit per session setting.
+type GucMask = u128;
 
 #[derive(Clone, Copy)]
 struct SettingActions {
     next: u64,
     session: [u64; GUC_SETTING_COUNT],
+    /// When each setting was last changed from its default, for the order of
+    /// `EXPLAIN (SETTINGS)` (PostgreSQL lists non-default settings in the
+    /// order they left their defaults); 0 while at its default.
+    explain_order: [u64; GUC_SETTING_COUNT],
 }
 
 impl SettingActions {
     const EMPTY: Self = Self {
         next: 0,
         session: [0; GUC_SETTING_COUNT],
+        explain_order: [0; GUC_SETTING_COUNT],
     };
 
-    fn record_session(&mut self, mask: u32) -> Result<(), SqlError> {
+    fn note_explain_order(&mut self, mask: GucMask, resetting: bool) {
+        for index in 0..GUC_SETTING_COUNT {
+            if mask & (1 << index) == 0 {
+                continue;
+            }
+            if resetting {
+                self.explain_order[index] = 0;
+            } else if self.explain_order[index] == 0 {
+                self.next = self.next.saturating_add(1);
+                self.explain_order[index] = self.next;
+            }
+        }
+    }
+
+    fn record_session(&mut self, mask: GucMask) -> Result<(), SqlError> {
         let next = self.next.checked_add(1).ok_or_else(|| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -1021,7 +1056,7 @@ impl SettingActions {
         Ok(())
     }
 
-    fn restore_mask(&self, configured: u32, entered: u64) -> u32 {
+    fn restore_mask(&self, configured: GucMask, entered: u64) -> GucMask {
         self.session
             .iter()
             .enumerate()
@@ -1035,7 +1070,7 @@ impl SettingActions {
     }
 }
 
-fn guc_bit(name: &str) -> u32 {
+fn guc_bit(name: &str) -> GucMask {
     if name.eq_ignore_ascii_case("datestyle") {
         GUC_DATESTYLE
     } else if name.eq_ignore_ascii_case("intervalstyle") {
@@ -1098,6 +1133,8 @@ fn guc_bit(name: &str) -> u32 {
         GUC_WORK_MEM
     } else if name.eq_ignore_ascii_case("plpgsql.print_strict_params") {
         GUC_PLPGSQL_PRINT_STRICT_PARAMS
+    } else if let Some(index) = planner::planner_index(name) {
+        1 << (GUC_PLANNER_FIRST + index)
     } else {
         0
     }
@@ -1113,7 +1150,7 @@ pub(crate) fn requires_set_privilege(name: &str) -> bool {
         || name.eq_ignore_ascii_case("plpgsql.variable_conflict")
 }
 
-fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: u32) {
+fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: GucMask) {
     macro_rules! copy {
         ($bit:ident, $field:ident) => {
             if mask & $bit != 0 {
@@ -1159,18 +1196,24 @@ fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: u32) {
     copy!(GUC_TRACK_FUNCTIONS, track_functions);
     copy!(GUC_PLPGSQL_VARIABLE_CONFLICT, plpgsql_variable_conflict);
     copy!(GUC_PLPGSQL_PRINT_STRICT_PARAMS, plpgsql_print_strict_params);
+    for index in 0..planner::PLANNER_SETTING_COUNT {
+        if mask & (1 << (GUC_PLANNER_FIRST + index)) != 0 {
+            target.planner.0[index] = source.planner.0[index];
+        }
+    }
 }
 
 fn finish_setting_change(
     state: &mut GucStore,
     values: GucValues,
-    bit: u32,
+    bit: GucMask,
     local: bool,
     resetting: bool,
 ) -> Result<(), SqlError> {
     if !local {
         state.actions.record_session(bit)?;
     }
+    state.actions.note_explain_order(bit, resetting);
     state.current = values;
     if !state.transaction.active {
         state.defaults = values;
@@ -1196,8 +1239,8 @@ fn finish_setting_change(
 struct GucSavepoint {
     current: GucValues,
     session: GucValues,
-    current_overrides: u32,
-    session_overrides: u32,
+    current_overrides: GucMask,
+    session_overrides: GucMask,
     session_actions: [u64; GUC_SETTING_COUNT],
 }
 
@@ -1210,8 +1253,8 @@ struct GucTransaction {
     active: bool,
     start: GucValues,
     session: GucValues,
-    start_overrides: u32,
-    session_overrides: u32,
+    start_overrides: GucMask,
+    session_overrides: GucMask,
     start_actions: [u64; GUC_SETTING_COUNT],
     savepoints: Vec<Option<GucSavepoint>>,
     savepoint_count: usize,
@@ -1221,13 +1264,13 @@ struct GucStore {
     current: GucValues,
     defaults: GucValues,
     cluster_defaults: GucValues,
-    cluster_overrides: u32,
-    connection_overrides: u32,
-    database_overrides: u32,
-    role_overrides: u32,
-    database_role_overrides: u32,
-    client_overrides: u32,
-    session_overrides: u32,
+    cluster_overrides: GucMask,
+    connection_overrides: GucMask,
+    database_overrides: GucMask,
+    role_overrides: GucMask,
+    database_role_overrides: GucMask,
+    client_overrides: GucMask,
+    session_overrides: GucMask,
     actions: SettingActions,
     transaction: GucTransaction,
 }
@@ -1254,7 +1297,7 @@ pub struct GucState {
 pub(crate) struct RoutineConfigScope {
     guc: *const GucState,
     prior: GucValues,
-    configured: u32,
+    configured: GucMask,
     entered: u64,
     owner: super::ExecutionIdentity,
 }
@@ -1265,8 +1308,8 @@ pub(crate) struct RoutineConfigScope {
 pub(crate) struct RoutineConfigImage {
     prior: GucValues,
     current: GucValues,
-    configured: u32,
-    restore: u32,
+    configured: GucMask,
+    restore: GucMask,
     entered: u64,
     paused: u64,
     owner: super::ExecutionIdentity,
@@ -1606,12 +1649,41 @@ impl GucState {
         let current = &state.current;
         let built_in = GucValues::new();
         let mut settings = PlannerSettings::EMPTY;
-        if current.search_path != built_in.search_path {
-            settings.entries[settings.count] = PlannerSetting {
-                name: "search_path",
-                value: current.search_path,
-            };
+        let mut orders = [0_u64; PLANNER_EXPLAIN_SETTINGS];
+        let mut push = |name: &'static str, value: StackStr<128>| {
+            let order = state.actions.explain_order[guc_bit(name).trailing_zeros() as usize];
+            settings.entries[settings.count] = PlannerSetting { name, value };
+            orders[settings.count] = order;
             settings.count += 1;
+        };
+        if current.search_path != built_in.search_path {
+            push(
+                "search_path",
+                StackStr::from_str(current.search_path.as_str()),
+            );
+        }
+        if current.work_mem != built_in.work_mem {
+            push(
+                "work_mem",
+                StackStr::from_str(show_int_setting(WORK_MEM, current.work_mem).as_str()),
+            );
+        }
+        for (index, setting) in planner::PLANNER_SETTINGS.iter().enumerate() {
+            if current.planner.0[index] != built_in.planner.0[index] {
+                push(
+                    setting.name,
+                    StackStr::from_str(planner::show(index, current.planner.0[index]).as_str()),
+                );
+            }
+        }
+        // A stable insertion sort keeps this allocation-free.
+        for at in 1..settings.count {
+            let mut position = at;
+            while position > 0 && orders[position - 1] > orders[position] {
+                orders.swap(position - 1, position);
+                settings.entries.swap(position - 1, position);
+                position -= 1;
+            }
         }
         settings
     }
@@ -2418,6 +2490,8 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
         values.plpgsql_variable_conflict = defaults.plpgsql_variable_conflict;
     } else if name.eq_ignore_ascii_case("plpgsql.print_strict_params") {
         values.plpgsql_print_strict_params = defaults.plpgsql_print_strict_params;
+    } else if let Some(index) = planner::planner_index(name) {
+        values.planner.0[index] = defaults.planner.0[index];
     } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
         // Storage scans are deterministic and never synchronize their starts.
     } else if name.eq_ignore_ascii_case("standard_conforming_strings")
@@ -2557,6 +2631,10 @@ fn apply_setting(
             ));
         };
         return store(&mut values.lc_monetary, canonical);
+    }
+    if let Some(index) = planner::planner_index(name) {
+        values.planner.0[index] = planner::parse(index, v)?;
+        return Ok(());
     }
     if name.eq_ignore_ascii_case("synchronize_seqscans") {
         if !parse_boolean_setting("synchronize_seqscans", v)? {
@@ -2826,6 +2904,10 @@ fn owned_setting(values: &GucValues, name: &str) -> Option<StackStr<256>> {
         Some(StackStr::from_str(values.lc_monetary.as_str()))
     } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
         Some(StackStr::from_str("off"))
+    } else if let Some(index) = planner::planner_index(name) {
+        Some(StackStr::from_str(
+            planner::show(index, values.planner.0[index]).as_str(),
+        ))
     } else if name.eq_ignore_ascii_case("default_transaction_isolation") {
         Some(StackStr::from_str(
             values.default_transaction_isolation.as_str(),
@@ -2908,6 +2990,8 @@ pub(crate) fn parse_transaction_isolation(v: &str) -> Option<TransactionIsolatio
 enum SettingUnit {
     None,
     Kilobytes,
+    /// PostgreSQL's `GUC_UNIT_BLOCKS`: 8 kB pages.
+    Blocks,
     Milliseconds,
 }
 
@@ -2968,6 +3052,13 @@ const KILOBYTE_UNITS: [(&str, f64); 5] = [
     ("kB", 1.0),
     ("B", 1.0 / 1024.0),
 ];
+const BLOCK_UNITS: [(&str, f64); 5] = [
+    ("TB", 1024.0 * 1024.0 * 1024.0 / 8.0),
+    ("GB", 1024.0 * 1024.0 / 8.0),
+    ("MB", 1024.0 / 8.0),
+    ("kB", 1.0 / 8.0),
+    ("B", 1.0 / 8192.0),
+];
 const MILLISECOND_UNITS: [(&str, f64); 6] = [
     ("d", 86_400_000.0),
     ("h", 3_600_000.0),
@@ -2982,6 +3073,7 @@ impl SettingUnit {
         match self {
             Self::None => &[],
             Self::Kilobytes => &KILOBYTE_UNITS,
+            Self::Blocks => &BLOCK_UNITS,
             Self::Milliseconds => &MILLISECOND_UNITS,
         }
     }
@@ -2990,6 +3082,7 @@ impl SettingUnit {
         match self {
             Self::None => "",
             Self::Kilobytes => " kB",
+            Self::Blocks => " 8kB",
             Self::Milliseconds => " ms",
         }
     }
@@ -2997,7 +3090,7 @@ impl SettingUnit {
     fn hint(self) -> &'static str {
         match self {
             Self::None => "",
-            Self::Kilobytes => {
+            Self::Kilobytes | Self::Blocks => {
                 "Valid units for this parameter are \"B\", \"kB\", \"MB\", \"GB\", and \"TB\"."
             }
             Self::Milliseconds => {
@@ -3228,6 +3321,76 @@ fn int_setting(name: &str) -> Option<IntSetting> {
     ]
     .into_iter()
     .find(|setting| setting.name.eq_ignore_ascii_case(name))
+    .or_else(|| {
+        planner::PLANNER_SETTINGS
+            .iter()
+            .find_map(|setting| match setting.kind {
+                planner::PlannerKind::Int(int, _) if int.name.eq_ignore_ascii_case(name) => {
+                    Some(int)
+                }
+                _ => None,
+            })
+    })
+}
+
+/// `pg_settings`' type, category, description, boot value, bounds and enum
+/// names for a planner setting.
+pub(crate) struct PlannerSettingMetadata {
+    pub(crate) vartype: &'static str,
+    pub(crate) category: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) boot: StackStr<32>,
+    pub(crate) bounds: Option<(StackStr<32>, StackStr<32>)>,
+    pub(crate) enum_names: &'static [&'static str],
+}
+
+pub(crate) fn planner_setting_metadata(name: &str) -> Option<PlannerSettingMetadata> {
+    let index = planner::planner_index(name)?;
+    let setting = planner::PLANNER_SETTINGS[index];
+    let boot_value = planner::PlannerValues::DEFAULTS.0[index];
+    let (boot, bounds, enum_names) = match setting.kind {
+        planner::PlannerKind::Int(int, default) => (
+            crate::stack_format!(32, "{default}"),
+            Some((
+                crate::stack_format!(32, "{}", int.min),
+                crate::stack_format!(32, "{}", int.max),
+            )),
+            &[][..],
+        ),
+        planner::PlannerKind::Real { min, max, .. } => (
+            planner::show(index, boot_value),
+            Some((format_g(min), format_g(max))),
+            &[][..],
+        ),
+        planner::PlannerKind::Enum(_, names) => (planner::show(index, boot_value), None, names),
+        planner::PlannerKind::Bool(_) => (planner::show(index, boot_value), None, &[][..]),
+    };
+    Some(PlannerSettingMetadata {
+        vartype: setting.kind.vartype(),
+        category: setting.category,
+        description: setting.description,
+        boot,
+        bounds,
+        enum_names,
+    })
+}
+
+/// The plan methods the active session allows; PostgreSQL's defaults
+/// outside a session (background work runs with them).
+pub(crate) fn planner_methods() -> PlannerMethods {
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return PlannerMethods::DEFAULT;
+        }
+        // SAFETY: `enter_eval_scope` owns the pointer's dynamic extent.
+        unsafe { &*pointer }
+            .store
+            .borrow()
+            .current
+            .planner
+            .methods()
+    })
 }
 
 // PostgreSQL escapes each non-printable UTF-8 byte, preserving ASCII backslashes.

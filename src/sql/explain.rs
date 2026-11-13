@@ -62,6 +62,45 @@ struct PlanNode {
     /// The node's qualifications in PostgreSQL's display order; unused
     /// entries are labelled `QualLabel::None`.
     quals: [(QualLabel, StackStr<512>); 3],
+    keys: PlanKeys,
+}
+
+/// A node's `Sort Key` or `Group Key` items, separated by
+/// [`KEY_SEPARATOR`]: as printed without `VERBOSE` (columns qualified only
+/// when the query reads several relations) and as printed with it.
+#[derive(Clone, Copy)]
+struct PlanKeys {
+    label: KeyLabel,
+    plain: StackStr<256>,
+    verbose: StackStr<256>,
+}
+
+const KEY_SEPARATOR: char = '\u{1f}';
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyLabel {
+    None,
+    Sort,
+    Group,
+}
+
+impl PlanKeys {
+    const NONE: Self = Self {
+        label: KeyLabel::None,
+        plain: StackStr::new(),
+        verbose: StackStr::new(),
+    };
+
+    /// The label and items to print, if any.
+    fn shown(&self, verbose: bool) -> Option<(&'static str, impl Iterator<Item = &str>)> {
+        let label = match self.label {
+            KeyLabel::None => return None,
+            KeyLabel::Sort => "Sort Key",
+            KeyLabel::Group => "Group Key",
+        };
+        let keys = if verbose { &self.verbose } else { &self.plain };
+        Some((label, keys.as_str().split(KEY_SEPARATOR)))
+    }
 }
 
 const NO_QUALS: [(QualLabel, StackStr<512>); 3] = [(QualLabel::None, StackStr::new()); 3];
@@ -149,6 +188,7 @@ impl PlanNode {
         cache_blocks: 0,
         constant_false: false,
         quals: NO_QUALS,
+        keys: PlanKeys::NONE,
     };
 }
 
@@ -167,6 +207,9 @@ pub(super) struct Plan<'a> {
     nodes: &'a mut [PlanNode],
     count: usize,
     planning_micros: u64,
+    /// The plan methods enabled while planning, which mark nodes that had
+    /// to use a disabled one.
+    methods: crate::sql::guc::PlannerMethods,
 }
 
 impl<'a> Plan<'a> {
@@ -178,7 +221,34 @@ impl<'a> Plan<'a> {
             nodes,
             count: 0,
             planning_micros: 0,
+            methods: crate::sql::guc::planner_methods(),
         })
+    }
+
+    /// Whether `node` runs a plan method the session disabled, which
+    /// PostgreSQL 18 reports as `Disabled: true`.
+    fn disabled(&self, node: &PlanNode) -> bool {
+        let methods = self.methods;
+        let name = node.name.as_str();
+        if name == "Seq Scan" {
+            !methods.seqscan
+        } else if name.starts_with("Index Only Scan") {
+            !methods.indexonlyscan
+        } else if name.starts_with("Index Scan") {
+            !methods.indexscan
+        } else if name == "Bitmap Heap Scan" {
+            !methods.bitmapscan
+        } else if name.starts_with("Nested Loop") {
+            !methods.nestloop
+        } else if name.starts_with("Hash") && name.ends_with("Join") {
+            !methods.hashjoin
+        } else if name == "Sort" {
+            !methods.sort
+        } else if name == "HashAggregate" {
+            !methods.hashagg
+        } else {
+            false
+        }
     }
 
     fn push(&mut self, node: PlanNode) -> Result<(), SqlError> {
@@ -1823,41 +1893,16 @@ fn scan_node<'a>(
     let index_identity = ordered
         .map(|ordered| (ordered.access(), ordered.index_name()))
         .or_else(|| index_plan.map(|plan| (plan, plan.index_name())));
-    let resident_index = index_identity.is_some_and(|(plan, _)| {
-        !matches!(
-            plan.method(),
-            crate::sql::ast::IndexAccessMethod::Brin
-                | crate::sql::ast::IndexAccessMethod::Gist
-                | crate::sql::ast::IndexAccessMethod::Gin
-                | crate::sql::ast::IndexAccessMethod::SpGist
-        ) && plan.is_exact()
-            && storage.value_binding_cache_complete(slot, plan.binding())
+    let use_index = index_identity.is_some_and(|(plan, _)| {
+        !derived
+            && plan.chosen_for_scan(
+                storage,
+                slot,
+                scope.defs.stored(table).expect("base table"),
+                txid,
+                ordered.is_some(),
+            )
     });
-    let selective_brin = index_identity.is_some_and(|(plan, _)| {
-        plan.method() == crate::sql::ast::IndexAccessMethod::Brin
-            && index_rows.saturating_mul(8) <= rows
-    });
-    let selective_gist = index_identity.is_some_and(|(plan, _)| {
-        plan.method() == crate::sql::ast::IndexAccessMethod::Gist
-            && index_rows.saturating_mul(4) <= rows
-    });
-    let selective_gin = index_identity.is_some_and(|(plan, _)| {
-        plan.method() == crate::sql::ast::IndexAccessMethod::Gin
-            && index_rows.saturating_mul(4) <= rows
-    });
-    let selective_spgist = index_identity.is_some_and(|(plan, _)| {
-        plan.method() == crate::sql::ast::IndexAccessMethod::SpGist
-            && index_rows.saturating_mul(4) <= rows
-    });
-    let use_index = ordered.is_some()
-        || index_identity.is_some()
-            && (resident_index
-                || selective_brin
-                || selective_gist
-                || selective_gin
-                || selective_spgist
-                || (generations != 0
-                    && !storage.sequential_spill_scan_is_cheaper(slot, index_rows, txid)));
     let blocks = if use_index {
         // One bounded key-generation descent per immutable generation, then
         // only the row blocks expected to survive the predicate.
@@ -1929,6 +1974,7 @@ fn scan_node<'a>(
         cache_blocks,
         constant_false: false,
         quals: NO_QUALS,
+        keys: PlanKeys::NONE,
     };
     let used = index_identity
         .filter(|_| use_index)
@@ -1943,6 +1989,9 @@ pub(super) fn plan_select<'a>(
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
     let started = std::time::Instant::now();
+    // Execution plans the same query: simple subqueries merged into it and
+    // outer joins its conditions narrow reduced.
+    let statement = query::pull_up_subqueries(statement, storage, txid, arena, None)?;
     let scope = match &statement.from {
         Some(from) => Some(QueryScope::resolve_schema(
             storage, from, txid, arena, None,
@@ -2183,6 +2232,19 @@ pub(super) fn plan_select<'a>(
                 } else {
                     "HashAggregate"
                 }),
+                keys: match group_keys(statement, arena)?.filter(|_| !statement.group_by.is_empty())
+                {
+                    Some(keys) => plan_keys(
+                        storage,
+                        txid,
+                        scope.as_ref(),
+                        statement,
+                        KeyLabel::Group,
+                        keys,
+                        arena,
+                    )?,
+                    None => PlanKeys::NONE,
+                },
                 total_cost,
                 rows: estimated_rows,
                 width,
@@ -2215,6 +2277,15 @@ pub(super) fn plan_select<'a>(
             &mut stage_count,
             PlanNode {
                 name: StackStr::from_str("Sort"),
+                keys: plan_keys(
+                    storage,
+                    txid,
+                    scope.as_ref(),
+                    statement,
+                    KeyLabel::Sort,
+                    order_keys(statement, arena)?,
+                    arena,
+                )?,
                 total_cost,
                 rows: estimated_rows,
                 width,
@@ -2230,8 +2301,31 @@ pub(super) fn plan_select<'a>(
         add_stage(
             &mut stages,
             &mut stage_count,
+            // Without an ordering PostgreSQL hashes the distinct rows.
             PlanNode {
-                name: StackStr::from_str("Unique"),
+                name: StackStr::from_str(
+                    if statement.order_by.is_empty() && statement.distinct_on.is_empty() {
+                        "HashAggregate"
+                    } else {
+                        "Unique"
+                    },
+                ),
+                keys: match group_keys(statement, arena)?.filter(|_| {
+                    statement.order_by.is_empty()
+                        && statement.distinct_on.is_empty()
+                        && statement.group_by.is_empty()
+                }) {
+                    Some(keys) => plan_keys(
+                        storage,
+                        txid,
+                        scope.as_ref(),
+                        statement,
+                        KeyLabel::Group,
+                        keys,
+                        arena,
+                    )?,
+                    None => PlanKeys::NONE,
+                },
                 total_cost,
                 rows: estimated_rows,
                 width,
@@ -2443,7 +2537,8 @@ pub(super) fn plan_select<'a>(
                 ordered_index_only,
             )?;
             scan.output = output;
-            let sequential = scan.name.as_str() == "Seq Scan";
+            let sequential =
+                scan.name.as_str() == "Seq Scan" && crate::sql::guc::planner_methods().material;
             scan = scan
                 .with_qual(QualLabel::IndexCond, index_conds[table].take())
                 .with_qual(QualLabel::Filter, filters[table].take());
@@ -2473,8 +2568,313 @@ pub(super) fn plan_select<'a>(
             push_scan(&mut plan, scan)?;
         }
     }
+    // PostgreSQL pulls a derived `VALUES` list into the query and scans it
+    // as `*VALUES*`.
+    if let (Some(from), Some(scope)) = (statement.from.as_ref(), scope.as_ref()) {
+        let items = core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
+        for (table, item) in items.enumerate().take(scope.n) {
+            let Some(tree) = item.subquery.and_then(values_list) else {
+                continue;
+            };
+            for at in 0..plan.count {
+                let node = plan.nodes[at];
+                if node.name.as_str() == "Subquery Scan"
+                    && node.relation.as_str().is_empty()
+                    && node.alias.as_str() == scope.names[table]
+                {
+                    let values = values_scan(&plan, tree, node.depth);
+                    plan.nodes[at] = PlanNode {
+                        name: values.name,
+                        alias: values.alias,
+                        ..node
+                    };
+                }
+            }
+        }
+        let mut plan = plan;
+        let items = core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
+        for (table, item) in items.enumerate().take(scope.n) {
+            let Some(body) = item.subquery.filter(|body| values_list(body).is_none()) else {
+                continue;
+            };
+            let passes_through = from.joins.is_empty()
+                && statement
+                    .items
+                    .iter()
+                    .all(|item| matches!(item, SelectItem::Wildcard(_)));
+            plan = with_derived_plan(
+                plan,
+                scope.names[table],
+                passes_through,
+                plan_derived(storage, txid, body, arena)?,
+                arena,
+            )?;
+        }
+        plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        return Ok(plan);
+    }
     plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
     Ok(plan)
+}
+
+/// The plan of a derived table's own query.
+fn plan_derived<'a>(
+    storage: &Storage,
+    txid: u32,
+    body: &Select<'_>,
+    arena: &'a Arena,
+) -> Result<Plan<'a>, SqlError> {
+    match body.set_body {
+        Some(tree) => plan_set_query(
+            storage,
+            txid,
+            &SetQuery {
+                with: body.with,
+                body: query::expand_set_tree(body.with, tree, storage, txid, None, None, arena)?,
+                order_by: body.order_by,
+                limit: body.limit,
+                offset: body.offset,
+                with_ties: body.with_ties,
+                locking: body.locking,
+            },
+            arena,
+        ),
+        None if body.with.is_empty() => plan_select(storage, txid, body, arena),
+        None => plan_select(
+            storage,
+            txid,
+            query::expand_ctes(body, storage, txid, arena)?,
+            arena,
+        ),
+    }
+}
+
+/// `plan` with `derived`, the plan of the derived table exposed as `name`,
+/// under its `Subquery Scan`. PostgreSQL drops a scan that neither filters
+/// nor reshapes the rows (`SELECT * FROM (...) s`) and runs the derived
+/// plan in its place.
+fn with_derived_plan<'a>(
+    plan: Plan<'a>,
+    name: &str,
+    passes_through: bool,
+    derived: Plan<'_>,
+    arena: &'a Arena,
+) -> Result<Plan<'a>, SqlError> {
+    let Some(at) = plan.nodes[..plan.count].iter().position(|node| {
+        node.name.as_str() == "Subquery Scan"
+            && node.relation.as_str().is_empty()
+            && node.alias.as_str() == name
+    }) else {
+        return Ok(plan);
+    };
+    let scan = plan.nodes[at];
+    let replaced = passes_through && scan.qualifications().next().is_none();
+    let mut expanded = Plan::new(arena, plan.count + derived.count)?;
+    expanded.methods = plan.methods;
+    for node in &plan.nodes[..at] {
+        expanded.push(*node)?;
+    }
+    let depth = if replaced {
+        scan.depth
+    } else {
+        expanded.push(scan)?;
+        scan.depth + 1
+    };
+    for node in &derived.nodes[..derived.count] {
+        expanded.push(PlanNode {
+            depth: node.depth.saturating_add(depth),
+            ..*node
+        })?;
+    }
+    for node in &plan.nodes[at + 1..plan.count] {
+        expanded.push(*node)?;
+    }
+    Ok(expanded)
+}
+
+/// One `Sort Key` or `Group Key` item: an expression and, for a sort, its
+/// direction and NULLS placement.
+type KeyItem<'e> = (&'e Expr<'e>, Option<(bool, bool)>);
+
+/// PostgreSQL's key list for `keys` of `statement`: an output-column
+/// position (or, for `ORDER BY`, an output name) stands for that column's
+/// expression; a column prints bare and any other expression in
+/// parentheses, followed by a sort's `DESC` and non-default `NULLS`
+/// placement. No keys when a key reads something other than stored tables.
+fn plan_keys(
+    storage: &Storage,
+    txid: u32,
+    scope: Option<&QueryScope<'_>>,
+    statement: &Select<'_>,
+    label: KeyLabel,
+    keys: &[KeyItem<'_>],
+    arena: &Arena,
+) -> Result<PlanKeys, SqlError> {
+    let Some(scope) = scope else {
+        return Ok(PlanKeys::NONE);
+    };
+    if keys.is_empty() || (0..scope.n).any(|table| scope.defs.stored(table).is_none()) {
+        return Ok(PlanKeys::NONE);
+    }
+    let joined = arena
+        .alloc_slice_with(scope.n, |table| {
+            crate::sql::catalog::deparse::Joined::new(
+                scope.names[table],
+                scope.defs.stored(table).expect("stored relation"),
+            )
+        })
+        .map_err(|_| arena_full())?;
+    let mut shown = PlanKeys {
+        label,
+        ..PlanKeys::NONE
+    };
+    for (verbose, text) in [(false, &mut shown.plain), (true, &mut shown.verbose)] {
+        let context = crate::sql::catalog::deparse::Context {
+            storage,
+            txid,
+            table: None,
+            parameters: &[],
+            joined,
+            pretty: false,
+            qualify: verbose || scope.n > 1,
+            bare: None,
+        };
+        for (index, &(key, order)) in keys.iter().enumerate() {
+            let expression = match key {
+                Expr::Int(position) => match usize::try_from(*position)
+                    .ok()
+                    .and_then(|position| statement.items.get(position.checked_sub(1)?))
+                {
+                    Some(SelectItem::Expr { expression, .. }) => *expression,
+                    _ => return Ok(PlanKeys::NONE),
+                },
+                Expr::Column {
+                    qualifier: None,
+                    name,
+                } if order.is_some() => statement
+                    .items
+                    .iter()
+                    .find_map(|item| match item {
+                        SelectItem::Expr {
+                            expression,
+                            alias: Some(alias),
+                        } if alias == name => Some(*expression),
+                        _ => None,
+                    })
+                    .unwrap_or(key),
+                _ => key,
+            };
+            let mark = arena.mark();
+            let part = crate::sql::catalog::deparse::deparse_expression(
+                &context,
+                expression,
+                crate::sql::catalog::deparse::Destination::Value,
+                arena,
+            );
+            let written = part.map(|part| {
+                part.map(|part| {
+                    if index != 0 {
+                        let _ = text.write_char(KEY_SEPARATOR);
+                    }
+                    if matches!(expression, Expr::Column { .. }) {
+                        let _ = write!(text, "{part}");
+                    } else {
+                        let _ = write!(text, "({part})");
+                    }
+                })
+                .is_some()
+            });
+            // SAFETY: the text was copied out of the arena.
+            unsafe { arena.rewind_to(mark) };
+            if !written? {
+                return Ok(PlanKeys::NONE);
+            }
+            if let Some((descending, nulls_first)) = order {
+                if descending {
+                    let _ = write!(text, " DESC");
+                }
+                match (descending, nulls_first) {
+                    (false, true) => {
+                        let _ = write!(text, " NULLS FIRST");
+                    }
+                    (true, false) => {
+                        let _ = write!(text, " NULLS LAST");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if text.is_truncated() {
+            return Ok(PlanKeys::NONE);
+        }
+    }
+    Ok(shown)
+}
+
+/// `statement`'s `ORDER BY` as key items.
+fn order_keys<'e>(statement: &Select<'e>, arena: &'e Arena) -> Result<&'e [KeyItem<'e>], SqlError> {
+    arena
+        .alloc_slice_with(statement.order_by.len(), |index| {
+            let order = statement.order_by[index];
+            (
+                order.expression,
+                Some((order.descending, order.nulls_first)),
+            )
+        })
+        .map(|keys| &*keys)
+        .map_err(|_| arena_full())
+}
+
+/// `statement`'s `GROUP BY`, or for `SELECT DISTINCT` its output columns, as
+/// key items. None when an output column is a wildcard.
+fn group_keys<'e>(
+    statement: &Select<'e>,
+    arena: &'e Arena,
+) -> Result<Option<&'e [KeyItem<'e>]>, SqlError> {
+    if !statement.group_by.is_empty() {
+        return arena
+            .alloc_slice_with(statement.group_by.len(), |index| {
+                (statement.group_by[index], None)
+            })
+            .map(|keys| Some(&*keys))
+            .map_err(|_| arena_full());
+    }
+    if statement
+        .items
+        .iter()
+        .any(|item| !matches!(item, SelectItem::Expr { .. }))
+    {
+        return Ok(None);
+    }
+    arena
+        .alloc_slice_with(statement.items.len(), |index| {
+            match statement.items[index] {
+                SelectItem::Expr { expression, .. } => (expression, None),
+                // Checked above: every output column is an expression.
+                _ => (&Expr::Null, None),
+            }
+        })
+        .map(|keys| Some(&*keys))
+        .map_err(|_| arena_full())
+}
+
+/// The `VALUES` list of several rows `select` consists of, if it is one.
+fn values_list<'s>(select: &'s Select<'s>) -> Option<&'s SetTree<'s>> {
+    let tree = select.set_body?;
+    let plain = select.order_by.is_empty()
+        && select.limit.is_none()
+        && select.offset.is_none()
+        && select.with.is_empty();
+    (plain
+        && matches!(
+            tree,
+            SetTree::Op {
+                syntax: crate::sql::ast::SetOperationSyntax::Values,
+                ..
+            }
+        )
+        && values_rows(tree).is_some())
+    .then_some(tree)
 }
 
 /// PostgreSQL's name of a join node executing a join of `kind` (the last
@@ -2573,6 +2973,7 @@ fn physical_scan_node(
         cache_blocks,
         constant_false: false,
         quals: NO_QUALS,
+        keys: PlanKeys::NONE,
     }
 }
 
@@ -2585,6 +2986,14 @@ fn push_set_tree(
     depth: u8,
 ) -> Result<PlanNode, SqlError> {
     match tree {
+        SetTree::Op {
+            syntax: crate::sql::ast::SetOperationSyntax::Values,
+            ..
+        } => {
+            let node = values_scan(plan, tree, depth);
+            plan.push(node)?;
+            Ok(node)
+        }
         SetTree::Select(select) => {
             let leaf = plan_select(storage, txid, select, arena)?;
             let root = leaf.nodes[0];
@@ -2635,11 +3044,128 @@ fn push_set_tree(
                 cache_blocks: left.cache_blocks.saturating_add(right.cache_blocks),
                 constant_false: false,
                 quals: NO_QUALS,
+                keys: PlanKeys::NONE,
             };
             plan.nodes[at] = node;
             Ok(node)
         }
     }
+}
+
+/// The rows of a `VALUES` list of several rows, which the parser keeps as a
+/// `UNION ALL` chain marked as `VALUES`.
+fn values_rows(tree: &SetTree<'_>) -> Option<(u64, usize)> {
+    match tree {
+        SetTree::Select(select) => Some((1, select.items.len())),
+        SetTree::Op {
+            syntax: crate::sql::ast::SetOperationSyntax::Values,
+            left,
+            right,
+            ..
+        } => {
+            let (left_rows, width) = values_rows(left)?;
+            let (right_rows, _) = values_rows(right)?;
+            Some((left_rows + right_rows, width))
+        }
+        SetTree::Op { .. } => None,
+    }
+}
+
+/// PostgreSQL's `Values Scan` of a `VALUES` list of several rows. Its range
+/// table entry is `*VALUES*`; later lists in the same plan get a numeric
+/// suffix (`*VALUES*_1`).
+fn values_scan(plan: &Plan<'_>, tree: &SetTree<'_>, depth: u8) -> PlanNode {
+    let (rows, columns) = values_rows(tree).unwrap_or((1, 0));
+    let earlier = plan.nodes[..plan.count]
+        .iter()
+        .filter(|node| node.name.as_str() == "Values Scan")
+        .count();
+    let mut alias = StackStr::new();
+    if earlier == 0 {
+        let _ = write!(alias, "*VALUES*");
+    } else {
+        let _ = write!(alias, "*VALUES*_{earlier}");
+    }
+    let mut output = StackStr::new();
+    for column in 1..=columns {
+        let _ = write!(
+            output,
+            "{}column{column}",
+            if column == 1 { "" } else { ", " }
+        );
+    }
+    PlanNode {
+        name: StackStr::from_str("Values Scan"),
+        alias,
+        output,
+        depth,
+        total_cost: rows as f64 * 0.0125,
+        rows,
+        width: 4 * columns as u32,
+        ..PlanNode::EMPTY
+    }
+}
+
+/// A set operation's `Sort Key`: its result columns, named as its first
+/// branch names them. No keys for an ordering by an expression.
+fn set_sort_keys(query: &SetQuery<'_>) -> PlanKeys {
+    let mut first = query.body;
+    while let SetTree::Op { left, .. } = first {
+        first = left;
+    }
+    let SetTree::Select(branch) = first else {
+        return PlanKeys::NONE;
+    };
+    let column_name = |position: usize| match branch.items.get(position)? {
+        SelectItem::Expr {
+            alias: Some(alias), ..
+        } => Some(*alias),
+        SelectItem::Expr {
+            expression: Expr::Column { name, .. },
+            alias: None,
+        } => Some(*name),
+        _ => None,
+    };
+    let mut keys = PlanKeys {
+        label: KeyLabel::Sort,
+        ..PlanKeys::NONE
+    };
+    for (index, order) in query.order_by.iter().enumerate() {
+        let name = match order.expression {
+            Expr::Int(position) => usize::try_from(*position)
+                .ok()
+                .and_then(|position| column_name(position.checked_sub(1)?)),
+            Expr::Column {
+                qualifier: None,
+                name,
+            } => Some(*name),
+            _ => None,
+        };
+        let Some(name) = name else {
+            return PlanKeys::NONE;
+        };
+        if index != 0 {
+            let _ = keys.plain.write_char(KEY_SEPARATOR);
+        }
+        crate::sql::catalog::write_identifier(&mut keys.plain, name);
+        if order.descending {
+            let _ = write!(keys.plain, " DESC");
+        }
+        match (order.descending, order.nulls_first) {
+            (false, true) => {
+                let _ = write!(keys.plain, " NULLS FIRST");
+            }
+            (true, false) => {
+                let _ = write!(keys.plain, " NULLS LAST");
+            }
+            _ => {}
+        }
+    }
+    keys.verbose = keys.plain;
+    if keys.plain.is_truncated() {
+        return PlanKeys::NONE;
+    }
+    keys
 }
 
 pub(super) fn plan_set_query<'a>(
@@ -2692,6 +3218,9 @@ pub(super) fn plan_set_query<'a>(
         node.object_requests = child.object_requests;
         node.cache_blocks = child.cache_blocks;
         node.output = child.output;
+        if node.name.as_str() == "Sort" {
+            node.keys = set_sort_keys(query);
+        }
         plan.nodes[at] = node;
         child = node;
     }
@@ -2790,6 +3319,7 @@ pub(super) fn plan_modification<'a>(
         cache_blocks: 0,
         constant_false: false,
         quals: NO_QUALS,
+        keys: PlanKeys::NONE,
     };
     plan.push(target_node)?;
     if let Some(from) = joined_from {
@@ -3008,7 +3538,8 @@ pub(super) fn plan_modification<'a>(
         for (position, &table) in order[..scope.n].iter().enumerate() {
             let mut node =
                 source_nodes[table].with_qual(QualLabel::Filter, filters[table + 1].take());
-            let sequential = node.name.as_str() == "Seq Scan";
+            let sequential =
+                node.name.as_str() == "Seq Scan" && crate::sql::guc::planner_methods().material;
             let hash = hash_at(position + 1);
             // A hash join hashes its inner relation; a nested loop rescans its
             // inner sequential scan from a materialized copy.
@@ -3087,31 +3618,7 @@ pub(super) fn plan_modification<'a>(
                 .flatten()
                 .map(|plan| (plan, plan.index_name()));
             let index = index.filter(|(plan, _)| {
-                let expected_rows =
-                    plan.expected_rows(storage, slot, &storage.table_def(slot, txid), txid);
-                let resident_exact = !matches!(
-                    plan.method(),
-                    crate::sql::ast::IndexAccessMethod::Brin
-                        | crate::sql::ast::IndexAccessMethod::Gist
-                        | crate::sql::ast::IndexAccessMethod::Gin
-                        | crate::sql::ast::IndexAccessMethod::SpGist
-                ) && plan.is_exact()
-                    && storage.value_binding_cache_complete(slot, plan.binding());
-                let selective_brin = plan.method() == crate::sql::ast::IndexAccessMethod::Brin
-                    && expected_rows.saturating_mul(8) <= storage.planning_row_estimate(slot);
-                let selective_gist = plan.method() == crate::sql::ast::IndexAccessMethod::Gist
-                    && expected_rows.saturating_mul(4) <= storage.planning_row_estimate(slot);
-                let selective_gin = plan.method() == crate::sql::ast::IndexAccessMethod::Gin
-                    && expected_rows.saturating_mul(4) <= storage.planning_row_estimate(slot);
-                let selective_spgist = plan.method() == crate::sql::ast::IndexAccessMethod::SpGist
-                    && expected_rows.saturating_mul(4) <= storage.planning_row_estimate(slot);
-                resident_exact
-                    || selective_brin
-                    || selective_gist
-                    || selective_gin
-                    || selective_spgist
-                    || (storage.spill_generation_count(slot) != 0
-                        && !storage.sequential_spill_scan_is_cheaper(slot, expected_rows, txid))
+                plan.chosen_for_scan(storage, slot, &storage.table_def(slot, txid), txid, false)
             });
             let index_name = index.as_ref().map(|(plan, name)| {
                 (
@@ -3240,6 +3747,14 @@ pub(super) fn visit_text_rows<E>(
     for (index, node) in plan.nodes[..plan.count].iter().enumerate() {
         let line = text_line(node, options, actual, index == 0);
         emit(line.as_str())?;
+        if plan.disabled(node) {
+            let mut disabled = StackStr::<512>::new();
+            for _ in 0..property_indent(node.depth) {
+                let _ = write!(disabled, " ");
+            }
+            let _ = write!(disabled, "Disabled: true");
+            emit(disabled.as_str())?;
+        }
         if options.verbose && !node.output.as_str().is_empty() {
             let mut output = StackStr::<512>::new();
             for _ in 0..property_indent(node.depth) {
@@ -3247,6 +3762,17 @@ pub(super) fn visit_text_rows<E>(
             }
             let _ = write!(output, "Output: {}", node.output.as_str());
             emit(output.as_str())?;
+        }
+        if let Some((label, mut keys)) = node.keys.shown(options.verbose) {
+            let mut line = StackStr::<2048>::new();
+            for _ in 0..property_indent(node.depth) {
+                let _ = write!(line, " ");
+            }
+            let _ = write!(line, "{label}: {}", keys.next().unwrap_or_default());
+            for key in keys {
+                let _ = write!(line, ", {key}");
+            }
+            emit(line.as_str())?;
         }
         for (label, text) in node.qualifications() {
             let mut qual = StackStr::<2048>::new();
@@ -3294,7 +3820,8 @@ pub(super) fn visit_text_rows<E>(
         }
     }
     if options.settings && !settings.entries().is_empty() {
-        let mut line = StackStr::<512>::new();
+        // Holds every reported setting at its longest shown value.
+        let mut line = StackStr::<4096>::new();
         let _ = write!(line, "Settings: ");
         for (index, setting) in settings.entries().iter().enumerate() {
             if index != 0 {
@@ -3918,12 +4445,15 @@ fn structured_node(
         );
         document.number("Actual Loops", 1);
     }
-    document.boolean("Disabled", false);
+    document.boolean("Disabled", plan.disabled(node));
     if options.verbose && !node.output.as_str().is_empty() {
         document.list("Output", node.output.as_str().split(", "));
     }
     if kind.join_type.is_some() {
         document.boolean("Inner Unique", false);
+    }
+    if let Some((label, keys)) = node.keys.shown(options.verbose) {
+        document.list(label, keys);
     }
     if node.constant_false {
         document.text("One-Time Filter", "false");

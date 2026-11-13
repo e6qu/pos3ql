@@ -461,6 +461,38 @@ mod callable_contract_tests {
     }
 }
 
+/// Whether every built-in function named `name` taking `argument_count`
+/// arguments is strict, so a call of it returns NULL for a NULL argument
+/// whichever overload it resolves to. False when there is none.
+pub(crate) fn builtin_overloads_strict(
+    storage: &Storage,
+    txid: u32,
+    name: &str,
+    argument_count: usize,
+) -> bool {
+    let first = builtin_properties::ROUTINES.partition_point(|routine| routine.name < name);
+    let mut any = false;
+    for routine in builtin_properties::ROUTINES[first..]
+        .iter()
+        .take_while(|routine| routine.name == name)
+        .filter(|routine| routine.argument_count == argument_count)
+    {
+        let Some(oid) = crate::storage::BuiltinRoutineOid::parse(routine.oid) else {
+            return false;
+        };
+        if !storage
+            .builtin_routine_state(oid, txid)
+            .attributes
+            .attributes
+            .strict
+        {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
 const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     // PostgreSQL 18.6 pg_proc.dat: both operands share the anyarray type.
     // https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_proc.dat
@@ -32383,7 +32415,12 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         };
         let (reset_value, source) = crate::sql::eval::funcs::system::session_setting_metadata(name)
             .unwrap_or((value, "default"));
+        let planner = crate::sql::guc::planner_setting_metadata(name);
         let (boot, vartype, context, unit) = metadata(name);
+        let (boot, vartype) = match &planner {
+            Some(planner) => (planner.boot.as_str(), planner.vartype),
+            None => (boot, vartype),
+        };
         let base_value = |shown: &str| {
             crate::sql::guc::int_setting_base_value(name, shown).map_or_else(
                 || crate::util::StackStr::<256>::from_str(shown),
@@ -32405,9 +32442,13 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                     text(bounds[1].as_str(), arena)?,
                 )
             }
-            None => (Datum::Null, Datum::Null),
+            None => match planner.as_ref().and_then(|planner| planner.bounds) {
+                Some((min, max)) => (text(min.as_str(), arena)?, text(max.as_str(), arena)?),
+                None => (Datum::Null, Datum::Null),
+            },
         };
         let enum_names: &[&str] = match name {
+            _ if planner.is_some() => planner.as_ref().map_or(&[], |planner| planner.enum_names),
             "track_functions" => &["none", "pl", "all"],
             "plpgsql.variable_conflict" => &crate::sql::guc::VariableConflict::NAMES,
             _ => &[],
@@ -32416,6 +32457,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             Datum::Null
         } else {
             let mut values = [Datum::Null; 3];
+            debug_assert!(enum_names.len() <= values.len());
             for (value, name) in values.iter_mut().zip(enum_names) {
                 *value = text(name, arena)?;
             }
@@ -32435,6 +32477,9 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 },
                 text(
                     match name {
+                        _ if planner.is_some() => {
+                            planner.as_ref().map_or("", |planner| planner.category)
+                        }
                         "track_functions" => "Statistics / Monitoring",
                         "plpgsql.variable_conflict" | "plpgsql.print_strict_params" => {
                             "Customized Options"
@@ -32446,6 +32491,9 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 )?,
                 text(
                     match name {
+                        _ if planner.is_some() => {
+                            planner.as_ref().map_or("", |planner| planner.description)
+                        }
                         "plpgsql.variable_conflict" => {
                             "Sets handling of conflicts between PL/pgSQL variable names and table column names."
                         }

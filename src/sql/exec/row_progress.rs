@@ -252,11 +252,16 @@ pub(crate) struct RowProgress {
     /// Where the statement's first attempt started: its `AFTER` triggers
     /// belong there, and a run from the start rolls back to it.
     start: Option<(StatementMark, crate::pg::overflow::OutputMark)>,
-    /// A data-modifying `WITH` query's step: the changed-row count at which
-    /// a row's start ends the attempt, the step having returned its row.
+    /// The step of a data-modifying `INSERT ... VALUES` query: the
+    /// changed-row count at which a row's start ends the attempt, the step
+    /// having returned its row.
     produce_until: Option<u64>,
-    /// The attempt ended at a row's start for that reason.
+    /// The attempt ended at the next row's start after the row it was given
+    /// or returned.
     produced: bool,
+    /// The source row given to the unfinished row, kept when its attempt
+    /// stops, so the row runs again with the same values.
+    source_row: Option<(usize, transition_rows::SavedTransitionRows)>,
 }
 
 impl RowProgress {
@@ -285,24 +290,80 @@ impl RowProgress {
             start: None,
             produce_until: None,
             produced: false,
+            source_row: None,
         })
     }
 
-    /// Makes this the progress of a data-modifying `WITH` query's step that
-    /// returns one row: the attempt ends at the start of the first row after
-    /// `changed` rows changed.
-    pub(crate) fn produce_until(&mut self, changed: u64) {
-        self.produce_until = Some(changed);
+    /// Makes an attempt of a data-modifying `INSERT ... VALUES` query's
+    /// step end at the start of the first row after `changed` rows changed,
+    /// or run to the end with `None`.
+    pub(crate) fn produce_until(&mut self, changed: Option<u64>) {
+        self.produce_until = changed;
     }
 
-    /// Whether this is a data-modifying `WITH` query's step returning one row.
-    pub(crate) fn producing(&self) -> bool {
-        self.produce_until.is_some()
+    /// Keeps the source values given to row `index` while it is unfinished.
+    pub(crate) fn keep_source_row(
+        &mut self,
+        index: usize,
+        values: &[Datum<'_>],
+        arena: &Arena,
+        pool: &std::sync::Arc<LeasePool>,
+    ) -> Result<(), SqlError> {
+        if self
+            .source_row
+            .as_ref()
+            .is_some_and(|(kept, _)| *kept == index)
+        {
+            return Ok(());
+        }
+        let mark = arena.mark();
+        let saved = encode_projected_pub(values, arena).and_then(|row| {
+            transition_rows::SavedTransitionRows::capture(
+                TransitionRows {
+                    old: core::slice::from_ref(&row),
+                    new: &[],
+                },
+                pool,
+            )
+        });
+        // SAFETY: the encoded row was copied into the saved owner.
+        unsafe { arena.rewind_to(mark) };
+        self.source_row = Some((index, saved?));
+        Ok(())
     }
 
-    /// The step runs its write to the end instead.
-    pub(crate) fn stop_producing(&mut self) {
-        self.produce_until = None;
+    /// Whether the source values of row `index` are kept.
+    pub(crate) fn keeps_source_row(&self, index: usize) -> bool {
+        self.source_row
+            .as_ref()
+            .is_some_and(|(kept, _)| *kept == index)
+    }
+
+    /// The source values kept for row `index`, decoded in `arena`.
+    pub(crate) fn kept_source_row<'out>(
+        &self,
+        index: usize,
+        arena: &'out Arena,
+    ) -> Result<Option<&'out [Datum<'out>]>, SqlError> {
+        let Some((_, saved)) = self.source_row.as_ref().filter(|(kept, _)| *kept == index) else {
+            return Ok(None);
+        };
+        let rows = saved.restore(arena)?;
+        let row = rows.old.first().ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a kept source row lost its values"
+            )
+        })?;
+        let row = arena
+            .alloc_slice_copy(row)
+            .map_err(|_| crate::sql::query::arena_full_pub())?;
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        let width = projected::decode_projected_row_into(row, arena, &mut values)?;
+        let values = arena
+            .alloc_slice_copy(&values[..width])
+            .map_err(|_| crate::sql::query::arena_full_pub())?;
+        Ok(Some(&*values))
     }
 
     /// A step's attempt starts at `mark`: a row an earlier step ended at
@@ -368,6 +429,26 @@ impl RowProgress {
         for level in self.steps.iter_mut() {
             level.running = false;
         }
+    }
+
+    /// Records the journal and lock positions of one attempt of a row the
+    /// engine writes on its own, inside the write's attempt.
+    pub(crate) fn begin_row_attempt(&mut self, wal: usize, lock: u64) {
+        self.journal = Some((wal, lock));
+        self.running = None;
+        self.produced = false;
+    }
+
+    /// A wait inside a data-modifying `WITH` query's step leaves the step's
+    /// own rows unfinished: the statement runs again from its first start,
+    /// where nothing of the step remains.
+    pub(crate) fn abandon_rows(&mut self) {
+        self.rows_resumable = false;
+    }
+
+    /// The row a resumed write continues at.
+    pub(crate) fn resume_index(&self) -> usize {
+        self.resume.as_ref().map_or(0, |resume| resume.start.index)
     }
 
     /// The error for a routine call that running after a rollback would
@@ -1249,7 +1330,7 @@ pub(super) fn start_row<'a>(
     progress.begin_row(index, row, changed, transitions, txn, responder)?;
     if progress.produce_until.is_some_and(|until| changed >= until) {
         // A data-modifying `WITH` query's step returned its row: its reader
-        // reads it before this row reads its source.
+        // reads it before this row runs.
         progress.produced = true;
         return Err(query::producer_yield());
     }
@@ -1273,6 +1354,27 @@ pub(super) fn end_rows(
     if !progress.produce_until.is_some_and(|until| changed >= until) {
         return Ok(());
     }
+    progress.begin_row(index, None, changed, transitions, txn, responder)?;
+    progress.produced = true;
+    Err(query::producer_yield())
+}
+
+/// After a row of an `INSERT ... SELECT` whose source the engine reads: the
+/// attempt ends at the next row's start, which a later call continues.
+pub(super) fn stop_after_row(
+    progress: Option<&mut RowProgress>,
+    index: usize,
+    changed: u64,
+    transitions: CaptureLengths,
+    txn: &TxnState,
+    responder: &Responder<'_>,
+) -> Result<(), SqlError> {
+    let Some(progress) = progress else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "a produced INSERT row has no write progress"
+        ));
+    };
     progress.begin_row(index, None, changed, transitions, txn, responder)?;
     progress.produced = true;
     Err(query::producer_yield())

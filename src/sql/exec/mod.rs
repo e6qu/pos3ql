@@ -20700,6 +20700,14 @@ static NO_TRIGGER_DML_COLUMNS: NoColumns = NoColumns;
 #[derive(Clone, Copy)]
 pub(crate) enum InsertSource<'a> {
     Statement,
+    /// One row of an `INSERT ... SELECT` whose source the engine reads:
+    /// rows before `index` were written by earlier calls, which kept their
+    /// progress. `Some` writes the row and stops at the next one's start;
+    /// `None` completes the statement after the last row.
+    Produced {
+        index: usize,
+        row: Option<&'a [Datum<'a>]>,
+    },
     MaterializedSelect {
         rows: &'a [&'a [u8]],
         assignments: AssignmentCasts<'a>,
@@ -81082,11 +81090,8 @@ fn open_streamed_source<'a>(
 
 /// Reads a streamed source's next row under the statement's snapshot, its
 /// output values detached into `arena`: `None` at the end. A row an earlier
-/// attempt wrote is only filtered (`evaluate` false); the rows the source
-/// reads are repeatable, so skipping such rows by count finds the
-/// unfinished one. Output calls run as the row is written, under the
-/// write's invocation log: a row that runs again replays them from where
-/// it started.
+/// attempt wrote is only filtered (`evaluate` false); the source reads
+/// repeatably, so skipping such rows by count finds the unfinished one.
 #[expect(
     clippy::too_many_arguments,
     reason = "a streamed source reads with the write's storage, snapshot and arenas"
@@ -81129,23 +81134,33 @@ fn next_streamed_row<'a>(
             continue;
         }
         let values = if evaluate {
+            let calls = super::query::active_invocation_position();
             let mut projected = crate::mem::arena::ArenaList::new(arena);
             for index in 0..reader.statement_items_len() {
-                let values = reader.evaluate_statement_item(
-                    index,
-                    storage,
-                    txid,
-                    arena,
-                    params,
-                    Some(sequences),
-                    None,
-                    arena,
-                )?;
+                let values = super::query::without_routine_invocations(|| {
+                    reader.evaluate_statement_item(
+                        index,
+                        storage,
+                        txid,
+                        arena,
+                        params,
+                        Some(sequences),
+                        None,
+                        arena,
+                    )
+                })?;
                 for value in values {
                     projected
                         .push(*value)
                         .map_err(|_| super::eval::arena_full())?;
                 }
+            }
+            if super::query::active_invocation_position() != calls {
+                // A source that reads repeatably calls no user routine.
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "a streamed INSERT source called a routine"
+                ));
             }
             Some(projected.as_slice())
         } else {
@@ -81191,16 +81206,18 @@ where
     }
     let assignment_casts = match source {
         InsertSource::MaterializedSelect { assignments, .. } => assignments,
-        InsertSource::Statement => match prepare_dml_assignment_casts(
-            &Stmt::Insert(*statement),
-            storage,
-            txn.txid,
-            arena,
-            transition,
-        ) {
-            Ok(casts) => casts,
-            Err(error) => return sql_fail(error),
-        },
+        InsertSource::Statement | InsertSource::Produced { .. } => {
+            match prepare_dml_assignment_casts(
+                &Stmt::Insert(*statement),
+                storage,
+                txn.txid,
+                arena,
+                transition,
+            ) {
+                Ok(casts) => casts,
+                Err(error) => return sql_fail(error),
+            }
+        }
     };
     let capturing = capture.is_some();
     let table_index = match resolve_dml_table(storage, &statement.table, txn.txid) {
@@ -81268,7 +81285,8 @@ where
         InsertSource::MaterializedSelect {
             deferred: Some(_), ..
         }
-        | InsertSource::Statement => match statement.select {
+        | InsertSource::Statement
+        | InsertSource::Produced { .. } => match statement.select {
             Some(select) => match prepare_insert_select_casts(
                 statement, select, storage, txn.txid, arena, transition,
             ) {
@@ -81551,28 +81569,23 @@ where
 
     // The source reads the table as of the statement's start, also when it
     // reads the table being inserted into, as in PostgreSQL. A source that
-    // the retained reader runs streams when the rows it reads are
-    // repeatable: it holds one source row at a time in a fixed block of the
-    // arena, and each row reads its source row and evaluates its output
-    // (calls included, when the write keeps row progress) before it is
-    // written. Any other source materializes its rows and their assignment
-    // conversions in the arena before writing, where exhaustion is the
-    // named `54000`; each emitted source row converts before the next row
-    // runs, so encoded values are typed.
+    // the retained reader runs and that reads repeatably streams: it holds
+    // one source row at a time in a fixed block of the arena, and each row
+    // reads its source row before it is written. (A source with calls that
+    // the engine reads row by row arrives as `InsertSource::Produced`.) Any
+    // other source materializes its rows and their assignment conversions in
+    // the arena before writing, where exhaustion is the named `54000`; each
+    // emitted source row converts before the next row runs, so encoded
+    // values are typed.
     if let Some(sel) = statement.select {
         let source_command = txn.command_id();
         let stream_mark = arena.mark();
         let mut stream = None;
-        let producing = progress
-            .as_deref()
-            .is_some_and(row_progress::RowProgress::producing);
         if matches!(source, InsertSource::Statement)
             && transition_relations.is_none()
-            && (!capturing || producing)
+            && !capturing
             && arena.remaining() >= 2 * STREAMED_SOURCE_BLOCK
-            && (super::query::select_reads_repeatably(sel, storage, txn.txid)
-                || progress.is_some()
-                    && super::query::select_streams_with_calls(sel, storage, txn.txid))
+            && super::query::select_reads_repeatably(sel, storage, txn.txid)
         {
             let opened = open_streamed_source(
                 sel,
@@ -81597,15 +81610,12 @@ where
                 unsafe { arena.rewind_to(stream_mark) };
             }
         }
-        if stream.is_none()
-            && let Some(progress) = progress.as_deref_mut()
-        {
-            // A materialized source runs its calls again in every step, so a
-            // data-modifying `WITH` query over one runs whole in one step.
-            progress.stop_producing();
-        }
         let deferred;
-        let (rows_bytes, count): (&[&[u8]], usize) = if stream.is_some() {
+        let produced = match source {
+            InsertSource::Produced { index, row } => Some((index, row)),
+            _ => None,
+        };
+        let (rows_bytes, count): (&[&[u8]], usize) = if stream.is_some() || produced.is_some() {
             deferred = None;
             (&[], 0)
         } else if let InsertSource::MaterializedSelect {
@@ -81685,9 +81695,9 @@ where
         // Row changes start here; a wait before them restarts the statement.
         row_progress::enter_rows(progress.as_deref_mut());
         let resumed = match progress.as_deref() {
-            Some(progress) => match progress
-                .resume_rows(|index| (stream.is_some() || index < count).then_some(None))
-            {
+            Some(progress) => match progress.resume_rows(|index| {
+                (stream.is_some() || produced.is_some() || index < count).then_some(None)
+            }) {
                 Ok(resumed) => resumed,
                 Err(error) => return sql_fail(error),
             },
@@ -81770,7 +81780,8 @@ where
                              responder: &mut Responder<'_>,
                              index: usize,
                              bytes: &'a [u8],
-                             mut stream: Option<&mut StreamedSource<'a>>|
+                             mut stream: Option<&mut StreamedSource<'a>>,
+                             given: Option<&'a [Datum<'a>]>|
          -> Outcome {
             {
                 let streaming = stream.is_some();
@@ -81860,6 +81871,23 @@ where
                             Ok(()) => inserted += 1,
                             Err(error) => return sql_fail(error),
                         }
+                        if given.is_some() {
+                            return match row_progress::stop_after_row(
+                                progress.as_deref_mut(),
+                                index + 1,
+                                inserted,
+                                row_progress::capture_lengths([
+                                    transition_capture.as_ref(),
+                                    conflict_transition_capture.as_ref(),
+                                    None,
+                                ]),
+                                txn,
+                                responder,
+                            ) {
+                                Ok(()) => sql_ok(),
+                                Err(error) => sql_fail(error),
+                            };
+                        }
                         return sql_ok();
                     }
                     Err(error) => return sql_fail(error),
@@ -81877,7 +81905,7 @@ where
                         Err(error) => return sql_fail(error),
                     }
                 } else {
-                    None
+                    given
                 };
                 // A streamed row converts here, inside its row: an
                 // assignment cast that calls a routine resumes at the row.
@@ -82036,12 +82064,54 @@ where
                     Err(error) => return sql_fail(error),
                 }
             }
+            if given.is_some() {
+                // The engine reads the next row after this one returns.
+                return match row_progress::stop_after_row(
+                    progress.as_deref_mut(),
+                    index + 1,
+                    inserted,
+                    row_progress::capture_lengths([
+                        transition_capture.as_ref(),
+                        conflict_transition_capture.as_ref(),
+                        None,
+                    ]),
+                    txn,
+                    responder,
+                ) {
+                    Ok(()) => sql_ok(),
+                    Err(error) => sql_fail(error),
+                };
+            }
             sql_ok()
         };
         let rows_outcome = match stream.as_mut() {
+            None if produced.is_some() => (|| -> Outcome {
+                let Some((index, row)) = produced else {
+                    return sql_ok();
+                };
+                if index != first_row {
+                    return sql_fail(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "a produced INSERT row does not continue its write"
+                    ));
+                }
+                let Some(row) = row else {
+                    return sql_ok();
+                };
+                write_row(
+                    storage,
+                    txn,
+                    services,
+                    responder,
+                    index,
+                    &[],
+                    None,
+                    Some(row),
+                )
+            })(),
             None => (|| -> Outcome {
                 for (index, bytes) in rows_bytes.iter().enumerate().skip(first_row) {
-                    match write_row(storage, txn, services, responder, index, bytes, None)? {
+                    match write_row(storage, txn, services, responder, index, bytes, None, None)? {
                         Ok(()) => {}
                         Err(error) => return sql_fail(error),
                     }
@@ -82088,6 +82158,7 @@ where
                         index,
                         &[],
                         Some(&mut *stream),
+                        None,
                     )? {
                         Ok(()) => {}
                         Err(error) => return sql_fail(error),

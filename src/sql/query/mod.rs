@@ -34,7 +34,7 @@ use invocation_results::{RoutineInvocationResult, RoutineResults};
 mod retained;
 pub(crate) use retained::{
     LockedRow, MAX_RETAINED_SOURCES, RetainedSelect, RetainedUse, StreamSource, set_query_select,
-    stream_query,
+    stream_query, union_all_leaves,
 };
 
 #[cfg(test)]
@@ -87,7 +87,9 @@ mod cte;
 mod view_write;
 pub(crate) use cte::captured_type_oid;
 pub(crate) use cte::{CteReader, dml_cte_runs_after, select_relations, set_query_relations};
-pub(crate) use cte::{select_reads_repeatably, select_streams_with_calls};
+pub(crate) use cte::{
+    select_calls_user_routines, select_reads_repeatably, select_streams_with_calls,
+};
 pub use view_write::{
     UpdatableView, ViewRewrite, ViewWrite, and_where, function_view_write_error,
     resolve_view_for_dml, view_column_is_updatable, view_is_auto_updatable,
@@ -1103,6 +1105,12 @@ pub(crate) struct WriteProducer {
     key: (usize, usize),
     /// Taken by the step that runs the query.
     progress: Option<super::exec::RowProgress>,
+    /// The reader of an `INSERT ... SELECT` source the engine drives, kept
+    /// between steps in a block of the statement arena's retained tail.
+    driven: Option<super::KeptDriven>,
+    /// The source rows the driven reader has read, so a reader opened again
+    /// (after its statement memory moved) skips them.
+    read: usize,
     rows: crate::mem::arena::RetainedList<ProducedRow>,
     /// The region of the step that found the query's end.
     end: Option<StepRegion>,
@@ -2199,6 +2207,8 @@ impl RoutineInvocationState {
             .push(WriteProducer {
                 key,
                 progress: None,
+                driven: None,
+                read: 0,
                 rows: crate::mem::arena::RetainedList::new(),
                 end: None,
             })
@@ -2267,6 +2277,28 @@ impl RoutineInvocationState {
     ) -> Result<(), SqlError> {
         self.producer_mut(key, |producer| {
             producer.progress = Some(progress);
+            Ok(())
+        })
+    }
+
+    /// Takes the driven reader of a query's step, with the source rows read.
+    pub(crate) fn take_producer_driven(
+        &self,
+        key: (usize, usize),
+    ) -> Result<(Option<super::KeptDriven>, usize), SqlError> {
+        self.producer_mut(key, |producer| Ok((producer.driven.take(), producer.read)))
+    }
+
+    /// Gives back the driven reader a step took.
+    pub(crate) fn return_producer_driven(
+        &self,
+        key: (usize, usize),
+        driven: Option<super::KeptDriven>,
+        read: usize,
+    ) -> Result<(), SqlError> {
+        self.producer_mut(key, |producer| {
+            producer.driven = driven;
+            producer.read = read;
             Ok(())
         })
     }

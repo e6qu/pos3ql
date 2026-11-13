@@ -26,6 +26,10 @@ pub(crate) enum RetainedUse {
 enum StatementUse {
     Handoff,
     WriteSource,
+    /// The source of an `INSERT ... SELECT` the engine reads row by row,
+    /// handing calls off on their row; it may read data-modifying `WITH`
+    /// queries as they run.
+    Driven,
 }
 use crate::storage::{
     CursorRow, MAX_COLUMNS, RowCursor, RowCursorBuffers, SpilledRowRepresentation, rowenc,
@@ -1628,7 +1632,7 @@ fn next_source_row<'a>(
 }
 
 /// Collects the queries of a set tree that is only explicit `UNION ALL`.
-fn union_all_leaves<'a>(
+pub(crate) fn union_all_leaves<'a>(
     tree: &'a crate::sql::ast::SetTree<'a>,
     leaves: &mut crate::mem::arena::ArenaList<'a, &'a Select<'a>>,
 ) -> Result<bool, SqlError> {
@@ -2849,6 +2853,27 @@ impl<'a> RetainedSelect<'a> {
         )
     }
 
+    /// A reader of an `INSERT ... SELECT` source the engine reads row by
+    /// row, whatever its calls.
+    pub(crate) fn open_driven_source(
+        storage: &Storage,
+        txid: u32,
+        statement: &'a Select<'a>,
+        params: &[Datum<'a>],
+        arena: &'a Arena,
+        responder: &mut Responder<'_>,
+    ) -> Result<Option<Self>, SqlError> {
+        Self::open_statement_for(
+            storage,
+            txid,
+            statement,
+            params,
+            arena,
+            responder,
+            StatementUse::Driven,
+        )
+    }
+
     fn open_statement_for(
         storage: &Storage,
         txid: u32,
@@ -2958,6 +2983,7 @@ impl<'a> RetainedSelect<'a> {
                 from.joins.is_empty()
                     && from.base.sample.is_none()
                     && mode == RetainedMode::Statement
+                    && statement_use != StatementUse::WriteSource
             })
             .and_then(|from| from.base.cte)
             .and_then(|cte| match cte.source {
@@ -4032,6 +4058,16 @@ impl<'a> RetainedSelect<'a> {
     /// first row, where a build that does not fit is reported.
     pub(crate) fn prepares_ahead(&self) -> bool {
         self.plan.sort().is_some() || self.plan.group().is_some() || !self.sublinks.is_empty()
+    }
+
+    /// The statement's RowDescription while it is unsent.
+    pub(crate) fn pending_description(&self) -> Option<&'a [ColDesc<'a>]> {
+        self.description
+    }
+
+    /// Another reader describes the result: this one sends no description.
+    pub(crate) fn discard_description(&mut self) {
+        self.description = None;
     }
 
     /// Whether the statement's RowDescription still waits for its first

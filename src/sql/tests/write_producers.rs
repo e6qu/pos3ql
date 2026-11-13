@@ -45,3 +45,104 @@ fn a_select_reads_a_data_modifying_with_query_as_it_runs() {
         );
     });
 }
+
+#[test]
+fn chained_queries_interleave_and_unread_queries_run_last_one_first() {
+    with_engine("write-producer-chain", |engine, budget| {
+        run_with(engine, budget, SETUP);
+        run_with(
+            engine,
+            budget,
+            "CREATE TABLE wp_b (x int); CREATE TABLE wp_c (x int); \
+             CREATE TRIGGER wp_b_before BEFORE INSERT ON wp_b FOR EACH ROW EXECUTE FUNCTION wp_row(); \
+             CREATE TRIGGER wp_c_before BEFORE INSERT ON wp_c FOR EACH ROW EXECUTE FUNCTION wp_row()",
+        );
+        // Results from PostgreSQL 18.6.
+        let output = run_with(
+            engine,
+            budget,
+            "WITH w1 AS (INSERT INTO wp_a SELECT g FROM generate_series(1, 2) g RETURNING x), \
+                  w2 AS (INSERT INTO wp_b SELECT wp_note('b', x) FROM w1 RETURNING x), \
+                  w3 AS (INSERT INTO wp_c VALUES (7) RETURNING x) \
+             SELECT wp_note('main', x) FROM w2",
+        );
+        assert_eq!(data_rows(&output), ["1", "2"]);
+        assert_eq!(
+            log(engine, budget),
+            "BEFORE wp_a 1,b 1,BEFORE wp_b 1,main 1,BEFORE wp_a 2,b 2,BEFORE wp_b 2,main 2,\
+             BEFORE wp_c 7"
+        );
+        // A query read only partly still writes every row after the reads.
+        let output = run_with(
+            engine,
+            budget,
+            "WITH w AS (INSERT INTO wp_a SELECT g FROM generate_series(1, 3) g RETURNING x) \
+             SELECT wp_note('main', x) FROM w LIMIT 1",
+        );
+        assert_eq!(data_rows(&output), ["1"]);
+        assert_eq!(
+            log(engine, budget),
+            "BEFORE wp_a 1,main 1,BEFORE wp_a 2,BEFORE wp_a 3"
+        );
+        // A UNION ALL reads its queries one after another.
+        let output = run_with(
+            engine,
+            budget,
+            "WITH w1 AS (INSERT INTO wp_a VALUES (1), (2) RETURNING x), \
+                  w2 AS (INSERT INTO wp_c VALUES (3) RETURNING x) \
+             SELECT wp_note('a', x) FROM w1 UNION ALL SELECT wp_note('c', x) FROM w2",
+        );
+        assert_eq!(data_rows(&output), ["1", "2", "3"]);
+        assert_eq!(
+            log(engine, budget),
+            "BEFORE wp_a 1,a 1,BEFORE wp_a 2,a 2,BEFORE wp_c 3,c 3"
+        );
+    });
+}
+
+#[test]
+fn a_write_reading_a_query_takes_sequence_values_in_turn() {
+    with_engine("write-producer-insert", |engine, budget| {
+        run_with(engine, budget, SETUP);
+        // Results from PostgreSQL 18.6: the query and the write reading it
+        // draw from one sequence row by row.
+        let output = run_with(
+            engine,
+            budget,
+            "CREATE TABLE wp_pairs (x int, y int); CREATE SEQUENCE wp_values; \
+             WITH w AS (INSERT INTO wp_a SELECT nextval('wp_values') \
+                        FROM generate_series(1, 3) RETURNING x) \
+             INSERT INTO wp_pairs SELECT x, nextval('wp_values') FROM w; \
+             SELECT x, y FROM wp_pairs ORDER BY x",
+        );
+        let text = String::from_utf8_lossy(&output).into_owned();
+        assert!(!text.contains("ERROR"), "{text}");
+        assert_eq!(data_rows(&output), ["1|2", "3|4", "5|6"]);
+        assert_eq!(
+            log(engine, budget),
+            "BEFORE wp_a 1,BEFORE wp_a 3,BEFORE wp_a 5"
+        );
+    });
+}
+
+#[test]
+fn a_query_read_row_by_row_keeps_its_memory_fixed() {
+    with_engine("write-producer-memory", |engine, budget| {
+        run_with(engine, budget, SETUP);
+        run_with(engine, budget, "DROP TRIGGER wp_a_before ON wp_a");
+        // Each step continues the query's source where the last one stopped
+        // and reclaims its own memory, so the statement arena does not grow
+        // with the rows.
+        let output = run_with_guc(
+            engine,
+            budget,
+            "WITH w AS (INSERT INTO wp_a SELECT g FROM generate_series(1, 400) g RETURNING x) \
+             SELECT wp_note('m', x) FROM w",
+            2 << 20,
+            &GucState::new(),
+        );
+        let text = String::from_utf8_lossy(&output).into_owned();
+        assert!(!text.contains("ERROR"), "{text}");
+        assert_eq!(data_rows(&output).len(), 400);
+    });
+}

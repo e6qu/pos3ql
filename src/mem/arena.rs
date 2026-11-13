@@ -257,6 +257,38 @@ impl Arena {
         }
     }
 
+    /// Lends a fixed block of `capacity` bytes from this arena's persistent
+    /// tail to a child arena: the block outlives every front rewind and is
+    /// reclaimed only when this arena resets.
+    pub(crate) fn alloc_persistent_block(&self, capacity: usize) -> Result<&Arena, ArenaFull> {
+        let capacity = capacity.next_multiple_of(ARENA_ALIGN);
+        if capacity == 0 {
+            return Err(self.full(1));
+        }
+        let layout =
+            Layout::from_size_align(capacity, ARENA_ALIGN).map_err(|_| self.full(capacity))?;
+        let base = self.alloc_raw_tail(layout)?;
+        let header = self.alloc_raw_tail(Layout::new::<Arena>())?.cast::<Arena>();
+        // SAFETY: as for `alloc_front_block`; the tail is never rewound
+        // below the block while this arena lives.
+        unsafe {
+            header.write(Arena {
+                what: self.what,
+                base,
+                capacity,
+                offset: Cell::new(0),
+                tail_offset: Cell::new(capacity),
+                high_water: Cell::new(0),
+                region_active: Cell::new(false),
+                borrowed: None,
+                retained_front: Cell::new(0),
+                retention_identity: retention_identity(),
+                interned: Cell::new(None),
+            });
+            Ok(&*header)
+        }
+    }
+
     /// Bytes still available to front allocations.
     pub(crate) fn remaining(&self) -> usize {
         self.allocation_limit().saturating_sub(self.offset.get())

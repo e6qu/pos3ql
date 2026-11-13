@@ -13,6 +13,7 @@ mod catalog_snapshot;
 mod catalog_snapshot_keys;
 pub(crate) mod commit;
 mod concurrent_index;
+mod driven_insert;
 #[cfg(all(test, not(miri)))]
 pub(crate) use concurrent_index::CommitPhase as IndexCommitPhaseForTests;
 pub(crate) mod array_assignment;
@@ -188,6 +189,15 @@ use parser::{ParseError, Parser};
 use prep::SqlPreparedPool;
 use txn::{DdlUndo, StatisticsUndo, TxnMode, TxnState};
 use types::{ColDesc, ColType, Datum};
+
+use driven_insert as driven;
+pub(crate) use driven_insert::{DrivenInsert, KeptDriven};
+
+/// A statement's `WITH` list and its bound data-modifying queries.
+type StatementWith<'a> = (
+    &'a [ast::Cte<'a>],
+    &'a [(&'a str, &'a ast::MaterializedCte<'a>)],
+);
 
 type ReturningCapture<'a> = dyn for<'row> FnMut(&Storage, u32, &dyn SequenceAccess, &[Datum<'row>]) -> Result<(), SqlError>
     + 'a;
@@ -15400,9 +15410,10 @@ impl Engine {
         }
     }
 
-    /// One step of a data-modifying `WITH` query: attempts of its write,
-    /// each ended by a call it makes (which completes in turn, with a log of
-    /// the step's own) or by the row it returned.
+    /// One step of a data-modifying `WITH` query. An `INSERT ... SELECT`
+    /// whose source the retained reader runs is driven row by row: the step
+    /// ends once a row returns its `RETURNING` row, when the read needs only
+    /// that row. Any other query runs whole in its first step.
     #[allow(clippy::too_many_arguments)]
     fn run_write_step(
         &mut self,
@@ -15417,8 +15428,6 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        // SAFETY: the loop completing this call still executes the statement.
-        let (with, params) = unsafe { write.statement() };
         let key = write.key();
         let snapshot = self.storage.read_snapshot();
         let pool = std::sync::Arc::clone(&self.storage.execution_control);
@@ -15431,26 +15440,289 @@ impl Engine {
             Ok(progress) => progress,
             Err(error) => return Ok(Err(error)),
         };
-        let (produced, _) = invocations.producer_state(key);
-        let calls = invocations.write_query_child(arena);
         let mut wire = None;
-        // What a step keeps (its calls' results, its row) lives in the
-        // statement arena's retained tail; each attempt's syntax and rows
-        // are reclaimed, so a query's memory does not grow with its rows.
+        // What a step keeps (its calls' results, its rows) lives in the
+        // statement arena's retained tail; what it read or analysed for an
+        // attempt is reclaimed, so a query's memory does not grow with its
+        // rows.
         let step_mark = arena.mark();
-        let outcome = loop {
+        let outcome = match invocations.take_producer_driven(key) {
+            Ok((kept, read)) => {
+                let outcome = self.run_driven_write_step(
+                    write,
+                    kept,
+                    read,
+                    &mut progress,
+                    start,
+                    invocations,
+                    arena,
+                    work,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    responder,
+                );
+                match outcome {
+                    Ok(Some(outcome)) => outcome,
+                    Ok(None) => self.run_whole_write_step(
+                        write,
+                        &mut progress,
+                        start,
+                        invocations,
+                        arena,
+                        work,
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        responder,
+                        &mut wire,
+                    ),
+                    Err(full) => {
+                        wire = Some(full);
+                        Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "data-modifying WITH query output overflowed"
+                        ))
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        };
+        self.storage.set_read_snapshot(snapshot);
+        // SAFETY: the step's rows were copied to the retained tail.
+        unsafe { arena.rewind_to(step_mark) };
+        let returned = invocations.return_producer_progress(key, progress);
+        if let Some(full) = wire {
+            return Err(full);
+        }
+        Ok(outcome.and(returned))
+    }
+
+    /// [`Self::run_write_step`] for an `INSERT ... SELECT` the engine drives:
+    /// `None` when its source is not driven, so the query runs whole. The
+    /// reader and the analysed statement live in a block of the statement
+    /// arena's persistent tail between steps.
+    #[allow(clippy::too_many_arguments)]
+    fn run_driven_write_step(
+        &mut self,
+        write: query::PendingWriteQuery,
+        kept: Option<KeptDriven>,
+        read: usize,
+        progress: &mut exec::RowProgress,
+        start: Option<sequence::StatementReplayStart>,
+        invocations: &query::RoutineInvocationState,
+        arena: &Arena,
+        work: &Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Option<Result<(), SqlError>>, WireFull> {
+        // SAFETY: the loop completing this call still executes the statement.
+        let (with, params) = unsafe { write.statement() };
+        let key = write.key();
+        // A query that ran whole marks its reader's rows as unknown.
+        if kept.is_none() && read == usize::MAX {
+            return Ok(None);
+        }
+        let driven = match kept {
+            // SAFETY: a kept reader lives in the statement arena's persistent
+            // tail and reads the statement's own syntax and parameters.
+            Some(kept) => Some(unsafe { kept.attach() }),
+            None => match self.open_driven_write_query(
+                with,
+                write.index,
+                params,
+                read,
+                progress,
+                arena,
+                txn,
+                guc,
+                responder,
+            ) {
+                // SAFETY: as above.
+                Ok(driven) => driven.map(|driven| unsafe { driven.attach() }),
+                Err(error) => return Ok(Some(Err(error))),
+            },
+        };
+        let Some(mut driven) = driven else {
+            if read != 0 {
+                return Ok(Some(Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "a data-modifying WITH query lost its driven source"
+                ))));
+            }
+            if let Err(error) = invocations.return_producer_driven(key, None, usize::MAX) {
+                return Ok(Some(Err(error)));
+            }
+            return Ok(None);
+        };
+        let (wal, lock) = (self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+        progress.begin_attempt(wal, lock);
+        let boundary = txn.write_completion_boundary.take();
+        let mut region_start = start;
+        let mut returned = |row: &[u8]| -> Result<(), SqlError> {
+            let region = query::StepRegion::finish(region_start, work)?;
+            invocations.add_produced_row(key, row, region, arena)?;
+            region_start = sequence::begin_replay_cursor()?;
+            Ok(())
+        };
+        let outcome = self.drive_insert(
+            &mut driven,
+            progress,
+            invocations,
+            Some(&mut returned),
+            write.row.is_some(),
+            true,
+            arena,
+            params,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            responder,
+        );
+        txn.write_completion_boundary = boundary;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(full) => {
+                let read = driven.read();
+                // SAFETY: as above.
+                let kept = unsafe { driven.into_kept() };
+                let _ = invocations.return_producer_driven(key, Some(kept), read);
+                return Err(full);
+            }
+        };
+        let finished = match outcome {
+            Ok(driven::DrivenEnd::Finished) => query::StepRegion::finish(region_start, work)
+                .and_then(|region| invocations.finish_producer(key, region)),
+            Ok(driven::DrivenEnd::Returned) => Ok(()),
+            Err(error) => Err(error),
+        };
+        let read = driven.read();
+        // SAFETY: as above.
+        let kept = unsafe { driven.into_kept() };
+        Ok(Some(finished.and(invocations.return_producer_driven(
+            key,
+            Some(kept),
+            read,
+        ))))
+    }
+
+    /// Analyses data-modifying `WITH` query `index` into a block of the
+    /// statement arena's persistent tail and opens its driven source,
+    /// skipping the `read` source rows earlier steps wrote; `None` when the
+    /// query is not an `INSERT ... SELECT` the engine drives.
+    #[allow(clippy::too_many_arguments)]
+    fn open_driven_write_query<'a>(
+        &mut self,
+        with: &'a [ast::Cte<'a>],
+        index: usize,
+        params: &'a [Datum<'a>],
+        read: usize,
+        progress: &exec::RowProgress,
+        arena: &Arena,
+        txn: &mut TxnState,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Option<KeptDriven>, SqlError> {
+        if !matches!(with[index].dml, Some(Stmt::Insert(insert)) if insert.select.is_some()) {
+            return Ok(None);
+        }
+        // SAFETY: the statement arena outlives the statement's invocation log,
+        // which holds the reader; the block is never reclaimed before.
+        let statement_arena: &'static Arena = unsafe { &*core::ptr::from_ref(arena) };
+        let Some(block) = DrivenInsert::block(statement_arena, driven::DrivenBlock::Persistent)
+        else {
+            return Ok(None);
+        };
+        // SAFETY: the statement's syntax and parameters outlive its log.
+        let (with, params): (&'static [ast::Cte<'static>], &'static [Datum<'static>]) =
+            unsafe { core::mem::transmute((with, params)) };
+        self.storage.set_read_snapshot(txn.command_id());
+        let mut earlier = ArenaList::new(block);
+        for prior in 0..index {
+            if with[prior].dml.is_none() {
+                continue;
+            }
+            let (_, mut materialized) =
+                self.analyze_dml_cte(with, prior, earlier.as_slice(), txn, block, params, guc)?;
+            materialized.source = Self::write_query_source(with, prior, params);
+            let materialized = block
+                .alloc(materialized)
+                .map_err(|_| query::arena_full_pub())?;
+            earlier
+                .push((with[prior].name, &*materialized))
+                .map_err(|_| query::arena_full_pub())?;
+        }
+        let (dml, _) =
+            self.analyze_dml_cte(with, index, earlier.as_slice(), txn, block, params, guc)?;
+        let (work, buffers) = self.work.cursor_parts();
+        DrivenInsert::open(
+            &self.storage,
+            txn,
+            dml,
+            block,
+            params,
+            responder,
+            work,
+            buffers,
+            read,
+            progress,
+        )
+        // SAFETY: the reader lives in the persistent block and reads the
+        // statement's syntax and parameters, which outlive the statement's
+        // invocation log.
+        .map(|driven| driven.map(|driven| unsafe { driven.into_kept() }))
+    }
+
+    /// [`Self::run_write_step`] for a query that runs whole: attempts of its
+    /// write, each ended by a call it makes, which completes in turn with a
+    /// log of the step's own.
+    #[allow(clippy::too_many_arguments)]
+    fn run_whole_write_step(
+        &mut self,
+        write: query::PendingWriteQuery,
+        progress: &mut exec::RowProgress,
+        start: Option<sequence::StatementReplayStart>,
+        invocations: &query::RoutineInvocationState,
+        arena: &Arena,
+        work: &Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+        wire: &mut Option<WireFull>,
+    ) -> Result<(), SqlError> {
+        // SAFETY: the loop completing this call still executes the statement.
+        let (with, params) = unsafe { write.statement() };
+        let key = write.key();
+        let snapshot = self.storage.read_snapshot();
+        let calls = invocations.write_query_child(arena);
+        let attempt_mark = arena.mark();
+        // An `INSERT ... VALUES` evaluates each row as it writes it and skips
+        // the rows earlier steps wrote by index: a read of one row runs it
+        // until it returns a row. Any other write runs whole.
+        let values =
+            matches!(with[write.index].dml, Some(Stmt::Insert(insert)) if insert.select.is_none());
+        let (produced, _) = invocations.producer_state(key);
+        let produce = (values && write.row.is_some()).then_some(produced as u64 + 1);
+        let (rows, region, finished) = loop {
             // SAFETY: nothing an earlier attempt left below the retained tail
             // is read again.
-            unsafe { arena.rewind_to(step_mark) };
-            if let Err(error) = sequence::rewind_replay_cursor(start) {
-                break Err(error);
-            }
+            unsafe { arena.rewind_to(attempt_mark) };
+            sequence::rewind_replay_cursor(start)?;
             calls.begin_attempt();
             let (wal, lock) = (self.wal.stage_mark(txn.txid), self.storage.lock_mark());
             let mark = txn.statement_mark(wal, lock);
             let effects = txn.transaction_effect_mark();
             progress.begin_attempt(wal, lock);
             progress.restart_fresh_row(mark, responder.mark());
+            progress.produce_until(produce);
             // The run's syntax and rows use the statement arena, whose tail
             // also takes the step's retained calls; its executor uses the
             // query workspace, which the next attempt resets.
@@ -15466,36 +15738,32 @@ impl Engine {
                         guc,
                         cursors,
                         responder,
-                        &mut progress,
-                        produced as u64 + 1,
+                        progress,
                     )
                 },
             );
             self.storage.set_read_snapshot(snapshot);
             let error = match result {
-                Ok(()) => break Ok((rows, true)),
+                Ok(()) => break (rows, query::StepRegion::finish(start, work)?, true),
                 Err(error) => error,
             };
             if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
-                break Err(error);
+                return Err(error);
             }
             if calls.take_produced() {
-                break Ok((rows, false));
+                break (rows, query::StepRegion::finish(start, work)?, false);
             }
-            let unfinished = match progress.unfinished_row(txn) {
-                Ok(unfinished) => unfinished,
-                Err(error) => break Err(error),
-            };
+            let unfinished = progress.unfinished_row(txn)?;
             if unfinished.is_none() && txn.transaction_effect_mark() != effects {
                 // Running the call after a rollback would hide the attempt's
                 // changes from it, unlike PostgreSQL.
-                break Err(exec::retained_progress_required());
+                return Err(exec::retained_progress_required());
             }
             // A query that kept rows undoes only its unfinished row.
             self.rollback_waiting_statement(txn, unfinished.map_or(mark, |row| row.mark));
             self.dml_scratch.clear();
             let Some(pending) = calls.take_pending() else {
-                break Err(sql_err!(
+                return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "data-modifying WITH query yielded without a pending call"
                 ));
@@ -15504,39 +15772,29 @@ impl Engine {
                 pending, &calls, arena, work, txn, sqlprep, cursors, guc, responder,
             ) {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => break Err(error),
+                Ok(Err(error)) => return Err(error),
                 Err(full) => {
-                    wire = Some(full);
-                    break Err(sql_err!(
+                    *wire = Some(full);
+                    return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "data-modifying WITH query output overflowed"
                     ));
                 }
             }
         };
-        let kept = outcome.as_ref().map_or(Ok(()), |(rows, finished)| {
-            let region = query::StepRegion::finish(start, work)?;
-            for row in rows.iter() {
-                invocations.add_produced_row(key, row, region, arena)?;
-            }
-            if *finished {
-                invocations.finish_producer(key, region)?;
-            }
-            Ok(())
-        });
-        // SAFETY: the step's row was copied to the retained tail.
-        unsafe { arena.rewind_to(step_mark) };
-        let returned = invocations.return_producer_progress(key, progress);
-        if let Some(full) = wire {
-            return Err(full);
+        progress.produce_until(None);
+        for row in rows {
+            invocations.add_produced_row(key, row, region, arena)?;
         }
-        Ok(outcome.and(kept).and(returned))
+        if finished {
+            invocations.finish_producer(key, region)?;
+        }
+        Ok(())
     }
 
-    /// One attempt of a step of data-modifying `WITH` query `index`, with
-    /// the rows it returned. The queries before it are bound for reading, so
-    /// one it reads runs its own steps as it reads them. An `INSERT` returns
-    /// one row per step; another write runs whole in its first step.
+    /// One attempt of data-modifying `WITH` query `index` run whole, with the
+    /// rows it returned. The queries before it are bound for reading, so one
+    /// it reads runs its own steps as it reads them.
     #[allow(clippy::too_many_arguments)]
     fn run_write_query<'a>(
         &mut self,
@@ -15549,7 +15807,6 @@ impl Engine {
         cursors: &mut cursor::CursorPool,
         responder: &mut Responder,
         progress: &mut exec::RowProgress,
-        produce_until: u64,
     ) -> (&'a [&'a [u8]], Result<(), SqlError>) {
         self.storage.set_read_snapshot(txn.command_id());
         let analysed = (|| {
@@ -15576,11 +15833,6 @@ impl Engine {
             Ok(dml) => dml,
             Err(error) => return (&[], Err(error)),
         };
-        if matches!(dml, Stmt::Insert(_)) {
-            progress.produce_until(produce_until);
-        } else {
-            progress.stop_producing();
-        }
         let connection_id = self.work.connection_id();
         let (work, row_buffers) = self.work.cursor_parts();
         Self::execute_write_step(
@@ -17661,6 +17913,44 @@ impl Engine {
         writes: Option<&query::RoutineInvocationState>,
         responder: &mut Responder,
     ) -> Result<Result<bool, SqlError>, WireFull> {
+        let emitted = match self.retained_select_rows(
+            source,
+            arena,
+            params,
+            source_snapshot,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            writes,
+            responder,
+        )? {
+            Ok(Some(emitted)) => emitted,
+            Ok(None) => return Ok(Ok(false)),
+            Err(error) => return Ok(Err(error)),
+        };
+        let tag = stack_format!(48, "SELECT {}", emitted);
+        responder.command_complete(tag.as_str())?;
+        Ok(Ok(true))
+    }
+
+    /// The rows of [`Self::execute_retained_select`], without its command
+    /// tag: their count, or `None` when its sort or hash table did not fit
+    /// before its description was sent.
+    #[allow(clippy::too_many_arguments)]
+    fn retained_select_rows<'statement>(
+        &mut self,
+        source: &mut query::RetainedSelect<'statement>,
+        arena: &'statement Arena,
+        params: &[Datum],
+        source_snapshot: u32,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        writes: Option<&query::RoutineInvocationState>,
+        responder: &mut Responder,
+    ) -> Result<Result<Option<u64>, SqlError>, WireFull> {
         let mut emitted = 0u64;
         loop {
             self.storage.set_read_snapshot(source_snapshot);
@@ -17698,7 +17988,7 @@ impl Engine {
                 }
                 Err(error) if source.description_pending() && !cursor_input_wait(&error) => {
                     if error.is_plan_build_exhausted() {
-                        return Ok(Ok(false));
+                        return Ok(Ok(None));
                     }
                     // PostgreSQL describes the result before its error.
                     if let Err(error) = source.send_description(responder) {
@@ -17818,9 +18108,7 @@ impl Engine {
             source.finish_statement_row(arena, row_emitted);
             emitted += u64::from(row_emitted);
         }
-        let tag = stack_format!(48, "SELECT {}", emitted);
-        responder.command_complete(tag.as_str())?;
-        Ok(Ok(true))
+        Ok(Ok(Some(emitted)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -17994,6 +18282,23 @@ impl Engine {
                     Some(query::RoutineInvocationContext::new(&invocations, arena)),
                     || {
                         Ok::<_, WireFull>(match statement {
+                            Stmt::Insert(_)
+                                if let Some(outcome) = self.drive_main_insert(
+                                    statement,
+                                    None,
+                                    arena,
+                                    params,
+                                    txn,
+                                    sqlprep,
+                                    cursors,
+                                    guc,
+                                    &invocations,
+                                    &mut progress,
+                                    responder,
+                                )? =>
+                            {
+                                outcome
+                            }
                             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
                                 let connection_id = self.work.connection_id();
                                 let (work, row_buffers) = self.work.cursor_parts();
@@ -18038,6 +18343,7 @@ impl Engine {
                                 responder,
                                 None,
                                 Some(&mut progress),
+                                Some(&invocations),
                             )?,
                             Stmt::Select(select) => self.execute_select_once(
                                 select,
@@ -18114,6 +18420,11 @@ impl Engine {
                     "data modification yielded without a pending routine invocation"
                 )));
             };
+            if matches!(pending.target, query::PendingRoutineTarget::WriteQuery(_)) {
+                // A wait inside the query's step leaves its rows unfinished:
+                // the statement then runs again from its first start.
+                progress.abandon_rows();
+            }
             if let Err(error) = self.complete_pending_routine(
                 pending,
                 &invocations,
@@ -18698,91 +19009,75 @@ impl Engine {
         )
     }
 
-    /// Runs a `SELECT` that reads data-modifying `WITH` queries through a
-    /// retained reader: each query runs its next step as the reader reads
-    /// past the rows it returned, so their row triggers and calls interleave
-    /// with the main query's, as in PostgreSQL. Then every query runs to its
-    /// end, last one first, as PostgreSQL's `ExecPostprocessPlan` does.
-    /// `None` when the reader does not run the main query.
+    /// Runs a `SELECT` that reads data-modifying `WITH` queries through
+    /// retained readers, one per query of a `UNION ALL`, read one after
+    /// another as PostgreSQL's Append node reads them: each `WITH` query
+    /// runs its next step as a reader reads past the rows it returned, so
+    /// their row triggers and calls interleave with the main query's, as in
+    /// PostgreSQL. Then every `WITH` query runs to its end, last one first,
+    /// as PostgreSQL's `ExecPostprocessPlan` does. `None` when the readers
+    /// do not run the main query.
     #[allow(clippy::too_many_arguments)]
     fn execute_select_reading_writes<'statement>(
         &mut self,
-        statement: &ast::Select<'_>,
-        dml_mats: &[(&str, &ast::MaterializedCte<'_>)],
+        statement: &'statement ast::Select<'statement>,
+        dml_mats: &[(
+            &'statement str,
+            &'statement ast::MaterializedCte<'statement>,
+        )],
         arena: &'statement Arena,
-        params: &[Datum],
+        params: &[Datum<'statement>],
         txn: &mut TxnState,
         (sqlprep, cursors): StatementServices<'_>,
         guc: &GucState,
         invocations: &'statement query::RoutineInvocationState,
         responder: &mut Responder,
     ) -> Result<Option<Result<(), SqlError>>, WireFull> {
-        if statement.set_body.is_some() {
-            return Ok(None);
-        }
         let mark = arena.mark();
-        let source_snapshot = txn.command_id();
-        let expanded = {
-            let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
-            query::expand_ctes_exec(
-                statement,
-                &self.storage,
-                txn.txid,
-                arena,
-                params,
-                dml_mats,
-                Some(&sequence),
-            )
-        };
-        let expanded = match expanded {
-            Ok(expanded) => expanded,
-            Err(error) => return Ok(Some(Err(error))),
-        };
-        let reads_writes = expanded.from.as_ref().is_some_and(|from| {
-            from.base
-                .cte
-                .is_some_and(|cte| matches!(cte.source, ast::MaterializedCteSource::Write(_)))
-        });
-        let retained = if reads_writes {
-            match query::RetainedSelect::open_statement(
-                &self.storage,
-                txn.txid,
-                expanded,
-                params,
-                arena,
-                responder,
-            ) {
-                Ok(source) => source,
-                Err(error) if error.is_plan_build_exhausted() => None,
-                Err(error) => return Ok(Some(Err(error))),
+        let opened =
+            self.open_write_readers(statement, dml_mats, arena, params, txn, guc, responder);
+        let mut readers = match opened {
+            Ok(Some(readers)) => readers,
+            Ok(None) => {
+                // SAFETY: a rejected shape owns no retained reader or
+                // description.
+                unsafe { arena.rewind_to(mark) };
+                return Ok(None);
             }
-        } else {
-            None
-        };
-        let Some(mut source) = retained else {
-            // SAFETY: a rejected shape owns no retained reader or description.
-            unsafe { arena.rewind_to(mark) };
-            return Ok(None);
-        };
-        match self.execute_retained_select(
-            &mut source,
-            arena,
-            params,
-            source_snapshot,
-            txn,
-            sqlprep,
-            cursors,
-            guc,
-            Some(invocations),
-            responder,
-        )? {
-            Ok(true) => {}
             Err(error) => return Ok(Some(Err(error))),
-            // Its sort did not fit before anything was sent: the general
-            // executor reads the rows the queries returned and the rest.
-            Ok(false) => return Ok(None),
+        };
+        let source_snapshot = txn.command_id();
+        let mut emitted = 0u64;
+        for (index, reader) in readers.iter_mut().flatten().enumerate() {
+            match self.retained_select_rows(
+                reader,
+                arena,
+                params,
+                source_snapshot,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                Some(invocations),
+                responder,
+            )? {
+                Ok(Some(rows)) => emitted += rows,
+                Err(error) => return Ok(Some(Err(error))),
+                // The first query's sort did not fit before anything was
+                // sent: the general executor reads the rows the `WITH`
+                // queries returned and the rest.
+                Ok(None) if index == 0 => return Ok(None),
+                Ok(None) => {
+                    return Ok(Some(Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "an appended query was described before its rows"
+                    ))));
+                }
+            }
         }
-        drop(source);
+        drop(readers);
+        let tag = stack_format!(48, "SELECT {}", emitted);
+        responder.command_complete(tag.as_str())?;
         for (_, materialized) in dml_mats.iter().rev() {
             let ast::MaterializedCteSource::Write(write) = materialized.source else {
                 continue;
@@ -18808,6 +19103,117 @@ impl Engine {
         }
         self.storage.set_read_snapshot(txn.command_id());
         Ok(Some(Ok(())))
+    }
+
+    /// Opens the readers of [`Self::execute_select_reading_writes`]: one
+    /// per query of a `SELECT` or of a `UNION ALL` without ordering or
+    /// bounds of its own, whose results share their column types, at least
+    /// one of them reading a data-modifying `WITH` query. The first reader
+    /// describes the result.
+    #[allow(clippy::too_many_arguments)]
+    fn open_write_readers<'statement>(
+        &mut self,
+        statement: &'statement ast::Select<'statement>,
+        dml_mats: &[(
+            &'statement str,
+            &'statement ast::MaterializedCte<'statement>,
+        )],
+        arena: &'statement Arena,
+        params: &[Datum<'statement>],
+        txn: &mut TxnState,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<
+        Option<[Option<query::RetainedSelect<'statement>>; query::MAX_RETAINED_SOURCES]>,
+        SqlError,
+    > {
+        let mut queries = ArenaList::new(arena);
+        match statement.set_body {
+            None => queries
+                .push(statement)
+                .map_err(|_| query::arena_full_pub())?,
+            Some(body) => {
+                if !statement.order_by.is_empty()
+                    || statement.limit.is_some()
+                    || statement.offset.is_some()
+                    || !statement.locking.is_empty()
+                    || !query::union_all_leaves(body, &mut queries)?
+                {
+                    return Ok(None);
+                }
+            }
+        }
+        let queries = queries.as_slice();
+        if queries.len() > query::MAX_RETAINED_SOURCES {
+            return Ok(None);
+        }
+        let mut readers: [Option<query::RetainedSelect<'statement>>; query::MAX_RETAINED_SOURCES] =
+            Default::default();
+        let mut reads_writes = false;
+        let mut description: Option<&[types::ColDesc<'_>]> = None;
+        for (slot, query) in readers.iter_mut().zip(queries) {
+            let query = arena
+                .alloc(ast::Select {
+                    with: statement.with,
+                    ..**query
+                })
+                .map_err(|_| query::arena_full_pub())?;
+            let expanded = {
+                let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
+                query::expand_ctes_exec(
+                    query,
+                    &self.storage,
+                    txn.txid,
+                    arena,
+                    params,
+                    dml_mats,
+                    Some(&sequence),
+                )?
+            };
+            reads_writes |= expanded.from.as_ref().is_some_and(|from| {
+                from.base
+                    .cte
+                    .is_some_and(|cte| matches!(cte.source, ast::MaterializedCteSource::Write(_)))
+            });
+            let reader = match query::RetainedSelect::open_statement(
+                &self.storage,
+                txn.txid,
+                expanded,
+                params,
+                arena,
+                responder,
+            ) {
+                Ok(reader) => reader,
+                Err(error) if error.is_plan_build_exhausted() => None,
+                Err(error) => return Err(error),
+            };
+            let Some(mut reader) = reader else {
+                return Ok(None);
+            };
+            let columns = reader.pending_description().ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "a retained statement reader has no description"
+                )
+            })?;
+            match description {
+                None => description = Some(columns),
+                Some(first) => {
+                    // PostgreSQL resolves a common type for differing
+                    // columns, which the general executor converts to.
+                    if first.len() != columns.len()
+                        || first.iter().zip(columns).any(|(first, column)| {
+                            first.type_oid != column.type_oid || first.type_mod != column.type_mod
+                        })
+                    {
+                        return Ok(None);
+                    }
+                    reader.discard_description();
+                }
+            }
+            *slot = Some(reader);
+        }
+        Ok(reads_writes.then_some(readers))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -20028,6 +20434,7 @@ impl Engine {
                 responder,
                 None,
                 None,
+                None,
             ),
             _ => Ok(Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -20052,6 +20459,7 @@ impl Engine {
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
         progress: Option<&mut exec::RowProgress>,
+        writes: Option<&query::RoutineInvocationState>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if let Err(error) = query::validate_dml_assignment_casts(
             &Stmt::With { ctes, statement },
@@ -20092,18 +20500,39 @@ impl Engine {
             None => true,
         };
         if run_main {
-            let outcome = self.execute_with_main_statement(
-                ctes,
-                statement,
-                dml_mats,
-                params,
-                txn,
-                guc,
-                cursors,
-                responder,
-                capture,
-                progress.as_deref_mut(),
-            )?;
+            let outcome = match (writes, capture, progress.as_deref_mut()) {
+                (Some(writes), None, Some(progress)) => match self.drive_main_insert(
+                    statement,
+                    Some((ctes, dml_mats)),
+                    arena,
+                    params,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    writes,
+                    progress,
+                    responder,
+                )? {
+                    Some(outcome) => outcome,
+                    None => self.execute_with_main_statement(
+                        ctes,
+                        statement,
+                        dml_mats,
+                        params,
+                        txn,
+                        guc,
+                        cursors,
+                        responder,
+                        None,
+                        Some(progress),
+                    )?,
+                },
+                (_, capture, progress) => self.execute_with_main_statement(
+                    ctes, statement, dml_mats, params, txn, guc, cursors, responder, capture,
+                    progress,
+                )?,
+            };
             if outcome.is_err() {
                 return Ok(outcome);
             }
@@ -20195,6 +20624,119 @@ impl Engine {
             let _sent = responder.truncate_to(output_mark);
         }
         Err(error)
+    }
+
+    /// Runs a top-level `INSERT ... SELECT` row by row from a retained
+    /// reader of its source, as PostgreSQL's ModifyTable pulls it: a source
+    /// that reads a data-modifying `WITH` query of the statement (`with`),
+    /// whose steps then interleave with the insert's rows, or a source whose
+    /// output list calls volatile built-in functions, which then stream
+    /// instead of materializing. `None` when the statement is not such an insert or
+    /// its source is not driven.
+    #[allow(clippy::too_many_arguments)]
+    fn drive_main_insert<'a>(
+        &mut self,
+        statement: &'a Stmt<'a>,
+        with: Option<StatementWith<'a>>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        writes: &query::RoutineInvocationState,
+        progress: &mut exec::RowProgress,
+        responder: &mut Responder,
+    ) -> Result<Option<Result<(), SqlError>>, WireFull> {
+        let Stmt::Insert(insert) = statement else {
+            return Ok(None);
+        };
+        let Some(select) = insert.select else {
+            return Ok(None);
+        };
+        let driven = match with {
+            Some((ctes, _)) => select.from.as_ref().is_some_and(|from| {
+                from.joins.is_empty()
+                    && from.base.subquery.is_none()
+                    && ctes.iter().any(|cte| {
+                        cte.dml.is_some() && cte.name.eq_ignore_ascii_case(from.base.table)
+                    })
+            }),
+            // A user routine's body may wait, which a call handed off on its
+            // row cannot keep; such a source materializes, its output calls
+            // still running as each row is written.
+            None => {
+                !query::select_reads_repeatably(select, &self.storage, txn.txid)
+                    && query::select_streams_with_calls(select, &self.storage, txn.txid)
+                    && !query::select_calls_user_routines(select, &self.storage, txn.txid)
+            }
+        };
+        if !driven {
+            return Ok(None);
+        }
+        let mark = arena.mark();
+        let Some(block) = DrivenInsert::block(arena, driven::DrivenBlock::Front) else {
+            return Ok(None);
+        };
+        let expanded = match with {
+            Some((ctes, dml_mats)) => {
+                let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
+                match query::expand_dml_ctes(
+                    statement,
+                    ctes,
+                    &self.storage,
+                    txn.txid,
+                    block,
+                    params,
+                    dml_mats,
+                    Some(&sequence),
+                ) {
+                    Ok(expanded) => expanded,
+                    Err(error) => return Ok(Some(Err(error))),
+                }
+            }
+            None => statement,
+        };
+        let opened = {
+            let (work, buffers) = self.work.cursor_parts();
+            DrivenInsert::open(
+                &self.storage,
+                txn,
+                expanded,
+                block,
+                params,
+                responder,
+                work,
+                buffers,
+                progress.resume_index(),
+                progress,
+            )
+        };
+        let mut driven = match opened {
+            Ok(Some(driven)) => driven,
+            Ok(None) => {
+                // SAFETY: a rejected source owns nothing in the block.
+                unsafe { arena.rewind_to(mark) };
+                return Ok(None);
+            }
+            Err(error) => return Ok(Some(Err(error))),
+        };
+        let outcome = self.drive_insert(
+            &mut driven,
+            progress,
+            writes,
+            None,
+            false,
+            false,
+            arena,
+            params,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            responder,
+        )?;
+        Ok(Some(outcome.map(|_| ())))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -22175,6 +22717,7 @@ impl Engine {
                 guc,
                 responder,
                 capture,
+                None,
                 None,
             ),
             Stmt::Select(select) => {

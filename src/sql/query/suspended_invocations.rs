@@ -68,6 +68,9 @@ impl RoutineInvocationState {
                 if let Some(producers) = producers.as_mut() {
                     for (producer, rows) in producers.iter_mut().zip(rows.iter_mut()) {
                         producer.rows = core::mem::replace(rows, RetainedList::new());
+                        // Its reader lives in the memory being left: the next
+                        // step opens another and skips the rows already read.
+                        producer.driven = None;
                     }
                 }
                 output.producers = RefCell::new(producers);

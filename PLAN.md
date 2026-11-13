@@ -548,10 +548,11 @@ written before the failing modifier are reported first, as PostgreSQL's
 analysis order finds them; in other statements the modifier error comes first.
 Writes to catalog views other than `pg_settings`, and to system catalogs,
 fail with `42P01`.
-A `RETURNING` list routed through a rule's `RETURNING` list reads the rule's
-relation and the statement's `FROM` or `USING` items (`UPDATE v ... FROM o
-RETURNING o.label, *`), but a subquery in that list fails with `0A000` where
-PostgreSQL evaluates it.
+A subquery reading `old` or `new` in the `RETURNING` list of a write through
+a view with an `INSTEAD OF` trigger or a rule (`UPDATE v ... RETURNING
+(SELECT old.label)`) fails with `42P01`: analysis of the view write resolves
+the subquery's outer references without the list's `old` and `new` names.
+Column-not-found errors carry no `Perhaps you meant` hint.
 An error inside a statement or expression of a PL/pgSQL body is positioned
 in it (`QUERY` and `LINE`), except at a name the lexer folded (`OLD.n`,
 `NOSUCH`) or a `$n` beyond the routine's parameters, which report no

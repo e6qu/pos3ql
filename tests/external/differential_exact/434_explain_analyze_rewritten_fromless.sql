@@ -45,3 +45,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM t434 WHERE random() > 2;
 EXPLAIN (COSTS OFF) SELECT lower(c) FROM u434 GROUP BY 1;
 EXPLAIN (COSTS OFF) SELECT a + 1 FROM u434 GROUP BY 1;
 EXPLAIN (COSTS OFF) SELECT a + 1, lower(c) FROM u434 ORDER BY 1, 2;
+-- Sort and grouping keys reading a function or a VALUES list.
+EXPLAIN (COSTS OFF) SELECT * FROM generate_series(1, 3) g ORDER BY g DESC;
+EXPLAIN (COSTS OFF) SELECT g, count(*) FROM generate_series(1, 3) g GROUP BY g;
+EXPLAIN (COSTS OFF) SELECT * FROM (VALUES (1, 2), (3, 4)) v(x, y) ORDER BY y;

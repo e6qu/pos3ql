@@ -533,7 +533,8 @@ grouped query its `HAVING` filter, an `OFFSET` its `Limit`, a distinct union the
 qualified, and a `VALUES` list's columns as `"*VALUES*".column1`; other nodes'
 `Output` lists stay unqualified, join conditions over a `VALUES` list or another
 derived relation are not printed, and `Sort Key`/`Group Key` items reading a
-derived table or function are not printed. An index scan prints the
+derived table are not printed (PostgreSQL prints the expressions of the
+derived table's query); keys reading a function or a `VALUES` list are. An index scan prints the
 conditions its index consumes as `Index Cond` (indexed column first and
 unqualified), and a parameterized inner index scan filters the other join
 conditions reading it, as PostgreSQL does. Outer joins of stored tables in

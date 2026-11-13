@@ -3531,20 +3531,12 @@ fn plan_keys(
 ) -> Result<PlanKeys, SqlError> {
     // A query without FROM reads no relation.
     let relations = scope.map_or(0, |scope| scope.n);
-    if keys.is_empty()
-        || scope.is_some_and(|scope| (0..scope.n).any(|table| scope.defs.stored(table).is_none()))
-    {
+    if keys.is_empty() {
         return Ok(PlanKeys::NONE);
     }
-    let joined = arena
-        .alloc_slice_with(relations, |table| {
-            let scope = scope.expect("relations come from the scope");
-            crate::sql::catalog::deparse::Joined::new(
-                scope.names[table],
-                scope.defs.stored(table).expect("stored relation"),
-            )
-        })
-        .map_err(|_| arena_full())?;
+    let Some(joined) = key_relations(scope, statement, arena)? else {
+        return Ok(PlanKeys::NONE);
+    };
     let mut shown = PlanKeys {
         label,
         ..PlanKeys::NONE
@@ -3641,6 +3633,73 @@ fn plan_keys(
         }
     }
     Ok(shown)
+}
+
+/// The relations a block's sort and grouping keys read, as PostgreSQL names
+/// their columns: a stored table's, a function scan's (`g`) and a pulled-up
+/// `VALUES` list's (`"*VALUES*".column1`). None when one is a derived table,
+/// whose columns PostgreSQL prints as the expressions of its query.
+fn key_relations<'a>(
+    scope: Option<&'a QueryScope<'_>>,
+    statement: &Select<'_>,
+    arena: &'a Arena,
+) -> Result<Option<&'a [crate::sql::catalog::deparse::Joined<'a>]>, SqlError> {
+    use crate::sql::catalog::deparse::{Column, Columns, Joined};
+    let Some(scope) = scope else {
+        return Ok(Some(&[]));
+    };
+    let items = statement
+        .from
+        .as_ref()
+        .map(|from| core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)));
+    let mut items = items.into_iter().flatten();
+    let joined = arena
+        .alloc_slice_with(scope.n, |_| None::<Joined<'a>>)
+        .map_err(|_| arena_full())?;
+    for (table, slot) in joined.iter_mut().enumerate() {
+        let item = items.next();
+        if let Some(definition) = scope.defs.stored(table) {
+            *slot = Some(Joined::new(scope.names[table], definition));
+            continue;
+        }
+        let Some(item) = item else {
+            return Ok(None);
+        };
+        let values = item.subquery.and_then(values_list).is_some();
+        if !(values || (item.is_function_source() && item.rows_from.is_none())) {
+            return Ok(None);
+        }
+        let Some(definition) = scope.defs.get(table) else {
+            return Ok(None);
+        };
+        let columns = arena
+            .alloc_slice_with(definition.n_columns, |index| Column {
+                name: definition.columns[index].name.as_str(),
+                type_oid: None,
+                merged: None,
+            })
+            .map_err(|_| arena_full())?;
+        if values {
+            for (index, column) in columns.iter_mut().enumerate() {
+                let printed = arena
+                    .alloc_str_display(format_args!("column{}", index + 1))
+                    .map_err(|_| arena_full())?;
+                column.merged = Some((Some("*VALUES*"), printed));
+            }
+        }
+        *slot = Some(Joined {
+            unqualified: true,
+            ..Joined::rule_columns(scope.names[table], Columns::Derived(columns))
+        });
+    }
+    if joined.iter().any(Option::is_none) {
+        return Ok(None);
+    }
+    Ok(Some(
+        &*arena
+            .alloc_slice_with(scope.n, |table| joined[table].expect("checked"))
+            .map_err(|_| arena_full())?,
+    ))
 }
 
 /// Whether `text` is one parenthesized expression.

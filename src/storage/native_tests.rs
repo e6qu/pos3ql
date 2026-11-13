@@ -4195,7 +4195,10 @@ fn catalog_object_pools_follow_their_independent_startup_capacities() {
         .expect("text catalog lock poisoned");
     assert_eq!(text_catalog.collations.len(), 12);
     assert_eq!(text_catalog.conversions.len(), 13);
-    assert_eq!(text_catalog.text_search_objects.len(), 27);
+    assert_eq!(
+        text_catalog.text_search_objects.len(),
+        BUILTIN_TEXT_SEARCH_SLOTS + 6
+    );
     drop(text_catalog);
     assert_eq!(storage.event_trigger_capacity(), 14);
     assert_eq!(
@@ -7167,7 +7170,7 @@ fn text_catalog_is_synchronized_and_startup_bounded() {
     assert_eq!(storage.conversions_visible_to(0).count(), WORKERS);
     assert_eq!(
         storage.text_search_objects_visible_to(0).count(),
-        7 + WORKERS
+        BUILTIN_TEXT_SEARCH_OBJECTS + WORKERS
     );
     for (slot, definition) in storage.collations_visible_to(0) {
         assert_eq!(storage.collation(slot).definition.name, definition.name);

@@ -2681,8 +2681,13 @@ fn with_derived_plan<'a>(
         scan.depth + 1
     };
     for node in &derived.nodes[..derived.count] {
+        // The derived table adds a range table entry, so PostgreSQL
+        // qualifies the columns of its keys.
+        let mut keys = node.keys;
+        keys.plain = keys.verbose;
         expanded.push(PlanNode {
             depth: node.depth.saturating_add(depth),
+            keys,
             ..*node
         })?;
     }

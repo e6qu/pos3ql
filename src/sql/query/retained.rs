@@ -1616,7 +1616,7 @@ fn next_source_row<'a>(
             }
             // A row not returned yet ends this read with the query's next
             // step pending; the same read runs again after it.
-            match super::read_write_query_row(source, *next, state_arena)? {
+            match super::read_write_query_row(source, *next)? {
                 super::ProducedRead::Row(bytes) => {
                     *next += 1;
                     Ok(Some(RetainedRow::Literal(bytes)))

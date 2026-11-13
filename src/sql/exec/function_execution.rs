@@ -666,6 +666,7 @@ fn run_body<'a>(
         depth: context.txn.trigger_depth(),
         retained,
         statement_end: false,
+        step: false,
     });
     let definition = crate::storage::RelationDefinition::EMPTY;
     let result = (|| {

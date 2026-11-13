@@ -16517,11 +16517,13 @@ impl Engine {
             Some(Err(error)) => return Ok(Err(error)),
             None => None,
         };
+        let outer = txn.write_completion_boundary;
         let mut steps = RuleSteps {
             level,
             finished: crate::mem::arena::ArenaList::new(arena),
             resumed: resumed.unwrap_or(&[]),
             started: false,
+            outer: outer.filter(|outer| outer.step && outer.depth == txn.trigger_depth()),
         };
         let mut original_rows = 0u64;
         if insert_event && !suppress_original {
@@ -16544,10 +16546,13 @@ impl Engine {
                             capture.take(),
                             progress.as_deref_mut(),
                         )
-                    })?;
+                    });
+                    steps.end_step(txn);
+                    let outcome = outcome?;
                     if let Err(error) = outcome {
-                        return Ok(Err(steps.stop(
+                        return Ok(Err(steps.stop_step(
                             progress.as_deref_mut(),
+                            txn,
                             error,
                             arena,
                             &storage.row_work,
@@ -16740,10 +16745,13 @@ impl Engine {
                                 use_returning,
                                 connection_id,
                                 progress.as_deref_mut(),
-                            )?;
+                            );
+                            steps.end_step(txn);
+                            let outcome = outcome?;
                             if let Err(error) = outcome {
-                                return Ok(Err(steps.stop(
+                                return Ok(Err(steps.stop_step(
                                     progress.as_deref_mut(),
+                                    txn,
                                     error,
                                     arena,
                                     &storage.row_work,
@@ -16808,10 +16816,13 @@ impl Engine {
                             capture.take(),
                             progress.as_deref_mut(),
                         )
-                    })?;
+                    });
+                    steps.end_step(txn);
+                    let outcome = outcome?;
                     if let Err(error) = outcome {
-                        return Ok(Err(steps.stop(
+                        return Ok(Err(steps.stop_step(
                             progress.as_deref_mut(),
+                            txn,
                             error,
                             arena,
                             &storage.row_work,
@@ -18126,10 +18137,17 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        if txn.pending_write_completion.is_some() {
-            return exec::resume_write_completion(
-                self, txn, arena, sqlprep, cursors, guc, responder,
-            );
+        let mut after_steps = false;
+        if let Some(completion) = txn.pending_write_completion.as_ref() {
+            let step = completion.step();
+            let resumed =
+                exec::resume_write_completion(self, txn, arena, sqlprep, cursors, guc, responder)?;
+            // A rule step's AFTER work ended: the statement continues with
+            // the steps after it.
+            if !step || resumed.is_err() {
+                return Ok(resumed);
+            }
+            after_steps = true;
         }
         if let Err(error) =
             query::validate_dml_assignment_casts(statement, &self.storage, txn.txid, arena, None)
@@ -18141,7 +18159,7 @@ impl Engine {
         let exec::RetainedWrite {
             mut progress,
             invocations,
-            replay,
+            mut replay,
         } = match txn.take_retained_write() {
             Some(write) => write,
             None => match sequence::begin_replay_cursor()
@@ -18160,6 +18178,14 @@ impl Engine {
         };
         if let Err(error) = invocations.require_arena(arena) {
             return Ok(Err(error));
+        }
+        if after_steps {
+            // As after the AFTER work in the attempt loop below.
+            invocations.begin_attempts_here();
+            replay = match sequence::begin_replay_cursor() {
+                Ok(replay) => replay,
+                Err(error) => return Ok(Err(error)),
+            };
         }
         if invocations.suspended.borrow().is_some() {
             // A call's body waited after the write stopped for it: it
@@ -18217,7 +18243,7 @@ impl Engine {
             Stmt::Merge(merge) => Some(merge.target),
             _ => None,
         };
-        let completion_handoff = direct_relation
+        let rules = direct_relation
             .and_then(|relation| {
                 match self
                     .storage
@@ -18227,14 +18253,14 @@ impl Engine {
                     _ => None,
                 }
             })
-            .is_some_and(|table| {
+            .map(|table| {
                 [
                     crate::storage::RewriteEvent::Insert,
                     crate::storage::RewriteEvent::Update,
                     crate::storage::RewriteEvent::Delete,
                 ]
                 .into_iter()
-                .all(|event| {
+                .any(|event| {
                     self.storage
                         .firing_rules_for(
                             crate::storage::RuleTarget::Table(table as u16),
@@ -18243,9 +18269,17 @@ impl Engine {
                             txn.txid,
                         )
                         .next()
-                        .is_none()
+                        .is_some()
                 })
             });
+        let completion_handoff = rules == Some(false);
+        // A rule-rewritten statement's steps hand their AFTER work over one
+        // step at a time; the statement replies after its last step.
+        let rule_steps = rules == Some(true)
+            && matches!(
+                main_statement,
+                Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)
+            );
         // Every attempt reads under the statement's snapshot: a routine
         // completed between attempts must not show its changes to the next.
         let source_snapshot = self
@@ -18268,17 +18302,19 @@ impl Engine {
             progress.begin_attempt(wal, lock);
             // AFTER triggers of a write that kept rows belong to its first attempt.
             let (start, _) = progress.note_start(statement_mark, output_mark);
-            let boundary = completion_handoff.then_some(txn::WriteCompletionBoundary {
-                mark: if progress.changed_rows() {
-                    start
-                } else {
-                    statement_mark
-                },
-                command: txn.command_id(),
-                depth: txn.trigger_depth(),
-                retained: true,
-                statement_end: true,
-            });
+            let boundary =
+                (completion_handoff || rule_steps).then_some(txn::WriteCompletionBoundary {
+                    mark: if progress.changed_rows() {
+                        start
+                    } else {
+                        statement_mark
+                    },
+                    command: txn.command_id(),
+                    depth: txn.trigger_depth(),
+                    retained: true,
+                    statement_end: completion_handoff,
+                    step: rule_steps,
+                });
             let prior_handoff = core::mem::replace(&mut txn.write_completion_boundary, boundary);
             let outcome = {
                 query::with_routine_invocation_scope(
@@ -18367,11 +18403,40 @@ impl Engine {
             // Whatever ended the attempt, no resumable row runs past it.
             query::set_resumable_row(false);
             let outcome = outcome?;
-            if txn.pending_write_completion.is_some() {
+            if let Some(completion) = txn.pending_write_completion.as_ref() {
                 self.dml_scratch.clear();
-                return exec::resume_write_completion(
+                let step = completion.step();
+                let resumed = exec::resume_write_completion(
                     self, txn, arena, sqlprep, cursors, guc, responder,
-                );
+                )?;
+                if !step {
+                    return Ok(resumed);
+                }
+                match resumed {
+                    // The next attempt skips the finished steps and replays
+                    // from here: their calls and values are not evaluated
+                    // again, and the AFTER work's follow them.
+                    Ok(()) => {
+                        invocations.begin_attempts_here();
+                        replay = match sequence::begin_replay_cursor() {
+                            Ok(replay) => replay,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        continue;
+                    }
+                    Err(error) => {
+                        if exec::is_wait(&error) {
+                            // The statement continues its steps once its AFTER
+                            // work finishes.
+                            txn.retain_write(exec::RetainedWrite {
+                                progress,
+                                invocations,
+                                replay,
+                            });
+                        }
+                        return Ok(Err(error));
+                    }
+                }
             }
             let Err(error) = outcome else {
                 return Ok(outcome);
@@ -22481,7 +22546,14 @@ impl Engine {
         capture: Option<&'capture mut ReturningCapture<'capture>>,
         snapshot_lease: &mut Option<crate::storage::StatementSnapshotLease>,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        if reset_workspace && txn.pending_write_completion.is_some() {
+        // A rule step's AFTER work resumes inside its statement's attempt
+        // loop, which then runs the steps after it.
+        if reset_workspace
+            && txn
+                .pending_write_completion
+                .as_ref()
+                .is_some_and(|completion| !completion.step())
+        {
             return exec::resume_write_completion(
                 self, txn, arena, sqlprep, cursors, guc, responder,
             );
@@ -32971,6 +33043,10 @@ struct RuleSteps<'a> {
     resumed: &'a [exec::StepRecord<'a>],
     /// Whether a step ran without progress, so the next is a new command.
     started: bool,
+    /// The enclosing write's completion boundary, when it lets the steps of
+    /// a rule-rewritten statement hand their `AFTER` work to its attempt
+    /// loop; each step runs under a boundary of its own command.
+    outer: Option<txn::WriteCompletionBoundary>,
 }
 
 impl<'a> RuleSteps<'a> {
@@ -32990,9 +33066,19 @@ impl<'a> RuleSteps<'a> {
                 txn.begin_command()?;
             }
             self.started = true;
+            // Without step progress a suspended completion could not be
+            // recorded: the step's AFTER work runs inline.
+            txn.write_completion_boundary = None;
             return Ok(None);
         };
         if progress.begin_step_at(self.level, index, true, txn, responder)? {
+            txn.write_completion_boundary = self.outer.map(|outer| txn::WriteCompletionBoundary {
+                command: txn.command_id(),
+                depth: txn.trigger_depth(),
+                statement_end: false,
+                step: true,
+                ..outer
+            });
             return Ok(None);
         }
         let record = *self.resumed.get(index).ok_or_else(|| {
@@ -33005,6 +33091,33 @@ impl<'a> RuleSteps<'a> {
             .push(record)
             .map_err(|_| query::arena_full_pub())?;
         Ok(Some(record.affected))
+    }
+
+    /// After a step ran: the enclosing boundary applies again.
+    fn end_step(&self, txn: &mut TxnState) {
+        txn.write_completion_boundary = self.outer;
+    }
+
+    /// A step that stopped with its rows written and its `AFTER` work handed
+    /// to the attempt loop is finished: the next attempt skips it.
+    fn stop_step(
+        &mut self,
+        mut progress: Option<&mut exec::RowProgress>,
+        txn: &mut TxnState,
+        error: SqlError,
+        arena: &Arena,
+        pool: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
+    ) -> SqlError {
+        self.end_step(txn);
+        if let Some(rows) = txn
+            .pending_write_completion
+            .as_mut()
+            .and_then(exec::SuspendedWriteCompletion::claim_step)
+            && let Err(error) = self.finish(progress.as_deref_mut(), rows)
+        {
+            return error;
+        }
+        self.stop(progress, error, arena, pool)
     }
 
     fn finish(

@@ -29349,6 +29349,7 @@ impl PlpgsqlExecHost<'_> {
                 depth: txn.trigger_depth(),
                 retained: true,
                 statement_end: false,
+                step: false,
             });
         }
         Ok(())
@@ -30607,6 +30608,7 @@ fn execute_nested_write<'a>(
                     depth: txn.trigger_depth(),
                     retained,
                     statement_end: false,
+                    step: false,
                 });
             responder.clear_affected_rows();
             let outcome = responder.without_query_output(|responder| {
@@ -30670,6 +30672,7 @@ fn execute_nested_write<'a>(
                     depth: txn.trigger_depth(),
                     retained,
                     statement_end: false,
+                    step: false,
                 });
             let mut scratch = storage.row_work.lease(0).map_err(|error| {
                 sql_err!(
@@ -30732,6 +30735,7 @@ fn execute_nested_write<'a>(
                     depth: txn.trigger_depth(),
                     retained,
                     statement_end: false,
+                    step: false,
                 });
             let mut scratch = storage.row_work.lease(0).map_err(|error| {
                 sql_err!(
@@ -30811,6 +30815,7 @@ fn execute_nested_write<'a>(
                     depth: txn.trigger_depth(),
                     retained,
                     statement_end: false,
+                    step: false,
                 });
             responder.clear_affected_rows();
             let outcome = responder.without_query_output(|responder| {
@@ -33098,6 +33103,7 @@ fn execute_rewritten_nested_write<'a>(
             depth: txn.trigger_depth(),
             retained,
             statement_end: false,
+            step: false,
         });
     let responder = &mut *context.responder;
     responder.clear_affected_rows();
@@ -37894,6 +37900,7 @@ fn execute_trigger_step_in<'a>(
                         depth: txn.trigger_depth(),
                         retained,
                         statement_end: false,
+                        step: false,
                     });
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {
@@ -38109,6 +38116,7 @@ fn execute_trigger_step_in<'a>(
                         depth: txn.trigger_depth(),
                         retained,
                         statement_end: false,
+                        step: false,
                     });
                 let mut scratch = storage.row_work.lease(0).map_err(|error| {
                     sql_err!(
@@ -38315,6 +38323,7 @@ fn execute_trigger_step_in<'a>(
                         depth: txn.trigger_depth(),
                         retained,
                         statement_end: false,
+                        step: false,
                     });
                 let mut scratch = storage.row_work.lease(0).map_err(|error| {
                     sql_err!(
@@ -38491,6 +38500,7 @@ fn execute_trigger_step_in<'a>(
                         depth: txn.trigger_depth(),
                         retained,
                         statement_end: false,
+                        step: false,
                     });
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {

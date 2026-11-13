@@ -95,6 +95,10 @@ pub(super) struct WriteCompletionBoundary {
     /// transaction's immediate constraint checks, so a wait in them keeps
     /// the finished AFTER events instead of running the statement again.
     pub(super) statement_end: bool,
+    /// The write is one step of a rule-rewritten statement: its suspended
+    /// completion finishes the step, and the statement runs another attempt
+    /// for the steps after it.
+    pub(super) step: bool,
 }
 
 impl TxnState {

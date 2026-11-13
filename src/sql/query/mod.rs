@@ -1245,7 +1245,6 @@ pub(crate) fn producer_yield() -> SqlError {
 pub(crate) fn read_write_query_row<'a>(
     source: &super::ast::WriteQuerySource<'_>,
     index: usize,
-    arena: &'a Arena,
 ) -> Result<ProducedRead<'a>, SqlError> {
     with_active_routine_invocations(|context| {
         let Some((invocations, statement_arena)) = context else {
@@ -1259,7 +1258,6 @@ pub(crate) fn read_write_query_row<'a>(
         // The rows live in the statement arena's retained tail, which outlives
         // every reader of the statement.
         let statement_arena: &'a Arena = unsafe { &*core::ptr::from_ref(statement_arena) };
-        let _ = arena;
         invocations.read_produced_row(source, index, statement_arena)
     })
 }
@@ -1684,6 +1682,9 @@ pub(crate) struct RoutineInvocationState {
     pub(super) execution: RoutineExecution,
     unowned_values: Cell<bool>,
     next: Cell<usize>,
+    /// Where each attempt starts replaying: past the calls of steps that
+    /// finished before an attempt ran their `AFTER` work.
+    first: Cell<usize>,
     pending: Cell<Option<PendingRoutineInvocation>>,
     pending_replay: Cell<Option<super::sequence::StatementReplayStart>>,
     /// The transaction's effects when the pending trigger firing started.
@@ -1971,6 +1972,7 @@ impl RoutineInvocationState {
             execution,
             unowned_values: Cell::new(false),
             next: Cell::new(0),
+            first: Cell::new(0),
             pending: Cell::new(None),
             pending_replay: Cell::new(None),
             pending_firing: Cell::new(None),
@@ -2333,6 +2335,12 @@ impl RoutineInvocationState {
         })
     }
 
+    /// Later attempts start replay where this one stands: the steps before
+    /// were finished and their calls are not evaluated again.
+    pub(crate) fn begin_attempts_here(&self) {
+        self.first.set(self.next.get());
+    }
+
     pub(crate) fn require_arena(&self, arena: &Arena) -> Result<(), SqlError> {
         if self.owner != arena.identity() {
             return Err(inactive_pending_call());
@@ -2351,7 +2359,7 @@ impl RoutineInvocationState {
     }
 
     pub(crate) fn begin_attempt(&self) {
-        self.next.set(0);
+        self.next.set(self.first.get());
         self.pending.set(None);
         self.pending_firing.set(None);
         self.inputs.begin_attempt();

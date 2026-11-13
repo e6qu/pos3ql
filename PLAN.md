@@ -138,11 +138,14 @@ is owned.
   sub-statements still reads synchronously); a
   statement whose restarts repeat downloads without progress reads the rest
   synchronously (`statement_restart_waits`), so it finishes with empty
-  caches. The `AFTER` work (foreign key checks included) of those steps and
+  caches. The `AFTER` work of a top-level rule-rewritten write's steps
+  yields: the step stays finished and the statement continues with the steps
+  after it. The `AFTER` work (foreign key checks included) of a data-modifying
+  `WITH` main statement's steps, of rule steps nested in a routine body, and
   of writes inside functions called from a restartable statement still reads
-  synchronously: a step's foreign key check that waited resumed the step at a
-  completion position past its last row and then waited again without a new
-  GET, a loop the download bound does not see. A data-modifying `WITH`
+  synchronously: giving those a step completion needs the same step record in
+  their enclosing write's attempt loop, which a routine body's write and the
+  `WITH` statement's steps do not hand to it yet. A data-modifying `WITH`
   `INSERT` runs as its rows are read, as PostgreSQL's CTE scan pulls its
   ModifyTable node (`src/sql/driven_insert.rs`): each read past the rows it
   returned runs one more step, which writes source rows until one returns a

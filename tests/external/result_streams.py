@@ -48,6 +48,15 @@ COPY_TABLE = "COPY result_stream_rows TO STDOUT"
 QUERIES = (
     (f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g", ROWS, ALL_PROTOCOLS, BOTH),
     ("SELECT id, payload FROM result_stream_rows", TABLE_ROWS, ALL_PROTOCOLS, BOTH),
+    # An uncorrelated IN list runs when the first row reads it and stays
+    # with the reader for the rest of the statement.
+    (
+        "SELECT id, payload FROM result_stream_rows "
+        "WHERE id % 3 IN (SELECT g FROM generate_series(0, 2) g)",
+        TABLE_ROWS,
+        ALL_PROTOCOLS,
+        BOTH,
+    ),
     # Nested-loop joins resume row by row, paged portals included.
     (
         f"SELECT g, repeat('x', 200) FROM generate_series(1, {ROWS}) g, (VALUES (1)) v",
@@ -72,6 +81,14 @@ QUERIES = (
         LOCAL_PAGED,
         LOCAL,
     ),
+    # A sorted stream keeps its uncorrelated subqueries too.
+    (
+        "SELECT id, payload FROM result_stream_rows "
+        "WHERE id > (SELECT min(g) - 1 FROM generate_series(1, 3) g) ORDER BY -id DESC",
+        TABLE_ROWS,
+        LOCAL_PAGED,
+        LOCAL,
+    ),
     # Two tables' read positions exceed the starter result_stream_bytes, so
     # this hash join spools; a paged portal would buffer more than
     # portal_result_bytes, so it is not paged here.
@@ -86,6 +103,16 @@ QUERIES = (
     # storage modes; rows must arrive as 1..n, so the key orders them.
     (
         "SELECT id, max(payload) FROM result_stream_rows GROUP BY id ORDER BY id",
+        TABLE_ROWS,
+        ALL_PROTOCOLS,
+        BOTH,
+    ),
+    # A grouping keeps its uncorrelated subqueries: they run when first read,
+    # in its filter, keys, aggregate arguments or output.
+    (
+        "SELECT id, max(payload), (SELECT count(*) FROM generate_series(1, 3) g) "
+        "FROM result_stream_rows WHERE id % 2 IN (SELECT g FROM generate_series(0, 1) g) "
+        "GROUP BY id ORDER BY id",
         TABLE_ROWS,
         ALL_PROTOCOLS,
         BOTH,

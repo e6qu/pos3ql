@@ -727,6 +727,11 @@ fn left_items<'s, 'd>(
 }
 
 impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
+    fn statement_subqueries(&self) -> &'a [crate::sql::eval::DeferredSubquery<'a>] {
+        self.enclosing
+            .map_or(&[], |enclosing| enclosing.statement_subqueries())
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         if let Some(qualifier) = self.sibling_qualifier(qualifier, name) {
             return left_items(self).lookup(qualifier, name);

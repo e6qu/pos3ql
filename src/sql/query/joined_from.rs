@@ -166,6 +166,7 @@ pub(super) fn scan_from_matches<'a>(
         subquery_expressions,
         storage,
         txid,
+        None,
         arena,
         params,
         Some(target),

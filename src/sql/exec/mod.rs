@@ -81005,7 +81005,6 @@ fn finish_instead_of_view_new_row<'a, Definition0: crate::storage::DefinitionBac
     Ok(Ok(true))
 }
 
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 /// A streamed `INSERT ... SELECT` source: the retained reader, the fixed
 /// arena block its state lives in, and the row read ahead of the writes.
 struct StreamedSource<'a> {
@@ -81143,6 +81142,7 @@ fn next_streamed_row<'a>(
     row
 }
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn insert<'a, 'scope, 'outer, 'snapshot>(
     storage: &mut Storage,
     txn: &mut TxnState,

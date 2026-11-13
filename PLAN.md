@@ -490,11 +490,11 @@ record, and only named composite types have a stored value form (a table's
 row type needs its own durable value form and key ordering first). A rule action that names its table's renamed column without
 `NEW.` or `OLD.` fails the rename with `0A000`. After a table, routine or type rename,
 `pg_get_viewdef` of a view it cannot deparse (see below) still prints the old
-names from the stored query text. A
-partition's `UNIQUE` or `PRIMARY KEY` constraint cannot be attached to
-its parent's plain unique index, so attaching such a partition builds a
-separate copy where PostgreSQL reuses the constraint's index; constraint
-indexes need a durable link to a parent index first.
+names from the stored query text. A unique
+violation is reported for the table's single-column keys first, then its
+unique indexes, then its multi-column keys, where PostgreSQL checks every
+index in creation (OID) order, so a row that breaks both a key and a later
+index can name a different constraint.
 An exclusion constraint element must be a column: an expression
 (`EXCLUDE USING gist (int4range(a, b) WITH &&)`) fails with `0A000`, since
 the stored constraint keeps no element expressions. A statement's own catalog scans, including those through views, read the

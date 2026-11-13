@@ -10238,6 +10238,28 @@ pub(crate) struct IndexMaintenanceTarget {
 }
 
 /// Includes the implicit constraint and TOAST indexes exposed by the catalogs.
+/// The index of `table`'s key or exclusion constraint `name`, the parent
+/// index it is attached to, and whether the constraint itself is a
+/// partition's copy of its parent's.
+pub(crate) fn inherited_constraint_index(
+    storage: &Storage,
+    txid: u32,
+    table: usize,
+    name: &str,
+) -> Option<(i32, i32, bool)> {
+    let mut found = None;
+    visit_indexes(storage, txid, None, |index| {
+        if index.table_slot == table
+            && index.constraint_identity.is_some()
+            && index.name.as_str() == name
+            && let Some(parent) = index.index_parent_oid
+        {
+            found = Some((index.oid, parent, index.constraint_parent.is_some()));
+        }
+    });
+    found
+}
+
 pub(crate) fn index_maintenance_target(
     storage: &Storage,
     txid: u32,

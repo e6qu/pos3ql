@@ -67505,20 +67505,66 @@ fn ensure_partition_index_in(
         pending_parent_drop_txid: None,
         ..parent
     };
-    let existing = (0..storage.index_count()).find(|slot| {
-        storage.index_table_slot_to(*slot, txn.txid) == Some(partition)
+    // PostgreSQL's `AttachPartitionEnsureIndexes` takes the partition's
+    // first equivalent index in OID order. An index created for a parent's
+    // constraint takes only the index of the same kind of partition
+    // constraint; a constraint's index is given its own slot to attach.
+    let parent_constraint = key_constraint_kind(&parent_def, parent.created_at);
+    let mut existing: Option<(i32, Option<usize>, usize)> = None;
+    for slot in 0..storage.index_count() {
+        if storage.index_table_slot_to(slot, txn.txid) != Some(partition) {
+            continue;
+        }
+        let Some(candidate) = storage.index_visible_to(slot, txn.txid) else {
+            continue;
+        };
+        let candidate = candidate.definition_for(txn.txid);
+        let definition = candidate.mutable_for(txn.txid);
+        if definition.parent.is_none()
+            && definition.kind.live()
+            && (matching == PartitionIndexMatch::AnyEquivalent || definition.kind.valid())
+            && parent_constraint
+                .is_none_or(|kind| key_constraint_kind(&table, candidate.created_at) == Some(kind))
+            && index_definitions_compatible(&copy, &candidate)
+            && existing.is_none_or(|(oid, ..)| candidate.relation_oid() < oid)
+        {
+            existing = Some((candidate.relation_oid(), Some(slot), 0));
+        }
+    }
+    let mark = arena.mark();
+    let keys = crate::sql::catalog::reindex_candidates(
+        storage,
+        txn.txid,
+        core::slice::from_ref(&partition),
+        None,
+        arena,
+    )?;
+    for (position, key) in keys.iter().enumerate() {
+        let oid = key.definition.relation_oid();
+        if !key.exclusion
             && storage
-                .index_visible_to(*slot, txn.txid)
-                .is_some_and(|candidate| {
-                    let candidate = candidate.definition_for(txn.txid);
-                    let definition = candidate.mutable_for(txn.txid);
-                    definition.parent.is_none()
-                        && definition.kind.live()
-                        && (matching == PartitionIndexMatch::AnyEquivalent
-                            || definition.kind.valid())
-                        && index_definitions_compatible(&copy, &candidate)
-                })
-    });
+                .indexes_for(table.schema.as_str(), table.name.as_str(), txn.txid)
+                .all(|index| index.created_at != key.definition.created_at)
+            && key_constraint_kind(&table, key.definition.created_at)
+                .is_some_and(|kind| parent_constraint.is_none_or(|parent| parent == kind))
+            && index_definitions_compatible(&copy, &key.definition)
+            && existing.is_none_or(|(existing, ..)| oid < existing)
+        {
+            existing = Some((oid, None, position));
+        }
+    }
+    let existing = match existing {
+        Some((_, Some(slot), _)) => Some(slot),
+        Some((_, None, position)) => Some(materialize_index_definition(
+            storage,
+            wal,
+            txn,
+            &keys[position],
+        )?),
+        None => None,
+    };
+    // SAFETY: the candidates were copied into the catalog where kept.
+    unsafe { arena.rewind_to(mark) };
     if let Some(slot) = existing {
         let mut definition = storage
             .index_visible_to(slot, txn.txid)
@@ -67561,6 +67607,32 @@ fn ensure_partition_index_in(
         )?;
     }
     Ok(())
+}
+
+/// Whether the index created at `created_at` belongs to a primary key
+/// (`Some(true)`) or unique constraint (`Some(false)`) of `table`.
+fn key_constraint_kind<B: crate::storage::DefinitionBacking>(
+    table: &crate::storage::TableDefinition<B>,
+    created_at: u64,
+) -> Option<bool> {
+    let created = |identity: Option<crate::storage::RelationIdentity>| {
+        identity.is_some_and(|identity| identity.created_at() == created_at)
+    };
+    table
+        .columns()
+        .iter()
+        .enumerate()
+        .find(|(column, metadata)| {
+            (metadata.primary || metadata.unique) && created(table.column_index_identity(*column))
+        })
+        .map(|(_, metadata)| metadata.primary)
+        .or_else(|| {
+            table
+                .uniques()
+                .iter()
+                .find(|key| created(key.index_identity))
+                .map(|key| key.kind.is_primary())
+        })
 }
 
 /// PostgreSQL's `DetachPartitionFinalize` for indexes: the detached
@@ -69713,19 +69785,8 @@ pub fn drop_index(
                     name.name
                 ));
             }
-            if let Some(table) = storage.index_table_slot_to(slot, txn.txid)
-                && attached_constraint_index(
-                    storage,
-                    &storage.table_def(table, txn.txid),
-                    definition.name_for(txn.txid).as_str(),
-                    txn.txid,
-                ) == Some(slot)
-            {
-                return sql_fail(constraint_requires_index(
-                    name.name,
-                    storage.table_def(table, txn.txid).name.as_str(),
-                ));
-            }
+            // An attached partition's index, even a constraint's, goes only
+            // with its parent index.
             if let Some(parent) = definition.mutable_for(txn.txid).parent {
                 use crate::sql::catalog::dependencies::ObjectAddress;
                 let parent = storage
@@ -69745,6 +69806,19 @@ pub fn drop_index(
                         0,
                     ),
                     arena,
+                ));
+            }
+            if let Some(table) = storage.index_table_slot_to(slot, txn.txid)
+                && attached_constraint_index(
+                    storage,
+                    &storage.table_def(table, txn.txid),
+                    definition.name_for(txn.txid).as_str(),
+                    txn.txid,
+                ) == Some(slot)
+            {
+                return sql_fail(constraint_requires_index(
+                    name.name,
+                    storage.table_def(table, txn.txid).name.as_str(),
                 ));
             }
             if build == crate::sql::ast::IndexBuildMode::Concurrent
@@ -69797,6 +69871,11 @@ pub fn drop_index(
                 }
                 return sql_ok();
             }
+            if let Err(error) =
+                drop_attached_key_constraints(storage, wal, txn, slot, cascade, responder)
+            {
+                return sql_fail(error);
+            }
             for descendant in (0..storage.index_count()).rev() {
                 if index_descends_from(storage, descendant, slot, txn.txid)
                     && let Err(error) = stage_index_drop(storage, wal, txn, descendant)
@@ -69808,6 +69887,18 @@ pub fn drop_index(
                 return sql_fail(error);
             }
         } else if let Some(table) = constraint_index_table(storage, *name, txn.txid) {
+            if let Some((index, parent, _)) =
+                crate::sql::catalog::inherited_constraint_index(storage, txn.txid, table, name.name)
+            {
+                use crate::sql::catalog::dependencies::ObjectAddress;
+                return sql_fail(dependency_report::required_by(
+                    storage,
+                    txn.txid,
+                    ObjectAddress::new(crate::sql::catalog::PG_CLASS_OID, index, 0),
+                    ObjectAddress::new(crate::sql::catalog::PG_CLASS_OID, parent, 0),
+                    arena,
+                ));
+            }
             return sql_fail(constraint_requires_index(
                 name.name,
                 storage.table_def(table, txn.txid).name.as_str(),
@@ -84930,9 +85021,91 @@ fn named_key_columns<Definition0: crate::storage::DefinitionBacking>(
     None
 }
 
-/// An attached constraint and its backing relation share the constraint
-/// name and exact key positions. This is the durable dependency proof: it
-/// survives WAL and checkpoint replay without a parallel mutable flag.
+/// A partition's key constraint whose index descends from `slot` depends on
+/// that index: `DROP INDEX` refuses it, or with `CASCADE` drops the
+/// constraint with its index, as PostgreSQL's dependency walk does.
+fn drop_attached_key_constraints(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+    cascade: bool,
+    responder: &mut Responder,
+) -> Result<(), SqlError> {
+    let mut detail = StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
+    for descendant in 0..storage.index_count() {
+        if !index_descends_from(storage, descendant, slot, txn.txid) {
+            continue;
+        }
+        let Some(table) = storage.index_table_slot_to(descendant, txn.txid) else {
+            continue;
+        };
+        let index = storage
+            .index_visible_to(descendant, txn.txid)
+            .expect("a descendant index is visible");
+        let name = index.name_for(txn.txid);
+        let (target, current) = storage.select_table_definition(table, txn.txid);
+        if attached_constraint_index(storage, &current, name.as_str(), txn.txid) != Some(descendant)
+        {
+            continue;
+        }
+        let parent = index
+            .mutable_for(txn.txid)
+            .parent
+            .and_then(|parent| storage.index_visible_to(usize::from(parent), txn.txid))
+            .expect("a descendant index has a visible parent");
+        let line = stack_format!(
+            256,
+            "constraint {} on table {} depends on index {}",
+            name.as_str(),
+            current.name.as_str(),
+            parent.name_for(txn.txid).as_str()
+        );
+        if !cascade {
+            use core::fmt::Write;
+            let separator = if detail.as_str().is_empty() { "" } else { "\n" };
+            let _ = write!(detail, "{separator}{}", line.as_str());
+            continue;
+        }
+        responder
+            .notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(
+                    160,
+                    "drop cascades to constraint {} on table {}",
+                    name.as_str(),
+                    current.name.as_str()
+                )
+                .as_str(),
+            )
+            .map_err(wire_to_sql)?;
+        let mut next = TableDefBuilder::from_definition(&current);
+        drop_dependent_foreign_keys(storage, wal, txn, table, &mut next, name.as_str(), true)?;
+        drop_named_constraint(&mut next, name.as_str());
+        txn.drop_constraint(table as u32, name)?;
+        stage_table_definition(storage, wal, txn, target, current, next)?;
+        stage_index_drop(storage, wal, txn, descendant)?;
+    }
+    if detail.as_str().is_empty() {
+        return Ok(());
+    }
+    let name = storage
+        .index_visible_to(slot, txn.txid)
+        .expect("the dropped index is visible")
+        .name_for(txn.txid);
+    crate::sql::eval::stash_diagnostic(
+        Some(detail),
+        Some(StackStr::from_str(
+            "Use DROP ... CASCADE to drop the dependent objects too.",
+        )),
+    );
+    Err(sql_err!(
+        sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+        "cannot drop index {} because other objects depend on it",
+        name.as_str()
+    ))
+}
+
 /// PostgreSQL's refusal to drop the index a constraint owns.
 fn constraint_requires_index(index: &str, table: &str) -> SqlError {
     crate::sql::eval::stash_diagnostic(
@@ -86210,8 +86383,21 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
                 PartitionInheritance::ParentAlter => child.columns[index].not_null.add_inherited(),
             };
         }
-        child.columns[index].unique |= expected.unique;
-        child.columns[index].primary |= expected.primary;
+        // A partition's equivalent single-column key constraint written as a
+        // table constraint is attached instead of gaining a second one.
+        let equivalent_key = child.uniques().iter().any(|existing| {
+            existing.columns() == [index as u16]
+                && existing.timing == crate::storage::ConstraintTiming::NotDeferrable
+                && if expected.primary {
+                    existing.kind.is_primary()
+                } else {
+                    existing.kind == crate::storage::UniqueKeyKind::UniqueNullsDistinct
+                }
+        });
+        if !equivalent_key {
+            child.columns[index].unique |= expected.unique;
+            child.columns[index].primary |= expected.primary;
+        }
         if expected.is_identity {
             child.columns[index].auto_increment = true;
             child.columns[index].is_identity = true;
@@ -86232,7 +86418,19 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
             existing.kind == constraint.kind
                 && existing.timing == constraint.timing
                 && existing.columns() == &columns[..constraint.n_cols]
-        }) {
+        }) || (constraint.n_cols == 1
+            && constraint.timing == crate::storage::ConstraintTiming::NotDeferrable
+            && match constraint.kind {
+                crate::storage::UniqueKeyKind::Primary => {
+                    child.columns[usize::from(columns[0])].primary
+                }
+                crate::storage::UniqueKeyKind::UniqueNullsDistinct => {
+                    let column = &child.columns[usize::from(columns[0])];
+                    column.unique && !column.primary
+                }
+                crate::storage::UniqueKeyKind::UniqueNullsNotDistinct => false,
+            })
+        {
             continue;
         }
         if child.n_uniques == crate::storage::MAX_UNIQUES {
@@ -90135,6 +90333,32 @@ fn alter_table_relation(
                 cascade,
             } => {
                 let attached_index = attached_constraint_index(storage, &new_def, name, txn.txid);
+                // A partition's key attached to its parent's goes only with
+                // the parent's constraint.
+                let inherited = crate::sql::catalog::inherited_constraint_index(
+                    storage,
+                    txn.txid,
+                    table_index,
+                    name,
+                );
+                if let Some((index, parent, false)) = inherited {
+                    use crate::sql::catalog::dependencies::ObjectAddress;
+                    return sql_fail(dependency_report::required_by(
+                        storage,
+                        txn.txid,
+                        ObjectAddress::new(crate::sql::catalog::PG_CLASS_OID, index, 0),
+                        ObjectAddress::new(crate::sql::catalog::PG_CLASS_OID, parent, 0),
+                        arena,
+                    ));
+                }
+                if inherited.is_some() {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_TABLE_DEFINITION,
+                        "cannot drop inherited constraint \"{}\" of relation \"{}\"",
+                        name,
+                        def.name.as_str()
+                    ));
+                }
                 if named_key_columns(&new_def, name).is_some()
                     && let Err(error) = drop_dependent_foreign_keys(
                         storage,

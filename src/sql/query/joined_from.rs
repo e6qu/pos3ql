@@ -506,6 +506,7 @@ fn project_items<'a>(
                 .and_then(|values| values.get(column).copied())
                 .unwrap_or(Datum::Null)),
             ResolvedColumn::Merged(merged) => lookup.lookup(None, scope.merged[merged].name),
+            ResolvedColumn::TableOid(table) => row.table_oid(table),
         }
     };
     let mut width = 0;

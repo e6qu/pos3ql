@@ -588,9 +588,12 @@ PostgreSQL evaluates them.
 cannot take is accepted until it runs, and the error it then reports (also
 from a cascaded `ON UPDATE CASCADE` between two composite types) has no
 position: parameters carry no source position for assignment analysis.
-A user table's `tableoid` system column fails with `0A000`
-(`SELECT tableoid::regclass FROM partitioned` names no partition); catalogs
-expose it. COPY to or from a server file or program,
+A window query, or an `UPDATE ... FROM` or `DELETE ... USING` `RETURNING`
+list, that reads the `tableoid` of a partitioned table or inheritance parent
+in a `FROM` item fails with `0A000`: those paths flatten each joined row
+without the leaf it came from (`JoinRowValues::Flat`, materialized joined
+rows); carrying the leaf oid as a hidden trailing value there fixes it.
+COPY to or from a server file or program,
 `COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
 RETURNING` a non-JSON, non-string type are rejected with `0A000`.
 A view

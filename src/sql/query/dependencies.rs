@@ -5083,6 +5083,8 @@ fn visit_resolved_column(
     };
     match resolved {
         super::ResolvedColumn::Table(table, column) => mark(table, column),
+        // A system column; the FROM item records the relation itself.
+        super::ResolvedColumn::TableOid(_) => Ok(()),
         super::ResolvedColumn::Merged(merged) => {
             for &(table, column) in scope.merged[merged].parts {
                 mark(table, column)?;

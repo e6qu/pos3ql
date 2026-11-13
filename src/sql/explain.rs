@@ -316,7 +316,7 @@ fn predicate_column(
                 }
                 match scope.find_column(*qualifier, name).ok()? {
                     query::ResolvedColumn::Table(table, column) => Some((table, column, operator)),
-                    query::ResolvedColumn::Merged(_) => None,
+                    query::ResolvedColumn::Merged(_) | query::ResolvedColumn::TableOid(_) => None,
                 }
             };
             side(left, right, *operator).or_else(|| side(right, left, reverse(*operator)))

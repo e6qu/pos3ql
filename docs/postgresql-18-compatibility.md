@@ -1010,7 +1010,13 @@ PostgreSQL physical standby cannot replay pos3ql's journal.
   tools are not provided. Row identities are not exposed as fake heap addresses.
   A query naming one of these columns of a table fails with `0A000` (`system
   column "ctid" is not supported`); as in PostgreSQL, a table column cannot
-  take a system column's name (`42701`).
+  take a system column's name (`42701`). The `tableoid` system column is
+  provided: it is the oid of the table that holds the row, so
+  `SELECT tableoid::regclass, count(*) FROM measurements GROUP BY 1` counts
+  the rows of each partition, inheritance child or foreign child. Window
+  queries and the `FROM` items of `UPDATE ... FROM` and `DELETE ... USING`
+  read it only from tables without children; over a partitioned table or an
+  inheritance parent there they fail with `0A000`.
 - PostgreSQL parallel query, JIT, and planner/executor hooks do not exist.
   Cost estimates and `EXPLAIN` text differ from PostgreSQL.
 - Logical copies are separate durable databases updated asynchronously; there

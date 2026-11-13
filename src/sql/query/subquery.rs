@@ -3861,7 +3861,8 @@ pub(crate) fn subquery_expression_type(
                 crate::sql::query::scope::ResolvedColumn::Table(table, column) => {
                     scope.defs.get(table).expect("resolved source").columns[column].user_type
                 }
-                crate::sql::query::scope::ResolvedColumn::Merged(_) => None,
+                crate::sql::query::scope::ResolvedColumn::Merged(_)
+                | crate::sql::query::scope::ResolvedColumn::TableOid(_) => None,
             };
             storage
                 .routine_type_oid(scope.output_type(entry), user_type, txid)

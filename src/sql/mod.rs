@@ -2800,6 +2800,7 @@ fn publication_row_matches(
         let result = (|| {
             let expression = parser::parse_expr(filter, arena)?;
             let row = exec::RowCtx {
+                table_oid: None,
                 def: crate::storage::RelationDefinition::from_definition(&definition),
                 values,
                 alias: None,

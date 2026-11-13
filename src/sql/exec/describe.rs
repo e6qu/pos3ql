@@ -4417,16 +4417,17 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
                 qualifier,
             ));
         }
-        self.definition
-            .column_index(name)
-            .map(|index| self.definition.columns()[index].ctype)
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" does not exist",
-                    name
-                )
-            })
+        match self.definition.column_index(name) {
+            Some(index) => Ok(self.definition.columns()[index].ctype),
+            // The written row's `tableoid` system column, also of its `old`
+            // and `new` images.
+            None if name == "tableoid" => Ok(ColType::Oid),
+            None => Err(sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" does not exist",
+                name
+            )),
+        }
     }
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
         self.resolve(qualifier, name).ok()?;

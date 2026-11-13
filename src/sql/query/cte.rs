@@ -8344,6 +8344,19 @@ fn subst_expr<'a>(
                     ctype: state.types[index],
                 }
             } else {
+                // A view exposes only its own columns: a name it does not
+                // list (a hidden base column, a system column) is not one.
+                if let (Some(written), Some(rewrite)) = (*qualifier, context.qualifier)
+                    && written == rewrite.from
+                    && !rewrite.exposed_columns.contains(name)
+                {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column {}.{} does not exist",
+                        written,
+                        name
+                    ));
+                }
                 Expr::Column {
                     qualifier: match (*qualifier, context.qualifier) {
                         (Some(written), Some(rewrite)) if written == rewrite.from => {

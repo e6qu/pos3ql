@@ -404,7 +404,7 @@ impl StoredQueryRenameScope<'_, '_> {
                         .is_none_or(|aliases| selected >= aliases.len()))
                 .then_some((self.current.slots[source], selected)))
             }
-            Ok(ResolvedColumn::Merged(_)) => Ok(None),
+            Ok(ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_)) => Ok(None),
             Err(error)
                 if matches!(
                     error.sqlstate.as_str(),
@@ -9270,8 +9270,8 @@ pub(super) fn resolve_position_target<'a>(
                         }
                         // The merged column as the star produced it. Its bare
                         // name can be ambiguous with another FROM item's column.
-                        merged @ ResolvedColumn::Merged(_) => {
-                            scope.copied_output_expression(merged, arena)
+                        entry @ (ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_)) => {
+                            scope.copied_output_expression(entry, arena)
                         }
                     };
                 }
@@ -13522,6 +13522,8 @@ fn project_row_skipping<'a>(
                             .find(|value| !value.is_null())
                             .unwrap_or(Datum::Null)
                     }
+                    // A star never expands to a system column.
+                    ResolvedColumn::TableOid(t) => row.table_oid(t).unwrap_or(Datum::Null),
                 };
                 for index in 0..scope.qualified_star_columns(q)? {
                     if n == MAX_PROJ {
@@ -13561,6 +13563,7 @@ fn project_row_skipping<'a>(
                                 .find(|v| !v.is_null())
                                 .unwrap_or(Datum::Null)
                         }
+                        ResolvedColumn::TableOid(t) => row.table_oid(t).unwrap_or(Datum::Null),
                     };
                     n += 1;
                 }
@@ -14991,7 +14994,7 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
             scope::ResolvedColumn::Table(table, column) => {
                 self.0.defs.get(table)?.columns.get(column)?.type_mod
             }
-            scope::ResolvedColumn::Merged(_) => -1,
+            scope::ResolvedColumn::Merged(_) | scope::ResolvedColumn::TableOid(_) => -1,
         };
         Some(super::exec::StaticTypeMeta {
             ctype,
@@ -15522,7 +15525,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
                 ResolvedColumn::Table(table, column) => {
                     Some(scope.defs.get(table)?.columns[column].type_mod)
                 }
-                ResolvedColumn::Merged(_) => None,
+                ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_) => None,
             }
         }
         match self.scope.find_column(qualifier, name) {
@@ -15557,7 +15560,7 @@ fn scope_column_metadata(
                 column.type_mod,
             )
         }
-        ResolvedColumn::Merged(_) => (ctype.oid(), -1),
+        ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_) => (ctype.oid(), -1),
     };
     Some(super::exec::StaticTypeMeta {
         ctype,
@@ -15577,7 +15580,7 @@ fn scope_column_type_mod(
         Ok(ResolvedColumn::Table(table, column)) => {
             scope.defs.get(table).expect("resolved").columns[column].type_mod
         }
-        Ok(ResolvedColumn::Merged(_)) => -1,
+        Ok(ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_)) => -1,
         Err(error)
             if matches!(
                 error.sqlstate.as_str(),

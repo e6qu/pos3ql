@@ -57,3 +57,23 @@ DELETE FROM fdw_mixed_parent WHERE fdw_progress_note(id) <> ''
   RETURNING id, note, fdw_progress_note(id + 2);
 SELECT count(*) FROM fdw_mixed_parent;
 ROLLBACK;
+-- tableoid names the foreign child or partition each row came from, in
+-- reads, conditions and RETURNING.
+BEGIN;
+CREATE TABLE fdw_toid_parent (id integer, note text);
+ALTER TABLE pos3ql_fdw_source INHERIT fdw_toid_parent;
+INSERT INTO fdw_toid_parent VALUES (2101, 'p1');
+INSERT INTO pos3ql_fdw_source(id, note) VALUES (2103, 'c1') RETURNING tableoid::regclass, id;
+SELECT tableoid::regclass, id, note FROM fdw_toid_parent WHERE id > 2100 ORDER BY id;
+UPDATE fdw_toid_parent SET note = note || '!' WHERE id > 2100 AND tableoid = 'pos3ql_fdw_source'::regclass
+  RETURNING tableoid::regclass, id, note;
+DELETE FROM fdw_toid_parent WHERE id > 2100 RETURNING tableoid::regclass, id;
+ROLLBACK;
+BEGIN;
+CREATE TABLE fdw_toid_part (id integer, note text) PARTITION BY RANGE (id);
+CREATE TABLE fdw_toid_local PARTITION OF fdw_toid_part FOR VALUES FROM (2000) TO (3000);
+ALTER TABLE fdw_toid_part ATTACH PARTITION pos3ql_fdw_mixed FOR VALUES FROM (0) TO (2000);
+INSERT INTO fdw_toid_part VALUES (1001, 'r'), (2001, 'l') RETURNING tableoid::regclass, id;
+SELECT tableoid::regclass, count(*) FROM fdw_toid_part GROUP BY 1 ORDER BY 1;
+DELETE FROM fdw_toid_part RETURNING tableoid::regclass, id;
+ROLLBACK;

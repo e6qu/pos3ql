@@ -1463,7 +1463,8 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
                                             name,
                                         }
                                     }
-                                    super::ResolvedColumn::Merged(_) => Expr::Column {
+                                    super::ResolvedColumn::Merged(_)
+                                    | super::ResolvedColumn::TableOid(_) => Expr::Column {
                                         qualifier: None,
                                         name: scope.output_name(entry),
                                     },

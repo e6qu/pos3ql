@@ -34,7 +34,7 @@ pub(super) fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u64> 
             Some(0)
         }
         Column { qualifier, name } => match scope.find_column(*qualifier, name).ok()? {
-            ResolvedColumn::Table(t, _) => Some(1 << t),
+            ResolvedColumn::Table(t, _) | ResolvedColumn::TableOid(t) => Some(1 << t),
             // Merged USING/NATURAL column: reads every contributing table.
             ResolvedColumn::Merged(m) => {
                 let mc = &scope.merged[m];
@@ -485,7 +485,7 @@ pub(super) fn fold_null<'a>(
                         .defs
                         .get(t)
                         .map(|d| d.columns[c].not_null.is_required()),
-                    ResolvedColumn::Merged(_) => None,
+                    ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_) => None,
                 })
                 .unwrap_or(false)
         {

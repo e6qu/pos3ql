@@ -2262,7 +2262,9 @@ pub(super) fn preserve_projection_type_identities(
                 )
                 .map(|metadata| metadata.type_oid)
                 .ok_or_else(shape_error),
-            super::ResolvedColumn::Merged(_) => Ok(scope.output_type(entry).oid()),
+            super::ResolvedColumn::Merged(_) | super::ResolvedColumn::TableOid(_) => {
+                Ok(scope.output_type(entry).oid())
+            }
         }
     };
     let mut output = 0usize;

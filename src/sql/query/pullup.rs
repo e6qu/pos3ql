@@ -1141,6 +1141,12 @@ fn inner_column<'a>(
                 name: scope.defs.column_name(table, column),
             })
             .map_err(|_| Stop::full())?),
+        ResolvedColumn::TableOid(table) => Ok(&*arena
+            .alloc(Expr::Column {
+                qualifier: Some(renamed[table]),
+                name: "tableoid",
+            })
+            .map_err(|_| Stop::full())?),
         ResolvedColumn::Merged(_) => Err(Stop::Keep),
     }
 }

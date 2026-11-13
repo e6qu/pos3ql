@@ -882,6 +882,7 @@ pub(crate) fn index_key_collations(
 ) -> Result<[crate::sql::ast::Collation; crate::storage::MAX_INDEX_COLS], SqlError> {
     let mut collations = [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS];
     let row = RowCtx {
+        table_oid: None,
         def: crate::storage::RelationDefinition::from_definition(def),
         values: &[],
         alias: None,
@@ -920,6 +921,7 @@ pub(crate) fn index_key_values<'a>(
                 arena,
                 crate::sql::eval::NO_PARAMS,
                 &RowCtx {
+                    table_oid: None,
                     def: crate::storage::RelationDefinition::from_definition(def),
                     values: row,
                     alias: None,
@@ -1447,6 +1449,7 @@ pub(crate) fn index_predicate_matches(
         arena,
         crate::sql::eval::NO_PARAMS,
         &RowCtx {
+            table_oid: None,
             def: crate::storage::RelationDefinition::from_definition(def),
             values,
             alias: None,
@@ -2442,6 +2445,7 @@ fn check_row_checks(
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<(), SqlError> {
     let context = RowCtx {
+        table_oid: None,
         def: crate::storage::RelationDefinition::from_definition(def),
         values,
         alias: None,
@@ -2634,6 +2638,7 @@ fn enforce_exclusion_constraint(
             return Ok(true);
         };
         let context = RowCtx {
+            table_oid: None,
             def: crate::storage::RelationDefinition::from_definition(def),
             values: row,
             alias: None,
@@ -3355,6 +3360,7 @@ pub(crate) fn validate_check_constraint(
                 arena,
                 &mut |_, values| {
                     let context = RowCtx {
+                        table_oid: None,
                         def: crate::storage::RelationDefinition::from_definition(definition),
                         values,
                         alias: None,

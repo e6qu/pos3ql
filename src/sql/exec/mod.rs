@@ -66293,9 +66293,10 @@ pub fn create_index(
             };
             expression_refs[i] = Some(index_column.expression);
             match catalog_column_type(storage, txn.txid, type_oid) {
-                // Expression keys are stored in the row encoding, which keeps
-                // row values only as columns of a named composite type.
-                Some((ColType::Record | ColType::Composite(_), _)) => {
+                // A named composite key, the whole row `(t)` included, is
+                // stored like a composite column; an anonymous record has no
+                // stored form or ordering.
+                Some((ColType::Record, _) | (ColType::Composite(_), None)) => {
                     // A whole row of an unknown relation is the analysis
                     // error PostgreSQL reports first.
                     fn unknown_whole_row(
@@ -66323,9 +66324,16 @@ pub fn create_index(
                             index_column.expression,
                         ));
                     }
+                    // PostgreSQL's index column name: a call's function name,
+                    // `expr` for other expressions.
+                    let name = match describe::derived_name(index_column.expression) {
+                        "?column?" => "expr",
+                        name => name,
+                    };
                     return sql_fail(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "index expressions of a row type are not supported"
+                        sqlstate::INVALID_TABLE_DEFINITION,
+                        "column \"{}\" has pseudo-type record",
+                        name
                     ));
                 }
                 Some((ctype, user_type)) => {

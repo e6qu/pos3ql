@@ -1691,11 +1691,11 @@ fn collect_index_constraints<'a, Resolve, Invariant>(
         if !operand_is_invariant(operand) {
             return false;
         }
-        let Some(index) = resolve_column(column) else {
+        // A whole row binds no column constraint.
+        let Some(set) = resolve_column(column).and_then(|index| constraints.get_mut(index)) else {
             return false;
         };
         let replacement = IndexConstraint { operand, operator };
-        let set = &mut constraints[index];
         match operator {
             BinaryOp::Eq => {
                 set.equality.get_or_insert(replacement);
@@ -1718,6 +1718,28 @@ fn collect_index_constraints<'a, Resolve, Invariant>(
     }
 }
 
+/// What a key resolver answers for a whole-row reference to the scanned
+/// table, which only a whole-row index key `(t)` matches.
+const WHOLE_ROW_KEY: usize = usize::MAX;
+
+/// [`WHOLE_ROW_KEY`] when `expression` reads the whole row of scope entry
+/// `table`: `t.*`, or a bare `t` that names no column.
+fn scope_whole_row(scope: &QueryScope<'_>, table: usize, expression: &Expr<'_>) -> Option<usize> {
+    let name = match expression {
+        Expr::WholeRow(name) => name,
+        Expr::Column {
+            qualifier: None,
+            name,
+        } if scope.find_column(None, name).is_err() => name,
+        _ => return None,
+    };
+    let source = scope.source(name).ok()?;
+    (source.table == table
+        && source.first == 0
+        && source.n_columns == scope.defs.get(table)?.n_columns)
+        .then_some(WHOLE_ROW_KEY)
+}
+
 fn index_expression_matches<'a, Resolve>(
     stored: &Expr<'_>,
     candidate: &Expr<'a>,
@@ -1731,6 +1753,7 @@ where
         return true;
     }
     match (stored, candidate) {
+        (Expr::WholeRow(_), candidate) => resolve_candidate(candidate) == Some(WHOLE_ROW_KEY),
         (Expr::Column { name: stored, .. }, candidate @ Expr::Column { .. }) => {
             definition.column_index(stored) == resolve_candidate(candidate)
         }
@@ -2206,6 +2229,25 @@ where
         for query in queries.iter().flatten() {
             collect_index_constraints(query, &mut resolve_key, operand_is_invariant, &mut by_key);
         }
+        // An untyped literal compared with a whole row fails as the query
+        // evaluates it; the key probe must not coerce it first.
+        for (position, expression) in expressions[..index.n_cols].iter().enumerate() {
+            if matches!(expression, Some(Expr::WholeRow(_))) {
+                let set = &mut by_key[position];
+                for constraint in [
+                    &mut set.equality,
+                    &mut set.lower,
+                    &mut set.upper,
+                    &mut set.inclusion,
+                ] {
+                    if constraint
+                        .is_some_and(|constraint| matches!(constraint.operand, Expr::Str(_)))
+                    {
+                        *constraint = None;
+                    }
+                }
+            }
+        }
         let mut constraints = [None; MAX_INDEX_COLS];
         let mut additional_constraints = [None; MAX_INDEX_COLS];
         let mut n_constraints = 0usize;
@@ -2472,6 +2514,9 @@ pub(crate) fn index_access_plan<'a>(
     }
     let mut by_column = [IndexConstraintSet::EMPTY; MAX_COLUMNS];
     let mut resolve_column = |expression: &Expr<'a>| {
+        if let Some(key) = scope_whole_row(scope, 0, expression) {
+            return Some(key);
+        }
         let Expr::Column { qualifier, name } = expression else {
             return None;
         };
@@ -2567,6 +2612,9 @@ pub(crate) fn parameterized_index_access_plan<'a>(
     let target_bit = 1u64 << table;
     let mut by_column = [IndexConstraintSet::EMPTY; MAX_COLUMNS];
     let mut resolve_column = |expression: &Expr<'a>| {
+        if let Some(key) = scope_whole_row(scope, table, expression) {
+            return Some(key);
+        }
         let Expr::Column { qualifier, name } = expression else {
             return None;
         };
@@ -2756,6 +2804,9 @@ pub(crate) fn ordered_index_access_plan<'a>(
     }
     let mut by_column = [IndexConstraintSet::EMPTY; MAX_COLUMNS];
     let mut resolve_column = |expression: &Expr<'a>| {
+        if let Some(key) = scope_whole_row(scope, 0, expression) {
+            return Some(key);
+        }
         let Expr::Column { qualifier, name } = expression else {
             return None;
         };
@@ -2783,7 +2834,9 @@ pub(crate) fn ordered_index_access_plan<'a>(
         let expression =
             super::resolve_order_target(requested.expression, items, scope, arena, storage, txid)?;
         order_targets[position] = expression;
-        order_columns[position] = resolve_column(expression).map(|column| column as u16);
+        order_columns[position] = resolve_column(expression)
+            .filter(|column| *column != WHOLE_ROW_KEY)
+            .map(|column| column as u16);
     }
 
     let slot = scope.slots[0];
@@ -3008,6 +3061,23 @@ pub(crate) fn dml_index_access_plan<'a>(
     }
     let mut by_column = [IndexConstraintSet::EMPTY; MAX_COLUMNS];
     let mut resolve_column = |expression: &Expr<'a>| {
+        let answers = |qualifier: &str| {
+            crate::sql::eval::qualifier_answers_target(
+                crate::storage::RelationDefinition::from_definition(definition),
+                alias,
+                qualifier,
+            )
+        };
+        match expression {
+            Expr::WholeRow(name) if answers(name) => return Some(WHOLE_ROW_KEY),
+            Expr::Column {
+                qualifier: None,
+                name,
+            } if definition.column_index(name).is_none() && answers(name) => {
+                return Some(WHOLE_ROW_KEY);
+            }
+            _ => {}
+        }
         let Expr::Column { qualifier, name } = expression else {
             return None;
         };

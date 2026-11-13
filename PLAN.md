@@ -466,10 +466,7 @@ one of them names fails with `0A000`, as does renaming an enum value any
 stored expression casts to; binding them follows the same dependency-list
 pattern. Renaming an enum value that a cast literal in a SQL-standard routine
 body spells (`RETURN 'a'::e`) leaves the body spelling the old label, so the
-call fails with `22P02`. An index key whose value is a whole row
-(`CREATE INDEX ON t ((t))`) fails with `0A000`: evaluation yields an anonymous
-record, and only named composite types have a stored value form (a table's
-row type needs its own durable value form and key ordering first). A rule action that names its table's renamed column without
+call fails with `22P02`. A rule action that names its table's renamed column without
 `NEW.` or `OLD.` fails the rename with `0A000`. After a table, routine or type rename,
 `pg_get_viewdef` of a view it cannot deparse (see below) still prints the old
 names from the stored query text.
@@ -533,7 +530,12 @@ columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1
 FROM (SELECT 10 / t.x) s)` fails with division by zero on a zero `x` where
 PostgreSQL, which drops unread subquery outputs, returns the row. A
 whole-row reference to a table (`SELECT t FROM t`) is typed `record`, where
-PostgreSQL types it as the table's row type `t`. A row constructor casts to a table's row type
+PostgreSQL types it as the table's row type `t`, so comparing one with an
+untyped literal (`WHERE t = '(1,a)'`) fails with `42883` where PostgreSQL
+reports `0A000`; whole-row index keys (`CREATE INDEX ON t ((t))`) do have the
+row type. An index scan on such a key needs a constant operand
+(`'(1,a)'::t`): `ROW(1, 'a')::t` is a call the planner does not fold, so it
+scans the table where PostgreSQL uses the index. A row constructor casts to a table's row type
 (`ROW(1, 'a')::t`) but not to a view's, and an array of a table's row type
 (`ARRAY[ROW(1, 'a')::t]`) fails with `0A000`, where PostgreSQL accepts both.
 A PL/pgSQL variable declared with a view's row type (`r v;` or

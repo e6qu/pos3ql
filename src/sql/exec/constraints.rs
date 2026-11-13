@@ -928,6 +928,18 @@ pub(crate) fn index_key_values<'a>(
             )?,
             None => row[columns[position] as usize],
         };
+        // A named composite key, such as a whole row `(t)`, is kept in the
+        // stored form a composite column has.
+        if let Datum::Composite { slot, .. } = keys[position] {
+            keys[position] = Datum::CompositeText {
+                slot,
+                physical_fields: (storage
+                    .require_row_type_definition(slot, txid)?
+                    .physical_field_count() as u16)
+                    | rowenc::COMPOSITE_MEMBER_IDENTITIES,
+                text: super::composite_storage_text(keys[position], slot, storage, txid, arena)?,
+            };
+        }
     }
     Ok(keys)
 }

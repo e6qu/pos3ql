@@ -395,10 +395,7 @@ fn resolve_set_order(
             }
         };
         if columns[index].collation_derivation == CollationDerivation::Indeterminate {
-            return Err(sql_err!(
-                sqlstate::INDETERMINATE_COLLATION,
-                "could not determine which collation to use for string comparison"
-            ));
+            return Err(crate::sql::eval::indeterminate_string_comparison());
         }
         reject_missing_ordering(columns[index].type_oid)?;
         keys[count] = (index, order.descending, order.nulls_first);
@@ -1057,6 +1054,65 @@ pub(super) fn collect_set_leaves<'a>(
     }
 }
 
+/// Visits each branch of a set operation in order, analysing each later
+/// branch with the earlier ones as `*SELECT* n` in reach of a missing
+/// column's spelling suggestion (see [`crate::sql::column_suggestion::with_set_branches`]).
+/// A `VALUES` list's rows are not branches.
+pub(super) fn visit_set_branches<'a, 'o>(
+    tree: &'a SetTree<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'o>>,
+    visit: &mut dyn FnMut(&'a Select<'a>) -> Result<(), SqlError>,
+) -> Result<(), SqlError>
+where
+    'a: 'o,
+{
+    let mut leaves = ArenaList::new(arena);
+    collect_set_leaves(tree, &mut leaves)?;
+    let leaves = leaves.as_slice();
+    let mut joins = ArenaList::new(arena);
+    collect_set_joins(tree, None, &mut joins)?;
+    let joins = joins.as_slice();
+    let branches = arena
+        .alloc_slice_with(leaves.len(), |_| ("", &[] as &[&str]))
+        .map_err(|_| arena_full())?;
+    for (index, leaf) in leaves.iter().enumerate() {
+        if index == 0 || matches!(joins[index], Some(SetJoin::Values)) {
+            visit(leaf)?;
+        } else {
+            crate::sql::column_suggestion::with_set_branches(&branches[..index], || visit(leaf))?;
+        }
+        if index + 1 < leaves.len() {
+            let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+            let mut types = [0; MAX_PROJ];
+            let count = describe_leaf(storage, leaf, txid, &mut columns, arena, &mut types, outer)?;
+            branches[index] = earlier_branch(index + 1, &columns[..count], arena)?;
+        }
+    }
+    Ok(())
+}
+
+/// An earlier set-operation branch as PostgreSQL names it in the range
+/// table: `*SELECT* n` with the branch's output column names.
+fn earlier_branch<'a>(
+    number: usize,
+    columns: &[ColDesc<'_>],
+    arena: &'a Arena,
+) -> Result<(&'a str, &'a [&'a str]), SqlError> {
+    let name = arena
+        .alloc_str_display(format_args!("*SELECT* {number}"))
+        .map_err(|_| arena_full())?;
+    let names = arena
+        .alloc_slice_with(columns.len(), |_| "")
+        .map_err(|_| arena_full())?;
+    for (target, column) in names.iter_mut().zip(columns) {
+        *target = arena.alloc_str(column.name).map_err(|_| arena_full())?;
+    }
+    Ok((name, names))
+}
+
 /// The set operation that combines a leaf with the leaves before it, which
 /// names it in PostgreSQL's errors.
 #[derive(Clone, Copy)]
@@ -1695,10 +1751,23 @@ where
             )
         };
     }
+    // Each later branch sees the earlier ones as `*SELECT* n` (see
+    // `visit_set_branches`).
+    let branches = arena
+        .alloc_slice_with(leaves.len(), |_| ("", &[] as &[&str]))
+        .map_err(|_| arena_full())?;
+    branches[0] = earlier_branch(1, &columns[..n_cols], arena)?;
     for (leaf_index, leaf) in leaves[1..].iter().enumerate() {
         let mut lc = [ColDesc::new("", 0, 0); MAX_PROJ];
-        let ln = describe_leaf(storage, leaf, txid, &mut lc, arena, &mut leaf_types, outer)?;
         let join = joins[leaf_index + 1];
+        let mut describe =
+            || describe_leaf(storage, leaf, txid, &mut lc, arena, &mut leaf_types, outer);
+        let ln = if matches!(join, Some(SetJoin::Values)) {
+            describe()?
+        } else {
+            crate::sql::column_suggestion::with_set_branches(&branches[..leaf_index + 1], describe)?
+        };
+        branches[leaf_index + 1] = earlier_branch(leaf_index + 2, &lc[..ln], arena)?;
         if ln != n_cols {
             let error = match join {
                 Some(SetJoin::Values) => sql_err!(
@@ -1728,7 +1797,14 @@ where
                 identical_mods[c] = false;
             }
             if unknown {
-                continue; // an untyped NULL column adopts the running type
+                // An untyped column adopts the running type. A set operation
+                // resolves each pair of inputs as it combines them, so two
+                // untyped inputs become text before a later input is seen;
+                // a VALUES list resolves all its rows at once.
+                if target[c].is_none() && !matches!(join, Some(SetJoin::Values)) {
+                    target[c] = Some(ColType::Text);
+                }
+                continue;
             }
             leaf_collations[(leaf_index + 1) * n_cols + c] = SetColumnCollation {
                 value: lc[c].collation,
@@ -1764,6 +1840,27 @@ where
     }
     // A column that stayed unknown across every branch (all NULL) is text.
     let target: [ColType; MAX_PROJ] = core::array::from_fn(|c| target[c].unwrap_or(ColType::Text));
+    // PostgreSQL coerces each branch's unknown literal to the column's type
+    // while analysing the query, positioned at the literal.
+    for leaf in leaves {
+        if leaf.set_body.is_some()
+            || leaf
+                .items
+                .iter()
+                .any(|item| !matches!(item, SelectItem::Expr { .. }))
+        {
+            continue;
+        }
+        for (item, ctype) in leaf.items.iter().zip(&target[..n_cols]) {
+            if let SelectItem::Expr {
+                expression: Expr::Str(literal),
+                ..
+            } = item
+            {
+                super::convert_literal(literal, Some(*ctype), arena)?;
+            }
+        }
+    }
     if set_tree_requires_equality(tree) {
         for ctype in &target[..n_cols] {
             if missing_equality(*ctype) {
@@ -2174,10 +2271,7 @@ pub(crate) fn sort_set_rows(
             }
         };
         if columns[index].collation_derivation == CollationDerivation::Indeterminate {
-            return Err(sql_err!(
-                sqlstate::INDETERMINATE_COLLATION,
-                "could not determine which collation to use for string comparison"
-            ));
+            return Err(crate::sql::eval::indeterminate_string_comparison());
         }
         reject_missing_ordering(columns[index].type_oid)?;
         keys[nk] = (index, ob.descending, ob.nulls_first);

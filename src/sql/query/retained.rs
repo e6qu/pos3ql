@@ -527,6 +527,20 @@ fn statement_sublinks<'a>(
         if !super::subquery::stable_uncorrelated(node, storage, txid, arena) {
             return Ok(None);
         }
+        let (Expr::Subquery(select)
+        | Expr::Exists(select)
+        | Expr::ArraySubquery(select)
+        | Expr::RowSubquery { select, .. }
+        | Expr::InSubquery { select, .. }
+        | Expr::QuantifiedSubquery { select, .. }) = node
+        else {
+            return Ok(None);
+        };
+        // A view in FROM is expanded only by the general executor as the
+        // subquery runs; that statement runs there and reports its own errors.
+        if !super::subquery::select_from_resolves(select, storage, txid, arena)? {
+            return Ok(None);
+        }
     }
     Ok(Some(nodes.as_slice()))
 }
@@ -1826,6 +1840,7 @@ fn appended_select<'a>(
             set_body: None,
             locking: &[],
             windows: &[],
+            written: crate::sql::ast::WrittenQuery::PLAIN,
         })
         .map_err(|_| arena_full())?;
     Ok(Some(&*wrapper))
@@ -1911,6 +1926,7 @@ pub(crate) fn set_query_select<'a>(
             set_body: Some(query.body),
             locking: query.locking,
             windows: &[],
+            written: crate::sql::ast::WrittenQuery::PLAIN,
         })
         .map(|select| &*select)
         .map_err(|_| arena_full())
@@ -3180,6 +3196,7 @@ impl<'a> RetainedSelect<'a> {
             }
         };
         check_select_types(statement, &scope, storage, txid, arena, None)?;
+        super::check_key_types(statement, &scope, arena, storage, txid)?;
         check_select_constants(statement, arena, storage, txid)?;
         super::require_select_routine_execute(statement, &scope, arena, storage, txid)?;
         let locking = if locks {
@@ -3187,7 +3204,6 @@ impl<'a> RetainedSelect<'a> {
                 return Ok(None);
             }
             super::validate_locking(statement, storage, txid, arena)?;
-            super::check_key_types(statement, &scope, arena, storage, txid)?;
             arena
                 .alloc_slice_copy(statement.locking)
                 .map_err(|_| arena_full())?
@@ -3261,6 +3277,15 @@ impl<'a> RetainedSelect<'a> {
         let predicate = statement
             .where_clause
             .map(|predicate| {
+                let predicate = plan::fold_catalog_inputs(
+                    predicate,
+                    arena,
+                    params,
+                    &EvalHooks {
+                        catalog: Some(&catalog),
+                        ..super::super::eval::NO_HOOKS
+                    },
+                )?;
                 // A grouping filters its input as the general executor's
                 // scan does, with the same planning-time folding.
                 if mode == RetainedMode::Statement && aggregates.is_none() {
@@ -3617,6 +3642,15 @@ impl<'a> RetainedSelect<'a> {
         let predicate = statement
             .where_clause
             .map(|predicate| {
+                let predicate = plan::fold_catalog_inputs(
+                    predicate,
+                    arena,
+                    params,
+                    &EvalHooks {
+                        catalog: Some(&catalog),
+                        ..super::super::eval::NO_HOOKS
+                    },
+                )?;
                 // A grouping filters its input as the general executor's
                 // scan does, with the same planning-time folding.
                 if mode == RetainedMode::Statement && aggregates.is_none() {

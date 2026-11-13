@@ -27,6 +27,8 @@ pub(super) struct Site<'a> {
     pub position: usize,
     pub text: &'a str,
     pub exception_variables: bool,
+    /// How many routine parameters the text names `$1` onwards.
+    pub positionals: u32,
 }
 
 struct Capture<'a> {
@@ -122,6 +124,7 @@ fn record_with(
                 position: start,
                 text,
                 exception_variables,
+                positionals: super::parser::procedural_positionals(),
             })
             .map_err(|_| super::query::arena_full_pub())
     })
@@ -161,8 +164,14 @@ pub(super) fn parse<'a>(
     row: &dyn super::eval::ColumnLookup<'a>,
     relations: Option<&'a [(&'a str, &'a super::ast::MaterializedCte<'a>)]>,
     arena: &'a Arena,
-    mut dependencies: Option<&mut crate::storage::StoredQueryDependencies>,
+    dependencies: Option<&mut crate::storage::StoredQueryDependencies>,
 ) -> Result<super::parser::Parser<'a>, SqlError> {
+    let mut dependencies = dependencies;
+    // Only the site's own text names the routine's parameters `$n`; what
+    // analysing it reads (stored views and routines) does not.
+    let positional = |parse: &mut dyn FnMut() -> Result<(), SqlError>| {
+        super::parser::with_procedural_positionals(site.positionals, parse)
+    };
     let mut parser = super::parser::Parser::new(site.text, arena)
         .map_err(|error| super::parse_error_to_sql(&error))?;
     parser.capture_type_inputs();
@@ -173,9 +182,16 @@ pub(super) fn parse<'a>(
     };
     match site.kind {
         Kind::Expression => {
-            let expression = parser
-                .expression(0)
-                .map_err(|error| super::parse_error_to_sql(&error))?;
+            let mut parsed = None;
+            positional(&mut || {
+                parsed = Some(
+                    parser
+                        .expression(0)
+                        .map_err(|error| super::parse_error_to_sql(&error))?,
+                );
+                Ok(())
+            })?;
+            let expression = parsed.expect("parsed site expression");
             let expression = match relations {
                 Some(relations) => super::query::bind_materialized_expression(
                     expression, relations, storage, txid, arena,
@@ -196,10 +212,17 @@ pub(super) fn parse<'a>(
                 )?;
             }
         }
-        Kind::Query | Kind::Statement => {
-            while let Some(statement) = parser
-                .next_stmt()
-                .map_err(|error| super::parse_error_to_sql(&error))?
+        Kind::Query | Kind::Statement => loop {
+            let mut next = None;
+            positional(&mut || {
+                next = parser
+                    .next_stmt()
+                    .map_err(|error| super::parse_error_to_sql(&error))?;
+                Ok(())
+            })?;
+            let Some(statement) = next else {
+                break;
+            };
             {
                 let statement = arena
                     .alloc(statement)
@@ -224,7 +247,7 @@ pub(super) fn parse<'a>(
                     )?;
                 }
             }
-        }
+        },
     }
     Ok(parser)
 }

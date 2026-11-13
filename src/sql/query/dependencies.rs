@@ -30,6 +30,9 @@ struct CollectionContext<'a> {
     bindings: Option<crate::storage::StoredQueryDependencyView<'a>>,
     /// The query levels enclosing a subquery, which its outer references name.
     enclosing: Option<&'a dyn EnclosingColumns>,
+    /// A rewrite rule's action, whose `RETURNING` list names the rule's OLD
+    /// and NEW rather than the written row's images.
+    rule_action: bool,
 }
 
 /// The columns of the query levels around a subquery.
@@ -49,6 +52,8 @@ trait EnclosingColumns {
 /// so a reference that resolves nowhere may belong to it.
 struct EnclosingLevel<'s, 'd, 'a> {
     scope: Option<&'s super::QueryScope<'d>>,
+    /// A RETURNING list's `old` and `new` names and the target they read.
+    returning: Option<([&'s str; 2], &'s str)>,
     parent: Option<&'s dyn EnclosingColumns>,
     /// Columns its subqueries read before the level's own relations are
     /// recorded, which the level marks once they are.
@@ -65,6 +70,10 @@ impl EnclosingColumns for EnclosingLevel<'_, '_, '_> {
     ) -> Result<bool, SqlError> {
         let Some(scope) = self.scope else {
             return Ok(true);
+        };
+        let qualifier = match (qualifier, self.returning) {
+            (Some(written), Some((aliases, target))) if aliases.contains(&written) => Some(target),
+            _ => qualifier,
         };
         if let Ok(resolved) =
             crate::sql::error_position::preserving_pending(|| scope.find_column(qualifier, name))
@@ -98,6 +107,7 @@ impl<'a> CollectionContext<'a> {
             transition: None,
             bindings,
             enclosing: None,
+            rule_action: false,
         }
     }
 
@@ -107,6 +117,7 @@ impl<'a> CollectionContext<'a> {
             transition: Some(transition),
             bindings: None,
             enclosing: None,
+            rule_action: false,
         }
     }
 
@@ -503,7 +514,10 @@ pub(super) fn collect_rule_actions(
             txid,
             &mut dependencies,
             arena,
-            CollectionContext::with_columns(&path, transition),
+            CollectionContext {
+                rule_action: true,
+                ..CollectionContext::with_columns(&path, transition)
+            },
         )?;
     }
     Ok(dependencies)
@@ -855,11 +869,12 @@ fn collect_statement(
     let no_excluded: Option<(usize, crate::storage::RelationDefinition<'_>)> = None;
     macro_rules! collect_expr {
         ($expression:expr, $scope:expr, $excluded:expr) => {{
-            collect_expression(
+            collect_dml_expression(
                 $expression,
+                $scope,
+                None,
                 storage,
                 txid,
-                CteNames::EMPTY,
                 dependencies,
                 arena,
                 context,
@@ -1124,6 +1139,11 @@ fn collect_statement(
                     if let SelectItem::Expr { expression, .. }
                     | SelectItem::RecordStar(expression) = item
                     {
+                        // In a rule action, OLD and NEW name the rule's rows.
+                        if context.rule_action {
+                            collect_expr!(expression, Some(&scope), no_excluded)?;
+                            continue;
+                        }
                         collect_returning_expression(
                             expression,
                             update.returning,
@@ -1192,6 +1212,11 @@ fn collect_statement(
                     if let SelectItem::Expr { expression, .. }
                     | SelectItem::RecordStar(expression) = item
                     {
+                        // In a rule action, OLD and NEW name the rule's rows.
+                        if context.rule_action {
+                            collect_expr!(expression, Some(&scope), no_excluded)?;
+                            continue;
+                        }
                         collect_returning_expression(
                             expression,
                             delete.returning,
@@ -1357,6 +1382,46 @@ fn collect_dml_routine_calls_with_output<'a>(
     Ok(())
 }
 
+/// Collects a data-modifying statement's expression, whose subqueries'
+/// outer references name the statement's own relations (`scope`).
+#[expect(clippy::too_many_arguments, reason = "dependency collection context")]
+fn collect_dml_expression<'a>(
+    expression: &'a Expr<'a>,
+    scope: Option<&super::QueryScope<'_>>,
+    returning: Option<([&str; 2], &str)>,
+    storage: &Storage,
+    txid: u32,
+    dependencies: &mut StoredQueryDependencies,
+    arena: &Arena,
+    context: CollectionContext<'_>,
+) -> Result<(), SqlError> {
+    let level = EnclosingLevel {
+        scope,
+        returning,
+        parent: context.enclosing,
+        deferred: core::cell::RefCell::new(crate::mem::arena::ArenaList::new(arena)),
+    };
+    collect_expression(
+        expression,
+        storage,
+        txid,
+        CteNames::EMPTY,
+        dependencies,
+        arena,
+        CollectionContext {
+            enclosing: Some(&level),
+            ..context
+        },
+    )?;
+    // The statement's relations are recorded with its own references.
+    for &(class, slot, column) in level.deferred.borrow().as_slice() {
+        if dependencies.depends_on(class, slot) {
+            dependencies.mark_referenced_column(class, slot, column)?;
+        }
+    }
+    Ok(())
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "RETURNING dependency collection needs the explicit DML analysis boundary"
@@ -1373,16 +1438,17 @@ fn collect_returning_expression<'a>(
     arena: &Arena,
     context: CollectionContext<'a>,
 ) -> Result<(), SqlError> {
-    collect_expression(
+    let aliases = [returning.old_name(), returning.new_name()];
+    collect_dml_expression(
         expression,
+        Some(scope),
+        Some((aliases, target_qualifier)),
         storage,
         txid,
-        CteNames::EMPTY,
         dependencies,
         arena,
         context,
     )?;
-    let aliases = [returning.old_name(), returning.new_name()];
     record_column_references(
         expression,
         scope,
@@ -1535,10 +1601,12 @@ pub(crate) fn validate_dml_assignment_casts(
                 validate_assignment_expression(
                     expression,
                     Some(name),
+                    AssignmentTarget::Update,
                     &target.columns()[index],
                     &columns,
                     storage,
                     txid,
+                    arena,
                 )
             };
         // An INSERT's VALUES rows read no relation, only the enclosing
@@ -1567,10 +1635,12 @@ pub(crate) fn validate_dml_assignment_casts(
                     validate_assignment_expression(
                         expression,
                         names.get(index).copied(),
+                        AssignmentTarget::Insert,
                         column,
                         columns,
                         storage,
                         txid,
+                        arena,
                     )?;
                 }
             }
@@ -1991,6 +2061,7 @@ fn validate_insert_projection(
             if validate_subscript_assignment(
                 expression,
                 target_name,
+                AssignmentTarget::Insert,
                 column,
                 &mut source_of,
                 storage,
@@ -2046,8 +2117,8 @@ fn validate_insert_projection(
             let Some(column) = target else {
                 return Ok(());
             };
-            validate_assignment_type(source, column, storage, txid).map_err(
-                |error| match expression {
+            validate_assignment_type(source, column, storage, txid).map_err(|error| {
+                match expression {
                     Some(expression) => {
                         crate::sql::error_position::at_expression(error, expression)
                     }
@@ -2056,8 +2127,14 @@ fn validate_insert_projection(
                         Some(item) => crate::sql::error_position::at_item(error, item),
                         None => error,
                     },
-                },
-            )
+                }
+            })?;
+            match expression {
+                Some(expression) => {
+                    validate_assigned_literal(expression, column, storage, txid, arena)
+                }
+                None => Ok(()),
+            }
         },
     )
 }
@@ -2556,16 +2633,23 @@ pub(crate) fn visit_projection_types(
 }
 
 /// PostgreSQL's assignment analysis (`transformAssignedExpr`) of one target:
-/// the value must coerce to the column's type in assignment context. A
+/// the value must coerce to the column's type in assignment context, and an
+/// unknown-type literal converts with the column type's input routine. A
 /// subscripted target checks each assigned value against the element type
 /// (or the container type for a slice or jsonb), positioned at the target.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the target, its column and the catalog that resolves the value"
+)]
 fn validate_assignment_expression(
     expression: &Expr<'_>,
     target_name: Option<&str>,
+    target: AssignmentTarget,
     column: &crate::storage::ColumnMeta,
     columns: &dyn ColTypeResolver,
     storage: &Storage,
     txid: u32,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     if matches!(expression, Expr::DefaultMarker) {
         return Ok(());
@@ -2575,6 +2659,7 @@ fn validate_assignment_expression(
     if validate_subscript_assignment(
         expression,
         target_name,
+        target,
         column,
         &mut source_of,
         storage,
@@ -2588,7 +2673,47 @@ fn validate_assignment_expression(
         storage,
         txid,
     )
-    .map_err(|error| crate::sql::error_position::at_expression(error, expression))
+    .map_err(|error| crate::sql::error_position::at_expression(error, expression))?;
+    validate_assigned_literal(expression, column, storage, txid, arena)
+}
+
+/// An UNKNOWN literal assigned to a column runs the column type's input
+/// routine while the statement is analysed, before any row is read.
+fn validate_assigned_literal(
+    expression: &Expr<'_>,
+    column: &crate::storage::ColumnMeta,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let Expr::Str(text) = expression else {
+        return Ok(());
+    };
+    let Some(target_oid) = storage.routine_type_oid(column.ctype, column.user_type, txid) else {
+        return Ok(());
+    };
+    let enumerated = match crate::sql::eval::constructor_type_from_oid(target_oid, &|oid| {
+        storage.domain_base_type_for_oid(oid, txid)
+    }) {
+        Some(ColType::Enum(_)) => true,
+        Some(ColType::Array(element)) => matches!(element.to_coltype(), ColType::Enum(_)),
+        _ => false,
+    };
+    if enumerated {
+        crate::sql::catalog::validate_enum_input_literal(storage, txid, text, target_oid, arena)
+    } else {
+        crate::sql::catalog::validate_literal_input(storage, txid, text, target_oid, arena)
+    }
+    .map_err(|error| crate::sql::error_position::at_subject(error, text))
+}
+
+/// Which statement assigns a column. PostgreSQL positions an error about the
+/// assigned column's own container only for `UPDATE`, whose target is a
+/// column reference; an `INSERT` target is not.
+#[derive(Clone, Copy)]
+enum AssignmentTarget {
+    Insert,
+    Update,
 }
 
 /// Checks the values of a parsed subscripted assignment; false when
@@ -2596,6 +2721,7 @@ fn validate_assignment_expression(
 fn validate_subscript_assignment(
     expression: &Expr<'_>,
     target_name: Option<&str>,
+    target: AssignmentTarget,
     column: &crate::storage::ColumnMeta,
     source_of: &mut dyn FnMut(&Expr<'_>) -> Result<i32, SqlError>,
     storage: &Storage,
@@ -2607,7 +2733,7 @@ fn validate_subscript_assignment(
         ..
     } = expression
     {
-        validate_subscript_assignment(base, target_name, column, source_of, storage, txid)?;
+        validate_subscript_assignment(base, target_name, target, column, source_of, storage, txid)?;
         validate_assignment_path(
             value,
             kinds,
@@ -2628,7 +2754,7 @@ fn validate_subscript_assignment(
     else {
         return Ok(false);
     };
-    validate_subscript_assignment(base, target_name, column, source_of, storage, txid)?;
+    validate_subscript_assignment(base, target_name, target, column, source_of, storage, txid)?;
     // A domain over a container assigns into its base type.
     let declared = storage.routine_type_oid(column.ctype, column.user_type, txid);
     let (container, container_oid) =
@@ -2636,13 +2762,42 @@ fn validate_subscript_assignment(
             Some(base) => (base, storage.routine_type_oid(base, None, txid)),
             None => (column.ctype, declared),
         };
-    let target = match (container, *name) {
+    let assigned = match (container, *name) {
         (ColType::Array(element), "__jsonb_subscript_set") => element.element_oid(),
         (ColType::Array(_) | ColType::Jsonb, _) => container_oid.unwrap_or_else(|| container.oid()),
-        _ => return Ok(true),
+        (
+            ColType::Int2Vector
+            | ColType::OidVector
+            | ColType::Name
+            | ColType::Geometry(
+                crate::sql::types::GeometryKind::Point
+                | crate::sql::types::GeometryKind::Line
+                | crate::sql::types::GeometryKind::Box
+                | crate::sql::types::GeometryKind::Lseg,
+            ),
+            _,
+        ) => return Ok(true),
+        _ => {
+            let error = sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "cannot subscript type {} because it does not support subscripting",
+                crate::sql::catalog::format_type_name(
+                    storage,
+                    txid,
+                    container_oid.unwrap_or_else(|| container.oid())
+                )?
+                .as_str()
+            );
+            return Err(match (target, target_name) {
+                (AssignmentTarget::Update, Some(name)) => {
+                    crate::sql::error_position::at_reference(error, name)
+                }
+                _ => error,
+            });
+        }
     };
     let source = source_of(value)?;
-    if crate::sql::catalog::can_coerce_assignment(storage, txid, source, target) {
+    if crate::sql::catalog::can_coerce_assignment(storage, txid, source, assigned) {
         return Ok(true);
     }
     let error = crate::sql::error_position::with_hint(
@@ -2650,7 +2805,7 @@ fn validate_subscript_assignment(
             sqlstate::DATATYPE_MISMATCH,
             "subscripted assignment to \"{}\" requires type {} but expression is of type {}",
             column.name.as_str(),
-            crate::sql::catalog::format_type_name(storage, txid, target)?.as_str(),
+            crate::sql::catalog::format_type_name(storage, txid, assigned)?.as_str(),
             crate::sql::catalog::format_type_name(storage, txid, source)?.as_str()
         ),
         "You will need to rewrite or cast the expression.",
@@ -2756,11 +2911,11 @@ fn validate_assignment_path(
                 operands.next();
             }
             let Some(element) = crate::sql::assignment_path::element_type_oid(container) else {
-                return Err(sql_err!(
+                return Err(at_target(sql_err!(
                     sqlstate::DATATYPE_MISMATCH,
                     "cannot subscript type {} because it does not support subscripting",
                     type_name(container)?.as_str()
-                ));
+                )));
             };
             // A slice assigns an array of the container's type.
             if kind == b'e' {
@@ -2878,6 +3033,20 @@ pub(crate) fn dml_dependency_scope<'a>(
     arena: &'a Arena,
     outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
 ) -> Result<super::QueryScope<'a>, SqlError> {
+    dml_join_scope(storage, target, alias, extra, txid, arena, outer).map(|(scope, _)| scope)
+}
+
+/// The schema scope of [`dml_dependency_scope`] with the FROM clause it
+/// resolves: the target first, then each extra FROM item joined by a comma.
+pub(crate) fn dml_join_scope<'a>(
+    storage: &'a Storage,
+    target: QualName<'a>,
+    alias: Option<&'a str>,
+    extra: Option<&'a FromClause<'a>>,
+    txid: u32,
+    arena: &'a Arena,
+    outer: Option<&dyn crate::sql::eval::ColumnLookup<'_>>,
+) -> Result<(super::QueryScope<'a>, &'a FromClause<'a>), SqlError> {
     let base = super::dml_target_ref(target, alias);
     let joins = match extra {
         None => &[][..],
@@ -2904,11 +3073,13 @@ pub(crate) fn dml_dependency_scope<'a>(
         .alloc(FromClause { base, joins })
         .map_err(|_| super::arena_full())?;
     let from = super::cte::expand_dml_from_schema(from, storage, txid, arena)?;
-    if crate::sql::is_pg_settings(target) {
+    let scope = if crate::sql::is_pg_settings(target) {
         // Its rule reads the view, which no write can target directly.
-        return super::QueryScope::resolve_schema(storage, from, txid, arena, outer);
-    }
-    super::QueryScope::resolve_dml_schema(storage, from, txid, arena, outer)
+        super::QueryScope::resolve_schema(storage, from, txid, arena, outer)?
+    } else {
+        super::QueryScope::resolve_dml_schema(storage, from, txid, arena, outer)?
+    };
+    Ok((scope, from))
 }
 
 fn collect_select<'a>(
@@ -2977,6 +3148,7 @@ fn collect_select<'a>(
         };
         let level = EnclosingLevel {
             scope: level_scope.as_ref(),
+            returning: None,
             parent: context.enclosing,
             deferred: core::cell::RefCell::new(crate::mem::arena::ArenaList::new(arena)),
         };
@@ -2985,64 +3157,10 @@ fn collect_select<'a>(
             ..context
         };
 
-        for item in select.items {
-            match item {
-                SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-                    collect_expression(
-                        expression,
-                        storage,
-                        txid,
-                        visible_ctes,
-                        dependencies,
-                        arena,
-                        nested,
-                    )?;
-                }
-                SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {}
-            }
-        }
-        for expression in select.distinct_on {
-            collect_expression(
-                expression,
-                storage,
-                txid,
-                visible_ctes,
-                dependencies,
-                arena,
-                nested,
-            )?;
-        }
-        for expression in select
-            .where_clause
-            .into_iter()
-            .chain(select.group_by.iter().copied())
-            .chain(select.having)
-            .chain(select.order_by.iter().map(|order| order.expression))
-            .chain(select.limit)
-            .chain(select.offset)
-        {
-            collect_expression(
-                expression,
-                storage,
-                txid,
-                visible_ctes,
-                dependencies,
-                arena,
-                nested,
-            )?;
-        }
-        if let Some(tree) = select.set_body {
-            collect_set_tree(
-                tree,
-                storage,
-                txid,
-                visible_ctes,
-                dependencies,
-                arena,
-                context,
-            )?;
-        }
+        // The level's relations come first: a subquery's outer references
+        // mark columns of relations the query already depends on.
         if let Some(from) = select.from {
+            // A LATERAL item's outer references name this level's items.
             collect_table_ref(
                 &from.base,
                 storage,
@@ -3050,7 +3168,7 @@ fn collect_select<'a>(
                 visible_ctes,
                 dependencies,
                 arena,
-                context,
+                if from.base.lateral { nested } else { context },
             )?;
             for join in from.joins {
                 collect_table_ref(
@@ -3060,7 +3178,7 @@ fn collect_select<'a>(
                     visible_ctes,
                     dependencies,
                     arena,
-                    context,
+                    if join.table.lateral { nested } else { context },
                 )?;
                 if let Some(on) = join.on {
                     collect_expression(
@@ -3125,6 +3243,22 @@ fn collect_select<'a>(
                     .chain(select.offset)
                     .chain(from.joins.iter().filter_map(|join| join.on))
                 {
+                    // `GROUP BY name` and `ORDER BY name` may name an output
+                    // column, whose expression the target list recorded.
+                    if let Expr::Column {
+                        qualifier: None,
+                        name,
+                    } = expression
+                        && select.items.iter().any(|item| {
+                            matches!(item, SelectItem::Expr { alias: Some(alias), .. } if alias == name)
+                        })
+                        && crate::sql::error_position::preserving_pending(|| {
+                            scope.find_column(None, name)
+                        })
+                        .is_err()
+                    {
+                        continue;
+                    }
                     record_column_references(
                         expression,
                         scope,
@@ -3143,6 +3277,63 @@ fn collect_select<'a>(
                 select,
                 dependencies,
                 arena,
+            )?;
+        }
+        for item in select.items {
+            match item {
+                SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                    collect_expression(
+                        expression,
+                        storage,
+                        txid,
+                        visible_ctes,
+                        dependencies,
+                        arena,
+                        nested,
+                    )?;
+                }
+                SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {}
+            }
+        }
+        for expression in select.distinct_on {
+            collect_expression(
+                expression,
+                storage,
+                txid,
+                visible_ctes,
+                dependencies,
+                arena,
+                nested,
+            )?;
+        }
+        for expression in select
+            .where_clause
+            .into_iter()
+            .chain(select.group_by.iter().copied())
+            .chain(select.having)
+            .chain(select.order_by.iter().map(|order| order.expression))
+            .chain(select.limit)
+            .chain(select.offset)
+        {
+            collect_expression(
+                expression,
+                storage,
+                txid,
+                visible_ctes,
+                dependencies,
+                arena,
+                nested,
+            )?;
+        }
+        if let Some(tree) = select.set_body {
+            collect_set_tree(
+                tree,
+                storage,
+                txid,
+                visible_ctes,
+                dependencies,
+                arena,
+                context,
             )?;
         }
         collect_routine_dependencies(
@@ -3281,8 +3472,40 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         )
     }
 
+    fn validate_literal_input(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
+        crate::sql::catalog::validate_literal_input(
+            self.storage,
+            self.txid,
+            text,
+            target_oid,
+            self.arena,
+        )
+    }
+
+    fn validate_call_literal_inputs(
+        &self,
+        selection: crate::sql::eval::RoutineCallSelection,
+        args: &[&crate::sql::ast::Expr<'_>],
+        argument_names: &[Option<&str>],
+        variadic: bool,
+    ) -> Result<(), SqlError> {
+        crate::sql::catalog::validate_call_literal_inputs(
+            self.storage,
+            self.txid,
+            selection,
+            args,
+            argument_names,
+            variadic,
+            self.arena,
+        )
+    }
+
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
         self.storage.domain_base_type_for_oid(type_oid, self.txid)
+    }
+
+    fn select_common_type(&self, inputs: &[i32]) -> Result<i32, crate::storage::CommonTypeFailure> {
+        self.storage.select_common_type(inputs, self.txid)
     }
 
     fn validate_explicit_cast(
@@ -3359,10 +3582,25 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
                 .column_index(name)
                 .map(|index| definition.columns()[index].ctype)
                 .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column excluded.{} does not exist",
-                        name
+                    let mut suggestion =
+                        crate::sql::column_suggestion::ColumnSuggestion::new(qualifier, name);
+                    if let Some(scope) = self.scope {
+                        scope.suggest_columns(&mut suggestion);
+                    }
+                    suggestion.relation(
+                        "excluded",
+                        definition
+                            .columns()
+                            .iter()
+                            .map(|column| column.name.as_str()),
+                    );
+                    crate::sql::error_position::with_column_suggestion(
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column excluded.{} does not exist",
+                            name
+                        ),
+                        &suggestion,
                     )
                 });
         }
@@ -3623,6 +3861,13 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
                 self.storage
                     .relation_row_type_creation(crate::storage::RowTypeRelation::Table(slot)),
             )));
+        }
+        // A trigger's OLD/NEW rows, or a table expression's own row.
+        if let Some(composite) = self
+            .transition
+            .and_then(|transition| transition.whole_row_composite_type(name))
+        {
+            return Some(composite);
         }
         self.scope?
             .whole_row_type(name)
@@ -6027,6 +6272,7 @@ pub(super) fn insert_source_width(
                 transition: None,
                 bindings: None,
                 enclosing: None,
+                rule_action: false,
             },
         ),
         (None, None) => Ok(0),

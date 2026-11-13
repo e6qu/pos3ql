@@ -15,7 +15,7 @@ fn rule_definition_flags_preserve_formats_nulls_and_argument_effects() {
             "CREATE TABLE rule_format_source(id integer); CREATE TABLE rule_format_sink(id integer); \
              CREATE RULE diag_nothing AS ON INSERT TO rule_format_source DO NOTHING; \
              CREATE RULE diag_instead AS ON DELETE TO rule_format_source DO INSTEAD NOTHING; \
-             CREATE RULE diag_action AS ON UPDATE TO rule_format_source DO ALSO INSERT INTO rule_format_sink VALUES(NEW.id); \
+             CREATE RULE diag_action AS ON UPDATE TO rule_format_source DO ALSO INSERT INTO rule_format_sink SELECT s.id FROM (SELECT NEW.id AS id) s WHERE 'a' LIKE 'a' ESCAPE '#'; \
              CREATE SEQUENCE rule_argument_effects", true);
         let plain =
             "CREATE RULE diag_nothing AS\n    ON INSERT TO public.rule_format_source DO NOTHING;";
@@ -68,17 +68,15 @@ fn rule_definition_flags_preserve_formats_nulls_and_argument_effects() {
             "ALTER SEQUENCE rule_argument_effects RESTART WITH 1",
             true,
         );
-        let unsupported = session.execute(
+        // The pretty flag's argument runs once, and the action deparses in
+        // either form.
+        let pretty_action = data_rows(&session.success(
             &mut engine,
             "SELECT pg_get_ruledef(oid,nextval('rule_argument_effects')=1) \
                FROM pg_rewrite WHERE rulename='diag_action'",
             true,
-        );
-        assert_eq!(error_sqlstates(&unsupported), ["0A000"]);
-        assert!(
-            String::from_utf8_lossy(&unsupported)
-                .contains("pretty formatting of rewrite rule actions is not supported")
-        );
+        ));
+        assert!(pretty_action[0].contains("like_escape('a'::text, '#'::text)"));
         assert_eq!(data_rows(&session.success(&mut engine,
             "SELECT nextval('rule_argument_effects'); \
              SELECT pg_get_ruledef(oid,false) LIKE '%rule_format_sink%' FROM pg_rewrite WHERE rulename='diag_action'", true)),

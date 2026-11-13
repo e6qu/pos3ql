@@ -110,8 +110,19 @@ pub(crate) struct SynthTable<'a> {
 const FIRST_USER_OID: i32 = 16384;
 const PG_CATALOG_NS_OID: i32 = 11;
 const PG_TOAST_NS_OID: i32 = 99;
-// PostgreSQL 18.6 initdb image; capture: actions/runs/40192510296.
-const INFORMATION_SCHEMA_NS_OID: i32 = 13_293;
+/// initdb draws every OID it assigns after importing the platform's collations
+/// from one counter, so these objects' OIDs depend on the reference's locale
+/// and ICU set. They follow the pinned CI reference image (`postgres:18` on
+/// Debian trixie: three libc and 870 ICU 76 collations), where
+/// `snowball_create.sql`'s `dsnowball_init` is the first such object; a
+/// Homebrew build on macOS numbers the same objects 406 higher. Capture of
+/// `information_schema`: actions/runs/40192510296.
+pub(crate) const DSNOWBALL_INIT_OID: i32 = 13_232;
+pub(crate) const DSNOWBALL_LEXIZE_OID: i32 = DSNOWBALL_INIT_OID + 1;
+pub(crate) const SNOWBALL_TEMPLATE_OID: i32 = DSNOWBALL_INIT_OID + 2;
+/// Each Snowball dictionary is followed by its configuration.
+pub(crate) const FIRST_SNOWBALL_DICTIONARY_OID: i32 = DSNOWBALL_INIT_OID + 3;
+pub(crate) const INFORMATION_SCHEMA_NS_OID: i32 = DSNOWBALL_INIT_OID + 61;
 /// Well-known catalog OIDs, for `pg_description.classoid`.
 pub(crate) const PG_CLASS_OID: i32 = 1259;
 pub(crate) const PG_NAMESPACE_OID: i32 = 2615;
@@ -159,13 +170,27 @@ const ACCESS_METHODS: [(&str, i32, i32, &str, &str); 7] = [
 const INTERNAL_LANGUAGE_OID: i32 = 12;
 const C_LANGUAGE_OID: i32 = 13;
 const SQL_LANGUAGE_OID: i32 = 14;
-const PLPGSQL_LANGUAGE_OID: i32 = 13_563;
+/// The `plpgsql` extension, language and handler OIDs; initdb creates them
+/// last, after the collations (see `DSNOWBALL_INIT_OID`).
+pub(crate) const PLPGSQL_EXTENSION_OID: i32 = DSNOWBALL_INIT_OID + 411;
+/// The comment of the `plpgsql` extension package.
+const PLPGSQL_EXTENSION_COMMENT: &str = "PL/pgSQL procedural language";
+const PLPGSQL_CALL_HANDLER_OID: i32 = PLPGSQL_EXTENSION_OID + 1;
+const PLPGSQL_INLINE_HANDLER_OID: i32 = PLPGSQL_EXTENSION_OID + 2;
+const PLPGSQL_VALIDATOR_OID: i32 = PLPGSQL_EXTENSION_OID + 3;
+pub(crate) const PLPGSQL_HANDLER_OIDS: [i32; 3] = [
+    PLPGSQL_CALL_HANDLER_OID,
+    PLPGSQL_INLINE_HANDLER_OID,
+    PLPGSQL_VALIDATOR_OID,
+];
+pub(crate) const PLPGSQL_LANGUAGE_OID: i32 = PLPGSQL_EXTENSION_OID + 4;
 /// `pg_proc.prolang` of a stored routine.
 pub(crate) const fn routine_language_oid(language: crate::storage::RoutineLanguage) -> i32 {
     match language {
         crate::storage::RoutineLanguage::Sql => SQL_LANGUAGE_OID,
         crate::storage::RoutineLanguage::PlPgSql => PLPGSQL_LANGUAGE_OID,
         crate::storage::RoutineLanguage::Internal => INTERNAL_LANGUAGE_OID,
+        crate::storage::RoutineLanguage::Native(_) => C_LANGUAGE_OID,
     }
 }
 
@@ -257,6 +282,126 @@ macro_rules! intrinsic {
 mod callable_signatures;
 #[path = "catalog_routine_descriptions.rs"]
 mod routine_descriptions;
+
+#[path = "catalog_access_method_members.rs"]
+mod access_method_members;
+#[path = "catalog_object_descriptions.rs"]
+mod object_descriptions;
+
+/// The `pg_description` text PostgreSQL 18.6 ships for a built-in object of
+/// catalog `classoid` (any catalog when `None`; the lowest catalog OID wins, as
+/// one-argument `obj_description` reads the first matching row).
+pub(crate) fn builtin_object_description(
+    storage: &Storage,
+    txid: u32,
+    classoid: Option<i32>,
+    oid: i32,
+) -> Option<&'static str> {
+    let mut found: Option<(i32, &'static str)> = None;
+    let mut consider = |class: i32, description: &'static str| {
+        if classoid.is_none_or(|wanted| wanted == class)
+            && found.is_none_or(|(best, _)| class < best)
+        {
+            found = Some((class, description));
+        }
+    };
+    if let Some(description) = builtin_routine_description(oid) {
+        consider(PG_PROC_OID, description);
+    }
+    for &(class, object, description) in object_descriptions::OBJECT_DESCRIPTIONS {
+        if object == oid {
+            consider(class, description);
+        }
+    }
+    if classoid.is_none_or(|class| {
+        matches!(
+            class,
+            PG_TS_PARSER_OID | PG_TS_TEMPLATE_OID | PG_TS_DICT_OID | PG_TS_CONFIG_OID
+        )
+    }) {
+        for (_, object) in storage.text_search_objects_visible_to(txid) {
+            if let Some((class, object, description)) = builtin_text_search_description(&object)
+                && object == oid
+            {
+                consider(class, description);
+            }
+        }
+    }
+    found.map(|(_, description)| description)
+}
+
+/// Whether a comment target is a built-in object with a shipped description,
+/// which removing the comment must hide rather than restore.
+pub(crate) fn comment_target_has_shipped_description(
+    storage: &Storage,
+    txid: u32,
+    class: crate::storage::CommentClass,
+    schema: &str,
+    name: &str,
+    subid: u32,
+) -> bool {
+    use crate::storage::CommentClass;
+    let shipped = |classoid: i32, oid: Option<i32>| {
+        oid.is_some_and(|oid| {
+            object_descriptions::OBJECT_DESCRIPTIONS
+                .iter()
+                .any(|&(class, object, _)| class == classoid && object == oid)
+        })
+    };
+    let text_search = |classoid: i32| {
+        schema == "pg_catalog"
+            && object_descriptions::TEXT_SEARCH_DESCRIPTIONS
+                .binary_search_by(|&(class, candidate, _)| {
+                    (class, candidate).cmp(&(classoid, name))
+                })
+                .is_ok()
+    };
+    match class {
+        CommentClass::Routine => builtin_routine_description(subid as i32).is_some(),
+        CommentClass::Schema => shipped(PG_NAMESPACE_OID, Some(namespace_oid(storage, name, txid))),
+        CommentClass::Type => shipped(PG_TYPE_OID, type_oid_of(storage, schema, name, txid)),
+        CommentClass::Operator => shipped(PG_OPERATOR_OID, i32::try_from(subid).ok()),
+        CommentClass::AccessMethod => shipped(PG_AM_OID, i32::try_from(subid).ok()),
+        CommentClass::ProceduralLanguage => shipped(PG_LANGUAGE_OID, i32::try_from(subid).ok()),
+        CommentClass::TextSearchParser => text_search(PG_TS_PARSER_OID),
+        CommentClass::TextSearchTemplate => text_search(PG_TS_TEMPLATE_OID),
+        CommentClass::TextSearchDictionary => text_search(PG_TS_DICT_OID),
+        CommentClass::TextSearchConfiguration => text_search(PG_TS_CONFIG_OID),
+        _ => false,
+    }
+}
+
+/// The shipped description of a `pg_catalog` text search object, keyed by name
+/// because initdb numbers the snowball objects after the platform's collations.
+fn builtin_text_search_description(
+    object: &crate::storage::TextSearchDefinition,
+) -> Option<(i32, i32, &'static str)> {
+    use crate::storage::TextSearchDefinition;
+    let (classoid, schema, name, oid) = match object {
+        TextSearchDefinition::Parser {
+            schema, name, oid, ..
+        } => (PG_TS_PARSER_OID, schema, name, *oid),
+        TextSearchDefinition::Template {
+            schema, name, oid, ..
+        } => (PG_TS_TEMPLATE_OID, schema, name, *oid),
+        TextSearchDefinition::Dictionary {
+            schema, name, oid, ..
+        } => (PG_TS_DICT_OID, schema, name, *oid),
+        TextSearchDefinition::Configuration {
+            schema, name, oid, ..
+        } => (PG_TS_CONFIG_OID, schema, name, *oid),
+    };
+    if schema.as_str() != "pg_catalog" {
+        return None;
+    }
+    let descriptions = object_descriptions::TEXT_SEARCH_DESCRIPTIONS;
+    descriptions
+        .binary_search_by(|&(class, candidate, _)| {
+            (class, candidate).cmp(&(classoid, name.as_str()))
+        })
+        .ok()
+        .map(|index| (classoid, oid, descriptions[index].2))
+}
 
 /// The `pg_description` text PostgreSQL 18.6 ships for a built-in routine.
 pub(crate) fn builtin_routine_description(oid: i32) -> Option<&'static str> {
@@ -364,6 +509,44 @@ mod callable_contract_tests {
     use super::*;
 
     #[test]
+    fn initdb_objects_after_collations_follow_one_numbering() {
+        let callable =
+            |oid| builtin_callable_by_oid(oid).map(|routine| (routine.schema, routine.name));
+        let routine = |oid| {
+            builtin_properties::ROUTINES
+                .iter()
+                .find(|routine| routine.oid == oid)
+                .map(|routine| routine.name)
+        };
+        for (oid, name) in [
+            (DSNOWBALL_INIT_OID, "dsnowball_init"),
+            (DSNOWBALL_LEXIZE_OID, "dsnowball_lexize"),
+            (PLPGSQL_CALL_HANDLER_OID, "plpgsql_call_handler"),
+            (PLPGSQL_INLINE_HANDLER_OID, "plpgsql_inline_handler"),
+            (PLPGSQL_VALIDATOR_OID, "plpgsql_validator"),
+        ] {
+            assert_eq!(callable(oid), Some(("pg_catalog", name)));
+            assert_eq!(routine(oid), Some(name));
+        }
+        assert_eq!(
+            callable(INFORMATION_SCHEMA_NS_OID + 1),
+            Some(("information_schema", "_pg_expandarray"))
+        );
+        for class in [PG_LANGUAGE_OID, PG_EXTENSION_OID] {
+            let object = if class == PG_LANGUAGE_OID {
+                PLPGSQL_LANGUAGE_OID
+            } else {
+                PLPGSQL_EXTENSION_OID
+            };
+            assert!(object_descriptions::OBJECT_DESCRIPTIONS.contains(&(
+                class,
+                object,
+                "PL/pgSQL procedural language"
+            )));
+        }
+    }
+
+    #[test]
     fn planner_procedures_match_every_callable_declaration() {
         let numeric = builtin_planner_procedure(1701).unwrap();
         assert_eq!(numeric.volatility, 0);
@@ -374,8 +557,8 @@ mod callable_contract_tests {
             assert_eq!(builtin_planner_procedure(oid).unwrap().volatility, 1);
         }
         assert_eq!(planner_properties::PROCEDURES.len(), 3397);
-        // Every PostgreSQL 18.6 pg_proc row, plus the two local FDW callbacks.
-        assert_eq!(callable_signatures::CALLABLES.len(), 3415);
+        // Every PostgreSQL 18.6 pg_proc row.
+        assert_eq!(callable_signatures::CALLABLES.len(), 3413);
         assert!(
             planner_properties::PROCEDURES
                 .iter()
@@ -428,7 +611,11 @@ mod callable_contract_tests {
         for oid in [6183, 6184] {
             assert_eq!(builtin_planner_procedure(oid).unwrap().cost, 100.0);
         }
-        assert!(builtin_planner_procedure(13700).unwrap().forbidden);
+        assert!(
+            builtin_planner_procedure(INFORMATION_SCHEMA_NS_OID + 1)
+                .unwrap()
+                .forbidden
+        );
     }
 
     #[test]
@@ -443,22 +630,39 @@ mod callable_contract_tests {
             assert!(signature.arguments.len() <= crate::storage::MAX_ROUTINE_ARGUMENTS);
             assert!(signature.required_arguments <= signature.arguments.len());
         }
-        for (oid, name, result, arguments, volatility) in [
-            (540000, "postgres_fdw_handler", 3115, &[][..], "v"),
-            (540001, "postgres_fdw_validator", 2278, &[1009, 26][..], "s"),
-        ] {
-            let declaration = builtin_callable_by_oid(oid).unwrap();
-            assert_eq!(declaration.name, name);
-            assert_eq!(declaration.result_oid, result);
-            assert_eq!(declaration.arguments, arguments);
-            assert_eq!(declaration.catalog.volatility, volatility);
-            assert_eq!(declaration.catalog.source, name);
-            assert!(declaration.catalog.strict);
-            assert_eq!(declaration.catalog.language, 12);
-            assert_eq!(declaration.catalog.parallel, "s");
-            assert!(declaration.defaults.is_none());
-        }
     }
+}
+
+/// Whether every built-in function named `name` taking `argument_count`
+/// arguments is strict, so a call of it returns NULL for a NULL argument
+/// whichever overload it resolves to. False when there is none.
+pub(crate) fn builtin_overloads_strict(
+    storage: &Storage,
+    txid: u32,
+    name: &str,
+    argument_count: usize,
+) -> bool {
+    let first = builtin_properties::ROUTINES.partition_point(|routine| routine.name < name);
+    let mut any = false;
+    for routine in builtin_properties::ROUTINES[first..]
+        .iter()
+        .take_while(|routine| routine.name == name)
+        .filter(|routine| routine.argument_count == argument_count)
+    {
+        let Some(oid) = crate::storage::BuiltinRoutineOid::parse(routine.oid) else {
+            return false;
+        };
+        if !storage
+            .builtin_routine_state(oid, txid)
+            .attributes
+            .attributes
+            .strict
+        {
+            return false;
+        }
+        any = true;
+    }
+    any
 }
 
 const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
@@ -832,20 +1036,6 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         1,
         "v"
     ),
-    IntrinsicRoutine {
-        oid: 540_000,
-        name: "postgres_fdw_handler",
-        argument_types: "",
-        argument_count: 0,
-        volatility: "v",
-    },
-    IntrinsicRoutine {
-        oid: 540_001,
-        name: "postgres_fdw_validator",
-        argument_types: "1009 26",
-        argument_count: 2,
-        volatility: "s",
-    },
     IntrinsicRoutine {
         oid: 715,
         name: "lo_create",
@@ -4765,6 +4955,165 @@ pub(crate) fn validate_enum_input_literal(
         .map_err(|_| super::query::arena_full_pub())?
 }
 
+/// An UNKNOWN literal converted to a built-in type, a domain over one, or an
+/// array of one runs that type's input routine during SQL analysis, as
+/// PostgreSQL's `coerce_type` does for constants: `nextval('missing')` and a
+/// dead `CASE` arm's `'abc'::integer` fail even when no row evaluates them.
+/// Enum literals have their own check; length and domain constraints remain
+/// runtime work, as in PostgreSQL.
+pub(crate) fn validate_literal_input(
+    storage: &Storage,
+    txid: u32,
+    text: &str,
+    target_oid: i32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let Some(target) = super::eval::constructor_type_from_oid(target_oid, &|oid| {
+        storage.domain_base_type_for_oid(oid, txid)
+    }) else {
+        return Ok(());
+    };
+    let builtin = (1..FIRST_USER_OID).contains(&target.oid())
+        && !matches!(
+            target,
+            ColType::Pseudo(_)
+                | ColType::Record
+                | ColType::Void
+                | ColType::Internal
+                | ColType::AnyArray
+                | ColType::PgDdlCommand
+        );
+    if !builtin {
+        return Ok(());
+    }
+    arena
+        .with_remaining_region(|scratch| {
+            let value = Datum::Text(text);
+            match target {
+                ColType::Array(element) if element.is_catalog_reference() => {
+                    let catalog = super::query::storage_catalog(storage, scratch, txid);
+                    super::eval::reg_array_cast(value, element, Some(&catalog), scratch)?;
+                }
+                ColType::Regtype => {
+                    let catalog = super::query::storage_catalog(storage, scratch, txid);
+                    super::eval::regtype_cast(value, Some(&catalog), scratch)?;
+                }
+                target if target.is_reg_object() => {
+                    let catalog = super::query::storage_catalog(storage, scratch, txid);
+                    super::eval::regobject_cast(value, target, Some(&catalog), scratch)?;
+                }
+                // An input the analysis cannot run here is reported by the
+                // evaluation that converts the literal.
+                target => match super::eval::cast_to(value, target, scratch) {
+                    Err(error) if error.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED => {}
+                    result => {
+                        result?;
+                    }
+                },
+            }
+            Ok(())
+        })
+        .map_err(|_| super::query::arena_full_pub())?
+}
+
+/// Runs [`validate_literal_input`] for each UNKNOWN literal a selected
+/// routine call passes.
+pub(crate) fn validate_call_literal_inputs(
+    storage: &Storage,
+    txid: u32,
+    selection: super::eval::RoutineCallSelection,
+    args: &[&super::ast::Expr<'_>],
+    argument_names: &[Option<&str>],
+    variadic: bool,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    use super::ast::Expr;
+    if !args.iter().any(|argument| matches!(argument, Expr::Str(_))) {
+        return Ok(());
+    }
+    let named = |index: usize| argument_names.get(index).copied().flatten();
+    match selection {
+        super::eval::RoutineCallSelection::Builtin { oid, .. } => {
+            let Some(routine) = builtin_callable_by_oid(oid) else {
+                return Ok(());
+            };
+            for (index, argument) in args.iter().enumerate() {
+                let Expr::Str(text) = argument else {
+                    continue;
+                };
+                let parameter = match named(index) {
+                    Some(name) => routine
+                        .argument_names
+                        .iter()
+                        .position(|written| *written == name),
+                    None => Some(index),
+                };
+                let Some(parameter) = parameter else {
+                    continue;
+                };
+                // Inputs spread over a variadic parameter take its element type.
+                let target = match routine.variadic_element {
+                    Some(element) if !variadic && parameter + 1 >= routine.arguments.len() => {
+                        element
+                    }
+                    _ => match routine.arguments.get(parameter) {
+                        Some(&declared) => declared,
+                        None => continue,
+                    },
+                };
+                validate_literal_input(storage, txid, text, target, arena)
+                    .map_err(|error| super::error_position::at_subject(error, text))?;
+            }
+        }
+        super::eval::RoutineCallSelection::Stored(slot) => {
+            let Some((_, mapping)) =
+                storage.routine_call_mapping(slot, argument_names, args.len(), variadic, txid)
+            else {
+                return Ok(());
+            };
+            let routine = storage.routine_for(slot, txid);
+            for (index, argument) in args.iter().enumerate() {
+                let Expr::Str(text) = argument else {
+                    continue;
+                };
+                let parameter = usize::from(mapping[index]);
+                let Some(declared) = routine.arguments().get(parameter) else {
+                    continue;
+                };
+                let variadic_input = routine
+                    .parameters()
+                    .iter()
+                    .filter(|parameter| parameter.mode.is_input())
+                    .nth(parameter)
+                    .is_some_and(|parameter| {
+                        matches!(
+                            parameter.mode,
+                            crate::storage::RoutineParameterMode::Variadic { .. }
+                        )
+                    });
+                let ctype = match declared.ctype {
+                    ColType::Array(element) if variadic_input && !variadic => element.to_coltype(),
+                    ctype => ctype,
+                };
+                if declared.user_type.is_some() && ctype == declared.ctype {
+                    // Domains and named types keep their own input routines.
+                    if let Some(target) =
+                        storage.routine_type_oid(declared.ctype, declared.user_type, txid)
+                    {
+                        validate_literal_input(storage, txid, text, target, arena)
+                            .map_err(|error| super::error_position::at_subject(error, text))?;
+                    }
+                    continue;
+                }
+                validate_literal_input(storage, txid, text, ctype.oid(), arena)
+                    .map_err(|error| super::error_position::at_subject(error, text))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_explicit_cast(
     storage: &Storage,
     txid: u32,
@@ -4891,12 +5240,16 @@ pub(crate) fn builtin_operator_of_procedure(procedure: i32) -> Option<(&'static 
         .or_else(|| {
             builtin_properties::OPERATORS
                 .iter()
-                .find(|(_, _, _, candidate)| {
-                    builtin_callable_by_oid(*candidate).is_some_and(|operator| {
-                        operator.catalog.language == signature.catalog.language
-                            && operator.catalog.source == signature.catalog.source
-                            && operator.arguments == signature.arguments
-                    })
+                .find(|&&(_, left, right, candidate)| {
+                    // Compare operand types first: the routine lookup is the
+                    // costly part, and catalog queries call this per row.
+                    let operands: &[i32] = if left == 0 { &[right] } else { &[left, right] };
+                    operands == signature.arguments
+                        && builtin_callable_by_oid(candidate).is_some_and(|operator| {
+                            operator.catalog.language == signature.catalog.language
+                                && operator.catalog.source == signature.catalog.source
+                                && operator.arguments == signature.arguments
+                        })
                 })
         })
         .map(|&(name, left, right, _)| (name, left, right))
@@ -5429,10 +5782,10 @@ pub(crate) fn intrinsic_record_field(
     ))
 }
 
-/// Modeled PostgreSQL operator contracts; scalar entries were first checked
-/// against 18.4. The resolver exposes only operations the engine evaluates;
-/// unsupported operator catalog entries remain explicit errors, never fake
-/// catalog rows.
+/// Operator contracts the evaluator implements, by their PostgreSQL 18 OIDs.
+/// `pg_operator` lists every built-in row from the generated
+/// [`OPERATOR_ROWS`](super::catalog_operator_rows::OPERATOR_ROWS); a test
+/// checks these contracts against those rows.
 #[derive(Clone, Copy)]
 struct CatalogOperator {
     oid: i32,
@@ -5441,814 +5794,10 @@ struct CatalogOperator {
     right: Option<ColType>,
     result: ColType,
     procedure_oid: i32,
-    procedure_name: &'static str,
-    commutator: i32,
-    negator: i32,
-    merges: bool,
-    hashes: bool,
-    restriction: Option<(i32, &'static str)>,
-    join: Option<(i32, &'static str)>,
 }
-
-/// Operators whose catalog signatures use PostgreSQL pseudo-types.  They are
-/// kept separate from the concrete evaluator lookup table: pretending
-/// `anyrange` is one concrete `ColType` would make overload resolution accept
-/// mismatched range subtypes.
-#[derive(Clone, Copy)]
-struct PolymorphicOperator {
-    oid: i32,
-    name: &'static str,
-    left_oid: i32,
-    right_oid: i32,
-    result_oid: i32,
-    procedure_oid: i32,
-    procedure_name: &'static str,
-    commutator: i32,
-    negator: i32,
-    merges: bool,
-    hashes: bool,
-    restriction: Option<(i32, &'static str)>,
-    join: Option<(i32, &'static str)>,
-}
-
-macro_rules! polymorphic_operator {
-    ($oid:literal,$name:literal,$left:literal,$right:literal,$result:literal,$proc:literal,$procname:literal,$com:literal,$neg:literal,$merge:literal,$hash:literal,$rest:expr,$join:expr) => {
-        PolymorphicOperator {
-            oid: $oid,
-            name: $name,
-            left_oid: $left,
-            right_oid: $right,
-            result_oid: $result,
-            procedure_oid: $proc,
-            procedure_name: $procname,
-            commutator: $com,
-            negator: $neg,
-            merges: $merge,
-            hashes: $hash,
-            restriction: $rest,
-            join: $join,
-        }
-    };
-}
-
-const EQSEL: Option<(i32, &str)> = Some((101, "eqsel"));
-const EQJOIN: Option<(i32, &str)> = Some((105, "eqjoinsel"));
-const NEQSEL: Option<(i32, &str)> = Some((102, "neqsel"));
-const NEQJOIN: Option<(i32, &str)> = Some((106, "neqjoinsel"));
-const RANGESEL: Option<(i32, &str)> = Some((3169, "rangesel"));
-const MULTIRANGESEL: Option<(i32, &str)> = Some((4243, "multirangesel"));
-const LTJOIN: Option<(i32, &str)> = Some((107, "scalarltjoinsel"));
-const LEJOIN: Option<(i32, &str)> = Some((386, "scalarlejoinsel"));
-const GEJOIN: Option<(i32, &str)> = Some((398, "scalargejoinsel"));
-const GTJOIN: Option<(i32, &str)> = Some((108, "scalargtjoinsel"));
-const AREAJOIN: Option<(i32, &str)> = Some((140, "areajoinsel"));
-const CONTJOIN: Option<(i32, &str)> = Some((1303, "contjoinsel"));
-const MATCHSEL: Option<(i32, &str)> = Some((5040, "matchingsel"));
-const MATCHJOIN: Option<(i32, &str)> = Some((5041, "matchingjoinsel"));
-
-const POLYMORPHIC_RANGE_OPERATORS: &[PolymorphicOperator] = &[
-    polymorphic_operator!(
-        2860,
-        "=",
-        4537,
-        4537,
-        16,
-        4244,
-        "multirange_eq",
-        2860,
-        2861,
-        true,
-        true,
-        EQSEL,
-        EQJOIN
-    ),
-    polymorphic_operator!(
-        2861,
-        "<>",
-        4537,
-        4537,
-        16,
-        4245,
-        "multirange_ne",
-        2861,
-        2860,
-        false,
-        false,
-        NEQSEL,
-        NEQJOIN
-    ),
-    polymorphic_operator!(
-        2862,
-        "<",
-        4537,
-        4537,
-        16,
-        4274,
-        "multirange_lt",
-        2865,
-        2864,
-        false,
-        false,
-        MULTIRANGESEL,
-        LTJOIN
-    ),
-    polymorphic_operator!(
-        2863,
-        "<=",
-        4537,
-        4537,
-        16,
-        4275,
-        "multirange_le",
-        2864,
-        2865,
-        false,
-        false,
-        MULTIRANGESEL,
-        LEJOIN
-    ),
-    polymorphic_operator!(
-        2864,
-        ">=",
-        4537,
-        4537,
-        16,
-        4276,
-        "multirange_ge",
-        2863,
-        2862,
-        false,
-        false,
-        MULTIRANGESEL,
-        GEJOIN
-    ),
-    polymorphic_operator!(
-        2865,
-        ">",
-        4537,
-        4537,
-        16,
-        4277,
-        "multirange_gt",
-        2862,
-        2863,
-        false,
-        false,
-        MULTIRANGESEL,
-        GTJOIN
-    ),
-    polymorphic_operator!(
-        2866,
-        "&&",
-        3831,
-        4537,
-        16,
-        4246,
-        "range_overlaps_multirange",
-        2867,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        AREAJOIN
-    ),
-    polymorphic_operator!(
-        2867,
-        "&&",
-        4537,
-        3831,
-        16,
-        4247,
-        "multirange_overlaps_range",
-        2866,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        AREAJOIN
-    ),
-    polymorphic_operator!(
-        2868,
-        "&&",
-        4537,
-        4537,
-        16,
-        4248,
-        "multirange_overlaps_multirange",
-        2868,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        AREAJOIN
-    ),
-    polymorphic_operator!(
-        2869,
-        "@>",
-        4537,
-        2283,
-        16,
-        4249,
-        "multirange_contains_elem",
-        2872,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        CONTJOIN
-    ),
-    polymorphic_operator!(
-        2870,
-        "@>",
-        4537,
-        3831,
-        16,
-        4250,
-        "multirange_contains_range",
-        2873,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        CONTJOIN
-    ),
-    polymorphic_operator!(
-        2871,
-        "@>",
-        4537,
-        4537,
-        16,
-        4251,
-        "multirange_contains_multirange",
-        2874,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        CONTJOIN
-    ),
-    polymorphic_operator!(
-        2872,
-        "<@",
-        2283,
-        4537,
-        16,
-        4252,
-        "elem_contained_by_multirange",
-        2869,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        CONTJOIN
-    ),
-    polymorphic_operator!(
-        2873,
-        "<@",
-        3831,
-        4537,
-        16,
-        4253,
-        "range_contained_by_multirange",
-        2870,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        CONTJOIN
-    ),
-    polymorphic_operator!(
-        2874,
-        "<@",
-        4537,
-        4537,
-        16,
-        4254,
-        "multirange_contained_by_multirange",
-        2871,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        CONTJOIN
-    ),
-    polymorphic_operator!(
-        2875,
-        "&<",
-        3831,
-        4537,
-        16,
-        4264,
-        "range_overleft_multirange",
-        0,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        LTJOIN
-    ),
-    polymorphic_operator!(
-        2876,
-        "&<",
-        4537,
-        3831,
-        16,
-        4265,
-        "multirange_overleft_range",
-        0,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        LTJOIN
-    ),
-    polymorphic_operator!(
-        2877,
-        "&<",
-        4537,
-        4537,
-        16,
-        4266,
-        "multirange_overleft_multirange",
-        0,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        LTJOIN
-    ),
-    polymorphic_operator!(
-        3585,
-        "&>",
-        3831,
-        4537,
-        16,
-        4267,
-        "range_overright_multirange",
-        0,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        GTJOIN
-    ),
-    polymorphic_operator!(
-        3882, "=", 3831, 3831, 16, 3855, "range_eq", 3882, 3883, true, true, EQSEL, EQJOIN
-    ),
-    polymorphic_operator!(
-        3883, "<>", 3831, 3831, 16, 3856, "range_ne", 3883, 3882, false, false, NEQSEL, NEQJOIN
-    ),
-    polymorphic_operator!(
-        3884, "<", 3831, 3831, 16, 3871, "range_lt", 3887, 3886, false, false, RANGESEL, LTJOIN
-    ),
-    polymorphic_operator!(
-        3885, "<=", 3831, 3831, 16, 3872, "range_le", 3886, 3887, false, false, RANGESEL, LEJOIN
-    ),
-    polymorphic_operator!(
-        3886, ">=", 3831, 3831, 16, 3873, "range_ge", 3885, 3884, false, false, RANGESEL, GEJOIN
-    ),
-    polymorphic_operator!(
-        3887, ">", 3831, 3831, 16, 3874, "range_gt", 3884, 3885, false, false, RANGESEL, GTJOIN
-    ),
-    polymorphic_operator!(
-        3888,
-        "&&",
-        3831,
-        3831,
-        16,
-        3857,
-        "range_overlaps",
-        3888,
-        0,
-        false,
-        false,
-        RANGESEL,
-        AREAJOIN
-    ),
-    polymorphic_operator!(
-        3889,
-        "@>",
-        3831,
-        2283,
-        16,
-        3858,
-        "range_contains_elem",
-        3891,
-        0,
-        false,
-        false,
-        RANGESEL,
-        CONTJOIN
-    ),
-    polymorphic_operator!(
-        3890,
-        "@>",
-        3831,
-        3831,
-        16,
-        3859,
-        "range_contains",
-        3892,
-        0,
-        false,
-        false,
-        RANGESEL,
-        CONTJOIN
-    ),
-    polymorphic_operator!(
-        3891,
-        "<@",
-        2283,
-        3831,
-        16,
-        3860,
-        "elem_contained_by_range",
-        3889,
-        0,
-        false,
-        false,
-        RANGESEL,
-        CONTJOIN
-    ),
-    polymorphic_operator!(
-        3892,
-        "<@",
-        3831,
-        3831,
-        16,
-        3861,
-        "range_contained_by",
-        3890,
-        0,
-        false,
-        false,
-        RANGESEL,
-        CONTJOIN
-    ),
-    polymorphic_operator!(
-        3893,
-        "<<",
-        3831,
-        3831,
-        16,
-        3863,
-        "range_before",
-        3894,
-        0,
-        false,
-        false,
-        RANGESEL,
-        LTJOIN
-    ),
-    polymorphic_operator!(
-        3894,
-        ">>",
-        3831,
-        3831,
-        16,
-        3864,
-        "range_after",
-        3893,
-        0,
-        false,
-        false,
-        RANGESEL,
-        GTJOIN
-    ),
-    polymorphic_operator!(
-        3895,
-        "&<",
-        3831,
-        3831,
-        16,
-        3865,
-        "range_overleft",
-        0,
-        0,
-        false,
-        false,
-        RANGESEL,
-        LTJOIN
-    ),
-    polymorphic_operator!(
-        3896,
-        "&>",
-        3831,
-        3831,
-        16,
-        3866,
-        "range_overright",
-        0,
-        0,
-        false,
-        false,
-        RANGESEL,
-        GTJOIN
-    ),
-    polymorphic_operator!(
-        3897,
-        "-|-",
-        3831,
-        3831,
-        16,
-        3862,
-        "range_adjacent",
-        3897,
-        0,
-        false,
-        false,
-        MATCHSEL,
-        MATCHJOIN
-    ),
-    polymorphic_operator!(
-        3898,
-        "+",
-        3831,
-        3831,
-        3831,
-        3867,
-        "range_union",
-        3898,
-        0,
-        false,
-        false,
-        None,
-        None
-    ),
-    polymorphic_operator!(
-        3899,
-        "-",
-        3831,
-        3831,
-        3831,
-        3869,
-        "range_minus",
-        0,
-        0,
-        false,
-        false,
-        None,
-        None
-    ),
-    polymorphic_operator!(
-        3900,
-        "*",
-        3831,
-        3831,
-        3831,
-        3868,
-        "range_intersect",
-        3900,
-        0,
-        false,
-        false,
-        None,
-        None
-    ),
-    polymorphic_operator!(
-        4035,
-        "&>",
-        4537,
-        3831,
-        16,
-        4268,
-        "multirange_overright_range",
-        0,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        GTJOIN
-    ),
-    polymorphic_operator!(
-        4142,
-        "&>",
-        4537,
-        4537,
-        16,
-        4269,
-        "multirange_overright_multirange",
-        0,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        GTJOIN
-    ),
-    polymorphic_operator!(
-        4179,
-        "-|-",
-        3831,
-        4537,
-        16,
-        4255,
-        "range_adjacent_multirange",
-        4180,
-        0,
-        false,
-        false,
-        MATCHSEL,
-        MATCHJOIN
-    ),
-    polymorphic_operator!(
-        4180,
-        "-|-",
-        4537,
-        3831,
-        16,
-        4257,
-        "multirange_adjacent_range",
-        4179,
-        0,
-        false,
-        false,
-        MATCHSEL,
-        MATCHJOIN
-    ),
-    polymorphic_operator!(
-        4198,
-        "-|-",
-        4537,
-        4537,
-        16,
-        4256,
-        "multirange_adjacent_multirange",
-        4198,
-        0,
-        false,
-        false,
-        MATCHSEL,
-        MATCHJOIN
-    ),
-    polymorphic_operator!(
-        4392,
-        "+",
-        4537,
-        4537,
-        4537,
-        4270,
-        "multirange_union",
-        4392,
-        0,
-        false,
-        false,
-        None,
-        None
-    ),
-    polymorphic_operator!(
-        4393,
-        "-",
-        4537,
-        4537,
-        4537,
-        4271,
-        "multirange_minus",
-        0,
-        0,
-        false,
-        false,
-        None,
-        None
-    ),
-    polymorphic_operator!(
-        4394,
-        "*",
-        4537,
-        4537,
-        4537,
-        4272,
-        "multirange_intersect",
-        4394,
-        0,
-        false,
-        false,
-        None,
-        None
-    ),
-    polymorphic_operator!(
-        4395,
-        "<<",
-        3831,
-        4537,
-        16,
-        4258,
-        "range_before_multirange",
-        4399,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        LTJOIN
-    ),
-    polymorphic_operator!(
-        4396,
-        "<<",
-        4537,
-        3831,
-        16,
-        4259,
-        "multirange_before_range",
-        4398,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        LTJOIN
-    ),
-    polymorphic_operator!(
-        4397,
-        "<<",
-        4537,
-        4537,
-        16,
-        4260,
-        "multirange_before_multirange",
-        4400,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        LTJOIN
-    ),
-    polymorphic_operator!(
-        4398,
-        ">>",
-        3831,
-        4537,
-        16,
-        4261,
-        "range_after_multirange",
-        4396,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        GTJOIN
-    ),
-    polymorphic_operator!(
-        4399,
-        ">>",
-        4537,
-        3831,
-        16,
-        4262,
-        "multirange_after_range",
-        4395,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        GTJOIN
-    ),
-    polymorphic_operator!(
-        4400,
-        ">>",
-        4537,
-        4537,
-        16,
-        4263,
-        "multirange_after_multirange",
-        4397,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        GTJOIN
-    ),
-    polymorphic_operator!(
-        4539,
-        "@>",
-        3831,
-        4537,
-        16,
-        4541,
-        "range_contains_multirange",
-        4540,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        CONTJOIN
-    ),
-    polymorphic_operator!(
-        4540,
-        "<@",
-        4537,
-        3831,
-        16,
-        4542,
-        "multirange_contained_by_range",
-        4539,
-        0,
-        false,
-        false,
-        MULTIRANGESEL,
-        CONTJOIN
-    ),
-];
 
 macro_rules! catalog_operator {
-    ($oid:literal, $name:literal, $left:expr, $right:expr, $result:expr, $procedure_oid:literal, $procedure_name:literal) => {
+    ($oid:literal, $name:literal, $left:expr, $right:expr, $result:expr, $procedure_oid:literal) => {
         CatalogOperator {
             oid: $oid,
             name: $name,
@@ -6256,41 +5805,12 @@ macro_rules! catalog_operator {
             right: Some($right),
             result: $result,
             procedure_oid: $procedure_oid,
-            procedure_name: $procedure_name,
-            commutator: 0,
-            negator: 0,
-            merges: false,
-            hashes: false,
-            restriction: None,
-            join: None,
-        }
-    };
-}
-
-macro_rules! catalog_operator_with_commutator {
-    ($oid:literal, $name:literal, $left:expr, $right:expr, $result:expr, $procedure_oid:literal, $procedure_name:literal, $commutator:literal) => {
-        CatalogOperator {
-            oid: $oid,
-            name: $name,
-            left: Some($left),
-            right: Some($right),
-            result: $result,
-            procedure_oid: $procedure_oid,
-            procedure_name: $procedure_name,
-            commutator: $commutator,
-            negator: 0,
-            merges: false,
-            hashes: false,
-            restriction: None,
-            join: None,
         }
     };
 }
 
 macro_rules! catalog_comparison_operator {
-    ($oid:literal, $name:literal, $type:expr, $procedure_oid:literal, $procedure_name:literal,
-     $commutator:literal, $negator:literal, $merges:literal, $hashes:literal,
-     $restriction_oid:literal, $restriction_name:literal, $join_oid:literal, $join_name:literal) => {
+    ($oid:literal, $name:literal, $type:expr, $procedure_oid:literal) => {
         CatalogOperator {
             oid: $oid,
             name: $name,
@@ -6298,22 +5818,12 @@ macro_rules! catalog_comparison_operator {
             right: Some($type),
             result: ColType::Bool,
             procedure_oid: $procedure_oid,
-            procedure_name: $procedure_name,
-            commutator: $commutator,
-            negator: $negator,
-            merges: $merges,
-            hashes: $hashes,
-            restriction: Some(($restriction_oid, $restriction_name)),
-            join: Some(($join_oid, $join_name)),
         }
     };
 }
 
 macro_rules! catalog_comparison_operator_types {
-    ($oid:literal, $name:literal, $left:expr, $right:expr, $procedure_oid:literal,
-     $procedure_name:literal, $commutator:literal, $negator:literal, $merges:literal,
-     $hashes:literal, $restriction_oid:literal, $restriction_name:literal,
-     $join_oid:literal, $join_name:literal) => {
+    ($oid:literal, $name:literal, $left:expr, $right:expr, $procedure_oid:literal) => {
         CatalogOperator {
             oid: $oid,
             name: $name,
@@ -6321,19 +5831,12 @@ macro_rules! catalog_comparison_operator_types {
             right: Some($right),
             result: ColType::Bool,
             procedure_oid: $procedure_oid,
-            procedure_name: $procedure_name,
-            commutator: $commutator,
-            negator: $negator,
-            merges: $merges,
-            hashes: $hashes,
-            restriction: Some(($restriction_oid, $restriction_name)),
-            join: Some(($join_oid, $join_name)),
         }
     };
 }
 
 macro_rules! catalog_prefix_operator {
-    ($oid:literal, $name:literal, $right:expr, $result:expr, $procedure_oid:literal, $procedure_name:literal) => {
+    ($oid:literal, $name:literal, $right:expr, $result:expr, $procedure_oid:literal) => {
         CatalogOperator {
             oid: $oid,
             name: $name,
@@ -6341,13 +5844,6 @@ macro_rules! catalog_prefix_operator {
             right: Some($right),
             result: $result,
             procedure_oid: $procedure_oid,
-            procedure_name: $procedure_name,
-            commutator: 0,
-            negator: 0,
-            merges: false,
-            hashes: false,
-            restriction: None,
-            join: None,
         }
     };
 }
@@ -6359,8 +5855,7 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Array(super::types::ArrElem::AclItem),
         ColType::AclItem,
         ColType::Array(super::types::ArrElem::AclItem),
-        1035,
-        "aclinsert"
+        1035
     ),
     catalog_operator!(
         967,
@@ -6368,8 +5863,7 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Array(super::types::ArrElem::AclItem),
         ColType::AclItem,
         ColType::Array(super::types::ArrElem::AclItem),
-        1036,
-        "aclremove"
+        1036
     ),
     catalog_operator!(
         968,
@@ -6377,142 +5871,38 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Array(super::types::ArrElem::AclItem),
         ColType::AclItem,
         ColType::Bool,
-        1037,
-        "aclcontains"
+        1037
     ),
-    catalog_comparison_operator!(
-        974,
-        "=",
-        ColType::AclItem,
-        1062,
-        "aclitemeq",
-        974,
-        0,
-        false,
-        true,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        3222,
-        "=",
-        ColType::PgLsn,
-        3233,
-        "pg_lsn_eq",
-        3222,
-        3223,
-        true,
-        true,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        3223,
-        "<>",
-        ColType::PgLsn,
-        3236,
-        "pg_lsn_ne",
-        3223,
-        3222,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        3224,
-        "<",
-        ColType::PgLsn,
-        3231,
-        "pg_lsn_lt",
-        3225,
-        3227,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator!(
-        3225,
-        ">",
-        ColType::PgLsn,
-        3235,
-        "pg_lsn_gt",
-        3224,
-        3226,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator!(
-        3226,
-        "<=",
-        ColType::PgLsn,
-        3232,
-        "pg_lsn_le",
-        3227,
-        3225,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator!(
-        3227,
-        ">=",
-        ColType::PgLsn,
-        3234,
-        "pg_lsn_ge",
-        3226,
-        3224,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
+    catalog_comparison_operator!(974, "=", ColType::AclItem, 1062),
+    catalog_comparison_operator!(3222, "=", ColType::PgLsn, 3233),
+    catalog_comparison_operator!(3223, "<>", ColType::PgLsn, 3236),
+    catalog_comparison_operator!(3224, "<", ColType::PgLsn, 3231),
+    catalog_comparison_operator!(3225, ">", ColType::PgLsn, 3235),
+    catalog_comparison_operator!(3226, "<=", ColType::PgLsn, 3232),
+    catalog_comparison_operator!(3227, ">=", ColType::PgLsn, 3234),
     catalog_operator!(
         3228,
         "-",
         ColType::PgLsn,
         ColType::PgLsn,
         ColType::Numeric,
-        3237,
-        "pg_lsn_mi"
+        3237
     ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         5025,
         "+",
         ColType::PgLsn,
         ColType::Numeric,
         ColType::PgLsn,
-        5022,
-        "pg_lsn_pli",
-        5026
+        5022
     ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         5026,
         "+",
         ColType::Numeric,
         ColType::PgLsn,
         ColType::PgLsn,
-        5023,
-        "numeric_pl_pg_lsn",
-        5025
+        5023
     ),
     catalog_operator!(
         5027,
@@ -6520,20 +5910,17 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::PgLsn,
         ColType::Numeric,
         ColType::PgLsn,
-        5024,
-        "pg_lsn_mii"
+        5024
     ),
     // PostgreSQL 18.6 temporal operators. Keeping the complete connected
     // family here makes direct operator resolution and pg_operator agree.
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         1076,
         "+",
         ColType::Date,
         ColType::Interval,
         ColType::Timestamp,
-        2071,
-        "date_pl_interval",
-        2551
+        2071
     ),
     catalog_operator!(
         1077,
@@ -6541,316 +5928,36 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Date,
         ColType::Interval,
         ColType::Timestamp,
-        2072,
-        "date_mi_interval"
+        2072
     ),
-    catalog_comparison_operator!(
-        1093,
-        "=",
-        ColType::Date,
-        1086,
-        "date_eq",
-        1093,
-        1094,
-        true,
-        true,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1094,
-        "<>",
-        ColType::Date,
-        1091,
-        "date_ne",
-        1094,
-        1093,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1095,
-        "<",
-        ColType::Date,
-        1087,
-        "date_lt",
-        1097,
-        1098,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1096,
-        "<=",
-        ColType::Date,
-        1088,
-        "date_le",
-        1098,
-        1097,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator!(
-        1097,
-        ">",
-        ColType::Date,
-        1089,
-        "date_gt",
-        1095,
-        1096,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1098,
-        ">=",
-        ColType::Date,
-        1090,
-        "date_ge",
-        1096,
-        1095,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
+    catalog_comparison_operator!(1093, "=", ColType::Date, 1086),
+    catalog_comparison_operator!(1094, "<>", ColType::Date, 1091),
+    catalog_comparison_operator!(1095, "<", ColType::Date, 1087),
+    catalog_comparison_operator!(1096, "<=", ColType::Date, 1088),
+    catalog_comparison_operator!(1097, ">", ColType::Date, 1089),
+    catalog_comparison_operator!(1098, ">=", ColType::Date, 1090),
+    catalog_operator!(1099, "-", ColType::Date, ColType::Date, ColType::Int4, 1140),
+    catalog_operator!(1100, "+", ColType::Date, ColType::Int4, ColType::Date, 1141),
+    catalog_operator!(1101, "-", ColType::Date, ColType::Int4, ColType::Date, 1142),
+    catalog_comparison_operator!(1108, "=", ColType::Time, 1145),
+    catalog_comparison_operator!(1109, "<>", ColType::Time, 1106),
+    catalog_comparison_operator!(1110, "<", ColType::Time, 1102),
+    catalog_comparison_operator!(1111, "<=", ColType::Time, 1103),
+    catalog_comparison_operator!(1112, ">", ColType::Time, 1104),
+    catalog_comparison_operator!(1113, ">=", ColType::Time, 1105),
+    catalog_comparison_operator!(1320, "=", ColType::Timestamptz, 1152),
+    catalog_comparison_operator!(1321, "<>", ColType::Timestamptz, 1153),
+    catalog_comparison_operator!(1322, "<", ColType::Timestamptz, 1154),
+    catalog_comparison_operator!(1323, "<=", ColType::Timestamptz, 1155),
+    catalog_comparison_operator!(1324, ">", ColType::Timestamptz, 1157),
+    catalog_comparison_operator!(1325, ">=", ColType::Timestamptz, 1156),
     catalog_operator!(
-        1099,
-        "-",
-        ColType::Date,
-        ColType::Date,
-        ColType::Int4,
-        1140,
-        "date_mi"
-    ),
-    catalog_operator_with_commutator!(
-        1100,
-        "+",
-        ColType::Date,
-        ColType::Int4,
-        ColType::Date,
-        1141,
-        "date_pli",
-        2555
-    ),
-    catalog_operator!(
-        1101,
-        "-",
-        ColType::Date,
-        ColType::Int4,
-        ColType::Date,
-        1142,
-        "date_mii"
-    ),
-    catalog_comparison_operator!(
-        1108,
-        "=",
-        ColType::Time,
-        1145,
-        "time_eq",
-        1108,
-        1109,
-        true,
-        true,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1109,
-        "<>",
-        ColType::Time,
-        1106,
-        "time_ne",
-        1109,
-        1108,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1110,
-        "<",
-        ColType::Time,
-        1102,
-        "time_lt",
-        1112,
-        1113,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1111,
-        "<=",
-        ColType::Time,
-        1103,
-        "time_le",
-        1113,
-        1112,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator!(
-        1112,
-        ">",
-        ColType::Time,
-        1104,
-        "time_gt",
-        1110,
-        1111,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1113,
-        ">=",
-        ColType::Time,
-        1105,
-        "time_ge",
-        1111,
-        1110,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
-    catalog_comparison_operator!(
-        1320,
-        "=",
-        ColType::Timestamptz,
-        1152,
-        "timestamptz_eq",
-        1320,
-        1321,
-        true,
-        true,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1321,
-        "<>",
-        ColType::Timestamptz,
-        1153,
-        "timestamptz_ne",
-        1321,
-        1320,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1322,
-        "<",
-        ColType::Timestamptz,
-        1154,
-        "timestamptz_lt",
-        1324,
-        1325,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1323,
-        "<=",
-        ColType::Timestamptz,
-        1155,
-        "timestamptz_le",
-        1325,
-        1324,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator!(
-        1324,
-        ">",
-        ColType::Timestamptz,
-        1157,
-        "timestamptz_gt",
-        1322,
-        1323,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1325,
-        ">=",
-        ColType::Timestamptz,
-        1156,
-        "timestamptz_ge",
-        1323,
-        1322,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
-    catalog_operator_with_commutator!(
         1327,
         "+",
         ColType::Timestamptz,
         ColType::Interval,
         ColType::Timestamptz,
-        1189,
-        "timestamptz_pl_interval",
-        2554
+        1189
     ),
     catalog_operator!(
         1328,
@@ -6858,8 +5965,7 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Timestamptz,
         ColType::Timestamptz,
         ColType::Interval,
-        1188,
-        "timestamptz_mi"
+        1188
     ),
     catalog_operator!(
         1329,
@@ -6867,116 +5973,22 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Timestamptz,
         ColType::Interval,
         ColType::Timestamptz,
-        1190,
-        "timestamptz_mi_interval"
+        1190
     ),
-    catalog_comparison_operator!(
-        1330,
-        "=",
-        ColType::Interval,
-        1162,
-        "interval_eq",
-        1330,
-        1331,
-        true,
-        true,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1331,
-        "<>",
-        ColType::Interval,
-        1163,
-        "interval_ne",
-        1331,
-        1330,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1332,
-        "<",
-        ColType::Interval,
-        1164,
-        "interval_lt",
-        1334,
-        1335,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1333,
-        "<=",
-        ColType::Interval,
-        1165,
-        "interval_le",
-        1335,
-        1334,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator!(
-        1334,
-        ">",
-        ColType::Interval,
-        1167,
-        "interval_gt",
-        1332,
-        1333,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1335,
-        ">=",
-        ColType::Interval,
-        1166,
-        "interval_ge",
-        1333,
-        1332,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
-    catalog_prefix_operator!(
-        1336,
-        "-",
-        ColType::Interval,
-        ColType::Interval,
-        1168,
-        "interval_um"
-    ),
-    catalog_operator_with_commutator!(
+    catalog_comparison_operator!(1330, "=", ColType::Interval, 1162),
+    catalog_comparison_operator!(1331, "<>", ColType::Interval, 1163),
+    catalog_comparison_operator!(1332, "<", ColType::Interval, 1164),
+    catalog_comparison_operator!(1333, "<=", ColType::Interval, 1165),
+    catalog_comparison_operator!(1334, ">", ColType::Interval, 1167),
+    catalog_comparison_operator!(1335, ">=", ColType::Interval, 1166),
+    catalog_prefix_operator!(1336, "-", ColType::Interval, ColType::Interval, 1168),
+    catalog_operator!(
         1337,
         "+",
         ColType::Interval,
         ColType::Interval,
         ColType::Interval,
-        1169,
-        "interval_pl",
-        1337
+        1169
     ),
     catalog_operator!(
         1338,
@@ -6984,48 +5996,39 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Interval,
         ColType::Interval,
         ColType::Interval,
-        1170,
-        "interval_mi"
+        1170
     ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         1360,
         "+",
         ColType::Date,
         ColType::Time,
         ColType::Timestamp,
-        1272,
-        "datetime_pl",
-        1363
+        1272
     ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         1361,
         "+",
         ColType::Date,
         ColType::Timetz,
         ColType::Timestamptz,
-        1297,
-        "datetimetz_pl",
-        1366
+        1297
     ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         1363,
         "+",
         ColType::Time,
         ColType::Date,
         ColType::Timestamp,
-        1296,
-        "timedate_pl",
-        1360
+        1296
     ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         1366,
         "+",
         ColType::Timetz,
         ColType::Date,
         ColType::Timestamptz,
-        1298,
-        "timetzdate_pl",
-        1361
+        1298
     ),
     catalog_operator!(
         1399,
@@ -7033,118 +6036,29 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Time,
         ColType::Time,
         ColType::Interval,
-        1690,
-        "time_mi_time"
+        1690
     ),
-    catalog_comparison_operator!(
-        1550,
-        "=",
-        ColType::Timetz,
-        1352,
-        "timetz_eq",
-        1550,
-        1551,
-        true,
-        true,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1551,
-        "<>",
-        ColType::Timetz,
-        1353,
-        "timetz_ne",
-        1551,
-        1550,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1552,
-        "<",
-        ColType::Timetz,
-        1354,
-        "timetz_lt",
-        1554,
-        1555,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1553,
-        "<=",
-        ColType::Timetz,
-        1355,
-        "timetz_le",
-        1555,
-        1554,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator!(
-        1554,
-        ">",
-        ColType::Timetz,
-        1357,
-        "timetz_gt",
-        1552,
-        1553,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1555,
-        ">=",
-        ColType::Timetz,
-        1356,
-        "timetz_ge",
-        1553,
-        1552,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
-    catalog_operator_with_commutator!(
+    catalog_comparison_operator!(1550, "=", ColType::Timetz, 1352),
+    catalog_comparison_operator!(1551, "<>", ColType::Timetz, 1353),
+    catalog_comparison_operator!(1552, "<", ColType::Timetz, 1354),
+    catalog_comparison_operator!(1553, "<=", ColType::Timetz, 1355),
+    catalog_comparison_operator!(1554, ">", ColType::Timetz, 1357),
+    catalog_comparison_operator!(1555, ">=", ColType::Timetz, 1356),
+    catalog_operator!(
         1583,
         "*",
         ColType::Interval,
         ColType::Float8,
         ColType::Interval,
-        1618,
-        "interval_mul",
-        1584
+        1618
     ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         1584,
         "*",
         ColType::Float8,
         ColType::Interval,
         ColType::Interval,
-        1624,
-        "mul_d_interval",
-        1583
+        1624
     ),
     catalog_operator!(
         1585,
@@ -7152,18 +6066,15 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Interval,
         ColType::Float8,
         ColType::Interval,
-        1326,
-        "interval_div"
+        1326
     ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         1800,
         "+",
         ColType::Time,
         ColType::Interval,
         ColType::Time,
-        1747,
-        "time_pl_interval",
-        1849
+        1747
     ),
     catalog_operator!(
         1801,
@@ -7171,18 +6082,15 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Time,
         ColType::Interval,
         ColType::Time,
-        1748,
-        "time_mi_interval"
+        1748
     ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         1802,
         "+",
         ColType::Timetz,
         ColType::Interval,
         ColType::Timetz,
-        1749,
-        "timetz_pl_interval",
-        2552
+        1749
     ),
     catalog_operator!(
         1803,
@@ -7190,118 +6098,29 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Timetz,
         ColType::Interval,
         ColType::Timetz,
-        1750,
-        "timetz_mi_interval"
+        1750
     ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         1849,
         "+",
         ColType::Interval,
         ColType::Time,
         ColType::Time,
-        1848,
-        "interval_pl_time",
-        1800
+        1848
     ),
-    catalog_comparison_operator!(
-        2060,
-        "=",
-        ColType::Timestamp,
-        2052,
-        "timestamp_eq",
-        2060,
-        2061,
-        true,
-        true,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        2061,
-        "<>",
-        ColType::Timestamp,
-        2053,
-        "timestamp_ne",
-        2061,
-        2060,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        2062,
-        "<",
-        ColType::Timestamp,
-        2054,
-        "timestamp_lt",
-        2064,
-        2065,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator!(
-        2063,
-        "<=",
-        ColType::Timestamp,
-        2055,
-        "timestamp_le",
-        2065,
-        2064,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator!(
-        2064,
-        ">",
-        ColType::Timestamp,
-        2057,
-        "timestamp_gt",
-        2062,
-        2063,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator!(
-        2065,
-        ">=",
-        ColType::Timestamp,
-        2056,
-        "timestamp_ge",
-        2063,
-        2062,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
-    catalog_operator_with_commutator!(
+    catalog_comparison_operator!(2060, "=", ColType::Timestamp, 2052),
+    catalog_comparison_operator!(2061, "<>", ColType::Timestamp, 2053),
+    catalog_comparison_operator!(2062, "<", ColType::Timestamp, 2054),
+    catalog_comparison_operator!(2063, "<=", ColType::Timestamp, 2055),
+    catalog_comparison_operator!(2064, ">", ColType::Timestamp, 2057),
+    catalog_comparison_operator!(2065, ">=", ColType::Timestamp, 2056),
+    catalog_operator!(
         2066,
         "+",
         ColType::Timestamp,
         ColType::Interval,
         ColType::Timestamp,
-        2032,
-        "timestamp_pl_interval",
-        2553
+        2032
     ),
     catalog_operator!(
         2067,
@@ -7309,8 +6128,7 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Timestamp,
         ColType::Timestamp,
         ColType::Interval,
-        2031,
-        "timestamp_mi"
+        2031
     ),
     catalog_operator!(
         2068,
@@ -7318,635 +6136,77 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Timestamp,
         ColType::Interval,
         ColType::Timestamp,
-        2033,
-        "timestamp_mi_interval"
+        2033
     ),
-    catalog_comparison_operator_types!(
-        2345,
-        "<",
-        ColType::Date,
-        ColType::Timestamp,
-        2338,
-        "date_lt_timestamp",
-        2375,
-        2348,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2346,
-        "<=",
-        ColType::Date,
-        ColType::Timestamp,
-        2339,
-        "date_le_timestamp",
-        2374,
-        2349,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2347,
-        "=",
-        ColType::Date,
-        ColType::Timestamp,
-        2340,
-        "date_eq_timestamp",
-        2373,
-        2350,
-        true,
-        false,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2348,
-        ">=",
-        ColType::Date,
-        ColType::Timestamp,
-        2342,
-        "date_ge_timestamp",
-        2372,
-        2345,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2349,
-        ">",
-        ColType::Date,
-        ColType::Timestamp,
-        2341,
-        "date_gt_timestamp",
-        2371,
-        2346,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2350,
-        "<>",
-        ColType::Date,
-        ColType::Timestamp,
-        2343,
-        "date_ne_timestamp",
-        2376,
-        2347,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2358,
-        "<",
-        ColType::Date,
-        ColType::Timestamptz,
-        2351,
-        "date_lt_timestamptz",
-        2388,
-        2361,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2359,
-        "<=",
-        ColType::Date,
-        ColType::Timestamptz,
-        2352,
-        "date_le_timestamptz",
-        2387,
-        2362,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2360,
-        "=",
-        ColType::Date,
-        ColType::Timestamptz,
-        2353,
-        "date_eq_timestamptz",
-        2386,
-        2363,
-        true,
-        false,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2361,
-        ">=",
-        ColType::Date,
-        ColType::Timestamptz,
-        2355,
-        "date_ge_timestamptz",
-        2385,
-        2358,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2362,
-        ">",
-        ColType::Date,
-        ColType::Timestamptz,
-        2354,
-        "date_gt_timestamptz",
-        2384,
-        2359,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2363,
-        "<>",
-        ColType::Date,
-        ColType::Timestamptz,
-        2356,
-        "date_ne_timestamptz",
-        2389,
-        2360,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2371,
-        "<",
-        ColType::Timestamp,
-        ColType::Date,
-        2364,
-        "timestamp_lt_date",
-        2349,
-        2374,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2372,
-        "<=",
-        ColType::Timestamp,
-        ColType::Date,
-        2365,
-        "timestamp_le_date",
-        2348,
-        2375,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2373,
-        "=",
-        ColType::Timestamp,
-        ColType::Date,
-        2366,
-        "timestamp_eq_date",
-        2347,
-        2376,
-        true,
-        false,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2374,
-        ">=",
-        ColType::Timestamp,
-        ColType::Date,
-        2368,
-        "timestamp_ge_date",
-        2346,
-        2371,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2375,
-        ">",
-        ColType::Timestamp,
-        ColType::Date,
-        2367,
-        "timestamp_gt_date",
-        2345,
-        2372,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2376,
-        "<>",
-        ColType::Timestamp,
-        ColType::Date,
-        2369,
-        "timestamp_ne_date",
-        2350,
-        2373,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2384,
-        "<",
-        ColType::Timestamptz,
-        ColType::Date,
-        2377,
-        "timestamptz_lt_date",
-        2362,
-        2387,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2385,
-        "<=",
-        ColType::Timestamptz,
-        ColType::Date,
-        2378,
-        "timestamptz_le_date",
-        2361,
-        2388,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2386,
-        "=",
-        ColType::Timestamptz,
-        ColType::Date,
-        2379,
-        "timestamptz_eq_date",
-        2360,
-        2389,
-        true,
-        false,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2387,
-        ">=",
-        ColType::Timestamptz,
-        ColType::Date,
-        2381,
-        "timestamptz_ge_date",
-        2359,
-        2384,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2388,
-        ">",
-        ColType::Timestamptz,
-        ColType::Date,
-        2380,
-        "timestamptz_gt_date",
-        2358,
-        2385,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2389,
-        "<>",
-        ColType::Timestamptz,
-        ColType::Date,
-        2382,
-        "timestamptz_ne_date",
-        2363,
-        2386,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2534,
-        "<",
-        ColType::Timestamp,
-        ColType::Timestamptz,
-        2520,
-        "timestamp_lt_timestamptz",
-        2544,
-        2537,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2535,
-        "<=",
-        ColType::Timestamp,
-        ColType::Timestamptz,
-        2521,
-        "timestamp_le_timestamptz",
-        2543,
-        2538,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2536,
-        "=",
-        ColType::Timestamp,
-        ColType::Timestamptz,
-        2522,
-        "timestamp_eq_timestamptz",
-        2542,
-        2539,
-        true,
-        false,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2537,
-        ">=",
-        ColType::Timestamp,
-        ColType::Timestamptz,
-        2524,
-        "timestamp_ge_timestamptz",
-        2541,
-        2534,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2538,
-        ">",
-        ColType::Timestamp,
-        ColType::Timestamptz,
-        2523,
-        "timestamp_gt_timestamptz",
-        2540,
-        2535,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2539,
-        "<>",
-        ColType::Timestamp,
-        ColType::Timestamptz,
-        2525,
-        "timestamp_ne_timestamptz",
-        2545,
-        2536,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2540,
-        "<",
-        ColType::Timestamptz,
-        ColType::Timestamp,
-        2527,
-        "timestamptz_lt_timestamp",
-        2538,
-        2543,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2541,
-        "<=",
-        ColType::Timestamptz,
-        ColType::Timestamp,
-        2528,
-        "timestamptz_le_timestamp",
-        2537,
-        2544,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2542,
-        "=",
-        ColType::Timestamptz,
-        ColType::Timestamp,
-        2529,
-        "timestamptz_eq_timestamp",
-        2536,
-        2545,
-        true,
-        false,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2543,
-        ">=",
-        ColType::Timestamptz,
-        ColType::Timestamp,
-        2531,
-        "timestamptz_ge_timestamp",
-        2535,
-        2540,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2544,
-        ">",
-        ColType::Timestamptz,
-        ColType::Timestamp,
-        2530,
-        "timestamptz_gt_timestamp",
-        2534,
-        2541,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator_types!(
-        2545,
-        "<>",
-        ColType::Timestamptz,
-        ColType::Timestamp,
-        2532,
-        "timestamptz_ne_timestamp",
-        2539,
-        2542,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_operator_with_commutator!(
+    catalog_comparison_operator_types!(2345, "<", ColType::Date, ColType::Timestamp, 2338),
+    catalog_comparison_operator_types!(2346, "<=", ColType::Date, ColType::Timestamp, 2339),
+    catalog_comparison_operator_types!(2347, "=", ColType::Date, ColType::Timestamp, 2340),
+    catalog_comparison_operator_types!(2348, ">=", ColType::Date, ColType::Timestamp, 2342),
+    catalog_comparison_operator_types!(2349, ">", ColType::Date, ColType::Timestamp, 2341),
+    catalog_comparison_operator_types!(2350, "<>", ColType::Date, ColType::Timestamp, 2343),
+    catalog_comparison_operator_types!(2358, "<", ColType::Date, ColType::Timestamptz, 2351),
+    catalog_comparison_operator_types!(2359, "<=", ColType::Date, ColType::Timestamptz, 2352),
+    catalog_comparison_operator_types!(2360, "=", ColType::Date, ColType::Timestamptz, 2353),
+    catalog_comparison_operator_types!(2361, ">=", ColType::Date, ColType::Timestamptz, 2355),
+    catalog_comparison_operator_types!(2362, ">", ColType::Date, ColType::Timestamptz, 2354),
+    catalog_comparison_operator_types!(2363, "<>", ColType::Date, ColType::Timestamptz, 2356),
+    catalog_comparison_operator_types!(2371, "<", ColType::Timestamp, ColType::Date, 2364),
+    catalog_comparison_operator_types!(2372, "<=", ColType::Timestamp, ColType::Date, 2365),
+    catalog_comparison_operator_types!(2373, "=", ColType::Timestamp, ColType::Date, 2366),
+    catalog_comparison_operator_types!(2374, ">=", ColType::Timestamp, ColType::Date, 2368),
+    catalog_comparison_operator_types!(2375, ">", ColType::Timestamp, ColType::Date, 2367),
+    catalog_comparison_operator_types!(2376, "<>", ColType::Timestamp, ColType::Date, 2369),
+    catalog_comparison_operator_types!(2384, "<", ColType::Timestamptz, ColType::Date, 2377),
+    catalog_comparison_operator_types!(2385, "<=", ColType::Timestamptz, ColType::Date, 2378),
+    catalog_comparison_operator_types!(2386, "=", ColType::Timestamptz, ColType::Date, 2379),
+    catalog_comparison_operator_types!(2387, ">=", ColType::Timestamptz, ColType::Date, 2381),
+    catalog_comparison_operator_types!(2388, ">", ColType::Timestamptz, ColType::Date, 2380),
+    catalog_comparison_operator_types!(2389, "<>", ColType::Timestamptz, ColType::Date, 2382),
+    catalog_comparison_operator_types!(2534, "<", ColType::Timestamp, ColType::Timestamptz, 2520),
+    catalog_comparison_operator_types!(2535, "<=", ColType::Timestamp, ColType::Timestamptz, 2521),
+    catalog_comparison_operator_types!(2536, "=", ColType::Timestamp, ColType::Timestamptz, 2522),
+    catalog_comparison_operator_types!(2537, ">=", ColType::Timestamp, ColType::Timestamptz, 2524),
+    catalog_comparison_operator_types!(2538, ">", ColType::Timestamp, ColType::Timestamptz, 2523),
+    catalog_comparison_operator_types!(2539, "<>", ColType::Timestamp, ColType::Timestamptz, 2525),
+    catalog_comparison_operator_types!(2540, "<", ColType::Timestamptz, ColType::Timestamp, 2527),
+    catalog_comparison_operator_types!(2541, "<=", ColType::Timestamptz, ColType::Timestamp, 2528),
+    catalog_comparison_operator_types!(2542, "=", ColType::Timestamptz, ColType::Timestamp, 2529),
+    catalog_comparison_operator_types!(2543, ">=", ColType::Timestamptz, ColType::Timestamp, 2531),
+    catalog_comparison_operator_types!(2544, ">", ColType::Timestamptz, ColType::Timestamp, 2530),
+    catalog_comparison_operator_types!(2545, "<>", ColType::Timestamptz, ColType::Timestamp, 2532),
+    catalog_operator!(
         2551,
         "+",
         ColType::Interval,
         ColType::Date,
         ColType::Timestamp,
-        2546,
-        "interval_pl_date",
-        1076
+        2546
     ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         2552,
         "+",
         ColType::Interval,
         ColType::Timetz,
         ColType::Timetz,
-        2547,
-        "interval_pl_timetz",
-        1802
+        2547
     ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         2553,
         "+",
         ColType::Interval,
         ColType::Timestamp,
         ColType::Timestamp,
-        2548,
-        "interval_pl_timestamp",
-        2066
+        2548
     ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         2554,
         "+",
         ColType::Interval,
         ColType::Timestamptz,
         ColType::Timestamptz,
-        2549,
-        "interval_pl_timestamptz",
-        1327
+        2549
     ),
-    catalog_operator_with_commutator!(
-        2555,
-        "+",
-        ColType::Int4,
-        ColType::Date,
-        ColType::Date,
-        2550,
-        "integer_pl_date",
-        1100
-    ),
+    catalog_operator!(2555, "+", ColType::Int4, ColType::Date, ColType::Date, 2550),
     CatalogOperator {
         oid: 639,
         name: "~",
@@ -7954,13 +6214,6 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         right: Some(ColType::Text),
         result: ColType::Bool,
         procedure_oid: 79,
-        procedure_name: "nameregexeq",
-        commutator: 0,
-        negator: 640,
-        merges: false,
-        hashes: false,
-        restriction: Some((1818, "regexeqsel")),
-        join: Some((1824, "regexeqjoinsel")),
     },
     CatalogOperator {
         oid: 640,
@@ -7969,13 +6222,6 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         right: Some(ColType::Text),
         result: ColType::Bool,
         procedure_oid: 1252,
-        procedure_name: "nameregexne",
-        commutator: 0,
-        negator: 639,
-        merges: false,
-        hashes: false,
-        restriction: Some((1821, "regexnesel")),
-        join: Some((1827, "regexnejoinsel")),
     },
     CatalogOperator {
         oid: 641,
@@ -7984,13 +6230,6 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         right: Some(ColType::Text),
         result: ColType::Bool,
         procedure_oid: 1254,
-        procedure_name: "textregexeq",
-        commutator: 0,
-        negator: 642,
-        merges: false,
-        hashes: false,
-        restriction: Some((1818, "regexeqsel")),
-        join: Some((1824, "regexeqjoinsel")),
     },
     CatalogOperator {
         oid: 642,
@@ -7999,13 +6238,6 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         right: Some(ColType::Text),
         result: ColType::Bool,
         procedure_oid: 1256,
-        procedure_name: "textregexne",
-        commutator: 0,
-        negator: 641,
-        merges: false,
-        hashes: false,
-        restriction: Some((1821, "regexnesel")),
-        join: Some((1827, "regexnejoinsel")),
     },
     CatalogOperator {
         oid: 1226,
@@ -8014,13 +6246,6 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         right: Some(ColType::Text),
         result: ColType::Bool,
         procedure_oid: 1240,
-        procedure_name: "nameicregexeq",
-        commutator: 0,
-        negator: 1227,
-        merges: false,
-        hashes: false,
-        restriction: Some((1820, "icregexeqsel")),
-        join: Some((1826, "icregexeqjoinsel")),
     },
     CatalogOperator {
         oid: 1227,
@@ -8029,13 +6254,6 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         right: Some(ColType::Text),
         result: ColType::Bool,
         procedure_oid: 1241,
-        procedure_name: "nameicregexne",
-        commutator: 0,
-        negator: 1226,
-        merges: false,
-        hashes: false,
-        restriction: Some((1823, "icregexnesel")),
-        join: Some((1829, "icregexnejoinsel")),
     },
     CatalogOperator {
         oid: 1228,
@@ -8044,13 +6262,6 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         right: Some(ColType::Text),
         result: ColType::Bool,
         procedure_oid: 1238,
-        procedure_name: "texticregexeq",
-        commutator: 0,
-        negator: 1229,
-        merges: false,
-        hashes: false,
-        restriction: Some((1820, "icregexeqsel")),
-        join: Some((1826, "icregexeqjoinsel")),
     },
     CatalogOperator {
         oid: 1229,
@@ -8059,112 +6270,20 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         right: Some(ColType::Text),
         result: ColType::Bool,
         procedure_oid: 1239,
-        procedure_name: "texticregexne",
-        commutator: 0,
-        negator: 1228,
-        merges: false,
-        hashes: false,
-        restriction: Some((1823, "icregexnesel")),
-        join: Some((1829, "icregexnejoinsel")),
     },
-    catalog_comparison_operator!(
-        1955,
-        "=",
-        ColType::Bytea,
-        1948,
-        "byteaeq",
-        1955,
-        1956,
-        true,
-        true,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1956,
-        "<>",
-        ColType::Bytea,
-        1953,
-        "byteane",
-        1956,
-        1955,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1957,
-        "<",
-        ColType::Bytea,
-        1949,
-        "bytealt",
-        1959,
-        1960,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1958,
-        "<=",
-        ColType::Bytea,
-        1950,
-        "byteale",
-        1960,
-        1959,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator!(
-        1959,
-        ">",
-        ColType::Bytea,
-        1951,
-        "byteagt",
-        1957,
-        1958,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1960,
-        ">=",
-        ColType::Bytea,
-        1952,
-        "byteage",
-        1958,
-        1957,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
+    catalog_comparison_operator!(1955, "=", ColType::Bytea, 1948),
+    catalog_comparison_operator!(1956, "<>", ColType::Bytea, 1953),
+    catalog_comparison_operator!(1957, "<", ColType::Bytea, 1949),
+    catalog_comparison_operator!(1958, "<=", ColType::Bytea, 1950),
+    catalog_comparison_operator!(1959, ">", ColType::Bytea, 1951),
+    catalog_comparison_operator!(1960, ">=", ColType::Bytea, 1952),
     catalog_operator!(
         2018,
         "||",
         ColType::Bytea,
         ColType::Bytea,
         ColType::Bytea,
-        2011,
-        "byteacat"
+        2011
     ),
     CatalogOperator {
         oid: 2016,
@@ -8173,13 +6292,6 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         right: Some(ColType::Bytea),
         result: ColType::Bool,
         procedure_oid: 2005,
-        procedure_name: "bytealike",
-        commutator: 0,
-        negator: 2017,
-        merges: false,
-        hashes: false,
-        restriction: Some((1819, "likesel")),
-        join: Some((1825, "likejoinsel")),
     },
     CatalogOperator {
         oid: 2017,
@@ -8188,133 +6300,36 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         right: Some(ColType::Bytea),
         result: ColType::Bool,
         procedure_oid: 2006,
-        procedure_name: "byteanlike",
-        commutator: 0,
-        negator: 2016,
-        merges: false,
-        hashes: false,
-        restriction: Some((1822, "nlikesel")),
-        join: Some((1828, "nlikejoinsel")),
     },
-    catalog_comparison_operator!(
-        1784,
-        "=",
-        ColType::Bit { varying: false },
-        1581,
-        "biteq",
-        1784,
-        1785,
-        true,
-        false,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1785,
-        "<>",
-        ColType::Bit { varying: false },
-        1582,
-        "bitne",
-        1785,
-        1784,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1786,
-        "<",
-        ColType::Bit { varying: false },
-        1595,
-        "bitlt",
-        1787,
-        1789,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1787,
-        ">",
-        ColType::Bit { varying: false },
-        1593,
-        "bitgt",
-        1786,
-        1788,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1788,
-        "<=",
-        ColType::Bit { varying: false },
-        1594,
-        "bitle",
-        1789,
-        1787,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator!(
-        1789,
-        ">=",
-        ColType::Bit { varying: false },
-        1592,
-        "bitge",
-        1788,
-        1786,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
-    catalog_operator_with_commutator!(
+    catalog_comparison_operator!(1784, "=", ColType::Bit { varying: false }, 1581),
+    catalog_comparison_operator!(1785, "<>", ColType::Bit { varying: false }, 1582),
+    catalog_comparison_operator!(1786, "<", ColType::Bit { varying: false }, 1595),
+    catalog_comparison_operator!(1787, ">", ColType::Bit { varying: false }, 1593),
+    catalog_comparison_operator!(1788, "<=", ColType::Bit { varying: false }, 1594),
+    catalog_comparison_operator!(1789, ">=", ColType::Bit { varying: false }, 1592),
+    catalog_operator!(
         1791,
         "&",
         ColType::Bit { varying: false },
         ColType::Bit { varying: false },
         ColType::Bit { varying: false },
-        1673,
-        "bitand",
-        1791
+        1673
     ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         1792,
         "|",
         ColType::Bit { varying: false },
         ColType::Bit { varying: false },
         ColType::Bit { varying: false },
-        1674,
-        "bitor",
-        1792
+        1674
     ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         1793,
         "#",
         ColType::Bit { varying: false },
         ColType::Bit { varying: false },
         ColType::Bit { varying: false },
-        1675,
-        "bitxor",
-        1793
+        1675
     ),
     catalog_operator!(
         1795,
@@ -8322,8 +6337,7 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Bit { varying: false },
         ColType::Int4,
         ColType::Bit { varying: false },
-        1677,
-        "bitshiftleft"
+        1677
     ),
     catalog_operator!(
         1796,
@@ -8331,8 +6345,7 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Bit { varying: false },
         ColType::Int4,
         ColType::Bit { varying: false },
-        1678,
-        "bitshiftright"
+        1678
     ),
     catalog_operator!(
         1797,
@@ -8340,303 +6353,34 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Bit { varying: true },
         ColType::Bit { varying: true },
         ColType::Bit { varying: true },
-        1679,
-        "bitcat"
+        1679
     ),
-    catalog_comparison_operator!(
-        1804,
-        "=",
-        ColType::Bit { varying: true },
-        1666,
-        "varbiteq",
-        1804,
-        1805,
-        true,
-        false,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1805,
-        "<>",
-        ColType::Bit { varying: true },
-        1667,
-        "varbitne",
-        1805,
-        1804,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1806,
-        "<",
-        ColType::Bit { varying: true },
-        1671,
-        "varbitlt",
-        1807,
-        1809,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1807,
-        ">",
-        ColType::Bit { varying: true },
-        1669,
-        "varbitgt",
-        1806,
-        1808,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1808,
-        "<=",
-        ColType::Bit { varying: true },
-        1670,
-        "varbitle",
-        1809,
-        1807,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator!(
-        1809,
-        ">=",
-        ColType::Bit { varying: true },
-        1668,
-        "varbitge",
-        1808,
-        1806,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
-    catalog_comparison_operator!(
-        385,
-        "=",
-        ColType::Cid,
-        69,
-        "cideq",
-        385,
-        0,
-        false,
-        true,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        387,
-        "=",
-        ColType::Tid,
-        1292,
-        "tideq",
-        387,
-        402,
-        true,
-        true,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        402,
-        "<>",
-        ColType::Tid,
-        1265,
-        "tidne",
-        402,
-        387,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        2799,
-        "<",
-        ColType::Tid,
-        2791,
-        "tidlt",
-        2800,
-        2802,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator!(
-        2800,
-        ">",
-        ColType::Tid,
-        2790,
-        "tidgt",
-        2799,
-        2801,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator!(
-        2801,
-        "<=",
-        ColType::Tid,
-        2793,
-        "tidle",
-        2802,
-        2800,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator!(
-        2802,
-        ">=",
-        ColType::Tid,
-        2792,
-        "tidge",
-        2801,
-        2799,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
-    catalog_comparison_operator!(
-        900,
-        "=",
-        ColType::Money,
-        888,
-        "cash_eq",
-        900,
-        901,
-        true,
-        false,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        901,
-        "<>",
-        ColType::Money,
-        889,
-        "cash_ne",
-        901,
-        900,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        902,
-        "<",
-        ColType::Money,
-        890,
-        "cash_lt",
-        903,
-        905,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator!(
-        903,
-        ">",
-        ColType::Money,
-        892,
-        "cash_gt",
-        902,
-        904,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator!(
-        904,
-        "<=",
-        ColType::Money,
-        891,
-        "cash_le",
-        905,
-        903,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator!(
-        905,
-        ">=",
-        ColType::Money,
-        893,
-        "cash_ge",
-        904,
-        902,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
-    catalog_operator_with_commutator!(
+    catalog_comparison_operator!(1804, "=", ColType::Bit { varying: true }, 1666),
+    catalog_comparison_operator!(1805, "<>", ColType::Bit { varying: true }, 1667),
+    catalog_comparison_operator!(1806, "<", ColType::Bit { varying: true }, 1671),
+    catalog_comparison_operator!(1807, ">", ColType::Bit { varying: true }, 1669),
+    catalog_comparison_operator!(1808, "<=", ColType::Bit { varying: true }, 1670),
+    catalog_comparison_operator!(1809, ">=", ColType::Bit { varying: true }, 1668),
+    catalog_comparison_operator!(385, "=", ColType::Cid, 69),
+    catalog_comparison_operator!(387, "=", ColType::Tid, 1292),
+    catalog_comparison_operator!(402, "<>", ColType::Tid, 1265),
+    catalog_comparison_operator!(2799, "<", ColType::Tid, 2791),
+    catalog_comparison_operator!(2800, ">", ColType::Tid, 2790),
+    catalog_comparison_operator!(2801, "<=", ColType::Tid, 2793),
+    catalog_comparison_operator!(2802, ">=", ColType::Tid, 2792),
+    catalog_comparison_operator!(900, "=", ColType::Money, 888),
+    catalog_comparison_operator!(901, "<>", ColType::Money, 889),
+    catalog_comparison_operator!(902, "<", ColType::Money, 890),
+    catalog_comparison_operator!(903, ">", ColType::Money, 892),
+    catalog_comparison_operator!(904, "<=", ColType::Money, 891),
+    catalog_comparison_operator!(905, ">=", ColType::Money, 893),
+    catalog_operator!(
         843,
         "*",
         ColType::Money,
         ColType::Float4,
         ColType::Money,
-        846,
-        "cash_mul_flt4",
-        845
+        846
     ),
     catalog_operator!(
         844,
@@ -8644,28 +6388,23 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Money,
         ColType::Float4,
         ColType::Money,
-        847,
-        "cash_div_flt4"
+        847
     ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         845,
         "*",
         ColType::Float4,
         ColType::Money,
         ColType::Money,
-        848,
-        "flt4_mul_cash",
-        843
+        848
     ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         906,
         "+",
         ColType::Money,
         ColType::Money,
         ColType::Money,
-        894,
-        "cash_pl",
-        906
+        894
     ),
     catalog_operator!(
         907,
@@ -8673,18 +6412,15 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Money,
         ColType::Money,
         ColType::Money,
-        895,
-        "cash_mi"
+        895
     ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         908,
         "*",
         ColType::Money,
         ColType::Float8,
         ColType::Money,
-        896,
-        "cash_mul_flt8",
-        916
+        896
     ),
     catalog_operator!(
         909,
@@ -8692,86 +6428,29 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Money,
         ColType::Float8,
         ColType::Money,
-        897,
-        "cash_div_flt8"
+        897
     ),
-    catalog_operator_with_commutator!(
-        912,
-        "*",
-        ColType::Money,
-        ColType::Int4,
-        ColType::Money,
-        864,
-        "cash_mul_int4",
-        917
-    ),
+    catalog_operator!(912, "*", ColType::Money, ColType::Int4, ColType::Money, 864),
+    catalog_operator!(913, "/", ColType::Money, ColType::Int4, ColType::Money, 865),
+    catalog_operator!(914, "*", ColType::Money, ColType::Int2, ColType::Money, 866),
+    catalog_operator!(915, "/", ColType::Money, ColType::Int2, ColType::Money, 867),
     catalog_operator!(
-        913,
-        "/",
-        ColType::Money,
-        ColType::Int4,
-        ColType::Money,
-        865,
-        "cash_div_int4"
-    ),
-    catalog_operator_with_commutator!(
-        914,
-        "*",
-        ColType::Money,
-        ColType::Int2,
-        ColType::Money,
-        866,
-        "cash_mul_int2",
-        918
-    ),
-    catalog_operator!(
-        915,
-        "/",
-        ColType::Money,
-        ColType::Int2,
-        ColType::Money,
-        867,
-        "cash_div_int2"
-    ),
-    catalog_operator_with_commutator!(
         916,
         "*",
         ColType::Float8,
         ColType::Money,
         ColType::Money,
-        919,
-        "flt8_mul_cash",
-        908
+        919
     ),
-    catalog_operator_with_commutator!(
-        917,
-        "*",
-        ColType::Int4,
-        ColType::Money,
-        ColType::Money,
-        862,
-        "int4_mul_cash",
-        912
-    ),
-    catalog_operator_with_commutator!(
-        918,
-        "*",
-        ColType::Int2,
-        ColType::Money,
-        ColType::Money,
-        863,
-        "int2_mul_cash",
-        914
-    ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(917, "*", ColType::Int4, ColType::Money, ColType::Money, 862),
+    catalog_operator!(918, "*", ColType::Int2, ColType::Money, ColType::Money, 863),
+    catalog_operator!(
         3346,
         "*",
         ColType::Money,
         ColType::Int8,
         ColType::Money,
-        3344,
-        "cash_mul_int8",
-        3349
+        3344
     ),
     catalog_operator!(
         3347,
@@ -8779,18 +6458,15 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Money,
         ColType::Int8,
         ColType::Money,
-        3345,
-        "cash_div_int8"
+        3345
     ),
-    catalog_operator_with_commutator!(
+    catalog_operator!(
         3349,
         "*",
         ColType::Int8,
         ColType::Money,
         ColType::Money,
-        3399,
-        "int8_mul_cash",
-        3346
+        3399
     ),
     catalog_operator!(
         3825,
@@ -8798,242 +6474,32 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Money,
         ColType::Money,
         ColType::Float8,
-        3822,
-        "cash_div_cash"
+        3822
     ),
-    catalog_comparison_operator!(
-        96,
-        "=",
-        ColType::Int4,
-        65,
-        "int4eq",
-        96,
-        518,
-        true,
-        true,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        97,
-        "<",
-        ColType::Int4,
-        66,
-        "int4lt",
-        521,
-        525,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator!(
-        518,
-        "<>",
-        ColType::Int4,
-        144,
-        "int4ne",
-        518,
-        96,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        521,
-        ">",
-        ColType::Int4,
-        147,
-        "int4gt",
-        97,
-        523,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator!(
-        523,
-        "<=",
-        ColType::Int4,
-        149,
-        "int4le",
-        525,
-        521,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator!(
-        525,
-        ">=",
-        ColType::Int4,
-        150,
-        "int4ge",
-        523,
-        97,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
-    catalog_operator!(
-        514,
-        "*",
-        ColType::Int4,
-        ColType::Int4,
-        ColType::Int4,
-        141,
-        "int4mul"
-    ),
-    catalog_operator!(
-        528,
-        "/",
-        ColType::Int4,
-        ColType::Int4,
-        ColType::Int4,
-        154,
-        "int4div"
-    ),
-    catalog_operator!(
-        530,
-        "%",
-        ColType::Int4,
-        ColType::Int4,
-        ColType::Int4,
-        156,
-        "int4mod"
-    ),
-    catalog_operator!(
-        551,
-        "+",
-        ColType::Int4,
-        ColType::Int4,
-        ColType::Int4,
-        177,
-        "int4pl"
-    ),
-    catalog_operator!(
-        555,
-        "-",
-        ColType::Int4,
-        ColType::Int4,
-        ColType::Int4,
-        181,
-        "int4mi"
-    ),
-    catalog_comparison_operator!(
-        5068,
-        "=",
-        ColType::Xid8,
-        5084,
-        "xid8eq",
-        5068,
-        5072,
-        true,
-        true,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        5072,
-        "<>",
-        ColType::Xid8,
-        5085,
-        "xid8ne",
-        5072,
-        5068,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        5073,
-        "<",
-        ColType::Xid8,
-        5034,
-        "xid8lt",
-        5074,
-        5076,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator!(
-        5074,
-        ">",
-        ColType::Xid8,
-        5035,
-        "xid8gt",
-        5073,
-        5075,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator!(
-        5075,
-        "<=",
-        ColType::Xid8,
-        5036,
-        "xid8le",
-        5076,
-        5074,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator!(
-        5076,
-        ">=",
-        ColType::Xid8,
-        5037,
-        "xid8ge",
-        5075,
-        5073,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
+    catalog_comparison_operator!(96, "=", ColType::Int4, 65),
+    catalog_comparison_operator!(97, "<", ColType::Int4, 66),
+    catalog_comparison_operator!(518, "<>", ColType::Int4, 144),
+    catalog_comparison_operator!(521, ">", ColType::Int4, 147),
+    catalog_comparison_operator!(523, "<=", ColType::Int4, 149),
+    catalog_comparison_operator!(525, ">=", ColType::Int4, 150),
+    catalog_operator!(514, "*", ColType::Int4, ColType::Int4, ColType::Int4, 141),
+    catalog_operator!(528, "/", ColType::Int4, ColType::Int4, ColType::Int4, 154),
+    catalog_operator!(530, "%", ColType::Int4, ColType::Int4, ColType::Int4, 156),
+    catalog_operator!(551, "+", ColType::Int4, ColType::Int4, ColType::Int4, 177),
+    catalog_operator!(555, "-", ColType::Int4, ColType::Int4, ColType::Int4, 181),
+    catalog_comparison_operator!(5068, "=", ColType::Xid8, 5084),
+    catalog_comparison_operator!(5072, "<>", ColType::Xid8, 5085),
+    catalog_comparison_operator!(5073, "<", ColType::Xid8, 5034),
+    catalog_comparison_operator!(5074, ">", ColType::Xid8, 5035),
+    catalog_comparison_operator!(5075, "<=", ColType::Xid8, 5036),
+    catalog_comparison_operator!(5076, ">=", ColType::Xid8, 5037),
     catalog_operator!(
         4012,
         "@?",
         ColType::Jsonb,
         ColType::Jsonpath,
         ColType::Bool,
-        4010,
-        "jsonb_path_exists_opr"
+        4010
     ),
     catalog_operator!(
         4013,
@@ -9041,8 +6507,7 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Jsonb,
         ColType::Jsonpath,
         ColType::Bool,
-        4011,
-        "jsonb_path_match_opr"
+        4011
     ),
     CatalogOperator {
         oid: 931,
@@ -9051,13 +6516,6 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         right: Some(ColType::Inet),
         result: ColType::Bool,
         procedure_oid: 927,
-        procedure_name: "network_sub",
-        commutator: 933,
-        negator: 0,
-        merges: false,
-        hashes: false,
-        restriction: Some((3560, "networksel")),
-        join: Some((3561, "networkjoinsel")),
     },
     CatalogOperator {
         oid: 932,
@@ -9066,13 +6524,6 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         right: Some(ColType::Inet),
         result: ColType::Bool,
         procedure_oid: 928,
-        procedure_name: "network_subeq",
-        commutator: 934,
-        negator: 0,
-        merges: false,
-        hashes: false,
-        restriction: Some((3560, "networksel")),
-        join: Some((3561, "networkjoinsel")),
     },
     CatalogOperator {
         oid: 933,
@@ -9081,13 +6532,6 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         right: Some(ColType::Inet),
         result: ColType::Bool,
         procedure_oid: 929,
-        procedure_name: "network_sup",
-        commutator: 931,
-        negator: 0,
-        merges: false,
-        hashes: false,
-        restriction: Some((3560, "networksel")),
-        join: Some((3561, "networkjoinsel")),
     },
     CatalogOperator {
         oid: 934,
@@ -9096,267 +6540,34 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         right: Some(ColType::Inet),
         result: ColType::Bool,
         procedure_oid: 930,
-        procedure_name: "network_supeq",
-        commutator: 932,
-        negator: 0,
-        merges: false,
-        hashes: false,
-        restriction: Some((3560, "networksel")),
-        join: Some((3561, "networkjoinsel")),
     },
-    catalog_comparison_operator!(
-        1201,
-        "=",
-        ColType::Inet,
-        920,
-        "network_eq",
-        1201,
-        1202,
-        true,
-        true,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1202,
-        "<>",
-        ColType::Inet,
-        925,
-        "network_ne",
-        1202,
-        1201,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1203,
-        "<",
-        ColType::Inet,
-        921,
-        "network_lt",
-        1205,
-        1206,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1204,
-        "<=",
-        ColType::Inet,
-        922,
-        "network_le",
-        1206,
-        1205,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator!(
-        1205,
-        ">",
-        ColType::Inet,
-        923,
-        "network_gt",
-        1203,
-        1204,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1206,
-        ">=",
-        ColType::Inet,
-        924,
-        "network_ge",
-        1204,
-        1203,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
-    catalog_comparison_operator!(
-        1220,
-        "=",
-        ColType::Macaddr,
-        830,
-        "macaddr_eq",
-        1220,
-        1221,
-        true,
-        true,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1221,
-        "<>",
-        ColType::Macaddr,
-        835,
-        "macaddr_ne",
-        1221,
-        1220,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1222,
-        "<",
-        ColType::Macaddr,
-        831,
-        "macaddr_lt",
-        1224,
-        1225,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1223,
-        "<=",
-        ColType::Macaddr,
-        832,
-        "macaddr_le",
-        1225,
-        1224,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator!(
-        1224,
-        ">",
-        ColType::Macaddr,
-        833,
-        "macaddr_gt",
-        1222,
-        1223,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator!(
-        1225,
-        ">=",
-        ColType::Macaddr,
-        834,
-        "macaddr_ge",
-        1223,
-        1222,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
-    catalog_prefix_operator!(2634, "~", ColType::Inet, ColType::Inet, 2627, "inetnot"),
-    catalog_operator!(
-        2635,
-        "&",
-        ColType::Inet,
-        ColType::Inet,
-        ColType::Inet,
-        2628,
-        "inetand"
-    ),
-    catalog_operator!(
-        2636,
-        "|",
-        ColType::Inet,
-        ColType::Inet,
-        ColType::Inet,
-        2629,
-        "inetor"
-    ),
-    catalog_operator_with_commutator!(
-        2637,
-        "+",
-        ColType::Inet,
-        ColType::Int8,
-        ColType::Inet,
-        2630,
-        "inetpl",
-        2638
-    ),
-    catalog_operator_with_commutator!(
-        2638,
-        "+",
-        ColType::Int8,
-        ColType::Inet,
-        ColType::Inet,
-        2631,
-        "int8pl_inet",
-        2637
-    ),
-    catalog_operator!(
-        2639,
-        "-",
-        ColType::Inet,
-        ColType::Int8,
-        ColType::Inet,
-        2632,
-        "inetmi_int8"
-    ),
-    catalog_operator!(
-        2640,
-        "-",
-        ColType::Inet,
-        ColType::Inet,
-        ColType::Int8,
-        2633,
-        "inetmi"
-    ),
-    catalog_prefix_operator!(
-        3147,
-        "~",
-        ColType::Macaddr,
-        ColType::Macaddr,
-        3144,
-        "macaddr_not"
-    ),
+    catalog_comparison_operator!(1201, "=", ColType::Inet, 920),
+    catalog_comparison_operator!(1202, "<>", ColType::Inet, 925),
+    catalog_comparison_operator!(1203, "<", ColType::Inet, 921),
+    catalog_comparison_operator!(1204, "<=", ColType::Inet, 922),
+    catalog_comparison_operator!(1205, ">", ColType::Inet, 923),
+    catalog_comparison_operator!(1206, ">=", ColType::Inet, 924),
+    catalog_comparison_operator!(1220, "=", ColType::Macaddr, 830),
+    catalog_comparison_operator!(1221, "<>", ColType::Macaddr, 835),
+    catalog_comparison_operator!(1222, "<", ColType::Macaddr, 831),
+    catalog_comparison_operator!(1223, "<=", ColType::Macaddr, 832),
+    catalog_comparison_operator!(1224, ">", ColType::Macaddr, 833),
+    catalog_comparison_operator!(1225, ">=", ColType::Macaddr, 834),
+    catalog_prefix_operator!(2634, "~", ColType::Inet, ColType::Inet, 2627),
+    catalog_operator!(2635, "&", ColType::Inet, ColType::Inet, ColType::Inet, 2628),
+    catalog_operator!(2636, "|", ColType::Inet, ColType::Inet, ColType::Inet, 2629),
+    catalog_operator!(2637, "+", ColType::Inet, ColType::Int8, ColType::Inet, 2630),
+    catalog_operator!(2638, "+", ColType::Int8, ColType::Inet, ColType::Inet, 2631),
+    catalog_operator!(2639, "-", ColType::Inet, ColType::Int8, ColType::Inet, 2632),
+    catalog_operator!(2640, "-", ColType::Inet, ColType::Inet, ColType::Int8, 2633),
+    catalog_prefix_operator!(3147, "~", ColType::Macaddr, ColType::Macaddr, 3144),
     catalog_operator!(
         3148,
         "&",
         ColType::Macaddr,
         ColType::Macaddr,
         ColType::Macaddr,
-        3145,
-        "macaddr_and"
+        3145
     ),
     catalog_operator!(
         3149,
@@ -9364,115 +6575,22 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Macaddr,
         ColType::Macaddr,
         ColType::Macaddr,
-        3146,
-        "macaddr_or"
+        3146
     ),
-    catalog_comparison_operator!(
-        3362,
-        "=",
-        ColType::Macaddr8,
-        4113,
-        "macaddr8_eq",
-        3362,
-        3363,
-        true,
-        true,
-        101,
-        "eqsel",
-        105,
-        "eqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        3363,
-        "<>",
-        ColType::Macaddr8,
-        4118,
-        "macaddr8_ne",
-        3363,
-        3362,
-        false,
-        false,
-        102,
-        "neqsel",
-        106,
-        "neqjoinsel"
-    ),
-    catalog_comparison_operator!(
-        3364,
-        "<",
-        ColType::Macaddr8,
-        4114,
-        "macaddr8_lt",
-        3366,
-        3367,
-        false,
-        false,
-        103,
-        "scalarltsel",
-        107,
-        "scalarltjoinsel"
-    ),
-    catalog_comparison_operator!(
-        3365,
-        "<=",
-        ColType::Macaddr8,
-        4115,
-        "macaddr8_le",
-        3367,
-        3366,
-        false,
-        false,
-        336,
-        "scalarlesel",
-        386,
-        "scalarlejoinsel"
-    ),
-    catalog_comparison_operator!(
-        3366,
-        ">",
-        ColType::Macaddr8,
-        4116,
-        "macaddr8_gt",
-        3364,
-        3365,
-        false,
-        false,
-        104,
-        "scalargtsel",
-        108,
-        "scalargtjoinsel"
-    ),
-    catalog_comparison_operator!(
-        3367,
-        ">=",
-        ColType::Macaddr8,
-        4117,
-        "macaddr8_ge",
-        3365,
-        3364,
-        false,
-        false,
-        337,
-        "scalargesel",
-        398,
-        "scalargejoinsel"
-    ),
-    catalog_prefix_operator!(
-        3368,
-        "~",
-        ColType::Macaddr8,
-        ColType::Macaddr8,
-        4120,
-        "macaddr8_not"
-    ),
+    catalog_comparison_operator!(3362, "=", ColType::Macaddr8, 4113),
+    catalog_comparison_operator!(3363, "<>", ColType::Macaddr8, 4118),
+    catalog_comparison_operator!(3364, "<", ColType::Macaddr8, 4114),
+    catalog_comparison_operator!(3365, "<=", ColType::Macaddr8, 4115),
+    catalog_comparison_operator!(3366, ">", ColType::Macaddr8, 4116),
+    catalog_comparison_operator!(3367, ">=", ColType::Macaddr8, 4117),
+    catalog_prefix_operator!(3368, "~", ColType::Macaddr8, ColType::Macaddr8, 4120),
     catalog_operator!(
         3369,
         "&",
         ColType::Macaddr8,
         ColType::Macaddr8,
         ColType::Macaddr8,
-        4121,
-        "macaddr8_and"
+        4121
     ),
     catalog_operator!(
         3370,
@@ -9480,8 +6598,7 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         ColType::Macaddr8,
         ColType::Macaddr8,
         ColType::Macaddr8,
-        4122,
-        "macaddr8_or"
+        4122
     ),
     CatalogOperator {
         oid: 3552,
@@ -9490,13 +6607,6 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         right: Some(ColType::Inet),
         result: ColType::Bool,
         procedure_oid: 3551,
-        procedure_name: "network_overlap",
-        commutator: 3552,
-        negator: 0,
-        merges: false,
-        hashes: false,
-        restriction: Some((3560, "networksel")),
-        join: Some((3561, "networkjoinsel")),
     },
 ];
 
@@ -9511,7 +6621,6 @@ fn builtin_regproc(entry: Option<(i32, &'static str)>) -> Datum<'static> {
 
 const XID8_BTREE_OPERATOR_FAMILY_OID: i32 = 5067;
 const XID8_BTREE_OPERATOR_CLASS_OID: i32 = 10053;
-const XID8_CMP_OID: i32 = 5096;
 const MONEY_BTREE_OPERATOR_FAMILY_OID: i32 = 2099;
 const MONEY_BTREE_OPERATOR_CLASS_OID: i32 = 10047;
 const PG_LSN_BTREE_OPERATOR_FAMILY_OID: i32 = 3253;
@@ -9556,8 +6665,6 @@ const MACADDR_BTREE_OPERATOR_CLASS_OID: i32 = 10024;
 const MACADDR_HASH_OPERATOR_CLASS_OID: i32 = 10025;
 const MACADDR8_BTREE_OPERATOR_CLASS_OID: i32 = 10026;
 const MACADDR8_HASH_OPERATOR_CLASS_OID: i32 = 10027;
-const MONEY_CMP_OID: i32 = 377;
-const BT_EQUAL_IMAGE_OID: i32 = 5051;
 
 #[cfg(test)]
 pub(super) const CATALOG_RELATIONS: &[&str] = &[
@@ -9706,7 +6813,9 @@ pub(super) const CATALOG_RELATIONS: &[&str] = &[
     "pg_wait_events",
 ];
 
-fn catalog_relation(name: &str) -> Option<crate::sql::catalog_metadata::CatalogRelation> {
+pub(crate) fn catalog_relation(
+    name: &str,
+) -> Option<crate::sql::catalog_metadata::CatalogRelation> {
     let relation = crate::sql::catalog_metadata::RELATIONS
         .iter()
         .copied()
@@ -10919,16 +8028,6 @@ fn column_statistics_options_datum<'a>(
     })
 }
 
-fn foreign_routine_oid(storage: &Storage, txid: u32, name: &str) -> Result<i32, SqlError> {
-    routine_oid_by_name(storage, txid, name, false)?.ok_or_else(|| {
-        sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "foreign-data routine \"{}\" is missing from pg_proc",
-            name
-        )
-    })
-}
-
 fn pg_foreign_data_wrapper<'a>(
     storage: &Storage,
     txid: u32,
@@ -10947,18 +8046,8 @@ fn pg_foreign_data_wrapper<'a>(
                 Datum::Int4(entry.oid()),
                 text(wrapper.name.as_str(), arena)?,
                 Datum::Int4(storage.role_oid(entry.ownership.owner_to(txid) as usize)),
-                Datum::Int4(match wrapper.handler {
-                    crate::storage::foreign::ForeignDataHandler::None => 0,
-                    crate::storage::foreign::ForeignDataHandler::Postgres => {
-                        foreign_routine_oid(storage, txid, "postgres_fdw_handler")?
-                    }
-                }),
-                Datum::Int4(match wrapper.validator {
-                    crate::storage::foreign::ForeignDataValidator::None => 0,
-                    crate::storage::foreign::ForeignDataValidator::Postgres => {
-                        foreign_routine_oid(storage, txid, "postgres_fdw_validator")?
-                    }
-                }),
+                Datum::Int4(wrapper.handler.routine_oid()),
+                Datum::Int4(wrapper.validator.routine_oid()),
                 acl(
                     storage,
                     crate::storage::AccessObject {
@@ -11296,7 +8385,16 @@ fn acl<'a>(
             && entry.object.slot != u16::MAX
     });
     if !storage.object_acl_defined(object, txid) {
-        return Ok(Datum::Null);
+        if !storage.is_initdb_template_database(object) {
+            return Ok(Datum::Null);
+        }
+        // initdb's `REVOKE CREATE, TEMPORARY ... FROM PUBLIC` leaves PUBLIC
+        // `CONNECT` ahead of the owner's privileges.
+        let owner = catalog_owner_name(storage, catalog_owner(storage, object, txid), txid);
+        let owner = super::types::acl_identifier(owner.as_str());
+        let public = stack_format!(160, "=c/{}", owner.as_str());
+        let owned = stack_format!(160, "{0}=CTc/{0}", owner.as_str());
+        return builtin_acl(&[public.as_str(), owned.as_str()], arena);
     }
     let values = arena
         .alloc_slice_with(storage.acl_entry_count() + 1, |_| Datum::Null)
@@ -11398,6 +8496,19 @@ fn acl<'a>(
         }
     }
     ordered[..ordered_count].sort_unstable_by_key(|(order, _)| *order);
+    // initdb writes a database-owned schema's ACL with `pg_database_owner`
+    // first, and later grants keep that item in place.
+    let database_owned = matches!(
+        catalog_owner(storage, object, txid),
+        CatalogOwner::DatabaseOwner
+    );
+    if database_owned
+        && let Some(position) = ordered[..ordered_count]
+            .iter()
+            .position(|(_, slot)| storage.acl_identity(*slot, txid) == (owner as u16, owner as u16))
+    {
+        ordered[..=position].rotate_right(1);
+    }
     for (position, (_, slot)) in ordered[..ordered_count].iter().copied().enumerate() {
         let entry = storage.acl_entry(slot);
         let (grantee, grantor) = storage.acl_identity(slot, txid);
@@ -11418,8 +8529,13 @@ fn acl<'a>(
         if privileges.0 == 0 && !owner_entry {
             continue;
         }
-        let grantee_name = (grantee != crate::storage::PUBLIC_ROLE)
-            .then(|| storage.role_name(grantee as usize, txid));
+        let grantee_name = (grantee != crate::storage::PUBLIC_ROLE).then(|| {
+            if database_owned && grantee == owner as u16 {
+                SqlName::parse("pg_database_owner").expect("built-in role fits")
+            } else {
+                storage.role_name(grantee as usize, txid)
+            }
+        });
         let grantee = grantee_name.as_ref().map_or("", |name| name.as_str());
         let grantor_name = if matches!(
             catalog_owner(storage, object, txid),
@@ -12016,11 +9132,11 @@ pub(crate) fn schema_oid_by_written(storage: &Storage, txid: u32, written: &str)
 }
 
 pub(crate) fn role_oid_by_written(storage: &Storage, txid: u32, written: &str) -> Option<i32> {
+    // Free role slots have no identity; only visible roles can match.
     (0..storage.role_count()).find_map(|slot| {
-        let oid = storage.role_oid(slot);
-        let visible = storage.role_slot_by_oid(oid, txid)?;
-        identifier_spelling_matches(written, storage.role_name(visible, txid).as_str())
-            .then_some(oid)
+        let role = storage.role(slot);
+        (role.visible_to(txid) && identifier_spelling_matches(written, role.name_to(txid).as_str()))
+            .then(|| role.oid().get())
     })
 }
 
@@ -12255,10 +9371,15 @@ fn write_statistics_keys<const N: usize>(
             &deparse::Context {
                 storage,
                 txid,
+                arena,
+                dependencies: None,
                 table: Some(table),
                 parameters: &[],
                 joined: &[],
                 pretty: true,
+                qualify: false,
+                domain_value: None,
+                bare: None,
             },
             source.as_str(),
             deparse::Destination::Value,
@@ -12378,10 +9499,15 @@ pub(crate) fn extended_statistics_expressions_by_oid<'a>(
                 &deparse::Context {
                     storage,
                     txid,
+                    arena,
+                    dependencies: None,
                     table: Some(&table),
                     parameters: &[],
                     joined: &[],
                     pretty: false,
+                    qualify: false,
+                    domain_value: None,
+                    bare: None,
                 },
                 expression.as_str(),
                 deparse::Destination::Value,
@@ -12527,11 +9653,18 @@ fn parent_constraint<Definition: crate::storage::DefinitionBacking>(
         let child_exclusion = child
             .exclusions()
             .iter()
-            .find(|exclusion| exclusion.columns() == child_columns)?;
+            .find(|exclusion| exclusion.name.as_str() == index.name.as_str())?;
+        // Column elements match by name; expressions name their columns.
+        let child_columns_in_parent = child_exclusion
+            .map_columns(|column| {
+                parent
+                    .column_index(child.columns()[usize::from(column)].name.as_str())
+                    .map(|column| column as u16)
+                    .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_COLUMN, "column is absent"))
+            })
+            .ok()?;
         for exclusion in parent.exclusions() {
-            if exclusion.columns() == columns
-                && exclusion.operators[..exclusion.n_cols]
-                    == child_exclusion.operators[..child_exclusion.n_cols]
+            if exclusion.same_elements(&child_columns_in_parent)
                 && exclusion.predicate == child_exclusion.predicate
             {
                 return Some((
@@ -12577,9 +9710,11 @@ fn visit_indexes(
                   is_primary: bool,
                   is_unique: bool,
                   constraint_identity: Option<crate::storage::ConstraintIdentity>,
-                  is_exclusion: bool,
+                  exclusion_method: Option<crate::sql::ast::IndexAccessMethod>,
                   timing: crate::storage::ConstraintTiming,
                   name: StackStr<64>| {
+            let is_exclusion = exclusion_method.is_some();
+            let method = exclusion_method.unwrap_or(crate::sql::ast::IndexAccessMethod::Btree);
             let mut c = [0u16; crate::storage::MAX_INDEX_COLS];
             c[..columns.len()].copy_from_slice(columns);
             let mut included = [0u16; crate::storage::MAX_INDEX_COLS];
@@ -12590,13 +9725,17 @@ fn visit_indexes(
                 if !expression_keys[position] {
                     let column = &def.columns()[usize::from(column)];
                     collations[position] = column.collation;
-                    resolved_operator_classes[position] = if is_exclusion {
-                        crate::sql::types::GistOperatorClass::for_type(column.ctype)
-                            .map(crate::storage::IndexOperatorClass::Gist)
-                    } else {
-                        crate::sql::types::BtreeOperatorClass::for_type(column.ctype)
-                            .map(crate::storage::IndexOperatorClass::Btree)
-                    };
+                    resolved_operator_classes[position] = storage
+                        .resolve_index_operator_class(
+                            None,
+                            crate::storage::RoutineResult {
+                                ctype: column.ctype,
+                                user_type: column.user_type,
+                            },
+                            method,
+                            txid,
+                        )
+                        .ok();
                 }
             }
             let mut info = IdxInfo {
@@ -12612,11 +9751,7 @@ fn visit_indexes(
                 } else {
                     crate::storage::IndexKind::Ordinary
                 },
-                method: if is_exclusion {
-                    crate::sql::ast::IndexAccessMethod::Gist
-                } else {
-                    crate::sql::ast::IndexAccessMethod::Btree
-                },
+                method,
                 columns: c,
                 expression_keys,
                 include_columns: included,
@@ -12684,7 +9819,7 @@ fn visit_indexes(
                         def.column_constraint_identity(ci)
                             .expect("admitted inline key has a constraint identity"),
                     ),
-                    false,
+                    None,
                     crate::storage::ConstraintTiming::NotDeferrable,
                     name,
                 ));
@@ -12711,7 +9846,7 @@ fn visit_indexes(
                         def.column_constraint_identity(ci)
                             .expect("admitted inline key has a constraint identity"),
                     ),
-                    false,
+                    None,
                     crate::storage::ConstraintTiming::NotDeferrable,
                     name,
                 ));
@@ -12747,7 +9882,7 @@ fn visit_indexes(
                     uk.identity
                         .expect("admitted unique key has a constraint identity"),
                 ),
-                false,
+                None,
                 uk.timing,
                 stack_str_64(uk.name.as_str()),
             ));
@@ -12763,13 +9898,25 @@ fn visit_indexes(
             {
                 continue;
             }
+            // An expression element is attribute 0 of the key, its source
+            // read back through `index_expression_source`.
+            let mut columns = [0u16; crate::storage::MAX_INDEX_COLS];
+            let mut expression_keys = [false; crate::storage::MAX_INDEX_COLS];
+            for (position, element) in exclusion.elements().enumerate() {
+                match element {
+                    crate::storage::ExclusionElement::Column(column) => columns[position] = column,
+                    crate::storage::ExclusionElement::Expression(_) => {
+                        expression_keys[position] = true;
+                    }
+                }
+            }
             visit(mk(
                 exclusion
                     .index_identity
                     .expect("admitted exclusion index has an identity")
                     .oid(),
-                exclusion.columns(),
-                [false; crate::storage::MAX_INDEX_COLS],
+                &columns[..exclusion.len()],
+                expression_keys,
                 &[],
                 [false; crate::storage::MAX_INDEX_COLS],
                 [false; crate::storage::MAX_INDEX_COLS],
@@ -12784,7 +9931,7 @@ fn visit_indexes(
                         .identity
                         .expect("admitted exclusion has a constraint identity"),
                 ),
-                true,
+                Some(exclusion.method),
                 exclusion.timing,
                 stack_str_64(exclusion.name.as_str()),
             ));
@@ -12840,7 +9987,7 @@ fn visit_indexes(
                     || inline.is_some_and(|column| def.columns()[column].primary),
                 index.unique,
                 constraint_identity,
-                attached_exclusion.is_some(),
+                attached_exclusion.map(|key| key.method),
                 attached
                     .map(|key| key.timing)
                     .or_else(|| attached_exclusion.map(|key| key.timing))
@@ -13034,7 +10181,13 @@ pub(crate) fn replica_identity_index_oid(
     let table_slot = (0..storage.table_count()).find(|slot| {
         storage.table_slot_visible_to(*slot, txid) && user_table_oid(storage, *slot) == relation_oid
     })?;
-    let mode = storage.table_def(table_slot, txid).replica_identity;
+    let definition = storage.table_def(table_slot, txid);
+    let mode = definition.replica_identity;
+    let key = definition
+        .key_index_marks
+        .replica_identity
+        .map(|key| key.oid());
+    drop(definition);
     let mut selected = None;
     visit_indexes(storage, txid, None, |index| {
         if index.table_slot != table_slot || selected.is_some() {
@@ -13046,7 +10199,9 @@ pub(crate) fn replica_identity_index_oid(
             }
             crate::storage::ReplicaIdentityMode::Index => index
                 .explicit_definition
-                .is_some_and(|definition| definition.replica_identity),
+                .map_or(key == Some(index.oid), |definition| {
+                    definition.replica_identity
+                }),
             crate::storage::ReplicaIdentityMode::Full
             | crate::storage::ReplicaIdentityMode::Nothing => false,
         };
@@ -13103,11 +10258,54 @@ fn index_expression_source(
     if !info.expression_keys[position] {
         return None;
     }
+    if let Some(index) = info_index(storage, info, txid) {
+        return index.expressions[position];
+    }
+    // A constraint-created exclusion index keeps its keys on the constraint.
+    let table = storage.table_def(info.table_slot, txid);
+    let exclusion = info
+        .is_exclusion
+        .then(|| {
+            table
+                .exclusions()
+                .iter()
+                .find(|exclusion| exclusion.name.as_str() == info.name.as_str())
+        })
+        .flatten()?;
+    match exclusion.element(position) {
+        crate::storage::ExclusionElement::Expression(text) => Some(StackStr::from_str(text)),
+        crate::storage::ExclusionElement::Column(_) => None,
+    }
+}
+
+fn info_index(storage: &Storage, info: &IdxInfo, txid: u32) -> Option<crate::storage::IndexDef> {
     let table = storage.table_def(info.table_slot, txid);
     storage
         .indexes_for(table.schema.as_str(), table.name.as_str(), txid)
-        .find(|index| index.name_for(txid).as_str() == info.name.as_str())?
-        .expressions[position]
+        .find(|index| index.name_for(txid).as_str() == info.name.as_str())
+}
+
+/// The stored text of `owner` in the index `info` describes, bound to the
+/// objects it was written against under their current names.
+fn bound_index_source<'a>(
+    storage: &Storage,
+    info: &IdxInfo,
+    owner: crate::storage::ExpressionOwner,
+    source: &str,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a super::ast::Expr<'a>, SqlError> {
+    if info.is_exclusion {
+        // An exclusion constraint keeps its predicate as name-resolved text;
+        // its index has no explicit definition to bind it through.
+        let source = arena.alloc_str(source).map_err(|_| arena_full())?;
+        return super::parser::parse_expr(source, arena);
+    }
+    let index = info_index(storage, info, txid)
+        .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "index definition is absent"))?;
+    super::exec::expression_bindings::bound_index_expression(
+        source, storage, &index, owner, txid, arena,
+    )
 }
 
 /// Materializes every visible index in the statement arena. This is sized from
@@ -13210,6 +10408,28 @@ pub(crate) struct IndexMaintenanceTarget {
 }
 
 /// Includes the implicit constraint and TOAST indexes exposed by the catalogs.
+/// The index of `table`'s key or exclusion constraint `name`, the parent
+/// index it is attached to, and whether the constraint itself is a
+/// partition's copy of its parent's.
+pub(crate) fn inherited_constraint_index(
+    storage: &Storage,
+    txid: u32,
+    table: usize,
+    name: &str,
+) -> Option<(i32, i32, bool)> {
+    let mut found = None;
+    visit_indexes(storage, txid, None, |index| {
+        if index.table_slot == table
+            && index.constraint_identity.is_some()
+            && index.name.as_str() == name
+            && let Some(parent) = index.index_parent_oid
+        {
+            found = Some((index.oid, parent, index.constraint_parent.is_some()));
+        }
+    });
+    found
+}
+
 pub(crate) fn index_maintenance_target(
     storage: &Storage,
     txid: u32,
@@ -13315,6 +10535,12 @@ pub(crate) fn reindex_candidates<'a>(
             .index_slot(table.schema.as_str(), index.name.as_str(), txid)
             .and_then(|slot| storage.index_visible_to(slot, txid))
             .filter(|definition| explicit_index_oid(definition) == index.oid);
+        // A constraint-created exclusion index keeps its expression keys on
+        // the constraint; the replacement index carries them itself.
+        let mut expressions = [None; crate::storage::MAX_INDEX_COLS];
+        for (position, expression) in expressions.iter_mut().enumerate().take(index.n_cols) {
+            *expression = index_expression_source(storage, &index, position, txid);
+        }
         let definition = explicit.unwrap_or_else(|| crate::storage::IndexDef {
             database: storage.current_database_oid(),
             created_at: table
@@ -13332,6 +10558,7 @@ pub(crate) fn reindex_candidates<'a>(
             },
             method: index.method,
             columns: index.columns,
+            expressions,
             include_columns: index.include_columns,
             collations: index.collations,
             explicit_collations: index.explicit_collations,
@@ -14022,10 +11249,9 @@ pub(crate) fn function_oid_visibility(storage: &Storage, txid: u32, oid: i32) ->
 }
 
 pub(crate) fn operator_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
-    if CATALOG_OPERATORS.iter().any(|operator| operator.oid == oid)
-        || POLYMORPHIC_RANGE_OPERATORS
-            .iter()
-            .any(|operator| operator.oid == oid)
+    if super::catalog_operator_rows::OPERATOR_ROWS
+        .binary_search_by_key(&oid, |row| row.0)
+        .is_ok()
     {
         return Some(true);
     }
@@ -14354,6 +11580,33 @@ mod routine_name_tests {
     }
 
     #[test]
+    fn modeled_operator_contracts_match_generated_postgresql_rows() {
+        use super::super::catalog_operator_rows::OPERATOR_ROWS;
+        assert!(OPERATOR_ROWS.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert_eq!(OPERATOR_ROWS.iter().filter(|row| row.1 == "=").count(), 63);
+        let row = |oid: i32| {
+            OPERATOR_ROWS[OPERATOR_ROWS
+                .binary_search_by_key(&oid, |row| row.0)
+                .unwrap_or_else(|_| panic!("operator {oid} is not a PostgreSQL row"))]
+        };
+        for operator in super::CATALOG_OPERATORS {
+            let row = row(operator.oid);
+            assert_eq!(
+                (row.1, row.5, row.6, row.7, row.10),
+                (
+                    operator.name,
+                    operator.left.map_or(0, super::ColType::oid),
+                    operator.right.map_or(0, super::ColType::oid),
+                    operator.result.oid(),
+                    operator.procedure_oid,
+                ),
+                "operator {}",
+                operator.oid
+            );
+        }
+    }
+
+    #[test]
     fn static_comment_catalog_identities_round_trip() {
         for (name, oid, _, _, _) in ACCESS_METHODS {
             assert_eq!(access_method_oid(name), Some(oid));
@@ -14673,6 +11926,14 @@ fn write_routine_type_name(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Name lookups `routine_oid_by_name` has made on this thread, which a
+    /// test reads to pin how often a statement repeats one.
+    pub(crate) static ROUTINE_NAME_LOOKUPS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+}
+
 /// Resolves the function catalog object types. `regproc` names a routine by
 /// unqualified name; `regprocedure` includes its complete argument signature.
 pub(crate) fn routine_oid_by_name(
@@ -14681,6 +11942,8 @@ pub(crate) fn routine_oid_by_name(
     written: &str,
     signature: bool,
 ) -> Result<Option<i32>, SqlError> {
+    #[cfg(test)]
+    ROUTINE_NAME_LOOKUPS.with(|lookups| lookups.set(lookups.get() + 1));
     let mut arguments = [crate::storage::RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
     let (name, argument_count) = if signature {
         let Some(parsed) = parse_routine_signature(written, storage, txid, &mut arguments) else {
@@ -14871,15 +12134,6 @@ fn parse_polymorphic_operator_signature(written: &str) -> Option<(&str, i32, i32
     Some((name.trim(), type_oid(left)?, type_oid(right)?))
 }
 
-fn polymorphic_type_name(oid: i32) -> Option<&'static str> {
-    match oid {
-        super::types::oid::ANYELEMENT => Some("anyelement"),
-        super::types::oid::ANYRANGE => Some("anyrange"),
-        super::types::oid::ANYMULTIRANGE => Some("anymultirange"),
-        _ => None,
-    }
-}
-
 pub(crate) fn operator_oid_by_name(
     storage: &Storage,
     txid: u32,
@@ -14908,38 +12162,36 @@ pub(crate) fn operator_oid_by_name(
     let ambiguous = || {
         sql_err!(
             sqlstate::AMBIGUOUS_FUNCTION,
-            "more than one operator named \"{}\"",
+            "more than one operator named {}",
             written
         )
     };
+    // Every built-in `pg_operator` row takes part, as in PostgreSQL: a bare
+    // name must be unique, a signature names its operand types (0 is NONE).
     let builtin = || -> Result<Option<i32>, SqlError> {
-        let mut found = None;
-        if let Some((_, left_oid, right_oid)) = polymorphic_arguments {
-            for operator in POLYMORPHIC_RANGE_OPERATORS {
-                if identifier_spelling_matches(written_name, operator.name)
-                    && operator.left_oid == left_oid
-                    && operator.right_oid == right_oid
-                    && found.replace(operator.oid).is_some()
-                {
-                    return Err(ambiguous());
+        let wanted = match (polymorphic_arguments, arguments) {
+            (Some((_, left, right)), _) => Some((left, right)),
+            (None, Some(signature)) => {
+                let operand = |operand: Option<crate::storage::RoutineResult>| match operand {
+                    None => Some(0),
+                    Some(result) if result.user_type.is_none() => Some(result.ctype.oid()),
+                    Some(_) => None,
+                };
+                match (operand(signature.left), operand(signature.right)) {
+                    (Some(left), Some(right)) => Some((left, right)),
+                    _ => return Ok(None),
                 }
             }
-            return Ok(found);
-        }
-        for operator in CATALOG_OPERATORS {
-            let builtin_signature = crate::storage::OperatorSignature {
-                left: operator.left.map(crate::storage::RoutineResult::builtin),
-                right: operator.right.map(crate::storage::RoutineResult::builtin),
-            };
-            if !identifier_spelling_matches(written_name, operator.name)
-                || arguments.is_some_and(|signature| signature != builtin_signature)
+            (None, None) => None,
+        };
+        let mut found = None;
+        for row in &super::catalog_operator_rows::OPERATOR_ROWS {
+            if !identifier_spelling_matches(written_name, row.1)
+                || wanted.is_some_and(|operands| operands != (row.5, row.6))
             {
                 continue;
             }
-            // Most modeled evaluator rows are only one representative of an
-            // overloaded built-in name.  JSON path existence is PostgreSQL's
-            // sole built-in `@?`, so its bare regoper spelling is resolvable.
-            if (!signature && operator.name != "@?") || found.replace(operator.oid).is_some() {
+            if found.replace(row.0).is_some() {
                 return Err(ambiguous());
             }
         }
@@ -15127,66 +12379,38 @@ pub(crate) fn operator_name_by_oid<'a>(
     signature: bool,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    if let Some(operator) = CATALOG_OPERATORS
-        .iter()
-        .find(|operator| operator.oid == oid)
-    {
-        if !signature {
-            if operator.name == "@?" {
-                return arena
-                    .alloc_str(operator.name)
-                    .map(Some)
-                    .map_err(|_| super::eval::arena_full());
-            }
-            return arena
-                .alloc_str_display(format_args!("pg_catalog.{}", operator.name))
-                .map(Some)
-                .map_err(|_| super::eval::arena_full());
-        }
-        let mut text = StackStr::<96>::new();
+    let rows = &super::catalog_operator_rows::OPERATOR_ROWS;
+    if let Ok(index) = rows.binary_search_by_key(&oid, |row| row.0) {
+        let (_, name, _, _, _, left, right, ..) = rows[index];
         use core::fmt::Write;
-        write!(text, "{}(", operator.name).map_err(|_| super::eval::arena_full())?;
-        for (index, operand) in [operator.left, operator.right].into_iter().enumerate() {
-            if index != 0 {
-                text.write_char(',')
-                    .map_err(|_| super::eval::arena_full())?;
-            }
-            text.write_str(operand.map_or("NONE", ColType::name))
+        let mut text = StackStr::<160>::new();
+        if signature {
+            write!(text, "{name}(").map_err(|_| super::eval::arena_full())?;
+            for (position, operand) in [left, right].into_iter().enumerate() {
+                if position != 0 {
+                    text.write_char(',')
+                        .map_err(|_| super::eval::arena_full())?;
+                }
+                if operand == 0 {
+                    text.write_str("NONE")
+                } else {
+                    text.write_str(format_type_oid(storage, txid, operand, -1).as_str())
+                }
                 .map_err(|_| super::eval::arena_full())?;
+            }
+            text.write_char(')')
+                .map_err(|_| super::eval::arena_full())?;
+        } else if rows.iter().filter(|row| row.1 == name).count() == 1
+            && !storage.has_visible_operator_named(name, txid)
+        {
+            // PostgreSQL's `regoperout` prints a name that resolves alone.
+            text.write_str(name)
+                .map_err(|_| super::eval::arena_full())?;
+        } else {
+            write!(text, "pg_catalog.{name}").map_err(|_| super::eval::arena_full())?;
         }
-        text.write_char(')')
-            .map_err(|_| super::eval::arena_full())?;
         return arena
             .alloc_str(text.as_str())
-            .map(Some)
-            .map_err(|_| super::eval::arena_full());
-    }
-    if let Some(operator) = POLYMORPHIC_RANGE_OPERATORS
-        .iter()
-        .find(|operator| operator.oid == oid)
-    {
-        if !signature {
-            return arena
-                .alloc_str_display(format_args!("pg_catalog.{}", operator.name))
-                .map(Some)
-                .map_err(|_| super::eval::arena_full());
-        }
-        let left = polymorphic_type_name(operator.left_oid).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "unknown polymorphic operator type OID {}",
-                operator.left_oid
-            )
-        })?;
-        let right = polymorphic_type_name(operator.right_oid).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "unknown polymorphic operator type OID {}",
-                operator.right_oid
-            )
-        })?;
-        return arena
-            .alloc_str_display(format_args!("{}({},{})", operator.name, left, right))
             .map(Some)
             .map_err(|_| super::eval::arena_full());
     }
@@ -15277,6 +12501,7 @@ pub fn function_def_text<'a>(
         match routine.language {
             crate::storage::RoutineLanguage::Sql => "sql",
             crate::storage::RoutineLanguage::PlPgSql => "plpgsql",
+            crate::storage::RoutineLanguage::Native(_) => "c",
             crate::storage::RoutineLanguage::Internal => {
                 unreachable!("non-aggregate stored routine has an executable language")
             }
@@ -15343,7 +12568,12 @@ pub fn function_def_text<'a>(
             if delimiter.is_truncated() {
                 return Err(routine_definition_too_large());
             }
-            let _ = write!(definition, "AS {0}{body}{0}", delimiter.as_str());
+            let _ = definition.write_str("AS ");
+            // A C routine prints its object file before its link symbol.
+            if let crate::storage::RoutineLanguage::Native(native) = routine.language {
+                let _ = write!(definition, "'{}', ", native.module().path());
+            }
+            let _ = write!(definition, "{0}{body}{0}", delimiter.as_str());
         }
         crate::storage::RoutineBodyKind::Return | crate::storage::RoutineBodyKind::Atomic => {
             write_sql_body(&mut definition, storage, txid, slot, &routine, arena)?;
@@ -15377,10 +12607,15 @@ fn write_sql_body(
     let context = deparse::Context {
         storage,
         txid,
+        arena,
+        dependencies: None,
         table: None,
         parameters: routine.parameters(),
         joined: &[],
         pretty: false,
+        qualify: false,
+        domain_value: None,
+        bare: None,
     };
     let dependencies = storage.snapshot_routine_dependencies_for(slot, txid, arena)?;
     let _formal = super::exec::enter_routine_parameter_types(
@@ -15954,10 +13189,15 @@ pub fn trigger_def_text<'a>(
                     &deparse::Context {
                         storage,
                         txid,
+                        arena,
+                        dependencies: None,
                         table: Some(&definition),
                         parameters: &[],
                         joined: &joined,
                         pretty,
+                        qualify: false,
+                        domain_value: None,
+                        bare: None,
                     },
                     when.as_str(),
                     deparse::Destination::Condition,
@@ -16092,10 +13332,15 @@ fn write_routine_arguments(
             let context = deparse::Context {
                 storage,
                 txid,
+                arena,
+                dependencies: None,
                 table: None,
                 parameters: &[],
                 joined: &[],
                 pretty: false,
+                qualify: false,
+                domain_value: None,
+                bare: None,
             };
             let deparsed = match storage
                 .routine_type_oid(parameter.ctype, parameter.user_type, txid)
@@ -16545,16 +13790,20 @@ pub(crate) fn view_def_text_pretty<'a>(
         let query = arena
             .alloc_str(view.sql.as_str().trim().trim_end_matches(';'))
             .map_err(|_| arena_full())?;
-        if let Ok(select) = crate::sql::parser::parse_query(query, arena)
-            && let Some(deparsed) =
-                deparse::view_definition(storage, txid, select, None, names, layout, arena)?
-        {
-            return Ok(Some(deparsed));
-        }
-        return arena
-            .alloc_str_display(format_args!("{};", view.sql.as_str()))
-            .map(Some)
-            .map_err(|_| arena_full());
+        let select = crate::sql::parser::parse_query(query, arena)
+            .map_err(|_| undeparsable_view(name.as_str()))?;
+        return deparse::view_definition(
+            storage,
+            txid,
+            select,
+            None,
+            names,
+            layout,
+            crate::storage::ViewQueryOrigin::View,
+            arena,
+        )?
+        .map(Some)
+        .ok_or_else(|| undeparsable_view(name.as_str()));
     }
     let stored = rewrite::view_definition(storage, txid, oid, arena)?;
     if stored.is_some()
@@ -16573,26 +13822,61 @@ pub(crate) fn view_def_text_pretty<'a>(
             .alloc_str(query.sql.as_str())
             .map_err(|_| arena_full())?;
         let dependencies = query.dependencies.view();
-        if let Ok(select) = crate::sql::query::parse_stored_query(
+        // A transaction whose catalog snapshot predates the view's current
+        // query reads its own version's text, deparsed under current names.
+        let text = stored.expect("checked stored text");
+        let view_name = view.name_for(txid);
+        if text.strip_suffix(';') != Some(sql) {
+            let text = arena
+                .alloc_str(text.trim().trim_end_matches(';'))
+                .map_err(|_| arena_full())?;
+            let select = crate::sql::parser::parse_query(text, arena)
+                .map_err(|_| undeparsable_view(view_name.as_str()))?;
+            return deparse::view_definition(
+                storage,
+                txid,
+                select,
+                None,
+                names,
+                layout,
+                view.options_for(txid).query_origin,
+                arena,
+            )?
+            .map(Some)
+            .ok_or_else(|| undeparsable_view(view_name.as_str()));
+        }
+        let select = crate::sql::query::parse_stored_query(
             sql,
             query.input_source.unwrap_or(sql),
             storage,
             txid,
             dependencies,
             arena,
-        ) && let Some(deparsed) = deparse::view_definition(
+        )?;
+        return deparse::view_definition(
             storage,
             txid,
             select,
             Some(dependencies),
             names,
             layout,
+            view.options_for(txid).query_origin,
             arena,
-        )? {
-            return Ok(Some(deparsed));
-        }
+        )?
+        .map(Some)
+        .ok_or_else(|| undeparsable_view(view_name.as_str()));
     }
     Ok(stored)
+}
+
+/// A view whose query shape the deparser cannot print. Printing its stored
+/// text instead would show names and forms PostgreSQL does not.
+fn undeparsable_view(name: &str) -> SqlError {
+    sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "deparsing the query of view \"{}\" is not supported",
+        name
+    )
 }
 
 pub fn rule_def_text<'a>(
@@ -16605,9 +13889,9 @@ pub fn rule_def_text<'a>(
     rewrite::rule_definition(storage, txid, oid, pretty, arena)
 }
 
-/// The bytes occupied by a relation's visible encoded row images. Plain views
-/// and indexes have no physical row store in pos3ql, so their exact size is
-/// zero; tables and materialized views share the table row store.
+/// The bytes occupied by a relation's visible encoded row images. Plain views,
+/// indexes and sequences have no physical row store in pos3ql, so their exact
+/// size is zero; tables and materialized views share the table row store.
 pub fn relation_size(storage: &Storage, txid: u32, oid: i32) -> Result<Option<i64>, SqlError> {
     for slot in 0..storage.table_count() {
         if !storage.table_slot_visible_to(slot, txid) {
@@ -16625,6 +13909,11 @@ pub fn relation_size(storage: &Storage, txid: u32, oid: i32) -> Result<Option<i6
         return Ok(Some(0));
     }
     if has_index_oid(storage, txid, oid) {
+        return Ok(Some(0));
+    }
+    if (0..storage.sequence_count()).any(|slot| {
+        storage.sequence_slot_visible_to(slot, txid) && sequence_oid(storage, slot) == oid
+    }) {
         return Ok(Some(0));
     }
     Ok(None)
@@ -16697,53 +13986,29 @@ fn pg_description<'a>(
     let def = schema::require("pg_description", false);
     // Shipped descriptions never change, so history keeps only stored rows;
     // a reader without a stored row falls back to the shipped text.
-    let shipped = match purpose {
-        Materialization::Query => routine_descriptions::ROUTINE_DESCRIPTIONS,
-        Materialization::History => &[],
+    let query = matches!(purpose, Materialization::Query);
+    let shipped_capacity = if query {
+        routine_descriptions::ROUTINE_DESCRIPTIONS.len()
+            + object_descriptions::OBJECT_DESCRIPTIONS.len()
+            + object_descriptions::TEXT_SEARCH_DESCRIPTIONS.len()
+    } else {
+        0
     };
     let out = arena
-        .alloc_slice_with(storage.comment_capacity() + shipped.len(), |_| {
+        .alloc_slice_with(storage.comment_capacity() + shipped_capacity, |_| {
             &[] as &[Datum]
         })
         .map_err(|_| arena_full())?;
-    let mut n = 0;
-    // Shipped built-in routine descriptions, unless a comment replaced or
-    // removed one in this database.
-    let commented = arena
-        .alloc_slice_with(storage.comment_capacity(), |_| u32::MAX)
+    // Stored rows, including the empty ones that hide a shipped description.
+    let stored = arena
+        .alloc_slice_with(storage.comment_capacity(), |_| (0i32, 0i32, 0i32, None))
         .map_err(|_| arena_full())?;
-    let mut commented_count = 0;
-    for (class, _, _, subid, _) in storage.comments_visible(txid) {
-        if class == crate::storage::CommentClass::Routine && commented_count < commented.len() {
-            commented[commented_count] = subid;
-            commented_count += 1;
-        }
-    }
-    let commented = &mut commented[..commented_count];
-    commented.sort_unstable();
-    for &(oid, description) in shipped {
-        if commented.binary_search(&(oid as u32)).is_ok() {
-            continue;
-        }
-        out[n] = row(
-            &[
-                Datum::Oid(oid as u32),
-                Datum::Oid(PG_PROC_OID as u32),
-                Datum::Int4(0),
-                text(description, arena)?,
-            ],
-            arena,
-        )?;
-        n += 1;
-    }
+    let mut stored_count = 0;
     for (class, schema, name, subid, description) in storage.comments_visible(txid) {
         let schema = schema.as_str();
         let name = name.as_str();
         let description = description.as_str();
-        if description.is_empty() {
-            continue;
-        }
-        if n == out.len() {
+        if stored_count == stored.len() {
             return Err(catalog_capacity_exceeded("pg_description"));
         }
         let (objoid, classoid) = match class {
@@ -17017,12 +14282,58 @@ fn pg_description<'a>(
         } else {
             subid as i32
         };
+        let description = if description.is_empty() {
+            None
+        } else {
+            Some(text(description, arena)?)
+        };
+        stored[stored_count] = (objoid, classoid, catalog_subid, description);
+        stored_count += 1;
+    }
+    let stored = &stored[..stored_count];
+    let mut n = 0;
+    if query {
+        let mut ship = |objoid: i32, classoid: i32, description: &str| -> Result<(), SqlError> {
+            if stored
+                .iter()
+                .any(|&(oid, class, subid, _)| oid == objoid && class == classoid && subid == 0)
+            {
+                return Ok(());
+            }
+            out[n] = row(
+                &[
+                    Datum::Oid(objoid as u32),
+                    Datum::Oid(classoid as u32),
+                    Datum::Int4(0),
+                    text(description, arena)?,
+                ],
+                arena,
+            )?;
+            n += 1;
+            Ok(())
+        };
+        for &(oid, description) in routine_descriptions::ROUTINE_DESCRIPTIONS {
+            ship(oid, PG_PROC_OID, description)?;
+        }
+        for &(classoid, oid, description) in object_descriptions::OBJECT_DESCRIPTIONS {
+            ship(oid, classoid, description)?;
+        }
+        for (_, object) in storage.text_search_objects_visible_to(txid) {
+            if let Some((classoid, oid, description)) = builtin_text_search_description(&object) {
+                ship(oid, classoid, description)?;
+            }
+        }
+    }
+    for &(objoid, classoid, subid, description) in stored {
+        let Some(description) = description else {
+            continue;
+        };
         out[n] = row(
             &[
                 Datum::Oid(objoid as u32),
                 Datum::Oid(classoid as u32),
-                Datum::Int4(catalog_subid),
-                text(description, arena)?,
+                Datum::Int4(subid),
+                description,
             ],
             arena,
         )?;
@@ -17471,16 +14782,15 @@ pub fn comment_text_for<'a>(
         }
     }
     Ok(match found {
-        // An empty row hides a built-in routine's shipped description.
+        // An empty row hides a built-in object's shipped description.
         Some("") => None,
         Some(text) => Some(text),
         None => match target {
-            super::eval::DescriptionTarget::Local {
-                catalog: None | Some("pg_proc"),
-                column: 0,
-            } => i32::try_from(oid)
-                .ok()
-                .and_then(builtin_routine_description),
+            super::eval::DescriptionTarget::Local { column: 0, .. } => {
+                i32::try_from(oid).ok().and_then(|oid| {
+                    builtin_object_description(storage, txid, classoid.map(|c| c as i32), oid)
+                })
+            }
             _ => None,
         },
     })
@@ -18106,7 +15416,11 @@ fn check_inheritance_count(
             .table_def(usize::from(attachment.parent), txid)
             .checks()
             .iter()
-            .any(|parent| parent.name == child.name && parent.expression == child.expression)
+            .any(|parent| {
+                !parent.no_inherit
+                    && parent.name == child.name
+                    && parent.expression == child.expression
+            })
     }));
     partition_count
         + definition
@@ -18119,7 +15433,9 @@ fn check_inheritance_count(
                     .checks()
                     .iter()
                     .any(|parent| {
-                        parent.name == child.name && parent.expression == child.expression
+                        !parent.no_inherit
+                            && parent.name == child.name
+                            && parent.expression == child.expression
                     })
             })
             .count()
@@ -18147,6 +15463,108 @@ fn append_constraint_attributes(
         crate::storage::ConstraintValidation::NotEnforced => {
             let _ = rendered.write_str(" NOT ENFORCED");
         }
+    }
+}
+
+/// The type a value of `type_oid` has under its domains (`getBaseType`):
+/// `type_oid` itself unless it is a domain.
+pub(crate) fn domain_root_type_oid(storage: &Storage, txid: u32, type_oid: i32) -> i32 {
+    let mut current = type_oid;
+    // Each step moves to a domain created earlier, so the walk ends.
+    while matches!(
+        crate::storage::NamedTypeKind::from_oid(current),
+        Some((crate::storage::NamedTypeKind::Domain, _, false))
+    ) {
+        let Some(slot) = (0..storage.domain_count()).find(|slot| {
+            storage.domain_slot_visible_to(*slot, txid)
+                && domain_oid(storage, *slot, txid) == current
+        }) else {
+            return current;
+        };
+        current = domain_base_oid(storage, &storage.domain_for(slot, txid), txid);
+    }
+    current
+}
+
+/// A built-in operator class's family and input type.
+pub(crate) fn builtin_operator_class_family(oid: i32) -> Option<(i32, i32)> {
+    if let Some(class) = BUILTIN_TREE_HASH_CLASSES
+        .iter()
+        .find(|class| class.0 == oid)
+    {
+        return Some((class.3, class.4));
+    }
+    if let Some(class) = super::types::BrinOperatorClass::from_oid(oid) {
+        return Some((class.family_oid(), class.input_oid()));
+    }
+    if let Some(class) = super::types::GistOperatorClass::from_oid(oid) {
+        return Some((class.family_oid(), class.input_oid()));
+    }
+    if let Some(class) = super::types::GinOperatorClass::from_oid(oid) {
+        return Some((class.family_oid(), class.input_oid()));
+    }
+    super::types::SpGistOperatorClass::from_oid(oid)
+        .map(|class| (class.family_oid(), class.input_oid()))
+}
+
+/// A built-in binary operator's name, left and right operand types and
+/// commutator.
+pub(crate) fn builtin_binary_operator_row(oid: i32) -> Option<(&'static str, i32, i32, i32)> {
+    let rows = &super::catalog_operator_rows::OPERATOR_ROWS;
+    let row = rows[rows.binary_search_by_key(&oid, |row| row.0).ok()?];
+    (row.2 == b'b').then_some((row.1, row.5, row.6, row.8))
+}
+
+/// The built-in binary operator `name(left, right)`.
+pub(crate) fn builtin_binary_operator(name: &str, left: i32, right: i32) -> Option<i32> {
+    super::catalog_operator_rows::OPERATOR_ROWS
+        .iter()
+        .find(|row| row.2 == b'b' && row.1 == name && row.5 == left && row.6 == right)
+        .map(|row| row.0)
+}
+
+/// Whether built-in operator family `family` of access method `method`
+/// has operator `operator` as a search member (`pg_amop`).
+pub(crate) fn builtin_family_has_operator(family: i32, method: i32, operator: i32) -> bool {
+    access_method_members::OPERATORS
+        .iter()
+        .any(|row| row.1 == family && row.5 == "s" && row.6 == operator && row.7 == method)
+}
+
+/// A table's stored expression deparsed after binding it to the objects it
+/// was written against, under their current names; `None` when the deparser
+/// does not cover its shape.
+fn bound_table_expression_display<'a>(
+    context: &deparse::Context<'_>,
+    table: &crate::storage::TableDef,
+    owner: crate::storage::ExpressionOwner,
+    source: &str,
+    destination: deparse::Destination,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let source = arena.alloc_str(source).map_err(|_| arena_full())?;
+    let Ok(expression) = crate::sql::parser::parse_expr(source, arena) else {
+        return Ok(None);
+    };
+    let bound = super::exec::expression_bindings::bind_table_expression(
+        expression,
+        context.storage,
+        table,
+        owner,
+        context.txid,
+        arena,
+    )?;
+    deparse::deparse_expression(context, bound, destination, arena)
+}
+
+/// `pg_type.typbasetype` of a domain: its parent domain or its base type.
+fn domain_base_oid(storage: &Storage, domain: &crate::storage::DomainDef, txid: u32) -> i32 {
+    match domain.base_domain {
+        Some(parent) => storage
+            .domain_identity_slot(parent.schema.as_str(), parent.name.as_str(), txid)
+            .map(|slot| domain_oid(storage, slot, txid))
+            .expect("visible domain retains its parent identity"),
+        None => domain.base.oid(),
     }
 }
 
@@ -18260,13 +15678,20 @@ pub fn constraint_def_text<'a>(
             let context = deparse::Context {
                 storage,
                 txid,
+                arena,
+                dependencies: None,
                 table: Some(&table),
                 parameters: &[],
                 joined: &[],
                 pretty,
+                qualify: false,
+                domain_value: None,
+                bare: None,
             };
-            match deparse::deparse(
+            match bound_table_expression_display(
                 &context,
+                &table,
+                crate::storage::ExpressionOwner::Check(check.name),
                 check.expression.as_str(),
                 deparse::Destination::Condition,
                 arena,
@@ -18278,6 +15703,9 @@ pub fn constraint_def_text<'a>(
                 None => {
                     let _ = write!(rendered, "CHECK (({}))", check.expression.as_str());
                 }
+            }
+            if check.no_inherit {
+                let _ = rendered.write_str(" NO INHERIT");
             }
             append_constraint_attributes(
                 &mut rendered,
@@ -18320,7 +15748,27 @@ pub fn constraint_def_text<'a>(
                 txid,
                 arena,
             )?;
-            let _ = write!(rendered, "CHECK (({}))", expression);
+            let context = deparse::Context {
+                storage,
+                txid,
+                table: None,
+                parameters: &[],
+                joined: &[],
+                pretty,
+                qualify: false,
+                domain_value: Some(domain_base_oid(storage, &domain, txid)),
+                bare: None,
+                arena,
+                dependencies: None,
+            };
+            match deparse::deparse(&context, expression, deparse::Destination::Condition, arena)? {
+                Some(deparsed) => {
+                    let _ = write!(rendered, "CHECK ({deparsed})");
+                }
+                None => {
+                    let _ = write!(rendered, "CHECK (({}))", expression);
+                }
+            }
             append_constraint_attributes(
                 &mut rendered,
                 crate::storage::ConstraintTiming::NotDeferrable,
@@ -18350,22 +15798,53 @@ pub fn constraint_def_text<'a>(
                 .iter()
                 .find(|exclusion| exclusion.name.as_str() == info.name.as_str())
                 .expect("exclusion index has its constraint");
-            let _ = rendered.write_str("EXCLUDE USING gist (");
-            for position in 0..exclusion.n_cols {
+            let _ = write!(rendered, "EXCLUDE USING {} (", exclusion.method.name());
+            for (position, (element, operator)) in
+                exclusion.elements().zip(exclusion.operators()).enumerate()
+            {
                 if position != 0 {
                     let _ = rendered.write_str(", ");
                 }
-                write_identifier(
-                    &mut rendered,
-                    table.columns()[exclusion.columns[position] as usize]
-                        .name
-                        .as_str(),
-                );
-                let _ = write!(rendered, " WITH {}", exclusion.operators[position].sql());
+                match element {
+                    crate::storage::ExclusionElement::Column(column) => write_identifier(
+                        &mut rendered,
+                        table.columns()[usize::from(column)].name.as_str(),
+                    ),
+                    crate::storage::ExclusionElement::Expression(text) => {
+                        let source = arena.alloc_str(text).map_err(|_| arena_full())?;
+                        let expression = super::parser::parse_expr(source, arena)?;
+                        let _ = rendered.write_str(index_expression_display(
+                            storage, txid, &table, expression, source, pretty, arena,
+                        )?);
+                    }
+                }
+                let _ = write!(rendered, " WITH {}", operator.sql());
             }
             let _ = rendered.write_str(")");
             if let Some(predicate) = &exclusion.predicate {
-                let _ = write!(rendered, " WHERE ({})", predicate.as_str());
+                let source = arena
+                    .alloc_str(predicate.as_str())
+                    .map_err(|_| arena_full())?;
+                let expression = super::parser::parse_expr(source, arena)?;
+                let deparsed = deparse::deparse_expression(
+                    &deparse::Context {
+                        storage,
+                        txid,
+                        arena,
+                        dependencies: None,
+                        table: Some(&table),
+                        parameters: &[],
+                        joined: &[],
+                        pretty,
+                        qualify: false,
+                        domain_value: None,
+                        bare: None,
+                    },
+                    expression,
+                    deparse::Destination::Condition,
+                    arena,
+                )?;
+                let _ = write!(rendered, " WHERE ({})", deparsed.unwrap_or(source));
             }
             append_constraint_attributes(
                 &mut rendered,
@@ -19004,10 +16483,19 @@ pub fn index_def_text<'a>(
                                 "index expression source is absent"
                             )
                         })?;
+                    let bound = bound_index_source(
+                        storage,
+                        info,
+                        crate::storage::ExpressionOwner::IndexKey(position as u8),
+                        expression.as_str(),
+                        txid,
+                        arena,
+                    )?;
                     return Ok(Some(index_expression_display(
                         storage,
                         txid,
                         &def,
+                        bound,
                         expression.as_str(),
                         pretty,
                         arena,
@@ -19037,15 +16525,7 @@ pub fn index_def_text<'a>(
         let visible = matches!(storage.resolve_relation(None, def.name.as_str(), txid),
             Some(crate::storage::ResolvedRelation::Table(slot)) if slot == info.table_slot);
         write_index_target(&mut s, &def, info, !pretty || !visible);
-        let _ = write!(
-            s,
-            " USING {} (",
-            if info.is_exclusion {
-                "gist"
-            } else {
-                info.method.name()
-            }
-        );
+        let _ = write!(s, " USING {} (", info.method.name());
         for k in 0..info.n_cols {
             if k > 0 {
                 let _ = s.write_str(", ");
@@ -19058,10 +16538,19 @@ pub fn index_def_text<'a>(
                             "index expression source is absent"
                         )
                     })?;
+                let bound = bound_index_source(
+                    storage,
+                    info,
+                    crate::storage::ExpressionOwner::IndexKey(k as u8),
+                    expression.as_str(),
+                    txid,
+                    arena,
+                )?;
                 let _ = s.write_str(index_expression_display(
                     storage,
                     txid,
                     &def,
+                    bound,
                     expression.as_str(),
                     pretty,
                     arena,
@@ -19100,16 +16589,29 @@ pub fn index_def_text<'a>(
         }
         write_index_storage_options(&mut s, info.explicit_definition);
         if let Some(predicate) = info.predicate {
-            let deparsed = deparse::deparse(
+            let bound = bound_index_source(
+                storage,
+                info,
+                crate::storage::ExpressionOwner::IndexPredicate,
+                predicate.as_str(),
+                txid,
+                arena,
+            )?;
+            let deparsed = deparse::deparse_expression(
                 &deparse::Context {
                     storage,
                     txid,
+                    arena,
+                    dependencies: None,
                     table: Some(&def),
                     parameters: &[],
                     joined: &[],
                     pretty,
+                    qualify: false,
+                    domain_value: None,
+                    bare: None,
                 },
-                predicate.as_str(),
+                bound,
                 deparse::Destination::Condition,
                 arena,
             )?;
@@ -19158,6 +16660,20 @@ fn index_attribute_names(
     Ok(names)
 }
 
+/// An expression key as a unique violation's detail names it, from its bound
+/// form `expression` (stored as `source`) on table `table`.
+pub(crate) fn index_key_display<'a>(
+    storage: &Storage,
+    txid: u32,
+    table: usize,
+    expression: &'a super::ast::Expr<'a>,
+    source: &str,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let table = storage.table_def(table, txid);
+    index_expression_display(storage, txid, &table, expression, source, true, arena)
+}
+
 /// `pg_get_indexdef_worker`: an expression key is parenthesized unless it
 /// looks like a function call. A shape the deparser cannot type keeps its
 /// canonical source spelling.
@@ -19165,22 +16681,27 @@ fn index_expression_display<'a>(
     storage: &Storage,
     txid: u32,
     table: &crate::storage::TableDef,
+    expression: &'a super::ast::Expr<'a>,
     source: &str,
     pretty: bool,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
     use core::fmt::Write;
-    let expression = super::parser::parse_expr(source, arena)?;
-    let deparsed = deparse::deparse(
+    let deparsed = deparse::deparse_expression(
         &deparse::Context {
             storage,
             txid,
+            arena,
+            dependencies: None,
             table: Some(table),
             parameters: &[],
             joined: &[],
             pretty,
+            qualify: false,
+            domain_value: None,
+            bare: None,
         },
-        source,
+        expression,
         deparse::Destination::Value,
         arena,
     )?;
@@ -22296,9 +19817,11 @@ fn pg_class<'a>(
                 Datum::Int4(i32::from(table_def.attributes.count)),
                 Datum::Float8(reltuples),
                 Datum::Int4(relpages),
-                Datum::Int4(match table_def.access_method {
-                    crate::storage::TableAccessMethod::Heap => 2,
-                    crate::storage::TableAccessMethod::Catalog(oid) => oid.get(),
+                // A foreign table has no table access method.
+                Datum::Int4(if relkind == "f" {
+                    0
+                } else {
+                    table_def.access_method.relam()
                 }),
                 Datum::Int4(relation_owner),
                 Datum::Int4(n_checks), // relchecks
@@ -22544,7 +20067,6 @@ fn pg_class<'a>(
                     crate::sql::ast::IndexAccessMethod::Brin => 3580,
                     crate::sql::ast::IndexAccessMethod::Gin => 2742,
                     crate::sql::ast::IndexAccessMethod::SpGist => 4000,
-                    crate::sql::ast::IndexAccessMethod::Btree if info.is_exclusion => 783,
                     crate::sql::ast::IndexAccessMethod::Btree => 403,
                 }),
                 Datum::Int4(storage.role_oid(usize::from(info.owner))),
@@ -22661,32 +20183,17 @@ fn pg_class<'a>(
         let n_columns = view.columns_for(txid).len();
         let mut option_values = [Datum::Null; 3];
         let mut option_count = 0;
-        if matches!(
-            view.security_for(txid),
-            crate::storage::ViewSecurity::Invoker
-        ) {
-            option_values[option_count] = text("security_invoker=true", arena)?;
-            option_count += 1;
-        }
-        if let Some(enabled) = view.security_barrier_for(txid).reloption() {
-            option_values[option_count] = text(
-                if enabled {
-                    "security_barrier=true"
-                } else {
-                    "security_barrier=false"
-                },
-                arena,
-            )?;
-            option_count += 1;
-        }
-        if let Some(option) = view.check_option_for(txid) {
-            option_values[option_count] = text(
-                match option {
-                    crate::storage::ViewCheckOption::Local => "check_option=local",
-                    crate::storage::ViewCheckOption::Cascaded => "check_option=cascaded",
-                },
-                arena,
-            )?;
+        let options = view.options_for(txid);
+        for option in options.order.names() {
+            let mut listed = crate::util::StackStr::<32>::new();
+            let name = match option {
+                crate::sql::ast::ViewOptionName::SecurityInvoker => "security_invoker",
+                crate::sql::ast::ViewOptionName::SecurityBarrier => "security_barrier",
+                crate::sql::ast::ViewOptionName::CheckOption => "check_option",
+            };
+            write!(listed, "{name}={}", options.order.spelling(option))
+                .map_err(|_| super::eval::arena_full())?;
+            option_values[option_count] = text(listed.as_str(), arena)?;
             option_count += 1;
         }
         let reloptions = if option_count != 0 {
@@ -23188,11 +20695,7 @@ fn pg_constraint_values<'a>(
                 Datum::Bool(false), // conperiod
                 text(" ", arena)?,  // confupdtype (n/a for non-FK)
                 text(" ", arena)?,  // confdeltype
-                attnum_array(
-                    &info.columns[..info.n_cols],
-                    &storage.table_def(info.table_slot, txid),
-                    arena,
-                )?,
+                key_attnum_array(info, &storage.table_def(info.table_slot, txid), arena)?,
                 Datum::Null,
                 Datum::Int4(2606),
                 Datum::Int4(namespace_oid(
@@ -23216,7 +20719,7 @@ fn pg_constraint_values<'a>(
                         .iter()
                         .find(|exclusion| exclusion.name.as_str() == info.name.as_str())
                         .expect("exclusion index has its constraint");
-                    exclusion_operator_array(&exclusion.operators[..exclusion.n_cols], arena)?
+                    exclusion_operator_array(exclusion.operators(), arena)?
                 } else {
                     Datum::Null
                 },
@@ -23467,7 +20970,7 @@ fn pg_constraint_values<'a>(
                     text(" ", arena)?,
                     Datum::Bool(!inherited),
                     Datum::Int4(inheritance_count as i32),
-                    Datum::Bool(false),
+                    Datum::Bool(check.no_inherit),
                     Datum::Null,
                     Datum::Null,
                     Datum::Null,
@@ -23780,6 +21283,10 @@ fn available_extension_requires<'a>(
     package: &crate::storage::ExtensionPackage,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    // A control file without `requires` lists NULL, not an empty array.
+    if package.requires().is_empty() {
+        return Ok(Datum::Null);
+    }
     let mut values = [Datum::Null; crate::storage::MAX_EXTENSION_REQUIRES];
     for (index, required) in package.requires().iter().enumerate() {
         values[index] = text(required.as_str(), arena)?;
@@ -23790,17 +21297,84 @@ fn available_extension_requires<'a>(
     })
 }
 
+/// Rows of the `pg_available_extensions()` and
+/// `pg_available_extension_versions()` functions: their views' rows without
+/// the `installed_version` or `installed` column the views add.
+pub(crate) fn available_extension_function_rows<'a>(
+    storage: &Storage,
+    txid: u32,
+    versions: bool,
+    arena: &'a Arena,
+) -> Result<&'a [&'a [Datum<'a>]], SqlError> {
+    let (table, installed) = if versions {
+        (pg_available_extension_versions(storage, txid, arena)?, 2)
+    } else {
+        (pg_available_extensions(storage, txid, arena)?, 2)
+    };
+    let rows = arena
+        .alloc_slice_with(table.rows.len(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    for (output, input) in rows.iter_mut().zip(table.rows) {
+        let values = arena
+            .alloc_slice_with(input.len() - 1, |index| {
+                input[if index < installed { index } else { index + 1 }]
+            })
+            .map_err(|_| arena_full())?;
+        *output = values;
+    }
+    Ok(rows)
+}
+
+/// Output columns of `pg_available_extensions()` or
+/// `pg_available_extension_versions()`, in order.
+pub(crate) fn available_extension_function_columns(
+    versions: bool,
+) -> &'static [(&'static str, ColType)] {
+    if versions {
+        &[
+            ("name", ColType::Name),
+            ("version", ColType::Text),
+            ("superuser", ColType::Bool),
+            ("trusted", ColType::Bool),
+            ("relocatable", ColType::Bool),
+            ("schema", ColType::Name),
+            ("requires", ColType::Array(super::types::ArrElem::Name)),
+            ("comment", ColType::Text),
+        ]
+    } else {
+        &[
+            ("name", ColType::Name),
+            ("default_version", ColType::Text),
+            ("comment", ColType::Text),
+        ]
+    }
+}
+
 fn pg_available_extensions<'a>(
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_available_extensions", false);
-    let count = storage.extension_packages().count();
+    let system = usize::from(storage.system_extension_packages());
+    let count = storage.extension_packages().count() + system;
     let out = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
+    // `$system` holds the plpgsql package initdb installs.
+    if system == 1 {
+        out[0] = row(
+            &[
+                text("plpgsql", arena)?,
+                text("1.0", arena)?,
+                text("1.0", arena)?,
+                text(PLPGSQL_EXTENSION_COMMENT, arena)?,
+            ],
+            arena,
+        )?;
+    }
     for (index, (_, package)) in storage.extension_packages().enumerate() {
+        let index = index + system;
         let installed = storage
             .extension_slot(package.name.as_str(), txid)
             .map(|slot| storage.extension(slot).definition_to(txid).2);
@@ -23836,6 +21410,23 @@ fn pg_available_extension_versions<'a>(
     let mut out: [&[Datum]; 256] = [&[]; 256];
     let mut emitted: [Option<(usize, crate::storage::ExtensionVersion)>; 256] = [None; 256];
     let mut count = 0usize;
+    if storage.system_extension_packages() {
+        out[0] = row(
+            &[
+                text("plpgsql", arena)?,
+                text("1.0", arena)?,
+                Datum::Bool(true),
+                Datum::Bool(true),
+                Datum::Bool(true),
+                Datum::Bool(false),
+                text("pg_catalog", arena)?,
+                Datum::Null,
+                text(PLPGSQL_EXTENSION_COMMENT, arena)?,
+            ],
+            arena,
+        )?;
+        count = 1;
+    }
     for (package_slot, package) in storage.extension_packages() {
         for (_, script) in storage.extension_scripts_for(package_slot) {
             if emitted[..count].contains(&Some((package_slot, script.to))) {
@@ -23884,9 +21475,25 @@ fn pg_extension<'a>(
     let def = schema::require("pg_extension", false);
     let count = storage.extensions_visible_to(txid).count();
     let out = arena
-        .alloc_slice_with(count, |_| &[] as &[Datum])
+        .alloc_slice_with(count + 1, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
+    // initdb installs plpgsql as an extension owned by the bootstrap superuser.
+    out[0] = row(
+        &[
+            Datum::Int4(3079),
+            Datum::Int4(PLPGSQL_EXTENSION_OID),
+            text("plpgsql", arena)?,
+            Datum::Int4(10),
+            Datum::Int4(PG_CATALOG_NS_OID),
+            Datum::Bool(false),
+            text("1.0", arena)?,
+            Datum::Null,
+            Datum::Null,
+        ],
+        arena,
+    )?;
     for (index, (slot, extension)) in storage.extensions_visible_to(txid).enumerate() {
+        let index = index + 1;
         let (namespace, relocatable, version) = extension.definition_to(txid);
         let mut config_oids = [Datum::Null; crate::storage::MAX_EXTENSION_CONFIG_RELATIONS];
         let mut config_conditions = [Datum::Null; crate::storage::MAX_EXTENSION_CONFIG_RELATIONS];
@@ -24111,6 +21718,27 @@ fn attnum_array<'a, Definition0: crate::storage::DefinitionBacking>(
     })
 }
 
+/// An index constraint's `conkey`: attribute 0 for an expression key.
+fn key_attnum_array<'a>(
+    info: &IdxInfo,
+    table: &crate::storage::TableDef,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let vals = arena
+        .alloc_slice_with(info.n_cols, |index| {
+            Datum::Int4(if info.expression_keys[index] {
+                0
+            } else {
+                i32::from(table.attribute_number(usize::from(info.columns[index])))
+            })
+        })
+        .map_err(|_| arena_full())?;
+    Ok(Datum::Array {
+        element: super::types::ArrElem::Int4,
+        raw: super::array::build(vals, arena)?,
+    })
+}
+
 fn empty_int_array<'a>(arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     Ok(Datum::Array {
         element: super::types::ArrElem::Int4,
@@ -24153,11 +21781,7 @@ fn exclusion_operator_array<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     let mut values = [Datum::Null; crate::storage::MAX_INDEX_COLS];
     for (index, operator) in operators.iter().copied().enumerate() {
-        values[index] = Datum::Int4(match operator {
-            crate::storage::ExclusionOperator::Equal => 3882,
-            crate::storage::ExclusionOperator::Overlaps => 3888,
-            crate::storage::ExclusionOperator::Adjacent => 3897,
-        });
+        values[index] = Datum::Int4(operator.oid());
     }
     Ok(Datum::Array {
         element: super::types::ArrElem::Int4,
@@ -24192,6 +21816,11 @@ fn pg_index<'a>(
         }
         attributes[info.n_cols..info.n_cols + info.n_include_cols]
             .copy_from_slice(&info.include_columns[..info.n_include_cols]);
+        // A key index carries its marks on its table.
+        let marks = storage.table_def(info.table_slot, txid).key_index_marks;
+        let key_marked = |mark: Option<crate::storage::RelationIdentity>| {
+            mark.map(|mark| mark.oid()) == Some(info.oid)
+        };
         out[n] = row(
             &[
                 Datum::Int4(info.oid),
@@ -24200,7 +21829,9 @@ fn pg_index<'a>(
                 Datum::Bool(info.is_unique),
                 Datum::Bool(
                     info.explicit_definition
-                        .is_some_and(|definition| definition.clustered),
+                        .map_or(key_marked(marks.clustered), |definition| {
+                            definition.clustered
+                        }),
                 ),
                 Datum::Bool(false), // indischeckxmin
                 Datum::Bool(
@@ -24215,7 +21846,9 @@ fn pg_index<'a>(
                 ),
                 Datum::Bool(
                     info.explicit_definition
-                        .is_some_and(|definition| definition.replica_identity),
+                        .map_or(key_marked(marks.replica_identity), |definition| {
+                            definition.replica_identity
+                        }),
                 ),
                 Datum::Bool(info.nulls_not_distinct),
                 Datum::Int4((info.n_cols + info.n_include_cols) as i32),
@@ -24364,7 +21997,14 @@ fn index_collations<'a>(
         } else if info.expression_keys[position] {
             let source = index_expression_source(storage, info, position, txid)
                 .expect("expression index has source");
-            let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
+            let expression = bound_index_source(
+                storage,
+                info,
+                crate::storage::ExpressionOwner::IndexKey(position as u8),
+                source.as_str(),
+                txid,
+                arena,
+            )?;
             let catalog = super::query::storage_catalog(storage, arena, txid);
             resolved_expression_collation(expression, &TableColumnTypes(&table), Some(&catalog))?
         } else {
@@ -24389,7 +22029,14 @@ fn index_operator_classes<'a>(
         } else if info.expression_keys[position] {
             let source = index_expression_source(storage, info, position, txid)
                 .expect("expression index has source");
-            let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
+            let expression = bound_index_source(
+                storage,
+                info,
+                crate::storage::ExpressionOwner::IndexKey(position as u8),
+                source.as_str(),
+                txid,
+                arena,
+            )?;
             let (oid, _) =
                 super::exec::infer_type_catalog(expression, Some(&table), storage, txid, arena)?;
             super::exec::catalog_column_type(storage, txid, oid)
@@ -24475,7 +22122,7 @@ fn oidvector<'a>(oids: &[i32], arena: &'a Arena) -> Result<Datum<'a>, SqlError> 
     })
 }
 
-fn catalog_column_type_oid(
+pub(crate) fn catalog_column_type_oid(
     storage: &Storage,
     column: &ColumnMeta,
     txid: u32,
@@ -24666,7 +22313,14 @@ fn pg_attribute<'a>(
                         },
                         arena,
                     )?, // attidentity: always 'a' / by default 'd'
-                    text(if c.default.is_generated() { "s" } else { "" }, arena)?, // attgenerated
+                    text(
+                        match c.default.generation() {
+                            Some(crate::storage::Generation::Stored) => "s",
+                            Some(crate::storage::Generation::Virtual) => "v",
+                            None => "",
+                        },
+                        arena,
+                    )?, // attgenerated
                     text(
                         match c.storage {
                             crate::sql::ast::ColumnStorage::Plain => "p",
@@ -24851,8 +22505,14 @@ fn pg_attribute<'a>(
                 .then(|| index_expression_source(storage, info, attribute, txid))
                 .flatten();
             let (name, ctype, type_oid, type_mod, collation) = if let Some(source) = expression {
-                let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
-                let expression = crate::sql::parser::parse_expr(source, arena)?;
+                let expression = bound_index_source(
+                    storage,
+                    info,
+                    crate::storage::ExpressionOwner::IndexKey(attribute as u8),
+                    source.as_str(),
+                    txid,
+                    arena,
+                )?;
                 let (type_oid, type_mod) = super::exec::infer_type_catalog(
                     expression,
                     Some(&table),
@@ -25236,7 +22896,7 @@ fn pg_attrdef<'a>(
         let table = storage.table_def(slot, txid);
         let relid = user_table_oid(storage, slot);
         for (ci, c) in table.columns().iter().enumerate() {
-            let Some(text_expr) = super::enum_values::default_expression(
+            let Some(mut text_expr) = super::enum_values::default_expression(
                 &c.default,
                 Some(c.ctype),
                 storage,
@@ -25246,6 +22906,34 @@ fn pg_attrdef<'a>(
             else {
                 continue;
             };
+            // An expression bound to catalog objects prints their current
+            // names.
+            let owner = crate::storage::ExpressionOwner::Column(c.name);
+            if table.expression_dependencies_of(owner).next().is_some()
+                && let Some(expression) = c.default.expression()
+                && let Some(bound) = bound_table_expression_display(
+                    &deparse::Context {
+                        storage,
+                        txid,
+                        table: Some(&table),
+                        parameters: &[],
+                        joined: &[],
+                        pretty: false,
+                        qualify: false,
+                        domain_value: None,
+                        bare: None,
+                        arena,
+                        dependencies: None,
+                    },
+                    &table,
+                    owner,
+                    expression.as_str(),
+                    deparse::Destination::Assignment(catalog_column_type_oid(storage, c, txid)?),
+                    arena,
+                )?
+            {
+                text_expr = bound;
+            }
             if n == out.len() {
                 return Err(catalog_capacity_exceeded("pg_attrdef"));
             }
@@ -25437,75 +23125,65 @@ fn pg_operator<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("pg_operator", false);
+    let builtin = &super::catalog_operator_rows::OPERATOR_ROWS;
     let rows = catalog_rows(
         arena,
-        CATALOG_OPERATORS.len()
-            + POLYMORPHIC_RANGE_OPERATORS.len()
-            + storage.operators_visible_to(txid).count(),
+        builtin.len() + storage.operators_visible_to(txid).count(),
     )?;
-    for (index, operator) in CATALOG_OPERATORS.iter().enumerate() {
-        rows[index] = row(
+    let routine = |oid: i32, name: &'static str| Datum::RegObject {
+        type_oid: super::types::oid::REGPROC,
+        referenced_oid: oid,
+        name,
+    };
+    for (
+        output,
+        &(
+            oid,
+            name,
+            kind,
+            merges,
+            hashes,
+            left,
+            right,
+            result,
+            commutator,
+            negator,
+            code,
+            code_name,
+            restriction,
+            restriction_name,
+            join,
+            join_name,
+        ),
+    ) in rows.iter_mut().zip(builtin)
+    {
+        *output = row(
             &[
                 Datum::Int4(2617),
-                Datum::Int4(operator.oid),
-                text(operator.name, arena)?,
+                Datum::Int4(oid),
+                text(name, arena)?,
                 Datum::Int4(PG_CATALOG_NS_OID),
                 Datum::Int4(10),
-                Datum::Bpchar(match (operator.left, operator.right) {
-                    (None, Some(_)) => "l",
-                    (Some(_), None) => "r",
+                Datum::Bpchar(match kind {
+                    b'l' => "l",
+                    b'r' => "r",
                     _ => "b",
                 }),
-                Datum::Bool(operator.merges),
-                Datum::Bool(operator.hashes),
-                Datum::Int4(operator.left.map_or(0, ColType::oid)),
-                Datum::Int4(operator.right.map_or(0, ColType::oid)),
-                Datum::Int4(operator.result.oid()),
-                Datum::Int4(operator.commutator),
-                Datum::Int4(operator.negator),
-                Datum::RegObject {
-                    type_oid: super::types::oid::REGPROC,
-                    referenced_oid: operator.procedure_oid,
-                    name: operator.procedure_name,
-                },
-                builtin_regproc(operator.restriction),
-                builtin_regproc(operator.join),
+                Datum::Bool(merges),
+                Datum::Bool(hashes),
+                Datum::Int4(left),
+                Datum::Int4(right),
+                Datum::Int4(result),
+                Datum::Int4(commutator),
+                Datum::Int4(negator),
+                routine(code, code_name),
+                routine(restriction, restriction_name),
+                routine(join, join_name),
             ],
             arena,
         )?;
     }
-    let mut count = CATALOG_OPERATORS.len();
-    for operator in POLYMORPHIC_RANGE_OPERATORS {
-        if count == rows.len() {
-            return Err(catalog_capacity_exceeded("pg_operator"));
-        }
-        rows[count] = row(
-            &[
-                Datum::Int4(2617),
-                Datum::Int4(operator.oid),
-                text(operator.name, arena)?,
-                Datum::Int4(PG_CATALOG_NS_OID),
-                Datum::Int4(10),
-                Datum::Bpchar("b"),
-                Datum::Bool(operator.merges),
-                Datum::Bool(operator.hashes),
-                Datum::Int4(operator.left_oid),
-                Datum::Int4(operator.right_oid),
-                Datum::Int4(operator.result_oid),
-                Datum::Int4(operator.commutator),
-                Datum::Int4(operator.negator),
-                Datum::RegObject {
-                    type_oid: super::types::oid::REGPROC,
-                    referenced_oid: operator.procedure_oid,
-                    name: operator.procedure_name,
-                },
-                builtin_regproc(operator.restriction),
-                builtin_regproc(operator.join),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
+    let mut count = builtin.len();
     for (slot, operator) in storage.operators_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_operator"));
@@ -26054,6 +23732,26 @@ fn pg_opclass<'a>(
         )?;
         count += 1;
     }
+    // Built-in rows in a fresh cluster's physical order, which an unordered
+    // aggregate such as psql's `\dAf` type list observes.
+    let builtin_count = count;
+    let position = |oid: i32| {
+        access_method_members::OPERATOR_CLASS_ORDER
+            .iter()
+            .position(|candidate| *candidate == oid)
+            .unwrap_or(usize::MAX)
+    };
+    let row_oid = |values: &[Datum]| match values[1] {
+        Datum::Int4(oid) => oid,
+        _ => 0,
+    };
+    for index in 1..builtin_count {
+        let mut slot = index;
+        while slot > 0 && position(row_oid(rows[slot - 1])) > position(row_oid(rows[slot])) {
+            rows.swap(slot - 1, slot);
+            slot -= 1;
+        }
+    }
     for (slot, class) in storage.operator_classes_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opclass"));
@@ -26098,658 +23796,10 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         .operator_families_visible_to(txid)
         .map(|(_, family)| family.operators.iter().filter(|member| member.used).count())
         .sum::<usize>();
-    let rows = catalog_rows(arena, 1024 + user_rows)?;
-    const XID8_BTREE_OPERATORS: [(i32, i16, i32); 5] = [
-        (10050, 1, 5073),
-        (10051, 2, 5075),
-        (10052, 3, 5068),
-        (10053, 4, 5076),
-        (10054, 5, 5074),
-    ];
-    const MONEY_BTREE_OPERATORS: [(i32, i16, i32); 5] = [
-        (10225, 1, 902),
-        (10226, 2, 904),
-        (10227, 3, 900),
-        (10228, 4, 905),
-        (10229, 5, 903),
-    ];
-    const TID_BTREE_OPERATORS: [(i32, i16, i32); 5] = [
-        (10055, 1, 2799),
-        (10056, 2, 2801),
-        (10057, 3, 387),
-        (10058, 4, 2802),
-        (10059, 5, 2800),
-    ];
+    let builtin = access_method_members::OPERATORS;
+    let rows = catalog_rows(arena, builtin.len() + user_rows)?;
     let mut count = 0usize;
-    for (oid, strategy, operator) in XID8_BTREE_OPERATORS {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(XID8_BTREE_OPERATOR_FAMILY_OID),
-                Datum::Int4(super::types::oid::XID8),
-                Datum::Int4(super::types::oid::XID8),
-                Datum::Int2(strategy),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(403),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, strategy, operator) in MONEY_BTREE_OPERATORS {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(MONEY_BTREE_OPERATOR_FAMILY_OID),
-                Datum::Int4(super::types::oid::MONEY),
-                Datum::Int4(super::types::oid::MONEY),
-                Datum::Int2(strategy),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(403),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, strategy, operator) in TID_BTREE_OPERATORS {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(TID_BTREE_OPERATOR_FAMILY_OID),
-                Datum::Int4(super::types::oid::TID),
-                Datum::Int4(super::types::oid::TID),
-                Datum::Int2(strategy),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(403),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, input, operator) in [
-        (
-            10290,
-            CID_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::CID,
-            385,
-        ),
-        (
-            10291,
-            TID_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::TID,
-            387,
-        ),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Int4(input),
-                Datum::Int2(1),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(405),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, input, strategy, operator, method) in [
-        (
-            10205,
-            BIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BIT,
-            1,
-            1786,
-            403,
-        ),
-        (
-            10206,
-            BIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BIT,
-            2,
-            1788,
-            403,
-        ),
-        (
-            10207,
-            BIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BIT,
-            3,
-            1784,
-            403,
-        ),
-        (
-            10208,
-            BIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BIT,
-            4,
-            1789,
-            403,
-        ),
-        (
-            10209,
-            BIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BIT,
-            5,
-            1787,
-            403,
-        ),
-        (
-            10115,
-            BYTEA_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            1,
-            1957,
-            403,
-        ),
-        (
-            10116,
-            BYTEA_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            2,
-            1958,
-            403,
-        ),
-        (
-            10117,
-            BYTEA_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            3,
-            1955,
-            403,
-        ),
-        (
-            10118,
-            BYTEA_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            4,
-            1960,
-            403,
-        ),
-        (
-            10119,
-            BYTEA_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            5,
-            1959,
-            403,
-        ),
-        (
-            10210,
-            VARBIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::VARBIT,
-            1,
-            1806,
-            403,
-        ),
-        (
-            10211,
-            VARBIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::VARBIT,
-            2,
-            1808,
-            403,
-        ),
-        (
-            10212,
-            VARBIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::VARBIT,
-            3,
-            1804,
-            403,
-        ),
-        (
-            10213,
-            VARBIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::VARBIT,
-            4,
-            1809,
-            403,
-        ),
-        (
-            10214,
-            VARBIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::VARBIT,
-            5,
-            1807,
-            403,
-        ),
-        (
-            10287,
-            BYTEA_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            1,
-            1955,
-            405,
-        ),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Int4(input),
-                Datum::Int2(strategy),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(method),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, input, strategy, operator, method) in [
-        (
-            10190,
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            1,
-            1203,
-            403,
-        ),
-        (
-            10191,
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            2,
-            1204,
-            403,
-        ),
-        (
-            10192,
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            3,
-            1201,
-            403,
-        ),
-        (
-            10193,
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            4,
-            1206,
-            403,
-        ),
-        (
-            10194,
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            5,
-            1205,
-            403,
-        ),
-        (
-            10262,
-            NETWORK_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            1,
-            1201,
-            405,
-        ),
-        (
-            10180,
-            MACADDR_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            1,
-            1222,
-            403,
-        ),
-        (
-            10181,
-            MACADDR_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            2,
-            1223,
-            403,
-        ),
-        (
-            10182,
-            MACADDR_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            3,
-            1220,
-            403,
-        ),
-        (
-            10183,
-            MACADDR_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            4,
-            1225,
-            403,
-        ),
-        (
-            10184,
-            MACADDR_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            5,
-            1224,
-            403,
-        ),
-        (
-            10273,
-            MACADDR_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            1,
-            1220,
-            405,
-        ),
-        (
-            10185,
-            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            1,
-            3364,
-            403,
-        ),
-        (
-            10186,
-            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            2,
-            3365,
-            403,
-        ),
-        (
-            10187,
-            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            3,
-            3362,
-            403,
-        ),
-        (
-            10188,
-            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            4,
-            3367,
-            403,
-        ),
-        (
-            10189,
-            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            5,
-            3366,
-            403,
-        ),
-        (
-            10274,
-            MACADDR8_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            1,
-            3362,
-            405,
-        ),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Int4(input),
-                Datum::Int2(strategy),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(method),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, input, strategy, operator, method) in [
-        (
-            10374,
-            RANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            1,
-            3884,
-            403,
-        ),
-        (
-            10375,
-            RANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            2,
-            3885,
-            403,
-        ),
-        (
-            10376,
-            RANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            3,
-            3882,
-            403,
-        ),
-        (
-            10377,
-            RANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            4,
-            3886,
-            403,
-        ),
-        (
-            10378,
-            RANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            5,
-            3887,
-            403,
-        ),
-        (
-            10379,
-            RANGE_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            1,
-            3882,
-            405,
-        ),
-        (
-            10416,
-            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-            1,
-            2862,
-            403,
-        ),
-        (
-            10417,
-            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-            2,
-            2863,
-            403,
-        ),
-        (
-            10418,
-            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-            3,
-            2860,
-            403,
-        ),
-        (
-            10419,
-            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-            4,
-            2864,
-            403,
-        ),
-        (
-            10420,
-            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-            5,
-            2865,
-            403,
-        ),
-        (
-            10421,
-            MULTIRANGE_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-            1,
-            2860,
-            405,
-        ),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Int4(input),
-                Datum::Int2(strategy),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(method),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, strategy, operator, method) in [
-        (10250, PG_LSN_BTREE_OPERATOR_FAMILY_OID, 1, 3224, 403),
-        (10251, PG_LSN_BTREE_OPERATOR_FAMILY_OID, 2, 3226, 403),
-        (10252, PG_LSN_BTREE_OPERATOR_FAMILY_OID, 3, 3222, 403),
-        (10253, PG_LSN_BTREE_OPERATOR_FAMILY_OID, 4, 3227, 403),
-        (10254, PG_LSN_BTREE_OPERATOR_FAMILY_OID, 5, 3225, 403),
-        (10296, PG_LSN_HASH_OPERATOR_FAMILY_OID, 1, 3222, 405),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(super::types::oid::PG_LSN),
-                Datum::Int4(super::types::oid::PG_LSN),
-                Datum::Int2(strategy),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(method),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    rows[count] = row(
-        &[
-            Datum::Int4(2602),
-            Datum::Int4(10294),
-            Datum::Int4(ACLITEM_HASH_OPERATOR_FAMILY_OID),
-            Datum::Int4(super::types::oid::ACLITEM),
-            Datum::Int4(super::types::oid::ACLITEM),
-            Datum::Int2(1),
-            Datum::Bpchar("s"),
-            Datum::Int4(974),
-            Datum::Int4(405),
-            Datum::Int4(0),
-        ],
-        arena,
-    )?;
-    count += 1;
-    for (oid, family, left, right, operator) in [
-        (10255, 427, 1042, 1042, 1054),
-        (10256, 431, 18, 18, 92),
-        (10257, 435, 1082, 1082, 1093),
-        (10258, 1971, 700, 700, 620),
-        (10259, 1971, 701, 701, 670),
-        (10260, 1971, 700, 701, 1120),
-        (10261, 1971, 701, 700, 1130),
-        (10263, 1977, 21, 21, 94),
-        (10264, 1977, 23, 23, 96),
-        (10265, 1977, 20, 20, 410),
-        (10266, 1977, 21, 23, 532),
-        (10267, 1977, 21, 20, 1862),
-        (10268, 1977, 23, 21, 533),
-        (10269, 1977, 23, 20, 15),
-        (10270, 1977, 20, 21, 1868),
-        (10271, 1977, 20, 23, 416),
-        (10272, 1983, 1186, 1186, 1330),
-        (10275, 1990, 26, 26, 607),
-        (10276, 1992, 30, 30, 649),
-        (10277, 6194, 2249, 2249, 2988),
-        (10278, 1995, 25, 25, 98),
-        (10279, 1995, 19, 19, 93),
-        (10280, 1995, 19, 25, 254),
-        (10281, 1995, 25, 19, 260),
-        (10282, 1997, 1083, 1083, 1108),
-        (10283, 1999, 1184, 1184, 1320),
-        (10284, 2001, 1266, 1266, 1550),
-        (10285, 2040, 1114, 1114, 2060),
-        (10286, 2222, 16, 16, 91),
-        (10288, 2225, 28, 28, 352),
-        (10289, 5032, 5069, 5069, 5068),
-        (10292, 2229, 25, 25, 98),
-        (10293, 2231, 1042, 1042, 1054),
-        (10295, 2969, 2950, 2950, 2972),
-        (10297, 1998, 1700, 1700, 1752),
-        (10298, 627, 2277, 2277, 1070),
-        (10358, 3523, 3500, 3500, 3516),
-        (10455, 4034, 3802, 3802, 3240),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(left),
-                Datum::Int4(right),
-                Datum::Int2(1),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(405),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, left, right, strategy, operator) in super::brin_catalog::OPERATORS {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(left),
-                Datum::Int4(right),
-                Datum::Int2(strategy),
-                Datum::Bpchar("s"),
-                Datum::Int4(operator),
-                Datum::Int4(3580),
-                Datum::Int4(0),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for &(oid, family, left, right, strategy, purpose, operator, sort_family) in
-        super::gist_catalog::OPERATORS
-    {
+    for &(oid, family, left, right, strategy, purpose, operator, method, sort_family) in builtin {
         rows[count] = row(
             &[
                 Datum::Int4(2602),
@@ -26760,47 +23810,7 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int2(strategy),
                 Datum::Bpchar(purpose),
                 Datum::Int4(operator),
-                Datum::Int4(783),
-                Datum::Int4(sort_family),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for &(oid, family, left, right, strategy, purpose, operator, sort_family) in
-        super::gin_catalog::OPERATORS
-    {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(left),
-                Datum::Int4(right),
-                Datum::Int2(strategy),
-                Datum::Bpchar(purpose),
-                Datum::Int4(operator),
-                Datum::Int4(2742),
-                Datum::Int4(sort_family),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for &(oid, family, left, right, strategy, purpose, operator, sort_family) in
-        super::spgist_catalog::OPERATORS
-    {
-        rows[count] = row(
-            &[
-                Datum::Int4(2602),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(left),
-                Datum::Int4(right),
-                Datum::Int2(strategy),
-                Datum::Bpchar(purpose),
-                Datum::Int4(operator),
-                Datum::Int4(4000),
+                Datum::Int4(method),
                 Datum::Int4(sort_family),
             ],
             arena,
@@ -26851,592 +23861,10 @@ fn pg_amproc<'a>(
         .operator_families_visible_to(txid)
         .map(|(_, family)| family.functions.iter().filter(|member| member.used).count())
         .sum::<usize>();
-    let rows = catalog_rows(arena, 1024 + user_rows)?;
-    rows[0] = row(
-        &[
-            Datum::Int4(2603),
-            Datum::Int4(10130),
-            Datum::Int4(XID8_BTREE_OPERATOR_FAMILY_OID),
-            Datum::Int4(super::types::oid::XID8),
-            Datum::Int4(super::types::oid::XID8),
-            Datum::Int2(1),
-            builtin_regproc(Some((XID8_CMP_OID, "xid8cmp"))),
-        ],
-        arena,
-    )?;
-    rows[1] = row(
-        &[
-            Datum::Int4(2603),
-            Datum::Int4(10131),
-            Datum::Int4(XID8_BTREE_OPERATOR_FAMILY_OID),
-            Datum::Int4(super::types::oid::XID8),
-            Datum::Int4(super::types::oid::XID8),
-            Datum::Int2(4),
-            builtin_regproc(Some((BT_EQUAL_IMAGE_OID, "btequalimage"))),
-        ],
-        arena,
-    )?;
-    rows[2] = row(
-        &[
-            Datum::Int4(2603),
-            Datum::Int4(10108),
-            Datum::Int4(MONEY_BTREE_OPERATOR_FAMILY_OID),
-            Datum::Int4(super::types::oid::MONEY),
-            Datum::Int4(super::types::oid::MONEY),
-            Datum::Int2(1),
-            builtin_regproc(Some((MONEY_CMP_OID, "cash_cmp"))),
-        ],
-        arena,
-    )?;
-    rows[3] = row(
-        &[
-            Datum::Int4(2603),
-            Datum::Int4(10109),
-            Datum::Int4(MONEY_BTREE_OPERATOR_FAMILY_OID),
-            Datum::Int4(super::types::oid::MONEY),
-            Datum::Int4(super::types::oid::MONEY),
-            Datum::Int2(4),
-            builtin_regproc(Some((BT_EQUAL_IMAGE_OID, "btequalimage"))),
-        ],
-        arena,
-    )?;
-    for (index, (oid, family, input, number, procedure, name)) in [
-        (
-            10110,
-            TID_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::TID,
-            1,
-            2794,
-            "bttidcmp",
-        ),
-        (
-            10111,
-            TID_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::TID,
-            4,
-            5051,
-            "btequalimage",
-        ),
-        (
-            10182,
-            CID_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::CID,
-            1,
-            6423,
-            "hashcid",
-        ),
-        (
-            10183,
-            CID_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::CID,
-            2,
-            6424,
-            "hashcidextended",
-        ),
-        (
-            10184,
-            TID_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::TID,
-            1,
-            2233,
-            "hashtid",
-        ),
-        (
-            10185,
-            TID_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::TID,
-            2,
-            2234,
-            "hashtidextended",
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[index + 4] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Int4(input),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-    }
-    for (index, (oid, family, input, number, procedure, name)) in [
-        (
-            10001,
-            BIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BIT,
-            1,
-            1596,
-            "bitcmp",
-        ),
-        (
-            10002,
-            BIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BIT,
-            4,
-            5051,
-            "btequalimage",
-        ),
-        (
-            10009,
-            BYTEA_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            1,
-            1954,
-            "byteacmp",
-        ),
-        (
-            10010,
-            BYTEA_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            2,
-            3331,
-            "bytea_sortsupport",
-        ),
-        (
-            10011,
-            BYTEA_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            4,
-            5051,
-            "btequalimage",
-        ),
-        (
-            10100,
-            VARBIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::VARBIT,
-            1,
-            1672,
-            "varbitcmp",
-        ),
-        (
-            10101,
-            VARBIT_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::VARBIT,
-            4,
-            5051,
-            "btequalimage",
-        ),
-        (
-            10176,
-            BYTEA_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            1,
-            6413,
-            "hashbytea",
-        ),
-        (
-            10177,
-            BYTEA_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::BYTEA,
-            2,
-            6414,
-            "hashbyteaextended",
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        rows[index + 10] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Int4(input),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-    }
-    let mut count = 19usize;
-    for (oid, family, input, number, procedure, name) in [
-        (
-            10044,
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            1,
-            926,
-            "network_cmp",
-        ),
-        (
-            10045,
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            2,
-            5033,
-            "network_sortsupport",
-        ),
-        (
-            10046,
-            NETWORK_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            4,
-            5051,
-            "btequalimage",
-        ),
-        (
-            10144,
-            NETWORK_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            1,
-            422,
-            "hashinet",
-        ),
-        (
-            10145,
-            NETWORK_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::INET,
-            2,
-            779,
-            "hashinetextended",
-        ),
-        (
-            10074,
-            MACADDR_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            1,
-            836,
-            "macaddr_cmp",
-        ),
-        (
-            10075,
-            MACADDR_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            2,
-            3359,
-            "macaddr_sortsupport",
-        ),
-        (
-            10076,
-            MACADDR_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            4,
-            5051,
-            "btequalimage",
-        ),
-        (
-            10154,
-            MACADDR_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            1,
-            399,
-            "hashmacaddr",
-        ),
-        (
-            10155,
-            MACADDR_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR,
-            2,
-            778,
-            "hashmacaddrextended",
-        ),
-        (
-            10120,
-            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            1,
-            4119,
-            "macaddr8_cmp",
-        ),
-        (
-            10121,
-            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            4,
-            5051,
-            "btequalimage",
-        ),
-        (
-            10198,
-            MACADDR8_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            1,
-            328,
-            "hashmacaddr8",
-        ),
-        (
-            10199,
-            MACADDR8_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::MACADDR8,
-            2,
-            781,
-            "hashmacaddr8extended",
-        ),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Int4(input),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, input, number, procedure, name) in [
-        (
-            10126,
-            RANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            1,
-            3870,
-            "range_cmp",
-        ),
-        (
-            10127,
-            RANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            2,
-            6391,
-            "range_sortsupport",
-        ),
-        (
-            10202,
-            RANGE_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            1,
-            3902,
-            "hash_range",
-        ),
-        (
-            10203,
-            RANGE_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYRANGE,
-            2,
-            3417,
-            "hash_range_extended",
-        ),
-        (
-            10128,
-            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-            1,
-            4273,
-            "multirange_cmp",
-        ),
-        (
-            10204,
-            MULTIRANGE_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-            1,
-            4278,
-            "hash_multirange",
-        ),
-        (
-            10205,
-            MULTIRANGE_HASH_OPERATOR_FAMILY_OID,
-            super::types::oid::ANYMULTIRANGE,
-            2,
-            4279,
-            "hash_multirange_extended",
-        ),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Int4(input),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, number, procedure, name) in [
-        (
-            10118,
-            PG_LSN_BTREE_OPERATOR_FAMILY_OID,
-            1,
-            3251,
-            "pg_lsn_cmp",
-        ),
-        (
-            10119,
-            PG_LSN_BTREE_OPERATOR_FAMILY_OID,
-            4,
-            5051,
-            "btequalimage",
-        ),
-        (
-            10196,
-            PG_LSN_HASH_OPERATOR_FAMILY_OID,
-            1,
-            3252,
-            "pg_lsn_hash",
-        ),
-        (
-            10197,
-            PG_LSN_HASH_OPERATOR_FAMILY_OID,
-            2,
-            3413,
-            "pg_lsn_hash_extended",
-        ),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(super::types::oid::PG_LSN),
-                Datum::Int4(super::types::oid::PG_LSN),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, number, procedure, name) in [
-        (10190, 1, 329, "hash_aclitem"),
-        (10191, 2, 777, "hash_aclitem_extended"),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(ACLITEM_HASH_OPERATOR_FAMILY_OID),
-                Datum::Int4(super::types::oid::ACLITEM),
-                Datum::Int4(super::types::oid::ACLITEM),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, input, number, procedure, name) in [
-        (10132, 427, 1042, 1, 1080, "hashbpchar"),
-        (10133, 427, 1042, 2, 972, "hashbpcharextended"),
-        (10134, 431, 18, 1, 454, "hashchar"),
-        (10135, 431, 18, 2, 446, "hashcharextended"),
-        (10136, 435, 1082, 1, 6415, "hashdate"),
-        (10137, 435, 1082, 2, 6416, "hashdateextended"),
-        (10138, 627, 2277, 1, 626, "hash_array"),
-        (10139, 627, 2277, 2, 782, "hash_array_extended"),
-        (10140, 1971, 700, 1, 451, "hashfloat4"),
-        (10141, 1971, 700, 2, 443, "hashfloat4extended"),
-        (10142, 1971, 701, 1, 452, "hashfloat8"),
-        (10143, 1971, 701, 2, 444, "hashfloat8extended"),
-        (10146, 1977, 21, 1, 449, "hashint2"),
-        (10147, 1977, 21, 2, 441, "hashint2extended"),
-        (10148, 1977, 23, 1, 450, "hashint4"),
-        (10149, 1977, 23, 2, 425, "hashint4extended"),
-        (10150, 1977, 20, 1, 949, "hashint8"),
-        (10151, 1977, 20, 2, 442, "hashint8extended"),
-        (10152, 1983, 1186, 1, 1697, "interval_hash"),
-        (10153, 1983, 1186, 2, 3418, "interval_hash_extended"),
-        (10156, 1990, 26, 1, 453, "hashoid"),
-        (10157, 1990, 26, 2, 445, "hashoidextended"),
-        (10158, 1992, 30, 1, 457, "hashoidvector"),
-        (10159, 1992, 30, 2, 776, "hashoidvectorextended"),
-        (10160, 1995, 25, 1, 400, "hashtext"),
-        (10161, 1995, 25, 2, 448, "hashtextextended"),
-        (10162, 1995, 19, 1, 455, "hashname"),
-        (10163, 1995, 19, 2, 447, "hashnameextended"),
-        (10164, 1997, 1083, 1, 1688, "time_hash"),
-        (10165, 1997, 1083, 2, 3409, "time_hash_extended"),
-        (10166, 1998, 1700, 1, 432, "hash_numeric"),
-        (10167, 1998, 1700, 2, 780, "hash_numeric_extended"),
-        (10168, 1999, 1184, 1, 6425, "timestamptz_hash"),
-        (10169, 1999, 1184, 2, 6426, "timestamptz_hash_extended"),
-        (10170, 2001, 1266, 1, 1696, "timetz_hash"),
-        (10171, 2001, 1266, 2, 3410, "timetz_hash_extended"),
-        (10172, 2040, 1114, 1, 2039, "timestamp_hash"),
-        (10173, 2040, 1114, 2, 3411, "timestamp_hash_extended"),
-        (10174, 2222, 16, 1, 6417, "hashbool"),
-        (10175, 2222, 16, 2, 6418, "hashboolextended"),
-        (10178, 2225, 28, 1, 6419, "hashxid"),
-        (10179, 2225, 28, 2, 6420, "hashxidextended"),
-        (10180, 5032, 5069, 1, 6421, "hashxid8"),
-        (10181, 5032, 5069, 2, 6422, "hashxid8extended"),
-        (10186, 2229, 25, 1, 400, "hashtext"),
-        (10187, 2229, 25, 2, 448, "hashtextextended"),
-        (10188, 2231, 1042, 1, 1080, "hashbpchar"),
-        (10189, 2231, 1042, 2, 972, "hashbpcharextended"),
-        (10192, 2969, 2950, 1, 2963, "uuid_hash"),
-        (10193, 2969, 2950, 2, 3412, "uuid_hash_extended"),
-        (10194, 6194, 2249, 1, 6192, "hash_record"),
-        (10195, 6194, 2249, 2, 6193, "hash_record_extended"),
-        (10200, 3523, 3500, 1, 3515, "hashenum"),
-        (10201, 3523, 3500, 2, 3414, "hashenumextended"),
-        (10206, 4034, 3802, 1, 4045, "jsonb_hash"),
-        (10207, 4034, 3802, 2, 3416, "jsonb_hash_extended"),
-    ] {
-        rows[count] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(input),
-                Datum::Int4(input),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for (oid, family, left, right, number, procedure, name) in super::brin_catalog::PROCEDURES {
-        rows[count] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(left),
-                Datum::Int4(right),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for &(oid, family, left, right, number, procedure, name) in super::gist_catalog::PROCEDURES {
-        rows[count] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(left),
-                Datum::Int4(right),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for &(oid, family, left, right, number, procedure, name) in super::gin_catalog::PROCEDURES {
-        rows[count] = row(
-            &[
-                Datum::Int4(2603),
-                Datum::Int4(oid),
-                Datum::Int4(family),
-                Datum::Int4(left),
-                Datum::Int4(right),
-                Datum::Int2(number),
-                builtin_regproc(Some((procedure, name))),
-            ],
-            arena,
-        )?;
-        count += 1;
-    }
-    for &(oid, family, left, right, number, procedure, name) in super::spgist_catalog::PROCEDURES {
+    let builtin = access_method_members::PROCEDURES;
+    let rows = catalog_rows(arena, builtin.len() + user_rows)?;
+    let mut count = 0usize;
+    for &(oid, family, left, right, number, procedure, name) in builtin {
         rows[count] = row(
             &[
                 Datum::Int4(2603),
@@ -27949,8 +24377,8 @@ fn pg_language<'a>(
             Datum::Bool(false),
             Datum::Bool(false),
             Datum::Int4(0),
-            Datum::Int4(2246),
             Datum::Int4(0),
+            Datum::Int4(2246),
             acl(
                 storage,
                 crate::storage::AccessObject {
@@ -27972,8 +24400,8 @@ fn pg_language<'a>(
             Datum::Bool(false),
             Datum::Bool(false),
             Datum::Int4(0),
-            Datum::Int4(2247),
             Datum::Int4(0),
+            Datum::Int4(2247),
             acl(
                 storage,
                 crate::storage::AccessObject {
@@ -27992,11 +24420,11 @@ fn pg_language<'a>(
             Datum::Int4(SQL_LANGUAGE_OID),
             text("sql", arena)?,
             Datum::Int4(10),
-            Datum::Bool(true),
             Datum::Bool(false),
+            Datum::Bool(true),
+            Datum::Int4(0),
             Datum::Int4(0),
             Datum::Int4(2248),
-            Datum::Int4(0),
             acl(
                 storage,
                 crate::storage::AccessObject {
@@ -28017,9 +24445,9 @@ fn pg_language<'a>(
             Datum::Int4(10),
             Datum::Bool(true),
             Datum::Bool(true),
-            Datum::Int4(13644),
-            Datum::Int4(13646),
-            Datum::Int4(13645),
+            Datum::Int4(PLPGSQL_CALL_HANDLER_OID),
+            Datum::Int4(PLPGSQL_INLINE_HANDLER_OID),
+            Datum::Int4(PLPGSQL_VALIDATOR_OID),
             acl(
                 storage,
                 crate::storage::AccessObject {
@@ -28402,7 +24830,12 @@ fn pg_proc<'a>(
                     },
                     arena,
                 )?,
-                Datum::Null,
+                match routine.language {
+                    crate::storage::RoutineLanguage::Native(native) => {
+                        text(native.module().path(), arena)?
+                    }
+                    _ => Datum::Null,
+                },
                 Datum::Bool(routine.attributes.strict),
                 Datum::Bool(routine.attributes.leakproof),
                 if routine.config_count == 0 {
@@ -29022,8 +25455,14 @@ fn text_search_regproc<'a>(oid: i32, arena: &'a Arena) -> Result<Datum<'a>, SqlE
         3721 => "prsd_lextype",
         3725 => "dsimple_init",
         3726 => "dsimple_lexize",
-        13_232 => "dsnowball_init",
-        13_233 => "dsnowball_lexize",
+        3728 => "dsynonym_init",
+        3729 => "dsynonym_lexize",
+        3731 => "dispell_init",
+        3732 => "dispell_lexize",
+        3740 => "thesaurus_init",
+        3741 => "thesaurus_lexize",
+        DSNOWBALL_INIT_OID => "dsnowball_init",
+        DSNOWBALL_LEXIZE_OID => "dsnowball_lexize",
         _ => {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -31238,13 +27677,7 @@ fn pg_type<'a>(
         if !storage.domain_slot_visible_to(slot, txid) {
             continue;
         }
-        let base_oid = match d.base_domain {
-            Some(parent) => storage
-                .domain_identity_slot(parent.schema.as_str(), parent.name.as_str(), txid)
-                .map(|slot| domain_oid(storage, slot, txid))
-                .expect("visible domain retains its parent identity"),
-            None => d.base.oid(),
-        };
+        let base_oid = domain_base_oid(storage, &d, txid);
         let array_oid =
             crate::sql::types::oid::domain_array_oid(storage.domain_for(slot, txid).creation());
         // A domain and its array take the base type's default collation.
@@ -32410,7 +28843,12 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         };
         let (reset_value, source) = crate::sql::eval::funcs::system::session_setting_metadata(name)
             .unwrap_or((value, "default"));
+        let planner = crate::sql::guc::planner_setting_metadata(name);
         let (boot, vartype, context, unit) = metadata(name);
+        let (boot, vartype) = match &planner {
+            Some(planner) => (planner.boot.as_str(), planner.vartype),
+            None => (boot, vartype),
+        };
         let base_value = |shown: &str| {
             crate::sql::guc::int_setting_base_value(name, shown).map_or_else(
                 || crate::util::StackStr::<256>::from_str(shown),
@@ -32432,9 +28870,13 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                     text(bounds[1].as_str(), arena)?,
                 )
             }
-            None => (Datum::Null, Datum::Null),
+            None => match planner.as_ref().and_then(|planner| planner.bounds) {
+                Some((min, max)) => (text(min.as_str(), arena)?, text(max.as_str(), arena)?),
+                None => (Datum::Null, Datum::Null),
+            },
         };
         let enum_names: &[&str] = match name {
+            _ if planner.is_some() => planner.as_ref().map_or(&[], |planner| planner.enum_names),
             "track_functions" => &["none", "pl", "all"],
             "plpgsql.variable_conflict" => &crate::sql::guc::VariableConflict::NAMES,
             "session_replication_role" => &crate::sql::guc::SessionReplicationRole::NAMES,
@@ -32444,6 +28886,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             Datum::Null
         } else {
             let mut values = [Datum::Null; 3];
+            debug_assert!(enum_names.len() <= values.len());
             for (value, name) in values.iter_mut().zip(enum_names) {
                 *value = text(name, arena)?;
             }
@@ -32463,6 +28906,9 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 },
                 text(
                     match name {
+                        _ if planner.is_some() => {
+                            planner.as_ref().map_or("", |planner| planner.category)
+                        }
                         "track_functions" => "Statistics / Monitoring",
                         "plpgsql.variable_conflict"
                         | "plpgsql.print_strict_params"
@@ -32479,6 +28925,9 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 )?,
                 text(
                     match name {
+                        _ if planner.is_some() => {
+                            planner.as_ref().map_or("", |planner| planner.description)
+                        }
                         "plpgsql.variable_conflict" => {
                             "Sets handling of conflicts between PL/pgSQL variable names and table column names."
                         }
@@ -32628,8 +29077,8 @@ fn info_foreign_data_wrappers<'a>(
                 Datum::Null,
                 match wrapper.handler {
                     crate::storage::foreign::ForeignDataHandler::None => Datum::Null,
-                    crate::storage::foreign::ForeignDataHandler::Postgres => {
-                        text("internal", arena)?
+                    crate::storage::foreign::ForeignDataHandler::Postgres { .. } => {
+                        text("c", arena)?
                     }
                 },
             ],

@@ -936,9 +936,10 @@ impl<'syntax, 'a> FrameExecution<'_, 'syntax, 'a> {
                 // whose assignments are copied back.
                 parent_values.copy_from_slice(&workspace.values[..parent_values.len()]);
                 if scope.reset
-                    && let Some(variable) = workspace.locals[..parent_values.len()]
-                        .iter()
-                        .rposition(|local| open.variable.names(local))
+                    && let Some(variable) =
+                        super::plpgsql_slot(&workspace.locals[..parent_values.len()], |local| {
+                            open.variable.names(local)
+                        })
                 {
                     parent_values[variable] = Datum::Null;
                 }
@@ -1103,13 +1104,20 @@ pub(super) fn start_row_loop<'syntax, 'a>(
             .transpose()?;
         drop(rows);
         if let Some(empty) = empty {
-            assign_trigger_local(context, locals, values, program.target, empty)?;
+            assign_loop_row(context, locals, values, program, empty, None)?;
         }
         status.set_found(false);
         return Ok(Step::complete());
     }
     let value = rows.value(0, context.arena)?;
-    assign_trigger_local(context, locals, values, program.target, value)?;
+    assign_loop_row(
+        context,
+        locals,
+        values,
+        program,
+        value,
+        query_source.then_some(rows.width()),
+    )?;
     Ok(Step::Enter(FrameEntry::new(
         program.block,
         EntryState::Rows {
@@ -1118,6 +1126,65 @@ pub(super) fn start_row_loop<'syntax, 'a>(
             values: rows,
         },
     )))
+}
+
+/// Assigns one row of a `FOR` loop to its variable, or its columns to a
+/// list of variables in order: missing columns are NULL and extra ones are
+/// ignored, as PostgreSQL's `exec_move_row` assigns them. A query's row,
+/// `width` columns wide, takes the `strict_multi_assignment` check.
+fn assign_loop_row<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    locals: &[TriggerLocalDecl],
+    values: &mut [Datum<'a>],
+    program: TriggerFor<'_>,
+    value: Datum<'a>,
+    width: Option<usize>,
+) -> Result<(), SqlError> {
+    if program.row_targets.is_empty() {
+        // A scalar variable took the first of the query's columns.
+        if let Some(width) = width
+            && !matches!(value, Datum::Record(_) | Datum::Composite { .. })
+        {
+            crate::sql::error_context::outside_query(|| {
+                check_multi_assignment(context.responder, 1, width)
+            })?;
+        }
+        return assign_trigger_local(context, locals, values, program.target, value);
+    }
+    let value = match value {
+        Datum::CompositeText {
+            slot,
+            physical_fields,
+            text,
+        } => crate::sql::eval::CatalogAccess::materialize_composite(
+            &crate::sql::query::storage_catalog(context.storage(), context.arena, context.txn.txid),
+            slot,
+            physical_fields,
+            text,
+            context.arena,
+        )?,
+        value => value,
+    };
+    let fields = match value {
+        Datum::Null => &[][..],
+        Datum::Record(fields) | Datum::Composite { fields, .. } => fields,
+        _ => {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "cannot assign non-composite value to a row variable"
+            ));
+        }
+    };
+    if width.is_some() {
+        crate::sql::error_context::outside_query(|| {
+            check_multi_assignment(context.responder, program.row_targets.len(), fields.len())
+        })?;
+    }
+    for (index, target) in program.row_targets.iter().enumerate() {
+        let field = fields.get(index).map_or(Datum::Null, |field| field.value);
+        assign_trigger_local(context, locals, values, *target, field)?;
+    }
+    Ok(())
 }
 
 /// Enters a cursor `FOR` loop: its record and portal slots extend the
@@ -1729,8 +1796,28 @@ impl<'declarations, 'a> execution_frame::ExecutionFrame<'declarations, 'a> {
                         };
                         if index + 1 < rows.len() {
                             let value = rows.value(index + 1, context.arena)?;
+                            let width = rows.width();
+                            let TriggerStatement::For(program) =
+                                frames.source_statement(frames.last().source)
+                            else {
+                                unreachable!("row loop frame source")
+                            };
+                            debug_assert_eq!(program.target, target);
                             let (scope, scope_values, _) = frames.scope(locals, values);
-                            assign_trigger_local(context, scope, scope_values, target, value)?;
+                            assign_loop_row(
+                                context,
+                                scope,
+                                scope_values,
+                                program,
+                                value,
+                                matches!(
+                                    program.source,
+                                    TriggerForSource::Query(_)
+                                        | TriggerForSource::Dml(_)
+                                        | TriggerForSource::DynamicQuery(_)
+                                )
+                                .then_some(width),
+                            )?;
                             let frame = frames.last_mut();
                             let Continuation::Rows { index, .. } = &mut frame.continuation else {
                                 unreachable!("row-loop frame")

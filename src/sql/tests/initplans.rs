@@ -683,4 +683,32 @@ fn correlated_scalar_subquery_analyses_once_per_statement() {
     let few = analyses(&mut e, &mut b, 3);
     let many = analyses(&mut e, &mut b, 200);
     assert_eq!(many, few);
+    // A correlated subquery nested in a correlated or `LATERAL` subquery is
+    // bound once per statement too, not once per run of the query around it.
+    let analyses = |e: &mut Engine, b: &mut Budget, rows: i32| {
+        run_with(e, b, "DELETE FROM outer_rows");
+        run_with(
+            e,
+            b,
+            &format!("INSERT INTO outer_rows SELECT g FROM generate_series(1, {rows}) g"),
+        );
+        let before = crate::sql::query::subquery_analyses();
+        let bytes = run_with(
+            e,
+            b,
+            "SELECT count(*) FILTER (WHERE (SELECT max(v) FROM inner_rows \
+             WHERE v <= outer_rows.id AND EXISTS (SELECT 1 FROM inner_rows i2 \
+             WHERE i2.v = inner_rows.v AND i2.v <= outer_rows.id)) = least(outer_rows.id, 50)), \
+             sum(l.c) \
+             FROM outer_rows, LATERAL (SELECT (SELECT count(*) FROM inner_rows \
+             WHERE v <= outer_rows.id) c) l",
+        );
+        let expected = (1..=rows).map(|id| id.min(50)).sum::<i32>();
+        assert_eq!(data_rows(&bytes), [format!("{rows}|{expected}")]);
+        crate::sql::query::subquery_analyses() - before
+    };
+    let few = analyses(&mut e, &mut b, 3);
+    let many = analyses(&mut e, &mut b, 200);
+    assert!(few > 0);
+    assert_eq!(many, few);
 }

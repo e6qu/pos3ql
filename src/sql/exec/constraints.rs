@@ -76,8 +76,12 @@ fn write_described_value(out: &mut DetailText, value: Datum<'_>) {
 }
 
 /// `Failing row contains (...).`, PostgreSQL's detail for a row that
-/// violates a NOT NULL or CHECK constraint.
-pub(crate) fn failing_row_detail(values: &[Datum<'_>]) -> Result<DetailText, SqlError> {
+/// violates a NOT NULL or CHECK constraint. A virtual generated column,
+/// which the row does not hold in PostgreSQL, reads `virtual`.
+pub(crate) fn failing_row_detail(
+    columns: &[crate::storage::ColumnMeta],
+    values: &[Datum<'_>],
+) -> Result<DetailText, SqlError> {
     use core::fmt::Write;
     let mut detail = DetailText::new();
     let _ = detail.write_str("Failing row contains (");
@@ -85,7 +89,14 @@ pub(crate) fn failing_row_detail(values: &[Datum<'_>]) -> Result<DetailText, Sql
         if index > 0 {
             let _ = detail.write_str(", ");
         }
-        write_described_value(&mut detail, *value);
+        if columns
+            .get(index)
+            .is_some_and(|column| column.default.is_virtual())
+        {
+            let _ = detail.write_str("virtual");
+        } else {
+            write_described_value(&mut detail, *value);
+        }
     }
     let _ = detail.write_str(").");
     if detail.is_truncated() {
@@ -558,49 +569,156 @@ fn duplicate_key_error<'v>(
     }
 }
 
-/// Stashes PostgreSQL's DETAIL and constraint fields for a conflict between
-/// `values` and `other` under `exclusion`.
-fn stash_exclusion_conflict(
-    duplicate: DuplicateKey,
-    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
-    exclusion: &crate::storage::ExclusionConstraint,
-    values: &[Datum],
-    other: &[Datum],
-) -> Result<(), SqlError> {
-    let names = || {
-        exclusion.columns[..exclusion.n_cols]
-            .iter()
-            .map(|column| def.columns()[*column as usize].name.as_str())
+/// An exclusion constraint's elements prepared for one scan: each expression
+/// element is parsed once into the arena and evaluated per row.
+#[derive(Clone, Copy)]
+pub(crate) struct ExclusionScan<'e, 'a> {
+    exclusion: &'e crate::storage::ExclusionConstraint,
+    columns: [u16; crate::storage::MAX_INDEX_COLS],
+    expressions: [Option<&'a Expr<'a>>; crate::storage::MAX_INDEX_COLS],
+    sources: [Option<&'a str>; crate::storage::MAX_INDEX_COLS],
+}
+
+/// One row's element values under an exclusion constraint.
+pub(crate) type ExclusionKeys<'a> = [Datum<'a>; crate::storage::MAX_INDEX_COLS];
+
+impl<'e, 'a> ExclusionScan<'e, 'a> {
+    /// A placeholder with no elements, for filling fixed storage.
+    pub(crate) const EMPTY: Self = Self {
+        exclusion: &crate::storage::ExclusionConstraint::EMPTY,
+        columns: [0; crate::storage::MAX_INDEX_COLS],
+        expressions: [None; crate::storage::MAX_INDEX_COLS],
+        sources: [None; crate::storage::MAX_INDEX_COLS],
     };
-    let mut existing_text = DetailText::new();
-    write_key_description(
-        &mut existing_text,
-        "key",
-        &mut names(),
-        &mut exclusion.columns[..exclusion.n_cols]
-            .iter()
-            .map(|column| other[*column as usize]),
-    );
-    let existing = match duplicate {
-        DuplicateKey::Write => "existing ",
-        DuplicateKey::IndexBuild => "",
-    };
-    let detail = key_detail(
-        &mut names(),
-        &mut exclusion.columns[..exclusion.n_cols]
-            .iter()
-            .map(|column| values[*column as usize]),
-        format_args!(" conflicts with {existing}{}.", existing_text.as_str()),
-    )?;
-    crate::sql::eval::stash_object_diagnostic(
-        Some(detail.as_str()),
-        crate::sql::eval::ErrorObjects::table_constraint(
-            def.schema.as_str(),
-            def.name.as_str(),
-            exclusion.name.as_str(),
-        ),
-    );
-    Ok(())
+
+    pub(crate) fn new(
+        exclusion: &'e crate::storage::ExclusionConstraint,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        let mut scan = Self {
+            exclusion,
+            columns: [0; crate::storage::MAX_INDEX_COLS],
+            expressions: [None; crate::storage::MAX_INDEX_COLS],
+            sources: [None; crate::storage::MAX_INDEX_COLS],
+        };
+        for (position, element) in exclusion.elements().enumerate() {
+            match element {
+                crate::storage::ExclusionElement::Column(column) => scan.columns[position] = column,
+                crate::storage::ExclusionElement::Expression(text) => {
+                    let source = arena
+                        .alloc_str(text)
+                        .map_err(|_| crate::sql::eval::arena_full())?;
+                    scan.sources[position] = Some(source);
+                    scan.expressions[position] =
+                        Some(crate::sql::parser::parse_expr(source, arena)?);
+                }
+            }
+        }
+        Ok(scan)
+    }
+
+    /// `row`'s element values, in the order `def` lays out its columns.
+    pub(crate) fn keys(
+        &self,
+        storage: &Storage,
+        txid: u32,
+        def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+        row: &[Datum<'a>],
+        arena: &'a Arena,
+    ) -> Result<ExclusionKeys<'a>, SqlError> {
+        let n = self.exclusion.len();
+        index_key_values(
+            storage,
+            txid,
+            def,
+            row,
+            &self.columns[..n],
+            &self.expressions[..n],
+            arena,
+        )
+    }
+
+    /// Whether two rows' elements all conflict; a NULL element never does.
+    pub(crate) fn conflicts(
+        &self,
+        left: &ExclusionKeys<'_>,
+        right: &ExclusionKeys<'_>,
+        arena: &Arena,
+    ) -> Result<bool, SqlError> {
+        for (position, operator) in self.exclusion.operators().iter().enumerate() {
+            if left[position].is_null() || right[position].is_null() {
+                return Ok(false);
+            }
+            if !crate::sql::eval::exclusion_operator(
+                operator.binary(),
+                left[position],
+                right[position],
+                arena,
+            )? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Stashes PostgreSQL's DETAIL and constraint fields for a conflict
+    /// between `values` and `other`. An expression element is described as
+    /// `pg_get_indexdef_columns` prints it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stash_conflict(
+        &self,
+        duplicate: DuplicateKey,
+        storage: &Storage,
+        txid: u32,
+        table_index: usize,
+        def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+        values: &ExclusionKeys<'_>,
+        other: &ExclusionKeys<'_>,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        let n = self.exclusion.len();
+        let mut names = [""; crate::storage::MAX_INDEX_COLS];
+        for (position, name) in names.iter_mut().enumerate().take(n) {
+            *name = match (self.expressions[position], self.sources[position]) {
+                (Some(expression), Some(source)) => crate::sql::catalog::index_key_display(
+                    storage,
+                    txid,
+                    table_index,
+                    expression,
+                    source,
+                    arena,
+                )?,
+                _ => def.columns()[usize::from(self.columns[position])]
+                    .name
+                    .as_str(),
+            };
+        }
+        let mut existing_text = DetailText::new();
+        write_key_description(
+            &mut existing_text,
+            "key",
+            &mut names[..n].iter().copied(),
+            &mut other[..n].iter().copied(),
+        );
+        let existing = match duplicate {
+            DuplicateKey::Write => "existing ",
+            DuplicateKey::IndexBuild => "",
+        };
+        let detail = key_detail(
+            &mut names[..n].iter().copied(),
+            &mut values[..n].iter().copied(),
+            format_args!(" conflicts with {existing}{}.", existing_text.as_str()),
+        )?;
+        crate::sql::eval::stash_object_diagnostic(
+            Some(detail.as_str()),
+            crate::sql::eval::ErrorObjects::table_constraint(
+                def.schema.as_str(),
+                def.name.as_str(),
+                self.exclusion.name.as_str(),
+            ),
+        );
+        Ok(())
+    }
 }
 
 /// The 23P01 error for a conflict with exclusion constraint `name`.
@@ -620,14 +738,28 @@ fn exclusion_violation(duplicate: DuplicateKey, name: SqlName) -> SqlError {
 }
 
 /// The index-build exclusion violation between rows `values` and `other`.
-pub(crate) fn index_build_exclusion_violation(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn index_build_exclusion_violation<'a>(
+    scan: &ExclusionScan<'_, 'a>,
+    storage: &Storage,
+    txid: u32,
+    table_index: usize,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
-    exclusion: &crate::storage::ExclusionConstraint,
-    values: &[Datum],
-    other: &[Datum],
+    values: &ExclusionKeys<'_>,
+    other: &ExclusionKeys<'_>,
+    arena: &'a Arena,
 ) -> SqlError {
-    match stash_exclusion_conflict(DuplicateKey::IndexBuild, def, exclusion, values, other) {
-        Ok(()) => exclusion_violation(DuplicateKey::IndexBuild, exclusion.name),
+    match scan.stash_conflict(
+        DuplicateKey::IndexBuild,
+        storage,
+        txid,
+        table_index,
+        def,
+        values,
+        other,
+        arena,
+    ) {
+        Ok(()) => exclusion_violation(DuplicateKey::IndexBuild, scan.exclusion.name),
         Err(error) => error,
     }
 }
@@ -930,6 +1062,18 @@ pub(crate) fn index_key_values<'a>(
             )?,
             None => row[columns[position] as usize],
         };
+        // A named composite key, such as a whole row `(t)`, is kept in the
+        // stored form a composite column has.
+        if let Datum::Composite { slot, .. } = keys[position] {
+            keys[position] = Datum::CompositeText {
+                slot,
+                physical_fields: (storage
+                    .require_row_type_definition(slot, txid)?
+                    .physical_field_count() as u16)
+                    | rowenc::COMPOSITE_MEMBER_IDENTITIES,
+                text: super::composite_storage_text(keys[position], slot, storage, txid, arena)?,
+            };
+        }
     }
     Ok(keys)
 }
@@ -969,8 +1113,28 @@ fn enforce_expression_index_uniqueness<'a>(
         return Ok(());
     }
     let violation = || {
+        // `pg_get_indexdef_columns`: each expression key deparsed from its
+        // binding.
+        let mut displays = [None; crate::storage::MAX_INDEX_COLS];
+        for (position, display) in displays.iter_mut().enumerate().take(columns.len()) {
+            if let (Some(expression), Some(source)) =
+                (expressions[position], expression_texts[position])
+            {
+                match crate::sql::catalog::index_key_display(
+                    storage,
+                    txid,
+                    table_index,
+                    expression,
+                    source,
+                    arena,
+                ) {
+                    Ok(text) => *display = Some(text),
+                    Err(error) => return error,
+                }
+            }
+        }
         let names = columns.iter().enumerate().map(|(position, column)| {
-            expression_texts[position].unwrap_or(def.columns()[*column as usize].name.as_str())
+            displays[position].unwrap_or(def.columns()[*column as usize].name.as_str())
         });
         let values = keys[..columns.len()].iter().copied();
         duplicate_key_error(duplicate, name, def, &mut { names }, &mut { values })
@@ -1466,30 +1630,200 @@ pub(crate) fn index_predicate_matches(
     }
 }
 
-/// Unique/PK enforcement for the single-column column flags: each `unique`
-/// column's value must not equal that column in any other visible row.
+/// A unique or exclusion constraint a row must satisfy, named by its
+/// position in the table definition or by its unique index.
+enum RowKey<'d> {
+    /// A single-column `UNIQUE` or `PRIMARY KEY` column flag.
+    Column(usize),
+    /// A table-level `UNIQUE` or `PRIMARY KEY` constraint.
+    Table(&'d crate::storage::UniqueKey),
+    /// An exclusion constraint, by its position in `def.exclusions()`.
+    Exclusion(usize),
+    /// A `CREATE UNIQUE INDEX` index.
+    Index(&'d crate::storage::IndexDef),
+}
+
+/// Visits every unique and exclusion constraint of `def` in index OID order,
+/// the order PostgreSQL's executor inserts index entries and so checks them:
+/// a row that violates two constraints names the one with the older index.
+/// Constraint keys come from the definition; unique indexes from the index
+/// catalog, scanned once per index visited plus once more.
+fn for_each_row_key<'d, B: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    def: &'d crate::storage::TableDefinition<B>,
+    txid: u32,
+    visit: &mut dyn FnMut(RowKey<'_>) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    // A key this statement is adding has no index yet; its index will be
+    // the table's newest, so it sorts after every existing one.
+    let oid = |identity: Option<crate::storage::RelationIdentity>| {
+        identity.map_or(i32::MAX, crate::storage::RelationIdentity::oid)
+    };
+    // The definition's key after `after` with the smallest index OID; keys
+    // without one keep their definition order.
+    let next_key = |after: Option<(i32, usize)>| {
+        let mut best: Option<((i32, usize), RowKey<'d>)> = None;
+        let mut ordinal = 0;
+        let mut consider = |oid: i32, key: RowKey<'d>| {
+            let order = (oid, ordinal);
+            ordinal += 1;
+            if after.is_none_or(|after| order > after)
+                && best.as_ref().is_none_or(|(best, _)| order < *best)
+            {
+                best = Some((order, key));
+            }
+        };
+        for (column, metadata) in def.columns().iter().enumerate() {
+            if metadata.unique {
+                consider(
+                    oid(def.column_index_identity(column)),
+                    RowKey::Column(column),
+                );
+            }
+        }
+        for key in def.uniques() {
+            consider(oid(key.index_identity), RowKey::Table(key));
+        }
+        for (position, exclusion) in def.exclusions().iter().enumerate() {
+            consider(oid(exclusion.index_identity), RowKey::Exclusion(position));
+        }
+        best
+    };
+    let mut key_after = None;
+    let mut index_after = None;
+    loop {
+        let index = storage
+            .unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid)
+            .map(|index| (crate::sql::catalog::explicit_index_oid(&index), index))
+            .filter(|(oid, _)| index_after.is_none_or(|after| *oid > after))
+            .min_by_key(|(oid, _)| *oid);
+        while let Some((order, key)) = next_key(key_after) {
+            if index.as_ref().is_some_and(|(bound, _)| order.0 > *bound) {
+                break;
+            }
+            visit(key)?;
+            key_after = Some(order);
+        }
+        let Some((oid, index)) = index else {
+            return Ok(());
+        };
+        visit(RowKey::Index(&index))?;
+        index_after = Some(oid);
+    }
+}
+
+/// Enforces a written row's unique and exclusion constraints, unique indexes
+/// included, in index OID order; deferrable constraints of a stored row are
+/// queued for their transaction instead.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn check_unique(
+fn check_row_keys(
     storage: &Storage,
     table_index: usize,
+    constraint_table: usize,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     schema: &[ColType],
     values: &[Datum],
-    self_rowid: Option<u64>,
+    row: ConstraintRow,
     txid: u32,
-    duplicate: DuplicateKey,
+    mut txn: Option<&mut TxnState>,
+    expressions: &ParsedChecks,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
-    for (i, column) in def.columns().iter().enumerate() {
-        if !column.unique {
-            continue;
-        }
-        let name = def.column_key_name(i).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "inline unique key has no admitted name"
+    let self_rowid = row.excluded();
+    // Existing rows meeting a new key are its index being built.
+    let duplicate = if matches!(row, ConstraintRow::Existing { .. }) {
+        DuplicateKey::IndexBuild
+    } else {
+        DuplicateKey::Write
+    };
+    // A deferrable key of a stored row is checked now, and only a row that
+    // meets a possible conflict is queued for the recheck, as PostgreSQL's
+    // partial unique check queues only those rows. The recheck then reports
+    // that row against the one it met.
+    let mut defer_on_conflict =
+        |name: SqlName, check: Result<(), SqlError>| -> Result<(), SqlError> {
+            let Err(error) = check else {
+                return Ok(());
+            };
+            if let Some(rowid) = row.stored()
+                && let Some(transaction) = txn.as_deref_mut()
+                && (error.sqlstate == sqlstate::UNIQUE_VIOLATION
+                    || error.sqlstate == sqlstate::EXCLUSION_VIOLATION
+                    || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+            {
+                crate::sql::eval::take_diagnostic();
+                let identity = transaction.constraint_identity(constraint_table as u32, name);
+                return transaction.defer_constraint(identity, rowid);
+            }
+            Err(error)
+        };
+    for_each_row_key(storage, def, txid, &mut |key| match key {
+        RowKey::Column(column) => {
+            let name = def.column_key_name(column).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "inline unique key has no admitted name"
+                )
+            })?;
+            enforce_key_uniqueness(
+                storage,
+                table_index,
+                def,
+                schema,
+                values,
+                self_rowid,
+                txid,
+                &[column as u16],
+                false,
+                name,
+                duplicate,
+                UniqueKeySource::Cache,
             )
-        })?;
-        enforce_key_uniqueness(
+        }
+        RowKey::Table(key) => {
+            let checked = enforce_key_uniqueness(
+                storage,
+                table_index,
+                def,
+                schema,
+                values,
+                self_rowid,
+                txid,
+                key.columns(),
+                key.kind.nulls_not_distinct(),
+                key.name,
+                duplicate,
+                UniqueKeySource::Cache,
+            );
+            if key.timing.is_deferrable() {
+                defer_on_conflict(key.name, checked)
+            } else {
+                checked
+            }
+        }
+        RowKey::Exclusion(position) => {
+            let exclusion = &def.exclusions()[position];
+            let checked = enforce_exclusion_constraint(
+                storage,
+                table_index,
+                def,
+                schema,
+                values,
+                self_rowid,
+                txid,
+                exclusion,
+                expressions[crate::storage::MAX_CHECKS + position],
+                arena,
+                row.validation_read(),
+                duplicate,
+            );
+            if exclusion.timing.is_deferrable() {
+                defer_on_conflict(exclusion.name, checked)
+            } else {
+                checked
+            }
+        }
+        RowKey::Index(index) => check_unique_index(
             storage,
             table_index,
             def,
@@ -1497,50 +1831,11 @@ pub(crate) fn check_unique(
             values,
             self_rowid,
             txid,
-            &[i as u16],
-            false,
-            name,
-            duplicate,
-            UniqueKeySource::Cache,
-        )?;
-    }
-    Ok(())
-}
-
-/// Enforces both column-level UNIQUE/PRIMARY KEY and every UNIQUE index.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn check_all_unique(
-    storage: &Storage,
-    table_index: usize,
-    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
-    schema: &[ColType],
-    values: &[Datum],
-    self_rowid: Option<u64>,
-    txid: u32,
-    arena: &Arena,
-    duplicate: DuplicateKey,
-) -> Result<(), SqlError> {
-    check_unique(
-        storage,
-        table_index,
-        def,
-        schema,
-        values,
-        self_rowid,
-        txid,
-        duplicate,
-    )?;
-    check_unique_indexes(
-        storage,
-        table_index,
-        def,
-        schema,
-        values,
-        self_rowid,
-        txid,
-        arena,
-        UniqueIndexCheck::Cache,
-    )
+            arena,
+            UniqueIndexCheck::Cache,
+            index,
+        ),
+    })
 }
 
 /// Rejects an indexed tuple before its row or CREATE INDEX WAL can commit if
@@ -1720,10 +2015,14 @@ fn check_index_tuple_sizes_inner(
             })? as u16;
         }
         if let Some(source) = index.predicate {
-            let source = arena
-                .alloc_str(source.as_str())
-                .map_err(|_| crate::sql::eval::arena_full())?;
-            let predicate = crate::sql::parser::parse_expr(source, arena)?;
+            let predicate = super::expression_bindings::bound_index_expression(
+                source.as_str(),
+                storage,
+                &index,
+                crate::storage::ExpressionOwner::IndexPredicate,
+                txid,
+                arena,
+            )?;
             if !index_predicate_matches(storage, txid, def, values, predicate, arena)? {
                 continue;
             }
@@ -1731,10 +2030,14 @@ fn check_index_tuple_sizes_inner(
         let mut expressions = [None; crate::storage::MAX_INDEX_COLS];
         for (position, source) in index.expressions[..index.n_cols].iter().enumerate() {
             if let Some(source) = source {
-                let source = arena
-                    .alloc_str(source.as_str())
-                    .map_err(|_| crate::sql::eval::arena_full())?;
-                expressions[position] = Some(crate::sql::parser::parse_expr(source, arena)?);
+                expressions[position] = Some(super::expression_bindings::bound_index_expression(
+                    source.as_str(),
+                    storage,
+                    &index,
+                    crate::storage::ExpressionOwner::IndexKey(position as u8),
+                    txid,
+                    arena,
+                )?);
             }
         }
         let key = index_key_values(
@@ -1773,76 +2076,84 @@ pub(crate) fn check_reindex_constraints(
     arena: &Arena,
     selected: Option<i32>,
 ) -> Result<(), SqlError> {
-    for (column, metadata) in def.columns().iter().enumerate() {
-        if !metadata.unique
-            || selected.is_some_and(|oid| {
-                def.column_index_identity(column)
-                    .is_none_or(|identity| identity.oid() != oid)
-            })
-        {
-            continue;
-        }
-        let name = def.column_key_name(column).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "inline unique key has no admitted name"
+    let unselected = |identity: Option<crate::storage::RelationIdentity>| {
+        selected.is_some_and(|oid| identity.is_none_or(|identity| identity.oid() != oid))
+    };
+    for_each_row_key(storage, def, txid, &mut |key| match key {
+        RowKey::Column(column) => {
+            if unselected(def.column_index_identity(column)) {
+                return Ok(());
+            }
+            let name = def.column_key_name(column).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "inline unique key has no admitted name"
+                )
+            })?;
+            enforce_key_uniqueness(
+                storage,
+                table_index,
+                def,
+                schema,
+                values,
+                Some(rowid),
+                txid,
+                &[column as u16],
+                false,
+                name,
+                DuplicateKey::IndexBuild,
+                UniqueKeySource::Rows,
             )
-        })?;
-        enforce_key_uniqueness(
-            storage,
-            table_index,
-            def,
-            schema,
-            values,
-            Some(rowid),
-            txid,
-            &[column as u16],
-            false,
-            name,
-            DuplicateKey::IndexBuild,
-            UniqueKeySource::Rows,
-        )?;
-    }
-    for key in def.uniques() {
-        if selected.is_some_and(|oid| {
-            key.index_identity
-                .is_none_or(|identity| identity.oid() != oid)
-        }) {
-            continue;
         }
-        enforce_key_uniqueness(
-            storage,
-            table_index,
-            def,
-            schema,
-            values,
-            Some(rowid),
-            txid,
-            key.columns(),
-            key.kind.nulls_not_distinct(),
-            key.name,
-            DuplicateKey::IndexBuild,
-            UniqueKeySource::Rows,
-        )?;
-    }
-    for exclusion in def.exclusions() {
-        if selected.is_some_and(|oid| {
-            exclusion
-                .index_identity
-                .is_none_or(|identity| identity.oid() != oid)
-        }) {
-            continue;
+        RowKey::Table(key) => {
+            if unselected(key.index_identity) {
+                return Ok(());
+            }
+            enforce_key_uniqueness(
+                storage,
+                table_index,
+                def,
+                schema,
+                values,
+                Some(rowid),
+                txid,
+                key.columns(),
+                key.kind.nulls_not_distinct(),
+                key.name,
+                DuplicateKey::IndexBuild,
+                UniqueKeySource::Rows,
+            )
         }
-        let predicate = exclusion
-            .predicate
-            .map(|source| {
-                let source = arena
-                    .alloc_str(source.as_str())
-                    .map_err(|_| crate::sql::eval::arena_full())?;
-                crate::sql::parser::parse_expr(source, arena)
-            })
-            .transpose()?;
-        enforce_exclusion_constraint(
+        RowKey::Exclusion(position) => {
+            let exclusion = &def.exclusions()[position];
+            if unselected(exclusion.index_identity) {
+                return Ok(());
+            }
+            let predicate = exclusion
+                .predicate
+                .map(|source| {
+                    let source = arena
+                        .alloc_str(source.as_str())
+                        .map_err(|_| crate::sql::eval::arena_full())?;
+                    crate::sql::parser::parse_expr(source, arena)
+                })
+                .transpose()?;
+            enforce_exclusion_constraint(
+                storage,
+                table_index,
+                def,
+                schema,
+                values,
+                Some(rowid),
+                txid,
+                exclusion,
+                predicate,
+                arena,
+                Some(storage.validation_read()),
+                DuplicateKey::IndexBuild,
+            )
+        }
+        RowKey::Index(index) => check_unique_index(
             storage,
             table_index,
             def,
@@ -1850,24 +2161,11 @@ pub(crate) fn check_reindex_constraints(
             values,
             Some(rowid),
             txid,
-            exclusion,
-            predicate,
             arena,
-            Some(storage.validation_read()),
-            DuplicateKey::IndexBuild,
-        )?;
-    }
-    check_unique_indexes(
-        storage,
-        table_index,
-        def,
-        schema,
-        values,
-        Some(rowid),
-        txid,
-        arena,
-        UniqueIndexCheck::Rebuild { selected },
-    )
+            UniqueIndexCheck::Rebuild { selected },
+            index,
+        ),
+    })
 }
 
 /// Normal writes may probe the derived cache. Explicit rebuilding validates
@@ -1885,14 +2183,45 @@ pub fn check_unique_indexes(
     check: UniqueIndexCheck,
 ) -> Result<(), SqlError> {
     for index in storage.unique_indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
+        check_unique_index(
+            storage,
+            table_index,
+            def,
+            schema,
+            values,
+            self_rowid,
+            txid,
+            arena,
+            check,
+            &index,
+        )?;
+    }
+    Ok(())
+}
+
+/// One unique index's check of a row, as [`check_unique_indexes`] runs it.
+#[allow(clippy::too_many_arguments)]
+fn check_unique_index(
+    storage: &Storage,
+    table_index: usize,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    schema: &[ColType],
+    values: &[Datum],
+    self_rowid: Option<u64>,
+    txid: u32,
+    arena: &Arena,
+    check: UniqueIndexCheck,
+    index: &crate::storage::IndexDef,
+) -> Result<(), SqlError> {
+    {
         if matches!(check, UniqueIndexCheck::Cache) && !index.mutable_for(txid).immediate {
             // The constraint's own timing controls checks. A detached REINDEX
             // replacement has no check trigger until the atomic link swap.
-            continue;
+            return Ok(());
         }
-        if matches!(check, UniqueIndexCheck::Rebuild { selected: Some(oid) } if oid != crate::sql::catalog::explicit_index_oid(&index))
+        if matches!(check, UniqueIndexCheck::Rebuild { selected: Some(oid) } if oid != crate::sql::catalog::explicit_index_oid(index))
         {
-            continue;
+            return Ok(());
         }
         let icols = &index.columns[..index.n_cols];
         let index_name = index.name_for(txid);
@@ -1905,10 +2234,17 @@ pub fn check_unique_indexes(
                     .alloc_str(source.as_str())
                     .map_err(|_| crate::sql::eval::arena_full())?;
                 expression_texts[position] = Some(source);
-                expressions[position] = Some(crate::sql::parser::parse_expr(source, arena)?);
+                expressions[position] = Some(super::expression_bindings::bound_index_expression(
+                    source,
+                    storage,
+                    index,
+                    crate::storage::ExpressionOwner::IndexKey(position as u8),
+                    txid,
+                    arena,
+                )?);
             }
         }
-        let resolved = resolve_index_operator_classes(&index)?;
+        let resolved = resolve_index_operator_classes(index)?;
         let custom = resolved[..index.n_cols]
             .iter()
             .any(|class| matches!(class, Some(crate::storage::IndexOperatorClass::Catalog(_))));
@@ -1929,10 +2265,14 @@ pub fn check_unique_indexes(
             let predicate = index
                 .predicate
                 .map(|source| {
-                    let source = arena
-                        .alloc_str(source.as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?;
-                    crate::sql::parser::parse_expr(source, arena)
+                    super::expression_bindings::bound_index_expression(
+                        source.as_str(),
+                        storage,
+                        index,
+                        crate::storage::ExpressionOwner::IndexPredicate,
+                        txid,
+                        arena,
+                    )
                 })
                 .transpose()?;
             let mut classes = [crate::storage::IndexOperatorClass::Btree(
@@ -1963,10 +2303,17 @@ pub fn check_unique_indexes(
                 },
                 arena,
             )?;
-            continue;
+            return Ok(());
         }
         if let Some(predicate) = index.predicate {
-            let expression = crate::sql::parser::parse_expr(predicate.as_str(), arena)?;
+            let expression = super::expression_bindings::bound_index_expression(
+                predicate.as_str(),
+                storage,
+                index,
+                crate::storage::ExpressionOwner::IndexPredicate,
+                txid,
+                arena,
+            )?;
             enforce_partial_index_uniqueness(
                 storage,
                 table_index,
@@ -2015,6 +2362,8 @@ pub(crate) type ParsedChecks<'a> =
 /// Re-parses every stored CHECK predicate once per statement into the arena.
 pub(crate) fn parse_checks<'a>(
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<ParsedChecks<'a>, SqlError> {
     let mut out: ParsedChecks<'a> =
@@ -2023,7 +2372,14 @@ pub(crate) fn parse_checks<'a>(
         let source = arena
             .alloc_str(c.expression.as_str())
             .map_err(|_| crate::sql::eval::arena_full())?;
-        out[i] = Some(crate::sql::parser::parse_expr(source, arena)?);
+        out[i] = Some(super::expression_bindings::bind_table_expression(
+            crate::sql::parser::parse_expr(source, arena)?,
+            storage,
+            def,
+            crate::storage::ExpressionOwner::Check(c.name),
+            txid,
+            arena,
+        )?);
     }
     for (index, exclusion) in def.exclusions().iter().enumerate() {
         if let Some(predicate) = &exclusion.predicate {
@@ -2082,7 +2438,7 @@ pub(crate) fn parse_defaults<'a>(
                     arena,
                 )?
             };
-            out[i] = Some(crate::sql::parser::parse_expression_with_type_inputs(
+            let parsed = crate::sql::parser::parse_expression_with_type_inputs(
                 text,
                 inputs,
                 arena,
@@ -2102,6 +2458,14 @@ pub(crate) fn parse_defaults<'a>(
                             }))
                     })
                 },
+            )?;
+            out[i] = Some(super::expression_bindings::bind_table_expression(
+                parsed,
+                storage,
+                def,
+                crate::storage::ExpressionOwner::Column(c.name),
+                txid,
+                arena,
             )?);
         }
     }
@@ -2130,7 +2494,7 @@ pub(crate) fn parse_generated<'a>(
                 .binary_search_by_key(&section, |(section, _)| *section)
                 .ok()
                 .map_or(&[][..], |index| input_sections[index].1);
-            out[i] = Some(crate::sql::parser::parse_expression_with_type_inputs(
+            let parsed = crate::sql::parser::parse_expression_with_type_inputs(
                 source,
                 inputs,
                 arena,
@@ -2150,6 +2514,14 @@ pub(crate) fn parse_generated<'a>(
                             }))
                     })
                 },
+            )?;
+            out[i] = Some(super::expression_bindings::bind_table_expression(
+                parsed,
+                storage,
+                def,
+                crate::storage::ExpressionOwner::Column(c.name),
+                txid,
+                arena,
             )?);
         }
     }
@@ -2278,13 +2650,6 @@ pub(crate) fn enforce_row_keys(
     arena: &Arena,
 ) -> Result<(), SqlError> {
     check_index_tuple_sizes(storage, def, values, txid, arena)?;
-    let self_rowid = row.excluded();
-    // Existing rows meeting a new key are its index being built.
-    let duplicate = if matches!(row, ConstraintRow::Existing { .. }) {
-        DuplicateKey::IndexBuild
-    } else {
-        DuplicateKey::Write
-    };
     let constraint_table = storage
         .find_visible(def.schema.as_str(), def.name.as_str(), txid)
         .unwrap_or(table_index);
@@ -2300,21 +2665,7 @@ pub(crate) fn enforce_row_keys(
             {
                 continue;
             }
-            check_all_unique(
-                storage, candidate, def, schema, values, self_rowid, txid, arena, duplicate,
-            )?;
-            check_or_defer_unique_keys(
-                storage,
-                candidate,
-                constraint_table,
-                def,
-                schema,
-                values,
-                row,
-                txid,
-                txn.as_deref_mut(),
-            )?;
-            check_or_defer_exclusions(
+            check_row_keys(
                 storage,
                 candidate,
                 constraint_table,
@@ -2329,29 +2680,7 @@ pub(crate) fn enforce_row_keys(
             )?;
         }
     } else {
-        check_all_unique(
-            storage,
-            table_index,
-            def,
-            schema,
-            values,
-            self_rowid,
-            txid,
-            arena,
-            duplicate,
-        )?;
-        check_or_defer_unique_keys(
-            storage,
-            table_index,
-            constraint_table,
-            def,
-            schema,
-            values,
-            row,
-            txid,
-            txn.as_deref_mut(),
-        )?;
-        check_or_defer_exclusions(
+        check_row_keys(
             storage,
             table_index,
             constraint_table,
@@ -2467,7 +2796,7 @@ fn check_row_checks(
             eval_full(expression, arena, params, &context, &hooks)?,
             Datum::Bool(false)
         ) {
-            let detail = failing_row_detail(&values[..def.columns().len()])?;
+            let detail = failing_row_detail(def.columns(), &values[..def.columns().len()])?;
             crate::sql::eval::stash_object_diagnostic(
                 Some(detail.as_str()),
                 crate::sql::eval::ErrorObjects::table_constraint(
@@ -2520,109 +2849,51 @@ fn check_fk_child(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn check_or_defer_unique_keys(
-    storage: &Storage,
-    table_index: usize,
-    constraint_table: usize,
-    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
-    schema: &[ColType],
-    values: &[Datum],
-    row: ConstraintRow,
-    txid: u32,
-    mut txn: Option<&mut TxnState>,
-) -> Result<(), SqlError> {
-    let self_rowid = row.excluded();
-    for key in def.uniques() {
-        if key.timing.is_deferrable()
-            && let Some(rowid) = row.stored()
-            && let Some(transaction) = txn.as_deref_mut()
-        {
-            let identity = transaction.constraint_identity(constraint_table as u32, key.name);
-            transaction.defer_constraint(identity, rowid)?;
-            continue;
-        }
-        enforce_key_uniqueness(
-            storage,
-            table_index,
-            def,
-            schema,
-            values,
-            self_rowid,
-            txid,
-            key.columns(),
-            key.kind.nulls_not_distinct(),
-            key.name,
-            // Existing rows meeting a new key are its index being built.
-            if matches!(row, ConstraintRow::Existing { .. }) {
-                DuplicateKey::IndexBuild
-            } else {
-                DuplicateKey::Write
-            },
-            UniqueKeySource::Cache,
-        )?;
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn check_or_defer_exclusions(
-    storage: &Storage,
-    table_index: usize,
-    constraint_table: usize,
-    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
-    schema: &[ColType],
-    values: &[Datum],
-    row: ConstraintRow,
-    txid: u32,
-    mut txn: Option<&mut TxnState>,
-    expressions: &ParsedChecks,
-    arena: &Arena,
-) -> Result<(), SqlError> {
-    let self_rowid = row.excluded();
-    for (index, exclusion) in def.exclusions().iter().enumerate() {
-        if exclusion.timing.is_deferrable()
-            && let Some(rowid) = row.stored()
-            && let Some(transaction) = txn.as_deref_mut()
-        {
-            let identity = transaction.constraint_identity(constraint_table as u32, exclusion.name);
-            transaction.defer_constraint(identity, rowid)?;
-            continue;
-        }
-        enforce_exclusion_constraint(
-            storage,
-            table_index,
-            def,
-            schema,
-            values,
-            self_rowid,
-            txid,
-            exclusion,
-            expressions[crate::storage::MAX_CHECKS + index],
-            arena,
-            row.validation_read(),
-            // Existing rows meeting a new constraint are its index being built.
-            if matches!(row, ConstraintRow::Existing { .. }) {
-                DuplicateKey::IndexBuild
-            } else {
-                DuplicateKey::Write
-            },
-        )?;
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn enforce_exclusion_constraint(
+fn enforce_exclusion_constraint<'a>(
     storage: &Storage,
     table_index: usize,
     def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
     _schema: &[ColType],
-    values: &[Datum],
+    values: &[Datum<'a>],
     self_rowid: Option<u64>,
     txid: u32,
     exclusion: &crate::storage::ExclusionConstraint,
     predicate: Option<&Expr>,
-    arena: &Arena,
+    arena: &'a Arena,
+    read: Option<ValidationRead>,
+    duplicate: DuplicateKey,
+) -> Result<(), SqlError> {
+    let mark = arena.mark();
+    let result = enforce_exclusion_constraint_in(
+        storage,
+        table_index,
+        def,
+        values,
+        self_rowid,
+        txid,
+        exclusion,
+        predicate,
+        arena,
+        read,
+        duplicate,
+    );
+    // SAFETY: the parsed elements and every evaluated key are consumed by the
+    // scan; only an owned error with its stashed diagnostic escapes.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enforce_exclusion_constraint_in<'a>(
+    storage: &Storage,
+    table_index: usize,
+    def: &crate::storage::TableDefinition<impl crate::storage::DefinitionBacking>,
+    values: &[Datum<'a>],
+    self_rowid: Option<u64>,
+    txid: u32,
+    exclusion: &crate::storage::ExclusionConstraint,
+    predicate: Option<&Expr>,
+    arena: &'a Arena,
     read: Option<ValidationRead>,
     duplicate: DuplicateKey,
 ) -> Result<(), SqlError> {
@@ -2651,6 +2922,12 @@ fn enforce_exclusion_constraint(
     if !predicate_holds(values)? {
         return Ok(());
     }
+    let scan = ExclusionScan::new(exclusion, arena)?;
+    let keys = scan.keys(storage, txid, def, values, arena)?;
+    // A NULL element conflicts with nothing.
+    if keys[..exclusion.len()].iter().any(Datum::is_null) {
+        return Ok(());
+    }
     let mut visit = |rowid: u64, state: crate::storage::RowRead<'_>| {
         use core::ops::ControlFlow;
         if self_rowid == Some(rowid) {
@@ -2663,6 +2940,7 @@ fn enforce_exclusion_constraint(
         let Some(home) = home else {
             return Ok(ControlFlow::Continue(()));
         };
+        let row_mark = arena.mark();
         let conflicts = storage.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut other = [Datum::Null; MAX_COLUMNS];
             decoder.decode(bytes, &mut other)?;
@@ -2670,33 +2948,25 @@ fn enforce_exclusion_constraint(
             if !predicate_holds(other)? {
                 return Ok(false);
             }
-            for position in 0..exclusion.n_cols {
-                let column = exclusion.columns[position] as usize;
-                if values[column].is_null() || other[column].is_null() {
-                    return Ok(false);
-                }
-                let operator = match exclusion.operators[position] {
-                    crate::storage::ExclusionOperator::Equal => crate::sql::ast::BinaryOp::Eq,
-                    crate::storage::ExclusionOperator::Overlaps => {
-                        crate::sql::ast::BinaryOp::Overlaps
-                    }
-                    crate::storage::ExclusionOperator::Adjacent => {
-                        crate::sql::ast::BinaryOp::Adjacent
-                    }
-                };
-                if !crate::sql::eval::exclusion_operator(
-                    operator,
-                    values[column],
-                    other[column],
-                    arena,
-                )? {
-                    return Ok(false);
-                }
+            let other_keys = scan.keys(storage, txid, def, other, arena)?;
+            if !scan.conflicts(&keys, &other_keys, arena)? {
+                return Ok(false);
             }
-            stash_exclusion_conflict(duplicate, def, exclusion, values, other)?;
+            scan.stash_conflict(
+                duplicate,
+                storage,
+                txid,
+                table_index,
+                def,
+                &keys,
+                &other_keys,
+                arena,
+            )?;
             Ok(true)
-        })?;
-        if conflicts {
+        });
+        // SAFETY: the other row's keys and description were consumed above.
+        unsafe { arena.rewind_to(row_mark) };
+        if conflicts? {
             return Err(exclusion_violation(duplicate, exclusion.name));
         }
         Ok(ControlFlow::Continue(()))
@@ -3339,7 +3609,14 @@ pub(crate) fn validate_check_constraint(
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let read = storage.validation_read();
-    let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
+    let expression = super::expression_bindings::bind_table_expression(
+        crate::sql::parser::parse_expr(check.expression.as_str(), arena)?,
+        storage,
+        definition,
+        crate::storage::ExpressionOwner::Check(check.name),
+        txid,
+        arena,
+    )?;
     let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {
         catalog: Some(&catalog),

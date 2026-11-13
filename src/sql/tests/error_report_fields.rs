@@ -914,9 +914,12 @@ fn procedural_variable_column_conflicts_follow_postgresql() {
                 "CREATE FUNCTION vc_bad() RETURNS int LANGUAGE plpgsql AS $$ #nonsense BEGIN RETURN 1; END $$",
                 &["ERROR 42601 syntax error at or near \"nonsense\" @62"],
             ),
+            // Until PL/pgSQL loads, the parameter is a placeholder.
+            ("SET plpgsql.variable_conflict = bogus", &["SET"]),
             (
-                "SET plpgsql.variable_conflict = bogus",
+                "DO $$ BEGIN NULL; END $$; SET plpgsql.variable_conflict = bogus",
                 &[
+                    "DO",
                     "ERROR 22023 invalid value for parameter \"plpgsql.variable_conflict\": \"bogus\" hint: Available values: error, use_variable, use_column.",
                 ],
             ),
@@ -926,9 +929,10 @@ fn procedural_variable_column_conflicts_follow_postgresql() {
                 &["SET", "data|use_column", "SHOW", "data|1", "SELECT 1"],
             ),
             (
-                "SELECT enumvals, context, category FROM pg_settings \
+                "DO $$ BEGIN NULL; END $$; SELECT enumvals, context, category FROM pg_settings \
                  WHERE name = 'plpgsql.variable_conflict'",
                 &[
+                    "DO",
                     "data|{error,use_variable,use_column}|superuser|Customized Options",
                     "SELECT 1",
                 ],

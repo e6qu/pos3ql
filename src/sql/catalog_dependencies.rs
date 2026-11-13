@@ -49,6 +49,43 @@ pub(crate) fn for_each_dependency(
             "constraint dependency row has an unexpected identity"
         )),
     };
+    macro_rules! push {
+        ($class:expr, $object:expr, $referenced_class:expr, $referenced_object:expr, $referenced_sub:expr, $kind:expr $(,)?) => {
+            visit(DependencyEdge {
+                dependent: ObjectAddress::new($class, $object, 0),
+                referenced: ObjectAddress::new(
+                    $referenced_class,
+                    $referenced_object,
+                    $referenced_sub,
+                ),
+                kind: $kind.as_bytes()[0],
+            })
+        };
+    }
+
+    // initdb's plpgsql extension owns its language and handlers; the language
+    // depends on its handlers.
+    for handler in PLPGSQL_HANDLER_OIDS {
+        push!(PG_PROC_OID, handler, 3079, PLPGSQL_EXTENSION_OID, 0, "e")?;
+    }
+    push!(
+        PG_LANGUAGE_OID,
+        PLPGSQL_LANGUAGE_OID,
+        3079,
+        PLPGSQL_EXTENSION_OID,
+        0,
+        "e"
+    )?;
+    for handler in PLPGSQL_HANDLER_OIDS.into_iter().rev() {
+        push!(
+            PG_LANGUAGE_OID,
+            PLPGSQL_LANGUAGE_OID,
+            PG_PROC_OID,
+            handler,
+            0,
+            "n"
+        )?;
+    }
     for values in constraints::dependencies(storage, txid, arena)? {
         let Datum::Char(kind) = values[6] else {
             return Err(sql_err!(
@@ -69,19 +106,6 @@ pub(crate) fn for_each_dependency(
             ),
             kind,
         })?;
-    }
-    macro_rules! push {
-        ($class:expr, $object:expr, $referenced_class:expr, $referenced_object:expr, $referenced_sub:expr, $kind:expr $(,)?) => {
-            visit(DependencyEdge {
-                dependent: ObjectAddress::new($class, $object, 0),
-                referenced: ObjectAddress::new(
-                    $referenced_class,
-                    $referenced_object,
-                    $referenced_sub,
-                ),
-                kind: $kind.as_bytes()[0],
-            })
-        };
     }
 
     // Sequence ownership is how pg_dump distinguishes serial/identity
@@ -125,30 +149,19 @@ pub(crate) fn for_each_dependency(
     for (_, entry) in storage.foreign_wrappers(txid) {
         let wrapper = entry.definition_for(txid);
         for routine in [
-            match wrapper.handler {
-                crate::storage::foreign::ForeignDataHandler::None => None,
-                crate::storage::foreign::ForeignDataHandler::Postgres => {
-                    Some("postgres_fdw_handler")
-                }
-            },
-            match wrapper.validator {
-                crate::storage::foreign::ForeignDataValidator::None => None,
-                crate::storage::foreign::ForeignDataValidator::Postgres => {
-                    Some("postgres_fdw_validator")
-                }
-            },
-        ]
-        .into_iter()
-        .flatten()
-        {
-            push!(
-                PG_FOREIGN_DATA_WRAPPER_OID,
-                entry.oid(),
-                PG_PROC_OID,
-                foreign_routine_oid(storage, txid, routine)?,
-                0,
-                "n",
-            )?;
+            wrapper.handler.routine_oid(),
+            wrapper.validator.routine_oid(),
+        ] {
+            if routine != 0 {
+                push!(
+                    PG_FOREIGN_DATA_WRAPPER_OID,
+                    entry.oid(),
+                    PG_PROC_OID,
+                    routine,
+                    0,
+                    "n",
+                )?;
+            }
         }
     }
     for (_, entry) in storage.foreign_servers(txid) {
@@ -883,7 +896,7 @@ pub(crate) fn for_each_dependency(
 
 /// The catalog identity a stored query dependency names, or `None` for one
 /// recorded by name only.
-fn stored_reference(
+pub(super) fn stored_reference(
     storage: &Storage,
     txid: u32,
     dependency: &crate::storage::StoredQueryDependency,
@@ -1102,11 +1115,54 @@ fn relation_dependencies(
             let Some(default) = definition.attribute_default_oid(column_index) else {
                 continue;
             };
+            // A generation expression is internal to its column, and depends
+            // normally on the columns it reads, as `StoreAttrDefault` records.
+            let generated = column.default.is_generated();
             visit(DependencyEdge {
                 dependent: ObjectAddress::new(PG_ATTRDEF_OID, default, 0),
                 referenced: ObjectAddress::new(PG_CLASS_OID, relation, attribute),
-                kind: b'a',
+                kind: if generated { b'i' } else { b'a' },
             })?;
+            if generated
+                && let Some(source) = column.default.expression().map(|source| source.as_str())
+            {
+                let mark = arena.mark();
+                let read = crate::sql::parser::parse_expr(source, arena).and_then(|expression| {
+                    crate::sql::exec::check_referenced_columns(expression, &definition)
+                });
+                // SAFETY: the column set is a value; nothing borrows the parse.
+                unsafe { arena.rewind_to(mark) };
+                let read = read?;
+                for other in 0..definition.n_columns {
+                    if read.contains(other) {
+                        visit(DependencyEdge {
+                            dependent: ObjectAddress::new(PG_ATTRDEF_OID, default, 0),
+                            referenced: ObjectAddress::new(
+                                PG_CLASS_OID,
+                                relation,
+                                i32::from(definition.attribute_number(other)),
+                            ),
+                            kind: b'n',
+                        })?;
+                    }
+                }
+            }
+            let owner = crate::storage::ExpressionOwner::Column(column.name);
+            if definition
+                .expression_dependencies_of(owner)
+                .next()
+                .is_some()
+            {
+                captured_expression_edges(
+                    storage,
+                    txid,
+                    &definition,
+                    owner,
+                    ObjectAddress::new(PG_ATTRDEF_OID, default, 0),
+                    visit,
+                )?;
+                continue;
+            }
             let mark = arena.mark();
             let mut references = [(0, 0); crate::storage::MAX_STORED_QUERY_DEPENDENCIES];
             let count = crate::sql::exec::column_default_dependencies(
@@ -1140,6 +1196,51 @@ fn relation_dependencies(
                 })?;
             }
         }
+        // A CHECK constraint depends normally on what its expression names.
+        for check in definition.checks() {
+            captured_expression_edges(
+                storage,
+                txid,
+                &definition,
+                crate::storage::ExpressionOwner::Check(check.name),
+                ObjectAddress::new(super::PG_CONSTRAINT_OID, check.oid(), 0),
+                visit,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The normal dependencies of a table expression on the objects it was bound
+/// to when written, each once.
+fn captured_expression_edges<B: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    txid: u32,
+    definition: &crate::storage::TableDefinition<B>,
+    owner: crate::storage::ExpressionOwner,
+    dependent: ObjectAddress,
+    visit: &mut dyn FnMut(DependencyEdge) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    let mut references = [(0, 0); crate::storage::MAX_TABLE_EXPRESSION_DEPENDENCIES];
+    let mut count = 0;
+    for dependency in definition.expression_dependencies_of(owner) {
+        let Ok(bound) = storage.rebound_stored_query_dependency(dependency, txid) else {
+            continue;
+        };
+        if let Some(reference) = stored_reference(storage, txid, &bound)
+            .filter(|(_, object)| *object >= crate::storage::FIRST_NORMAL_OBJECT_ID)
+            && !references[..count].contains(&reference)
+        {
+            references[count] = reference;
+            count += 1;
+        }
+    }
+    for (class, object) in &references[..count] {
+        visit(DependencyEdge {
+            dependent,
+            referenced: ObjectAddress::new(*class, *object, 0),
+            kind: b'n',
+        })?;
     }
     Ok(())
 }

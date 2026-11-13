@@ -123,8 +123,12 @@ enum ColdRequest {
     JoinQuery,
     /// A paged portal of a RIGHT join of the cold table with itself.
     RightJoin,
-    /// A simple Query of the same RIGHT join.
+    /// A simple Query of the same RIGHT join: a hash join probing its
+    /// preserved side.
     RightJoinQuery,
+    /// A simple Query of a FULL hash join of the cold table with itself,
+    /// whose hashed rows carry match flags.
+    FullJoinQuery,
     /// A simple Query of a grouping, which reads its whole input first.
     GroupedQuery,
     /// A join with a bounded derived table, which the general executor
@@ -214,6 +218,14 @@ fn right_joins_stream_cold_tables() {
     cold_result_stream(
         "result-stream-cold-right-join-query",
         ColdRequest::RightJoinQuery,
+    );
+}
+
+#[test]
+fn full_joins_stream_cold_tables() {
+    cold_result_stream(
+        "result-stream-cold-full-join-query",
+        ColdRequest::FullJoinQuery,
     );
 }
 
@@ -351,6 +363,9 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
             ColdRequest::Paged => paged_request(sql, 50),
             ColdRequest::RightJoinQuery => query(
                 "SELECT b.id, b.code FROM cold_orders a RIGHT JOIN cold_orders b ON a.id = b.id",
+            ),
+            ColdRequest::FullJoinQuery => query(
+                "SELECT a.id, a.code FROM cold_orders a FULL JOIN cold_orders b ON a.id = b.id",
             ),
             ColdRequest::SpooledJoin => query(
                 "SELECT a.id, a.code FROM cold_orders a \
@@ -502,6 +517,7 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
         | ColdRequest::View
         | ColdRequest::JoinQuery
         | ColdRequest::RightJoinQuery
+        | ColdRequest::FullJoinQuery
         | ColdRequest::GroupedQuery
         | ColdRequest::SpooledJoin
         | ColdRequest::CteTwice

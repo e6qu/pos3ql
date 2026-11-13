@@ -21,6 +21,7 @@ pub(super) fn allocate(
     mut def: TableDefBuilder,
     allocation: super::CatalogAllocation,
     creation: TableCreation,
+    declared: Option<&super::ConstraintDeclarationOrder>,
 ) -> Result<usize, SqlError> {
     def.attributes.initialize(def.n_columns)?;
     if !def.attributes.validate(def.n_columns) {
@@ -198,7 +199,7 @@ pub(super) fn allocate(
                 for identity in def.implicit_index_identities_mut() {
                     *identity = None;
                 }
-                storage.reserve_table_catalog_identities(&mut def)?;
+                storage.reserve_declared_table_catalog_identities(&mut def, declared)?;
             }
             super::CatalogAllocation::Restore(_) => {
                 storage.validate_table_catalog_identities(&def, created_at)?

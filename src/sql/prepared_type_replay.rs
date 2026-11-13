@@ -200,6 +200,7 @@ pub(super) fn stage_type_record(
             expressions,
             unique,
             definition,
+            expression_dependencies,
         } => {
             let mut stored_expressions = [None; crate::storage::MAX_INDEX_COLS];
             for (index, expression) in expressions.iter().enumerate() {
@@ -207,43 +208,43 @@ pub(super) fn stage_type_record(
                     .map(crate::storage::index_expression_stackstr)
                     .transpose()?;
             }
-            let slot = storage.create_index(
-                crate::storage::IndexDef {
-                    database: storage.current_database_oid(),
-                    created_at: *created_at,
-                    schema: SqlName::parse(schema)?,
-                    name: SqlName::parse(name)?,
-                    pending_name: None,
-                    table: SqlName::parse(table)?,
-                    relation: *relation,
-                    table_binding: None,
-                    pending_table: None,
-                    method: *method,
-                    ownership: crate::storage::Ownership::BOOTSTRAP,
-                    columns: *columns,
-                    expressions: stored_expressions,
-                    include_columns: *include_columns,
-                    collations: *collations,
-                    explicit_collations: *explicit_collations,
-                    operator_classes: *operator_classes,
-                    resolved_operator_classes: *resolved_operator_classes,
-                    operator_class_options: *operator_class_options,
-                    descending: *descending,
-                    nulls_first: *nulls_first,
-                    n_cols: *n_cols,
-                    n_include_cols: *n_include_cols,
-                    nulls_not_distinct: *nulls_not_distinct,
-                    predicate: predicate
-                        .map(crate::storage::index_predicate_stackstr)
-                        .transpose()?,
-                    unique: *unique,
-                    mutable: *definition,
-                    pending_definition: None,
-                    ddl_state: crate::storage::CatalogDdlState::Present,
-                    pending_parent_drop_txid: None,
-                },
-                txid,
-            )?;
+            let mut index = crate::storage::IndexDef {
+                database: storage.current_database_oid(),
+                created_at: *created_at,
+                schema: SqlName::parse(schema)?,
+                name: SqlName::parse(name)?,
+                pending_name: None,
+                table: SqlName::parse(table)?,
+                relation: *relation,
+                table_binding: None,
+                pending_table: None,
+                method: *method,
+                ownership: crate::storage::Ownership::BOOTSTRAP,
+                columns: *columns,
+                expressions: stored_expressions,
+                include_columns: *include_columns,
+                collations: *collations,
+                explicit_collations: *explicit_collations,
+                operator_classes: *operator_classes,
+                resolved_operator_classes: *resolved_operator_classes,
+                operator_class_options: *operator_class_options,
+                descending: *descending,
+                nulls_first: *nulls_first,
+                n_cols: *n_cols,
+                n_include_cols: *n_include_cols,
+                nulls_not_distinct: *nulls_not_distinct,
+                predicate: predicate
+                    .map(crate::storage::index_predicate_stackstr)
+                    .transpose()?,
+                unique: *unique,
+                mutable: *definition,
+                pending_definition: None,
+                ddl_state: crate::storage::CatalogDdlState::Present,
+                pending_parent_drop_txid: None,
+                ..crate::storage::IndexDef::EMPTY
+            };
+            index.restore_expression_dependencies(expression_dependencies.entries())?;
+            let slot = storage.create_index(index, txid)?;
             transaction.record_catalog_change(storage, DdlUndo::IndexCreated(slot as u32))?;
         }
         WalOp::AlterIndexDefinition {

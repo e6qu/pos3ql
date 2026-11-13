@@ -8,7 +8,9 @@ tested surface must fail with an error rather than being accepted and ignored.
 
 **User example:** `psql`, a driver, and `pg_restore` work on the tested paths.
 A PostgreSQL extension that contains a C library cannot be installed, even
-though its `CREATE EXTENSION` command is recognized.
+though its `CREATE EXTENSION` command is recognized. The one exception is
+`postgres_fdw`, which pos3ql builds in: `CREATE EXTENSION postgres_fdw`
+installs it as PostgreSQL does.
 
 The server reports version `18.4 (pos3ql 0.1)`. The vendored PostgreSQL
 regression slice is pinned to PostgreSQL 18.6; older test fixtures keep their
@@ -187,6 +189,31 @@ Syntax and errors:
   constraint of a domain violation. `RAISE ... USING COLUMN`, `CONSTRAINT`,
   `DATATYPE`, `TABLE` and `SCHEMA` set those fields (up to 1,024 bytes each)
   and `GET STACKED DIAGNOSTICS` reads them.
+- `COPY FROM` reports errors in PostgreSQL's order. PostgreSQL buffers rows
+  and adds their index entries only when the buffer flushes: after 1,000 rows,
+  after 64 KB of input lines, and at the end of the data. So if row 2
+  duplicates row 1 and row 3 fails a `CHECK`, the `CHECK` error is reported.
+  A duplicate found at a flush has the context `COPY t, line 2` with no input
+  text. Rows are not buffered, and a duplicate is reported at once with its
+  line text, when the table has a `BEFORE` row trigger, is a foreign table, an
+  omitted column's default calls a volatile function other than `nextval`, or
+  `WHERE` is volatile. `COPY FROM` into a table whose row-level security
+  policies apply to the user fails with `0A000`, as in PostgreSQL.
+- `COPY` into a view, materialized view or sequence is refused with `42809`
+  only after the server has started reading the client's data, as PostgreSQL
+  does, so `psql` reports it at the end of the data. Privileges and the column
+  list are checked first. `COPY` of an index fails at once with `cannot open
+  relation`. `COPY ... TO` of a view, foreign or partitioned table hints at the
+  `COPY (SELECT ...) TO` form. Once a `COPY FROM` has failed, the client's
+  `CopyFail` ends it with that error rather than a second one.
+- An untyped string literal is converted with its target type's input routine
+  while the statement is analysed, as PostgreSQL does, so it fails even when no
+  row evaluates it: `SELECT nextval('missing') FROM empty_table`,
+  `CASE WHEN false THEN 'abc'::integer END`, `UPDATE t SET n = 'abc' WHERE
+  false`, a `COPY ... WHERE` predicate and a column default all report the bad
+  input. This covers built-in types (including `regclass` and the other
+  object-identifier types), arrays of them and enums; domain constraints and
+  length limits are still checked when the value is computed.
 - Checks PostgreSQL makes after parsing are reported when the statement would
   run, with PostgreSQL's code and message: type modifiers (`numeric(2000)` is
   `22023`, `NUMERIC precision 2000 must be between 1 and 1000`; `numeric(5,-2)`
@@ -275,6 +302,16 @@ Syntax and errors:
   and `USER` leaves them alone. A view's
   `INSTEAD OF` trigger that does not fire leaves the row unwritten without an
   error.
+- Writing through an automatically updatable view into a view below it that
+  has its own `INSTEAD OF` trigger or rewrite rule for the write writes that
+  view, as PostgreSQL's rewriter does: with `v2` selecting `a AS x, b * 2 AS
+  b2` from trigger view `v1`, `INSERT INTO v2 (x) VALUES (3) RETURNING *`
+  fires `v1`'s trigger with `(3, NULL)` and returns the row it returns, and
+  the check options of the views above apply to that row. Their column
+  defaults reach `v1`'s trigger and rules' `NEW`. A conditional `DO INSTEAD`
+  rule without an unconditional one or a trigger fails with `55000` (`Views
+  with conditional DO INSTEAD rules are not automatically updatable.`), and
+  `MERGE` into a relation with rules fails with `0A000`.
 - A trigger's `NEW` and `OLD` have the table's row type in every firing. One
   without a row (`OLD` in an `INSERT` trigger, `NEW` in a `DELETE` trigger,
   both in a statement trigger) is NULL, and so are its fields; a field the
@@ -321,6 +358,22 @@ Syntax and errors:
   initialized in order each time it is entered, outside its own exception
   handlers. `END outer` and `END LOOP outer` must repeat the label (`end label
   "b" differs from block's label "a"`).
+- A routine's parameters are PL/pgSQL variables under their names and as
+  `$1`, `$2`, ... in declaration order, output parameters included, so
+  `$1` sees an assignment made through the parameter's name and `$2 := 'x'`
+  sets an unnamed `OUT` parameter. `a ALIAS FOR $1` (or for a parameter's
+  name, an earlier variable, `label.x`, or a trigger's `NEW` and `OLD`)
+  declares another name for the same variable: `a := a + 1` changes `$1`.
+  An alias of a name that is not declared fails when the routine is created
+  (`variable "$2" does not exist`).
+- `FOR a, b IN SELECT ...` (or `EXECUTE`, or a data change with
+  `RETURNING`) assigns each row's columns to the listed scalar variables in
+  order: missing columns are NULL, extra ones ignored, and a loop without
+  rows leaves them all NULL. A single scalar variable takes the first column.
+  `strict_multi_assignment` reports a count mismatch. Integer and cursor
+  loops take one variable (`integer FOR loop must have only one target
+  variable`), and a record in the list fails (`"r" is not a scalar
+  variable`).
 - A name in a PL/pgSQL statement that is both a variable and a column is
   ambiguous, as in PostgreSQL: with parameter `a`, `UPDATE t SET b = 1/(a-15)`
   fails with `42702` (`column reference "a" is ambiguous`, detail `It could
@@ -330,18 +383,35 @@ Syntax and errors:
   setting `plpgsql.variable_conflict = use_column`, reads the column instead;
   `use_variable` reads the variable everywhere, so with variable `a = 2`,
   `SELECT sum(a) FROM t` adds 2 per row and `GROUP BY a` makes one group.
-  PL/pgSQL's settings (`plpgsql.variable_conflict`,
-  `plpgsql.print_strict_params`, `plpgsql.check_asserts`,
-  `plpgsql.extra_warnings`, `plpgsql.extra_errors`) exist from startup.
 - PL/pgSQL "loads" in a session the first time the session runs or creates
-  PL/pgSQL code, as PostgreSQL loads its library: placeholders named
-  `plpgsql.anything` (for example from `SET plpgsql.foo = 'x'`) are then
-  removed with `WARNING: invalid configuration parameter name "plpgsql.foo",
-  removing it`, and a later `SET plpgsql.bar = 'y'` fails with `42602`
-  (`"plpgsql" is a reserved prefix.`). `plpgsql.check_asserts = off` skips
-  `ASSERT` statements. PL/pgSQL's extra checks are not implemented:
-  `plpgsql.extra_warnings` and `plpgsql.extra_errors` accept only `none`, and
-  any other valid value fails with `0A000`.
+  PL/pgSQL code, as PostgreSQL loads its library. Until then its settings
+  (`plpgsql.variable_conflict`, `plpgsql.print_strict_params`,
+  `plpgsql.check_asserts`, `plpgsql.extra_warnings`, `plpgsql.extra_errors`)
+  are unknown: `SHOW plpgsql.variable_conflict` fails with `42704`, `SET`
+  stores any value as a placeholder and `pg_settings` lists none of them.
+  Loading turns each placeholder into the setting at every transaction
+  level; a value the setting rejects (`SET plpgsql.variable_conflict =
+  'bogus'`), or that the role could not set, is dropped with PostgreSQL's
+  warning (`invalid value for parameter ...` with its hint). Other
+  placeholders named `plpgsql.anything` are then removed with `WARNING:
+  invalid configuration parameter name "plpgsql.foo", removing it`, and a
+  later `SET plpgsql.bar = 'y'` fails with `42602` (`"plpgsql" is a reserved
+  prefix.`). A rejected value warns once for the session's own `SET` and
+  once for each transaction level (`SAVEPOINT`) that assigned it, even to the
+  same value. `ALTER SYSTEM` changes no session: before loading it stores any
+  `plpgsql.*` value unchecked, and `ALTER SYSTEM RESET plpgsql.foo` (like
+  `ALTER ROLE ... RESET`) removes a setting under the reserved prefix.
+  `plpgsql.check_asserts = off` skips `ASSERT` statements.
+- PL/pgSQL's extra checks follow `plpgsql.extra_warnings` (a `WARNING`) and
+  `plpgsql.extra_errors` (an `ERROR`, which wins), each `none`, `all` or a
+  list such as `too_many_rows, strict_multi_assignment`.
+  `shadowed_variables` reports a declaration that hides a parameter, `found`,
+  a trigger variable, a loop variable or an enclosing block's variable, when
+  `CREATE FUNCTION` or `CREATE PROCEDURE` checks the body. `too_many_rows`
+  reports a `SELECT ... INTO` without `STRICT` that finds a second row (its
+  `ROW_COUNT` is then 2). `strict_multi_assignment` reports a row stored into
+  a different number of variables or record fields, once per missing source
+  and once for extra columns, as `SELECT 1, 2 INTO a` does.
 - A PL/pgSQL function keeps the `plpgsql.variable_conflict` and
   `plpgsql.print_strict_params` values it was compiled under, as PostgreSQL's
   per-session function cache does: the creating session compiles it at
@@ -465,13 +535,16 @@ Functions and expressions:
   defaults and `RETURN` bodies as PostgreSQL does: `DEFAULT 'x'` on a `text`
   column is shown as `'x'::text`, and `CHECK (v <> '')` on a `varchar` column as
   `CHECK (((v)::text <> ''::text))`. `pg_get_viewdef` uses PostgreSQL's
-  indented layout for views over plain tables joined with `ON`, printing the
-  current names of renamed tables, functions, types and enum values
+  indented layout, wrap column and qualification for views over tables, other
+  views, subqueries, functions, joins, set operations, `WITH` queries,
+  `LATERAL` items and `VALUES` lists, naming a table read again in a nested
+  query `t_1` as PostgreSQL does and printing the current names of renamed tables, functions, types and enum values
   (`WHERE (x = 'z'::status)` after `ALTER TYPE status RENAME VALUE 'a' TO
   'z'`). Pretty output
   (`pg_get_constraintdef(oid, true)`, as psql's `\d` uses) drops redundant
-  parentheses as PostgreSQL does. Expressions outside the deparser's typed
-  coverage and other views keep their stored spelling
+  parentheses as PostgreSQL does. A view or rule is always printed from its
+  analyzed query, never from its stored text; a query shape the deparser does
+  not cover fails with `0A000` instead
   (see [PLAN](../PLAN.md#close-application-compatibility-gaps)).
 
 - Named arguments and omitted defaults run in declared input order and share
@@ -577,7 +650,17 @@ Functions and expressions:
   each built-in routine
   (`obj_description('lower(text)'::regprocedure)` is `lowercase`);
   `COMMENT ON FUNCTION` replaces it and `COMMENT ... IS NULL` removes it in
-  the current database. Changes survive restart and
+  the current database. Built-in schemas, languages, access methods, types,
+  operators and text search objects carry their shipped descriptions the same
+  way (`obj_description('public'::regnamespace, 'pg_namespace')` is
+  `standard public schema`), and so does the `plpgsql` extension that initdb
+  installs: it is listed in `pg_extension`, owns its language and handlers in
+  `pg_depend`, and psql's `\dx` and `\dx+` show it. `CREATE EXTENSION plpgsql`
+  reports that it already exists; altering, dropping or commenting on it fails
+  with `0A000`. `pg_available_extensions()` and
+  `pg_available_extension_versions()` run as table functions, and
+  `pg_relation_size`, `pg_total_relation_size` and `pg_indexes_size` report the
+  bytes of a relation's stored rows (indexes and sequences have none). Changes survive restart and
   are copied by `CREATE DATABASE ... TEMPLATE`. Each changed routine uses one
   of the `max_builtin_routine_entries` rows (default 64); running out fails
   with `54000`. A signature may name a pseudo-type, as in PostgreSQL:
@@ -812,6 +895,102 @@ literal of an array of a named domain, such as
 AFTER-trigger results already survive waits. Closing these gaps is tracked in
 [PLAN.md](../PLAN.md#pause-and-resume-every-query-path).
 
+## Full-text search languages
+
+Full-text search turns a document into lexemes, the normalized word forms a
+`tsvector` holds. A language's stemmer reduces related forms to one lexeme,
+so `to_tsvector('german', 'Häuser')` is `'haus':1` and matches a query for
+`haus`. Every database has the text search objects PostgreSQL 18.6's initdb
+creates: the `default` parser; the `simple`, `synonym`, `ispell`,
+`thesaurus` and `snowball` templates; the `simple` dictionary and
+configuration; and for each of 29 languages (`arabic` through `yiddish`, as
+`\dF` lists them) a Snowball dictionary `<language>_stem` and a configuration
+`<language>`. Their OIDs, `dictinitoption` text, token mappings (Hindi and
+Russian stem all-ASCII words as English) and descriptions match the
+PostgreSQL 18.6 reference image, so psql's `\dF`, `\dF+`, `\dFd` and `\dFt`
+print the same tables. Each database keeps its own copy of these 66 objects,
+so `max_text_search_objects` must hold 66 per database.
+
+- `CREATE TEXT SEARCH DICTIONARY ... (TEMPLATE = snowball, Language = ...)`
+  accepts the 29 languages and `porter`, the original Porter stemmer
+  PostgreSQL also ships. `StopWords` names one of the 15 shipped stopword
+  lists (`danish`, `dutch`, `english`, `finnish`, `french`, `german`,
+  `hungarian`, `italian`, `nepali`, `norwegian`, `portuguese`, `russian`,
+  `spanish`, `swedish`, `turkish`); the `simple` template accepts `StopWords`
+  and `Accept`. There are no other stopword or dictionary files, so another
+  name fails with `F0000` (`could not open stop-word file`), and a dictionary
+  from the `synonym`, `ispell` or `thesaurus` template fails with `0A000`.
+- Words are lower-cased as under PostgreSQL's C ctype, the only database
+  ctype pos3ql provides: ASCII letters only, so
+  `ts_lexize('german_stem', 'HÄUSER')` is `{hÄus}` in both.
+- `SET default_text_search_config` resolves the configuration and stores its
+  schema-qualified name (`german` becomes `pg_catalog.german`); an unknown
+  configuration fails with `22023`. `text @@ tsquery` uses this setting.
+- Limits: as in PostgreSQL, a word longer than 1,000 bytes skips stemming and
+  stopwords. A word is stemmed in a fixed 4,096-byte buffer; a stem that
+  would outgrow it fails with `54000`, which no word within PostgreSQL's
+  limits reaches.
+
+### Snowball provenance
+
+The stemmers are a statement-for-statement Rust translation of PostgreSQL
+18.6's generated C files, `src/sql/snowball/<language>.rs`, produced by
+`tools/generate-snowball-stemmers.py` from
+[`src/backend/snowball/libstemmer`](https://github.com/postgres/postgres/tree/REL_18_6/src/backend/snowball/libstemmer)
+(each file's SHA-256 is in its header). PostgreSQL synced those files with
+[Snowball](https://snowballstem.org) commit
+[`d19326ac`](https://github.com/snowballstem/snowball/commit/d19326ac6c1b9a417fc872f7c2f845265a5e9ece)
+(2025-02-19; the files say Snowball 2.2.0 generated them).
+`src/sql/snowball/mod.rs` ports Snowball's runtime (`utilities.c`, `api.c`)
+to a fixed buffer and carries Snowball's BSD 3-clause license. The stopword
+lists in `src/sql/snowball/stopwords.rs` come from
+[`src/backend/snowball/stopwords`](https://github.com/postgres/postgres/tree/REL_18_6/src/backend/snowball/stopwords),
+which PostgreSQL took from snowballstem.org under the same license. The
+inputs were read from the `REL_18_6` source archive
+(`https://codeload.github.com/postgres/postgres/tar.gz/refs/tags/REL_18_6`,
+SHA-256 `ff9b1187e3ab120282b9f3e09a5efba2425838b3a843150c5cb2f019f47ac400`,
+retrieved 2026-11-13). Regenerate with:
+
+```sh
+python3 -I tools/generate-snowball-stemmers.py \
+  --source /path/to/postgres-REL_18_6/src/backend/snowball \
+  --output src/sql/snowball
+```
+
+### Default text search parser provenance
+
+The `default` parser (`ts_parse`, `ts_debug`, `to_tsvector`, `ts_headline`)
+is a port of PostgreSQL 18.6's
+[`src/backend/tsearch/wparser_def.c`](https://github.com/postgres/postgres/blob/REL_18_6/src/backend/tsearch/wparser_def.c).
+`tools/generate-text-parser-tables.py` reads that file and
+[`src/include/common/unicode_nonspacing_table.h`](https://github.com/postgres/postgres/blob/REL_18_6/src/include/common/unicode_nonspacing_table.h)
+from the same `REL_18_6` archive and writes the token types, per-state action
+lists and character tables to `src/sql/text_parser/tables.rs` (each input's
+SHA-256 is in its header). `src/sql/text_parser/mod.rs` ports the interpreter
+(`TParserGet`) and its character tests for a UTF-8 database with the C ctype,
+where every non-ASCII character is a letter. `src/sql/text_parser/headline.rs`
+ports `ts_headline`: `hlparsetext` and `generateHeadline` from `ts_parse.c`,
+`prsd_headline` and its cover selection from `wparser_def.c`, the
+position-reporting query executor from `tsvector_op.c` and the option list
+parser from `tsearchcmds.c`. Regenerate the tables with:
+
+```sh
+python3 -I tools/generate-text-parser-tables.py \
+  --source /path/to/postgres-REL_18_6 \
+  --output src/sql/text_parser/tables.rs
+```
+
+Differential fixture
+`tests/external/differential_exact/391_text_search_parser.sql` compares
+`ts_parse`, `ts_debug`, `to_tsvector` and `ts_headline` on URLs, e-mail
+addresses, hosts, file paths, numbers, versions, XML tags and entities,
+hyphenated words, mixed scripts and long tokens with PostgreSQL 18.6.
+
+Differential fixture
+`tests/external/differential_exact/390_snowball_text_search.sql` compares
+sample words of every language, configurations, dictionary DDL and psql's
+describe output with PostgreSQL 18.6.
+
 ## Physical access paths
 
 | Method | Supported paths |
@@ -827,6 +1006,15 @@ Index names describe SQL behavior, not PostgreSQL's page layout; native index
 callbacks are not available. MVCC visibility and SQL rechecks decide every
 result. [Immutable index navigation](index-navigation.md) specifies pruning,
 covering, and nearest-neighbor eligibility.
+
+An exclusion constraint (`EXCLUDE USING gist (during WITH &&)`) may use the
+B-tree (the default), hash, GiST or SP-GiST method with any commutative
+operator of the column type's default operator class for that method, as
+PostgreSQL checks it: `EXCLUDE (code WITH =)` on `text`, `EXCLUDE USING gist
+(area WITH &&)` on `box`. Each element must be a column; an expression element
+such as `int4range(lo, hi)` returns `0A000`. `CLUSTER` and `REPLICA IDENTITY
+USING INDEX` accept a primary key or unique constraint's index as well as an
+ordinary index.
 
 `REINDEX (TABLESPACE ...)` without `CONCURRENTLY` returns `0A000` for
 constraint-generated indexes such as `orders_pkey`, or for a table, schema, or
@@ -908,6 +1096,7 @@ Exhaustion returns `54000` naming the pool, before any partial effect.
 | Setting(s) | Bounds |
 |---|---|
 | `sql_arena_bytes` (per-connection statement memory), `work_arena_bytes` (per query workspace; see [`work_mem`](#work_mem)) | Row images, joins, lists, programs, JSON/XML work, table-function rows, sorts and aggregates, retained scan/COPY/validation records (32 bytes per resident row) |
+| `catalog_image_bytes` (per query workspace, default 8 MiB) | Catalog relation images a query that calls a user routine builds when it starts, so its own catalog scans read the catalog as it began |
 | `max_tables`, `max_extended_statistics`, other catalog `max_*` | One capacity per catalog family; omitting `max_extended_statistics` derives it from `max_tables`, so set it explicitly |
 | `max_connections`, `max_prepared_transactions`, `max_subscriptions` | Transaction identity registry has `max_connections + max_prepared_transactions` entries |
 | `max_catalog_versions_per_object`, `max_ddl_per_transaction` | Retained definition/undo versions. Enum label images use `max_enums + P` slots, `P = min(max_enums * max_catalog_versions_per_object, (max_connections + max_prepared_transactions + max_subscriptions) * max_ddl_per_transaction)`, each holding `max_enum_labels_per_type` labels |
@@ -956,6 +1145,41 @@ files: a sort, grouping or hash table that outgrows the workspace fails with
 `54000` whatever `work_mem` says. Raise `work_arena_bytes` in the configuration
 file and restart to let larger sorts run.
 
+### Planner settings
+
+PostgreSQL's planner settings (every `pg_settings` row in a "Query Tuning"
+category, such as `enable_seqscan`, `random_page_cost` or `geqo`) steer how a
+query is planned; they never change its result. pos3ql accepts all 52 with
+PostgreSQL 18's values, units, ranges, errors, `SHOW` text, `pg_settings` row,
+`SET LOCAL`, routine `SET` clause and `EXPLAIN (SETTINGS)` line.
+
+Where pos3ql's planner has the same choice, the setting decides it:
+
+- `enable_seqscan`, `enable_indexscan` and `enable_bitmapscan` choose between
+  a sequential scan and an index scan (a bitmap heap scan for BRIN and GIN
+  indexes). For example, `SET enable_indexscan = off` makes
+  `SELECT * FROM t WHERE id = 5` read `t` sequentially.
+- `enable_hashjoin` and `enable_nestloop` choose between a hash join and a
+  nested loop, and `enable_material` drops the `Materialize` step `EXPLAIN`
+  shows over a nested loop's inner sequential scan.
+- When every way to run a step is disabled, the step still runs and `EXPLAIN`
+  marks it `Disabled: true`, as PostgreSQL 18 does. `SET enable_seqscan = off`
+  followed by `EXPLAIN SELECT * FROM t` on a table without indexes prints
+  `Seq Scan on t` with `Disabled: true`. A disabled sort or hashed aggregate is
+  marked the same way.
+
+The other settings name plan types or cost inputs pos3ql's planner does not
+have, so they change no plan, just as disabling an unused method changes
+nothing in PostgreSQL: there is no merge join (`enable_mergejoin`), parallel
+query, JIT, genetic optimizer, memoize, incremental sort, TID scan or
+partitionwise planning, and pos3ql's costs come from its own storage model
+rather than `seq_page_cost`-style constants. Two choices PostgreSQL makes
+differently: with index scans disabled PostgreSQL can still read a B-tree
+index through a bitmap heap scan, which pos3ql does not have, so pos3ql scans
+sequentially; and with sequential scans disabled PostgreSQL can read a whole
+table through any B-tree index, while pos3ql uses an index only for a
+condition or ordering it serves.
+
 ### Cursor capacity
 
 Each cursor reserves `cursor_bytes` for rows, `cursor_query_bytes` for its query,
@@ -982,9 +1206,10 @@ rows fit; raising `cursor_bytes` does not help there.
 - `WITH HOLD`: the unread suffix (plus history when scrolling) must fit; a
   scrollable cursor whose rows are evaluated again saves its whole result.
 - A trigger fired inside a writing statement (`INSERT`, `UPDATE`, `DELETE`,
-  `MERGE`, `COPY`, `TRUNCATE`, deferred constraints) can read a cursor whose
-  query runs whole at its first read. One that evaluates its rows as they are
-  fetched, or whose data-modifying `WITH` queries have not run yet, raises
+  `MERGE`, `COPY`, `TRUNCATE`, deferred constraints) can read a session
+  cursor, including one that locks its rows and one whose data-modifying
+  `WITH` queries then run at that first read, as the trigger's own writes do.
+  A cursor that calls a user-defined routine for each fetched row raises
   `0A000` there.
 - A PL/pgSQL `OPEN` query with data-modifying `WITH` queries runs once, at
   the cursor's first `FETCH` or `MOVE` as in PostgreSQL, and its whole result
@@ -1017,7 +1242,12 @@ PostgreSQL physical standby cannot replay pos3ql's journal.
   window queries and in the `FROM` items of `UPDATE ... FROM` and `DELETE
   ... USING`.
 - PostgreSQL parallel query, JIT, and planner/executor hooks do not exist.
-  Cost estimates and `EXPLAIN` text differ from PostgreSQL.
+  Cost estimates differ from PostgreSQL. `EXPLAIN` shows the plan pos3ql
+  runs: scan filters (`Filter: (a = 1)`), a hash join's `Hash Cond` and `Hash`
+  node, and a nested loop's `Join Filter` and `Materialize` inner scan, in
+  PostgreSQL's layout. There is no merge join, so a query PostgreSQL plans as
+  `Merge Join` shows a hash join or nested loop. A statement a rewrite rule
+  changes shows each statement the rule produces, separated by an empty line.
 - Logical copies are separate durable databases updated asynchronously; there
   are no shared-storage replicas or multiple writers.
 - Monitoring fields for absent subsystems report empty or zero values. A
@@ -1044,6 +1274,20 @@ The SQL extension lifecycle works: control and version scripts, updates,
 dependencies, trusted installation, relocation, membership, ownership, comments,
 catalogs, transactions, dump/restore, and recovery. Repository fixture packages
 test it.
+
+`postgres_fdw` is built in and found in `$system`, the default
+`extension_control_path` entry, like PostgreSQL's own contrib packages:
+`CREATE EXTENSION postgres_fdw` runs PostgreSQL 18.6's versions 1.0 to 1.2
+scripts, which create `postgres_fdw_handler`, `postgres_fdw_validator` and
+the `postgres_fdw` wrapper in the target schema. Before that, no handler
+exists. Their `LANGUAGE C` functions (`AS '$libdir/postgres_fdw', 'symbol'`)
+bind to pos3ql's implementation: a wrapper uses them as its handler and
+validator, but calling one directly (`SELECT postgres_fdw_validator(...)`,
+`postgres_fdw_get_connections()`, `postgres_fdw_disconnect(...)`,
+`postgres_fdw_disconnect_all()`) fails with `0A000`. A `LANGUAGE C` function
+of any other library fails with `0A000`; an unknown symbol of
+`$libdir/postgres_fdw` fails with `42883`. Other packages in PostgreSQL's
+`$system` directory are not available.
 
 Third-party extensions, SQL-only or native, are not certified. PostgreSQL C
 libraries, server ABI and hooks, background workers, native procedural

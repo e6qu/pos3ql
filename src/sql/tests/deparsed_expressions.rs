@@ -288,3 +288,122 @@ fn sql_standard_bodies_print_one_analyzed_statement_per_line() {
         ]
     );
 }
+
+/// `JSON_TABLE` FROM items print as PostgreSQL 18.6's `get_json_table`
+/// prints them (outputs captured from PostgreSQL 18.6).
+#[test]
+fn json_table_views_print_postgresql_layout() {
+    let (mut engine, mut budget) = test_engine();
+    rows(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE json_rows (id integer PRIMARY KEY, document jsonb NOT NULL); \
+         CREATE VIEW json_projection AS \
+           SELECT source.id, item.ordinality, item.item_id, item.price \
+             FROM json_rows AS source \
+             CROSS JOIN LATERAL JSON_TABLE(source.document, '$.items[*] ? (@.active == true)' \
+               COLUMNS (ordinality FOR ORDINALITY, item_id integer PATH '$.id', \
+                 price numeric(10,2) PATH '$.price')) AS item; \
+         CREATE VIEW j2 AS SELECT * FROM JSON_TABLE('{\"a\":1}'::jsonb, '$' PASSING 1 AS x \
+           COLUMNS (a int PATH '$.a' DEFAULT 0 ON EMPTY ERROR ON ERROR, \
+             b text FORMAT JSON PATH '$' WITH WRAPPER, c bool EXISTS PATH '$.a', \
+             NESTED PATH '$.n[*]' COLUMNS (d int PATH '$')) ERROR ON ERROR) jt",
+    );
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_viewdef('json_projection'), pg_get_viewdef('j2')"
+        ),
+        [concat!(
+            " SELECT source.id,\n    item.ordinality,\n    item.item_id,\n    item.price\n",
+            "   FROM (json_rows source\n     CROSS JOIN LATERAL JSON_TABLE(\n",
+            "            source.document, '$.\"items\"[*]?(@.\"active\" == true)' AS json_table_path_0\n",
+            "            COLUMNS (\n                ordinality FOR ORDINALITY,\n",
+            "                item_id integer PATH '$.\"id\"',\n",
+            "                price numeric(10,2) PATH '$.\"price\"'\n",
+            "            )\n        ) item);|",
+            " SELECT a,\n    b,\n    c,\n    d\n   FROM JSON_TABLE(\n",
+            "            '{\"a\": 1}'::jsonb, '$' AS json_table_path_0\n",
+            "            PASSING\n                1 AS x\n            COLUMNS (\n",
+            "                a integer PATH '$.\"a\"' DEFAULT 0 ON EMPTY ERROR ON ERROR,\n",
+            "                b text FORMAT JSON PATH '$' WITH UNCONDITIONAL WRAPPER KEEP QUOTES,\n",
+            "                c boolean EXISTS PATH '$.\"a\"',\n",
+            "                NESTED PATH '$.\"n\"[*]' AS json_table_path_1\n",
+            "                COLUMNS (\n                    d integer PATH '$'\n",
+            "                )\n            ) ERROR ON ERROR\n        ) jt;"
+        )]
+    );
+}
+
+/// `ROWS FROM` over a table function and a scalar one prints each function
+/// and the item's full column list (outputs captured from PostgreSQL 18.6).
+#[test]
+fn rows_from_views_print_postgresql_layout() {
+    let (mut engine, mut budget) = test_engine();
+    rows(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA d; \
+         CREATE FUNCTION d.dump_rows(start_value integer) RETURNS TABLE(item integer, label text) \
+           LANGUAGE sql AS 'SELECT start_value, ''one'' UNION ALL SELECT start_value + 1, ''two'''; \
+         CREATE VIEW d.row_view AS SELECT item,label,generated,ordinality \
+           FROM ROWS FROM (d.dump_rows(1), generate_series(10,30,10)) WITH ORDINALITY \
+           AS rows(item,label,generated,ordinality); \
+         CREATE VIEW d.v2 AS SELECT * FROM d.dump_rows(3); \
+         CREATE VIEW d.v3 AS SELECT * FROM ROWS FROM (d.dump_rows(1), generate_series(1,2)) r",
+    );
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_viewdef('d.row_view'), pg_get_viewdef('d.v2'), pg_get_viewdef('d.v3')"
+        ),
+        [concat!(
+            " SELECT item,\n    label,\n    generated,\n    ordinality\n",
+            "   FROM ROWS FROM(d.dump_rows(1), generate_series(10, 30, 10)) WITH ORDINALITY ",
+            "rows(item, label, generated, ordinality);|",
+            " SELECT item,\n    label\n   FROM d.dump_rows(3) dump_rows(item, label);|",
+            " SELECT item,\n    label,\n    generate_series\n",
+            "   FROM ROWS FROM(d.dump_rows(1), generate_series(1, 2)) r(item, label, generate_series);"
+        )]
+    );
+}
+
+/// A text search configuration an expression binds to its OID prints by
+/// name (outputs captured from PostgreSQL 18.6).
+#[test]
+fn bound_text_search_configurations_print_by_name() {
+    let (mut engine, mut budget) = test_engine();
+    rows(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA od; \
+         CREATE TEXT SEARCH CONFIGURATION od.documents (COPY = english); \
+         CREATE TABLE od.sd (id int, body text, \
+           terms tsvector GENERATED ALWAYS AS (to_tsvector('od.documents', body)) STORED, \
+           c bool CHECK (to_tsvector('english', body) @@ 'x'::tsquery OR true)); \
+         CREATE VIEW od.v AS SELECT to_tsvector('od.documents', body) FROM od.sd",
+    );
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'od.sd'::regclass"
+        ),
+        ["to_tsvector('od.documents'::regconfig, body)"]
+    );
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+             WHERE conrelid = 'od.sd'::regclass AND contype = 'c'"
+        ),
+        ["CHECK (((to_tsvector('english'::regconfig, body) @@ '''x'''::tsquery) OR true))"]
+    );
+    assert_eq!(
+        rows(&mut engine, &mut budget, "SELECT pg_get_viewdef('od.v')"),
+        [" SELECT to_tsvector('od.documents'::regconfig, body) AS to_tsvector\n   FROM od.sd;"]
+    );
+}

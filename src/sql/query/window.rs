@@ -188,6 +188,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         with: &[],
         set_body: None,
         locking: &[],
+        written: crate::sql::ast::WrittenQuery::PLAIN,
     };
     let inner = arena.alloc(inner).map_err(|_| arena_full())?;
 
@@ -237,7 +238,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         base: TableRef {
             schema: None,
             table: "",
-            alias: Some("?grouped"),
+            alias: Some(super::GROUPED_WINDOW_SOURCE),
             subquery: Some(inner),
             func_args: None,
             func_argument_names: &[],
@@ -279,6 +280,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         with: &[],
         set_body: None,
         locking: &[],
+        written: crate::sql::ast::WrittenQuery::PLAIN,
     };
     Ok(&*arena.alloc(outer).map_err(|_| arena_full())?)
 }

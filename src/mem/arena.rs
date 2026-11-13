@@ -524,6 +524,46 @@ impl Arena {
         }
     }
 
+    /// A fixed `bytes` workspace carved from the owning arena's durable tail,
+    /// for statement state built by code that allocates through an ordinary
+    /// arena (an analysis run part-way through a statement). Its allocations,
+    /// including its own marks and rewinds, never touch this arena's front,
+    /// so per-row rewinds cannot reclaim them; the owner's reset does.
+    pub(crate) fn persistent_workspace(
+        &self,
+        what: &'static str,
+        bytes: usize,
+    ) -> Result<&Arena, ArenaFull> {
+        let owner = self.retention_owner();
+        let capacity = bytes.next_multiple_of(ARENA_ALIGN);
+        let layout =
+            Layout::from_size_align(capacity, ARENA_ALIGN).map_err(|_| owner.full(capacity))?;
+        let base = owner.alloc_raw_tail(layout)?;
+        let header = owner
+            .alloc_raw_tail(Layout::new::<Arena>())?
+            .cast::<Arena>();
+        // SAFETY: both ranges are disjoint, aligned tail allocations of the
+        // owner, live until its `reset`, which takes `&mut self` and so ends
+        // every borrow returned here. The header is never dropped: its
+        // storage belongs to the owner and must not be freed through it.
+        unsafe {
+            header.write(Arena {
+                what,
+                base,
+                capacity,
+                offset: Cell::new(0),
+                tail_offset: Cell::new(capacity),
+                high_water: Cell::new(0),
+                region_active: Cell::new(false),
+                borrowed: None,
+                retained_front: Cell::new(0),
+                retention_identity: retention_identity(),
+                interned: Cell::new(None),
+            });
+            Ok(&*header)
+        }
+    }
+
     /// Rewinds the arena. Requires `&mut self`, so the borrow checker
     /// guarantees no allocation handed out earlier is still alive.
     pub fn reset(&mut self) {
@@ -955,6 +995,12 @@ impl<'a> ArenaString<'a> {
     pub(crate) fn as_str(&self) -> &'a str {
         // UTF-8 validity: every push comes from a &str.
         unsafe { core::str::from_utf8_unchecked(self.bytes.as_slice()) }
+    }
+
+    /// Drops the text past byte `len`, which must be a character boundary.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        assert!(self.as_str().is_char_boundary(len));
+        self.bytes.truncate(len);
     }
 }
 

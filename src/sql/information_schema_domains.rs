@@ -1,12 +1,12 @@
 //! The domains PostgreSQL's `information_schema` declares for its view columns.
 //!
 //! Source: <https://github.com/postgres/postgres/blob/REL_18_6/src/backend/catalog/information_schema.sql>
-//! (`CREATE DOMAIN cardinal_number ...` through `yes_or_no`). Their catalog
-//! identifiers follow the PostgreSQL 18.6 initdb image recorded in
-//! `catalog_callable_signatures.rs`, where `information_schema._pg_expandarray`
-//! is 13700 and these declarations follow the helper functions.
+//! (`CREATE DOMAIN cardinal_number ...` through `yes_or_no`). initdb numbers
+//! them after the schema and its helper functions, from the counter
+//! `INFORMATION_SCHEMA_NS_OID` documents.
 
 use crate::sql::ast::Collation;
+use crate::sql::catalog::INFORMATION_SCHEMA_NS_OID;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
@@ -50,11 +50,11 @@ impl InformationSchemaDomain {
 
     pub(crate) const fn oid(self) -> i32 {
         match self {
-            Self::CardinalNumber => 13713,
-            Self::CharacterData => 13716,
-            Self::SqlIdentifier => 13718,
-            Self::TimeStamp => 13724,
-            Self::YesOrNo => 13726,
+            Self::CardinalNumber => INFORMATION_SCHEMA_NS_OID + 14,
+            Self::CharacterData => INFORMATION_SCHEMA_NS_OID + 17,
+            Self::SqlIdentifier => INFORMATION_SCHEMA_NS_OID + 19,
+            Self::TimeStamp => INFORMATION_SCHEMA_NS_OID + 25,
+            Self::YesOrNo => INFORMATION_SCHEMA_NS_OID + 27,
         }
     }
 
@@ -98,12 +98,12 @@ impl InformationSchemaDomain {
     pub(crate) const fn check(self) -> Option<DomainCheck> {
         match self {
             Self::CardinalNumber => Some(DomainCheck {
-                oid: 13714,
+                oid: INFORMATION_SCHEMA_NS_OID + 15,
                 name: "cardinal_number_domain_check",
                 source: "VALUE >= 0",
             }),
             Self::YesOrNo => Some(DomainCheck {
-                oid: 13727,
+                oid: INFORMATION_SCHEMA_NS_OID + 28,
                 name: "yes_or_no_check",
                 // PostgreSQL stores the declared `VALUE IN ('YES', 'NO')` in
                 // this analyzed form.

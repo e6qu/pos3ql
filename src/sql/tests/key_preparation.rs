@@ -20,7 +20,7 @@ fn key_preparation_sql_expression_failure_rollback_reindex_and_cold_recovery() {
             let mut engine = Engine::new(&config, &mut budget).unwrap();
             let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
             assert_eq!(
-                data_rows(&session.success(
+                data_rows(&session.success_script(
                     &mut engine,
                     include_str!(
                         "../../../tests/external/differential_exact/19_key_preparation.sql"

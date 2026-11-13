@@ -330,9 +330,10 @@ fn sorted_and_paged_projection_effects(external: bool) {
         &mut engine,
         "CREATE TABLE projection_locks(row_id integer PRIMARY KEY,order_key integer); \
              INSERT INTO projection_locks VALUES(1,1),(2,1),(3,2); \
-             ALTER SEQUENCE projection_calls RESTART WITH 1; BEGIN",
+             ALTER SEQUENCE projection_calls RESTART WITH 1",
         true,
     );
+    session.success(&mut engine, "BEGIN", true);
     let locked = session.success(&mut engine,
             "SELECT order_key,marker FROM (SELECT row_id,order_key,nextval('projection_calls') AS marker \
                  FROM projection_locks ORDER BY order_key FETCH FIRST 1 ROW WITH TIES FOR UPDATE) AS selected; \
@@ -367,8 +368,12 @@ fn sorted_and_paged_projection_effects(external: bool) {
     );
     session.success(
         &mut engine,
-        "ALTER SEQUENCE projection_calls RESTART WITH 1; BEGIN; \
-             SELECT row_id FROM projection_locks WHERE row_id=3 FOR UPDATE",
+        "ALTER SEQUENCE projection_calls RESTART WITH 1",
+        true,
+    );
+    session.success(
+        &mut engine,
+        "BEGIN; SELECT row_id FROM projection_locks WHERE row_id=3 FOR UPDATE",
         true,
     );
     let waiting_query = "SELECT order_key,marker FROM (SELECT row_id,order_key,nextval('projection_calls') AS marker \
@@ -1536,7 +1541,7 @@ fn routine_defaults_retain_creation_bindings_and_recover_without_a_cache() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     assert_eq!(
-        data_rows(&session.success(&mut engine, exercise, true)),
+        data_rows(&session.success_script(&mut engine, exercise, true)),
         [
             "41|f",
             "41|42|7|901|301",

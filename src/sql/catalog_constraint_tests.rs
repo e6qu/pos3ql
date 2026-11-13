@@ -802,8 +802,12 @@ fn catalog_constraint_null_modes_keep_deferred_savepoint_semantics() {
         engine.commit_progress = CommitProgressMode::Reactor;
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
         session.success(&mut engine,
-            "CREATE TABLE null_deferred(a integer CONSTRAINT null_deferred_key UNIQUE NULLS NOT DISTINCT DEFERRABLE INITIALLY DEFERRED);
-             BEGIN; INSERT INTO null_deferred VALUES(NULL),(NULL)", true);
+            "CREATE TABLE null_deferred(a integer CONSTRAINT null_deferred_key UNIQUE NULLS NOT DISTINCT DEFERRABLE INITIALLY DEFERRED)", true);
+        session.success(
+            &mut engine,
+            "BEGIN; INSERT INTO null_deferred VALUES(NULL),(NULL)",
+            true,
+        );
         assert_eq!(
             error_sqlstates(&session.execute(&mut engine, "COMMIT", true)),
             ["23505"]
@@ -852,12 +856,16 @@ fn catalog_constraint_null_modes_survive_prepared_decisions_and_empty_disk() {
                  COMMENT ON COLUMN saved_nulls.a IS 'retained comment';
                  ALTER TABLE saved_nulls ADD CONSTRAINT saved_positive CHECK(a>0);
                  CREATE TABLE saved_nodes(expression pg_node_tree, relation oid);
-                 INSERT INTO saved_nodes SELECT conbin,conrelid FROM pg_constraint WHERE conname='saved_positive';
-                 BEGIN; ALTER TABLE saved_nulls DROP COLUMN lost, ADD COLUMN fresh smallint;
+                 INSERT INTO saved_nodes SELECT conbin,conrelid FROM pg_constraint WHERE conname='saved_positive'", false);
+            session.success(
+                &mut engine,
+                "BEGIN; ALTER TABLE saved_nulls DROP COLUMN lost, ADD COLUMN fresh smallint;
                  ALTER TABLE saved_nulls RENAME TO saved_renamed_nulls;
                  ALTER DOMAIN saved_domain RENAME TO saved_renamed_domain;
                  INSERT INTO saved_renamed_nulls(a,b) VALUES(1,NULL);
-                 PREPARE TRANSACTION 'saved-null-mode'", false);
+                 PREPARE TRANSACTION 'saved-null-mode'",
+                false,
+            );
             if checkpoint {
                 assert!(engine.checkpoint().unwrap());
             }

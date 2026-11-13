@@ -426,6 +426,13 @@ pub struct TxnState {
     // One SQL command can commit several transactions. A caught cancellation
     // stays consumed until the command ends, including across those commits.
     statement_timeout_consumed: bool,
+    /// The CommandComplete of a simple Query's statement (by its position in
+    /// the message) that waits for that statement's transaction boundary.
+    /// It survives a wait for the commit, so it outlives the transaction.
+    pub(crate) held_command_complete: Option<(
+        usize,
+        crate::util::StackStr<{ crate::pg::respond::COMMAND_TAG_MAX }>,
+    )>,
     pub txid: u32,
     /// The isolation level promised to this transaction. READ COMMITTED takes
     /// a fresh durable-LSN snapshot per statement; REPEATABLE READ pins the
@@ -1438,6 +1445,7 @@ impl TxnState {
             mode: TxnMode::Idle,
             failed: false,
             statement_timeout_consumed: false,
+            held_command_complete: None,
             txid: 0,
             isolation: TransactionIsolation::ReadCommitted,
             read_only: false,
@@ -2192,7 +2200,7 @@ impl TxnState {
         self.sources = TransactionSources::default();
     }
 
-    pub(crate) fn apply_begin_characteristics(
+    fn apply_begin_characteristics(
         &mut self,
         characteristics: super::ast::TransactionCharacteristics,
     ) {

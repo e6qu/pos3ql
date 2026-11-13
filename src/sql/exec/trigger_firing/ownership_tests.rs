@@ -220,6 +220,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
         let (program, code) = compile_plpgsql_execution(
             source,
             PlpgsqlProgramKind::Trigger,
+            0,
             &storage,
             100,
             &original,
@@ -256,6 +257,7 @@ fn paused_firing_keeps_rows_arguments_schemas_and_effects_after_source_destructi
             input_owner: super::super::super::type_input_plans::Owner::Backend,
             input_collation: crate::sql::ast::Collation::None,
             input_sites: program.input_sites,
+            positionals: 0,
             variable_conflict: crate::sql::guc::VariableConflict::Error,
             print_strict_params: false,
             fresh_snapshots: true,

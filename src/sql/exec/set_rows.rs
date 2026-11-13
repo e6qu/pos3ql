@@ -86,6 +86,60 @@ impl PlpgsqlSetResult {
             .map_err(|_| super::super::query::arena_full_pub())?
     }
 
+    /// PostgreSQL's `RETURN QUERY` check of a query's columns against the
+    /// result columns of a function returning rows: the same count and, by
+    /// position, the same types.
+    pub(super) fn check_query_structure(
+        &self,
+        returned: &[ColDesc<'_>],
+        storage: &Storage,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        let Contract::Columns(columns) = &self.contract else {
+            return Ok(());
+        };
+        let mismatch = |detail: core::fmt::Arguments<'_>| {
+            crate::sql::error_position::with_detail(
+                sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "structure of query does not match function result type"
+                ),
+                detail,
+            )
+        };
+        let count = |returned: usize| {
+            mismatch(format_args!(
+                "Number of returned columns ({}) does not match expected column count ({}).",
+                returned,
+                columns.len()
+            ))
+        };
+        for (index, column) in columns.iter().enumerate() {
+            let Some(field) = returned.get(index) else {
+                return Err(count(returned.len()));
+            };
+            let declared = storage
+                .routine_type_oid(column.ctype, column.user_type, txid)
+                .unwrap_or(column.ctype.oid());
+            if field.type_oid != declared {
+                let returned =
+                    crate::sql::catalog::format_type_name(storage, txid, field.type_oid)?;
+                let expected = crate::sql::catalog::format_type_name(storage, txid, declared)?;
+                return Err(mismatch(format_args!(
+                    "Returned type {} does not match expected type {} in column \"{}\" (position {}).",
+                    returned.as_str(),
+                    expected.as_str(),
+                    column.name.as_str(),
+                    index + 1
+                )));
+            }
+        }
+        if returned.len() != columns.len() {
+            return Err(count(returned.len()));
+        }
+        Ok(())
+    }
+
     pub(super) fn rows<'a>(&self, arena: &'a Arena) -> Result<&'a [&'a [u8]], SqlError> {
         self.rows.rows(arena)
     }

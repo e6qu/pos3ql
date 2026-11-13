@@ -25,8 +25,8 @@ schema changes follow a different procedure; see
 
 | Object | Identity | Read | Write | Notes |
 |---|---|---:|---:|---|
-| Checkpoint manifest | `pos3ql-manifest-v40` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
-| Journal record | Version `30` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
+| Checkpoint manifest | `pos3ql-manifest-v41` | yes | yes | Only accepted manifest; every other header is rejected before its references are used. |
+| Journal record | Version `32` at header byte 17; bytes 18–23 are zero | yes | yes | Other versions are rejected even when the checksum is valid. |
 | Immutable block | Header bytes 5–7: `01 00 00` | yes | yes | Identity is SHA-256 of `pos3ql:block:v1\0`, the one-byte block type, then payload; the LSN is provenance, excluded from identity. |
 | Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
 | Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process's writer token. |
@@ -87,7 +87,7 @@ Do not keep a decoder or add a conversion solely for an older pos3ql version.
 ### Journal records
 
 Framing is 24 bytes: CRC32C, payload length and LSN in bytes 0–15; byte 16 is
-the operation kind; byte 17 is the version (`30`); bytes 18–23 are zero.
+the operation kind; byte 17 is the version (`32`); bytes 18–23 are zero.
 Field-width changes use new kind bytes. Kinds with special rules:
 
 | Kind | Meaning | Rule |
@@ -97,7 +97,7 @@ Field-width changes use new kind bytes. Kinds with special rules:
 | 141 | Trigger create | Current; requires the ten-byte position prefix. Kind 55 remains readable. |
 | 142 | Routine create | Current; 16-bit result counts. Kind 45 remains readable. |
 | 143 | Composite create | Current. Kind 58 remains readable. |
-| 144/145 | View create / view columns | Current; 16-bit column count. Each column's name is followed by its type (four-byte type OID, two-byte length, four-byte modifier, four-byte collation code), then its default and the default's four-byte `pg_attrdef` stamp. Kinds 5/126, whose columns have no types, are rejected. |
+| 144/145 | View create / view columns | Current; 16-bit column count. Each column's name is followed by its type (four-byte type OID, two-byte length, four-byte modifier, four-byte collation code), then its default and the default's four-byte `pg_attrdef` stamp. Kinds 5/126, whose columns have no types, are rejected. A view create ends with its options, which view-option changes (kind 127) carry alone: security, barrier and check-option codes, a query-origin byte (0 `CREATE VIEW`, 1 `CREATE OR REPLACE RULE "_RETURN"`), then the `reloptions` list (order code, then each listed option's written value: length and eight padded bytes). An order that disagrees with the codes is rejected. |
 | 148 | Composite rename or schema move | Prior name, prior schema, new schema, new name. Preserves current fields. |
 | 149 | Enum create | Current. Kinds 23 and 147 are rejected. |
 | 150 | Extended statistics ANALYZE | Current. Kind 77 enum-dependent hash summaries are retired; counts stay valid. |
@@ -112,6 +112,7 @@ Field-width changes use new kind bytes. Kinds with special rules:
 | 159 | Built-in routine attributes | Four-byte database identifier, four-byte built-in routine OID, then strict, volatility, parallel, security-definer and leakproof bytes, cost and rows as IEEE-754 bits, a settings count (at most 16) and each `SET` setting's name and value, each after a one-byte length. Owner and privileges use the object owner and ACL kinds with the routine OID. |
 | 160 | Trigger alteration | Ten-byte position, prior name, target kind, table schema and name, new name, enabled mode, then the complete `WHEN` condition (two-byte length plus one, zero when absent). Kind 57, without the condition, is rejected. |
 | 161 | Index alteration | Schema, index name and mutable settings, then the complete key expressions (four-byte presence mask over the 32 key positions; each present expression as a two-byte length and text) and predicate (flag byte, then two-byte length and text). Kind 71, without the expressions, is rejected. |
+| 171 | Foreign-data wrapper | Slot, creation stamp, owner, presence byte, then name, the handler's and validator's four-byte `pg_proc` OIDs (0 for none) and the options. Kind 115, with one postgres_fdw flag byte each, is rejected. |
 
 Other payload rules:
 
@@ -120,15 +121,23 @@ Other payload rules:
   another partition. Other bits are rejected. Recovery and restored prepared
   transactions keep the move flag, so a statement that waited for the row
   fails with PostgreSQL's `40001` instead of skipping it.
-- **Table definition payload** is version 18: version byte, ten-byte catalog
-  position, name, then the definition. Other versions are rejected. After its
-  validation code, each foreign key stores four one-byte `tgenabled` codes
-  (`O`, `R`, `A`, `D`) for its delete-action, update-action, insert-check and
-  update-check RI triggers, then a one-byte count and the two-byte column
-  positions its `ON DELETE SET NULL (...)` or `SET DEFAULT (...)` list
-  changes (PostgreSQL's `confdelsetcols`; zero means every key column). The
-  manifest's `fkey` line carries the same four codes, count and positions
-  after the validation code.
+- **Table definition payload** is version 21: version byte, ten-byte catalog
+  position, name, then the definition. Other versions are rejected. Each
+  column carries a generation-kind byte after its NOT NULL inheritance byte
+  (0, or the `attgenerated` code `s` or `v`), which must agree with the
+  generated flag. After its validation code, each foreign key stores four
+  one-byte `tgenabled` codes (`O`, `R`, `A`, `D`) for its delete-action,
+  update-action, insert-check and update-check RI triggers, then a one-byte
+  count and the two-byte column positions its `ON DELETE SET NULL (...)` or
+  `SET DEFAULT (...)` list changes (PostgreSQL's `confdelsetcols`; zero means
+  every key column). The manifest's `fkey` line carries the same four codes,
+  count and positions after the validation code. Each exclusion constraint
+  element is a tag byte, `0` with a two-byte column position or `1` with a
+  two-byte length and that many bytes of canonical UTF-8 expression text,
+  then the four-byte operator OID. An unknown tag, invalid UTF-8, a span past
+  the record or more than 256 bytes of expression text in one constraint is
+  rejected. The definition ends with its
+  [expression dependencies](#expression-dependencies).
 - **Domain payload** uses marker 251; earlier layouts are rejected. A mandatory
   checked-default input section follows the constraint identities (an empty
   section is explicit).
@@ -166,21 +175,26 @@ inserts a missing writer.
 | Record | Contents and rules |
 |---|---|
 | `table2` | Slot, creation stamp, hexadecimal checked-input image, name. Internal large-object page table keeps its reserved slot and stamp zero. |
-| `sq7`, `rtn2` | Sequence / routine slot and creation stamp. |
+| `sq7`, `rtn2` | Sequence / routine slot and creation stamp. A routine's language code is 0 (SQL), 1 (PL/pgSQL), 2 (internal aggregate) or 16 plus a native routine code for a `LANGUAGE C` routine bound to built-in postgres_fdw code (0 handler, 1 validator, 2 and 3 `get_connections` 1.1 and 1.2, 4 `disconnect`, 5 `disconnect_all`). Such a handler's `fdw_handler` result persists as type code 250. |
+| `fdw2` | Foreign-data wrapper slot, creation stamp, owner, handler and validator `pg_proc` OIDs (0 for none), name and options. The earlier `fdw` record, with 0/1 flags, is rejected. |
+| `xpk`, `xsc` | Available extension packages and their version scripts, numbered after the packages built into the binary (`$system`'s postgres_fdw), which are never persisted. |
 | `mv6` | Materialized-view catalog position and backing-table position. |
-| `vw14` | View position and stamp, return-rule position and stamp, encoded query, then each column by ordinal: name, checked default, `pg_attrdef` stamp (zero without a default), type OID, type length, type modifier and collation code. |
+| `vw16` | View position and stamp, return-rule position and stamp, encoded query, schema, search path, name, then the security, barrier, check-option and query-origin codes (query origin: 0 `CREATE VIEW`, 1 `CREATE OR REPLACE RULE "_RETURN"`; it decides whether `pg_get_viewdef` qualifies columns), the `reloptions` list as hexadecimal (order code, then each option's written value: length and eight padded bytes), then each column by ordinal: name, checked default, `pg_attrdef` stamp (zero without a default), type OID, type length, type modifier and collation code. |
 | `hidx <table-slot> <0-or-1>` | Required once per table, including tables without indexes. The large-object page table requires `0`. |
-| `col4` | Hexadecimal column name and NOT NULL constraint name (empty when nullable). Extra fields are rejected. |
+| `col5` | Type, flags, then the generation kind, the field `col5` adds (0, or `pg_attribute.attgenerated`'s `s` or `v` code), then the remaining column fields; hexadecimal column name and NOT NULL constraint name (empty when nullable). Extra fields are rejected. |
+| `xdep <hex>` | One [expression dependency](#expression-dependencies) of the preceding table, in its journal encoding; at most 64 per table. Index owners are rejected. |
 | `attributes2` | Entry count and each attribute entry as sixteen hex digits. |
 | `implicit_index POSITION CREATED_AT` | Constraint-created index identities, including the current TOAST index. |
 | `inline_key_name ATTRIBUTE HEX_NAME` | One per active inline primary or unique key. |
 | `constraint_identity POSITION CREATED_AT` | Table constraint identities in the [canonical order](#constraints-and-keys). |
 | `ukey` | Starts with the unique-key mode tag. |
+| `excl3` | Timing, method and element count, then per element `c COLUMN` or `e HEX_EXPRESSION` followed by the operator OID, then the hexadecimal name and predicate (`-` for none). Other element tags, over-long expression text and the earlier `excl2` record are rejected. |
 | `dom7`, `enm3`, `cmp2` | Domain, enum and composite types; written before the required `types_end`. Later type records or a missing/duplicate `types_end` are rejected. |
 | `nsp` | Creation stamp, database-owner flag (`0`/`1`), hexadecimal name. Stamp zero is an initial public schema. |
 | `pub` | Creation stamp after the owner, before the flags. |
 | `pacl` | Parameter permissions; an empty row differs from removal. |
 | `brtn` | Built-in routine attributes in the preceding `dbctx` database: OID, five attribute codes, cost and rows bits, then the journal record's settings bytes in hex (at most 6,180 characters). `own` and `acl` records for class 20 name the routine OID. |
+| `idx` | Index definition; a trailing `xd <count> <hex>...` lists its [expression dependencies](#expression-dependencies) (1–16), omitted when it has none. Table owners are rejected. |
 | `ptx` | Prepared transaction; owner as decimal role identifier. |
 | `rol` | Role identifier, catalog slot, encoded name and attributes. Never written for the predefined roles, which are bootstrap facts. |
 | `rmem` | Position, stamp, role/member/grantor identifiers, option flags. Every live membership is listed, so restoring a manifest first removes the initdb memberships a fresh catalog starts with. |
@@ -358,7 +372,7 @@ detached partition CHECKs, and domain CHECK and NOT NULL constraints each have a
 creation identity. Renames preserve it; replacing a backing index changes
 `conindid` but not the constraint identifier, comments or dependencies.
 
-Table payload v18 and domain marker 251 append one four-byte little-endian
+Table payload v21 and domain marker 251 append one four-byte little-endian
 identity per constraint and column default. Table order: CHECKs, foreign keys,
 live attributes by stable attribute number (NOT NULL, then the default or
 generation expression, each when present), detached partition CHECK, named
@@ -371,11 +385,29 @@ the saved counter, or shared by distinct tables or domains in one database.
 | Rule | Format |
 |---|---|
 | Per-kind capacity | 64 table constraints per kind, 64 domain checks; journal counts are bytes; the 65th returns `54000` |
-| Unique-key mode | Tag `0` NULLs distinct, `1` primary key, `2` `NULLS NOT DISTINCT`; other tags rejected. v18 stores tag, key-column count and timing as three bytes before positions |
+| Unique-key mode | Tag `0` NULLs distinct, `1` primary key, `2` `NULLS NOT DISTINCT`; other tags rejected. v21 stores tag, key-column count and timing as three bytes before positions |
 | Constraint-created indexes | Own stamp; stored beside stable attribute numbers within the 512-byte column metadata bound |
-| Inline key names | Chosen once at admission (63-byte limit, no split UTF-8, collision suffix); v18 stores two-byte attribute number plus bounded name per key |
+| Inline key names | Chosen once at admission (63-byte limit, no split UTF-8, collision suffix); v21 stores two-byte attribute number plus bounded name per key |
 | NOT NULL names | Stored for columns and domains; renaming `orders` keeps `orders_id_not_null` |
 | Deferred uniqueness | Stored; every current index-option section is required |
+
+### Expression dependencies
+
+The objects a CHECK constraint, column default or generation expression, or
+index key or predicate was bound to when written. Table payloads append a
+one-byte count and the entries after the constraint identities; index journal
+records append marker `0xa7`, a one-byte count and the entries after the
+definition. Each entry:
+
+| Field | Encoding |
+|---|---|
+| Owner | `1` CHECK constraint, `2` column (each followed by a length-prefixed name), `3` index key (followed by its one-byte position), `4` index predicate |
+| Class | One byte, as in stored-query dependencies |
+| Identity | Length-prefixed key as stored-query dependencies write it (routine, operator and text search configuration OIDs, type and collation identities) |
+| Names | Four length-prefixed names: current schema and name, then the spelling the expression used |
+
+An entry is at most 512 bytes; the slot is bound again on use. Unknown owner
+codes, classes or identity keys are rejected.
 
 ### Indexes
 

@@ -90253,10 +90253,16 @@ fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
     ));
     assert_eq!(rows, ["5|10|1|20|{1,2}|10|ready"]);
 
-    let rejected = run_with(&mut engine, &mut budget, "COPY copy_defaults FROM STDIN");
+    // COPY reads no generated column: the default list leaves it out, and
+    // naming one fails at setup, as in PostgreSQL.
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY copy_defaults (input, doubled) FROM STDIN",
+    );
     assert!(
-        String::from_utf8_lossy(&rejected).contains("428C9"),
-        "COPY targeting a generated column must fail at setup"
+        String::from_utf8_lossy(&rejected).contains("column \"doubled\" is a generated column"),
+        "COPY naming a generated column must fail at setup"
     );
 }
 

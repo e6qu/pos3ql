@@ -185,18 +185,6 @@ pub(super) fn validate_generated_refs<Definition0: crate::storage::DefinitionBac
         if let Some(e) = offending {
             return Err(e);
         }
-        // A cast or operator PostgreSQL marks stable (`a::text::regclass`)
-        // makes the expression depend on more than the row.
-        if crate::sql::planner_inputs::inline::index_expression_is_mutable(
-            expression, &columns, storage, txid, arena,
-        )?
-        .unwrap_or(false)
-        {
-            return Err(sql_err!(
-                sqlstate::INVALID_OBJECT_DEFINITION,
-                "generation expression is not immutable"
-            ));
-        }
         if c.default.is_virtual() && user_type(source_oid).is_some() {
             return Err(crate::sql::error_position::with_detail(
                 sql_err!(
@@ -219,6 +207,19 @@ pub(super) fn validate_generated_refs<Definition0: crate::storage::DefinitionBac
                     crate::sql::catalog::format_type_name(storage, txid, source_oid)?.as_str()
                 ),
                 "You will need to rewrite or cast the expression.",
+            ));
+        }
+        // A cast or operator PostgreSQL marks stable (`a::text::regclass`)
+        // makes the expression depend on more than the row; PostgreSQL checks
+        // this after the expression's type.
+        if crate::sql::planner_inputs::inline::index_expression_is_mutable(
+            expression, &columns, storage, txid, arena,
+        )?
+        .unwrap_or(false)
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "generation expression is not immutable"
             ));
         }
     }

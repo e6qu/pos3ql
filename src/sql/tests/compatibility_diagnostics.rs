@@ -1805,7 +1805,8 @@ fn missing_columns_suggest_spellings_and_virtual_columns_follow_postgresql() {
         run_with(
             engine,
             budget,
-            "CREATE TABLE t (abc int, xyz text, abe int); CREATE TABLE u (abc int, qqq int)",
+            "CREATE TABLE t (abc int, xyz text, abe int); CREATE TABLE u (abc int, qqq int); \
+             CREATE TABLE vg (a int, b int GENERATED ALWAYS AS (a + 1))",
         );
         for (sql, expected) in [
             (
@@ -1837,8 +1838,7 @@ fn missing_columns_suggest_spellings_and_virtual_columns_follow_postgresql() {
                 "ERROR 0A000 unique constraints on virtual generated columns are not supported",
             ),
             (
-                "CREATE TABLE v (a int, b int GENERATED ALWAYS AS (a + 1)); \
-                 CREATE INDEX ON v (b)",
+                "CREATE INDEX ON vg (b)",
                 "ERROR 0A000 indexes on virtual generated columns are not supported",
             ),
         ] {

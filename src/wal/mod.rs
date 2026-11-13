@@ -15823,6 +15823,32 @@ mod tests {
     }
 
     #[test]
+    fn table_payload_keeps_each_generated_column_kind() {
+        let mut definition = sample_def();
+        definition.columns[1].default = ColumnDefault::Generated {
+            expression: StackStr::from_str("upper(id::text)"),
+            kind: crate::storage::Generation::Virtual,
+        };
+        let mut budget = Budget::new(8192);
+        let mut payload = FixedBuf::new(&mut budget, "generated table payload", 4096).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(append_payload(
+                &mut payload,
+                &WalOp::CreateTable {
+                    identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
+                    definition: (&definition).into(),
+                }
+            ));
+            let (_, decoded, _) = decode_table_payload(payload.readable()).unwrap();
+            assert_eq!(
+                decoded.columns[1].default.generation(),
+                Some(crate::storage::Generation::Virtual)
+            );
+            assert_eq!(decoded.columns[0].default.generation(), None);
+        });
+    }
+
+    #[test]
     fn table_payload_rejects_versions_with_the_removed_increment_cache() {
         let definition = sample_def();
         let mut budget = Budget::new(8192);
@@ -15836,9 +15862,9 @@ mod tests {
                     definition: (&definition).into(),
                 }
             ));
-            assert_eq!(current.readable()[0], 17);
+            assert_eq!(current.readable()[0], 18);
             assert!(decode_table_payload(current.readable()).is_some());
-            for version in (0..17).chain(core::iter::once(u8::MAX)) {
+            for version in (0..18).chain(core::iter::once(u8::MAX)) {
                 incompatible.clear();
                 assert!(incompatible.append(&[version]));
                 assert!(incompatible.append(&current.readable()[1..]));

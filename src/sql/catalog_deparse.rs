@@ -1456,6 +1456,10 @@ fn plain_table<'r>(
 /// are reported as unsupported. A stored view's relations, routines and types
 /// are bound to the identities they captured at CREATE and printed under
 /// their current names.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a view's query, captured names, columns and layout are explicit"
+)]
 pub(crate) fn view_definition<'a>(
     storage: &Storage,
     txid: u32,

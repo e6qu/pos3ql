@@ -9575,9 +9575,11 @@ fn visit_indexes(
                   is_primary: bool,
                   is_unique: bool,
                   constraint_identity: Option<crate::storage::ConstraintIdentity>,
-                  is_exclusion: bool,
+                  exclusion_method: Option<crate::sql::ast::IndexAccessMethod>,
                   timing: crate::storage::ConstraintTiming,
                   name: StackStr<64>| {
+            let is_exclusion = exclusion_method.is_some();
+            let method = exclusion_method.unwrap_or(crate::sql::ast::IndexAccessMethod::Btree);
             let mut c = [0u16; crate::storage::MAX_INDEX_COLS];
             c[..columns.len()].copy_from_slice(columns);
             let mut included = [0u16; crate::storage::MAX_INDEX_COLS];
@@ -9588,13 +9590,17 @@ fn visit_indexes(
                 if !expression_keys[position] {
                     let column = &def.columns()[usize::from(column)];
                     collations[position] = column.collation;
-                    resolved_operator_classes[position] = if is_exclusion {
-                        crate::sql::types::GistOperatorClass::for_type(column.ctype)
-                            .map(crate::storage::IndexOperatorClass::Gist)
-                    } else {
-                        crate::sql::types::BtreeOperatorClass::for_type(column.ctype)
-                            .map(crate::storage::IndexOperatorClass::Btree)
-                    };
+                    resolved_operator_classes[position] = storage
+                        .resolve_index_operator_class(
+                            None,
+                            crate::storage::RoutineResult {
+                                ctype: column.ctype,
+                                user_type: column.user_type,
+                            },
+                            method,
+                            txid,
+                        )
+                        .ok();
                 }
             }
             let mut info = IdxInfo {
@@ -9610,11 +9616,7 @@ fn visit_indexes(
                 } else {
                     crate::storage::IndexKind::Ordinary
                 },
-                method: if is_exclusion {
-                    crate::sql::ast::IndexAccessMethod::Gist
-                } else {
-                    crate::sql::ast::IndexAccessMethod::Btree
-                },
+                method,
                 columns: c,
                 expression_keys,
                 include_columns: included,
@@ -9682,7 +9684,7 @@ fn visit_indexes(
                         def.column_constraint_identity(ci)
                             .expect("admitted inline key has a constraint identity"),
                     ),
-                    false,
+                    None,
                     crate::storage::ConstraintTiming::NotDeferrable,
                     name,
                 ));
@@ -9709,7 +9711,7 @@ fn visit_indexes(
                         def.column_constraint_identity(ci)
                             .expect("admitted inline key has a constraint identity"),
                     ),
-                    false,
+                    None,
                     crate::storage::ConstraintTiming::NotDeferrable,
                     name,
                 ));
@@ -9745,7 +9747,7 @@ fn visit_indexes(
                     uk.identity
                         .expect("admitted unique key has a constraint identity"),
                 ),
-                false,
+                None,
                 uk.timing,
                 stack_str_64(uk.name.as_str()),
             ));
@@ -9782,7 +9784,7 @@ fn visit_indexes(
                         .identity
                         .expect("admitted exclusion has a constraint identity"),
                 ),
-                true,
+                Some(exclusion.method),
                 exclusion.timing,
                 stack_str_64(exclusion.name.as_str()),
             ));
@@ -9838,7 +9840,7 @@ fn visit_indexes(
                     || inline.is_some_and(|column| def.columns()[column].primary),
                 index.unique,
                 constraint_identity,
-                attached_exclusion.is_some(),
+                attached_exclusion.map(|key| key.method),
                 attached
                     .map(|key| key.timing)
                     .or_else(|| attached_exclusion.map(|key| key.timing))
@@ -15186,6 +15188,51 @@ pub(crate) fn domain_root_type_oid(storage: &Storage, txid: u32, type_oid: i32) 
     current
 }
 
+/// A built-in operator class's family and input type.
+pub(crate) fn builtin_operator_class_family(oid: i32) -> Option<(i32, i32)> {
+    if let Some(class) = BUILTIN_TREE_HASH_CLASSES
+        .iter()
+        .find(|class| class.0 == oid)
+    {
+        return Some((class.3, class.4));
+    }
+    if let Some(class) = super::types::BrinOperatorClass::from_oid(oid) {
+        return Some((class.family_oid(), class.input_oid()));
+    }
+    if let Some(class) = super::types::GistOperatorClass::from_oid(oid) {
+        return Some((class.family_oid(), class.input_oid()));
+    }
+    if let Some(class) = super::types::GinOperatorClass::from_oid(oid) {
+        return Some((class.family_oid(), class.input_oid()));
+    }
+    super::types::SpGistOperatorClass::from_oid(oid)
+        .map(|class| (class.family_oid(), class.input_oid()))
+}
+
+/// A built-in binary operator's name, left and right operand types and
+/// commutator.
+pub(crate) fn builtin_binary_operator_row(oid: i32) -> Option<(&'static str, i32, i32, i32)> {
+    let rows = &super::catalog_operator_rows::OPERATOR_ROWS;
+    let row = rows[rows.binary_search_by_key(&oid, |row| row.0).ok()?];
+    (row.2 == b'b').then_some((row.1, row.5, row.6, row.8))
+}
+
+/// The built-in binary operator `name(left, right)`.
+pub(crate) fn builtin_binary_operator(name: &str, left: i32, right: i32) -> Option<i32> {
+    super::catalog_operator_rows::OPERATOR_ROWS
+        .iter()
+        .find(|row| row.2 == b'b' && row.1 == name && row.5 == left && row.6 == right)
+        .map(|row| row.0)
+}
+
+/// Whether built-in operator family `family` of access method `method`
+/// has operator `operator` as a search member (`pg_amop`).
+pub(crate) fn builtin_family_has_operator(family: i32, method: i32, operator: i32) -> bool {
+    access_method_members::OPERATORS
+        .iter()
+        .any(|row| row.1 == family && row.5 == "s" && row.6 == operator && row.7 == method)
+}
+
 /// `pg_type.typbasetype` of a domain: its parent domain or its base type.
 fn domain_base_oid(storage: &Storage, domain: &crate::storage::DomainDef, txid: u32) -> i32 {
     match domain.base_domain {
@@ -15407,7 +15454,7 @@ pub fn constraint_def_text<'a>(
                 .iter()
                 .find(|exclusion| exclusion.name.as_str() == info.name.as_str())
                 .expect("exclusion index has its constraint");
-            let _ = rendered.write_str("EXCLUDE USING gist (");
+            let _ = write!(rendered, "EXCLUDE USING {} (", exclusion.method.name());
             for position in 0..exclusion.n_cols {
                 if position != 0 {
                     let _ = rendered.write_str(", ");
@@ -16094,15 +16141,7 @@ pub fn index_def_text<'a>(
         let visible = matches!(storage.resolve_relation(None, def.name.as_str(), txid),
             Some(crate::storage::ResolvedRelation::Table(slot)) if slot == info.table_slot);
         write_index_target(&mut s, &def, info, !pretty || !visible);
-        let _ = write!(
-            s,
-            " USING {} (",
-            if info.is_exclusion {
-                "gist"
-            } else {
-                info.method.name()
-            }
-        );
+        let _ = write!(s, " USING {} (", info.method.name());
         for k in 0..info.n_cols {
             if k > 0 {
                 let _ = s.write_str(", ");
@@ -19605,7 +19644,6 @@ fn pg_class<'a>(
                     crate::sql::ast::IndexAccessMethod::Brin => 3580,
                     crate::sql::ast::IndexAccessMethod::Gin => 2742,
                     crate::sql::ast::IndexAccessMethod::SpGist => 4000,
-                    crate::sql::ast::IndexAccessMethod::Btree if info.is_exclusion => 783,
                     crate::sql::ast::IndexAccessMethod::Btree => 403,
                 }),
                 Datum::Int4(storage.role_oid(usize::from(info.owner))),
@@ -21264,11 +21302,7 @@ fn exclusion_operator_array<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     let mut values = [Datum::Null; crate::storage::MAX_INDEX_COLS];
     for (index, operator) in operators.iter().copied().enumerate() {
-        values[index] = Datum::Int4(match operator {
-            crate::storage::ExclusionOperator::Equal => 3882,
-            crate::storage::ExclusionOperator::Overlaps => 3888,
-            crate::storage::ExclusionOperator::Adjacent => 3897,
-        });
+        values[index] = Datum::Int4(operator.oid());
     }
     Ok(Datum::Array {
         element: super::types::ArrElem::Int4,
@@ -21595,7 +21629,7 @@ fn oidvector<'a>(oids: &[i32], arena: &'a Arena) -> Result<Datum<'a>, SqlError> 
     })
 }
 
-fn catalog_column_type_oid(
+pub(crate) fn catalog_column_type_oid(
     storage: &Storage,
     column: &ColumnMeta,
     txid: u32,

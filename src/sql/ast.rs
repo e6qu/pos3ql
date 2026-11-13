@@ -2767,6 +2767,18 @@ impl IndexAccessMethod {
         }
     }
 
+    /// `pg_am.oid`.
+    pub const fn oid(self) -> i32 {
+        match self {
+            Self::Btree => 403,
+            Self::Hash => 405,
+            Self::Brin => 3580,
+            Self::Gist => 783,
+            Self::Gin => 2742,
+            Self::SpGist => 4000,
+        }
+    }
+
     pub const fn name(self) -> &'static str {
         match self {
             Self::Btree => "btree",
@@ -4280,7 +4292,11 @@ pub enum TableConstraint<'a> {
         source_position: SourcePosition,
         name: Option<&'a str>,
         columns: &'a [&'a str],
-        operators: &'a [ExclusionOperator],
+        /// The access method enforcing the constraint (`USING`, B-tree by
+        /// default).
+        method: IndexAccessMethod,
+        /// Each element's operator as written.
+        operators: &'a [&'a str],
         predicate: Option<&'a Expr<'a>>,
         predicate_text: Option<&'a str>,
         timing: ConstraintTiming,
@@ -4307,13 +4323,6 @@ impl TableConstraint<'_> {
             } => *source_position,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExclusionOperator {
-    Equal,
-    Overlaps,
-    Adjacent,
 }
 
 /// The transaction-local check mode selected by a constraint definition or

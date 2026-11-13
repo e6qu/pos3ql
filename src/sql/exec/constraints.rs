@@ -2670,15 +2670,7 @@ fn enforce_exclusion_constraint(
                 if values[column].is_null() || other[column].is_null() {
                     return Ok(false);
                 }
-                let operator = match exclusion.operators[position] {
-                    crate::storage::ExclusionOperator::Equal => crate::sql::ast::BinaryOp::Eq,
-                    crate::storage::ExclusionOperator::Overlaps => {
-                        crate::sql::ast::BinaryOp::Overlaps
-                    }
-                    crate::storage::ExclusionOperator::Adjacent => {
-                        crate::sql::ast::BinaryOp::Adjacent
-                    }
-                };
+                let operator = exclusion.operators[position].binary();
                 if !crate::sql::eval::exclusion_operator(
                     operator,
                     values[column],

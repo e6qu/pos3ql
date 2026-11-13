@@ -1226,8 +1226,8 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
     for exclusion in def.exclusions() {
         n += 1
             + exclusion.name.as_str().len()
-            + 2
-            + exclusion.n_cols * 3
+            + 3
+            + exclusion.n_cols * 6
             + 2
             + exclusion
                 .predicate
@@ -1374,10 +1374,14 @@ fn append_table_payload<B: DefinitionBacking>(
     ok &= buffer.append(&[def.n_exclusions as u8]);
     for exclusion in def.exclusions() {
         ok &= name_bytes(buffer, exclusion.name.as_str());
-        ok &= buffer.append(&[exclusion.n_cols as u8, exclusion.timing.code()]);
+        ok &= buffer.append(&[
+            exclusion.n_cols as u8,
+            exclusion.timing.code(),
+            exclusion.method.code(),
+        ]);
         for position in 0..exclusion.n_cols {
             ok &= buffer.append(&exclusion.columns[position].to_le_bytes());
-            ok &= buffer.append(&[exclusion.operators[position].code()]);
+            ok &= buffer.append(&exclusion.operators[position].oid().to_le_bytes());
         }
         let predicate = exclusion.predicate.as_ref().map(|value| value.as_str());
         ok &=
@@ -8540,20 +8544,22 @@ fn decode_op_inner<'a>(
             for slot in &mut def.exclusions[..n_exclusions] {
                 let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
                 exclusion.name = SqlName::parse(take_name(&mut at)?).ok()?;
-                let meta = payload.get(at..at + 2)?;
-                at += 2;
+                let meta = payload.get(at..at + 3)?;
+                at += 3;
                 exclusion.n_cols = meta[0] as usize;
                 if exclusion.n_cols == 0 || exclusion.n_cols > MAX_INDEX_COLS {
                     return None;
                 }
                 exclusion.timing = crate::storage::ConstraintTiming::from_code(meta[1])?;
+                exclusion.method = crate::sql::ast::IndexAccessMethod::from_code(meta[2])?;
                 for position in 0..exclusion.n_cols {
                     exclusion.columns[position] =
                         u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
                     at += 2;
-                    exclusion.operators[position] =
-                        crate::storage::ExclusionOperator::from_code(*payload.get(at)?)?;
-                    at += 1;
+                    exclusion.operators[position] = crate::storage::ExclusionOperator::from_oid(
+                        i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?),
+                    )?;
+                    at += 4;
                 }
                 let predicate_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
                 at += 2;
@@ -15464,7 +15470,7 @@ mod tests {
         let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
         exclusion.name = SqlName::parse("t_id_excl").unwrap();
         exclusion.columns[0] = 0;
-        exclusion.operators[0] = crate::storage::ExclusionOperator::Adjacent;
+        exclusion.operators[0] = crate::storage::ExclusionOperator::from_oid(3897).unwrap();
         exclusion.n_cols = 1;
         exclusion.predicate = Some(crate::util::StackStr::from_str("id > 0"));
         exclusion.timing = crate::storage::ConstraintTiming::DeferrableDeferred;
@@ -15939,7 +15945,7 @@ mod tests {
                     .map(|predicate| predicate.as_str()),
             ),
             (
-                crate::storage::ExclusionOperator::Adjacent,
+                crate::storage::ExclusionOperator::from_oid(3897).unwrap(),
                 crate::storage::ConstraintTiming::DeferrableDeferred,
                 Some("id > 0"),
             )

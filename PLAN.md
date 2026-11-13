@@ -224,7 +224,7 @@ is owned.
     subquery that runs once per statement and shares its slot across outer
     rows (`(SELECT x + (SELECT nextval('s')) ...)` per row); correlated
     scalar subqueries bound once per statement; aggregates of a scalar
-    subquery (`sum((SELECT v FROM u LIMIT 1))`, which fails with `42725`) and
+    subquery (`sum((SELECT v FROM u LIMIT 1))`) and
     held running aggregate values that do not keep each row's scratch; and
     outer references through a subquery's `LIMIT` or `OFFSET` (`ARRAY(SELECT
     w ... LIMIT t.id)`, `(SELECT array_agg(w) ... OFFSET t.id - 1)`),
@@ -460,14 +460,7 @@ or a set operation, whose outer references fail as missing FROM-clause
 entries; a `UNION` subquery reading an outer column fails the same way, and a
 correlated `LIMIT` or `JOIN ... ON` inside a subquery cannot read an outer
 column. A subquery reading an aggregate of a query that also has window
-functions fails with `0A000`. An aggregate whose argument is a scalar subquery
-(`SELECT sum((SELECT v FROM u LIMIT 1)) FROM t`) fails with `42725`
-(`function sum is not unique`), and `CREATE VIEW` over a query with a
-correlated scalar subquery fails with `XX000` (`column dependency has no
-owning relation dependency`). An aggregate of an `UPDATE` or `DELETE`
-target in a subquery of its `WHERE` (`UPDATE t SET v = 2 WHERE (SELECT
-max(t.v) FROM u) > 0`) is not rejected with PostgreSQL's `aggregate functions
-are not allowed in WHERE`. A SQL function whose earlier
+functions fails with `0A000`. A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final
@@ -505,10 +498,9 @@ partition's `UNIQUE` or `PRIMARY KEY` constraint cannot be attached to
 its parent's plain unique index, so attaching such a partition builds a
 separate copy where PostgreSQL reuses the constraint's index; constraint
 indexes need a durable link to a parent index first.
-An exclusion constraint accepts only range columns
-with `=`, `&&` and `-|-`: one over a B-tree index fails with `42601`, and one
-over `box` (`EXCLUDE USING gist (b WITH &&)`) with `42704`; the stored
-constraint needs its index method and operator OIDs first. A
+An exclusion constraint element must be a column: an expression
+(`EXCLUDE USING gist (int4range(a, b) WITH &&)`) fails with `0A000`, since
+the stored constraint keeps no element expressions. A
 statement's scans read catalog changes that routines it called made earlier in
 the same statement: `SELECT mk(g), (SELECT count(*) FROM pg_class WHERE
 relname LIKE 'made_%') FROM generate_series(1, 3) g`, where `mk` creates a

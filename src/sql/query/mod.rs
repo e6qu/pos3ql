@@ -15995,6 +15995,94 @@ fn detached_join_values<'a, 'r>(
 }
 
 /// The FROM item for a DML target, which includes inheritance descendants.
+/// PostgreSQL's analysis errors for aggregates in an `INSERT`, `UPDATE` or
+/// `DELETE`: none of the statement's own level may appear in its `VALUES`,
+/// `WHERE`, `RETURNING` or `SET` clauses, checked in PostgreSQL's order.
+pub(crate) fn check_data_modification_aggregates<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    statement: &Stmt<'a>,
+) -> Result<(), SqlError> {
+    let mut values: &[&[&Expr<'a>]] = &[];
+    let (table, alias, extra, where_clause, returning, assignments) = match statement {
+        Stmt::Insert(insert) => {
+            values = insert.rows;
+            (
+                insert.table,
+                insert.alias,
+                None,
+                None,
+                insert.returning,
+                &[][..],
+            )
+        }
+        Stmt::Update(update) => (
+            update.table,
+            update.alias,
+            update.from,
+            update.where_clause,
+            update.returning,
+            update.assignments,
+        ),
+        Stmt::Delete(delete) => (
+            delete.table,
+            delete.alias,
+            delete.using,
+            delete.where_clause,
+            delete.returning,
+            &[][..],
+        ),
+        _ => return Ok(()),
+    };
+    let mut clauses = ArenaList::new(arena);
+    let mut push =
+        |clause, expression| clauses.push((clause, expression)).map_err(|_| arena_full());
+    for &expression in values.iter().flat_map(|row| row.iter()) {
+        push(Some("VALUES"), expression)?;
+    }
+    if let Some(expression) = where_clause {
+        push(None, expression)?;
+    }
+    for item in returning.items {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
+            push(Some("RETURNING"), expression)?;
+        }
+    }
+    for (_, expression) in assignments {
+        push(Some("UPDATE"), expression)?;
+    }
+    if clauses.is_empty() {
+        return Ok(());
+    }
+    let base = dml_target_ref(table, alias);
+    let joins = match extra {
+        None => &[][..],
+        Some(extra) => &*arena
+            .alloc_slice_with(extra.joins.len() + 1, |index| match index {
+                0 => crate::sql::ast::Join {
+                    table: extra.base,
+                    kind: crate::sql::ast::JoinKind::Comma,
+                    on: None,
+                    using: None,
+                    natural: false,
+                },
+                _ => extra.joins[index - 1],
+            })
+            .map_err(|_| arena_full())?,
+    };
+    let from = arena
+        .alloc(FromClause { base, joins })
+        .map_err(|_| arena_full())?;
+    aggregate_levels::check_data_modification_aggregates(
+        storage,
+        txid,
+        arena,
+        from,
+        clauses.as_slice(),
+    )
+}
+
 pub(crate) fn dml_target_ref<'a>(target: QualName<'a>, alias: Option<&'a str>) -> TableRef<'a> {
     TableRef {
         schema: target.schema,

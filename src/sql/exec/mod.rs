@@ -4081,7 +4081,7 @@ fn validate_partitioned_unique_keys<Definition0: crate::storage::DefinitionBacki
                 .iter()
                 .position(|column| column == key)
                 .is_some_and(|position| {
-                    exclusion.operators[position] == crate::storage::ExclusionOperator::Equal
+                    exclusion.operators[position].binary() == crate::sql::ast::BinaryOp::Eq
                 })
         });
         if !includes_equal_partition_keys {
@@ -80062,6 +80062,14 @@ where
     let seq_session = services.seq_session;
     let coercion_txid = txn.txid;
     let value_scope: &'scope dyn ColumnLookup<'a> = transition.unwrap_or(&NO_TRIGGER_DML_COLUMNS);
+    if let Err(error) = super::query::check_data_modification_aggregates(
+        storage,
+        txn.txid,
+        arena,
+        &Stmt::Insert(*statement),
+    ) {
+        return sql_fail(error);
+    }
     if let Err(error) = super::query::validate_dml_assignment_casts(
         &Stmt::Insert(*statement),
         storage,
@@ -81797,6 +81805,14 @@ pub(crate) fn update<'a>(
     ) {
         return sql_fail(error);
     }
+    if let Err(error) = super::query::check_data_modification_aggregates(
+        storage,
+        txn.txid,
+        arena,
+        &Stmt::Update(*statement),
+    ) {
+        return sql_fail(error);
+    }
     let seq_session = services.seq_session;
     let coercion_txid = txn.txid;
     if let Err(error) = super::query::validate_dml_assignment_casts(
@@ -83248,6 +83264,14 @@ pub(crate) fn delete<'a>(
         statement.using,
         statement.alias.unwrap_or(statement.table.name),
         false,
+    ) {
+        return sql_fail(error);
+    }
+    if let Err(error) = super::query::check_data_modification_aggregates(
+        storage,
+        txn.txid,
+        arena,
+        &Stmt::Delete(*statement),
     ) {
         return sql_fail(error);
     }
@@ -85337,11 +85361,7 @@ fn rewritten_key_conflict<Definition0: crate::storage::DefinitionBacking>(
                 conflict = false;
                 break;
             }
-            let operator = match exclusion.operators[position] {
-                crate::storage::ExclusionOperator::Equal => crate::sql::ast::BinaryOp::Eq,
-                crate::storage::ExclusionOperator::Overlaps => crate::sql::ast::BinaryOp::Overlaps,
-                crate::storage::ExclusionOperator::Adjacent => crate::sql::ast::BinaryOp::Adjacent,
-            };
+            let operator = exclusion.operators[position].binary();
             if !super::eval::exclusion_operator(operator, a[column], b[column], arena)? {
                 conflict = false;
                 break;

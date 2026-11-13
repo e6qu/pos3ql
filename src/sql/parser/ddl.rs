@@ -22,20 +22,20 @@ use crate::sql::ast::{
     CreateOperator, CreateOperatorClass, CreateRoutine, CreateRule, CreateSchemaElement,
     CreateStatistics, CreateTextSearchConfiguration, CreateTextSearchDictionary,
     CreateTextSearchParser, CreateTextSearchTemplate, CreateTransform, CreateTrigger, DomainCheck,
-    EventTriggerEvent, ExclusionOperator, Expr, ExtensionMemberIdentity, ExtensionRelationKind,
-    ForeignDataHandler, ForeignDataValidator, ForeignOption, ForeignOptionAction,
-    ForeignSchemaSelection, ForeignUser, ImportForeignSchema, IndexAccessMethod, IndexBuildMode,
-    IndexStorageOptionNames, IndexStorageOptions, IndexTargetScope, OperatorClassMember,
-    OperatorFamilyMember, OperatorFamilyMemberIdentity, OperatorIdentity, OperatorOperands,
-    PartitionBound, PartitionClause, PartitionStrategy, PolicyCommand, PolicyExpression,
-    PolicyIdentity, PolicyPermissiveness, PolicyRole, PublicationDescendants,
-    PublicationOperations, PublicationTarget, RelationPersistence, RelationStorageOptionNames,
-    RelationStorageOptions, RoleOptions, RoutineArgument, RoutineArgumentMode, RoutineArgumentType,
-    RoutineCreateKind, RoutineIdentity, RoutineParallel, RoutineResultColumn, RoutineTargetKind,
-    RuleAction, RuleEvent, RuleMode, SchemaAuthorization, SchemaName, SourcePosition,
-    StatisticsExpression, StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName,
-    StatisticsTarget, SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions,
-    SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
+    EventTriggerEvent, Expr, ExtensionMemberIdentity, ExtensionRelationKind, ForeignDataHandler,
+    ForeignDataValidator, ForeignOption, ForeignOptionAction, ForeignSchemaSelection, ForeignUser,
+    ImportForeignSchema, IndexAccessMethod, IndexBuildMode, IndexStorageOptionNames,
+    IndexStorageOptions, IndexTargetScope, OperatorClassMember, OperatorFamilyMember,
+    OperatorFamilyMemberIdentity, OperatorIdentity, OperatorOperands, PartitionBound,
+    PartitionClause, PartitionStrategy, PolicyCommand, PolicyExpression, PolicyIdentity,
+    PolicyPermissiveness, PolicyRole, PublicationDescendants, PublicationOperations,
+    PublicationTarget, RelationPersistence, RelationStorageOptionNames, RelationStorageOptions,
+    RoleOptions, RoutineArgument, RoutineArgumentMode, RoutineArgumentType, RoutineCreateKind,
+    RoutineIdentity, RoutineParallel, RoutineResultColumn, RoutineTargetKind, RuleAction,
+    RuleEvent, RuleMode, SchemaAuthorization, SchemaName, SourcePosition, StatisticsExpression,
+    StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName, StatisticsTarget,
+    SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions, SubscriptionOrigin,
+    SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
     SubscriptionSynchronousCommit, TableAccessMethod, TableMembership, TablespaceOptionNames,
     TablespaceOptions, TextSearchConfigurationSource, TextSearchObjectKind, TextSearchOption,
     TransformFunction, TriggerEvent, TriggerIdentity, TriggerKind, TriggerTiming,
@@ -5860,34 +5860,7 @@ impl<'a> Parser<'a> {
         };
         let table = self.qual_name("table name")?;
         let method = if self.eat_ident("using")? {
-            let method = self.any_ident("index access method")?;
-            if method.eq_ignore_ascii_case("btree") {
-                IndexAccessMethod::Btree
-            } else if method.eq_ignore_ascii_case("hash") {
-                IndexAccessMethod::Hash
-            } else if method.eq_ignore_ascii_case("brin") {
-                IndexAccessMethod::Brin
-            } else if method.eq_ignore_ascii_case("gist") {
-                IndexAccessMethod::Gist
-            } else if method.eq_ignore_ascii_case("gin") {
-                IndexAccessMethod::Gin
-            } else if method.eq_ignore_ascii_case("spgist") {
-                IndexAccessMethod::SpGist
-            } else {
-                return Err(ParseError {
-                    at: self.peek_at,
-                    message: stack_format!(
-                        super::PARSE_MESSAGE_BYTES,
-                        "index access method \"{}\" is not supported",
-                        method
-                    ),
-                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                    cursor: None,
-                    hint: None,
-                    near: None,
-                    detail: None,
-                });
-            }
+            self.index_access_method()?
         } else {
             IndexAccessMethod::Btree
         };
@@ -9205,32 +9178,62 @@ impl<'a> Parser<'a> {
         Ok(not_distinct)
     }
 
+    /// An index access method name after `USING`.
+    fn index_access_method(&mut self) -> Result<IndexAccessMethod, ParseError> {
+        let method = self.any_ident("index access method")?;
+        Ok(if method.eq_ignore_ascii_case("btree") {
+            IndexAccessMethod::Btree
+        } else if method.eq_ignore_ascii_case("hash") {
+            IndexAccessMethod::Hash
+        } else if method.eq_ignore_ascii_case("brin") {
+            IndexAccessMethod::Brin
+        } else if method.eq_ignore_ascii_case("gist") {
+            IndexAccessMethod::Gist
+        } else if method.eq_ignore_ascii_case("gin") {
+            IndexAccessMethod::Gin
+        } else if method.eq_ignore_ascii_case("spgist") {
+            IndexAccessMethod::SpGist
+        } else {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(
+                    super::PARSE_MESSAGE_BYTES,
+                    "index access method \"{}\" is not supported",
+                    method
+                ),
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                cursor: None,
+                hint: None,
+                near: None,
+                detail: None,
+            });
+        })
+    }
+
     fn exclusion_constraint(
         &mut self,
         name: Option<&'a str>,
         source_position: SourcePosition,
     ) -> Result<TableConstraint<'a>, ParseError> {
-        if self.eat_ident("using")? {
-            let method = self.col_ident("exclusion index method")?;
-            if method != "gist" {
-                let mut error = self.err_here("only GiST exclusion constraints are supported");
-                error.sqlstate = sqlstate::FEATURE_NOT_SUPPORTED;
-                return Err(error);
-            }
-        }
+        let method = if self.eat_ident("using")? {
+            self.index_access_method()?
+        } else {
+            IndexAccessMethod::Btree
+        };
         self.expect_op("(")?;
         let mut columns = ArenaList::new(self.arena);
         let mut operators = ArenaList::new(self.arena);
         loop {
+            if self.peeked == Tok::Op("(") || self.lookahead(1)? == Tok::Op("(") {
+                let mut error =
+                    self.err_here("exclusion constraint elements must be columns, not expressions");
+                error.sqlstate = sqlstate::FEATURE_NOT_SUPPORTED;
+                return Err(error);
+            }
             let column = self.col_ident("exclusion column")?;
             self.push(&mut columns, column)?;
             self.expect_ident("with")?;
-            let operator = match self.any_op_token()? {
-                "=" => ExclusionOperator::Equal,
-                "&&" => ExclusionOperator::Overlaps,
-                "-|-" => ExclusionOperator::Adjacent,
-                _ => return Err(self.err_here("unsupported exclusion operator")),
-            };
+            let operator = self.any_op_token()?;
             self.push(&mut operators, operator)?;
             if !self.eat_op(",")? {
                 break;
@@ -9251,6 +9254,7 @@ impl<'a> Parser<'a> {
         Ok(TableConstraint::Exclusion {
             source_position,
             name,
+            method,
             columns: columns.as_slice(),
             operators: operators.as_slice(),
             predicate,

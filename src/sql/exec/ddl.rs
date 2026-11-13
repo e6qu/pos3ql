@@ -1286,6 +1286,96 @@ fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
     Ok(())
 }
 
+/// The operator an exclusion constraint element compares `column` with, as
+/// PostgreSQL's `ComputeIndexAttrs` checks it: the column type's default
+/// operator class for `method`, then a commutative operator `written` of the
+/// class's operator family.
+fn exclusion_operator(
+    storage: &Storage,
+    column: &crate::storage::ColumnMeta,
+    method: crate::sql::ast::IndexAccessMethod,
+    written: &str,
+    txid: u32,
+) -> Result<crate::storage::ExclusionOperator, SqlError> {
+    let class = storage.resolve_index_operator_class(
+        None,
+        crate::storage::RoutineResult {
+            ctype: column.ctype,
+            user_type: column.user_type,
+        },
+        method,
+        txid,
+    )?;
+    let Some((family, input)) = crate::sql::catalog::builtin_operator_class_family(class.oid())
+    else {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "exclusion constraints over user-defined operator classes are not supported"
+        ));
+    };
+    let type_oid = crate::sql::catalog::catalog_column_type_oid(storage, column, txid)?;
+    let type_name = |oid: i32| crate::sql::catalog::format_type_oid(storage, txid, oid, -1);
+    let operator = crate::sql::catalog::builtin_binary_operator(written, type_oid, type_oid)
+        .or_else(|| crate::sql::catalog::builtin_binary_operator(written, input, input))
+        .ok_or_else(|| {
+            crate::sql::error_position::with_hint(
+                sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "operator does not exist: {} {} {}",
+                    type_name(type_oid).as_str(),
+                    written,
+                    type_name(type_oid).as_str()
+                ),
+                "No operator matches the given name and argument types. You might need to add explicit type casts.",
+            )
+        })?;
+    let (_, left, right, commutator) = crate::sql::catalog::builtin_binary_operator_row(operator)
+        .expect("a found built-in operator has a row");
+    let signature = crate::stack_format!(
+        600,
+        "{}({},{})",
+        written,
+        type_name(left).as_str(),
+        type_name(right).as_str()
+    );
+    if commutator != operator {
+        crate::sql::eval::stash_diagnostic(
+            Some(crate::util::StackStr::from_str(
+                "Only commutative operators can be used in exclusion constraints.",
+            )),
+            None,
+        );
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "operator {} is not commutative",
+            signature.as_str()
+        ));
+    }
+    if !crate::sql::catalog::builtin_family_has_operator(family, method.oid(), operator) {
+        let family_name =
+            crate::sql::catalog::builtin_operator_family(family).map_or("", |(_, name)| name);
+        crate::sql::eval::stash_diagnostic(
+            Some(crate::util::StackStr::from_str(
+                "The exclusion operator must be related to the index operator class for the constraint.",
+            )),
+            None,
+        );
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "operator {} is not a member of operator family \"{}\"",
+            signature.as_str(),
+            family_name
+        ));
+    }
+    crate::storage::ExclusionOperator::from_oid(operator).ok_or_else(|| {
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "exclusion operator {} is not supported",
+            signature.as_str()
+        )
+    })
+}
+
 /// Applies each parsed table constraint to `def`: single-column PK/UNIQUE set
 /// column flags; multi-column PK/UNIQUE become entries in `def.uniques`; CHECK
 /// predicates and FOREIGN KEYs are validated and recorded.
@@ -1554,6 +1644,7 @@ pub(super) fn attach_constraints(
             TableConstraint::Exclusion {
                 source_position: _,
                 name,
+                method,
                 columns,
                 operators,
                 predicate,
@@ -1561,20 +1652,29 @@ pub(super) fn attach_constraints(
                 timing,
             } => {
                 let (indices, count) = resolve_cols(def, columns)?;
-                for &column in &indices[..count] {
-                    if !matches!(
-                        def.columns[column as usize].ctype,
-                        crate::sql::types::ColType::Range(_)
-                    ) {
-                        return Err(crate::sql::error_position::with_hint(
-                            sql_err!(
-                                sqlstate::UNDEFINED_OBJECT,
-                                "data type {} has no default operator class for access method \"gist\"",
-                                def.columns[column as usize].ctype.name()
-                            ),
-                            crate::sql::error_position::DEFAULT_OPERATOR_CLASS_HINT,
-                        ));
-                    }
+                if matches!(
+                    method,
+                    crate::sql::ast::IndexAccessMethod::Brin
+                        | crate::sql::ast::IndexAccessMethod::Gin
+                ) {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "access method \"{}\" does not support exclusion constraints",
+                        method.name()
+                    ));
+                }
+                let mut resolved = [crate::storage::ExclusionConstraint::EMPTY.operators[0];
+                    crate::storage::MAX_INDEX_COLS];
+                for (position, (&column, operator)) in
+                    indices[..count].iter().zip(*operators).enumerate()
+                {
+                    resolved[position] = exclusion_operator(
+                        storage,
+                        &def.columns[column as usize],
+                        *method,
+                        operator,
+                        txid,
+                    )?;
                 }
                 if def.n_exclusions == crate::storage::MAX_EXCLUSIONS {
                     return Err(sql_err!(
@@ -1608,19 +1708,8 @@ pub(super) fn attach_constraints(
                     ));
                 }
                 exclusion.columns[..count].copy_from_slice(&indices[..count]);
-                for (index, operator) in operators.iter().copied().enumerate() {
-                    exclusion.operators[index] = match operator {
-                        crate::sql::ast::ExclusionOperator::Equal => {
-                            crate::storage::ExclusionOperator::Equal
-                        }
-                        crate::sql::ast::ExclusionOperator::Overlaps => {
-                            crate::storage::ExclusionOperator::Overlaps
-                        }
-                        crate::sql::ast::ExclusionOperator::Adjacent => {
-                            crate::storage::ExclusionOperator::Adjacent
-                        }
-                    };
-                }
+                exclusion.operators[..count].copy_from_slice(&resolved[..count]);
+                exclusion.method = *method;
                 exclusion.n_cols = count;
                 exclusion.timing = storage_timing(*timing);
                 exclusion.predicate = match predicate_text {

@@ -6075,7 +6075,7 @@ impl Checkpointer {
                     def.fkeys[i] = fk;
                     def.n_fkeys += 1;
                 }
-                Some("excl") => {
+                Some("excl2") => {
                     let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("excl outside table"));
                     };
@@ -6083,6 +6083,7 @@ impl Checkpointer {
                         return Err(CheckpointSetupError::Corrupt("too many excl lines"));
                     }
                     let timing: u8 = parse_field(words.next(), "excl timing")?;
+                    let method: u8 = parse_field(words.next(), "excl method")?;
                     let n_cols: usize = parse_field(words.next(), "excl ncols")?;
                     if n_cols == 0 || n_cols > crate::storage::MAX_INDEX_COLS {
                         return Err(CheckpointSetupError::Corrupt("bad excl ncols"));
@@ -6090,12 +6091,14 @@ impl Checkpointer {
                     let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
                     exclusion.timing = crate::storage::ConstraintTiming::from_code(timing)
                         .ok_or(CheckpointSetupError::Corrupt("bad excl timing"))?;
+                    exclusion.method = crate::sql::ast::IndexAccessMethod::from_code(method)
+                        .ok_or(CheckpointSetupError::Corrupt("bad excl method"))?;
                     exclusion.n_cols = n_cols;
                     for position in 0..n_cols {
                         exclusion.columns[position] = parse_field(words.next(), "excl col")?;
-                        let operator: u8 = parse_field(words.next(), "excl operator")?;
+                        let operator: i32 = parse_field(words.next(), "excl operator")?;
                         exclusion.operators[position] =
-                            crate::storage::ExclusionOperator::from_code(operator)
+                            crate::storage::ExclusionOperator::from_oid(operator)
                                 .ok_or(CheckpointSetupError::Corrupt("bad excl operator"))?;
                     }
                     exclusion.name = sql_name(&decode_hex_name(
@@ -11133,13 +11136,13 @@ impl Checkpointer {
             }
             for exclusion in definition.exclusions() {
                 use core::fmt::Write;
-                let mut elements = StackStr::<128>::new();
+                let mut elements = StackStr::<{ 24 * crate::storage::MAX_INDEX_COLS }>::new();
                 for position in 0..exclusion.n_cols {
                     let _ = write!(
                         elements,
                         "{} {} ",
                         exclusion.columns[position],
-                        exclusion.operators[position].code()
+                        exclusion.operators[position].oid()
                     );
                 }
                 let mut hex_name = StackStr::<130>::new();
@@ -11164,8 +11167,9 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "excl {} {} {}{} {}",
+                        "excl2 {} {} {} {}{} {}",
                         exclusion.timing.code(),
+                        exclusion.method.code(),
                         exclusion.n_cols,
                         elements.as_str(),
                         hex_name.as_str(),

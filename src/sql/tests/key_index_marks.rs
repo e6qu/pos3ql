@@ -10,10 +10,12 @@ const MARKS: [&str; 4] = [
     "km_pkey|t|f",
 ];
 const ACCESS_METHODS: [&str; 2] = ["kp|0", "kp_1|2"];
+const EXCLUSIONS: &str = "SELECT conname, conexclop, pg_get_constraintdef(oid) \
+                          FROM pg_constraint WHERE conrelid = 'ke'::regclass ORDER BY 1";
 
-/// CLUSTER and replica identity marks on key indexes, and a partitioned
-/// table's unset access method, survive journal replay and checkpoint
-/// recovery.
+/// CLUSTER and replica identity marks on key indexes, a partitioned table's
+/// unset access method and exclusion constraints' methods and operators
+/// survive journal replay and checkpoint recovery.
 #[test]
 fn key_index_marks_and_unset_access_methods_survive_recovery() {
     for checkpoint in [false, true] {
@@ -44,7 +46,9 @@ fn key_index_marks_and_unset_access_methods_survive_recovery() {
                  ALTER TABLE km CLUSTER ON km_pkey; \
                  ALTER TABLE km REPLICA IDENTITY USING INDEX km_b_key; \
                  CREATE TABLE kp (a int) PARTITION BY LIST (a); \
-                 CREATE TABLE kp_1 PARTITION OF kp FOR VALUES IN (1)",
+                 CREATE TABLE kp_1 PARTITION OF kp FOR VALUES IN (1); \
+                 CREATE TABLE ke (b box, t text, EXCLUDE USING gist (b WITH &&), \
+                   EXCLUDE (t WITH =))",
                 false,
             );
             assert_eq!(
@@ -76,6 +80,23 @@ fn key_index_marks_and_unset_access_methods_survive_recovery() {
                     false
                 )),
                 ["i"]
+            );
+            assert_eq!(
+                data_rows(&session.success(&mut engine, EXCLUSIONS, false)),
+                [
+                    "ke_b_excl|{500}|EXCLUDE USING gist (b WITH &&)",
+                    "ke_t_excl|{98}|EXCLUDE USING btree (t WITH =)",
+                ]
+            );
+            let output = session.execute(
+                &mut engine,
+                "INSERT INTO ke VALUES ('((0,0),(2,2))', 'a'), ('((1,1),(3,3))', 'b')",
+                false,
+            );
+            assert!(
+                String::from_utf8_lossy(&output).contains("C23P01"),
+                "{}",
+                String::from_utf8_lossy(&output)
             );
         }
         std::fs::remove_dir_all(&config.data_dir).unwrap();

@@ -1881,38 +1881,43 @@ impl UniqueKey {
     }
 }
 
+/// The built-in commutative binary operator, by `pg_operator` OID, that an
+/// exclusion constraint compares one element with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExclusionOperator {
-    Equal,
-    Overlaps,
-    Adjacent,
+pub struct ExclusionOperator {
+    oid: i32,
+    binary: crate::sql::ast::BinaryOp,
 }
 
 impl ExclusionOperator {
-    pub const fn code(self) -> u8 {
-        match self {
-            Self::Equal => 0,
-            Self::Overlaps => 1,
-            Self::Adjacent => 2,
-        }
+    /// `None` unless `oid` is a built-in binary operator the evaluator runs.
+    pub(crate) fn from_oid(oid: i32) -> Option<Self> {
+        let (name, ..) = crate::sql::catalog::builtin_binary_operator_row(oid)?;
+        Some(Self {
+            oid,
+            binary: crate::sql::ast::BinaryOp::from_operator_name(name)?,
+        })
     }
 
-    pub const fn from_code(code: u8) -> Option<Self> {
-        match code {
-            0 => Some(Self::Equal),
-            1 => Some(Self::Overlaps),
-            2 => Some(Self::Adjacent),
-            _ => None,
-        }
+    pub(crate) const fn oid(self) -> i32 {
+        self.oid
     }
 
-    pub const fn sql(self) -> &'static str {
-        match self {
-            Self::Equal => "=",
-            Self::Overlaps => "&&",
-            Self::Adjacent => "-|-",
-        }
+    pub(crate) const fn binary(self) -> crate::sql::ast::BinaryOp {
+        self.binary
     }
+
+    pub(crate) fn sql(self) -> &'static str {
+        crate::sql::catalog::builtin_binary_operator_row(self.oid)
+            .expect("an exclusion operator is a built-in binary operator")
+            .0
+    }
+
+    /// Range equality, the operator of `EMPTY`'s unused positions.
+    const RANGE_EQUAL: Self = Self {
+        oid: 3882,
+        binary: crate::sql::ast::BinaryOp::Eq,
+    };
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1920,6 +1925,8 @@ pub struct ExclusionConstraint {
     pub(crate) identity: Option<ConstraintIdentity>,
     pub(crate) index_identity: Option<RelationIdentity>,
     pub name: SqlName,
+    /// The index access method that enforces the constraint.
+    pub method: crate::sql::ast::IndexAccessMethod,
     pub columns: [u16; MAX_INDEX_COLS],
     pub operators: [ExclusionOperator; MAX_INDEX_COLS],
     pub n_cols: usize,
@@ -1932,8 +1939,9 @@ impl ExclusionConstraint {
         identity: None,
         index_identity: None,
         name: SqlName::EMPTY,
+        method: crate::sql::ast::IndexAccessMethod::Gist,
         columns: [0; MAX_INDEX_COLS],
-        operators: [ExclusionOperator::Equal; MAX_INDEX_COLS],
+        operators: [ExclusionOperator::RANGE_EQUAL; MAX_INDEX_COLS],
         n_cols: 0,
         predicate: None,
         timing: ConstraintTiming::NotDeferrable,

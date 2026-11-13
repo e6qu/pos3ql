@@ -2966,6 +2966,41 @@ fn collect_select<'a>(
             enclosing: Some(&level),
             ..context
         };
+        // Relations come first: a subquery's outer references mark columns of
+        // the relations this level reads.
+        if let Some(from) = select.from {
+            collect_table_ref(
+                &from.base,
+                storage,
+                txid,
+                visible_ctes,
+                dependencies,
+                arena,
+                context,
+            )?;
+            for join in from.joins {
+                collect_table_ref(
+                    &join.table,
+                    storage,
+                    txid,
+                    visible_ctes,
+                    dependencies,
+                    arena,
+                    context,
+                )?;
+                if let Some(on) = join.on {
+                    collect_expression(
+                        on,
+                        storage,
+                        txid,
+                        visible_ctes,
+                        dependencies,
+                        arena,
+                        nested,
+                    )?;
+                }
+            }
+        }
 
         for item in select.items {
             match item {
@@ -3025,37 +3060,6 @@ fn collect_select<'a>(
             )?;
         }
         if let Some(from) = select.from {
-            collect_table_ref(
-                &from.base,
-                storage,
-                txid,
-                visible_ctes,
-                dependencies,
-                arena,
-                context,
-            )?;
-            for join in from.joins {
-                collect_table_ref(
-                    &join.table,
-                    storage,
-                    txid,
-                    visible_ctes,
-                    dependencies,
-                    arena,
-                    context,
-                )?;
-                if let Some(on) = join.on {
-                    collect_expression(
-                        on,
-                        storage,
-                        txid,
-                        visible_ctes,
-                        dependencies,
-                        arena,
-                        nested,
-                    )?;
-                }
-            }
             if let Some(scope) = level_scope.as_ref() {
                 for item in select.items {
                     match item {

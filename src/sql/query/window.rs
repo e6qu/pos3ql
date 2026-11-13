@@ -25,9 +25,9 @@ use super::group::row_passes_correlated_where;
 use super::subquery::{correlated_in_expression, correlated_scan_conjuncts};
 use super::{
     AggState, GroupedRewrite, Outcome, QueryScope, arena_full, collect_grouped_aggs,
-    merge_correlated, pax_column_demand, project_row, record_star_width, rewrite_grouped_expr,
-    scan_source_recycling_with_pax_columns, scan_source_with_pax_columns, sql_fail, sql_ok,
-    window_row,
+    collect_grouped_sublinks, merge_correlated, pax_column_demand, project_row, record_star_width,
+    rewrite_grouped_expr, scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
+    sql_fail, sql_ok, window_row,
 };
 
 /// The WHERE conjuncts the scan applies, and the correlated subqueries the
@@ -125,6 +125,14 @@ pub(crate) fn rewrite_grouped_windows<'a>(
     }
     for ob in statement.order_by {
         collect_grouped_aggs(ob.expression, &mut agg_nodes, storage, txid, columns)?;
+    }
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
+            collect_grouped_sublinks(expression, &mut agg_nodes)?;
+        }
+    }
+    for ob in statement.order_by {
+        collect_grouped_sublinks(ob.expression, &mut agg_nodes)?;
     }
     let agg_nodes = agg_nodes.as_slice();
     let n_aggs = agg_nodes.len();

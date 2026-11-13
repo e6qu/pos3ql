@@ -10333,18 +10333,75 @@ fn collect_grouped_aggs<'a>(
         return Ok(());
     }
     if is_sublink(e) {
-        // The window layer evaluates subqueries above the grouped derived
-        // table, where an aggregate this query owns has no group to read.
+        // A subquery reading an aggregate this query owns runs once per group
+        // in the grouped derived table, where that aggregate has its value;
+        // the window layer reads its result like an aggregate's.
+        let mut owns = false;
         aggregate_levels::visit_owned_outer_aggregates(e, &mut |_| {
-            Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "a subquery reading an aggregate of a query with window functions is not supported"
-            ))
+            owns = true;
+            Ok(())
         })?;
+        if owns {
+            if !out.as_slice().iter().any(|(p, _)| core::ptr::eq(*p, e)) {
+                out.push((e as *const _, e)).map_err(|_| arena_full())?;
+            }
+            return Ok(());
+        }
     }
     walk_children(e, &mut |child| {
         collect_grouped_aggs(child, out, storage, txid, columns)
     })
+}
+
+/// Adds the subqueries of a grouped window query's output to `out` after its
+/// aggregates: each runs once per group in the grouped derived table, where
+/// its references to this query's grouping keys resolve and an ungrouped one
+/// fails as in a grouped query without windows. A subquery inside an
+/// aggregate's arguments runs per input row and stays there; one whose
+/// operand holds a window function stays in the window layer.
+pub(super) fn collect_grouped_sublinks<'a>(
+    e: &'a Expr<'a>,
+    out: &mut ArenaList<'a, (*const Expr<'a>, &'a Expr<'a>)>,
+) -> Result<(), SqlError> {
+    if out.as_slice().iter().any(|(p, _)| core::ptr::eq(*p, e)) {
+        return Ok(());
+    }
+    if is_sublink(e) && !expr_has_window(e) {
+        return out.push((e as *const _, e)).map_err(|_| arena_full());
+    }
+    if let Expr::Call {
+        over: Some(spec),
+        args,
+        filter,
+        ..
+    } = e
+    {
+        for argument in args
+            .iter()
+            .copied()
+            .chain(spec.partition_by.iter().copied())
+        {
+            collect_grouped_sublinks(argument, out)?;
+        }
+        for key in spec.order_by {
+            collect_grouped_sublinks(key.expression, out)?;
+        }
+        if let Some(frame) = &spec.frame {
+            for bound in [&frame.start, &frame.end] {
+                if let FrameBound::Preceding(x) | FrameBound::Following(x) = bound {
+                    collect_grouped_sublinks(x, out)?;
+                }
+            }
+        }
+        if let Some(filter) = filter {
+            collect_grouped_sublinks(filter, out)?;
+        }
+        return Ok(());
+    }
+    if e.is_aggregate_use() {
+        return Ok(());
+    }
+    walk_children(e, &mut |child| collect_grouped_sublinks(child, out))
 }
 
 /// Context for [`rewrite_grouped_expr`]: the inner derived table's exposed
@@ -10437,18 +10494,17 @@ fn rewrite_grouped_expr<'a>(
             // A name outside the query's sources is an outer reference, such as
             // a PL/pgSQL variable, and stays constant in every group; evaluation
             // reports it if nothing defines it. A known one is ungrouped.
-            if let Some(scope) = context.scope
-                && scope.find_column(*qualifier, name).is_err()
-            {
-                return Ok(e);
+            match context.scope {
+                Some(scope) if scope.find_column(*qualifier, name).is_err() => Ok(e),
+                Some(scope) => Err(group::ungrouped_error(e, scope)),
+                None => Err(sql_err!(
+                    sqlstate::GROUPING_ERROR,
+                    "column \"{}{}{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+                    qualifier.unwrap_or(""),
+                    if qualifier.is_some() { "." } else { "" },
+                    name
+                )),
             }
-            Err(sql_err!(
-                sqlstate::GROUPING_ERROR,
-                "column \"{}{}{}\" must appear in the GROUP BY clause or be used in an aggregate function",
-                qualifier.unwrap_or(""),
-                if qualifier.is_some() { "." } else { "" },
-                name
-            ))
         }
         Expr::Unary { operator, operand , .. } => {
             alloc(Expr::Unary {source_position: e.source_position(),  operator: *operator, operand: rewrite(operand)? })

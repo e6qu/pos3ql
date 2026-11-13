@@ -1413,7 +1413,7 @@ fn expand_grouped_stars<'a>(
 
 /// PostgreSQL's ungrouped-column error, naming the column as `table.column`
 /// however the query spelled it.
-fn ungrouped_error(column: &Expr, scope: &QueryScope) -> SqlError {
+pub(super) fn ungrouped_error(column: &Expr, scope: &QueryScope) -> SqlError {
     let (qualifier, name) = match column {
         Expr::Column { qualifier, name } => (*qualifier, *name),
         _ => (None, ""),

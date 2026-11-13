@@ -575,8 +575,7 @@ A PL/pgSQL variable declared with a view's row type (`r v;` or
 error has no cursor position: PL/pgSQL assignment targets do not keep their
 place in the routine body. A trigger fired inside a writing statement cannot
 `FETCH` from a session cursor that calls a user-defined routine for each
-fetched row, or first read one whose data-modifying `WITH` queries have not
-run (`0A000`). A protocol-level `Parse` message checks only
+fetched row (`0A000`). A protocol-level `Parse` message checks only
 syntax and parameter types, so analysis errors (`SELECT current_date + $1`,
 `SELECT 1 WHERE 'x'`) arrive at `Bind` or `Execute` where PostgreSQL reports
 them at `Parse`, and `pg_prepared_statements` lists only SQL `PREPARE`

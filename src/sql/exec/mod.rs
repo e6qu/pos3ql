@@ -23127,6 +23127,83 @@ fn bind_plpgsql_dml_ctes<'a>(
     Ok((expand_plpgsql_with(context, bound, scope)?, materialized))
 }
 
+/// Runs a session cursor's query with data-modifying `WITH` queries on its
+/// first read from a trigger fired inside a writing statement: the writes run
+/// as the trigger's own nested writes do, and the main query's rows fill the
+/// cursor as the session's first FETCH fills it.
+fn fill_trigger_writing_cursor<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    name: &str,
+) -> Result<(), SqlError> {
+    let Some((at, super::cursor::PendingFill::Write)) =
+        context.host.cursors().pending_fill(name)?
+    else {
+        return Ok(());
+    };
+    let arena = context.arena;
+    let (query, mut description, mut rows) =
+        context.host.cursors_mut().begin_write_fill(at, arena)?;
+    let description_mark = description.mark();
+    let render = super::guc::with_active_state(|guc| Ok(guc.render()))?;
+    let outer_params = context.params;
+    context.params = query.params;
+    let filled = super::type_input_plans::with_owner(query.owner, || {
+        with_bound_parameter_types(query.parameter_types, || {
+            context.storage_mut().set_read_snapshot(query.snapshot.0);
+            let (bound, materialized) =
+                bind_plpgsql_dml_ctes(context, query.statement, &crate::sql::eval::NoColumns)?;
+            let txid = context.txn.txid;
+            let sequence =
+                crate::sql::sequence::SeqEval::new(context.storage(), context.seq_session(), txid);
+            let mut capture = Responder::for_cursor(
+                &mut description,
+                crate::pg::respond::CursorRowOutput::Save(&mut rows),
+            )
+            .rows_only();
+            capture.set_render(render);
+            let selected = if bound.from.is_some() {
+                super::query::select_query(
+                    context.storage(),
+                    txid,
+                    bound,
+                    arena,
+                    query.params,
+                    Some(&sequence),
+                    &mut capture,
+                )
+            } else {
+                super::query::constant_select(
+                    context.storage(),
+                    txid,
+                    bound,
+                    arena,
+                    query.params,
+                    Some(&sequence),
+                    &mut capture,
+                )
+            };
+            match selected {
+                Ok(outcome) => outcome?,
+                Err(WireFull) => {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "cursor result exceeds cursor_bytes"
+                    ));
+                }
+            }
+            finish_plpgsql_dml_ctes(context, query.statement, materialized)
+        })
+    });
+    context.params = outer_params;
+    // The description was written when the cursor opened.
+    description.truncate_to(description_mark);
+    context
+        .host
+        .cursors_mut()
+        .end_write_fill(at, description, rows, filled.is_ok())?;
+    filled
+}
+
 /// Binds a query's ordinary `WITH` queries. A materialized one only
 /// describes its rows here and runs when the query first reads them.
 fn expand_plpgsql_with<'a>(
@@ -35999,13 +36076,17 @@ fn execute_trigger_step_in<'a>(
                         };
                         // A query with data-modifying WITH queries runs on its
                         // first read, in a new command as PostgreSQL runs it.
-                        let fills = matches!(context.host, PlpgsqlExecHost::Routine { .. })
-                            && matches!(
-                                context.host.cursors().pending_fill(name)?,
-                                Some((_, super::cursor::PendingFill::Write))
-                            );
+                        let fills = matches!(
+                            context.host.cursors().pending_fill(name)?,
+                            Some((_, super::cursor::PendingFill::Write))
+                        );
                         let (count, rows) = if fills {
-                            in_new_plpgsql_command(context, fetch)?
+                            in_new_plpgsql_command(context, |context| {
+                                if matches!(context.host, PlpgsqlExecHost::Atomic { .. }) {
+                                    fill_trigger_writing_cursor(context, name)?;
+                                }
+                                fetch(context)
+                            })?
                         } else {
                             fetch(context)?
                         };
@@ -36606,6 +36687,9 @@ fn execute_trigger_step_in<'a>(
                             move_only: false,
                         } => {
                             let arena = context.arena;
+                            if matches!(context.host, PlpgsqlExecHost::Atomic { .. }) {
+                                fill_trigger_writing_cursor(context, name)?;
+                            }
                             let rows = {
                                 let cursors = match &mut context.host {
                                     PlpgsqlExecHost::Routine {

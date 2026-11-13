@@ -3146,8 +3146,9 @@ fn fetch_saves_row(
 /// cursor that evaluates its rows as fetched reads them with the workspace's
 /// scan buffers, as the trigger's own queries run, and a cursor that locks
 /// its rows locks each one as it is fetched (`repeatable` says whether the
-/// transaction's snapshot is fixed). A cursor whose data-modifying `WITH`
-/// queries have not run needs the session's engine.
+/// transaction's snapshot is fixed). The trigger runs a cursor's
+/// data-modifying `WITH` queries before its first read
+/// (`fill_trigger_writing_cursor`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fetch_trigger_cursor(
     storage: &Storage,
@@ -3166,8 +3167,8 @@ pub(crate) fn fetch_trigger_cursor(
         match cursors.pending_fill(name)? {
             Some((_, cursor::PendingFill::Write)) => {
                 return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "cursor \"{}\" runs data-modifying WITH queries when first fetched, which is not supported in trigger execution",
+                    sqlstate::INTERNAL_ERROR,
+                    "cursor \"{}\" was fetched before its data-modifying WITH queries ran",
                     name
                 ));
             }

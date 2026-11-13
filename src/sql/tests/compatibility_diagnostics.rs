@@ -1798,9 +1798,9 @@ fn data_change_subquery_constants_convert_before_rows_are_read() {
 
 /// A missing column's error carries PostgreSQL's spelling suggestion from the
 /// failing query and the queries enclosing it, and a virtual generated
-/// column, PostgreSQL 18's default kind, is rejected rather than stored.
+/// column, PostgreSQL 18's default kind, refuses what PostgreSQL refuses.
 #[test]
-fn missing_columns_suggest_spellings_and_virtual_columns_are_rejected() {
+fn missing_columns_suggest_spellings_and_virtual_columns_follow_postgresql() {
     with_engine("missing-column-suggestions", |engine, budget| {
         run_with(
             engine,
@@ -1833,12 +1833,13 @@ fn missing_columns_suggest_spellings_and_virtual_columns_are_rejected() {
                  reference the column \"t.xyz\".",
             ),
             (
-                "CREATE TABLE v (a int, b int GENERATED ALWAYS AS (a + 1))",
-                "ERROR 0A000 virtual generated columns are not supported",
+                "CREATE TABLE v (a int, b int GENERATED ALWAYS AS (a + 1) VIRTUAL UNIQUE)",
+                "ERROR 0A000 unique constraints on virtual generated columns are not supported",
             ),
             (
-                "CREATE TABLE v (a int, b int GENERATED ALWAYS AS (a + 1) VIRTUAL)",
-                "ERROR 0A000 virtual generated columns are not supported",
+                "CREATE TABLE v (a int, b int GENERATED ALWAYS AS (a + 1)); \
+                 CREATE INDEX ON v (b)",
+                "ERROR 0A000 indexes on virtual generated columns are not supported",
             ),
         ] {
             assert_eq!(

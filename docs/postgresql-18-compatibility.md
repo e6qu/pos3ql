@@ -933,9 +933,10 @@ rows fit; raising `cursor_bytes` does not help there.
 - `WITH HOLD`: the unread suffix (plus history when scrolling) must fit; a
   scrollable cursor whose rows are evaluated again saves its whole result.
 - A trigger fired inside a writing statement (`INSERT`, `UPDATE`, `DELETE`,
-  `MERGE`, `COPY`, `TRUNCATE`, deferred constraints) can read a cursor whose
-  query runs whole at its first read. One that evaluates its rows as they are
-  fetched, or whose data-modifying `WITH` queries have not run yet, raises
+  `MERGE`, `COPY`, `TRUNCATE`, deferred constraints) can read a session
+  cursor, including one that locks its rows and one whose data-modifying
+  `WITH` queries then run at that first read, as the trigger's own writes do.
+  A cursor that calls a user-defined routine for each fetched row raises
   `0A000` there.
 - A PL/pgSQL `OPEN` query with data-modifying `WITH` queries runs once, at
   the cursor's first `FETCH` or `MOVE` as in PostgreSQL, and its whole result

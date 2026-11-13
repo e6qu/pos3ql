@@ -525,9 +525,15 @@ condition and each nested loop's join filter, sort and grouping keys
 on "*VALUES*"`, a derived table's own plan under its `Subquery Scan` (or in
 its place when the scan neither filters nor reshapes rows), and each outer
 join narrowed by conditions that reject its nullable side's NULLs, as
-PostgreSQL's `reduce_outer_joins` does. A derived table's scan prints no
-`Filter`, keys reading a derived table or function are not printed, and
-`VERBOSE` output names a `VALUES` list's columns by their aliases. An index scan prints the
+PostgreSQL's `reduce_outer_joins` does. A derived table's, a function's
+(`Function Scan`) and a pulled-up `VALUES` list's scan print their `Filter`, a
+grouped query its `HAVING` filter, an `OFFSET` its `Limit`, a distinct union the
+`Append` it hashes, and a relation a set operation reads again a unique name
+(`t1_1`). `VERBOSE` prints relation schemas, a single relation's conditions
+qualified, and a `VALUES` list's columns as `"*VALUES*".column1`; other nodes'
+`Output` lists stay unqualified, join conditions over a `VALUES` list or another
+derived relation are not printed, and `Sort Key`/`Group Key` items reading a
+derived table or function are not printed. An index scan prints the
 conditions its index consumes as `Index Cond` (indexed column first and
 unqualified), and a parameterized inner index scan filters the other join
 conditions reading it, as PostgreSQL does. Outer joins of stored tables in
@@ -556,9 +562,32 @@ a relation with rules of its own (which PostgreSQL rewrites again) fail with
 `0A000`. Planning them needs a `VALUES` list kept apart from a `UNION ALL`
 of rows for these rewrites, and a rewrite of each action's own rules; under `EXPLAIN ANALYZE` the statement runs
 once and its time and I/O are reported on its last query. `EXPLAIN ANALYZE`
-reports actual rows only on each plan's top node, where PostgreSQL reports
-every node (`(never executed)` for nodes that did not run), because the
-executor keeps no per-node counters. Notices carry
+counts, per plan node, the loops, rows and the rows its `Filter` and `Join
+Filter` removed while the statement runs, and prints `(never executed)` for
+nodes that did not run: scans (also a nested loop's inner rescans and
+parameterized index scans), nested-loop and hash joins with their `Hash` and
+`Materialize` inputs, aggregation, sorts, `DISTINCT`, limits, window
+evaluation, set operations, derived tables, `VALUES` lists, a write's target
+scan and an `INSERT`'s source query, in all four formats. Times are measured
+per loop, to the first row and to the end; in pos3ql's push-based executor a
+node's time also includes the work of the nodes reading its rows. Not yet
+shown: subplans and InitPlans (a condition with a subquery prints no
+`Filter`), semi joins, the `Sort Method`, hash `Buckets`/`Batches`/`Memory
+Usage`, aggregate and `Materialize` storage lines that PostgreSQL measures in
+its own allocator, per-node `Buffers` and `WAL` (reported on the top node
+only), trigger time lines, an index-only scan's `Heap Fetches` and a bitmap
+heap scan's `Heap Blocks`. A node of a path the executor does not count (a
+FROM-less top query, a data-modifying `WITH`, a joined `UPDATE` or `DELETE`,
+`MERGE`) prints no actual figures, except the top node, which reports the
+statement's rows; a `LIMIT` that stops `Unique` early leaves its `Sort`
+without figures, as pos3ql deduplicates before sorting. Where pos3ql's plan
+differs from PostgreSQL's cost-based one the figures are those of the plan it
+shows and runs: it hashes the second of two joined relations where PostgreSQL
+may hash the smaller filtered one, joins three or more relations in nested
+loops where PostgreSQL may hash them, sorts before `DISTINCT ... ORDER BY`
+where PostgreSQL may hash first, shows no window's input `Sort` or `Window:`
+line, and does not flatten a distinct union of more than two inputs into one
+`Append`. Notices carry
 no position (`''::tsquery` points at the literal in PostgreSQL). Built-in
 calls with constant arguments are not folded once while planning: `SELECT
 timestamptypmodin('{7}') FROM generate_series(1, 3)` warns three times where

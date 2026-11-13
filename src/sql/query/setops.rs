@@ -1650,13 +1650,8 @@ pub(crate) fn unify_set_type(a: ColType, b: ColType) -> Option<ColType> {
 
 /// Materializes a set tree to self-describing rows, coercing every leaf's rows
 /// to the columns' common `target` types so the combining operators can match
-/// rows by their encoded bytes.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "set tree evaluation carries statement context"
-)]
-/// Evaluates `tree`. Its set operations are numbered in pre-order from
-/// `numbers.0` and its leaves left to right from `numbers.1`, as EXPLAIN
+/// rows by their encoded bytes. Its set operations are numbered in pre-order
+/// from `numbers.0` and its leaves left to right from `numbers.1`, as EXPLAIN
 /// numbers them; a `VALUES` list is one leaf of neither kind.
 #[expect(
     clippy::too_many_arguments,

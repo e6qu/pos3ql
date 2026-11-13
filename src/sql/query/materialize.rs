@@ -2987,9 +2987,6 @@ pub(crate) fn extend_ties(
     Ok(end)
 }
 
-/// DISTINCT / ORDER BY execution to the wire: materialize the rows, then page
-/// with LIMIT/OFFSET and emit.
-#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 /// The stages of a materialized query that `EXPLAIN ANALYZE` counts. A
 /// `LIMIT` stops PostgreSQL's `Unique` early, after fewer sorted rows than
 /// the deduplication before the sort reads, so that sort is not counted.
@@ -3001,6 +2998,9 @@ pub(crate) fn materialized_stages(limited: bool) -> instrument::Stages {
     stages
 }
 
+/// DISTINCT / ORDER BY execution to the wire: materialize the rows, then page
+/// with LIMIT/OFFSET and emit.
+#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
 pub(crate) fn materialized_select<'a>(
     storage: &'a Storage,
     scope: &QueryScope<'a>,

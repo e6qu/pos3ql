@@ -1385,6 +1385,7 @@ enum DerivedNames {
 
 /// The `Filter` of the scan of a derived relation (a subquery, function or
 /// `VALUES` list) read alone: `condition`, when it reads only that relation.
+#[allow(clippy::too_many_arguments)]
 fn derived_relation_filter<'a>(
     storage: &Storage,
     txid: u32,
@@ -1455,6 +1456,7 @@ fn derived_relation_filter<'a>(
     deparse_qual(&context, &conjuncts[..count], arena)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn single_relation_quals<'a>(
     storage: &Storage,
     txid: u32,
@@ -6060,7 +6062,7 @@ pub(super) fn emit_rewritten(
             }
         })
     };
-    responder.row_description(&[ColDesc::new("QUERY PLAN", oid::TEXT, -1)])?;
+    responder.row_description(&[result_column(options.format)])?;
     if options.format == ExplainFormat::Text {
         for (index, query) in queries.iter().enumerate() {
             if index != 0 {
@@ -6094,6 +6096,20 @@ pub(super) fn emit_rewritten(
     Ok(Ok(()))
 }
 
+/// EXPLAIN's result column: `json` and `xml` documents carry their types,
+/// as PostgreSQL's `ExplainResultDesc` declares them.
+pub(super) const fn result_column(format: ExplainFormat) -> ColDesc<'static> {
+    ColDesc::new(
+        "QUERY PLAN",
+        match format {
+            ExplainFormat::Json => oid::JSON,
+            ExplainFormat::Xml => oid::XML,
+            ExplainFormat::Text | ExplainFormat::Yaml => oid::TEXT,
+        },
+        -1,
+    )
+}
+
 pub(super) fn emit_plan(
     plan: &Plan<'_>,
     options: ExplainOptions,
@@ -6110,7 +6126,7 @@ pub(super) fn emit_plan(
         Ok(document) => document,
         Err(error) => return Ok(Err(error)),
     };
-    responder.row_description(&[ColDesc::new("QUERY PLAN", oid::TEXT, -1)])?;
+    responder.row_description(&[result_column(options.format)])?;
     responder.data_row(&[Datum::Text(document)])?;
     responder.command_complete("EXPLAIN")?;
     Ok(Ok(()))

@@ -15196,8 +15196,8 @@ impl Engine {
             }
         };
         match statement {
-            Stmt::Explain { .. } => {
-                responder.row_description(&[ColDesc::new("QUERY PLAN", types::oid::TEXT, -1)])?;
+            Stmt::Explain { options, .. } => {
+                responder.row_description(&[explain::result_column(options.format)])?;
                 Ok(true)
             }
             Stmt::With { statement, .. } => {

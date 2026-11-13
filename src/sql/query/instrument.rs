@@ -285,7 +285,6 @@ impl Node {
 
     /// Opens one execution of the node, which ends when the returned loop
     /// is dropped. A start inside an open loop of the same node joins it.
-    #[must_use]
     pub(crate) fn start(self) -> Loop {
         self.begin();
         Loop(self)
@@ -528,11 +527,11 @@ mod tests {
             Slot::new(None),
         ];
         analyze(&mut slots, false, || {
-            let node = node(Role::Scan(0));
+            let scan = node(Role::Scan(0));
             for _ in 0..2 {
-                let _loop = node.start();
-                node.row();
-                node.filtered();
+                let _loop = scan.start();
+                scan.row();
+                scan.filtered();
             }
             let _derived = enter(Segment::Derived(1));
             let inner = node(Role::Scan(0));
@@ -555,9 +554,9 @@ mod tests {
         let mut slots = [Slot::new(Some(scan))];
         analyze(&mut slots, true, || {
             let _body = suspend();
-            let node = node(Role::Scan(0));
-            let _loop = node.start();
-            node.row();
+            let scan = node(Role::Scan(0));
+            let _loop = scan.start();
+            scan.row();
         });
         assert_eq!(slots[0].counters().loops, 0);
     }

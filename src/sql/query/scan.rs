@@ -6830,7 +6830,6 @@ fn reads_no_query_column(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// The error-safe `WHERE` conjuncts a nested loop checks at one join-order
 /// depth: those reading only that depth's relation, PostgreSQL's filter of
 /// its scan, and those also reading earlier relations, its join's filter.
@@ -6921,6 +6920,7 @@ fn count_leaf(nodes: &[DepthNodes], passed: bool) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_source_mode<'a>(
     storage: &'a Storage,
     scope: &QueryScope<'a>,

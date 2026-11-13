@@ -31402,6 +31402,16 @@ fn execute_bound_plpgsql_dynamic_query<'a>(
     query: BoundPlpgsqlCommand<'a>,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    // `FOR ... IN EXECUTE 'EXPLAIN ...'` reads the plan's lines.
+    if let Stmt::Explain { options, statement } = query.statement {
+        return execute_plpgsql_dynamic_explain(
+            context,
+            *options,
+            statement,
+            query.arguments,
+            &mut |line| emit(&[Datum::Text(line)]),
+        );
+    }
     let query = resolve_plpgsql_dynamic_prepared(context, query)?;
     let arena = context.arena;
     let txid = context.txn.txid;
@@ -34373,7 +34383,7 @@ fn execute_plpgsql_dynamic_explain(
                     txn,
                     (sqlprep, cursors),
                     guc,
-                    &mut *responder,
+                    responder,
                 )
             });
             let output = responder.finish_discard_query_output();
@@ -35978,6 +35988,10 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                     arena,
                     crate::sql::exec::DescriptionTarget::Sql,
                 )?,
+                Stmt::Explain { options, .. } => {
+                    columns[0] = super::explain::result_column(options.format);
+                    1
+                }
                 _ => 0,
             };
             for (field, column) in fields.iter_mut().zip(&columns[..width]) {
@@ -38343,9 +38357,8 @@ fn execute_trigger_step_in<'a>(
                                     columns[..3].copy_from_slice(&super::guc::SHOW_ALL_COLUMNS);
                                     3
                                 }
-                                Stmt::Explain { .. } if record_target => {
-                                    columns[0] =
-                                        ColDesc::new("QUERY PLAN", super::types::oid::TEXT, -1);
+                                Stmt::Explain { options, .. } if record_target => {
+                                    columns[0] = super::explain::result_column(options.format);
                                     1
                                 }
                                 _ => 0,

@@ -360,31 +360,40 @@ pub(crate) fn describe_data_modification_columns<'a>(
     if returning.is_empty() {
         return Ok(0);
     }
-    let (target, returning, target_alias, from) =
-        match crate::sql::query::resolve_view_for_dml(storage, target, txid, arena) {
-            Ok(Some(view)) => {
-                let rewritten = crate::sql::query::rewrite_view_dml(
-                    statement,
-                    target.name,
-                    view.base.name,
-                    view.base.schema.expect("view base is qualified"),
-                    view.columns,
-                    view.base_columns,
-                    storage,
-                    txid,
-                    arena,
-                )?;
-                let (returning, target_alias, from) = match rewritten {
-                    Stmt::Insert(insert) => (insert.returning, insert.alias, None),
-                    Stmt::Update(update) => (update.returning, update.alias, update.from),
-                    Stmt::Delete(delete) => (delete.returning, delete.alias, delete.using),
-                    _ => unreachable!("view rewrite keeps its statement kind"),
-                };
-                (view.base, returning, target_alias, from)
-            }
-            Ok(None) => (target, returning, target_alias, from),
-            Err(error) => return Err(error),
-        };
+    let (target, returning, target_alias, from) = match crate::sql::query::resolve_view_for_dml(
+        storage,
+        target,
+        txid,
+        arena,
+        match statement {
+            Stmt::Insert(_) => crate::sql::query::ViewWrite::Insert,
+            Stmt::Update(_) => crate::sql::query::ViewWrite::Update,
+            _ => crate::sql::query::ViewWrite::Delete,
+        },
+    ) {
+        Ok(Some(view)) => {
+            let rewritten = crate::sql::query::rewrite_view_dml(
+                statement,
+                target.name,
+                view.base.name,
+                view.base.schema.expect("view base is qualified"),
+                view.columns,
+                view.base_columns,
+                storage,
+                txid,
+                arena,
+            )?;
+            let (returning, target_alias, from) = match rewritten {
+                Stmt::Insert(insert) => (insert.returning, insert.alias, None),
+                Stmt::Update(update) => (update.returning, update.alias, update.from),
+                Stmt::Delete(delete) => (delete.returning, delete.alias, delete.using),
+                _ => unreachable!("view rewrite keeps its statement kind"),
+            };
+            (view.base, returning, target_alias, from)
+        }
+        Ok(None) => (target, returning, target_alias, from),
+        Err(error) => return Err(error),
+    };
     if let Some(from) = from {
         return crate::sql::exec::describe_dml_from_returning(
             storage,
@@ -4900,6 +4909,29 @@ pub(crate) fn user_routine_call_result(
     routine
         .and_then(|routine| routine.function_result_contract())
         .or_else(|| {
+            // PostgreSQL resolves a call to a trigger function, typed
+            // `trigger` or `event_trigger`; running it fails.
+            if bound_oid.is_none() && arguments.is_empty() && argument_names.is_empty() {
+                for (kind, pseudo) in [
+                    (
+                        crate::storage::RoutineCallKind::Trigger,
+                        crate::sql::types::PseudoType::Trigger,
+                    ),
+                    (
+                        crate::storage::RoutineCallKind::EventTrigger,
+                        crate::sql::types::PseudoType::EventTrigger,
+                    ),
+                ] {
+                    if let crate::storage::RoutineCallSelection::Stored(_) =
+                        storage.select_routine_call(name, &[], &[], false, txid, kind)
+                    {
+                        return Some(crate::storage::RoutineResult {
+                            ctype: ColType::Pseudo(pseudo),
+                            user_type: None,
+                        });
+                    }
+                }
+            }
             // A stored query binds an aggregate call to its OID.
             if let Some(oid) = bound_oid {
                 // Its declared result is exact unless polymorphic.

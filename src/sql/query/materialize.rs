@@ -753,7 +753,11 @@ fn union_all_branches_rerun(
 /// Whether `expression` calls an aggregate outside a nested subquery. The
 /// subquery's own columns are not in scope here, so a call is classified by
 /// name: a built-in aggregate or any visible user-defined aggregate.
-fn expression_has_aggregate_use(expression: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
+pub(super) fn expression_has_aggregate_use(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> bool {
     if let Expr::Call {
         name,
         args,

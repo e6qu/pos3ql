@@ -4225,6 +4225,9 @@ fn capture_table_func_routine(
             txid,
         )
         .ok_or_else(|| srf_signature_error(tref.table))?;
+    if let Some(error) = super::trigger_function_source_error(storage, slot, tref.table, txid) {
+        return Err(error);
+    }
     let routine = storage
         .function_for_captured_call(
             oid,

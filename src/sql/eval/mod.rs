@@ -10693,6 +10693,29 @@ fn unsupported_builtin_function(oid: i32, hooks: &EvalHooks<'_, '_>) -> SqlError
             oid
         );
     };
+    // PostgreSQL's built-in trigger functions check how they were called.
+    match oid {
+        1291 => {
+            return sql_err!(
+                sqlstate::TRIGGER_PROTOCOL_VIOLATED,
+                "suppress_redundant_updates_trigger: must be called as trigger"
+            );
+        }
+        1250 | 1644..=1655 => {
+            return sql_err!(
+                sqlstate::TRIGGER_PROTOCOL_VIOLATED,
+                "function \"{}\" was not called by trigger manager",
+                signature.name
+            );
+        }
+        3752 | 3753 => {
+            return sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "tsvector_update_trigger: not fired by trigger manager"
+            );
+        }
+        _ => {}
+    }
     let mut message = crate::util::StackStr::<192>::new();
     let _ = write!(message, "function {}(", signature.name);
     for (index, &argument) in signature.arguments.iter().enumerate() {

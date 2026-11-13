@@ -893,23 +893,7 @@ pub(super) fn grouped_rows<'a>(
     // expanded column is validated (and projected) like a written one —
     // PostgreSQL accepts `SELECT * FROM t GROUP BY a, b, c`.
     let statement = expand_grouped_stars(statement, scope, storage, txid, arena)?;
-    // Validate: non-aggregate select items must be GROUP BY expressions.
-    for item in statement.items {
-        let SelectItem::Expr { expression, .. } = item else {
-            return Err(sql_err!(
-                sqlstate::GROUPING_ERROR,
-                "SELECT * must appear in the GROUP BY clause or be used in an aggregate function"
-            ));
-        };
-        if let Some(column) = ungrouped_column(expression, statement.group_by, scope, agg_nodes) {
-            return Err(ungrouped_error(column, scope));
-        }
-    }
-    if let Some(h) = statement.having
-        && let Some(column) = ungrouped_column(h, statement.group_by, scope, agg_nodes)
-    {
-        return Err(ungrouped_error(column, scope));
-    }
+    check_grouped_columns(statement, scope, agg_nodes)?;
 
     let expressions: &mut [&Expr] = arena
         .alloc_slice_with(
@@ -1412,6 +1396,44 @@ fn expand_grouped_stars<'a>(
         })
         .map_err(|_| arena_full())?;
     Ok(&*out)
+}
+
+/// Non-aggregate select items and `HAVING` must read only grouped columns.
+fn check_grouped_columns<'a>(
+    statement: &Select<'a>,
+    scope: &QueryScope<'a>,
+    agg_nodes: &[(*const Expr<'a>, &'a Expr<'a>)],
+) -> Result<(), SqlError> {
+    for item in statement.items {
+        let SelectItem::Expr { expression, .. } = item else {
+            return Err(sql_err!(
+                sqlstate::GROUPING_ERROR,
+                "SELECT * must appear in the GROUP BY clause or be used in an aggregate function"
+            ));
+        };
+        if let Some(column) = ungrouped_column(expression, statement.group_by, scope, agg_nodes) {
+            return Err(ungrouped_error(column, scope));
+        }
+    }
+    if let Some(h) = statement.having
+        && let Some(column) = ungrouped_column(h, statement.group_by, scope, agg_nodes)
+    {
+        return Err(ungrouped_error(column, scope));
+    }
+    Ok(())
+}
+
+/// [`grouped_rows`]'s grouping check for a query that is only described.
+pub(super) fn validate_grouped_columns<'a>(
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    agg_nodes: &[(*const Expr<'a>, &'a Expr<'a>)],
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let statement = expand_grouped_stars(statement, scope, storage, txid, arena)?;
+    check_grouped_columns(statement, scope, agg_nodes)
 }
 
 /// PostgreSQL's ungrouped-column error, naming the column as `table.column`

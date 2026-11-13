@@ -574,12 +574,14 @@ written before the failing modifier are reported first, as PostgreSQL's
 analysis order finds them; in other statements the modifier error comes first.
 Custom parameters with a dotted name (`SET myapp.tenant = '7'`,
 `current_setting('myapp.tenant')`) fail with `42704` where PostgreSQL stores
-them as placeholders. Writes to system catalogs and catalog views fail with
-`42P01` (`relation "pg_settings" does not exist`), so `UPDATE pg_settings SET
-setting = ...` does not set the parameter as PostgreSQL's rule does. Calling a
-trigger function directly (`SELECT f()` for a function returning `trigger`)
-fails during analysis with `42704` or `42883` where PostgreSQL fails when the
-call runs (`0A000` for PL/pgSQL, `39P01` for built-in trigger functions).
+them as placeholders. `UPDATE pg_settings` runs PostgreSQL's rule
+(`set_config` per selected row, then `UPDATE 0`) from a top-level statement
+only; inside a routine body, and for other catalog views and system
+catalogs, writes fail with `42P01`. Writing through a view whose query reads
+another view, or that computes a column, fails with `0A000` (`writing through
+view "v" is not supported`) where PostgreSQL writes the base relation and
+rejects only an assignment to a computed column; `MERGE` into an
+automatically updatable view fails the same way.
 A trigger's returned row is checked by column type identity only: a
 `varchar(5)` column accepts a returned `varchar(10)` field where PostgreSQL
 also compares type modifiers. `ROW(...)::t` for a table's row type fails

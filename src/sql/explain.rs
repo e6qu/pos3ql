@@ -885,6 +885,9 @@ pub(super) fn plan_select<'a>(
         )?),
         None => None,
     };
+    if let Some(scope) = scope.as_ref() {
+        query::validate_static_grouping(statement, scope, storage, txid, arena)?;
+    }
     let capacity = scope
         .as_ref()
         .map_or(MAX_EXPLAIN_STAGES, |scope| scope.n * 2 + MAX_EXPLAIN_STAGES);

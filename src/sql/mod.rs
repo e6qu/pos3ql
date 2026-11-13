@@ -17016,58 +17016,63 @@ impl Engine {
                         progress,
                     );
                 }
-                let (insert, view_check) =
-                    match query::resolve_view_for_dml(storage, insert.table, txn.txid, arena) {
-                        Ok(Some(view)) => {
-                            let view_check = Some(exec::ViewCheck {
-                                predicate: view.check_option.and(view.where_clause),
-                                view_name: insert.table.name,
-                                defaults: exec::ViewInsertDefaults {
-                                    base_columns: view.base_columns,
-                                    columns: view.defaults,
-                                    inputs: view.default_inputs,
-                                },
-                            });
-                            let rewritten = match query::rewrite_view_dml(
-                                statement,
-                                insert.table.name,
-                                view.base.name,
-                                view.base.schema.expect("view base is qualified"),
-                                view.columns,
-                                view.base_columns,
-                                storage,
-                                txn.txid,
-                                arena,
-                            ) {
-                                Ok(Stmt::Insert(rewritten)) => rewritten,
-                                Ok(_) => unreachable!("insert rewrite keeps its statement kind"),
-                                Err(error) => return Ok(Err(error)),
-                            };
-                            let columns = if rewritten.columns.is_empty() {
-                                view.base_columns
-                            } else {
-                                rewritten.columns
-                            };
-                            let rewritten = match arena.alloc(Insert {
-                                source_position: rewritten.source_position,
-                                table: view.base,
-                                alias: rewritten.alias,
-                                columns,
-                                rows: rewritten.rows,
-                                select: rewritten.select,
-                                on_conflict: rewritten.on_conflict,
-                                returning: rewritten.returning,
-                                overriding: rewritten.overriding,
-                                values_defaults: rewritten.values_defaults,
-                            }) {
-                                Ok(rewritten) => &*rewritten,
-                                Err(_) => return Ok(Err(query::arena_full_pub())),
-                            };
-                            (rewritten, view_check)
-                        }
-                        Ok(None) => (insert, None),
-                        Err(error) => return Ok(Err(error)),
-                    };
+                let (insert, view_check) = match query::resolve_view_for_dml(
+                    storage,
+                    insert.table,
+                    txn.txid,
+                    arena,
+                    query::ViewWrite::Insert,
+                ) {
+                    Ok(Some(view)) => {
+                        let view_check = Some(exec::ViewCheck {
+                            predicate: view.check_option.and(view.where_clause),
+                            view_name: insert.table.name,
+                            defaults: exec::ViewInsertDefaults {
+                                base_columns: view.base_columns,
+                                columns: view.defaults,
+                                inputs: view.default_inputs,
+                            },
+                        });
+                        let rewritten = match query::rewrite_view_dml(
+                            statement,
+                            insert.table.name,
+                            view.base.name,
+                            view.base.schema.expect("view base is qualified"),
+                            view.columns,
+                            view.base_columns,
+                            storage,
+                            txn.txid,
+                            arena,
+                        ) {
+                            Ok(Stmt::Insert(rewritten)) => rewritten,
+                            Ok(_) => unreachable!("insert rewrite keeps its statement kind"),
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        let columns = if rewritten.columns.is_empty() {
+                            view.base_columns
+                        } else {
+                            rewritten.columns
+                        };
+                        let rewritten = match arena.alloc(Insert {
+                            source_position: rewritten.source_position,
+                            table: view.base,
+                            alias: rewritten.alias,
+                            columns,
+                            rows: rewritten.rows,
+                            select: rewritten.select,
+                            on_conflict: rewritten.on_conflict,
+                            returning: rewritten.returning,
+                            overriding: rewritten.overriding,
+                            values_defaults: rewritten.values_defaults,
+                        }) {
+                            Ok(rewritten) => &*rewritten,
+                            Err(_) => return Ok(Err(query::arena_full_pub())),
+                        };
+                        (rewritten, view_check)
+                    }
+                    Ok(None) => (insert, None),
+                    Err(error) => return Ok(Err(error)),
+                };
                 exec::insert(
                     storage,
                     txn,
@@ -17112,59 +17117,64 @@ impl Engine {
                         progress,
                     );
                 }
-                let (update, view_check) =
-                    match query::resolve_view_for_dml(storage, update.table, txn.txid, arena) {
-                        Ok(Some(view)) => {
-                            let view_check = view.check_option.map(|_| exec::ViewCheck {
-                                predicate: view.where_clause,
-                                view_name: update.table.name,
-                                defaults: exec::ViewInsertDefaults {
-                                    base_columns: view.base_columns,
-                                    columns: view.defaults,
-                                    inputs: view.default_inputs,
-                                },
-                            });
-                            let rewritten = match query::rewrite_view_dml(
-                                statement,
-                                update.table.name,
-                                view.base.name,
-                                view.base.schema.expect("view base is qualified"),
-                                view.columns,
-                                view.base_columns,
-                                storage,
-                                txn.txid,
-                                arena,
-                            ) {
-                                Ok(Stmt::Update(rewritten)) => rewritten,
-                                Ok(_) => unreachable!("update rewrite keeps its statement kind"),
-                                Err(error) => return Ok(Err(error)),
-                            };
-                            let where_clause = match query::and_where(
-                                view.where_clause,
-                                rewritten.where_clause,
-                                arena,
-                            ) {
-                                Ok(where_clause) => where_clause,
-                                Err(error) => return Ok(Err(error)),
-                            };
-                            let rewritten = match arena.alloc(Update {
-                                source_position: rewritten.source_position,
-                                table: view.base,
-                                inheritance: view.base_inheritance,
-                                alias: update.alias,
-                                assignments: rewritten.assignments,
-                                from: rewritten.from,
-                                where_clause,
-                                returning: rewritten.returning,
-                            }) {
-                                Ok(rewritten) => &*rewritten,
-                                Err(_) => return Ok(Err(query::arena_full_pub())),
-                            };
-                            (rewritten, view_check)
-                        }
-                        Ok(None) => (update, None),
-                        Err(error) => return Ok(Err(error)),
-                    };
+                let (update, view_check) = match query::resolve_view_for_dml(
+                    storage,
+                    update.table,
+                    txn.txid,
+                    arena,
+                    query::ViewWrite::Update,
+                ) {
+                    Ok(Some(view)) => {
+                        let view_check = view.check_option.map(|_| exec::ViewCheck {
+                            predicate: view.where_clause,
+                            view_name: update.table.name,
+                            defaults: exec::ViewInsertDefaults {
+                                base_columns: view.base_columns,
+                                columns: view.defaults,
+                                inputs: view.default_inputs,
+                            },
+                        });
+                        let rewritten = match query::rewrite_view_dml(
+                            statement,
+                            update.table.name,
+                            view.base.name,
+                            view.base.schema.expect("view base is qualified"),
+                            view.columns,
+                            view.base_columns,
+                            storage,
+                            txn.txid,
+                            arena,
+                        ) {
+                            Ok(Stmt::Update(rewritten)) => rewritten,
+                            Ok(_) => unreachable!("update rewrite keeps its statement kind"),
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        let where_clause = match query::and_where(
+                            view.where_clause,
+                            rewritten.where_clause,
+                            arena,
+                        ) {
+                            Ok(where_clause) => where_clause,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        let rewritten = match arena.alloc(Update {
+                            source_position: rewritten.source_position,
+                            table: view.base,
+                            inheritance: view.base_inheritance,
+                            alias: update.alias,
+                            assignments: rewritten.assignments,
+                            from: rewritten.from,
+                            where_clause,
+                            returning: rewritten.returning,
+                        }) {
+                            Ok(rewritten) => &*rewritten,
+                            Err(_) => return Ok(Err(query::arena_full_pub())),
+                        };
+                        (rewritten, view_check)
+                    }
+                    Ok(None) => (update, None),
+                    Err(error) => return Ok(Err(error)),
+                };
                 exec::update(
                     storage,
                     txn,
@@ -17207,47 +17217,52 @@ impl Engine {
                         progress,
                     );
                 }
-                let delete =
-                    match query::resolve_view_for_dml(storage, delete.table, txn.txid, arena) {
-                        Ok(Some(view)) => {
-                            let rewritten = match query::rewrite_view_dml(
-                                statement,
-                                delete.table.name,
-                                view.base.name,
-                                view.base.schema.expect("view base is qualified"),
-                                view.columns,
-                                view.base_columns,
-                                storage,
-                                txn.txid,
-                                arena,
-                            ) {
-                                Ok(Stmt::Delete(rewritten)) => rewritten,
-                                Ok(_) => unreachable!("delete rewrite keeps its statement kind"),
-                                Err(error) => return Ok(Err(error)),
-                            };
-                            let where_clause = match query::and_where(
-                                view.where_clause,
-                                rewritten.where_clause,
-                                arena,
-                            ) {
-                                Ok(where_clause) => where_clause,
-                                Err(error) => return Ok(Err(error)),
-                            };
-                            match arena.alloc(Delete {
-                                table: view.base,
-                                inheritance: view.base_inheritance,
-                                alias: delete.alias,
-                                using: rewritten.using,
-                                where_clause,
-                                returning: rewritten.returning,
-                            }) {
-                                Ok(rewritten) => &*rewritten,
-                                Err(_) => return Ok(Err(query::arena_full_pub())),
-                            }
+                let delete = match query::resolve_view_for_dml(
+                    storage,
+                    delete.table,
+                    txn.txid,
+                    arena,
+                    query::ViewWrite::Delete,
+                ) {
+                    Ok(Some(view)) => {
+                        let rewritten = match query::rewrite_view_dml(
+                            statement,
+                            delete.table.name,
+                            view.base.name,
+                            view.base.schema.expect("view base is qualified"),
+                            view.columns,
+                            view.base_columns,
+                            storage,
+                            txn.txid,
+                            arena,
+                        ) {
+                            Ok(Stmt::Delete(rewritten)) => rewritten,
+                            Ok(_) => unreachable!("delete rewrite keeps its statement kind"),
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        let where_clause = match query::and_where(
+                            view.where_clause,
+                            rewritten.where_clause,
+                            arena,
+                        ) {
+                            Ok(where_clause) => where_clause,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        match arena.alloc(Delete {
+                            table: view.base,
+                            inheritance: view.base_inheritance,
+                            alias: delete.alias,
+                            using: rewritten.using,
+                            where_clause,
+                            returning: rewritten.returning,
+                        }) {
+                            Ok(rewritten) => &*rewritten,
+                            Err(_) => return Ok(Err(query::arena_full_pub())),
                         }
-                        Ok(None) => delete,
-                        Err(error) => return Ok(Err(error)),
-                    };
+                    }
+                    Ok(None) => delete,
+                    Err(error) => return Ok(Err(error)),
+                };
                 exec::delete(
                     storage,
                     txn,
@@ -17270,7 +17285,46 @@ impl Engine {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// `UPDATE pg_settings` runs PostgreSQL's `pg_settings_u` rule:
+    /// `SELECT set_config(old.name, new.setting, false)` for each row whose
+    /// new name equals its old one, then `UPDATE 0` from the `DO INSTEAD
+    /// NOTHING` rule `pg_settings_n`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the rule's query runs with every execution service"
+    )]
+    fn update_pg_settings(
+        &mut self,
+        update: &ast::Update<'_>,
+        arena: &Arena,
+        params: &[Datum],
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let select = match pg_settings_rule_query(update, arena) {
+            Ok(select) => select,
+            Err(error) => return Ok(Err(error)),
+        };
+        responder.begin_command_completion_capture();
+        let outcome =
+            self.execute_select(select, arena, params, txn, sqlprep, cursors, guc, responder)?;
+        if outcome.is_err() {
+            return Ok(outcome);
+        }
+        if responder.take_command_completion_tag(arena, false).is_err() {
+            return Ok(Err(crate::sql::eval::arena_full()));
+        }
+        responder.command_complete("UPDATE 0")?;
+        Ok(Ok(()))
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a SELECT runs with every execution service"
+    )]
     fn execute_select(
         &mut self,
         statement: &ast::Select<'_>,
@@ -17794,7 +17848,9 @@ impl Engine {
                 }
             }
         }
-        // A data-modifying `WITH` hands its main write's completion over too.
+        // A data-modifying `WITH` hands its main write's completion over too:
+        // its unread queries run first, then every AFTER event runs on the
+        // engine, as PostgreSQL fires them at the statement's end.
         let main_statement = match statement {
             Stmt::With { statement, .. } => *statement,
             statement => statement,
@@ -19854,6 +19910,31 @@ impl Engine {
                 capture,
                 progress.as_deref_mut(),
             )?;
+            if let Err(error) = &outcome
+                && error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION
+                && txn.pending_write_completion.is_some()
+            {
+                // The main write handed its completion to the caller, which
+                // fires the AFTER events after the unread queries run.
+                let unread = match progress.as_deref_mut() {
+                    Some(progress) => {
+                        progress.finish_step();
+                        progress.begin_step(1, false, txn, responder).map(|_| ())
+                    }
+                    None => Ok(()),
+                }
+                .and_then(|()| {
+                    self.run_unread_dml_ctes(
+                        ctes, main, dml_mats, txn, arena, params, guc, cursors, responder,
+                    )
+                });
+                if let Err(error) = unread {
+                    txn.pending_write_completion = None;
+                    let _sent = responder.truncate_to(output_mark);
+                    return Ok(Err(error));
+                }
+                return Ok(outcome);
+            }
             if outcome.is_err() {
                 return Ok(outcome);
             }
@@ -23245,6 +23326,14 @@ impl Engine {
                     responder,
                 )
             }
+            Stmt::Insert(insert) if is_pg_settings(insert.table) => Ok(Err(
+                query::function_view_write_error("pg_settings", query::ViewWrite::Insert),
+            )),
+            Stmt::Delete(delete) if is_pg_settings(delete.table) => Ok(Err(
+                query::function_view_write_error("pg_settings", query::ViewWrite::Delete),
+            )),
+            Stmt::Update(update) if is_pg_settings(update.table) => self
+                .update_pg_settings(update, arena, params, txn, sqlprep, cursors, guc, responder),
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_)
                 if reset_workspace =>
             {
@@ -27051,6 +27140,150 @@ fn fixed_setting(name: &str) -> Option<&'static str> {
 /// The per-connection prepared statements and cursors a statement's trigger
 /// bodies and referential actions may use through the engine.
 type StatementServices<'s> = (&'s mut SqlPreparedPool, &'s mut cursor::CursorPool);
+
+/// Whether an `UPDATE` targets the built-in `pg_settings` view, which the
+/// search path always finds in `pg_catalog` first.
+fn is_pg_settings(table: ast::QualName<'_>) -> bool {
+    table.name == "pg_settings" && matches!(table.schema, None | Some("pg_catalog"))
+}
+
+/// The query of `pg_settings_u` for one `UPDATE pg_settings`: the updated
+/// `setting` (or the old one) is applied to each row the `WHERE` selects
+/// whose updated `name` still equals its old one.
+fn pg_settings_rule_query<'a>(
+    update: &ast::Update<'a>,
+    arena: &'a Arena,
+) -> Result<&'a ast::Select<'a>, SqlError> {
+    if !update.returning.items.is_empty() {
+        crate::sql::eval::stash_diagnostic(
+            None,
+            Some(crate::util::StackStr::from_str(
+                "You need an unconditional ON UPDATE DO INSTEAD rule with a RETURNING clause.",
+            )),
+        );
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot perform UPDATE RETURNING on relation \"pg_settings\""
+        ));
+    }
+    if update.from.is_some() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "UPDATE pg_settings with FROM is not supported"
+        ));
+    }
+    let template = parser::parse_query(
+        "SELECT set_config(name, setting, false) FROM pg_catalog.pg_settings WHERE name = name",
+        arena,
+    )?;
+    let ast::SelectItem::Expr {
+        expression:
+            call @ ast::Expr::Call {
+                args: [name, setting, local],
+                ..
+            },
+        ..
+    } = template.items[0]
+    else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "pg_settings rule template did not parse as one call"
+        ));
+    };
+    let mut new_name = None;
+    let mut new_setting = *setting;
+    for &(column, value) in update.assignments {
+        if !PG_SETTINGS_COLUMNS.contains(&column) {
+            return Err(crate::sql::error_position::at_subject(
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" of relation \"pg_settings\" does not exist",
+                    column
+                ),
+                column,
+            ));
+        }
+        match column {
+            "name" => new_name = Some(value),
+            "setting" => new_setting = value,
+            _ => {}
+        }
+    }
+    let arguments = arena
+        .alloc_slice_copy(&[*name, new_setting, *local])
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let mut call = *call;
+    if let ast::Expr::Call { args, .. } = &mut call {
+        *args = arguments;
+    }
+    let call = &*arena
+        .alloc(call)
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let renamed = match (new_name, template.where_clause) {
+        (
+            Some(new_name),
+            Some(ast::Expr::Binary {
+                source_position,
+                operator,
+                right,
+                ..
+            }),
+        ) => Some(
+            &*arena
+                .alloc(ast::Expr::Binary {
+                    source_position: *source_position,
+                    operator: *operator,
+                    left: new_name,
+                    right,
+                })
+                .map_err(|_| crate::sql::eval::arena_full())?,
+        ),
+        _ => None,
+    };
+    let where_clause = query::and_where(update.where_clause, renamed, arena)?;
+    let items = arena
+        .alloc_slice_copy(&[ast::SelectItem::Expr {
+            expression: call,
+            alias: None,
+        }])
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let mut from = template.from.ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "pg_settings rule template has no FROM"
+        )
+    })?;
+    from.base.alias = update.alias;
+    let mut select = *template;
+    select.items = items;
+    select.from = Some(from);
+    select.where_clause = where_clause;
+    arena
+        .alloc(select)
+        .map(|select| &*select)
+        .map_err(|_| crate::sql::eval::arena_full())
+}
+
+/// `pg_settings`'s columns, which an `UPDATE` may assign.
+const PG_SETTINGS_COLUMNS: [&str; 17] = [
+    "name",
+    "setting",
+    "unit",
+    "category",
+    "short_desc",
+    "extra_desc",
+    "context",
+    "vartype",
+    "source",
+    "min_val",
+    "max_val",
+    "enumvals",
+    "boot_val",
+    "reset_val",
+    "sourcefile",
+    "sourceline",
+    "pending_restart",
+];
 
 pub(crate) const SETTING_NAMES: &[&str] = &[
     "application_name",

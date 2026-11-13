@@ -51253,7 +51253,13 @@ pub fn create_view(
         Ok(publication) => {
             let new_slot = publication.slot();
             if check_option.is_some() {
-                match super::query::resolve_view_for_dml(storage, *name, txn.txid, arena) {
+                match super::query::resolve_view_for_dml(
+                    storage,
+                    *name,
+                    txn.txid,
+                    arena,
+                    super::query::ViewWrite::CheckOption,
+                ) {
                     Ok(Some(_)) => {}
                     Ok(None) => {
                         storage.finish_view_publication(
@@ -51913,7 +51919,13 @@ fn alter_view_inner(
                             crate::storage::ViewSecurityBarrier::from_enabled(*enabled);
                     }
                     ViewOption::CheckOption(option) => {
-                        match super::query::resolve_view_for_dml(storage, name, txn.txid, arena) {
+                        match super::query::resolve_view_for_dml(
+                            storage,
+                            name,
+                            txn.txid,
+                            arena,
+                            super::query::ViewWrite::CheckOption,
+                        ) {
                             Ok(Some(_)) => {}
                             Ok(None) => {
                                 return sql_fail(sql_err!(
@@ -75649,6 +75661,30 @@ pub(crate) fn merge<'a>(
         schema: statement.target.schema,
         name: statement.target.name,
     };
+    if let Some(crate::storage::ResolvedRelation::View(_)) =
+        storage.resolve_relation(target_qual.schema, target_qual.name, txn.txid)
+    {
+        // PostgreSQL rejects a view that is not automatically updatable for
+        // the first action that would write it.
+        for when in statement.whens {
+            let write = match when.action() {
+                MergeAction::Insert { .. } => super::query::ViewWrite::MergeInsert,
+                MergeAction::Update(_) => super::query::ViewWrite::MergeUpdate,
+                MergeAction::Delete => super::query::ViewWrite::MergeDelete,
+                MergeAction::DoNothing => continue,
+            };
+            if let Err(error) =
+                super::query::resolve_view_for_dml(storage, target_qual, txn.txid, arena, write)
+            {
+                return sql_fail(error);
+            }
+        }
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "MERGE into view \"{}\" is not supported",
+            target_qual.name
+        ));
+    }
     let table_index = match resolve_dml_table(storage, &target_qual, txn.txid) {
         Ok(i) => i,
         Err(e) => return sql_fail(e),

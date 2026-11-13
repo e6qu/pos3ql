@@ -1085,6 +1085,14 @@ impl StepRegion {
         })
     }
 
+    /// The region of a row whose step has not ended yet.
+    pub(crate) const fn unfinished() -> Self {
+        Self {
+            start: None,
+            end: super::sequence::StatementReplayCursor::EMPTY,
+        }
+    }
+
     /// A reader reading the step's row again replays past the region.
     fn skip(self) -> Result<(), SqlError> {
         super::sequence::skip_replay_region(self.start, self.end)
@@ -2168,18 +2176,19 @@ impl RoutineInvocationState {
     }
 
     /// Takes the write progress of a query's next step, starting the query
-    /// with `start` at its first step. At most `levels` queries run at once.
+    /// with `start` at its first step. The records of the statement's
+    /// `queries` data-modifying `WITH` queries are leased at the first.
     pub(crate) fn take_producer_progress(
         &self,
         key: (usize, usize),
         pool: &std::sync::Arc<crate::mem::lease_pool::LeasePool>,
-        levels: usize,
+        queries: usize,
         start: impl FnOnce() -> Result<super::exec::RowProgress, SqlError>,
     ) -> Result<super::exec::RowProgress, SqlError> {
         let table = self.write_table();
         let mut producers = table.producers.borrow_mut();
         if producers.is_none() {
-            *producers = Some(pool.lease::<WriteProducer>(levels).map_err(|error| {
+            *producers = Some(pool.lease::<WriteProducer>(queries).map_err(|error| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "data-modifying WITH query progress: {}",
@@ -2196,11 +2205,10 @@ impl RoutineInvocationState {
                 )
             });
         }
-        if producers.len() == levels {
+        if producers.len() == queries {
             return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "data-modifying WITH queries running as their rows are read exceed the {} write_step_levels",
-                levels
+                sqlstate::INTERNAL_ERROR,
+                "a statement ran more data-modifying WITH queries than it has"
             ));
         }
         producers
@@ -2257,6 +2265,27 @@ impl RoutineInvocationState {
         })
     }
 
+    /// Gives the rows from index `first` on the region of the step that
+    /// returned them.
+    pub(crate) fn finish_produced_rows(
+        &self,
+        key: (usize, usize),
+        first: usize,
+        region: StepRegion,
+        arena: &Arena,
+    ) -> Result<(), SqlError> {
+        self.producer_mut(key, |producer| {
+            producer
+                .rows
+                .with_mut_slice(arena, |rows| {
+                    for row in rows.iter_mut().skip(first) {
+                        row.region = region;
+                    }
+                })
+                .map_err(|_| inactive_pending_call())
+        })
+    }
+
     /// Records that the query ended in a step that consumed `region`.
     pub(crate) fn finish_producer(
         &self,
@@ -2269,14 +2298,15 @@ impl RoutineInvocationState {
         })
     }
 
-    /// Gives back the write progress a step took.
+    /// Gives back the write progress a step took; a query that ended keeps
+    /// only its rows.
     pub(crate) fn return_producer_progress(
         &self,
         key: (usize, usize),
         progress: super::exec::RowProgress,
     ) -> Result<(), SqlError> {
         self.producer_mut(key, |producer| {
-            producer.progress = Some(progress);
+            producer.progress = producer.end.is_none().then_some(progress);
             Ok(())
         })
     }
@@ -2297,7 +2327,7 @@ impl RoutineInvocationState {
         read: usize,
     ) -> Result<(), SqlError> {
         self.producer_mut(key, |producer| {
-            producer.driven = driven;
+            producer.driven = driven.filter(|_| producer.end.is_none());
             producer.read = read;
             Ok(())
         })

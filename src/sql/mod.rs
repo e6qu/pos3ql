@@ -15431,12 +15431,11 @@ impl Engine {
         let key = write.key();
         let snapshot = self.storage.read_snapshot();
         let pool = std::sync::Arc::clone(&self.storage.execution_control);
-        let mut progress = match invocations.take_producer_progress(
-            key,
-            &pool,
-            self.storage.write_step_levels,
-            || exec::RowProgress::new(&self.storage),
-        ) {
+        // SAFETY: the loop completing this call still executes the statement.
+        let (with, _) = unsafe { write.statement() };
+        let mut progress = match invocations.take_producer_progress(key, &pool, with.len(), || {
+            exec::RowProgress::new(&self.storage)
+        }) {
             Ok(progress) => progress,
             Err(error) => return Ok(Err(error)),
         };
@@ -15711,7 +15710,10 @@ impl Engine {
             matches!(with[write.index].dml, Some(Stmt::Insert(insert)) if insert.select.is_none());
         let (produced, _) = invocations.producer_state(key);
         let produce = (values && write.row.is_some()).then_some(produced as u64 + 1);
-        let (rows, region, finished) = loop {
+        // Rows an attempt returned stay returned: the next attempt continues
+        // at the unfinished row. Their journal region is known at the end.
+        let first = invocations.producer_state(key).0;
+        let (region, finished) = loop {
             // SAFETY: nothing an earlier attempt left below the retained tail
             // is read again.
             unsafe { arena.rewind_to(attempt_mark) };
@@ -15743,15 +15745,18 @@ impl Engine {
                 },
             );
             self.storage.set_read_snapshot(snapshot);
+            for row in rows {
+                invocations.add_produced_row(key, row, query::StepRegion::unfinished(), arena)?;
+            }
             let error = match result {
-                Ok(()) => break (rows, query::StepRegion::finish(start, work)?, true),
+                Ok(()) => break (query::StepRegion::finish(start, work)?, true),
                 Err(error) => error,
             };
             if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
                 return Err(error);
             }
             if calls.take_produced() {
-                break (rows, query::StepRegion::finish(start, work)?, false);
+                break (query::StepRegion::finish(start, work)?, false);
             }
             let unfinished = progress.unfinished_row(txn)?;
             if unfinished.is_none() && txn.transaction_effect_mark() != effects {
@@ -15783,9 +15788,7 @@ impl Engine {
             }
         };
         progress.produce_until(None);
-        for row in rows {
-            invocations.add_produced_row(key, row, region, arena)?;
-        }
+        invocations.finish_produced_rows(key, first, region, arena)?;
         if finished {
             invocations.finish_producer(key, region)?;
         }

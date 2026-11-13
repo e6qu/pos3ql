@@ -143,16 +143,18 @@ is owned.
   synchronously: a step's foreign key check that waited resumed the step at a
   completion position past its last row and then waited again without a new
   GET, a loop the download bound does not see. A data-modifying `WITH`
-  sub-statement that the main statement reads runs to completion when first
-  read, so its `AFTER` events queue before the main statement's own, and
-  its volatile calls run before the main statement's later ones; PostgreSQL
-  runs it as the main statement reads its rows, so both interleave (one
-  that nothing reads already runs after the main statement, last one first,
-  as in PostgreSQL). Matching that order needs sub-statements that run as
-  their rows are read, by the
-  [design](docs/architecture.md#write-sub-statements-that-run-as-their-rows-are-read):
-  producer nodes over retained selections, and a streaming
-  `INSERT ... SELECT` source.
+  `INSERT` runs as its rows are read, as PostgreSQL's CTE scan pulls its
+  ModifyTable node (`src/sql/driven_insert.rs`): each read past the rows it
+  returned runs one more step, which writes source rows until one returns a
+  row, so row triggers, calls and sequence values interleave with the
+  reader's and `AFTER` events queue in PostgreSQL's order; queries read only
+  partly, or not at all, then run to their end, last one first. The reader
+  is a `SELECT` whose single `FROM` item is the query (also each query of a
+  `UNION ALL` of such `SELECT`s), another such `INSERT ... SELECT`, or a
+  top-level `INSERT ... SELECT` from it; any other reader (a join, a sort, a
+  `SELECT` without calls) reads the query whole at its first read, as
+  before, and an `UPDATE`, `DELETE` or `MERGE` query runs whole at its first
+  read. A wait inside a step runs the statement again from its first start.
   `INSTEAD OF` view rows, DDL, COPY, replication apply and deferred
   triggers read synchronously. A routine call inside the rows
   keeps the changed rows (row progress), also for views and rules written
@@ -164,27 +166,25 @@ is owned.
   (`SQL row expression requires retained write progress`), because
   restarting would hide the earlier rows from the call. Multi-step
   statements nested deeper than `write_step_levels` fail the same way with
-  `54000` naming that setting. `INSERT ... SELECT` streams a source that calls
-  no volatile built-in and no user routine, and materializes any other
-  source before writing. Volatile user routine calls in its output list (also a
-  rule action's `VALUES` over several rows) run as each row is inserted, as
-  in PostgreSQL; calls in its `WHERE`, join conditions, subqueries,
-  aggregate arguments or a `UNION`/`INTERSECT`/`EXCEPT` branch still run
-  before the first row, so they do not see rows the statement inserts.
-  Running those row by row needs the source and the row phase to keep
-  separate invocation logs, since the source then runs ahead of the rows by
-  a different amount in each attempt. A data-modifying `WITH` sub-statement runs to completion
-  before the main statement reads it, where PostgreSQL interleaves them row
-  by row, so a call in the main statement sees all of its rows. PostgreSQL
-  18.6 runs `WITH w1 AS (INSERT INTO a SELECT g ... RETURNING x), w2 AS
-  (INSERT INTO b SELECT x, note('b', x) FROM w1 RETURNING x) SELECT
-  note('main', x) FROM w2` as BEFORE a 1, b 1, main 1, BEFORE a 2, ... and
-  queues AFTER a 1, AFTER b 1, AFTER a 2, ...; a query read only partly
-  (`LIMIT 2`) still writes every row after the main query's reads. Matching
-  that needs the producer nodes of the design, which need the main query to
-  be a retained reader of CTE scans (not yet admitted) so a write can run
-  between its reads. A PL/pgSQL
-  `WITH ... INSERT/UPDATE/DELETE` statement fails with `0A000`.
+  `54000` naming that setting. `INSERT ... SELECT`
+  streams a source that calls no volatile built-in and no user routine; one
+  whose output list calls volatile built-ins only (`nextval`, `random()`)
+  is read by the engine row by row, its output evaluated as each row is
+  written; any other source materializes before writing. Volatile user
+  routine calls in its output list (also a rule action's `VALUES` over
+  several rows) run as each row is inserted, as in PostgreSQL; calls in its
+  `WHERE`, join conditions, subqueries, aggregate arguments or a
+  `UNION`/`INTERSECT`/`EXCEPT` branch still run before the first row, so
+  they do not see rows the statement inserts. Reading a user routine's
+  source row by row needs a call handed off on its row to keep its body
+  across a wait (the call's own invocation log retained with the write),
+  which only a data-modifying `WITH` query's reader accepts today: there a
+  wait inside such a call fails with `0A000`
+  (`expression wait requires an owned invocation log`). A `WITH` `INSERT`
+  read row by row re-reads nothing between steps: its reader and analysed
+  statement stay in a 512 KiB block of the statement arena's persistent
+  tail. A PL/pgSQL `WITH ... INSERT/UPDATE/DELETE` statement fails with
+  `0A000`.
 - **Routine variables in `WITH`:** the `WITH` queries of a PL/pgSQL
   `RETURN QUERY`, `SELECT ... INTO`, `PERFORM` or `FOR` query read the
   routine's variables, materialized or not, but three other `WITH` positions
@@ -515,8 +515,9 @@ queries, including data-modifying ones, in one new command as PostgreSQL
 does; a cursor's query with data-modifying `WITH` queries runs at its first
 read. Remaining: a PL/pgSQL write with `WITH` queries whose nested AFTER
 trigger waits fails with `0A000` instead of resuming; and a data-modifying
-`WITH` query runs whole before the main query reads it, so a trigger's or
-called function's notices arrive in a different order than PostgreSQL's
+`WITH` `UPDATE`, `DELETE` or `MERGE`, or one read by a join, a sort or a
+query without calls, runs whole at its first read, so a trigger's or called
+function's notices arrive in a different order than PostgreSQL's
 interleaved execution. The index behind a primary key or unique
 constraint cannot be named by `CLUSTER ON`, `CLUSTER ... USING` or `REPLICA
 IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's

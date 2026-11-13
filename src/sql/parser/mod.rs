@@ -38,6 +38,15 @@ type OrderLimit<'a> = (
     Option<&'a Expr<'a>>,
     Option<&'a Expr<'a>>,
     bool,
+    // `LIMIT ALL` was written.
+    bool,
+);
+/// A `GROUP BY` clause: its flat expressions, expanded grouping sets and
+/// written elements.
+type GroupByClause<'a> = (
+    &'a [&'a Expr<'a>],
+    &'a [GroupingSet<'a>],
+    &'a [crate::sql::ast::GroupingElement<'a>],
 );
 /// PostgreSQL bounds the fully expanded grouping-set product at 4,096 and a
 /// single CUBE at 12 elements.
@@ -2972,6 +2981,7 @@ impl<'a> Parser<'a> {
             None
         };
         let where_clause = self.where_clause()?;
+        let mut grouping_written: &'a [crate::sql::ast::GroupingElement<'a>] = &[];
         let (group_by, grouping_sets, grouping_set_quantifier) = if self.eat_ident("group")? {
             self.expect_ident("by")?;
             let quantifier = if self.eat_ident("distinct")? {
@@ -2980,7 +2990,8 @@ impl<'a> Parser<'a> {
                 let _ = self.eat_ident("all")?;
                 GroupingSetQuantifier::All
             };
-            let (group_by, grouping_sets) = self.group_by_clause()?;
+            let (group_by, grouping_sets, written) = self.group_by_clause()?;
+            grouping_written = written;
             (group_by, grouping_sets, quantifier)
         } else {
             (&[][..], &[][..], GroupingSetQuantifier::All)
@@ -3018,6 +3029,11 @@ impl<'a> Parser<'a> {
             with: &[],
             set_body: None,
             locking: &[],
+            written: crate::sql::ast::WrittenQuery {
+                values: false,
+                limit_all: false,
+                grouping: grouping_written,
+            },
         })
     }
 
@@ -3104,11 +3120,13 @@ impl<'a> Parser<'a> {
         let mut limit = None;
         let mut offset = None;
         let mut with_ties = false;
+        let mut limit_all = false;
         loop {
-            if limit.is_none() && self.eat_ident("limit")? {
+            if limit.is_none() && !limit_all && self.eat_ident("limit")? {
                 // `LIMIT ALL` is the standard spelling of "no limit"; it leaves
                 // the clause unset rather than binding an expression.
                 if self.eat_ident("all")? {
+                    limit_all = true;
                     continue;
                 }
                 limit = Some(self.expression(0)?);
@@ -3144,7 +3162,7 @@ impl<'a> Parser<'a> {
         if with_ties && order_by.is_empty() {
             return Err(self.err_here("WITH TIES cannot be specified without ORDER BY clause"));
         }
-        Ok((order_by, limit, offset, with_ties))
+        Ok((order_by, limit, offset, with_ties, limit_all))
     }
 
     /// Parses ASC, DESC, or PostgreSQL's ordering-operator spelling shared by
@@ -3222,7 +3240,7 @@ impl<'a> Parser<'a> {
         let saved_allow = self.allow_into;
         self.allow_into = false;
         let body = self.set_union()?;
-        let (order_by, limit, offset, with_ties) = self.order_limit()?;
+        let (order_by, limit, offset, with_ties, limit_all) = self.order_limit()?;
         // Row-locking clauses come last, after ORDER BY / LIMIT / OFFSET.
         let locking = self.locking_clauses()?;
         self.allow_into = saved_allow;
@@ -3231,6 +3249,7 @@ impl<'a> Parser<'a> {
             let mut sel = **s;
             sel.order_by = order_by;
             sel.limit = limit;
+            sel.written.limit_all = limit_all;
             sel.offset = offset;
             sel.with_ties = with_ties;
             sel.locking = locking;
@@ -3254,6 +3273,10 @@ impl<'a> Parser<'a> {
             with: &[],
             set_body: Some(body),
             locking,
+            written: crate::sql::ast::WrittenQuery {
+                limit_all,
+                ..crate::sql::ast::WrittenQuery::PLAIN
+            },
         })
     }
 
@@ -3284,6 +3307,7 @@ impl<'a> Parser<'a> {
                 with: query.with,
                 set_body: Some(query.body),
                 locking: query.locking,
+                written: crate::sql::ast::WrittenQuery::PLAIN,
             }),
             _ => Err(self.err_here("query must end in SELECT, TABLE, or VALUES")),
         }
@@ -3365,6 +3389,7 @@ impl<'a> Parser<'a> {
                 with: &[],
                 set_body: None,
                 locking: &[],
+                written: crate::sql::ast::WrittenQuery::PLAIN,
             })
             .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
         let mut ctes = ArenaList::new(self.arena);
@@ -3517,7 +3542,7 @@ impl<'a> Parser<'a> {
         let saved_into = self.into_clause.take();
         self.allow_into = true;
         let body = self.set_union()?;
-        let (order_by, limit, offset, with_ties) = self.order_limit()?;
+        let (order_by, limit, offset, with_ties, limit_all) = self.order_limit()?;
         let locking = self.locking_clauses()?;
         let stmt_end = self.peek_at;
         self.allow_into = saved_allow;
@@ -3550,6 +3575,7 @@ impl<'a> Parser<'a> {
             let mut sel = **s;
             sel.order_by = order_by;
             sel.limit = limit;
+            sel.written.limit_all = limit_all;
             sel.offset = offset;
             sel.with_ties = with_ties;
             sel.locking = locking;
@@ -3647,10 +3673,10 @@ impl<'a> Parser<'a> {
             let enclosing_windows =
                 core::mem::replace(&mut self.windows, ArenaList::new(self.arena));
             let inner = self.set_union()?;
-            let (order_by, limit, offset, with_ties) = self.order_limit()?;
+            let (order_by, limit, offset, with_ties, limit_all) = self.order_limit()?;
             self.windows = enclosing_windows;
             self.expect_op(")")?;
-            if order_by.is_empty() && limit.is_none() && offset.is_none() {
+            if order_by.is_empty() && limit.is_none() && offset.is_none() && !limit_all {
                 return Ok(inner);
             }
             let sel = match inner {
@@ -3658,6 +3684,7 @@ impl<'a> Parser<'a> {
                     let mut sel = **s;
                     sel.order_by = order_by;
                     sel.limit = limit;
+                    sel.written.limit_all = limit_all;
                     sel.offset = offset;
                     sel.with_ties = with_ties;
                     sel
@@ -3680,6 +3707,10 @@ impl<'a> Parser<'a> {
                     with: &[],
                     set_body: Some(op),
                     locking: &[],
+                    written: crate::sql::ast::WrittenQuery {
+                        limit_all,
+                        ..crate::sql::ast::WrittenQuery::PLAIN
+                    },
                 },
             };
             let boxed = self
@@ -3735,6 +3766,10 @@ impl<'a> Parser<'a> {
                     with: &[],
                     set_body: None,
                     locking: &[],
+                    written: crate::sql::ast::WrittenQuery {
+                        values: true,
+                        ..crate::sql::ast::WrittenQuery::PLAIN
+                    },
                 };
                 let leaf = self.alloc_set(SetTree::Select(
                     self.arena
@@ -3823,6 +3858,7 @@ impl<'a> Parser<'a> {
                 with: &[],
                 set_body: None,
                 locking: &[],
+                written: crate::sql::ast::WrittenQuery::PLAIN,
             };
             return self.alloc_set(SetTree::Select(
                 self.arena
@@ -4842,6 +4878,7 @@ impl<'a> Parser<'a> {
                 with: &[],
                 set_body: None,
                 locking: &[],
+                written: crate::sql::ast::WrittenQuery::PLAIN,
             })
             .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
         Ok(TableRef {
@@ -7437,6 +7474,7 @@ impl<'a> Parser<'a> {
                     default: clauses.default,
                     default_text: clauses.default_text,
                     generated_text: clauses.generated_text,
+                    generated_kind: clauses.generated_kind,
                     identity: clauses.identity,
                 },
                 if_not_exists,
@@ -7684,7 +7722,7 @@ impl<'a> Parser<'a> {
                     crate::sql::ast::ColGen::Identity(spec) => {
                         Ok(AlterAction::AddIdentity { column, spec })
                     }
-                    crate::sql::ast::ColGen::Generated(_) => {
+                    crate::sql::ast::ColGen::Generated(..) => {
                         Err(self.err_here("a column cannot be turned into a generated column"))
                     }
                 }
@@ -8217,6 +8255,10 @@ impl<'a> Parser<'a> {
                 self.arena
                     .alloc(Select {
                         items: items.as_slice(),
+                        written: crate::sql::ast::WrittenQuery {
+                            values: true,
+                            ..crate::sql::ast::WrittenQuery::PLAIN
+                        },
                         ..Select::EMPTY
                     })
                     .map_err(|_| self.err_here("VALUES too large"))?,
@@ -8237,7 +8279,7 @@ impl<'a> Parser<'a> {
         let saved_allow = self.allow_into;
         self.allow_into = false;
         let body = self.set_union_after(first)?;
-        let (order_by, limit, offset, with_ties) = self.order_limit()?;
+        let (order_by, limit, offset, with_ties, limit_all) = self.order_limit()?;
         let locking = self.locking_clauses()?;
         self.allow_into = saved_allow;
         self.windows = enclosing_windows;
@@ -8248,6 +8290,10 @@ impl<'a> Parser<'a> {
             with_ties,
             set_body: Some(body),
             locking,
+            written: crate::sql::ast::WrittenQuery {
+                limit_all,
+                ..crate::sql::ast::WrittenQuery::PLAIN
+            },
             ..Select::EMPTY
         })
     }
@@ -10498,11 +10544,11 @@ impl<'a> Parser<'a> {
     /// Parses a flat, deduplicated grouping-expression list plus PostgreSQL's
     /// expanded grouping sets. Set bitmaps grow with the expression list and
     /// the expanded set count has PostgreSQL's exact 4,096 boundary.
-    fn group_by_clause(
-        &mut self,
-    ) -> Result<(&'a [&'a Expr<'a>], &'a [GroupingSet<'a>]), ParseError> {
+    fn group_by_clause(&mut self) -> Result<GroupByClause<'a>, ParseError> {
+        use crate::sql::ast::GroupingElement;
         let mut flat = ArenaList::new(self.arena);
         let mut acc = ArenaList::new(self.arena);
+        let mut written = ArenaList::new(self.arena);
         self.push(&mut acc, GroupingSet::EMPTY)?;
         let mut explicit = false;
         loop {
@@ -10511,27 +10557,39 @@ impl<'a> Parser<'a> {
                 let is_cube = self.peeked == Tok::Ident("cube");
                 self.advance()?;
                 self.expect_op("(")?;
-                let terms = self.grouping_term_list(&mut flat)?;
+                let (terms, members) = self.grouping_term_list(&mut flat)?;
                 self.expect_op(")")?;
                 self.expand_grouping_terms(is_cube, terms.as_slice(), &mut elem)?;
+                let members = members.as_slice();
+                self.push(
+                    &mut written,
+                    if is_cube {
+                        GroupingElement::Cube(members)
+                    } else {
+                        GroupingElement::Rollup(members)
+                    },
+                )?;
                 explicit = true;
             } else if self.peeked == Tok::Ident("grouping") {
                 self.advance()?;
                 self.expect_ident("sets")?;
                 self.expect_op("(")?;
+                let mut members = ArenaList::new(self.arena);
                 loop {
-                    self.grouping_set_member(&mut flat, &mut elem)?;
+                    let member = self.grouping_set_member(&mut flat, &mut elem)?;
+                    self.push(&mut members, member)?;
                     if !self.eat_op(",")? {
                         break;
                     }
                 }
                 self.expect_op(")")?;
+                self.push(&mut written, GroupingElement::Sets(members.as_slice()))?;
                 explicit = true;
             } else {
-                let set = self.grouping_term(&mut flat)?;
+                let (set, member) = self.grouping_term(&mut flat)?;
                 self.push(&mut elem, set)?;
+                self.push(&mut written, member)?;
             }
-
             let product = acc
                 .len()
                 .checked_mul(elem.len())
@@ -10551,8 +10609,12 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let grouping_sets = if explicit { acc.as_slice() } else { &[] };
-        Ok((flat.as_slice(), grouping_sets))
+        let (grouping_sets, written) = if explicit {
+            (acc.as_slice(), written.as_slice())
+        } else {
+            (&[][..], &[][..])
+        };
+        Ok((flat.as_slice(), grouping_sets, written))
     }
 
     fn grouping_set_from_words(
@@ -10634,42 +10696,54 @@ impl<'a> Parser<'a> {
     fn grouping_term(
         &mut self,
         flat: &mut ArenaList<'a, &'a Expr<'a>>,
-    ) -> Result<GroupingSet<'a>, ParseError> {
+    ) -> Result<(GroupingSet<'a>, crate::sql::ast::GroupingElement<'a>), ParseError> {
         let mut words = [0u64; MAX_GROUP_WORDS];
-        if self.peeked == Tok::Op("(") && self.paren_is_group_list()? {
+        let written = if self.peeked == Tok::Op("(") && self.paren_is_group_list()? {
             self.advance()?;
+            let mut members = ArenaList::new(self.arena);
             if self.peeked != Tok::Op(")") {
                 loop {
                     let expression = self.expression(0)?;
                     let index = self.intern_group(flat, expression)?;
                     words[index / 64] |= 1u64 << (index % 64);
+                    self.push(&mut members, index as u16)?;
                     if !self.eat_op(",")? {
                         break;
                     }
                 }
             }
             self.expect_op(")")?;
+            crate::sql::ast::GroupingElement::List(members.as_slice())
         } else {
             let expression = self.expression(0)?;
             let index = self.intern_group(flat, expression)?;
             words[index / 64] |= 1u64 << (index % 64);
-        }
-        self.grouping_set_from_words(&words)
+            crate::sql::ast::GroupingElement::Expression(index as u16)
+        };
+        Ok((self.grouping_set_from_words(&words)?, written))
     }
 
     fn grouping_term_list(
         &mut self,
         flat: &mut ArenaList<'a, &'a Expr<'a>>,
-    ) -> Result<ArenaList<'a, GroupingSet<'a>>, ParseError> {
+    ) -> Result<
+        (
+            ArenaList<'a, GroupingSet<'a>>,
+            ArenaList<'a, crate::sql::ast::GroupingElement<'a>>,
+        ),
+        ParseError,
+    > {
         let mut terms = ArenaList::new(self.arena);
+        let mut written = ArenaList::new(self.arena);
         loop {
-            let term = self.grouping_term(flat)?;
+            let (term, member) = self.grouping_term(flat)?;
             self.push(&mut terms, term)?;
+            self.push(&mut written, member)?;
             if !self.eat_op(",")? {
                 break;
             }
         }
-        Ok(terms)
+        Ok((terms, written))
     }
 
     fn expand_grouping_terms(
@@ -10716,20 +10790,42 @@ impl<'a> Parser<'a> {
         &mut self,
         flat: &mut ArenaList<'a, &'a Expr<'a>>,
         output: &mut ArenaList<'a, GroupingSet<'a>>,
-    ) -> Result<(), ParseError> {
+    ) -> Result<crate::sql::ast::GroupingElement<'a>, ParseError> {
         if self.peeked == Tok::Ident("rollup") || self.peeked == Tok::Ident("cube") {
             let is_cube = self.peeked == Tok::Ident("cube");
             self.advance()?;
             self.expect_op("(")?;
-            let terms = self.grouping_term_list(flat)?;
+            let (terms, members) = self.grouping_term_list(flat)?;
             self.expect_op(")")?;
-            self.expand_grouping_terms(is_cube, terms.as_slice(), output)
+            self.expand_grouping_terms(is_cube, terms.as_slice(), output)?;
+            let members = members.as_slice();
+            Ok(if is_cube {
+                crate::sql::ast::GroupingElement::Cube(members)
+            } else {
+                crate::sql::ast::GroupingElement::Rollup(members)
+            })
+        } else if self.peeked == Tok::Ident("grouping") {
+            // A nested `GROUPING SETS (...)` contributes its sets directly.
+            self.advance()?;
+            self.expect_ident("sets")?;
+            self.expect_op("(")?;
+            let mut members = ArenaList::new(self.arena);
+            loop {
+                let member = self.grouping_set_member(flat, output)?;
+                self.push(&mut members, member)?;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+            Ok(crate::sql::ast::GroupingElement::Sets(members.as_slice()))
         } else {
-            let set = self.grouping_term(flat)?;
+            let (set, member) = self.grouping_term(flat)?;
             if output.len() == MAX_GROUPING_SETS {
                 return Err(self.grouping_sets_limit());
             }
-            self.push(output, set)
+            self.push(output, set)?;
+            Ok(member)
         }
     }
 

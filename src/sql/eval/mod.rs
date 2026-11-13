@@ -877,6 +877,14 @@ impl<'b, 'a: 'b> ColumnLookup<'b> for RoutineVariables<'_, 'a> {
 pub trait ColumnLookup<'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError>;
 
+    /// Offers this scope's FROM items, then the enclosing queries' ones, to
+    /// a missing column's spelling suggestion.
+    fn suggest_columns(
+        &self,
+        _suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+    }
+
     /// The `plpgsql.variable_conflict` rule of the PL/pgSQL variable this
     /// scope or an enclosing one names `qualifier.name`, or None when no
     /// variable answers to it. A scope that puts a relation's columns in front
@@ -1758,6 +1766,13 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
 impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
     fn outer_aggregate(&self, call: *const Expr<'_>) -> Option<Datum<'a>> {
         (**self).outer_aggregate(call)
+    }
+
+    fn suggest_columns(
+        &self,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        (**self).suggest_columns(suggestion);
     }
 
     fn statement_subqueries(&self) -> StatementScope<'a> {
@@ -5792,9 +5807,29 @@ fn eval_binary_values<'a>(
         });
     }
     Ok(OperatorEvaluation {
-        value: binary(operator, l, r, left_unknown, right_unknown, arena)?,
+        value: binary(operator, l, r, left_unknown, right_unknown, arena).map_err(|error| {
+            unknown_operand_input_failure(error, [(left, left_unknown), (right, right_unknown)])
+        })?,
         first_argument: l,
     })
+}
+
+/// Positions the failed input of an unknown-type literal operand at the
+/// literal, as PostgreSQL's analysis coerces it to the operator's input type.
+fn unknown_operand_input_failure(error: SqlError, operands: [(&Expr<'_>, bool); 2]) -> SqlError {
+    for (operand, unknown) in operands {
+        if let (true, Expr::Str(text)) = (unknown, operand)
+            && error
+                .message
+                .as_str()
+                .strip_suffix('"')
+                .and_then(|message| message.strip_suffix(*text))
+                .is_some_and(|message| message.ends_with(": \""))
+        {
+            return crate::sql::error_position::at_subject(error, text);
+        }
+    }
+    error
 }
 
 fn materialize_acl_value<'a>(
@@ -8630,13 +8665,25 @@ fn required_comparison_collation(
     collation: Option<DerivedCollation>,
 ) -> Result<crate::sql::ast::Collation, SqlError> {
     match collation {
-        Some(collation) if collation.indeterminate => Err(sql_err!(
-            sqlstate::INDETERMINATE_COLLATION,
-            "could not determine which collation to use for string comparison"
-        )),
+        Some(collation) if collation.indeterminate => Err(indeterminate_string_comparison()),
         Some(collation) => Ok(collation.value),
         None => Ok(crate::sql::ast::Collation::None),
     }
+}
+
+/// A string comparison whose inputs' implicit collations conflict.
+pub(crate) fn indeterminate_string_comparison() -> SqlError {
+    let error = sql_err!(
+        sqlstate::INDETERMINATE_COLLATION,
+        "could not determine which collation to use for string comparison"
+    );
+    stash_diagnostic(
+        None,
+        Some(StackStr::from_str(
+            "Use the COLLATE clause to set the collation explicitly.",
+        )),
+    );
+    error
 }
 
 /// PostgreSQL's collation-combination rule, shared by every expression that
@@ -9744,6 +9791,66 @@ pub(crate) fn undefined_function<'a, T>(
 
 /// Normalize only a catalog-selected builtin. Written arguments stay as AST
 /// nodes so each implementation retains its strictness and short-circuit rules.
+/// PostgreSQL coerces an unknown-type literal argument of the selected
+/// builtin to the parameter's declared type when it parses the call
+/// (`round('1.5')` reads `'1.5'` as `double precision`). Numeric and boolean
+/// parameters take that conversion here; the handlers of other parameter
+/// types read the literal's text themselves.
+fn coerce_unknown_builtin_arguments<'a, 'b>(
+    oid: i32,
+    args: &'b [&'a Expr<'a>],
+    variadic: bool,
+    arena: &'a Arena,
+) -> Result<&'b [&'a Expr<'a>], SqlError>
+where
+    'a: 'b,
+{
+    let Some(declaration) = super::catalog::builtin_callable_by_oid(oid) else {
+        return Ok(args);
+    };
+    // An expanded variadic call passes its trailing arguments as elements.
+    let declared = |position: usize| -> Option<ColType> {
+        let oid = match declaration.variadic_element {
+            Some(element) if !variadic && position + 1 >= declaration.arguments.len() => element,
+            _ => *declaration.arguments.get(position)?,
+        };
+        ColType::from_oid(oid).filter(|ctype| {
+            matches!(
+                ctype,
+                ColType::Int2
+                    | ColType::Int4
+                    | ColType::Int8
+                    | ColType::Float4
+                    | ColType::Float8
+                    | ColType::Numeric
+                    | ColType::Bool
+            )
+        })
+    };
+    if !args.iter().enumerate().any(|(position, argument)| {
+        matches!(argument, Expr::Str(_)) && declared(position).is_some()
+    }) {
+        return Ok(args);
+    }
+    let coerced = arena
+        .alloc_slice_with(args.len(), |position| args[position])
+        .map_err(|_| arena_full())?;
+    for (position, argument) in coerced.iter_mut().enumerate() {
+        if let (Expr::Str(_), Some(ctype)) = (*argument, declared(position)) {
+            *argument = arena
+                .alloc(Expr::Cast {
+                    source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                    operand: argument,
+                    type_name: ctype.name(),
+                    type_mod: -1,
+                    binding: crate::sql::ast::CastBinding::Resolve,
+                })
+                .map_err(|_| arena_full())?;
+        }
+    }
+    Ok(coerced)
+}
+
 pub(crate) fn bind_builtin_arguments<'a, 'b>(
     oid: i32,
     args: &'b [&'a Expr<'a>],
@@ -10086,7 +10193,8 @@ fn call<'a>(
         if let Some(catalog) = hooks.catalog {
             catalog.require_builtin_routine_execute(oid)?;
         }
-        bind_builtin_arguments(oid, args, argument_names, variadic, arena)?
+        let bound = bind_builtin_arguments(oid, args, argument_names, variadic, arena)?;
+        coerce_unknown_builtin_arguments(oid, bound, variadic, arena)?
     } else {
         args
     };

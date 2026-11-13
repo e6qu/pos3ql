@@ -44,21 +44,33 @@ pub(super) fn build_def(
                 c.name
             ));
         }
-        def.columns[i] = build_column(c, storage, txid, arena)?;
+        // CREATE TABLE positions its columns' default errors; ALTER TABLE
+        // ADD COLUMN does not.
+        def.columns[i] =
+            crate::sql::error_position::with_analysis(|| build_column(c, storage, txid, arena))?;
         if let Some(name) = c.not_null_name {
             def.set_not_null_constraint_name(i, SqlName::parse(name)?);
         }
     }
-    // A generation expression may not reference another generated column (42P17);
-    // needs the full column set, so check once the table is assembled.
-    validate_generated_refs(&def, arena)?;
+    // A generation expression reads the other columns, so it is analysed
+    // once the table is assembled, positioned in the statement's text.
+    crate::sql::error_position::with_analysis(|| {
+        validate_generated_refs(&def, Some(columns), storage, txid, arena)
+    })?;
     Ok(def)
 }
 
-/// Enforces that no `GENERATED` column's expression references another generated
-/// column (or itself) — PostgreSQL's `check_nested_generated` rule (42P17).
+/// PostgreSQL's `cookDefault` for each `GENERATED` column: the expression's
+/// columns, operators and constants resolve against the table, it may not
+/// reference another generated column (or itself, 42P17), and its type must
+/// convert to the column's by assignment. `sources` are the columns as
+/// written, whose generation text is positioned in the statement; without
+/// them the stored text is analysed.
 pub(super) fn validate_generated_refs<Definition0: crate::storage::DefinitionBacking>(
     def: &crate::storage::TableDefinition<Definition0>,
+    sources: Option<&[ColumnDef]>,
+    storage: &Storage,
+    txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     for c in def.columns() {
@@ -66,8 +78,95 @@ pub(super) fn validate_generated_refs<Definition0: crate::storage::DefinitionBac
             continue;
         }
         let default = c.default.expression();
-        let text = default.as_ref().expect("generated column has expr text");
-        let expression = crate::sql::parser::parse_expr(text.as_str(), arena)?;
+        let stored = default.as_ref().expect("generated column has expr text");
+        let text = sources
+            .and_then(|columns| {
+                columns
+                    .iter()
+                    .find(|column| column.name == c.name.as_str())?
+                    .generated_text
+            })
+            .unwrap_or(stored.as_str());
+        let expression = crate::sql::parser::parse_expr(text, arena)?;
+        let column_oid = storage
+            .routine_type_oid(c.ctype, c.user_type, txid)
+            .unwrap_or_else(|| c.ctype.oid());
+        let user_type = |type_oid: i32| crate::storage::NamedTypeKind::from_oid(type_oid);
+        if c.default.is_virtual() && (c.primary || c.unique) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "{} on virtual generated columns are not supported",
+                if c.primary {
+                    "primary keys"
+                } else {
+                    "unique constraints"
+                }
+            ));
+        }
+        if c.default.is_virtual() {
+            // PostgreSQL 18 limits what a virtual column may compute with.
+            match user_type(column_oid) {
+                Some((crate::storage::NamedTypeKind::Domain, _, false)) => {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "virtual generated column \"{}\" cannot have a domain type",
+                        c.name.as_str()
+                    ));
+                }
+                Some(_) => {
+                    return Err(crate::sql::error_position::with_detail(
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "virtual generated column \"{}\" cannot have a user-defined type",
+                            c.name.as_str()
+                        ),
+                        format_args!(
+                            "Virtual generated columns that make use of user-defined types are not yet supported."
+                        ),
+                    ));
+                }
+                None => {}
+            }
+            if let Some(function) = expression.find_function(&|name| {
+                let name = name.rsplit('.').next().unwrap_or(name);
+                crate::sql::catalog::builtin_callable_signatures(name)
+                    .next()
+                    .is_none()
+            }) {
+                return Err(crate::sql::error_position::with_detail(
+                    crate::sql::error_position::at_reference(
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "generation expression uses user-defined function"
+                        ),
+                        function,
+                    ),
+                    format_args!(
+                        "Virtual generated columns that make use of user-defined functions are not yet supported."
+                    ),
+                ));
+            }
+        }
+        let columns = super::CatalogCols {
+            definition: Some(crate::storage::RelationDefinition::from_definition(def)),
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        };
+        let (source_oid, _) = super::infer_type_res(expression, &columns)?;
+        crate::sql::query::check_literal_operands_typed(
+            expression,
+            &|other| {
+                super::infer_type_res(other, &columns)
+                    .ok()
+                    .and_then(|(oid, _)| ColType::from_oid(oid))
+            },
+            storage,
+            txid,
+            arena,
+        )?;
         let mut offending: Option<SqlError> = None;
         expression.for_each_column(&mut |name| {
             if offending.is_some() {
@@ -85,6 +184,43 @@ pub(super) fn validate_generated_refs<Definition0: crate::storage::DefinitionBac
         });
         if let Some(e) = offending {
             return Err(e);
+        }
+        if c.default.is_virtual() && user_type(source_oid).is_some() {
+            return Err(crate::sql::error_position::with_detail(
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "generation expression uses user-defined type"
+                ),
+                format_args!(
+                    "Virtual generated columns that make use of user-defined types are not yet supported."
+                ),
+            ));
+        }
+        let target_oid = column_oid;
+        if !crate::sql::catalog::can_coerce_assignment(storage, txid, source_oid, target_oid) {
+            return Err(crate::sql::error_position::with_hint(
+                sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "column \"{}\" is of type {} but default expression is of type {}",
+                    c.name.as_str(),
+                    crate::sql::catalog::format_type_name(storage, txid, target_oid)?.as_str(),
+                    crate::sql::catalog::format_type_name(storage, txid, source_oid)?.as_str()
+                ),
+                "You will need to rewrite or cast the expression.",
+            ));
+        }
+        // A cast or operator PostgreSQL marks stable (`a::text::regclass`)
+        // makes the expression depend on more than the row; PostgreSQL checks
+        // this after the expression's type.
+        if crate::sql::planner_inputs::inline::index_expression_is_mutable(
+            expression, &columns, storage, txid, arena,
+        )?
+        .unwrap_or(false)
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "generation expression is not immutable"
+            ));
         }
     }
     Ok(())
@@ -300,9 +436,13 @@ pub(super) fn build_column(
                 c.name
             ));
         }
-        ColumnDefault::Generated(resolve_generated(gtext, storage, txid, arena)?)
+        ColumnDefault::Generated {
+            expression: resolve_generated(gtext, storage, txid, arena)?,
+            kind: c.generated_kind,
+        }
     } else {
         let column_default = resolve_default(
+            c.name,
             c.default,
             c.default_text,
             ctype,
@@ -479,7 +619,9 @@ pub(super) fn resolve_generated(
 }
 
 /// Resolves a column DEFAULT into one complete catalog state.
+#[expect(clippy::too_many_arguments, reason = "DDL column context")]
 pub(super) fn resolve_default(
+    column: &str,
     default: Option<&Expr>,
     default_text: Option<&str>,
     ctype: ColType,
@@ -497,13 +639,20 @@ pub(super) fn resolve_default(
             "cannot use subquery in DEFAULT expression"
         ));
     }
-    let mut has_reference = false;
-    expression.for_each_column_reference(&mut |_, _| has_reference = true);
-    if has_reference {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot use column reference in DEFAULT expression"
-        ));
+    let mut reference = None;
+    expression.for_each_column_reference(&mut |qualifier, name| {
+        if reference.is_none() {
+            reference = Some(crate::sql::error_position::at_reference(
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot use column reference in DEFAULT expression"
+                ),
+                qualifier.unwrap_or(name),
+            ));
+        }
+    });
+    if let Some(error) = reference {
+        return Err(error);
     }
     // A literal-only default folds to a constant now; anything volatile or
     // stable (any function call) is kept as text and evaluated at insert time.
@@ -521,6 +670,24 @@ pub(super) fn resolve_default(
             sequences: None,
             merge_action: None,
         };
+        let source_oid =
+            crate::sql::eval::expression_type_identity(expression, &NoColumns, &hooks)?
+                .routine_argument_oid();
+        let target_oid = ctype.oid();
+        if source_oid != crate::sql::types::oid::UNKNOWN
+            && !crate::sql::catalog::can_coerce_assignment(storage, txid, source_oid, target_oid)
+        {
+            return Err(crate::sql::error_position::with_hint(
+                sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "column \"{}\" is of type {} but default expression is of type {}",
+                    column,
+                    crate::sql::catalog::format_type_name(storage, txid, target_oid)?.as_str(),
+                    crate::sql::catalog::format_type_name(storage, txid, source_oid)?.as_str()
+                ),
+                "You will need to rewrite or cast the expression.",
+            ));
+        }
         let v = eval_full(
             expression,
             arena,
@@ -528,9 +695,10 @@ pub(super) fn resolve_default(
             &NoColumns,
             &hooks,
         )?;
-        let source_oid =
-            crate::sql::eval::expression_type_identity(expression, &NoColumns, &hooks)?
-                .routine_argument_oid();
+        let literal_input = |error: SqlError| match expression {
+            Expr::Str(text) => crate::sql::error_position::at_reference(error, text),
+            _ => error,
+        };
         let v = match ctype {
             ColType::Array(crate::sql::types::ArrElem::Domain { .. })
                 if source_oid == ctype.oid() =>
@@ -550,13 +718,16 @@ pub(super) fn resolve_default(
                 let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
                 crate::sql::eval::regobject_cast(v, target, Some(&catalog), arena)?
             }
-            _ => cast_to(v, ctype, arena)?,
+            _ => cast_to(v, ctype, arena).map_err(literal_input)?,
         };
-        let v = apply_typmod(v, ctype, type_mod, arena)?;
-        return Ok(ColumnDefault::Constant {
-            value: OwnedDatum::from_datum(&v)?,
-            expression: store_default_text(default_text)?,
-        });
+        // A value its type modifier rejects fails at each insert, as
+        // PostgreSQL applies the modifier when the default is used.
+        if let Ok(v) = apply_typmod(v, ctype, type_mod, arena) {
+            return Ok(ColumnDefault::Constant {
+                value: OwnedDatum::from_datum(&v)?,
+                expression: store_default_text(default_text)?,
+            });
+        }
     }
     let source = store_default_text(default_text)?;
     Ok(ColumnDefault::Expression(
@@ -1138,18 +1309,11 @@ fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
                     variables.add_whole_row()
                 }
                 None => {
-                    if let Some(qualifier) = qualifier {
-                        return Err(sql_err!(
-                            sqlstate::UNDEFINED_COLUMN,
-                            "column {}.{} does not exist",
-                            qualifier,
-                            name
-                        ));
-                    }
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" does not exist",
-                        name
+                    return Err(crate::sql::column_suggestion::missing_relation_column(
+                        *qualifier,
+                        name,
+                        def.name.as_str(),
+                        &def.columns.as_ref()[..def.n_columns],
                     ));
                 }
             }
@@ -1347,6 +1511,7 @@ pub(super) fn attach_constraints(
                 }
                 has_primary = true;
                 let (indices, n) = resolve_cols(def, columns)?;
+                reject_virtual_columns(def, &indices[..n], "primary keys")?;
                 for &column_index in &indices[..n] {
                     def.columns[column_index as usize].not_null =
                         def.columns[column_index as usize].not_null.add_local();
@@ -1400,6 +1565,7 @@ pub(super) fn attach_constraints(
                 nulls_not_distinct,
             } => {
                 let (indices, n) = resolve_cols(def, columns)?;
+                reject_virtual_columns(def, &indices[..n], "unique constraints")?;
                 let stored_timing = storage_timing(*timing);
                 let equivalent_flag = n == 1
                     && !*nulls_not_distinct
@@ -1460,7 +1626,17 @@ pub(super) fn attach_constraints(
                 text,
                 validation,
             } => {
-                let single_column = expression_variables(expression, def)?.single_column();
+                // CREATE TABLE (the only caller merging equivalent
+                // constraints) positions a CHECK's unknown column as
+                // PostgreSQL does; ALTER TABLE reports it without one.
+                let single_column = if merge_equivalent {
+                    crate::sql::error_position::with_analysis(|| {
+                        expression_variables(expression, def)
+                    })?
+                } else {
+                    expression_variables(expression, def)?
+                }
+                .single_column();
                 if text.len() > crate::storage::CHECK_SQL_MAX {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -1526,6 +1702,7 @@ pub(super) fn attach_constraints(
                         def.name.as_str()
                     ));
                 }
+                let (indices, n) = resolve_cols(def, columns)?;
                 attach_fkey(
                     storage,
                     def,
@@ -1541,6 +1718,8 @@ pub(super) fn attach_constraints(
                     exclude,
                     arena,
                 )?;
+                // The referenced key is checked first, as PostgreSQL does.
+                reject_virtual_columns(def, &indices[..n], "foreign key constraints")?;
             }
             TableConstraint::Exclusion {
                 source_position: _,
@@ -2202,4 +2381,24 @@ fn storage_validation(validation: AstConstraintValidation) -> crate::storage::Co
         }
         AstConstraintValidation::NotEnforced => crate::storage::ConstraintValidation::NotEnforced,
     }
+}
+
+/// PostgreSQL 18's refusal of a key, index or statistics over a virtual
+/// generated column, whose values the row does not hold.
+pub(crate) fn reject_virtual_columns<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
+    columns: &[u16],
+    what: &str,
+) -> Result<(), SqlError> {
+    if columns
+        .iter()
+        .any(|&column| def.columns()[usize::from(column)].default.is_virtual())
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "{} on virtual generated columns are not supported",
+            what
+        ));
+    }
+    Ok(())
 }

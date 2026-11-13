@@ -420,11 +420,38 @@ pub(super) fn rule_definition<'a>(
     let mut body = crate::sql::array::elements(raw, element);
     let condition = body.next().expect("body condition was counted");
     let actions = crate::sql::array::len(raw) - 1;
-    if pretty && actions != 0 {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "pretty formatting of rewrite rule actions is not supported"
-        ));
+    let rule_table = match crate::sql::query::privilege_relation(
+        storage,
+        transaction,
+        PrivilegeRelation::Oid(relation_oid),
+    )? {
+        Some(crate::storage::ResolvedRelation::Table(slot)) => {
+            Some(storage.table_def(slot, transaction))
+        }
+        _ => None,
+    };
+    // Each action as PostgreSQL deparses it, or its saved text when its
+    // shape is outside the deparser's coverage.
+    let mut deparsed_actions = [None; crate::storage::MAX_RULE_ACTIONS];
+    for (slot, action) in deparsed_actions.iter_mut().zip(body) {
+        let source = string(action)?;
+        *slot = match rule_table.as_deref() {
+            Some(table) => super::deparse::rule_action_definition(
+                storage,
+                transaction,
+                table,
+                source,
+                pretty,
+                arena,
+            )?,
+            None => None,
+        };
+        if pretty && slot.is_none() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "pretty formatting of rewrite rule actions is not supported"
+            ));
+        }
     }
     let mut output = StackStr::<{ crate::storage::RULE_SQL_MAX + 512 }>::new();
     let _ = output.write_str("CREATE RULE ");
@@ -464,6 +491,7 @@ pub(super) fn rule_definition<'a>(
                             parameters: &[],
                             joined: &joined,
                             pretty,
+                            qualify: false,
                         },
                         source,
                         super::deparse::Destination::Condition,
@@ -493,14 +521,38 @@ pub(super) fn rule_definition<'a>(
         " DO {}",
         if boolean(values[5])? { "INSTEAD " } else { "" }
     );
+    // `appendContextKeyword` drops trailing spaces before a line break.
+    let write_action = |output: &mut StackStr<{ crate::storage::RULE_SQL_MAX + 512 }>,
+                        index: usize,
+                        saved: &str| {
+        match deparsed_actions[index] {
+            Some(text) => {
+                if text.starts_with('\n') {
+                    let kept = output.as_str().trim_end_matches(' ').len();
+                    output.truncate(kept);
+                }
+                let _ = output.write_str(text);
+            }
+            None => {
+                let _ = output.write_str(saved);
+            }
+        }
+    };
     if actions == 0 {
         let _ = output.write_str("NOTHING;");
     } else if actions == 1 {
-        let _ = write!(output, "{};", string(body.next().expect("counted action"))?);
+        let saved = string(body.next().expect("counted action"))?;
+        write_action(&mut output, 0, saved);
+        let _ = output.write_char(';');
     } else {
         let _ = output.write_char('(');
-        for action in body {
-            let _ = write!(output, "{};", string(action)?);
+        for (index, action) in body.enumerate() {
+            write_action(&mut output, index, string(action)?);
+            let _ = output.write_str(if deparsed_actions[index].is_some() {
+                ";\n"
+            } else {
+                ";"
+            });
         }
         let _ = output.write_str(");");
     }

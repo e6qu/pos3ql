@@ -10412,8 +10412,8 @@ mod tests {
             connection
                 .send
                 .readable()
-                .windows(b"<Plan><Node-Type>".len())
-                .any(|frame| frame == b"<Plan><Node-Type>"),
+                .windows(b"<Node-Type>".len())
+                .any(|frame| frame == b"<Node-Type>"),
             "{}",
             String::from_utf8_lossy(connection.send.readable())
         );

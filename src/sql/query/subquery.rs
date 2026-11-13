@@ -983,7 +983,7 @@ pub(super) fn check_select_literals<'a>(
         .chain(select.having)
         .chain(from.joins.iter().filter_map(|join| join.on));
     for expression in expressions {
-        super::check_literal_operands(expression, &scope, arena)?;
+        super::check_literal_operands(expression, &scope, storage, txid, arena)?;
         check_subquery_literals(expression, Some(&scope), storage, txid, arena)?;
     }
     Ok(())

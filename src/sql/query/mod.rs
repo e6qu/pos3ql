@@ -46,8 +46,11 @@ pub(crate) use setops::set_query_into_rows;
 
 pub(crate) mod generator;
 mod joined_from;
+#[cfg(test)]
+pub(crate) use joined_from::target_hash_builds;
 pub(crate) use joined_from::{
-    JoinedFromRow, joined_from_match, recheck_joined_from_match, with_joined_from_row,
+    JoinedFromRow, TargetHash, TargetHashPlan, joined_from_match, recheck_joined_from_match,
+    target_hash_plan, with_joined_from_row,
 };
 mod materialize;
 pub(crate) use materialize::{ScopeSchema, locked_row_where_passes};
@@ -106,10 +109,12 @@ use cte::expand_set_tree_exec;
 pub(crate) use cte::filter_view_rows;
 pub(crate) use cte::{
     RuleInsertTarget, RuleReturningRelation, RuleTransitionType, attach_rule_source,
-    describe_stored_set_query, dml_parameter_scope_query, expand_set_tree, expand_stored_query,
-    expand_stored_query_exec, expand_stored_rule_action_exec, expand_stored_rule_expression_exec,
+    check_rule_condition_aggregates, check_rule_insert_values, describe_stored_set_query,
+    dml_parameter_scope_query, expand_set_tree, expand_stored_query, expand_stored_query_exec,
+    expand_stored_rule_action_exec, expand_stored_rule_expression_exec,
     expand_stored_statement_exec, restrict_rule_original, rule_original_transition,
-    rule_returning_entries, rule_returning_items, rule_transition_source,
+    rule_relation_ref, rule_returning_entries, rule_returning_items, rule_select,
+    rule_transition_source,
 };
 pub use cte::{
     describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under, expand_dml_ctes,
@@ -8415,7 +8420,9 @@ pub(crate) fn analyse_select<'a>(
     }
     let scope = QueryScope::resolve_schema(storage, from, txid, arena, outer)?;
     check_select_types(select, &scope, storage, txid, arena, outer)?;
+    // Unknown literals convert during analysis, before constants fold.
     check_key_types(select, &scope, arena, storage, txid)?;
+    check_select_constants(select, arena, storage, txid)?;
     let schema = ScopeSchema(&scope);
     let row = Chained {
         inner: &schema,
@@ -8460,6 +8467,7 @@ pub(crate) fn analyse_dml_condition<'a>(
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<(), SqlError> {
     let (target, alias, extra, condition) = match statement {
         Stmt::Update(update) => (update.table, update.alias, update.from, update.where_clause),
@@ -8478,23 +8486,141 @@ pub(crate) fn analyse_dml_condition<'a>(
         dependencies::dml_dependency_scope(storage, target, alias, extra, txid, arena, None)?;
     let columns = CatalogScopeCols {
         scope: &scope,
-        outer: None,
+        outer,
         storage,
         txid,
         arena,
     };
     super::exec::infer_type_res(condition, &columns)?;
     check_condition_type("WHERE", condition, &columns, storage, txid, arena)?;
-    check_literal_operands(condition, &scope, arena)?;
+    check_literal_operands(condition, &scope, storage, txid, arena)?;
     let schema = ScopeSchema(&scope);
     let row = Chained {
         inner: &schema,
-        outer: None,
+        outer,
     };
     analyse_sublinks(condition, storage, txid, arena, &row)
 }
 
-fn analyse_sublinks<'a>(
+/// PostgreSQL's analysis of an `INSERT` rule action's `RETURNING` list: the
+/// rule's OLD and NEW exist but cannot be reached there, where `old` and
+/// `new` name the inserted row.
+pub(crate) fn check_rule_insert_returning<'a>(
+    statement: &'a Stmt<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    rule: &dyn ColumnLookup<'a>,
+) -> Result<(), SqlError> {
+    let Stmt::Insert(insert) = statement else {
+        return Ok(());
+    };
+    let returning = insert.returning;
+    let Some(crate::storage::ResolvedRelation::Table(slot)) =
+        storage.resolve_relation(insert.table.schema, insert.table.name, txid)
+    else {
+        return Ok(());
+    };
+    let definition = storage.table_def(slot, txid);
+    let mut hidden = None;
+    for item in returning.items {
+        if let SelectItem::Expr { expression, .. } = item {
+            expression.for_each_column_reference(&mut |qualifier, name| {
+                if hidden.is_none()
+                    && let Some(qualifier) = qualifier
+                    && (qualifier == returning.old_name() || qualifier == returning.new_name())
+                    && definition.column_index(name).is_none()
+                    && rule.col_type(Some(qualifier), name).is_some()
+                {
+                    hidden = Some(crate::sql::error_position::at_reference(
+                        crate::sql::error_position::with_detail(
+                            sql_err!(
+                                sqlstate::UNDEFINED_COLUMN,
+                                "column {}.{} does not exist",
+                                qualifier,
+                                name
+                            ),
+                            format_args!(
+                                "There is a column named \"{}\" in table \"{}\", but it cannot be referenced from this part of the query.",
+                                name, qualifier
+                            ),
+                        ),
+                        qualifier,
+                    ));
+                }
+            });
+        }
+    }
+    hidden.map_or(Ok(()), Err)
+}
+
+/// PostgreSQL's parse analysis of a rewrite rule action at `CREATE RULE`,
+/// with OLD and NEW typed by `transition`: a query's relations, operators
+/// and types, and a data-changing statement's condition and assignments.
+/// Nothing is read or written.
+pub(crate) fn analyse_rule_action<'a>(
+    statement: &'a Stmt<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    transition: &dyn ColumnLookup<'a>,
+) -> Result<(), SqlError> {
+    match statement {
+        Stmt::Select(select) => {
+            let mark = arena.mark();
+            let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+            let analysed = expand_ctes(select, storage, txid, arena).and_then(|select| {
+                describe_select(
+                    select,
+                    storage,
+                    txid,
+                    arena,
+                    &mut columns,
+                    crate::sql::exec::DescriptionTarget::Sql,
+                    Some(transition),
+                )?;
+                analyse_select(select, storage, txid, arena, Some(transition))?;
+                if select.from.is_none() && select.set_body.is_none() {
+                    let catalog = storage_catalog(storage, arena, txid);
+                    let columns = super::eval::RuntimeColumnTypes {
+                        row: transition,
+                        catalog: Some(&catalog),
+                    };
+                    for item in select.items {
+                        if let SelectItem::Expr { expression, .. } = item {
+                            check_literal_operands_typed(
+                                expression,
+                                &|other| {
+                                    super::exec::infer_type_res(other, &columns)
+                                        .ok()
+                                        .and_then(|(oid, _)| ColType::from_oid(oid))
+                                },
+                                storage,
+                                txid,
+                                arena,
+                            )?;
+                        }
+                    }
+                }
+                Ok(())
+            });
+            // Only the verdict leaves; the description is discarded.
+            unsafe { arena.rewind_to(mark) };
+            analysed
+        }
+        Stmt::SetQuery(query) => {
+            analyse_set_tree(query.body, storage, txid, arena, Some(transition))
+        }
+        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
+            analyse_dml_condition(statement, storage, txid, arena, Some(transition))?;
+            validate_dml_assignment_casts(statement, storage, txid, arena, Some(transition))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// [`analyse_select`] for every subquery of `expression`, with `row` as the
+/// outer query's columns.
+pub(crate) fn analyse_sublinks<'a>(
     expression: &'a Expr<'a>,
     storage: &'a Storage,
     txid: u32,
@@ -8585,6 +8711,8 @@ pub(crate) fn analyse_routine_program<'a>(
 fn check_literal_operands<'a>(
     expression: &'a Expr<'a>,
     scope: &QueryScope<'a>,
+    storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     check_literal_operands_typed(
@@ -8594,6 +8722,8 @@ fn check_literal_operands<'a>(
                 .ok()
                 .and_then(|(oid, _)| ColType::from_oid(oid))
         },
+        storage,
+        txid,
         arena,
     )
 }
@@ -8602,38 +8732,30 @@ fn check_literal_operands<'a>(
 pub(crate) fn check_literal_operands_typed<'a>(
     expression: &'a Expr<'a>,
     infer: &dyn Fn(&'a Expr<'a>) -> Option<ColType>,
+    storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     use crate::sql::ast::BinaryOp;
-    let convert = |literal: &'a str, other: &'a Expr<'a>, arithmetic: bool| {
-        let Some(ctype) = infer(other) else {
-            return Ok(());
-        };
-        let numeric = matches!(
-            ctype,
-            ColType::Int2
-                | ColType::Int4
-                | ColType::Int8
-                | ColType::Float4
-                | ColType::Float8
-                | ColType::Numeric
-        );
-        let comparable = numeric
-            || matches!(
-                ctype,
-                ColType::Bool
-                    | ColType::Date
-                    | ColType::Timestamp
-                    | ColType::Timestamptz
-                    | ColType::Uuid
+    // The literal takes the type PostgreSQL's operator resolution gives it.
+    let convert_operand =
+        |literal: &'a str, other: &'a Expr<'a>, operator: &BinaryOp, left: bool| {
+            let (Some(ctype), Some(symbol)) = (infer(other), operator.operator_name()) else {
+                return Ok(());
+            };
+            let (known, unknown) = (Some(ctype.oid()), Some(super::types::oid::UNKNOWN));
+            let inputs = if left {
+                super::catalog::builtin_operator_input_oids(symbol, unknown, known)
+            } else {
+                super::catalog::builtin_operator_input_oids(symbol, known, unknown)
+            };
+            let target = inputs.and_then(
+                |(left_input, right_input)| {
+                    if left { left_input } else { right_input }
+                },
             );
-        if !(if arithmetic { numeric } else { comparable }) {
-            return Ok(());
-        }
-        crate::sql::eval::cast_to(Datum::Text(literal), ctype, arena)
-            .map(|_| ())
-            .map_err(|error| crate::sql::error_position::at_subject(error, literal))
-    };
+            convert_literal(literal, target.and_then(ColType::from_oid), arena)
+        };
     match expression {
         Expr::Binary {
             operator,
@@ -8641,45 +8763,235 @@ pub(crate) fn check_literal_operands_typed<'a>(
             right,
             ..
         } => {
-            check_literal_operands_typed(left, infer, arena)?;
-            check_literal_operands_typed(right, infer, arena)?;
-            let arithmetic = match operator {
-                BinaryOp::Eq
-                | BinaryOp::NotEq
-                | BinaryOp::Lt
-                | BinaryOp::LtEq
-                | BinaryOp::Gt
-                | BinaryOp::GtEq => false,
-                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
-                    true
-                }
-                _ => return Ok(()),
-            };
+            check_literal_operands_typed(left, infer, storage, txid, arena)?;
+            check_literal_operands_typed(right, infer, storage, txid, arena)?;
             match (left, right) {
                 (Expr::Str(_), Expr::Str(_)) => Ok(()),
-                (Expr::Str(literal), other) | (other, Expr::Str(literal)) => {
-                    convert(literal, other, arithmetic)
-                }
+                (Expr::Str(literal), other) => convert_operand(literal, other, operator, true),
+                (other, Expr::Str(literal)) => convert_operand(literal, other, operator, false),
                 _ => Ok(()),
             }
         }
-        Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
-            check_literal_operands_typed(operand, infer, arena)
-        }
         Expr::InList { operand, list, .. } => {
-            check_literal_operands_typed(operand, infer, arena)?;
+            check_literal_operands_typed(operand, infer, storage, txid, arena)?;
             for item in *list {
                 match item {
                     Expr::Str(literal) if !matches!(operand, Expr::Str(_)) => {
-                        convert(literal, operand, false)?
+                        convert_operand(literal, operand, &BinaryOp::Eq, false)?
                     }
-                    item => check_literal_operands_typed(item, infer, arena)?,
+                    item => check_literal_operands_typed(item, infer, storage, txid, arena)?,
                 }
             }
             Ok(())
         }
-        _ => Ok(()),
+        // The arguments PostgreSQL resolves to one common type convert to it.
+        Expr::Call {
+            name,
+            args,
+            over: None,
+            ..
+        } if matches!(*name, "coalesce" | "greatest" | "least")
+            && args
+                .iter()
+                .any(|argument| !matches!(argument, Expr::Str(_))) =>
+        {
+            let common = super::eval::funcs::conditional::literal_argument_type(args, infer);
+            for argument in *args {
+                match argument {
+                    Expr::Str(literal) => convert_literal(literal, common, arena)?,
+                    argument => {
+                        check_literal_operands_typed(argument, infer, storage, txid, arena)?
+                    }
+                }
+            }
+            Ok(())
+        }
+        Expr::Call {
+            name: "nullif",
+            args: [left, right],
+            over: None,
+            ..
+        } => {
+            check_literal_operands_typed(left, infer, storage, txid, arena)?;
+            check_literal_operands_typed(right, infer, storage, txid, arena)?;
+            match (left, right) {
+                (Expr::Str(_), Expr::Str(_)) => Ok(()),
+                (Expr::Str(literal), other) => convert_operand(literal, other, &BinaryOp::Eq, true),
+                (other, Expr::Str(literal)) => {
+                    convert_operand(literal, other, &BinaryOp::Eq, false)
+                }
+                _ => Ok(()),
+            }
+        }
+        // An array constructor's unknown elements take its element type.
+        Expr::Array(items)
+            if items.iter().any(|item| matches!(item, Expr::Str(_)))
+                && items.iter().any(|item| !matches!(item, Expr::Str(_))) =>
+        {
+            match infer(expression) {
+                Some(ColType::Array(element)) => convert_array_elements(
+                    expression,
+                    element.to_coltype(),
+                    infer,
+                    storage,
+                    txid,
+                    arena,
+                ),
+                _ => walk_children(expression, &mut |child| {
+                    check_literal_operands_typed(child, infer, storage, txid, arena)
+                }),
+            }
+        }
+        // `ARRAY['1', 'x']::int[]` converts each unknown element to the
+        // element type, as PostgreSQL coerces the array constructor.
+        Expr::Cast {
+            operand: operand @ Expr::Array(_),
+            type_name,
+            ..
+        } => match ColType::from_sql_name(type_name) {
+            Some(ColType::Array(element)) => {
+                convert_array_elements(operand, element.to_coltype(), infer, storage, txid, arena)
+            }
+            _ => check_literal_operands_typed(operand, infer, storage, txid, arena),
+        },
+        // An unknown literal passed to a builtin function converts to the
+        // parameter type of the candidate PostgreSQL's function resolution
+        // selects, given the other arguments' types.
+        Expr::Call {
+            kind: crate::sql::ast::CallKind::Routine,
+            name,
+            args,
+            argument_names: [],
+            variadic: false,
+            star: false,
+            over: None,
+            ..
+        } if args.iter().any(|argument| matches!(argument, Expr::Str(_))) => {
+            let mut oids = [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            if args.len() > oids.len() {
+                return Ok(());
+            }
+            for (oid, argument) in oids.iter_mut().zip(*args) {
+                if matches!(argument, Expr::Str(_) | Expr::Null) {
+                    continue;
+                }
+                check_literal_operands_typed(argument, infer, storage, txid, arena)?;
+                let Some(ctype) = infer(argument) else {
+                    return Ok(());
+                };
+                *oid = ctype.oid();
+            }
+            let oids = &oids[..args.len()];
+            let crate::storage::RoutineCallSelection::Builtin { oid, .. } = storage
+                .select_routine_call(
+                    name,
+                    &[],
+                    oids,
+                    false,
+                    txid,
+                    crate::storage::RoutineCallKind::Function,
+                )
+            else {
+                return Ok(());
+            };
+            let Some(parameters) = storage.builtin_call_input_oids(oid, &[], oids, false, txid)
+            else {
+                return Ok(());
+            };
+            for (argument, parameter) in args.iter().zip(parameters) {
+                if let Expr::Str(literal) = argument {
+                    convert_literal(literal, ColType::from_oid(parameter), arena)?;
+                }
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand: None,
+            whens,
+            otherwise,
+            ..
+        } => {
+            let common = infer(expression);
+            for (condition, result) in *whens {
+                check_literal_operands_typed(condition, infer, storage, txid, arena)?;
+                match result {
+                    Expr::Str(literal) => convert_literal(literal, common, arena)?,
+                    result => check_literal_operands_typed(result, infer, storage, txid, arena)?,
+                }
+            }
+            match otherwise {
+                Some(Expr::Str(literal)) => convert_literal(literal, common, arena),
+                Some(result) => check_literal_operands_typed(result, infer, storage, txid, arena),
+                None => Ok(()),
+            }
+        }
+        Expr::Subquery(_)
+        | Expr::Exists(_)
+        | Expr::ArraySubquery(_)
+        | Expr::RowSubquery { .. }
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. } => Ok(()),
+        _ => walk_children(expression, &mut |child| {
+            check_literal_operands_typed(child, infer, storage, txid, arena)
+        }),
     }
+}
+
+/// Converts the unknown literals of a (nested) array constructor to its
+/// element type.
+fn convert_array_elements<'a>(
+    constructor: &'a Expr<'a>,
+    element: ColType,
+    infer: &dyn Fn(&'a Expr<'a>) -> Option<ColType>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let Expr::Array(items) = constructor else {
+        return check_literal_operands_typed(constructor, infer, storage, txid, arena);
+    };
+    for item in *items {
+        match item {
+            Expr::Str(literal) => convert_literal(literal, Some(element), arena)?,
+            Expr::Array(_) => convert_array_elements(item, element, infer, storage, txid, arena)?,
+            item => check_literal_operands_typed(item, infer, storage, txid, arena)?,
+        }
+    }
+    Ok(())
+}
+
+/// Converts an unknown-type literal to the builtin type analysis gave it,
+/// positioned at the literal when its input fails. Text-like and
+/// unresolved targets accept any string.
+pub(super) fn convert_literal<'a>(
+    literal: &'a str,
+    target: Option<ColType>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let Some(target) = target.filter(|target| {
+        matches!(
+            target,
+            ColType::Int2
+                | ColType::Int4
+                | ColType::Int8
+                | ColType::Float4
+                | ColType::Float8
+                | ColType::Numeric
+                | ColType::Bool
+                | ColType::Date
+                | ColType::Time
+                | ColType::Timetz
+                | ColType::Timestamp
+                | ColType::Timestamptz
+                | ColType::Interval
+                | ColType::Uuid
+        )
+    }) else {
+        return Ok(());
+    };
+    crate::sql::eval::cast_to(Datum::Text(literal), target, arena)
+        .map(|_| ())
+        .map_err(|error| crate::sql::error_position::at_subject(error, literal))
 }
 
 /// PostgreSQL has no equality or ordering for `json` — two documents differing
@@ -8698,7 +9010,7 @@ fn check_key_types<'a>(
 ) -> Result<(), SqlError> {
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } = item {
-            check_literal_operands(expression, scope, arena)?;
+            check_literal_operands(expression, scope, storage, txid, arena)?;
         }
     }
     for expression in statement
@@ -8724,7 +9036,27 @@ fn check_key_types<'a>(
                 .flat_map(|from| from.joins.iter().filter_map(|join| join.on)),
         )
     {
-        check_literal_operands(expression, scope, arena)?;
+        check_literal_operands(expression, scope, storage, txid, arena)?;
+    }
+    for key in statement.distinct_on {
+        check_literal_operands(key, scope, storage, txid, arena)?;
+    }
+    let mut window_literals = |spec: &'a crate::sql::ast::WindowSpec<'a>| {
+        for key in spec
+            .partition_by
+            .iter()
+            .copied()
+            .chain(spec.order_by.iter().map(|key| key.expression))
+        {
+            check_literal_operands(key, scope, storage, txid, arena)?;
+        }
+        Ok(())
+    };
+    for spec in statement.windows {
+        window_literals(spec)?;
+    }
+    for expression in select_window_owners(statement) {
+        for_each_inline_window(expression, &mut window_literals)?;
     }
     let noncomparable = |e: &Expr<'a>| {
         infer_scope_type(e, scope)
@@ -10560,13 +10892,19 @@ fn rewrite_grouped_expr<'a>(
                             };
                             Some(WindowFrame {
                                 units: f.units,
+                                between: f.between,
                                 start: bound(&f.start)?,
                                 end: bound(&f.end)?,
                                 exclusion: f.exclusion,
                             })
                         }
                     };
-                    let spec = super::ast::WindowSpec { partition_by, order_by, frame };
+                    let spec = super::ast::WindowSpec {
+                        partition_by,
+                        order_by,
+                        frame,
+                        ..**spec
+                    };
                     Some(&*arena.alloc(spec).map_err(|_| arena_full())?)
                 }
             };
@@ -10700,9 +11038,6 @@ fn check_select_types<'a>(
         check(w)?;
         check_condition_type("WHERE", w, columns, storage, txid, arena)?;
     }
-    for g in statement.group_by {
-        check(g)?;
-    }
     if let Some(h) = statement.having {
         check(h)?;
         check_condition_type("HAVING", h, columns, storage, txid, arena)?;
@@ -10717,6 +11052,30 @@ fn check_select_types<'a>(
             txid,
         )?)?;
     }
+    // `GROUP BY 1` and `GROUP BY name` name output columns.
+    let grouped = resolve_group_ordinals(statement, Some(scope), arena, storage, txid)?;
+    for g in grouped.group_by {
+        check(g)?;
+    }
+    for key in statement.distinct_on {
+        check(resolve_position_target(
+            key,
+            statement.items,
+            Some(scope),
+            arena,
+            storage,
+            txid,
+            "DISTINCT ON",
+        )?)?;
+    }
+    // PostgreSQL analyses window definitions last: the WINDOW clause's, then
+    // each inline OVER (...) as the select list and ORDER BY reach it.
+    for spec in statement.windows {
+        check_window_spec(spec, &check)?;
+    }
+    for expression in select_window_owners(statement) {
+        for_each_inline_window(expression, &mut |spec| check_window_spec(spec, &check))?;
+    }
     for expression in statement
         .items
         .iter()
@@ -10730,6 +11089,49 @@ fn check_select_types<'a>(
         subquery::check_subquery_literals(expression, Some(scope), storage, txid, arena)?;
     }
     Ok(())
+}
+
+/// The expressions of a query that may hold window function calls.
+fn select_window_owners<'s, 'a>(
+    statement: &'s Select<'a>,
+) -> impl Iterator<Item = &'a Expr<'a>> + 's {
+    statement
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } => Some(*expression),
+            _ => None,
+        })
+        .chain(statement.order_by.iter().map(|key| key.expression))
+}
+
+fn check_window_spec<'a>(
+    spec: &'a crate::sql::ast::WindowSpec<'a>,
+    check: &dyn Fn(&'a Expr<'a>) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    for key in spec.partition_by {
+        check(key)?;
+    }
+    for key in spec.order_by {
+        check(key.expression)?;
+    }
+    Ok(())
+}
+
+/// Visits every `OVER (...)` written in `expression`, outside subqueries.
+fn for_each_inline_window<'a>(
+    expression: &'a Expr<'a>,
+    visit: &mut dyn FnMut(&'a crate::sql::ast::WindowSpec<'a>) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    if let Expr::Call {
+        over: Some(spec), ..
+    } = expression
+    {
+        visit(spec)?;
+    }
+    walk_children(expression, &mut |child| {
+        for_each_inline_window(child, visit)
+    })
 }
 
 /// Surfaces plan-time constant errors (e.g. `1/0`) across every expression
@@ -10750,6 +11152,33 @@ fn check_select_constants_in<'a>(
     txid: u32,
 ) -> Result<(), SqlError> {
     let catalog = storage_catalog(storage, arena, txid);
+    if statement.from.is_none() {
+        // Unknown-type literals of a query without columns convert as its
+        // operators resolve them.
+        let columns = super::exec::CatalogCols {
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        };
+        for item in statement.items {
+            if let SelectItem::Expr { expression, .. } = item {
+                check_literal_operands_typed(
+                    expression,
+                    &|other| {
+                        super::exec::infer_type_res(other, &columns)
+                            .ok()
+                            .and_then(|(oid, _)| ColType::from_oid(oid))
+                    },
+                    storage,
+                    txid,
+                    arena,
+                )?;
+            }
+        }
+    }
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
             super::eval::check_constant_errors(expression, arena, Some(&catalog))?;
@@ -10767,8 +11196,28 @@ fn check_select_constants_in<'a>(
     for ob in statement.order_by {
         super::eval::check_constant_errors(ob.expression, arena, Some(&catalog))?;
     }
+    for key in statement.distinct_on {
+        super::eval::check_constant_errors(key, arena, Some(&catalog))?;
+    }
     for bound in [statement.limit, statement.offset].into_iter().flatten() {
         super::eval::check_constant_errors(bound, arena, Some(&catalog))?;
+    }
+    let mut window_constants = |spec: &crate::sql::ast::WindowSpec<'a>| {
+        for key in spec
+            .partition_by
+            .iter()
+            .copied()
+            .chain(spec.order_by.iter().map(|key| key.expression))
+        {
+            super::eval::check_constant_errors(key, arena, Some(&catalog))?;
+        }
+        Ok(())
+    };
+    for spec in statement.windows {
+        window_constants(spec)?;
+    }
+    for expression in select_window_owners(statement) {
+        for_each_inline_window(expression, &mut window_constants)?;
     }
     Ok(())
 }
@@ -11830,6 +12279,42 @@ fn check_condition_type<'a>(
     Ok(())
 }
 
+/// A rewrite rule's WHERE condition is checked as a query's WHERE clause:
+/// its constant operands convert and its type is boolean.
+pub(crate) fn check_rule_condition_type<'a>(
+    condition: &'a Expr<'a>,
+    columns: &dyn super::exec::ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    check_literal_operands_typed(
+        condition,
+        &|other| {
+            super::exec::infer_type_res(other, columns)
+                .ok()
+                .and_then(|(oid, _)| ColType::from_oid(oid))
+        },
+        storage,
+        txid,
+        arena,
+    )?;
+    check_condition_type("WHERE", condition, columns, storage, txid, arena)
+}
+
+/// The first aggregate call in `expression`, outside its subqueries.
+pub(crate) fn first_aggregate<'a>(
+    expression: &'a Expr<'a>,
+    storage: &Storage,
+    txid: u32,
+    columns: &dyn super::exec::ColTypeResolver,
+    arena: &'a Arena,
+) -> Result<Option<&'a Expr<'a>>, SqlError> {
+    let mut nodes = ArenaList::new(arena);
+    collect_aggs(expression, &mut nodes, storage, txid, columns)?;
+    Ok(nodes.as_slice().first().map(|(_, aggregate)| *aggregate))
+}
+
 /// Parse analysis of a FROM-less `SELECT` without running it: its `WHERE`
 /// type and its constant inputs, as `PREPARE` checks them.
 pub(crate) fn analyse_fromless_select<'a>(
@@ -11852,7 +12337,61 @@ pub(crate) fn analyse_fromless_select<'a>(
     if let Some(condition) = statement.where_clause {
         check_condition_type("WHERE", condition, &columns, storage, txid, arena)?;
     }
+    check_fromless_keys(statement, &columns, storage, txid, arena)?;
     check_select_constants(statement, arena, storage, txid)
+}
+
+/// The ORDER BY and DISTINCT ON keys of a query without FROM: output
+/// positions or expressions over no columns, checked as PostgreSQL's
+/// analysis checks them.
+fn check_fromless_keys<'a>(
+    statement: &'a Select<'a>,
+    columns: &dyn super::exec::ColTypeResolver,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let mut order = [&Expr::Null; MAX_PROJ];
+    let mut on = [&Expr::Null; MAX_PROJ];
+    if statement.order_by.len() > MAX_PROJ || statement.distinct_on.len() > MAX_PROJ {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "a query without FROM can have at most {} ORDER BY or DISTINCT ON keys",
+            MAX_PROJ
+        ));
+    }
+    for (slot, key) in order.iter_mut().zip(statement.order_by) {
+        *slot = resolve_position_target(
+            key.expression,
+            statement.items,
+            None,
+            arena,
+            storage,
+            txid,
+            "ORDER BY",
+        )?;
+        super::exec::infer_type_res(slot, columns)?;
+    }
+    for (slot, key) in on.iter_mut().zip(statement.distinct_on) {
+        *slot = resolve_position_target(
+            key,
+            statement.items,
+            None,
+            arena,
+            storage,
+            txid,
+            "DISTINCT ON",
+        )?;
+        super::exec::infer_type_res(slot, columns)?;
+    }
+    if !statement.order_by.is_empty() && !statement.distinct_on.is_empty() {
+        materialize::check_distinct_on_order(
+            &order[..statement.order_by.len()],
+            &on[..statement.distinct_on.len()],
+            statement.distinct_on,
+        )?;
+    }
+    Ok(())
 }
 
 /// Admit the virtual input row once before scalar projection or set expansion.
@@ -11953,6 +12492,9 @@ pub(crate) fn constant_select_resumable<'a>(
         && let Err(error) =
             check_condition_type("WHERE", w, &resolved_columns, storage, txid, arena)
     {
+        return sql_fail(error);
+    }
+    if let Err(error) = check_fromless_keys(statement, &resolved_columns, storage, txid, arena) {
         return sql_fail(error);
     }
     if let Err(e) = check_select_constants(statement, arena, storage, txid) {
@@ -15245,6 +15787,15 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
                     super::exec::ColTypeResolver::resolve(outer, qualifier, name)
                 })
                 .unwrap_or(Err(error))
+                .map_err(|error| {
+                    let mut suggestion =
+                        crate::sql::column_suggestion::ColumnSuggestion::new(qualifier, name);
+                    self.scope.suggest_columns(&mut suggestion);
+                    if let Some(outer) = self.outer {
+                        outer.suggest_columns(&mut suggestion);
+                    }
+                    crate::sql::error_position::with_column_suggestion(error, &suggestion)
+                })
             }
             Err(error) => Err(error),
         }
@@ -15871,6 +16422,7 @@ pub fn first_from_match<'a, 'r>(
     on_match: &mut dyn FnMut(&dyn ColumnLookup<'a>) -> Result<(), SqlError>,
     sequences: Option<&dyn SequenceAccess>,
     matched_row: Option<MatchedFromRow<'_, 'r>>,
+    hashed: Option<&'a [u64]>,
 ) -> Result<bool, SqlError> {
     let mut found = false;
     let mut matched_row = matched_row;
@@ -15885,6 +16437,7 @@ pub fn first_from_match<'a, 'r>(
         params,
         target,
         sequences,
+        hashed,
         &mut |row, joined, _| {
             if let Some(matched_row) = matched_row.as_mut() {
                 *matched_row.values = detached_join_values(row, arena, matched_row.arena)?;

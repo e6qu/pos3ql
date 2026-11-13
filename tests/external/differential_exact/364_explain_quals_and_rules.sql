@@ -1,0 +1,22 @@
+-- EXPLAIN prints each scan's filter, a hash join's condition and Hash node,
+-- a nested loop's materialized inner scan, and, for a statement a rewrite
+-- rule changes, the plan of every statement the rule produces.
+CREATE TABLE t364 (a int, b text);
+CREATE TABLE l364 (a int, b text);
+EXPLAIN (COSTS OFF) SELECT * FROM t364 WHERE a = 1 AND b <> 'x';
+EXPLAIN (COSTS OFF) UPDATE t364 SET b = 'y' WHERE a = 1;
+EXPLAIN (COSTS OFF) DELETE FROM t364 WHERE a > 2 OR b IS NULL;
+EXPLAIN (COSTS OFF) SELECT * FROM t364, l364 WHERE t364.a = 1 AND l364.a = 1;
+EXPLAIN (COSTS OFF) SELECT * FROM t364 JOIN l364 ON t364.a = l364.a WHERE l364.b = 'x';
+EXPLAIN (COSTS OFF) UPDATE l364 SET b = 'y' FROM t364 WHERE l364.a = 1 AND t364.a = 1;
+EXPLAIN (COSTS OFF) DELETE FROM l364 USING t364 WHERE l364.a < 0 AND t364.a = 1;
+EXPLAIN (COSTS OFF) UPDATE l364 SET b = t364.b FROM t364;
+CREATE RULE ins364 AS ON INSERT TO t364 WHERE new.a > 0
+  DO ALSO INSERT INTO l364 VALUES (new.a, new.b);
+CREATE RULE upd364 AS ON UPDATE TO t364
+  DO INSTEAD (UPDATE l364 SET b = new.b WHERE a = old.a; DELETE FROM l364 WHERE a < 0);
+CREATE RULE del364 AS ON DELETE TO t364 DO ALSO NOTIFY chan364;
+EXPLAIN (COSTS OFF) INSERT INTO t364 VALUES (1, 'x');
+EXPLAIN (COSTS OFF) UPDATE t364 SET b = 'y' WHERE a = 1;
+EXPLAIN (COSTS OFF) DELETE FROM t364;
+DROP TABLE t364, l364;

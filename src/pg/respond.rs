@@ -2699,9 +2699,11 @@ impl<'b> Responder<'b> {
                             m.u8(b'D');
                             m.cstr(detail.as_str());
                         }
-                        Some(crate::sql::error_position::AnalysisNote::Hint(hint))
-                            if analysis_hint.is_none()
-                                && diagnostic.as_ref().is_none_or(|d| d.hint.is_none()) =>
+                        Some(
+                            crate::sql::error_position::AnalysisNote::Hint(hint)
+                            | crate::sql::error_position::AnalysisNote::Suggestion(hint),
+                        ) if analysis_hint.is_none()
+                            && diagnostic.as_ref().is_none_or(|d| d.hint.is_none()) =>
                         {
                             m.u8(b'H');
                             m.cstr(hint.as_str());

@@ -480,16 +480,43 @@ the options as written; keeping them needs the written order in the view's
 journal records and checkpoint image. `pg_operator` lists 27 `=` operators
 where PostgreSQL lists 63, so a foreign key's `conpfeqop`, `conppeqop` and
 `conffeqop` are NULL where PostgreSQL lists each key column's equality
-operator (`{96}`); they need the complete built-in operator rows first. `pg_get_viewdef` uses PostgreSQL's
-layout, including its wrap column, only for a view
-over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
-comma or `USING` joins, subqueries or set operations; other views return their
-query text. In a `BEGIN ATOMIC` body only a `SELECT` of expressions
+operator (`{96}`); they need the complete built-in operator rows first. `pg_get_viewdef`, `pg_views`,
+`pg_get_ruledef` and `pg_rules` print a view's or rule action's query as
+PostgreSQL deparses it, in its indented layout and wrap column, including
+subqueries, functions, explicit, `USING` and `NATURAL` joins, set operations,
+`DISTINCT ON`, windows, grouping sets, `WITH` queries, `LATERAL` items,
+`VALUES` lists, `TABLESAMPLE` and sublinks. A query that reads a function
+returning a record or composite type, a catalog relation, a `WITH` query with
+`SEARCH` or `CYCLE` or one that modifies data, or that groups or orders by a
+constant, or an expression outside the typed expression coverage, still prints
+its stored text, and a rule action's pretty form then fails with `0A000`. The
+routines and types a view's subqueries name are printed as the subquery names
+them, so after such a routine or type is renamed the view prints its stored
+text. In a `BEGIN ATOMIC` body only a `SELECT` of expressions
 without `FROM` is deparsed (`SELECT (x + 1);`, under the current names of
 the routines and types it named); other statements are printed one per line
 as written, keeping names that were since renamed, where PostgreSQL prints its analyzed form (`INSERT
-INTO t (a, b) VALUES (f.x, 'q'::text);`); rule actions (`DO INSERT ...`) are printed as written, and their pretty
-form fails with `0A000`; policy expressions are not deparsed. Notices carry
+INTO t (a, b) VALUES (f.x, 'q'::text);`); policy
+expressions are not deparsed. `EXPLAIN` prints
+the left-deep join tree pos3ql runs, with scan filters, a hash join's
+condition and each nested loop's join filter, for relations joined by
+commas, `CROSS JOIN` or inner `ON` conditions; outer joins print the tree
+without their conditions, and index scans omit `Index Cond`. The join order
+is pos3ql's (FROM order, or its selectivity order for comma lists), which
+can differ from PostgreSQL's cost-based order. The executor has no merge
+join, so where PostgreSQL's costs pick `Merge Join` over sorted inputs
+pos3ql shows the hash join or nested loop it runs. `UPDATE ... FROM` and `DELETE ...
+USING` hash their first FROM table when it is joined to the target by
+equality, as a `SELECT` of the two tables would, and join later FROM items to
+it in nested loops; PostgreSQL may instead hash the joined FROM items. For a
+statement a rewrite rule changes, an `INSERT ... SELECT` action of an
+`INSERT` of several rows or of a query reading tables, an `INSERT` of an
+aggregated or ordered query, a conditional `INSTEAD` rule on an `INSERT` of
+several rows and an action on a view fail with `0A000`; under `EXPLAIN ANALYZE` the statement runs
+once and its time and I/O are reported on its last query. `EXPLAIN ANALYZE`
+reports actual rows only on each plan's top node, where PostgreSQL reports
+every node (`(never executed)` for nodes that did not run), because the
+executor keeps no per-node counters. Notices carry
 no position (`''::tsquery` points at the literal in PostgreSQL). Built-in
 calls with constant arguments are not folded once while planning: `SELECT
 timestamptypmodin('{7}') FROM generate_series(1, 3)` warns three times where
@@ -519,13 +546,7 @@ IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 set, and omits an explicit `security_invoker=false`. A `CHECK` constraint
 marked `NO INHERIT` fails with `0A000`, and exclusion constraints support only
 GiST over range columns (`EXCLUDE USING btree (a WITH =)` fails with `0A000`).
-`pg_constraint` omits the system catalogs' own not-null constraints. A rewrite rule's multi-row `INSERT ... VALUES` action
-resolves each column's type across its rows as a `VALUES` list does, so
-`VALUES ('1'::text, 3), (2, DEFAULT)` into a `text` column fails with `VALUES
-types text and integer cannot be matched` where PostgreSQL converts each value
-to the target column's type; and a rule action's `RETURNING` list that reads
-`NEW` or `OLD` fails with `missing FROM-clause entry` when the triggering
-statement asks for rows. A derived table computes output
+`pg_constraint` omits the system catalogs' own not-null constraints. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1
 FROM (SELECT 10 / t.x) s)` fails with division by zero on a zero `x` where
 PostgreSQL, which drops unread subquery outputs, returns the row. A
@@ -539,15 +560,16 @@ A PL/pgSQL variable declared with a view's row type (`r v;` or
 `r v%ROWTYPE`) fails with `0A000`; a table's works. A `CONSTANT` assignment
 error has no cursor position: PL/pgSQL assignment targets do not keep their
 place in the routine body. A trigger fired inside a writing statement cannot
-`FETCH` from a session cursor that locks its rows or calls a user-defined
-routine for each fetched row, or first read one whose data-modifying `WITH`
-queries have not run (`0A000`). A protocol-level `Parse` message checks only
+`FETCH` from a session cursor that calls a user-defined routine for each
+fetched row (`0A000`). A protocol-level `Parse` message checks only
 syntax and parameter types, so analysis errors (`SELECT current_date + $1`,
 `SELECT 1 WHERE 'x'`) arrive at `Bind` or `Execute` where PostgreSQL reports
 them at `Parse`, and `pg_prepared_statements` lists only SQL `PREPARE`
-statements, not protocol ones. `PREPARE` checks a `SELECT` without `FROM` and
-the types of every query, but constant inputs of a query with `FROM`
-(`SELECT 'a'::int FROM t`) are converted when it runs.
+statements, not protocol ones. An unknown-type literal argument of a
+builtin function converts to the selected candidate's parameter type when the
+statement is analysed only for numeric, boolean and date and time
+parameters; other parameter types read the literal's text when the function
+runs.
 Checks PostgreSQL makes in parse analysis or execution (type modifiers, COPY
 options, storage parameters, sequence, database and large-object values,
 SQL/JSON result types) are reported when the statement would run. In a
@@ -557,15 +579,12 @@ analysis order finds them; in other statements the modifier error comes first.
 A `RETURNING` list routed through a rule's `RETURNING` list reads the rule's
 relation only: `UPDATE v ... FROM o RETURNING o.label`, `*` beside `FROM` or
 `USING` sources, and subqueries in that list fail with `0A000` where
-PostgreSQL evaluates them. A rule condition's `OLD` or `NEW` that the event
-lacks (`ON INSERT ... WHERE OLD.n > 0`) is reported without its cursor
-position, and a missing field of a PL/pgSQL record variable read in a `DO`
+PostgreSQL evaluates them. A missing field of a PL/pgSQL record variable read in a `DO`
 body (`RAISE NOTICE '%', r.nope`) carries a position where PostgreSQL names
 the expression in `CONTEXT`. Selecting a field of a named composite cast to
 `record` (`(ROW(1, 2)::t::record).id`) fails as an unknown field. Reading a
 field of a NULL `record` parameter names the expression in `CONTEXT`, which
 PostgreSQL omits because it raises the error while evaluating, not planning.
-PostgreSQL evaluates them.
 A foreign key between two different composite types fails with `0A000`
 where PostgreSQL compares them field by field.
 A user table's `tableoid` system column fails with `0A000`

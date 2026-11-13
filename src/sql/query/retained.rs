@@ -1790,6 +1790,7 @@ fn appended_select<'a>(
             set_body: None,
             locking: &[],
             windows: &[],
+            written: crate::sql::ast::WrittenQuery::PLAIN,
         })
         .map_err(|_| arena_full())?;
     Ok(Some(&*wrapper))
@@ -1875,6 +1876,7 @@ pub(crate) fn set_query_select<'a>(
             set_body: Some(query.body),
             locking: query.locking,
             windows: &[],
+            written: crate::sql::ast::WrittenQuery::PLAIN,
         })
         .map(|select| &*select)
         .map_err(|_| arena_full())
@@ -3058,6 +3060,7 @@ impl<'a> RetainedSelect<'a> {
             }
         };
         check_select_types(statement, &scope, storage, txid, arena, None)?;
+        super::check_key_types(statement, &scope, arena, storage, txid)?;
         check_select_constants(statement, arena, storage, txid)?;
         super::require_select_routine_execute(statement, &scope, arena, storage, txid)?;
         let locking = if locks {
@@ -3065,7 +3068,6 @@ impl<'a> RetainedSelect<'a> {
                 return Ok(None);
             }
             super::validate_locking(statement, storage, txid, arena)?;
-            super::check_key_types(statement, &scope, arena, storage, txid)?;
             arena
                 .alloc_slice_copy(statement.locking)
                 .map_err(|_| arena_full())?

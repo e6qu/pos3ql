@@ -1029,7 +1029,7 @@ fn prepend_rule_source<'a>(
     })
 }
 
-fn rule_select<'a>(
+pub(crate) fn rule_select<'a>(
     items: &'a [SelectItem<'a>],
     from: Option<FromClause<'a>>,
     where_clause: Option<&'a Expr<'a>>,
@@ -1052,10 +1052,11 @@ fn rule_select<'a>(
         with: &[],
         set_body: None,
         locking: &[],
+        written: crate::sql::ast::WrittenQuery::PLAIN,
     }
 }
 
-fn rule_relation_ref<'a>(
+pub(crate) fn rule_relation_ref<'a>(
     name: crate::sql::ast::QualName<'a>,
     alias: Option<&'a str>,
 ) -> TableRef<'a> {
@@ -1080,6 +1081,45 @@ fn rule_relation_ref<'a>(
         view_access: None,
         join_members: None,
     }
+}
+
+/// PostgreSQL's aggregate placement check of a rule's `WHERE` condition: an
+/// aggregate whose arguments read only the rule's OLD or NEW row, even one
+/// written inside a subquery (`(SELECT sum(new.a))`), belongs to the
+/// condition's level, where aggregates are not allowed.
+pub(crate) fn check_rule_condition_aggregates<'a>(
+    relation: crate::sql::ast::QualName<'a>,
+    condition: &'a Expr<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let mark = arena.mark();
+    let result = (|| {
+        let joins = arena
+            .alloc_slice_with(1, |_| Join {
+                table: rule_relation_ref(relation, Some("new")),
+                kind: JoinKind::Comma,
+                on: None,
+                using: None,
+                natural: false,
+            })
+            .map_err(|_| arena_full())?;
+        let select = arena
+            .alloc(rule_select(
+                &[],
+                Some(FromClause {
+                    base: rule_relation_ref(relation, Some("old")),
+                    joins,
+                }),
+                Some(condition),
+            ))
+            .map_err(|_| arena_full())?;
+        super::aggregate_levels::assign_aggregate_levels(select, storage, txid, arena).map(|_| ())
+    })();
+    // Only the verdict leaves; the analysis query is discarded.
+    unsafe { arena.rewind_to(mark) };
+    result
 }
 
 fn append_rule_input_from<'a>(
@@ -1875,10 +1915,12 @@ pub(crate) fn rule_returning_items<'a>(
 }
 
 /// The target relation of a rule's `INSERT ... VALUES` action: its column
-/// names in order and their declared type identities.
+/// names in order, their declared type identities and the names that
+/// resolve those types under any search path.
 pub(crate) struct RuleInsertTarget<'a> {
     pub names: &'a [&'a str],
     pub type_oids: &'a [i32],
+    pub type_names: &'a [&'a str],
 }
 
 /// Attaches the original statement's transition-row source to one rebound
@@ -1958,10 +2000,46 @@ pub(crate) fn attach_rule_source<'a>(
         .map_err(|_| arena_full())
 }
 
+/// PostgreSQL's analysis of a rule's `INSERT ... VALUES` action: each item
+/// is assigned to its target column with OLD and NEW typed by the rule's
+/// transition `source`, before the action becomes a query over that source.
+pub(crate) fn check_rule_insert_values<'a>(
+    statement: &'a Stmt<'a>,
+    source: &'a TableRef<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let Stmt::Insert(insert) = statement else {
+        return Ok(());
+    };
+    if insert.select.is_some() || insert.rows.is_empty() {
+        return Ok(());
+    }
+    let from = arena
+        .alloc(FromClause {
+            base: *source,
+            joins: &[],
+        })
+        .map_err(|_| arena_full())?;
+    let scope = super::QueryScope::resolve_schema(storage, from, txid, arena, None)?;
+    super::validate_dml_assignment_casts(
+        statement,
+        storage,
+        txid,
+        arena,
+        Some(&super::ScopeSchema(&scope)),
+    )
+}
+
 /// A rule's `INSERT ... VALUES` action as `INSERT ... SELECT` over its
 /// source rows. Several rows join the source as `LATERAL (VALUES ...)`, so
 /// every `VALUES` row is inserted for one source row before the next, as
-/// PostgreSQL's plan does. A column written as `DEFAULT` in every row leaves
+/// PostgreSQL's plan does. PostgreSQL converts each item of such a list to
+/// its target column's type rather than resolving one type across the rows;
+/// the caller has checked each item's assignment to its column, so each item
+/// is converted to the column's type here (without its modifier, which the
+/// assignment applies). A column written as `DEFAULT` in every row leaves
 /// the target list; one written as `DEFAULT` in some rows keeps a typed null
 /// placeholder, and the executor takes the default for the positions the
 /// trailing row-number column selects from `values_defaults`.
@@ -2070,23 +2148,23 @@ fn rule_insert_values<'a>(
         .iter()
         .any(|mask| *mask != crate::storage::ColumnSet::EMPTY);
     let mut placeholder_types = [0i32; crate::storage::MAX_COLUMNS];
+    let mut target_types = [""; crate::storage::MAX_COLUMNS];
     for (slot, position) in kept.iter().enumerate() {
-        if rows.iter().any(|row| is_default(row[*position])) {
-            let name = named[*position];
-            let index = target
-                .names
-                .iter()
-                .position(|column| *column == name)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" of relation \"{}\" does not exist",
-                        name,
-                        insert.table.name
-                    )
-                })?;
-            placeholder_types[slot] = target.type_oids[index];
-        }
+        let name = named[*position];
+        let index = target
+            .names
+            .iter()
+            .position(|column| *column == name)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" of relation \"{}\" does not exist",
+                    name,
+                    insert.table.name
+                )
+            })?;
+        placeholder_types[slot] = target.type_oids[index];
+        target_types[slot] = target.type_names[index];
     }
     // The joined VALUES list numbers the rows; each target picks its row's
     // expression with a CASE in the output list, so volatile calls run as
@@ -2165,7 +2243,18 @@ fn rule_insert_values<'a>(
                     })
                     .map_err(|_| arena_full())?
             } else {
-                row[*position]
+                // PostgreSQL converts each item to its target column's type
+                // rather than resolving one type across the rows; the
+                // assignment applies the column's modifier.
+                &*arena
+                    .alloc(Expr::Cast {
+                        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                        operand: row[*position],
+                        type_name: target_types[slot],
+                        type_mod: -1,
+                        binding: crate::sql::ast::CastBinding::Resolve,
+                    })
+                    .map_err(|_| arena_full())?
             };
             let number = &*arena
                 .alloc(Expr::Int(index as i64))
@@ -3793,6 +3882,7 @@ fn wrap_set_tree_with<'a>(
         with,
         set_body: Some(tree),
         locking: &[],
+        written: crate::sql::ast::WrittenQuery::PLAIN,
     };
     Ok(&*arena.alloc(sel).map_err(|_| arena_full())?)
 }
@@ -5409,6 +5499,7 @@ fn wrap_set_tree<'a>(tree: &'a SetTree<'a>, arena: &'a Arena) -> Result<&'a Sele
         with: &[],
         set_body: Some(tree),
         locking: &[],
+        written: crate::sql::ast::WrittenQuery::PLAIN,
     };
     Ok(&*arena.alloc(sel).map_err(|_| arena_full())?)
 }
@@ -6289,6 +6380,7 @@ fn subst_select_body<'a>(
         with: &[],
         set_body,
         locking: s.locking,
+        written: crate::sql::ast::WrittenQuery::PLAIN,
     };
     Ok(&*arena.alloc(new).map_err(|_| arena_full())?)
 }
@@ -6482,8 +6574,17 @@ fn subst_insert<'a>(
         rows,
         select,
         on_conflict,
+        // A rule's OLD and NEW cannot be referenced from an INSERT action's
+        // RETURNING list, where `old` and `new` name the inserted row's images.
         returning: Returning {
-            items: subst_select_items(statement.returning.items, context, arena)?,
+            items: subst_select_items(
+                statement.returning.items,
+                Subst {
+                    rule_transition: None,
+                    ..context
+                },
+                arena,
+            )?,
             ..statement.returning
         },
         overriding: statement.overriding,
@@ -7746,6 +7847,7 @@ fn subst_expr<'a>(
                         partition_by: subst_expr_slice(w.partition_by, context, arena)?,
                         order_by: ob2.as_slice(),
                         frame,
+                        ..**w
                     };
                     Some(&*arena.alloc(spec).map_err(|_| arena_full())?)
                 }

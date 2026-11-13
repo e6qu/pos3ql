@@ -76,8 +76,12 @@ fn write_described_value(out: &mut DetailText, value: Datum<'_>) {
 }
 
 /// `Failing row contains (...).`, PostgreSQL's detail for a row that
-/// violates a NOT NULL or CHECK constraint.
-pub(crate) fn failing_row_detail(values: &[Datum<'_>]) -> Result<DetailText, SqlError> {
+/// violates a NOT NULL or CHECK constraint. A virtual generated column,
+/// which the row does not hold in PostgreSQL, reads `virtual`.
+pub(crate) fn failing_row_detail(
+    columns: &[crate::storage::ColumnMeta],
+    values: &[Datum<'_>],
+) -> Result<DetailText, SqlError> {
     use core::fmt::Write;
     let mut detail = DetailText::new();
     let _ = detail.write_str("Failing row contains (");
@@ -85,7 +89,14 @@ pub(crate) fn failing_row_detail(values: &[Datum<'_>]) -> Result<DetailText, Sql
         if index > 0 {
             let _ = detail.write_str(", ");
         }
-        write_described_value(&mut detail, *value);
+        if columns
+            .get(index)
+            .is_some_and(|column| column.default.is_virtual())
+        {
+            let _ = detail.write_str("virtual");
+        } else {
+            write_described_value(&mut detail, *value);
+        }
     }
     let _ = detail.write_str(").");
     if detail.is_truncated() {
@@ -2463,7 +2474,7 @@ fn check_row_checks(
             eval_full(expression, arena, params, &context, &hooks)?,
             Datum::Bool(false)
         ) {
-            let detail = failing_row_detail(&values[..def.columns().len()])?;
+            let detail = failing_row_detail(def.columns(), &values[..def.columns().len()])?;
             crate::sql::eval::stash_object_diagnostic(
                 Some(detail.as_str()),
                 crate::sql::eval::ErrorObjects::table_constraint(
@@ -4272,7 +4283,7 @@ pub(crate) fn fire_foreign_key_action(
                             )),
                         )?
                     }
-                    crate::storage::ColumnDefault::Generated(_) => {
+                    crate::storage::ColumnDefault::Generated { .. } => {
                         return Err(sql_err!(
                             sqlstate::INTERNAL_ERROR,
                             "generated column cannot be a foreign-key SET DEFAULT target"

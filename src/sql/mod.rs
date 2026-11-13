@@ -17,6 +17,7 @@ mod concurrent_index;
 pub(crate) use concurrent_index::CommitPhase as IndexCommitPhaseForTests;
 pub(crate) mod array_assignment;
 pub(crate) mod assignment_path;
+pub(crate) mod column_suggestion;
 pub mod copy;
 pub mod cursor;
 pub mod datetime;
@@ -3143,14 +3144,18 @@ fn fetch_saves_row(
 /// engine's storage, and returns the row count as [`Engine::fetch_cursor`].
 /// A pending read-only query runs here with the cursor's snapshot, and a
 /// cursor that evaluates its rows as fetched reads them with the workspace's
-/// scan buffers, as the trigger's own queries run. A cursor that locks its
-/// rows, and one whose data-modifying `WITH` queries have not run, need the
-/// session's engine.
+/// scan buffers, as the trigger's own queries run, and a cursor that locks
+/// its rows locks each one as it is fetched (`repeatable` says whether the
+/// transaction's snapshot is fixed). The trigger runs a cursor's
+/// data-modifying `WITH` queries before its first read
+/// (`fill_trigger_writing_cursor`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fetch_trigger_cursor(
     storage: &Storage,
     services: &mut exec::TriggerServices<'_>,
     arena: &Arena,
     txid: u32,
+    repeatable: bool,
     name: &str,
     motion: cursor::FetchMotion,
     move_only: bool,
@@ -3162,8 +3167,8 @@ pub(crate) fn fetch_trigger_cursor(
         match cursors.pending_fill(name)? {
             Some((_, cursor::PendingFill::Write)) => {
                 return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "cursor \"{}\" runs data-modifying WITH queries when first fetched, which is not supported in trigger execution",
+                    sqlstate::INTERNAL_ERROR,
+                    "cursor \"{}\" was fetched before its data-modifying WITH queries ran",
                     name
                 ));
             }
@@ -3208,20 +3213,14 @@ pub(crate) fn fetch_trigger_cursor(
             });
         }
         if let Some((at, needed)) = cursors.read_request(name, motion, move_only)? {
-            if cursors.locks_rows(at) {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "cursor \"{}\" locks its rows when fetched, which is not supported in trigger execution",
-                    name
-                ));
-            }
+            let locks = cursors.locks_rows(at);
             cursors.begin_fetch(at, motion, move_only, needed)?;
             loop {
                 let refill = cursors.refill(at);
                 let target = refill.map_or(needed, |(_, last)| last);
                 while cursors.produced_rows(at) < target {
                     let saved = fetch_saves_row(cursors, at, needed, refill, motion, move_only);
-                    let produced = TriggerCursorRead {
+                    let mut read = TriggerCursorRead {
                         storage,
                         sequence: &sequence,
                         owner: cursors.plan_owner(at)?,
@@ -3232,8 +3231,12 @@ pub(crate) fn fetch_trigger_cursor(
                         name,
                         at,
                         render,
-                    }
-                    .advance(saved)?;
+                    };
+                    let produced = if locks {
+                        read.advance_locking(saved, repeatable)?
+                    } else {
+                        read.advance(saved)?
+                    };
                     if !produced {
                         cursors.finish_input(at);
                         break;
@@ -3371,7 +3374,7 @@ impl TriggerCursorRead<'_, '_> {
         if self.cursors.plan_owner(self.at)? != self.owner {
             return Err(changed());
         }
-        if self.cursors.execution_parts(self.at).0.skip_row() {
+        if output != CursorRowSink::Locking && self.cursors.execution_parts(self.at).0.skip_row() {
             return Ok(false);
         }
         if output == CursorRowSink::SaveReplacing {
@@ -3413,26 +3416,7 @@ impl TriggerCursorRead<'_, '_> {
         } else {
             CursorRowSink::Discard
         };
-        // An ordered cursor saves and sorts every row its filter passes
-        // before its first row, as the session's FETCH does.
-        while self.cursors.sort_pending(self.at) {
-            let sorted = self.with_row_scratch(source_snapshot, |read| {
-                if !read.prepare_source_row()? {
-                    read.cursors
-                        .finish_sorting(read.at, read.storage, read.txid)?;
-                    return Ok(true);
-                }
-                if read.evaluate_row(true, CursorRowSink::FilterOnly)? {
-                    read.cursors.save_pending_input(read.at)?;
-                }
-                read.cursors.execution_parts(read.at).0.finish_row(false);
-                Ok(false)
-            })?;
-            if sorted {
-                break;
-            }
-        }
-        let sorted = self.cursors.sorted_source(self.at);
+        let sorted = self.sort_input(source_snapshot)?;
         loop {
             let produced = self.with_row_scratch(source_snapshot, |read| {
                 let ready = if sorted {
@@ -3455,6 +3439,117 @@ impl TriggerCursorRead<'_, '_> {
                 None => return Ok(false),
                 Some(true) => return Ok(true),
                 Some(false) => {}
+            }
+        }
+    }
+
+    /// An ordered cursor saves and sorts every row its filter passes before
+    /// its first row, as the session's FETCH does. Returns whether the
+    /// cursor reads its sorted rows.
+    fn sort_input(&mut self, source_snapshot: u32) -> Result<bool, SqlError> {
+        while self.cursors.sort_pending(self.at) {
+            let sorted = self.with_row_scratch(source_snapshot, |read| {
+                if !read.prepare_source_row()? {
+                    read.cursors
+                        .finish_sorting(read.at, read.storage, read.txid)?;
+                    return Ok(true);
+                }
+                if read.evaluate_row(true, CursorRowSink::FilterOnly)? {
+                    read.cursors.save_pending_input(read.at)?;
+                }
+                read.cursors.execution_parts(read.at).0.finish_row(false);
+                Ok(false)
+            })?;
+            if sorted {
+                break;
+            }
+        }
+        Ok(self.cursors.sorted_source(self.at))
+    }
+
+    /// [`Engine::advance_locking_cursor`] for a trigger's FETCH or MOVE.
+    fn advance_locking(&mut self, saved: bool, repeatable: bool) -> Result<bool, SqlError> {
+        let source_snapshot = self.storage.read_snapshot();
+        let (storage, txid, at) = (self.storage, self.txid, self.at);
+        let sorted = self.sort_input(source_snapshot)?;
+        loop {
+            self.storage.set_read_snapshot(source_snapshot);
+            if self.cursors.locked_output(at).is_none() {
+                let passed = self.with_row_scratch(source_snapshot, |read| {
+                    let ready = if sorted {
+                        read.cursors.prepare_sorted_row(at)?
+                    } else {
+                        read.prepare_source_row()?
+                    };
+                    if !ready {
+                        return Ok(None);
+                    }
+                    let mark = read.cursors.output_mark(at);
+                    let filter = !sorted || read.cursors.needs_recheck(at);
+                    let passed = read.evaluate_row(filter, CursorRowSink::Locking)?;
+                    if passed {
+                        read.cursors.set_locked_output(at, mark);
+                    } else {
+                        read.cursors.execution_parts(at).0.finish_row(false);
+                        read.cursors.finish_locked_row(at);
+                    }
+                    Ok(Some(passed))
+                })?;
+                match passed {
+                    None => return Ok(false),
+                    Some(false) => continue,
+                    Some(true) => {}
+                }
+            }
+            let locked = self
+                .cursors
+                .execution_parts(at)
+                .0
+                .lock_pending(storage, txid)?;
+            let recheck = if locked {
+                self.cursors
+                    .execution_parts(at)
+                    .0
+                    .recheck_pending(storage, txid)?
+            } else {
+                query::LockedRow::Skip
+            };
+            match recheck {
+                query::LockedRow::Unchanged => {}
+                query::LockedRow::Updated if repeatable => {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "could not serialize access due to concurrent update"
+                    ));
+                }
+                // PostgreSQL's row lock reports a deletion as an update too.
+                query::LockedRow::Deleted if repeatable => {
+                    return Err(sql_err!(
+                        sqlstate::SERIALIZATION_FAILURE,
+                        "could not serialize access due to concurrent update"
+                    ));
+                }
+                query::LockedRow::Updated => {
+                    // The latest version is filtered and projected again.
+                    self.cursors.drop_locked_output(at);
+                    self.cursors.set_recheck(at);
+                    continue;
+                }
+                query::LockedRow::Skip | query::LockedRow::Deleted => {
+                    self.cursors.drop_locked_output(at);
+                    self.cursors.execution_parts(at).0.finish_row(false);
+                    self.cursors.finish_locked_row(at);
+                    continue;
+                }
+            }
+            let skipped = self.cursors.execution_parts(at).0.skip_row();
+            if skipped || !saved {
+                self.cursors.drop_locked_output(at);
+            }
+            self.cursors.execution_parts(at).0.finish_row(!skipped);
+            self.cursors.finish_locked_row(at);
+            if !skipped {
+                return Ok(true);
             }
         }
     }
@@ -11183,6 +11278,14 @@ impl Engine {
                                 &self.storage,
                                 txn.txid,
                                 arena,
+                                None,
+                            )?;
+                            query::validate_dml_assignment_casts(
+                                statement,
+                                &self.storage,
+                                txn.txid,
+                                arena,
+                                None,
                             )?;
                             Ok(count)
                         }
@@ -15416,6 +15519,7 @@ impl Engine {
                 Ok(())
             };
         storage.set_read_snapshot(txn.command_id());
+        reject_with_query_rules(storage, dml, txn)?;
         // The sub-statement's foreign key checks wait for the statement's
         // end, where its main statement fires them.
         let outer = txn
@@ -16410,6 +16514,15 @@ impl Engine {
                             Err(_) => return Ok(Err(query::arena_full_pub())),
                         }
                     };
+                    if let Err(error) = query::check_rule_insert_values(
+                        action,
+                        &transition.source,
+                        storage,
+                        txn.txid,
+                        arena,
+                    ) {
+                        return Ok(Err(error));
+                    }
                     let action = match query::attach_rule_source(
                         action,
                         transition.source,
@@ -16447,6 +16560,8 @@ impl Engine {
                                 responder,
                                 if use_returning { capture.take() } else { None },
                                 use_returning,
+                                // A statement returning rows sends only those.
+                                outer_returns_rows && !use_returning,
                                 connection_id,
                                 progress.as_deref_mut(),
                             )?;
@@ -16640,9 +16755,32 @@ impl Engine {
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
         returning: bool,
+        quiet: bool,
         connection_id: i32,
         progress: Option<&mut exec::RowProgress>,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if quiet {
+            return responder.without_query_output(|responder| {
+                Self::execute_rule_action(
+                    storage,
+                    scratch,
+                    arena,
+                    action,
+                    authorization,
+                    txn,
+                    params,
+                    guc,
+                    cursors,
+                    row_buffers,
+                    responder,
+                    capture,
+                    returning,
+                    false,
+                    connection_id,
+                    progress,
+                )
+            });
+        }
         match action {
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) if returning => responder
                 .without_command_complete(|responder| {
@@ -16663,8 +16801,9 @@ impl Engine {
                         connection_id,
                     )
                 }),
-            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
-                responder.without_query_output(|responder| {
+            // Rules on the action's own target may send SELECT rows.
+            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => responder
+                .without_command_complete(|responder| {
                     Self::execute_data_modification(
                         storage,
                         scratch,
@@ -16681,9 +16820,10 @@ impl Engine {
                         progress,
                         connection_id,
                     )
-                })
-            }
-            Stmt::Select(select) => responder.without_query_output(|responder| {
+                }),
+            // PostgreSQL sends a SELECT action's rows before the statement's
+            // command tag.
+            Stmt::Select(select) => responder.without_command_complete(|responder| {
                 let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
                 if select.from.is_some() {
                     query::select_query(
@@ -16707,7 +16847,7 @@ impl Engine {
                     )
                 }
             }),
-            Stmt::SetQuery(query) => responder.without_query_output(|responder| {
+            Stmt::SetQuery(query) => responder.without_command_complete(|responder| {
                 let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
                 query::set_query(
                     storage,
@@ -21779,12 +21919,33 @@ impl Engine {
                 if planned.is_err() {
                     return Ok(planned);
                 }
-                let plan = with_prepared_parameter_types(parameter_types, || {
-                    explain::plan_statement(&self.storage, txn.txid, planned_statement, arena)
-                });
-                let plan = match plan {
-                    Ok(plan) => plan,
+                // A statement a rewrite rule changes is explained as the
+                // queries the rule produces.
+                let rewritten = match explain::rewritten_queries(
+                    &self.storage,
+                    txn.txid,
+                    planned_statement,
+                    arena,
+                ) {
+                    Ok(rewritten) => rewritten,
                     Err(error) => return Ok(Err(error)),
+                };
+                let plan = match rewritten.as_ref() {
+                    Some(_) => None,
+                    None => {
+                        let plan = with_prepared_parameter_types(parameter_types, || {
+                            explain::plan_statement(
+                                &self.storage,
+                                txn.txid,
+                                planned_statement,
+                                arena,
+                            )
+                        });
+                        match plan {
+                            Ok(plan) => Some(plan),
+                            Err(error) => return Ok(Err(error)),
+                        }
+                    }
                 };
                 // SQL EXECUTE arguments are bounded by the pool's declared
                 // parameter count (prep::MAX_PREP_PARAMS) whenever types were
@@ -21858,7 +22019,15 @@ impl Engine {
                 } else {
                     None
                 };
-                explain::emit_plan(&plan, *options, actual, &settings, responder)
+                match (rewritten, plan) {
+                    (Some(queries), _) => explain::emit_rewritten(
+                        &queries, *options, actual, &settings, arena, responder,
+                    ),
+                    (None, Some(plan)) => {
+                        explain::emit_plan(&plan, *options, actual, &settings, arena, responder)
+                    }
+                    (None, None) => unreachable!("an unrewritten statement is planned"),
+                }
             }
             Stmt::With { .. } if reset_workspace => self.execute_modification_resumable(
                 statement, arena, params, txn, sqlprep, cursors, guc, responder,
@@ -21910,6 +22079,8 @@ impl Engine {
                     check_option: *check_option,
                     sql,
                     raw_path: guc.search_path().as_str(),
+                    kept_column_types: &[],
+                    query_origin: crate::storage::ViewQueryOrigin::View,
                 },
                 arena,
                 responder,
@@ -23378,6 +23549,8 @@ impl Engine {
                                         check_option: *check_option,
                                         sql,
                                         raw_path: schema_path,
+                                        kept_column_types: &[],
+                                        query_origin: crate::storage::ViewQueryOrigin::View,
                                     },
                                     arena,
                                     responder,
@@ -29892,6 +30065,7 @@ fn apply_wal_op(
             security_invoker,
             security_barrier,
             check_option,
+            query_origin,
             dependencies,
         } => {
             let (columns, default_inputs) = columns.materialize(storage, 0)?;
@@ -29948,6 +30122,13 @@ fn apply_wal_op(
                                 )?)
                             }
                         },
+                        query_origin: crate::storage::ViewQueryOrigin::from_code(query_origin)
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::DATA_EXCEPTION,
+                                    "journal has invalid view query origin"
+                                )
+                            })?,
                     },
                 },
             )?;
@@ -29963,6 +30144,7 @@ fn apply_wal_op(
             security_invoker,
             security_barrier,
             check_option,
+            query_origin,
         } => {
             let slot = storage
                 .resolve_access_object(crate::storage::AccessClass::View, schema, name, 0)
@@ -30003,6 +30185,13 @@ fn apply_wal_op(
                         )
                     })?,
                     check_option,
+                    query_origin: crate::storage::ViewQueryOrigin::from_code(query_origin)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "journal has invalid view query origin"
+                            )
+                        })?,
                 },
                 0,
             )?;
@@ -32217,6 +32406,61 @@ pub(crate) fn analyze_dml_cte<'a>(
     ))
 }
 
+/// PostgreSQL rewrites a data-modifying `WITH` query only into exactly one
+/// statement: rules that would leave none, several, or a conditional one are
+/// rejected before anything runs.
+fn reject_with_query_rules(
+    storage: &Storage,
+    statement: &Stmt<'_>,
+    txn: &TxnState,
+) -> Result<(), SqlError> {
+    let (relation, event) = match statement {
+        Stmt::Insert(insert) => (insert.table, crate::storage::RewriteEvent::Insert),
+        Stmt::Update(update) => (update.table, crate::storage::RewriteEvent::Update),
+        Stmt::Delete(delete) => (delete.table, crate::storage::RewriteEvent::Delete),
+        _ => return Ok(()),
+    };
+    let target = match storage.resolve_relation(relation.schema, relation.name, txn.txid) {
+        Some(crate::storage::ResolvedRelation::Table(slot)) => {
+            crate::storage::RuleTarget::Table(slot as u16)
+        }
+        Some(crate::storage::ResolvedRelation::View(slot)) => {
+            crate::storage::RuleTarget::View(slot as u16)
+        }
+        _ => return Ok(()),
+    };
+    let mut statements = 1usize;
+    let mut conditional_instead = false;
+    let mut also = false;
+    let mut unconditional_instead = false;
+    for (_, rule) in storage.firing_rules_for(target, event, txn.replication_apply, txn.txid) {
+        let definition = rule.definition_for(txn.txid);
+        statements += definition.action_sql().count();
+        match definition.mode {
+            crate::storage::RewriteMode::Also => also = true,
+            crate::storage::RewriteMode::Instead if definition.condition.is_some() => {
+                conditional_instead = true;
+            }
+            crate::storage::RewriteMode::Instead => unconditional_instead = true,
+        }
+    }
+    if unconditional_instead {
+        statements -= 1;
+    }
+    let message = match statements {
+        1 => return Ok(()),
+        0 => "DO INSTEAD NOTHING rules are not supported for data-modifying statements in WITH",
+        _ if conditional_instead => {
+            "conditional DO INSTEAD rules are not supported for data-modifying statements in WITH"
+        }
+        _ if also => "DO ALSO rules are not supported for data-modifying statements in WITH",
+        _ => {
+            "multi-statement DO INSTEAD rules are not supported for data-modifying statements in WITH"
+        }
+    };
+    Err(sql_err!(sqlstate::FEATURE_NOT_SUPPORTED, "{}", message))
+}
+
 /// The column names, in order, of the table a rule's INSERT action writes.
 /// The columns and declared types of a rule `INSERT` action's target table
 /// or view.
@@ -32257,7 +32501,15 @@ fn rule_insert_target<'a>(
     let type_oids = arena
         .alloc_slice_with(columns.len(), |_| 0)
         .map_err(|_| crate::sql::eval::arena_full())?;
-    for ((name, type_oid), column) in names.iter_mut().zip(type_oids.iter_mut()).zip(columns) {
+    let type_names = arena
+        .alloc_slice_with(columns.len(), |_| "")
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    for (((name, type_oid), type_name), column) in names
+        .iter_mut()
+        .zip(type_oids.iter_mut())
+        .zip(type_names.iter_mut())
+        .zip(columns)
+    {
         *name = arena
             .alloc_str(column.name.as_str())
             .map_err(|_| crate::sql::eval::arena_full())?;
@@ -32270,6 +32522,12 @@ fn rule_insert_target<'a>(
                     column.name.as_str()
                 )
             })?;
+        *type_name = catalog::user_type_name_text(storage, txid, *type_oid, arena)?
+            .unwrap_or_else(|| column.ctype.name());
     }
-    Ok(query::RuleInsertTarget { names, type_oids })
+    Ok(query::RuleInsertTarget {
+        names,
+        type_oids,
+        type_names,
+    })
 }

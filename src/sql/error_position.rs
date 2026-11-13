@@ -115,10 +115,13 @@ pub(crate) struct Annotation {
 pub(crate) enum AnalysisNote {
     Detail(crate::util::StackStr<NOTE_BYTES>),
     Hint(crate::util::StackStr<NOTE_BYTES>),
+    /// A missing column's spelling suggestion: a later search over more
+    /// enclosing queries replaces it.
+    Suggestion(crate::util::StackStr<NOTE_BYTES>),
 }
 
 /// Two quoted identifiers of `NAMEDATALEN - 1` bytes plus the wording.
-const NOTE_BYTES: usize = 2 * crate::sql::lexer::MAX_IDENTIFIER_BYTES + 128;
+pub(crate) const NOTE_BYTES: usize = 2 * crate::sql::lexer::MAX_IDENTIFIER_BYTES + 128;
 
 /// Attaches a computed DETAIL to `error`.
 pub(crate) fn with_detail(error: SqlError, detail: core::fmt::Arguments<'_>) -> SqlError {
@@ -128,6 +131,58 @@ pub(crate) fn with_detail(error: SqlError, detail: core::fmt::Arguments<'_>) -> 
 /// Attaches a computed HINT to `error`.
 pub(crate) fn with_computed_hint(error: SqlError, hint: core::fmt::Arguments<'_>) -> SqlError {
     note(error, AnalysisNote::Hint(note_text(hint)))
+}
+
+/// Attaches PostgreSQL's spelling suggestion for a missing column to
+/// `error`, replacing an earlier suggestion; an explanation already attached
+/// (why an existing column is out of reach) stays.
+pub(crate) fn with_column_suggestion(
+    error: SqlError,
+    suggestion: &crate::sql::column_suggestion::ColumnSuggestion<'_>,
+) -> SqlError {
+    if error.sqlstate.as_str() != crate::sql::eval::sqlstate::UNDEFINED_COLUMN
+        || error.sqlstate.internal_control().is_some()
+    {
+        return error;
+    }
+    let message_hash = message_hash(&error.message);
+    PENDING.with(|pending| {
+        let known = pending
+            .get()
+            .filter(|known| known.sqlstate == error.sqlstate && known.message_hash == message_hash);
+        if known.is_some_and(|known| {
+            matches!(
+                known.note,
+                Some(AnalysisNote::Detail(_) | AnalysisNote::Hint(_))
+            ) || known.hint.is_some()
+        }) {
+            return;
+        }
+        pending.set(Some(Pending {
+            sqlstate: error.sqlstate,
+            message_hash,
+            position: known.and_then(|known| known.position),
+            hint: None,
+            note: {
+                let mut suggestion = *suggestion;
+                crate::sql::column_suggestion::offer_set_branches(&mut suggestion);
+                suggestion.hint().map(AnalysisNote::Suggestion)
+            },
+        }))
+    });
+    error
+}
+
+/// Whether `error` already carries a detail, hint or suggestion.
+fn has_pending_note(error: &SqlError) -> bool {
+    let message_hash = message_hash(&error.message);
+    PENDING.with(|pending| {
+        pending.get().is_some_and(|known| {
+            known.sqlstate == error.sqlstate
+                && known.message_hash == message_hash
+                && (known.note.is_some() || known.hint.is_some())
+        })
+    })
 }
 
 fn note_text(text: core::fmt::Arguments<'_>) -> crate::util::StackStr<NOTE_BYTES> {
@@ -772,6 +827,17 @@ pub(crate) fn with_copied_source<R>(written: &str, copy: &str, run: impl FnOnce(
 }
 
 /// Runs `run` positioning relation and column lookups in the installed
+/// statement text, for a utility statement that analyses queries written
+/// inside it (`CREATE RULE`).
+pub(crate) fn with_analysis<R>(run: impl FnOnce() -> R) -> R {
+    let _scope = SourceScope(
+        SOURCE.with(Cell::get),
+        ANALYZED.with(|flag| flag.replace(true)),
+    );
+    run()
+}
+
+/// Runs `run` positioning relation and column lookups in the installed
 /// statement text, for queries parsed from `text`, a slice of it written
 /// inside a utility statement (a `CREATE FUNCTION ... BEGIN ATOMIC` body):
 /// their parsed offsets count from the slice's start.
@@ -852,7 +918,17 @@ pub(crate) fn column_reference(error: SqlError, qualifier: Option<&str>, name: &
             | sqlstate::AMBIGUOUS_COLUMN
             | sqlstate::GROUPING_ERROR
     ) {
-        at_reference(error, qualifier.unwrap_or(name))
+        let error = at_reference(error, qualifier.unwrap_or(name));
+        // A reference no FROM item answers still searches the earlier
+        // branches of an enclosing set operation for a suggestion.
+        if crate::sql::column_suggestion::set_branches_in_reach() && !has_pending_note(&error) {
+            with_column_suggestion(
+                error,
+                &crate::sql::column_suggestion::ColumnSuggestion::new(qualifier, name),
+            )
+        } else {
+            error
+        }
     } else {
         error
     }

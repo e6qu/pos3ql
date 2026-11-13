@@ -417,8 +417,10 @@ Functions and expressions:
   defaults and `RETURN` bodies as PostgreSQL does: `DEFAULT 'x'` on a `text`
   column is shown as `'x'::text`, and `CHECK (v <> '')` on a `varchar` column as
   `CHECK (((v)::text <> ''::text))`. `pg_get_viewdef` uses PostgreSQL's
-  indented layout for views over plain tables joined with `ON`, printing the
-  current names of renamed tables, functions, types and enum values
+  indented layout, wrap column and qualification for views over tables, other
+  views, subqueries, functions, joins, set operations, `WITH` queries,
+  `LATERAL` items and `VALUES` lists, naming a table read again in a nested
+  query `t_1` as PostgreSQL does and printing the current names of renamed tables, functions, types and enum values
   (`WHERE (x = 'z'::status)` after `ALTER TYPE status RENAME VALUE 'a' TO
   'z'`). Pretty output
   (`pg_get_constraintdef(oid, true)`, as psql's `\d` uses) drops redundant
@@ -933,9 +935,10 @@ rows fit; raising `cursor_bytes` does not help there.
 - `WITH HOLD`: the unread suffix (plus history when scrolling) must fit; a
   scrollable cursor whose rows are evaluated again saves its whole result.
 - A trigger fired inside a writing statement (`INSERT`, `UPDATE`, `DELETE`,
-  `MERGE`, `COPY`, `TRUNCATE`, deferred constraints) can read a cursor whose
-  query runs whole at its first read. One that evaluates its rows as they are
-  fetched, or whose data-modifying `WITH` queries have not run yet, raises
+  `MERGE`, `COPY`, `TRUNCATE`, deferred constraints) can read a session
+  cursor, including one that locks its rows and one whose data-modifying
+  `WITH` queries then run at that first read, as the trigger's own writes do.
+  A cursor that calls a user-defined routine for each fetched row raises
   `0A000` there.
 - A PL/pgSQL `OPEN` query with data-modifying `WITH` queries runs once, at
   the cursor's first `FETCH` or `MOVE` as in PostgreSQL, and its whole result
@@ -963,7 +966,12 @@ PostgreSQL physical standby cannot replay pos3ql's journal.
   column "ctid" is not supported`); as in PostgreSQL, a table column cannot
   take a system column's name (`42701`).
 - PostgreSQL parallel query, JIT, and planner/executor hooks do not exist.
-  Cost estimates and `EXPLAIN` text differ from PostgreSQL.
+  Cost estimates differ from PostgreSQL. `EXPLAIN` shows the plan pos3ql
+  runs: scan filters (`Filter: (a = 1)`), a hash join's `Hash Cond` and `Hash`
+  node, and a nested loop's `Join Filter` and `Materialize` inner scan, in
+  PostgreSQL's layout. There is no merge join, so a query PostgreSQL plans as
+  `Merge Join` shows a hash join or nested loop. A statement a rewrite rule
+  changes shows each statement the rule produces, separated by an empty line.
 - Logical copies are separate durable databases updated asynchronously; there
   are no shared-storage replicas or multiple writers.
 - Monitoring fields for absent subsystems report empty or zero values. A

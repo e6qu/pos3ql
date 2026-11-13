@@ -11070,20 +11070,33 @@ fn replication_slots_are_bounded_and_have_resume_positions() {
 fn column_default_encodes_one_execution_state() {
     let expression = StackStr::from_str("7");
     assert!(matches!(
-        ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), Some(expression), false),
+        ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), Some(expression), None),
         Some(ColumnDefault::Constant { .. })
     ));
     assert!(matches!(
-        ColumnDefault::from_parts(None, Some(expression), false),
+        ColumnDefault::from_parts(None, Some(expression), None),
         Some(ColumnDefault::Expression(_))
     ));
     assert!(matches!(
-        ColumnDefault::from_parts(None, Some(expression), true),
-        Some(ColumnDefault::Generated(_))
+        ColumnDefault::from_parts(None, Some(expression), Some(Generation::Virtual)),
+        Some(ColumnDefault::Generated {
+            kind: Generation::Virtual,
+            ..
+        })
     ));
-    assert!(ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), None, true).is_none());
-    assert!(ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), None, false).is_none());
-    assert!(ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), Some(expression), true).is_none());
+    assert!(
+        ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), None, Some(Generation::Stored))
+            .is_none()
+    );
+    assert!(ColumnDefault::from_parts(Some(OwnedDatum::Int4(7)), None, None).is_none());
+    assert!(
+        ColumnDefault::from_parts(
+            Some(OwnedDatum::Int4(7)),
+            Some(expression),
+            Some(Generation::Stored)
+        )
+        .is_none()
+    );
 }
 
 #[test]

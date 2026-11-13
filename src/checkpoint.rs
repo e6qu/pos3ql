@@ -4514,12 +4514,23 @@ impl Checkpointer {
                     }
                     def.persistence = code;
                 }
-                Some("col4") => {
+                Some("col5") => {
                     let Some((_, _, def, seen)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("col outside table"));
                     };
                     let type_code: u8 = parse_field(words.next(), "col type")?;
                     let not_null: u8 = parse_field(words.next(), "col notnull")?;
+                    let generation = match parse_field::<u8>(words.next(), "col generation")? {
+                        0 => None,
+                        code => Some(crate::storage::Generation::from_code(code).ok_or(
+                            CheckpointSetupError::Corrupt("invalid column generation kind"),
+                        )?),
+                    };
+                    if generation.is_some() != (not_null & 32 != 0) {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "column generation kind does not match its flags",
+                        ));
+                    }
                     let not_null_inheritable: u8 =
                         parse_field(words.next(), "col not-null inheritable")?;
                     if not_null_inheritable > 1 {
@@ -4641,7 +4652,7 @@ impl Checkpointer {
                     let default = ColumnDefault::from_parts(
                         default_from_hex(default_hex)?,
                         default_expr,
-                        not_null & 32 != 0,
+                        generation,
                     )
                     .ok_or(CheckpointSetupError::Corrupt(
                         "invalid column default state",
@@ -6512,7 +6523,7 @@ impl Checkpointer {
                         )
                         .map_err(|_| CheckpointSetupError::Corrupt("invalid foreign table"))?;
                 }
-                Some("vw14") => {
+                Some("vw15") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     load_view(storage, line, metadata.catalog_sequence)?;
                 }
@@ -10980,9 +10991,12 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "col4 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                        "col5 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                         c.ctype.code(),
                         flags,
+                        c.default
+                            .generation()
+                            .map_or(0, crate::storage::Generation::code),
                         u8::from(c.not_null_inheritable),
                         not_null_name_hex.as_str(),
                         c.type_mod,
@@ -11619,7 +11633,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "vw14 {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "vw15 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     view_slot,
                     view.created_at,
                     view.return_rule,
@@ -11636,6 +11650,7 @@ impl Checkpointer {
                     view.options
                         .check_option
                         .map_or(0, crate::storage::ViewCheckOption::code),
+                    view.options.query_origin.code(),
                     ManifestViewColumns(view.columns),
                     ManifestInputBytes(view.default_inputs.bytes()),
                     ManifestDependencies(storage.view_dependencies(view_slot, 0).view())
@@ -19052,7 +19067,7 @@ fn load_view(
     catalog_sequence: u64,
 ) -> Result<(), CheckpointSetupError> {
     let mut words = line.split(' ');
-    if words.next() != Some("vw14") {
+    if words.next() != Some("vw15") {
         return Err(CheckpointSetupError::Corrupt("unsupported view record"));
     }
     let identity = crate::storage::ViewCatalogIdentity::new(
@@ -19098,6 +19113,11 @@ fn load_view(
             .ok_or(CheckpointSetupError::Corrupt("invalid view check option"))
             .map(Some)?,
     };
+    let query_origin = crate::storage::ViewQueryOrigin::from_code(parse_field(
+        words.next(),
+        "view query origin missing",
+    )?)
+    .ok_or(CheckpointSetupError::Corrupt("invalid view query origin"))?;
     let encoded_columns = words
         .next()
         .ok_or(CheckpointSetupError::Corrupt("view columns missing"))?;
@@ -19180,10 +19200,10 @@ fn load_view(
             };
             defaults[index] = match tag {
                 0 if value == "0" && expression.is_none() => ColumnDefault::NONE,
-                1 => ColumnDefault::from_parts(default_from_hex(value)?, expression, false).ok_or(
+                1 => ColumnDefault::from_parts(default_from_hex(value)?, expression, None).ok_or(
                     CheckpointSetupError::Corrupt("invalid view constant default"),
                 )?,
-                2 if value == "0" => ColumnDefault::from_parts(None, expression, false).ok_or(
+                2 if value == "0" => ColumnDefault::from_parts(None, expression, None).ok_or(
                     CheckpointSetupError::Corrupt("invalid view expression default"),
                 )?,
                 _ => return Err(CheckpointSetupError::Corrupt("invalid view column default")),
@@ -19259,6 +19279,7 @@ fn load_view(
             security,
             security_barrier,
             check_option,
+            query_origin,
         },
     };
     storage
@@ -19569,7 +19590,7 @@ impl core::fmt::Display for ManifestViewColumns {
                         write!(output, "{byte:02x}")?;
                     }
                 }
-                ColumnDefault::Generated(_) => {
+                ColumnDefault::Generated { .. } => {
                     return Err(core::fmt::Error);
                 }
             }
@@ -20167,7 +20188,7 @@ mod stored_dependency_tests {
             oversized_utf8.as_str(),
         ] {
             let view = format!(
-                "vw14 0 1 0 2 {} {} {} {} 0 0 0 0:0: - i2 0 -",
+                "vw15 0 1 0 2 {} {} {} {} 0 0 0 0 0:0: - i2 0 -",
                 ManifestName("SELECT 1"),
                 ManifestName("public"),
                 ManifestName(path),

@@ -2938,6 +2938,70 @@ fn locking_cursors_lock_each_row_when_fetched_and_recheck_changed_rows() {
     }
 }
 
+/// A trigger fired inside a writing statement fetches from a session cursor
+/// that locks its rows as PostgreSQL's LockRows node does: each fetched row
+/// is locked, a conflicting lock is waited for, and the retried statement
+/// neither repeats nor skips a fetch.
+#[test]
+fn triggers_fetch_row_locking_session_cursors() {
+    let mut config = test_config("trigger-locking-cursor");
+    config.transaction_mode = crate::config::TransactionMode::Mvcc;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut owner = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut other = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    owner.success(
+        &mut engine,
+        "CREATE TABLE lt (id int PRIMARY KEY, v int); \
+         INSERT INTO lt VALUES (1, 10), (2, 20), (3, 30); \
+         CREATE TABLE fetched (v int); CREATE TABLE fired (a int); \
+         CREATE FUNCTION take() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         DECLARE v int; c refcursor := 'locking'; \
+         BEGIN FETCH c INTO v; INSERT INTO fetched VALUES (v); RETURN NEW; END $$; \
+         CREATE TRIGGER take BEFORE INSERT ON fired FOR EACH ROW EXECUTE FUNCTION take()",
+        true,
+    );
+    owner.success(
+        &mut engine,
+        "BEGIN; DECLARE locking CURSOR FOR SELECT v FROM lt ORDER BY id FOR UPDATE; \
+         INSERT INTO fired VALUES (1)",
+        true,
+    );
+    assert_eq!(
+        error_sqlstates(&other.execute(
+            &mut engine,
+            "SELECT id FROM lt WHERE id = 1 FOR UPDATE NOWAIT",
+            true
+        )),
+        ["55P03"]
+    );
+    other.success(
+        &mut engine,
+        "BEGIN; UPDATE lt SET v = 21 WHERE id = 2",
+        true,
+    );
+    let status = owner.execute_status(&mut engine, "INSERT INTO fired VALUES (2), (3)", true);
+    assert!(
+        matches!(
+            status,
+            ExecutionStatus::Blocked {
+                wait: StatementWait::Lock,
+                ..
+            }
+        ),
+        "{status:?}"
+    );
+    other.success(&mut engine, "COMMIT", true);
+    owner.success(&mut engine, "INSERT INTO fired VALUES (2), (3)", true);
+    assert_eq!(
+        data_rows(&owner.success(&mut engine, "SELECT v FROM fetched ORDER BY v", true)),
+        ["10", "21", "30"]
+    );
+    owner.success(&mut engine, "ROLLBACK", true);
+    drop((owner, other, engine));
+    std::fs::remove_dir_all(config.data_dir).unwrap();
+}
+
 #[test]
 fn locking_cursors_reject_repeatable_read_changes_and_bound_sorted_rows() {
     let mut config = test_config("locking-cursor-repeatable");
@@ -3528,8 +3592,8 @@ fn open_cursors_keep_the_tables_they_read_in_use() {
 }
 
 /// A trigger fired inside a writing statement reads a session cursor that
-/// evaluates its rows as fetched; one that locks its rows or calls a
-/// user-defined routine for each row is rejected loudly, not misread.
+/// evaluates its rows as fetched; one that calls a user-defined routine for
+/// each row is rejected loudly, not misread.
 #[test]
 fn triggers_fetch_streaming_session_cursors() {
     let config = test_config("trigger-streaming-cursor");
@@ -3557,28 +3621,18 @@ fn triggers_fetch_streaming_session_cursors() {
         )),
         ["30", "10", "20"]
     );
-    for (declare, message) in [
-        (
-            "DECLARE streaming CURSOR FOR SELECT a FROM streamed FOR UPDATE",
-            "cursor \"streaming\" locks its rows when fetched, which is not supported in \
-             trigger execution",
-        ),
-        (
-            "DECLARE streaming NO SCROLL CURSOR FOR SELECT plus(a) FROM streamed",
-            "cursor \"streaming\" calls a user-defined routine for each fetched row, which is \
-             not supported in trigger execution",
-        ),
-    ] {
-        let output = String::from_utf8_lossy(&session.execute(
-            &mut engine,
-            &format!("BEGIN; {declare}; INSERT INTO fired VALUES (1)"),
-            true,
-        ))
-        .to_string();
-        assert!(
-            output.contains("0A000") && output.contains(message),
-            "{declare}: {output}"
-        );
-        session.success(&mut engine, "ROLLBACK", true);
-    }
+    let declare = "DECLARE streaming NO SCROLL CURSOR FOR SELECT plus(a) FROM streamed";
+    let message = "cursor \"streaming\" calls a user-defined routine for each fetched row, \
+                   which is not supported in trigger execution";
+    let output = String::from_utf8_lossy(&session.execute(
+        &mut engine,
+        &format!("BEGIN; {declare}; INSERT INTO fired VALUES (1)"),
+        true,
+    ))
+    .to_string();
+    assert!(
+        output.contains("0A000") && output.contains(message),
+        "{declare}: {output}"
+    );
+    session.success(&mut engine, "ROLLBACK", true);
 }

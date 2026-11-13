@@ -13,6 +13,24 @@ use super::super::{
     ColumnLookup, EvalHooks, SqlError, arity_err, cast_to, eval_full, sqlstate, static_type,
 };
 
+/// The type an unknown-type literal argument of `coalesce`, `greatest` or
+/// `least` takes at analysis: PostgreSQL's common type of the arguments. None
+/// when an argument's type is not known statically or no builtin type is common.
+pub(crate) fn literal_argument_type<'e, 'a: 'e>(
+    args: &'e [&'e Expr<'a>],
+    infer: &dyn Fn(&'e Expr<'a>) -> Option<ColType>,
+) -> Option<ColType> {
+    const FUNCTION_ARGUMENTS: usize = 100;
+    let mut inputs = [(false, crate::sql::types::oid::UNKNOWN); FUNCTION_ARGUMENTS];
+    let inputs = inputs.get_mut(..args.len())?;
+    for (input, argument) in inputs.iter_mut().zip(args) {
+        if !matches!(argument, Expr::Str(_) | Expr::Null) {
+            input.1 = infer(argument)?.oid();
+        }
+    }
+    crate::storage::builtin_compatible_element_oid(inputs).and_then(ColType::from_oid)
+}
+
 /// Handles the conditional/null-handling family. Returns `None` if `name` is not
 /// one of these functions, leaving the router to keep matching.
 #[allow(clippy::too_many_arguments)]

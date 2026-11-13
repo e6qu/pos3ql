@@ -27,7 +27,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 29;
+pub(crate) const RECORD_VERSION: u8 = 30;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -267,7 +267,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 17;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 18;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -1191,6 +1191,7 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
         n += 2; // attstattarget
         n += 9; // attoptions presence byte plus two float4 bit patterns
         n += 2; // attstorage + attcompression
+        n += 1; // attgenerated
         // User-defined column: name, then a format marker and schema.
         if let Some(identity) = c.user_type {
             n += 1 + identity.storage_name().as_str().len();
@@ -1307,6 +1308,11 @@ fn append_table_payload<B: DefinitionBacking>(
         ok &= buffer.append(&[c.ctype.code(), flags]);
         ok &= buffer.append(&[c.not_null.code()]);
         ok &= buffer.append(&[u8::from(c.not_null_inheritable)]);
+        // The generation kind (`pg_attribute.attgenerated`), zero when none.
+        ok &= buffer.append(&[c
+            .default
+            .generation()
+            .map_or(0, crate::storage::Generation::code)]);
         ok &= name_bytes(
             buffer,
             def.not_null_names.as_ref()[column]
@@ -1555,6 +1561,7 @@ pub(crate) enum WalOp<'a> {
         security_invoker: bool,
         security_barrier: u8,
         check_option: u8,
+        query_origin: u8,
         dependencies: WalStoredQueryDependencies<'a>,
     },
     DropView {
@@ -1567,6 +1574,7 @@ pub(crate) enum WalOp<'a> {
         security_invoker: bool,
         security_barrier: u8,
         check_option: u8,
+        query_origin: u8,
     },
     SetViewColumns {
         schema: &'a str,
@@ -3605,9 +3613,12 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             security_invoker: _,
             security_barrier: _,
             check_option: _,
+            query_origin: _,
             dependencies,
         } => {
+            // One more byte for the query origin after the three option bytes.
             crate::storage::ViewCatalogIdentity::ENCODED_BYTES
+                + 1
                 + 1
                 + name.len()
                 + columns.encoded_len()
@@ -3621,7 +3632,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + dependencies.encoded_len()
         }
         WalOp::DropView { schema, name } => 1 + name.len() + 1 + schema.len(),
-        WalOp::SetViewOptions { schema, name, .. } => 1 + name.len() + 1 + schema.len() + 3,
+        WalOp::SetViewOptions { schema, name, .. } => 1 + name.len() + 1 + schema.len() + 4,
         WalOp::SetViewColumns {
             schema,
             name,
@@ -5334,6 +5345,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             security_invoker,
             security_barrier,
             check_option,
+            query_origin,
             dependencies,
         } => {
             buffer.append(&(identity.slot() as u16).to_le_bytes())
@@ -5351,6 +5363,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     u8::from(*security_invoker),
                     *security_barrier,
                     *check_option,
+                    *query_origin,
                 ])
                 && dependencies.append(buffer)
         }
@@ -5361,6 +5374,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             security_invoker,
             security_barrier,
             check_option,
+            query_origin,
         } => {
             name_bytes(buffer, name)
                 && name_bytes(buffer, schema)
@@ -5368,6 +5382,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     u8::from(*security_invoker),
                     *security_barrier,
                     *check_option,
+                    *query_origin,
                 ])
         }
         WalOp::SetViewColumns {
@@ -8346,6 +8361,14 @@ fn decode_op_inner<'a>(
                     _ => return None,
                 };
                 at += 1;
+                let generation = match *payload.get(at)? {
+                    0 => None,
+                    code => Some(crate::storage::Generation::from_code(code)?),
+                };
+                at += 1;
+                if generation.is_some() != (meta[1] & 16 != 0) {
+                    return None;
+                }
                 let name = take_name(&mut at)?;
                 let not_null_name = if name.is_empty() {
                     None
@@ -8403,8 +8426,7 @@ fn decode_op_inner<'a>(
                 } else {
                     None
                 };
-                let default =
-                    ColumnDefault::from_parts(default_value, default_expr, meta[1] & 16 != 0)?;
+                let default = ColumnDefault::from_parts(default_value, default_expr, generation)?;
                 def.not_null_names[i] = not_null_name;
                 def.columns[i] = ColumnMeta {
                     name: SqlName::parse(col_name).ok()?,
@@ -8919,6 +8941,9 @@ fn decode_op_inner<'a>(
                 _ => return None,
             };
             at += 1;
+            let query_origin = *payload.get(at)?;
+            crate::storage::ViewQueryOrigin::from_code(query_origin)?;
+            at += 1;
             let encoded = payload.get(at..)?;
             if !validate_stored_query_dependencies(encoded) {
                 return None;
@@ -8935,6 +8960,7 @@ fn decode_op_inner<'a>(
                 security_invoker,
                 security_barrier,
                 check_option,
+                query_origin,
                 dependencies,
             })
         }),
@@ -8960,12 +8986,16 @@ fn decode_op_inner<'a>(
                 return None;
             }
             at += 1;
+            let query_origin = *payload.get(at)?;
+            crate::storage::ViewQueryOrigin::from_code(query_origin)?;
+            at += 1;
             (at == payload.len()).then_some(WalOp::SetViewOptions {
                 schema,
                 name,
                 security_invoker,
                 security_barrier,
                 check_option,
+                query_origin,
             })
         }),
         KIND_SET_VIEW_COLUMNS_V2 => decode_large_op(|| {
@@ -12568,7 +12598,7 @@ fn encoded_view_default_len(default: crate::storage::ColumnDefault) -> usize {
             1 + encoded_default_len(&Some(value)) + 2 + expression.as_str().len()
         }
         crate::storage::ColumnDefault::Expression(expression) => 1 + 2 + expression.as_str().len(),
-        crate::storage::ColumnDefault::Generated(_) => {
+        crate::storage::ColumnDefault::Generated { .. } => {
             unreachable!("view columns cannot carry generated expressions")
         }
     }
@@ -12704,7 +12734,7 @@ fn append_view_default(buffer: &mut FixedBuf, default: crate::storage::ColumnDef
                 && buffer.append(&(bytes.len() as u16).to_le_bytes())
                 && buffer.append(bytes)
         }
-        crate::storage::ColumnDefault::Generated(_) => {
+        crate::storage::ColumnDefault::Generated { .. } => {
             unreachable!("view columns cannot carry generated expressions")
         }
     }
@@ -12729,14 +12759,14 @@ fn decode_view_default(payload: &[u8], at: &mut usize) -> Option<crate::storage:
         0 => Some(crate::storage::ColumnDefault::NONE),
         1 => {
             let value = decode_default(payload, at)??;
-            crate::storage::ColumnDefault::from_parts(Some(value), Some(expression(at)?), false)
+            crate::storage::ColumnDefault::from_parts(Some(value), Some(expression(at)?), None)
         }
         2 | 3 => {
             let expression = expression(at)?;
             if (tag == 3) != crate::sql::enum_values::checks::is_bound(expression.as_str()) {
                 return None;
             }
-            crate::storage::ColumnDefault::from_parts(None, Some(expression), false)
+            crate::storage::ColumnDefault::from_parts(None, Some(expression), None)
         }
         _ => None,
     }
@@ -14697,6 +14727,7 @@ mod tests {
                     security_invoker: false,
                     security_barrier: 0,
                     check_option: 0,
+                    query_origin: 0,
                     dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
                 },
             ),
@@ -15792,6 +15823,32 @@ mod tests {
     }
 
     #[test]
+    fn table_payload_keeps_each_generated_column_kind() {
+        let mut definition = sample_def();
+        definition.columns[1].default = ColumnDefault::Generated {
+            expression: StackStr::from_str("upper(id::text)"),
+            kind: crate::storage::Generation::Virtual,
+        };
+        let mut budget = Budget::new(8192);
+        let mut payload = FixedBuf::new(&mut budget, "generated table payload", 4096).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(append_payload(
+                &mut payload,
+                &WalOp::CreateTable {
+                    identity: crate::storage::CatalogPosition::new(0, 1).unwrap(),
+                    definition: (&definition).into(),
+                }
+            ));
+            let (_, decoded, _) = decode_table_payload(payload.readable()).unwrap();
+            assert_eq!(
+                decoded.columns[1].default.generation(),
+                Some(crate::storage::Generation::Virtual)
+            );
+            assert_eq!(decoded.columns[0].default.generation(), None);
+        });
+    }
+
+    #[test]
     fn table_payload_rejects_versions_with_the_removed_increment_cache() {
         let definition = sample_def();
         let mut budget = Budget::new(8192);
@@ -15805,9 +15862,9 @@ mod tests {
                     definition: (&definition).into(),
                 }
             ));
-            assert_eq!(current.readable()[0], 17);
+            assert_eq!(current.readable()[0], 18);
             assert!(decode_table_payload(current.readable()).is_some());
-            for version in (0..17).chain(core::iter::once(u8::MAX)) {
+            for version in (0..18).chain(core::iter::once(u8::MAX)) {
                 incompatible.clear();
                 assert!(incompatible.append(&[version]));
                 assert!(incompatible.append(&current.readable()[1..]));
@@ -16278,6 +16335,7 @@ mod tests {
                     security_invoker: false,
                     security_barrier: 0,
                     check_option: 0,
+                    query_origin: 0,
                     dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
                 }
             ));
@@ -16401,6 +16459,7 @@ mod tests {
                 security_invoker: true,
                 security_barrier: 1,
                 check_option: 2,
+                query_origin: 0,
                 dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
             },
         ));
@@ -16492,6 +16551,7 @@ mod tests {
                 security_invoker: true,
                 security_barrier: 1,
                 check_option: 1,
+                query_origin: 0,
             },
         ));
         assert!(matches!(
@@ -17886,6 +17946,7 @@ mod tests {
                         security_invoker: false,
                         security_barrier: 0,
                         check_option: 0,
+                        query_origin: 0,
                         dependencies: WalStoredQueryDependencies::Captured(dependencies),
                     }
                 } else {
@@ -18211,6 +18272,7 @@ mod tests {
                         security_invoker: false,
                         security_barrier: 0,
                         check_option: 0,
+                        query_origin: 0,
                         dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
                     },
                     WalOp::CreateMatview {

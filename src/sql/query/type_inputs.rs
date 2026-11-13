@@ -1586,13 +1586,10 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
     where
         'storage: 'a,
     {
-        match tree {
-            ast::SetTree::Select(select) => self.select(select, outer, None),
-            ast::SetTree::Op { left, right, .. } => {
-                self.set_tree(left, outer)?;
-                self.set_tree(right, outer)
-            }
-        }
+        let (storage, txid, arena) = (self.storage, self.txid, self.arena);
+        super::setops::visit_set_branches(tree, storage, txid, arena, outer, &mut |select| {
+            self.select(select, outer, None)
+        })
     }
 
     /// Visits `statement`, whose queries see `outer` (a PL/pgSQL routine's

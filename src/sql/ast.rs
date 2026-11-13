@@ -3213,6 +3213,41 @@ pub struct Select<'a> {
     /// `FOR UPDATE`/`FOR SHARE`/… row-locking clauses, in written order. Empty
     /// when the query carries none.
     pub locking: &'a [LockClause<'a>],
+    /// How the query was written where execution no longer needs it.
+    pub written: WrittenQuery<'a>,
+}
+
+/// The written form of a query level that its executable fields expand,
+/// kept so that `pg_get_viewdef` and `pg_get_ruledef` print it as written.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WrittenQuery<'a> {
+    /// The level is one row of a `VALUES` list.
+    pub values: bool,
+    /// `LIMIT ALL`, which executes as no limit.
+    pub limit_all: bool,
+    /// The `GROUP BY` elements, by position in `group_by`, when the clause
+    /// holds grouping sets.
+    pub grouping: &'a [GroupingElement<'a>],
+}
+
+impl WrittenQuery<'_> {
+    pub const PLAIN: Self = Self {
+        values: false,
+        limit_all: false,
+        grouping: &[],
+    };
+}
+
+/// One written `GROUP BY` element.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GroupingElement<'a> {
+    /// One expression, by its position in `group_by`.
+    Expression(u16),
+    /// A parenthesized list, `(a, b)` or `()`.
+    List(&'a [u16]),
+    Rollup(&'a [GroupingElement<'a>]),
+    Cube(&'a [GroupingElement<'a>]),
+    Sets(&'a [GroupingElement<'a>]),
 }
 
 impl Select<'_> {
@@ -3235,6 +3270,7 @@ impl Select<'_> {
         with: &[],
         set_body: None,
         locking: &[],
+        written: WrittenQuery::PLAIN,
     };
 }
 
@@ -3772,8 +3808,15 @@ pub enum SelectItem<'a> {
 }
 
 /// A window function's resolved `OVER` clause.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct WindowSpec<'a> {
+    /// The `WINDOW` clause name this specification was defined under, which
+    /// `OVER name` keeps for deparsing.
+    pub name: Option<&'a str>,
+    /// The window an `OVER (base ...)` or `AS (base ...)` copy extends.
+    pub base: Option<&'a str>,
+    /// A copy took its `ORDER BY` from `base`.
+    pub copied_order: bool,
     pub partition_by: &'a [&'a Expr<'a>],
     pub order_by: &'a [OrderBy<'a>],
     /// Explicit `ROWS`/`RANGE`/`GROUPS` frame; None = the default frame
@@ -3781,10 +3824,23 @@ pub struct WindowSpec<'a> {
     pub frame: Option<WindowFrame<'a>>,
 }
 
+/// Names only record how the specification was written; two specifications
+/// that partition, order and frame rows alike evaluate alike.
+impl PartialEq for WindowSpec<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.partition_by == other.partition_by
+            && self.order_by == other.order_by
+            && self.frame == other.frame
+    }
+}
+
 /// An explicit window frame clause.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WindowFrame<'a> {
     pub units: FrameUnits,
+    /// Written as `BETWEEN start AND end`; otherwise `end` is the implied
+    /// `CURRENT ROW`.
+    pub between: bool,
     pub start: FrameBound<'a>,
     pub end: FrameBound<'a>,
     pub exclusion: FrameExclusion,
@@ -4907,9 +4963,11 @@ pub struct ColumnDef<'a> {
     /// The raw source text of the DEFAULT expression, for storing non-constant
     /// defaults and for `pg_get_expr` / `\d` reconstruction.
     pub default_text: Option<&'a str>,
-    /// `GENERATED ALWAYS AS (expr) STORED`: the raw source text of the generation
-    /// expression, computed from the row's other columns at insert/update.
+    /// `GENERATED ALWAYS AS (expr) [STORED | VIRTUAL]`: the raw source text of
+    /// the generation expression, computed from the row's other columns.
     pub generated_text: Option<&'a str>,
+    /// The generation kind; `VIRTUAL` when neither keyword is written.
+    pub generated_kind: crate::storage::Generation,
     /// `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [(options)]`.
     pub identity: Option<IdentitySpec<'a>>,
 }
@@ -4927,8 +4985,8 @@ pub struct IdentitySpec<'a> {
 
 /// The result of parsing a `GENERATED` column clause.
 pub enum ColGen<'a> {
-    /// `ALWAYS AS (expr) STORED`.
-    Generated(&'a str),
+    /// `ALWAYS AS (expr) [STORED | VIRTUAL]`.
+    Generated(&'a str, crate::storage::Generation),
     /// `{ ALWAYS | BY DEFAULT } AS IDENTITY [(options)]`.
     Identity(IdentitySpec<'a>),
 }
@@ -6719,7 +6777,7 @@ impl<'a> Expr<'a> {
         self.find_function(&is_volatile_function)
     }
 
-    fn find_function(&self, matches: &dyn Fn(&str) -> bool) -> Option<&str> {
+    pub(crate) fn find_function(&self, matches: &dyn Fn(&str) -> bool) -> Option<&str> {
         match self {
             Expr::Call { name, args, .. } => {
                 if matches(name) {

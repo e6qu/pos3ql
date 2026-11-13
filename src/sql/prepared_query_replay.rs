@@ -26,6 +26,7 @@ pub(super) fn stage_query_record(
             security_invoker,
             security_barrier,
             check_option,
+            query_origin,
             dependencies,
         } => {
             let (columns, default_inputs) = columns.materialize(storage, txid)?;
@@ -50,7 +51,12 @@ pub(super) fn stage_query_record(
                         creation_path,
                         dependencies,
                     },
-                    options: view_options(*security_invoker, *security_barrier, *check_option)?,
+                    options: view_options(
+                        *security_invoker,
+                        *security_barrier,
+                        *check_option,
+                        *query_origin,
+                    )?,
                 },
                 txid,
             )?;
@@ -124,13 +130,19 @@ pub(super) fn stage_query_record(
             security_invoker,
             security_barrier,
             check_option,
+            query_origin,
         } => {
             let slot = storage
                 .view_slot(schema, name, txid)
                 .ok_or_else(|| invalid("view source"))?;
             let prior = storage.stage_view_options(
                 storage.prepare_view_edit(slot, txid)?,
-                view_options(*security_invoker, *security_barrier, *check_option)?,
+                view_options(
+                    *security_invoker,
+                    *security_barrier,
+                    *check_option,
+                    *query_origin,
+                )?,
                 txid,
             )?;
             transaction.record_catalog_change(
@@ -636,7 +648,12 @@ fn text<const N: usize>(value: &str) -> Result<StackStr<N>, SqlError> {
     Ok(result)
 }
 
-fn view_options(invoker: bool, barrier: u8, check: u8) -> Result<ViewOptions, SqlError> {
+fn view_options(
+    invoker: bool,
+    barrier: u8,
+    check: u8,
+    origin: u8,
+) -> Result<ViewOptions, SqlError> {
     Ok(ViewOptions {
         security: if invoker {
             ViewSecurity::Invoker
@@ -650,6 +667,8 @@ fn view_options(invoker: bool, barrier: u8, check: u8) -> Result<ViewOptions, Sq
         } else {
             Some(ViewCheckOption::from_code(check).ok_or_else(|| invalid("view check option"))?)
         },
+        query_origin: crate::storage::ViewQueryOrigin::from_code(origin)
+            .ok_or_else(|| invalid("view query origin"))?,
     })
 }
 

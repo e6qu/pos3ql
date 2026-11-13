@@ -982,7 +982,40 @@ pub enum ColumnDefault {
         expression: StackStr<DEFAULT_EXPR_MAX>,
     },
     Expression(StackStr<DEFAULT_EXPR_MAX>),
-    Generated(StackStr<DEFAULT_EXPR_MAX>),
+    Generated {
+        expression: StackStr<DEFAULT_EXPR_MAX>,
+        kind: Generation,
+    },
+}
+
+/// How a generated column holds its value. PostgreSQL 18 computes a
+/// `VIRTUAL` column when it is read and keeps a `STORED` one in the row. A
+/// generation expression reads only its own row and is immutable, so pos3ql
+/// keeps both kinds' values in the row; the kind decides what PostgreSQL
+/// exposes (`attgenerated`, trigger rows, error details) and which
+/// definitions are allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Generation {
+    Stored,
+    Virtual,
+}
+
+impl Generation {
+    /// `pg_attribute.attgenerated`.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Stored => b's',
+            Self::Virtual => b'v',
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            b's' => Some(Self::Stored),
+            b'v' => Some(Self::Virtual),
+            _ => None,
+        }
+    }
 }
 
 impl ColumnDefault {
@@ -993,32 +1026,50 @@ impl ColumnDefault {
             Self::None => None,
             Self::Constant { expression, .. }
             | Self::Expression(expression)
-            | Self::Generated(expression) => Some(expression),
+            | Self::Generated { expression, .. } => Some(expression),
         }
     }
 
     pub const fn constant(&self) -> Option<&OwnedDatum> {
         match self {
             Self::Constant { value, .. } => Some(value),
-            Self::None | Self::Expression(_) | Self::Generated(_) => None,
+            Self::None | Self::Expression(_) | Self::Generated { .. } => None,
         }
     }
 
     pub const fn is_generated(self) -> bool {
-        matches!(self, Self::Generated(_))
+        matches!(self, Self::Generated { .. })
+    }
+
+    /// The generation kind of a generated column.
+    pub const fn generation(self) -> Option<Generation> {
+        match self {
+            Self::Generated { kind, .. } => Some(kind),
+            _ => None,
+        }
+    }
+
+    pub const fn is_virtual(self) -> bool {
+        matches!(
+            self,
+            Self::Generated {
+                kind: Generation::Virtual,
+                ..
+            }
+        )
     }
 
     pub const fn from_parts(
         value: Option<OwnedDatum>,
         expression: Option<StackStr<DEFAULT_EXPR_MAX>>,
-        generated: bool,
+        generation: Option<Generation>,
     ) -> Option<Self> {
-        match (value, expression, generated) {
-            (None, None, false) => Some(Self::None),
-            (Some(value), Some(expression), false) => Some(Self::Constant { value, expression }),
-            (Some(_), None, false) => None,
-            (None, Some(expression), false) => Some(Self::Expression(expression)),
-            (None, Some(expression), true) => Some(Self::Generated(expression)),
+        match (value, expression, generation) {
+            (None, None, None) => Some(Self::None),
+            (Some(value), Some(expression), None) => Some(Self::Constant { value, expression }),
+            (Some(_), None, None) => None,
+            (None, Some(expression), None) => Some(Self::Expression(expression)),
+            (None, Some(expression), Some(kind)) => Some(Self::Generated { expression, kind }),
             _ => None,
         }
     }
@@ -6137,6 +6188,7 @@ pub struct ViewOptions {
     pub security: ViewSecurity,
     pub security_barrier: ViewSecurityBarrier,
     pub check_option: Option<ViewCheckOption>,
+    pub query_origin: ViewQueryOrigin,
 }
 
 impl ViewOptions {
@@ -6144,7 +6196,35 @@ impl ViewOptions {
         security: ViewSecurity::Definer,
         security_barrier: ViewSecurityBarrier::Default,
         check_option: None,
+        query_origin: ViewQueryOrigin::View,
     };
+}
+
+/// Which statement wrote a view's query. PostgreSQL's `CREATE OR REPLACE
+/// RULE "_RETURN"` keeps the rule's `OLD` and `NEW` entries in the query's
+/// range table, so `pg_get_viewdef` qualifies every column it prints; a
+/// `CREATE VIEW` query has no such entries. Not a reloption.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewQueryOrigin {
+    View,
+    ReturnRule,
+}
+
+impl ViewQueryOrigin {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::View => 0,
+            Self::ReturnRule => 1,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::View),
+            1 => Some(Self::ReturnRule),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -18234,7 +18314,7 @@ fn rename_column_default_schema(
         ColumnDefault::None => Ok(false),
         ColumnDefault::Constant { expression, .. }
         | ColumnDefault::Expression(expression)
-        | ColumnDefault::Generated(expression) => {
+        | ColumnDefault::Generated { expression, .. } => {
             crate::sql::enum_values::checks::rename_default_schema(
                 expression, spans, old, new, arena,
             )
@@ -56207,6 +56287,8 @@ impl Storage {
             RuleMetadataChange::Rename(_) | RuleMetadataChange::SetEnabled(_) => None,
         };
         let target = self.query_rule_target(selected.definition_for(txid).target, txid)?;
+        // Read before the catalog lock below; the relation's name lives there.
+        let (_, relation) = self.rule_target_names(selected.definition_for(txid).target, txid);
         let mut owners = self.catalog_dependency_owners(
             &self.view_rule_catalog,
             type_contracts::CatalogPublicationInput::RuleMetadataEdit,
@@ -56310,7 +56392,9 @@ impl Storage {
         {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
-                "rule already exists for relation"
+                "rule \"{}\" for relation \"{}\" already exists",
+                definition.name.as_str(),
+                relation.as_str()
             ));
         }
         if matches!(change, RuleMetadataChange::Rename(_)) {

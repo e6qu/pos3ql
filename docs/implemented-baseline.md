@@ -381,6 +381,10 @@ INSERT INTO t VALUES (3);
 FETCH ALL FROM c;  -- includes 3
 ```
 
+A trigger can also `FETCH` from a session cursor declared `FOR UPDATE` or
+`FOR SHARE`: each fetched row is locked then, and a fetch that meets another
+transaction's lock waits for it without repeating or skipping a row.
+
 Rows the transaction changes after `DECLARE`, and later commits, stay
 invisible. Until its query has run, the cursor holds its snapshot in a
 statement snapshot slot; each server reserves `max_connections` ×
@@ -546,6 +550,17 @@ triggers and generated columns: `INSERT INTO audit SELECT id FROM inserted_rows`
 reads that COPY's rows. AFTER row triggers cannot change them. These rows use
 `copy_transition_bytes` plus `txn_rows` records reserved per connection and per
 subscription worker; exhaustion returns `54000` and aborts the COPY.
+
+A generated column is `VIRTUAL` unless `STORED` is written, as in PostgreSQL
+18: `CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2))` lists `b` with
+`attgenerated = 'v'`. Queries read its computed value; a trigger's `OLD` and
+`NEW` hold NULL for it, a failing-row detail prints `virtual`, and COPY reads
+and writes no generated column. Indexes, keys, foreign keys, extended
+statistics, domain or user-defined types, user-defined functions in its
+expression, `DROP EXPRESSION`, and `SET EXPRESSION` on a table with CHECK
+constraints are refused with PostgreSQL's errors. Because the expression is
+immutable and reads only its own row, pos3ql keeps the computed value in the
+row; this is not visible to SQL.
 
 Deferred constraints run before every commit, including after COPY and at an
 extended-protocol Sync. A failed check rolls back the command instead of
@@ -716,7 +731,9 @@ are the reference.
 
 `CREATE OR REPLACE VIEW` keeps the view's identifier, row type, `_RETURN` rule,
 owner, permissions and comments. Renaming a source column keeps the view's
-output names.
+output names. `CREATE OR REPLACE RULE "_RETURN" AS ON SELECT TO v DO INSTEAD
+SELECT ...` replaces the query of view `v` when it returns the same column
+names and types, and also keeps the view's options.
 
 A materialized view created `WITH NO DATA` fails ordinary reads with `55000`,
 including `LIMIT 0`. REFRESH requires MAINTAIN, runs as the owner and holds an
@@ -729,12 +746,25 @@ fail as in PostgreSQL (`0A000` for `CREATE RULE`, `2BP01` for dropping
 `_RETURN`); only `COMMENT ON RULE "_RETURN"` is accepted.
 
 Rewrite rules take the target table's exclusive lock, so a rule that redirects
-an insert conflicts with ordinary reads of that table. `_RETURN` cannot be
-renamed or dropped apart from its view. `pg_get_ruledef` supports both
-formatting modes for unconditional `DO NOTHING` rules and for `_RETURN` rules,
-whose action is printed as `pg_get_viewdef` prints the view; other rules
-return their saved SQL, and pretty formatting of a condition or action returns
-`0A000`. A missing rule returns NULL.
+an insert conflicts with ordinary reads of that table. A rule condition may
+use subqueries over other tables and the event's `OLD` and `NEW` rows
+(`WHERE EXISTS (SELECT 1 FROM allowed WHERE allowed.id = new.id)`). `_RETURN`
+cannot be renamed or dropped apart from its view. `CREATE OR REPLACE RULE
+"_RETURN"` replaces a view's query when it returns the view's column names
+and types; a column written without the view column's type modifier
+(`numeric` for `numeric(5,2)`) keeps the view's declared type, as in
+PostgreSQL. `pg_get_ruledef` and `pg_rules` print a rule as PostgreSQL
+deparses it, in both formatting modes, when its condition is an expression
+over `OLD`, `NEW` and constants and each action is `NOTIFY`, a query, or an
+`INSERT ... VALUES` (one or more rows), `INSERT ... SELECT`, `UPDATE ... SET
+... [FROM ...] WHERE` or `DELETE ... [USING ...] WHERE`, each with an optional
+`RETURNING` list. Their queries may read subqueries, functions, joins, set
+operations, `WITH` queries and `VALUES` lists, printed as `pg_get_viewdef`
+prints them (for example `DO INSTEAD ( UPDATE log SET b = new.b WHERE (log.a =
+old.a); ...)`); `_RETURN` rules print their query as `pg_get_viewdef` does.
+Other rules
+return their saved SQL, and their pretty form fails with `0A000`. A missing
+rule returns NULL.
 
 ## Catalog listings and current lookups
 

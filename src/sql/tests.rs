@@ -34,6 +34,7 @@ mod foreign_parent_admission;
 mod function_progress;
 mod geometric_casts;
 mod geometry_assignments;
+mod hash_outer_joins;
 mod index_expression_mutability;
 mod index_parent_ownership;
 mod indirect_execute_privileges;

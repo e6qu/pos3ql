@@ -659,6 +659,87 @@ fn join_quals<'a>(
     Ok(Some(quals))
 }
 
+/// The `Hash Cond` and `Join Filter` of an outer hash join of two relations
+/// with no WHERE clause: its condition's equalities between the probe and
+/// build relations, outer side first, and its other conjuncts. None when a
+/// conjunct reads only one side, which PostgreSQL places elsewhere.
+fn outer_hash_quals<'a>(
+    storage: &Storage,
+    txid: u32,
+    relations: &[(&'a str, &'a crate::storage::TableDef)],
+    probe: usize,
+    condition: &'a Expr<'a>,
+    arena: &'a Arena,
+) -> Result<Option<(StackStr<512>, Option<StackStr<512>>)>, SqlError> {
+    let resolve = |qualifier: Option<&str>, name: &str| -> Option<usize> {
+        let has = |table: &crate::storage::TableDef| {
+            table
+                .columns()
+                .iter()
+                .any(|column| column.name.as_str() == name)
+        };
+        match qualifier {
+            Some(qualifier) => relations
+                .iter()
+                .position(|(exposed, table)| *exposed == qualifier && has(table)),
+            None => {
+                let mut found = relations
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, table))| has(table))
+                    .map(|(index, _)| index);
+                match (found.next(), found.next()) {
+                    (Some(index), None) => Some(index),
+                    _ => None,
+                }
+            }
+        }
+    };
+    let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
+    let mut count = 0;
+    if split_conjuncts(condition, &mut conjuncts, &mut count).is_none() {
+        return Ok(None);
+    }
+    let mut hash_conds = [&Expr::Null; MAX_CONJUNCTS];
+    let mut hash_count = 0;
+    let mut filters = [&Expr::Null; MAX_CONJUNCTS];
+    let mut filter_count = 0;
+    for &conjunct in &conjuncts[..count] {
+        if relation_mask(conjunct, &resolve) != Some(0b11) {
+            return Ok(None);
+        }
+        if let Some(equality) = equijoin(conjunct, &resolve, probe, arena)? {
+            hash_conds[hash_count] = equality;
+            hash_count += 1;
+        } else {
+            filters[filter_count] = conjunct;
+            filter_count += 1;
+        }
+    }
+    let joined = arena
+        .alloc_slice_with(relations.len(), |index| {
+            crate::sql::catalog::deparse::Joined::new(relations[index].0, relations[index].1)
+        })
+        .map_err(|_| arena_full())?;
+    let context = crate::sql::catalog::deparse::Context {
+        storage,
+        txid,
+        table: None,
+        parameters: &[],
+        joined,
+        pretty: false,
+        qualify: true,
+    };
+    let Some(hash_cond) = deparse_qual(&context, &hash_conds[..hash_count], arena)? else {
+        return Ok(None);
+    };
+    let join_filter = deparse_qual(&context, &filters[..filter_count], arena)?;
+    if filter_count != 0 && join_filter.is_none() {
+        return Ok(None);
+    }
+    Ok(Some((hash_cond, join_filter)))
+}
+
 /// The filter of a scan of one relation reading `condition`, when every
 /// conjunct reads only that relation.
 fn single_relation_filter<'a>(
@@ -1564,6 +1645,7 @@ pub(super) fn plan_select<'a>(
     let mut object_requests = 0u64;
     let mut cache_blocks = 0u64;
     let mut hash_join = false;
+    let mut hash_join_name = "Hash Join";
     let table_count = scope.as_ref().map_or(0, |scope| scope.n);
     let table_order = arena
         .alloc_slice_with(table_count, |index| index)
@@ -1636,6 +1718,7 @@ pub(super) fn plan_select<'a>(
             table_order[0] = layout.probe_table;
             table_order[1] = layout.build_table;
             hash_join = true;
+            hash_join_name = plan.node_name();
         }
     }
 
@@ -1664,14 +1747,18 @@ pub(super) fn plan_select<'a>(
             &mut stages,
             &mut stage_count,
             PlanNode {
-                name: StackStr::from_str(join_node(
-                    statement
-                        .from
-                        .as_ref()
-                        .and_then(|from| from.joins.last())
-                        .map(|join| join.kind),
-                    hash_join,
-                )),
+                name: StackStr::from_str(if hash_join {
+                    hash_join_name
+                } else {
+                    join_node(
+                        statement
+                            .from
+                            .as_ref()
+                            .and_then(|from| from.joins.last())
+                            .map(|join| join.kind),
+                        false,
+                    )
+                }),
                 total_cost,
                 rows: estimated_rows,
                 width,
@@ -1852,6 +1939,29 @@ pub(super) fn plan_select<'a>(
                     }
                 }
             }
+        } else if hash_join
+            && scope.n == 2
+            && statement.where_clause.is_none()
+            && let Some(join) = statement.from.as_ref().and_then(|from| from.joins.first())
+            && matches!(
+                join.kind,
+                crate::sql::ast::JoinKind::Left
+                    | crate::sql::ast::JoinKind::Right
+                    | crate::sql::ast::JoinKind::Full
+            )
+            && let Some(condition) = join.on.or(scope.join_on[0])
+            && let (Some(first), Some(second)) = (relation(0), relation(1))
+            && let Some((hash_cond, join_filter)) = outer_hash_quals(
+                storage,
+                txid,
+                &[first, second],
+                table_order[0],
+                condition,
+                arena,
+            )?
+        {
+            stages[0] = stages[0].with_qual(QualLabel::HashCond, Some(hash_cond));
+            join_filters[1] = join_filter;
         }
     }
     for (depth, stage) in stages[..stage_count].iter().rev().enumerate() {
@@ -3248,6 +3358,14 @@ fn node_kind(node: &PlanNode) -> NodeKind<'_> {
         "Hash Left Join" => {
             kind.node_type = "Hash Join";
             kind.join_type = Some("Left");
+        }
+        "Hash Right Join" => {
+            kind.node_type = "Hash Join";
+            kind.join_type = Some("Right");
+        }
+        "Hash Full Join" => {
+            kind.node_type = "Hash Join";
+            kind.join_type = Some("Full");
         }
         _ => {}
     }

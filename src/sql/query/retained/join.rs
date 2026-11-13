@@ -103,6 +103,11 @@ pub(super) struct HashShape {
     count: usize,
     /// The planned build row count; it sizes the bucket array.
     capacity: usize,
+    /// A probe row without a partner joins a NULL build row.
+    preserve_probe: bool,
+    /// The build rows no probe row matched return after the probe; the
+    /// build then keeps rows whose key has a NULL, outside every bucket.
+    preserve_build: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -114,6 +119,8 @@ struct HashEntry {
 }
 
 /// A hash join's build rows, in `plan_build_bytes` leases owned by the level.
+/// Entries keep the build source's row order, which a RIGHT or FULL join's
+/// match flags index.
 struct HashTable {
     shape: HashShape,
     buckets: MutableSlice<u32>,
@@ -121,7 +128,8 @@ struct HashTable {
     rows: MutableSlice<u8>,
     started: bool,
     built: bool,
-    /// The next entry of the current probe's bucket chain.
+    /// The next entry of the current probe's bucket chain, or, while the
+    /// unmatched build rows return, the next entry in row order.
     next: u32,
     probe: u64,
 }
@@ -196,16 +204,18 @@ impl HashTable {
         .map(Some)
     }
 
-    /// Adds one build row; a row with a NULL key can never match.
+    /// Adds one build row. A row with a NULL key can never match: it is
+    /// kept, outside every bucket, only when unmatched build rows return.
     fn insert(
         &mut self,
         storage: &Storage,
         txid: u32,
         values: &[Datum<'_>],
     ) -> Result<(), SqlError> {
-        let Some(hash) = self.hash(storage, txid, values, true)? else {
+        let hash = self.hash(storage, txid, values, true)?;
+        if hash.is_none() && !self.shape.preserve_build {
             return Ok(());
-        };
+        }
         let length = crate::sql::exec::projected_row_len(values)?;
         let start = self.rows.len();
         let offset = |value: usize| {
@@ -238,31 +248,54 @@ impl HashTable {
             values,
             &mut self.rows.as_mut_slice()[start..start + length],
         )?;
-        let bucket = (hash as usize) & (self.buckets.len() - 1);
-        let next = self.buckets.as_slice()[bucket];
+        let bucket = hash.map(|hash| (hash as usize) & (self.buckets.len() - 1));
         self.entries
             .push(HashEntry {
-                hash,
-                next,
+                hash: hash.unwrap_or(0),
+                next: bucket.map_or(NO_ENTRY, |bucket| self.buckets.as_slice()[bucket]),
                 start: start32,
                 len: len32,
             })
             .map_err(build_full)?;
-        self.buckets.as_mut_slice()[bucket] = index;
+        if let Some(bucket) = bucket {
+            self.buckets.as_mut_slice()[bucket] = index;
+        }
         Ok(())
     }
 
-    /// The next entry in the current chain whose hash matches the probe.
-    fn next_candidate(&mut self) -> Option<&[u8]> {
+    /// The next entry in the current chain whose hash matches the probe,
+    /// with its index.
+    fn next_candidate(&mut self) -> Option<(usize, &[u8])> {
         while self.next != NO_ENTRY {
-            let entry = self.entries.as_slice()[self.next as usize];
+            let index = self.next as usize;
+            let entry = self.entries.as_slice()[index];
             self.next = entry.next;
             if entry.hash == self.probe {
                 let start = entry.start as usize;
-                return Some(&self.rows.as_slice()[start..start + entry.len as usize]);
+                return Some((
+                    index,
+                    &self.rows.as_slice()[start..start + entry.len as usize],
+                ));
             }
         }
         None
+    }
+
+    /// The next entry in row order, with its index, after [`Self::start_rows`].
+    fn next_row(&mut self) -> Option<(usize, &[u8])> {
+        let index = self.next as usize;
+        let entry = *self.entries.as_slice().get(index)?;
+        self.next += 1;
+        let start = entry.start as usize;
+        Some((
+            index,
+            &self.rows.as_slice()[start..start + entry.len as usize],
+        ))
+    }
+
+    /// Starts reading every entry in row order.
+    fn start_rows(&mut self) {
+        self.next = 0;
     }
 }
 
@@ -374,15 +407,13 @@ pub(super) fn join_shape<'a>(
         }
         *item = Some(shape);
     }
-    // A RIGHT or FULL join reads as the general executor's nested loop with
-    // match flags: two items whose inner one is a table or literal list.
+    // A RIGHT or FULL join of two items reads as the general executor's
+    // hash join, or as its nested loop with match flags when the inner item
+    // is a table or literal list.
     for (index, join) in from.joins.iter().enumerate() {
         match join.kind {
             JoinKind::Inner | JoinKind::Cross | JoinKind::Comma | JoinKind::Left => {}
-            JoinKind::Right | JoinKind::Full
-                if scope.n == 2
-                    && matches!(items[1], Some(ItemShape::Table | ItemShape::Literals(_))) =>
-            {
+            JoinKind::Right | JoinKind::Full if scope.n == 2 => {
                 if join.kind == JoinKind::Full
                     && let Some(on) = join.on
                     && crate::sql::query::plan::check_full_join_condition(on, scope, index + 1)
@@ -438,7 +469,7 @@ pub(super) fn join_shape<'a>(
         }
     }
     let all_cross = from.joins.iter().all(|join| join.kind.is_cross());
-    let order = if all_cross {
+    let mut order = if all_cross {
         crate::sql::query::plan::join_order(storage, scope, where_clause, arena)?
     } else {
         arena
@@ -460,22 +491,34 @@ pub(super) fn join_shape<'a>(
         arena,
     )? {
         let layout = plan.key_layout();
-        if layout.probe_table != order[0]
-            || layout.build_table != order[1]
-            || !matches!(items[layout.build_table], Some(ItemShape::Table))
-        {
+        if !matches!(items[layout.build_table], Some(ItemShape::Table)) {
             return Ok(None);
         }
+        // The probe item is read first, as the general executor reads it.
+        order = arena
+            .alloc_slice_copy(&[layout.probe_table, layout.build_table])
+            .map_err(|_| arena_full())?;
         let count = layout.keys.len();
         let mut shape = HashShape {
             keys: [(0, 0); 8],
             collations: [Collation::None; 8],
             count,
             capacity: layout.capacity,
+            preserve_probe: plan.preserves_probe_rows(),
+            preserve_build: plan.preserves_build_rows(),
         };
         shape.keys[..count].copy_from_slice(layout.keys);
         shape.collations[..count].copy_from_slice(layout.collations);
         hash = Some(shape);
+    }
+    if hash.is_none()
+        && from
+            .joins
+            .iter()
+            .any(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full))
+        && !matches!(items[1], Some(ItemShape::Table | ItemShape::Literals(_)))
+    {
+        return Ok(None);
     }
     for depth in 1..scope.n {
         if crate::sql::query::scan::parameterized_index_access_plan(
@@ -567,9 +610,12 @@ pub(super) fn open_levels<'a>(
         // checked like the pushed-down conjuncts after them.
         let mut synthesized = [&Expr::Null; crate::sql::query::plan::MAX_CONJUNCTS];
         let mut synthesized_count = 0;
-        if table > 0 {
-            let join = &from.joins[table - 1];
-            match (join.on, scope.join_on[table - 1]) {
+        // The join that adds a level's item; a hash join probing its second
+        // item adds the first one below it.
+        if depth > 0 {
+            let join_index = table.max(1) - 1;
+            let join = &from.joins[join_index];
+            match (join.on, scope.join_on[join_index]) {
                 (Some(condition), _) => {
                     on[depth] = Some(bind_expression(condition, arena, Some(columns), None)?);
                 }
@@ -613,10 +659,18 @@ pub(super) fn open_levels<'a>(
         _ => None,
     };
     let outer_join = |table: usize| (table > 0).then(|| from.joins[table - 1].kind);
-    let right_join = from
-        .joins
-        .iter()
-        .any(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full));
+    // A hash join keeps the unmatched rows its plan names; a nested loop
+    // keeps a LEFT or FULL join's outer rows and a RIGHT or FULL join's
+    // inner rows.
+    let (left_join, right_join) = match shape.hash {
+        Some(hash) => (hash.preserve_probe, hash.preserve_build),
+        None => (
+            false,
+            from.joins
+                .iter()
+                .any(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full)),
+        ),
+    };
     // The flags grow as the joining pass reads the right item: counting
     // its rows first would read storage before the join could wait.
     let mut right = if right_join {
@@ -665,7 +719,11 @@ pub(super) fn open_levels<'a>(
                     pending: None,
                     decoded_columns: masks[depth],
                 },
-                left: matches!(outer_join(table), Some(JoinKind::Left | JoinKind::Full)),
+                left: if shape.hash.is_some() {
+                    depth == 1 && left_join
+                } else {
+                    matches!(outer_join(table), Some(JoinKind::Left | JoinKind::Full))
+                },
                 on: on[depth],
                 pushdown: pushdown[depth],
                 matched: false,
@@ -812,7 +870,16 @@ impl<'a> JoinState<'a> {
                         buffers,
                         work,
                     )?;
-                    self.start_probe(scope, storage, txid, work)?;
+                    if pass == RightPass::Unmatched {
+                        // The outer row is NULL: every build row is visited.
+                        self.levels[depth]
+                            .hash
+                            .as_mut()
+                            .expect("hash level")
+                            .start_rows();
+                    } else {
+                        self.start_probe(scope, storage, txid, work)?;
+                    }
                 } else {
                     let level = &mut self.levels[depth];
                     if depth > 0 {
@@ -838,20 +905,26 @@ impl<'a> JoinState<'a> {
             let level = &mut self.levels[depth];
             if level.scan.pending.is_none() {
                 let mark = state_arena.mark();
+                // A hash level's entry, which indexes its match flags.
+                let mut entry = None;
                 let next = match &mut level.hash {
-                    Some(table) => table
-                        .next_candidate()
-                        .map(|bytes| {
-                            state_arena
-                                .alloc_slice_copy(bytes)
-                                .map(|values| RetainedRow::Saved {
-                                    rowid: None,
-                                    version: None,
-                                    values,
-                                })
-                                .map_err(|_| arena_full())
-                        })
-                        .transpose(),
+                    Some(table) => if pass == RightPass::Unmatched {
+                        table.next_row()
+                    } else {
+                        table.next_candidate()
+                    }
+                    .map(|(index, bytes)| {
+                        entry = Some(index);
+                        state_arena
+                            .alloc_slice_copy(bytes)
+                            .map(|values| RetainedRow::Saved {
+                                rowid: None,
+                                version: None,
+                                values,
+                            })
+                            .map_err(|_| arena_full())
+                    })
+                    .transpose(),
                     None => next_source_row(
                         &mut level.scan.source,
                         state_arena,
@@ -884,7 +957,7 @@ impl<'a> JoinState<'a> {
                         });
                         level.checked = false;
                         if let Some(right) = &mut level.right {
-                            right.current = right.read;
+                            right.current = entry.unwrap_or(right.read);
                             right.read += 1;
                             if pass == RightPass::Joining {
                                 right.cover(right.current)?;

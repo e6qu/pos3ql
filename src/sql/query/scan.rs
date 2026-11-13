@@ -5625,12 +5625,18 @@ struct HashEntry<'a> {
     hash: u64,
     rowid: Option<u64>,
     row: BoundRow<'a>,
+    /// The row's key has no NULL, so the row is in a bucket chain.
+    keyed: bool,
+    /// A probe row joined this row.
+    matched: bool,
 }
 
 const EMPTY_HASH_ENTRY: HashEntry<'static> = HashEntry {
     hash: 0,
     rowid: None,
     row: BoundRow::Encoded(&[]),
+    keyed: false,
+    matched: false,
 };
 
 /// Whether two join-key column types compare and hash identically to the `=`
@@ -5940,7 +5946,11 @@ pub(crate) struct HashJoinPlan<'a> {
     key_count: usize,
     key_collations: [Collation; 8],
     on: Option<&'a Expr<'a>>,
+    /// A LEFT join's probe rows, or a FULL join's, survive without a partner.
     preserves_probe_rows: bool,
+    /// The build rows no probe row matched are returned NULL-extended after
+    /// the probe, as PostgreSQL's Hash Right and Hash Full joins return them.
+    preserves_build_rows: bool,
     build_capacity: usize,
 }
 
@@ -5956,6 +5966,27 @@ pub(crate) struct HashKeyLayout<'p> {
 }
 
 impl HashJoinPlan<'_> {
+    /// PostgreSQL's name for this join node: the outer (probe) side's rows
+    /// are preserved by a left join, the inner (hashed) side's by a right join.
+    pub(crate) fn node_name(&self) -> &'static str {
+        match (self.preserves_probe_rows, self.preserves_build_rows) {
+            (false, false) => "Hash Join",
+            (true, false) => "Hash Left Join",
+            (false, true) => "Hash Right Join",
+            (true, true) => "Hash Full Join",
+        }
+    }
+
+    /// Whether build rows nothing matched are returned after the probe.
+    pub(crate) fn preserves_build_rows(&self) -> bool {
+        self.preserves_build_rows
+    }
+
+    /// Whether probe rows nothing matched are returned NULL-extended.
+    pub(crate) fn preserves_probe_rows(&self) -> bool {
+        self.preserves_probe_rows
+    }
+
     pub(crate) fn key_layout(&self) -> HashKeyLayout<'_> {
         HashKeyLayout {
             probe_table: self.probe_table,
@@ -6000,29 +6031,11 @@ pub(crate) fn select_hash_join_plan<'a>(
         }
     }
     let join = &from.joins[0];
-    if !matches!(
-        join.kind,
-        JoinKind::Inner | JoinKind::Cross | JoinKind::Comma | JoinKind::Left
-    ) {
-        return Ok(None);
-    }
     let first_table = order[0];
     let second_table = order[1];
     if scope.lateral[first_table] || scope.lateral[second_table] {
         return Ok(None);
     }
-    // Keep the physical probe's established scan order when only the first
-    // source is derived. Otherwise probe the first source in its own row order.
-    let (probe_table, build_table) = if scope.derived[first_table].is_some()
-        && scope.derived[second_table].is_none()
-        && matches!(
-            join.kind,
-            JoinKind::Inner | JoinKind::Cross | JoinKind::Comma
-        ) {
-        (second_table, first_table)
-    } else {
-        (first_table, second_table)
-    };
     // A partitioned source owns rows in several leaf maps. Its physical row
     // identity is not representable by the hash run's rowid-only payload.
     // Derived sources have no storage slot, so classify that boundary before
@@ -6034,27 +6047,67 @@ pub(crate) fn select_hash_join_plan<'a>(
                 .partition
                 .is_partitioned()
     };
-    if is_partition_parent(probe_table) || is_partition_parent(build_table) {
+    if is_partition_parent(first_table) || is_partition_parent(second_table) {
         return Ok(None);
     }
+    const MAX_HASH_ENTRIES: usize = 1 << 15;
+    let capacity = |table: usize| -> Result<Option<usize>, SqlError> {
+        let rows = if let Some(run) = scope.external_runs[table] {
+            usize::try_from(run.rows()).map_err(|_| arena_full())?
+        } else {
+            scope.derived[table].map_or_else(
+                || storage.planning_row_estimate(scope.slots[table]) as usize,
+                <[&[u8]]>::len,
+            )
+        };
+        Ok((rows <= MAX_HASH_ENTRIES).then_some(rows))
+    };
+    // The probe and build sides, and which unmatched rows each keeps. An
+    // outer join hashes its nullable side, as a left join always has; when
+    // only the preserved side fits the build table, it is hashed instead and
+    // its unmatched rows return after the probe (PostgreSQL's right join).
+    let swapped = |keeps_first: bool, keeps_second: bool| -> Result<_, SqlError> {
+        Ok(if let Some(rows) = capacity(second_table)? {
+            Some((first_table, second_table, keeps_first, keeps_second, rows))
+        } else {
+            capacity(first_table)?
+                .map(|rows| (second_table, first_table, keeps_second, keeps_first, rows))
+        })
+    };
+    let sides = match join.kind {
+        JoinKind::Inner | JoinKind::Cross | JoinKind::Comma => {
+            // Keep the physical probe's established scan order when only the
+            // first source is derived. Otherwise probe the first source in
+            // its own row order.
+            let (probe, build) =
+                if scope.derived[first_table].is_some() && scope.derived[second_table].is_none() {
+                    (second_table, first_table)
+                } else {
+                    (first_table, second_table)
+                };
+            capacity(build)?.map(|rows| (probe, build, false, false, rows))
+        }
+        JoinKind::Left => swapped(true, false)?,
+        // The nullable first source is hashed: the second probes it.
+        JoinKind::Right => match capacity(first_table)? {
+            Some(rows) => Some((second_table, first_table, true, false, rows)),
+            None => {
+                capacity(second_table)?.map(|rows| (first_table, second_table, false, true, rows))
+            }
+        },
+        JoinKind::Full => swapped(true, true)?,
+    };
+    let Some((probe_table, build_table, preserves_probe_rows, preserves_build_rows, rows)) = sides
+    else {
+        return Ok(None);
+    };
     let on = join.on.or(scope.join_on[0]);
     let Some((keys, key_count)) =
         hash_join_keys(scope, on, where_clause, probe_table, build_table)?
     else {
         return Ok(None);
     };
-    const MAX_HASH_ENTRIES: usize = 1 << 15;
-    let build_capacity = if let Some(run) = scope.external_runs[build_table] {
-        usize::try_from(run.rows()).map_err(|_| arena_full())?
-    } else {
-        scope.derived[build_table].map_or_else(
-            || storage.planning_row_estimate(scope.slots[build_table]) as usize,
-            <[&[u8]]>::len,
-        )
-    };
-    if build_capacity > MAX_HASH_ENTRIES {
-        return Ok(None);
-    }
+    let build_capacity = rows;
     // Empty builds still need buckets for NULL-preserving probes. Schema-only
     // EXPLAIN scopes also have no materialized rows; they select the same
     // representation without executing a derived query for planning.
@@ -6075,7 +6128,8 @@ pub(crate) fn select_hash_join_plan<'a>(
         key_count,
         key_collations,
         on,
-        preserves_probe_rows: matches!(join.kind, JoinKind::Left),
+        preserves_probe_rows,
+        preserves_build_rows,
         build_capacity,
     }))
 }
@@ -6776,6 +6830,12 @@ fn scan_source_mode<'a>(
     /// the planner's estimate; a build side larger than that estimate (rows
     /// spilled to object storage are estimated, not counted) grows the table
     /// in the statement arena instead of changing the execution strategy.
+    ///
+    /// A plan that preserves build rows keeps every build row, including
+    /// those with a NULL key (kept out of the buckets, so nothing reaches
+    /// them), with one match flag each. A probe row's candidate sets its flag
+    /// once the whole join condition holds; after the probe, the unflagged
+    /// rows return with the probe side NULL, in the build source's row order.
     #[allow(clippy::too_many_arguments)]
     fn execute_hash_join_plan<'a>(
         storage: &'a Storage,
@@ -6800,397 +6860,235 @@ fn scan_source_mode<'a>(
         let nkeys = plan.key_count;
         let key_collations = plan.key_collations;
         let on = plan.on;
+        let keep_build = plan.preserves_build_rows;
         let build_slot = scope.slots[build_t];
         let build_def = scope.defs.get(build_t).expect("resolved");
         let build_derived_rows = scope.derived[build_t];
         let build_external_run = scope.external_runs[build_t];
         let build_count = plan.build_capacity;
-        let completed = (|| -> Result<bool, SqlError> {
-            let mut buckets_len = (build_count * 2).next_power_of_two().max(16);
-            let mut entries = arena
-                .alloc_slice_with(build_count, |_| EMPTY_HASH_ENTRY)
-                .map_err(|_| arena_full())?;
-            let mut next = arena
-                .alloc_slice_with(build_count, |_| 0u32)
-                .map_err(|_| arena_full())?;
-            let mut buckets = arena
-                .alloc_slice_with(buckets_len, |_| u32::MAX)
-                .map_err(|_| arena_full())?;
-            let mut build_schema = [ColType::Bool; MAX_COLUMNS];
-            for (ctype, column) in build_schema
-                .iter_mut()
-                .zip(&build_def.columns[..scope.row_width(build_t)])
-            {
-                *ctype = column.ctype;
-            }
-            let build_schema = &build_schema[..scope.row_width(build_t)];
-            let hash_cols: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-            let mut key_vals = [Datum::Null; 8];
-            let mut n = 0usize;
-            // Doubles the entries and rehashes them into twice as many
-            // buckets. Chains keep their order: later rows first.
-            macro_rules! grow_build {
-                () => {{
-                    if n == entries.len() {
-                        let grown = entries.len().checked_mul(2).ok_or_else(arena_full)?;
-                        let old_entries = &*entries;
-                        entries = arena
-                            .alloc_slice_with(grown, |index| {
-                                old_entries.get(index).copied().unwrap_or(EMPTY_HASH_ENTRY)
-                            })
-                            .map_err(|_| arena_full())?;
-                        next = arena
-                            .alloc_slice_with(grown, |_| 0u32)
-                            .map_err(|_| arena_full())?;
-                        buckets_len = (grown * 2).next_power_of_two().max(16);
-                        buckets = arena
-                            .alloc_slice_with(buckets_len, |_| u32::MAX)
-                            .map_err(|_| arena_full())?;
-                        for index in 0..n {
+        let mut buckets_len = (build_count * 2).next_power_of_two().max(16);
+        let mut entries = arena
+            .alloc_slice_with(build_count, |_| EMPTY_HASH_ENTRY)
+            .map_err(|_| arena_full())?;
+        let mut next = arena
+            .alloc_slice_with(build_count, |_| 0u32)
+            .map_err(|_| arena_full())?;
+        let mut buckets = arena
+            .alloc_slice_with(buckets_len, |_| u32::MAX)
+            .map_err(|_| arena_full())?;
+        let mut build_schema = [ColType::Bool; MAX_COLUMNS];
+        for (ctype, column) in build_schema
+            .iter_mut()
+            .zip(&build_def.columns[..scope.row_width(build_t)])
+        {
+            *ctype = column.ctype;
+        }
+        let build_schema = &build_schema[..scope.row_width(build_t)];
+        let hash_cols: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+        let mut n = 0usize;
+        // Adds one build row. A NULL key never matches: such a row is kept,
+        // unlinked, only when unmatched build rows are returned.
+        let mut insert =
+            |rowid: Option<u64>, row: BoundRow<'a>, values: &[Datum<'a>]| -> Result<(), SqlError> {
+                let mut key_vals = [Datum::Null; 8];
+                let mut keyed = true;
+                for i in 0..nkeys {
+                    key_vals[i] = values[keys[i].1];
+                    if key_vals[i].is_null() {
+                        keyed = false;
+                        break;
+                    }
+                }
+                if !keyed && !keep_build {
+                    return Ok(());
+                }
+                if n == entries.len() {
+                    // Double the entries and rehash them into twice as many
+                    // buckets. Chains keep their order: later rows first.
+                    let grown = entries.len().checked_mul(2).ok_or_else(arena_full)?;
+                    let old_entries = &*entries;
+                    entries = arena
+                        .alloc_slice_with(grown, |index| {
+                            old_entries.get(index).copied().unwrap_or(EMPTY_HASH_ENTRY)
+                        })
+                        .map_err(|_| arena_full())?;
+                    next = arena
+                        .alloc_slice_with(grown, |_| u32::MAX)
+                        .map_err(|_| arena_full())?;
+                    buckets_len = (grown * 2).next_power_of_two().max(16);
+                    buckets = arena
+                        .alloc_slice_with(buckets_len, |_| u32::MAX)
+                        .map_err(|_| arena_full())?;
+                    for index in 0..n {
+                        if entries[index].keyed {
                             let bucket = (entries[index].hash as usize) & (buckets_len - 1);
                             next[index] = buckets[bucket];
                             buckets[bucket] = index as u32;
                         }
                     }
-                }};
-            }
-            macro_rules! insert_build {
-                ($rowid:expr, $row:expr, $values:expr) => {{
-                    let values = $values;
-                    let mut any_null = false;
-                    for i in 0..nkeys {
-                        key_vals[i] = values[keys[i].1];
-                        if key_vals[i].is_null() {
-                            any_null = true;
-                            break;
-                        }
-                    }
-                    if !any_null {
-                        grow_build!();
-                        let hash = hash_key_collated_catalog(
-                            storage,
-                            txid,
-                            &key_vals[..nkeys],
-                            &hash_cols[..nkeys],
-                            &key_collations[..nkeys],
-                        )?;
-                        let bucket = (hash as usize) & (buckets_len - 1);
-                        entries[n] = HashEntry {
-                            hash,
-                            rowid: $rowid,
-                            row: $row,
-                        };
-                        next[n] = buckets[bucket];
-                        buckets[bucket] = n as u32;
-                        n += 1;
-                    }
-                }};
-            }
-            macro_rules! insert_derived {
-                ($bytes:expr) => {{
-                    let bytes = $bytes;
-                    let mut values = [Datum::Null; MAX_COLUMNS];
-                    for (column, value) in values.iter_mut().enumerate().take(build_schema.len()) {
-                        *value =
-                            crate::sql::exec::decode_projected_col_record(bytes, column, arena)?;
-                    }
-                    insert_build!(
-                        None,
-                        BoundRow::Encoded(bytes),
-                        &values[..build_schema.len()]
-                    );
-                }};
-            }
-            if let Some(run) = build_external_run {
-                let mut reader = storage.external_run_reader()?;
-                storage
-                    .with_block_store(|blocks| reader.start(blocks, run))
-                    .expect("external run has a block store")?;
-                while let Some(bytes) = reader.row() {
-                    let bytes = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
-                    insert_derived!(bytes);
-                    storage
-                        .with_block_store(|blocks| reader.advance(blocks))
-                        .expect("external run has a block store")?;
                 }
-            } else if let Some(rows) = build_derived_rows {
-                for &bytes in rows {
-                    insert_derived!(bytes);
-                }
-            } else if let Some(demand) = pax_demand.selected_mask(build_t)
-                && let Some(scan) = storage.immutable_row_scan_in(build_slot, arena)?
-            {
-                storage.record_relation_scan(
-                    txid,
-                    build_slot,
-                    None,
-                    0,
-                    crate::sql::datetime::now_micros(),
-                )?;
-                scan.for_each_spilled_row_batch(arena, false, Some(demand), &mut |rows| {
-                    for spilled in rows {
-                        storage.record_relation_tuple_read(txid, build_slot, None)?;
-                        // Rows not yet in column blocks arrive encoded.
-                        match spilled.representation {
-                            crate::storage::SpilledRowRepresentation::Values(values) => {
-                                insert_build!(
-                                    Some(spilled.rowid),
-                                    BoundRow::Values(values),
-                                    values
-                                );
-                            }
-                            crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
-                                let mut decoded = [Datum::Null; MAX_COLUMNS];
-                                rowenc::decode(bytes, build_schema, &mut decoded)?;
-                                insert_build!(
-                                    Some(spilled.rowid),
-                                    BoundRow::Encoded(bytes),
-                                    &decoded[..build_schema.len()]
-                                );
-                            }
-                        }
-                    }
-                    Ok(ControlFlow::Continue(()))
-                })?;
-            } else {
-                storage.record_relation_scan(
-                    txid,
-                    build_slot,
-                    None,
-                    0,
-                    crate::sql::datetime::now_micros(),
-                )?;
-                storage.for_each_row_state(build_slot, &mut |rowid, state| {
-                    let Some(home) = storage.visible_row_home(build_slot, rowid, state, txid)?
-                    else {
-                        return Ok(ControlFlow::Continue(()));
-                    };
-                    storage.record_relation_tuple_read(txid, build_slot, None)?;
-                    let bytes = storage.row_bytes(build_slot, rowid, home, arena)?;
-                    let mut buffer = [Datum::Null; MAX_COLUMNS];
-                    rowenc::decode(bytes, build_schema, &mut buffer)?;
-                    let mut any_null = false;
-                    for i in 0..nkeys {
-                        key_vals[i] = buffer[keys[i].1];
-                        if key_vals[i].is_null() {
-                            any_null = true;
-                            break;
-                        }
-                    }
-                    if any_null {
-                        return Ok(ControlFlow::Continue(()));
-                    }
-                    grow_build!();
-                    let hash = hash_key_collated_catalog(
+                let hash = if keyed {
+                    hash_key_collated_catalog(
                         storage,
                         txid,
                         &key_vals[..nkeys],
                         &hash_cols[..nkeys],
                         &key_collations[..nkeys],
-                    )?;
+                    )?
+                } else {
+                    0
+                };
+                entries[n] = HashEntry {
+                    hash,
+                    rowid,
+                    row,
+                    keyed,
+                    matched: false,
+                };
+                if keyed {
                     let bucket = (hash as usize) & (buckets_len - 1);
-                    entries[n] = HashEntry {
-                        hash,
-                        rowid: Some(rowid),
-                        row: BoundRow::Encoded(bytes),
-                    };
                     next[n] = buckets[bucket];
                     buckets[bucket] = n as u32;
-                    n += 1;
-                    Ok(ControlFlow::Continue(()))
-                })?;
-            }
-
-            // Probe: scan the outer side once, resolving each row's key
-            // against the build table. The outer side is iterated in the same
-            // sorted order the nested loop uses (rowid/offset), so un-ORDER-BY'd
-            // output matches byte-for-byte. Per-row decode and leaf-eval scratch
-            // recycle; the build table (allocated above the mark) survives.
-            let probe_slot = scope.slots[probe_t];
-            let probe_def = scope.defs.get(probe_t).expect("resolved");
-            let mut probe_schema = [ColType::Bool; MAX_COLUMNS];
-            for (ctype, column) in probe_schema
-                .iter_mut()
-                .zip(&probe_def.columns[..scope.row_width(probe_t)])
-            {
-                *ctype = column.ctype;
-            }
-            let probe_schema = &probe_schema[..scope.row_width(probe_t)];
-            if scope.derived[probe_t].is_none()
-                && let Some(demand) = pax_demand.selected_mask(probe_t)
-                && let Some(scan) = storage.immutable_row_scan_in(probe_slot, arena)?
-            {
-                storage.record_relation_scan(
-                    txid,
-                    probe_slot,
-                    None,
-                    0,
-                    crate::sql::datetime::now_micros(),
-                )?;
-                let mut stopped = false;
-                scan.for_each_spilled_row_batch(arena, recycle_rows, Some(demand), &mut |rows| {
-                    for spilled in rows {
-                        check_timeout()?;
-                        storage.record_relation_tuple_read(txid, probe_slot, None)?;
-                        // Rows not yet in column blocks arrive encoded.
-                        let values = match spilled.representation {
-                            crate::storage::SpilledRowRepresentation::Values(values) => values,
-                            crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
-                                let mut decoded = [Datum::Null; MAX_COLUMNS];
-                                rowenc::decode(bytes, probe_schema, &mut decoded)?;
-                                &*arena
-                                    .alloc_slice_copy(&decoded[..probe_schema.len()])
-                                    .map_err(|_| arena_full())?
-                            }
-                        };
-                        let mut any_null = false;
-                        for i in 0..nkeys {
-                            key_vals[i] = values[keys[i].0];
-                            if key_vals[i].is_null() {
-                                any_null = true;
-                                break;
-                            }
-                        }
-                        let mut matched_any = false;
-                        if !any_null {
-                            let hash = hash_key_collated_catalog(
-                                storage,
-                                txid,
-                                &key_vals[..nkeys],
-                                &hash_cols[..nkeys],
-                                &key_collations[..nkeys],
-                            )?;
-                            let mut index = buckets[(hash as usize) & (buckets_len - 1)];
-                            while index != u32::MAX {
-                                let entry = &entries[index as usize];
-                                if entry.hash == hash {
-                                    let mut build_values = [Datum::Null; MAX_COLUMNS];
-                                    decode_hash_source(
-                                        entry.row,
-                                        build_schema,
-                                        build_derived_rows.is_some(),
-                                        arena,
-                                        &mut build_values,
-                                    )?;
-                                    let mut keys_match = true;
-                                    for key in 0..nkeys {
-                                        if !compare_datums_collated(
-                                            storage,
-                                            txid,
-                                            key_collations[key],
-                                            &build_values[keys[key].1],
-                                            &key_vals[key],
-                                        )?
-                                        .is_eq()
-                                        {
-                                            keys_match = false;
-                                            break;
-                                        }
-                                    }
-                                    if keys_match {
-                                        let mut bound = [None::<BoundRow>; 2];
-                                        let mut rowids = [None; 2];
-                                        bound[probe_t] = Some(BoundRow::Values(values));
-                                        rowids[probe_t] = Some(spilled.rowid);
-                                        bound[build_t] = Some(entry.row);
-                                        rowids[build_t] = entry.rowid;
-                                        let row = assemble(
-                                            storage,
-                                            txid,
-                                            scope,
-                                            &bound,
-                                            &rowids,
-                                            order,
-                                            2,
-                                            decode_buffers,
-                                            arena,
-                                        )?;
-                                        if let Some(condition) = on {
-                                            let chained = Chained { inner: &row, outer };
-                                            if !matches!(
-                                                eval_full(
-                                                    condition, arena, params, &chained, hooks
-                                                )?,
-                                                Datum::Bool(true)
-                                            ) {
-                                                index = next[index as usize];
-                                                continue;
-                                            }
-                                        }
-                                        matched_any = true;
-                                        if let Some(predicate) = where_clause {
-                                            let chained = Chained { inner: &row, outer };
-                                            if !where_passes(
-                                                predicate, arena, params, &chained, hooks,
-                                            )? {
-                                                index = next[index as usize];
-                                                continue;
-                                            }
-                                        }
-                                        if !f(&row)? {
-                                            stopped = true;
-                                            return Ok(ControlFlow::Break(()));
-                                        }
-                                    }
-                                }
-                                index = next[index as usize];
-                            }
-                        }
-                        if !matched_any && plan.preserves_probe_rows {
-                            let mut bound = [None::<BoundRow>; 2];
-                            let mut rowids = [None; 2];
-                            bound[probe_t] = Some(BoundRow::Values(values));
-                            rowids[probe_t] = Some(spilled.rowid);
-                            let row = assemble(
-                                storage,
-                                txid,
-                                scope,
-                                &bound,
-                                &rowids,
-                                order,
-                                2,
-                                decode_buffers,
-                                arena,
-                            )?;
-                            let passes = if let Some(predicate) = where_clause {
-                                let chained = Chained { inner: &row, outer };
-                                where_passes(predicate, arena, params, &chained, hooks)?
-                            } else {
-                                true
-                            };
-                            if passes && !f(&row)? {
-                                stopped = true;
-                                return Ok(ControlFlow::Break(()));
-                            }
-                        }
-                    }
-                    Ok(ControlFlow::Continue(()))
-                })?;
-                if stopped {
-                    return Ok(true);
                 }
-                return Ok(true);
-            }
-            let mut visit_probe = |rowid: Option<u64>, bytes: &'a [u8]| -> Result<bool, SqlError> {
-                check_timeout()?;
-                let mut buffer = [Datum::Null; MAX_COLUMNS];
+                n += 1;
+                Ok(())
+            };
+        if let Some(run) = build_external_run {
+            let mut reader = storage.external_run_reader()?;
+            storage
+                .with_block_store(|blocks| reader.start(blocks, run))
+                .expect("external run has a block store")?;
+            while let Some(bytes) = reader.row() {
+                let bytes = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
+                let mut values = [Datum::Null; MAX_COLUMNS];
                 decode_hash_source(
                     BoundRow::Encoded(bytes),
-                    probe_schema,
-                    scope.derived[probe_t].is_some(),
+                    build_schema,
+                    true,
                     arena,
-                    &mut buffer,
+                    &mut values,
                 )?;
-                let mut any_null = false;
+                insert(
+                    None,
+                    BoundRow::Encoded(bytes),
+                    &values[..build_schema.len()],
+                )?;
+                storage
+                    .with_block_store(|blocks| reader.advance(blocks))
+                    .expect("external run has a block store")?;
+            }
+        } else if let Some(rows) = build_derived_rows {
+            for &bytes in rows {
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                decode_hash_source(
+                    BoundRow::Encoded(bytes),
+                    build_schema,
+                    true,
+                    arena,
+                    &mut values,
+                )?;
+                insert(
+                    None,
+                    BoundRow::Encoded(bytes),
+                    &values[..build_schema.len()],
+                )?;
+            }
+        } else if let Some(demand) = pax_demand.selected_mask(build_t)
+            && let Some(scan) = storage.immutable_row_scan_in(build_slot, arena)?
+        {
+            storage.record_relation_scan(
+                txid,
+                build_slot,
+                None,
+                0,
+                crate::sql::datetime::now_micros(),
+            )?;
+            scan.for_each_spilled_row_batch(arena, false, Some(demand), &mut |rows| {
+                for spilled in rows {
+                    storage.record_relation_tuple_read(txid, build_slot, None)?;
+                    // Rows not yet in column blocks arrive encoded.
+                    match spilled.representation {
+                        crate::storage::SpilledRowRepresentation::Values(values) => {
+                            insert(Some(spilled.rowid), BoundRow::Values(values), values)?;
+                        }
+                        crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
+                            let mut decoded = [Datum::Null; MAX_COLUMNS];
+                            rowenc::decode(bytes, build_schema, &mut decoded)?;
+                            insert(
+                                Some(spilled.rowid),
+                                BoundRow::Encoded(bytes),
+                                &decoded[..build_schema.len()],
+                            )?;
+                        }
+                    }
+                }
+                Ok(ControlFlow::Continue(()))
+            })?;
+        } else {
+            storage.record_relation_scan(
+                txid,
+                build_slot,
+                None,
+                0,
+                crate::sql::datetime::now_micros(),
+            )?;
+            storage.for_each_row_state(build_slot, &mut |rowid, state| {
+                let Some(home) = storage.visible_row_home(build_slot, rowid, state, txid)? else {
+                    return Ok(ControlFlow::Continue(()));
+                };
+                storage.record_relation_tuple_read(txid, build_slot, None)?;
+                let bytes = storage.row_bytes(build_slot, rowid, home, arena)?;
+                let mut buffer = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, build_schema, &mut buffer)?;
+                insert(
+                    Some(rowid),
+                    BoundRow::Encoded(bytes),
+                    &buffer[..build_schema.len()],
+                )?;
+                Ok(ControlFlow::Continue(()))
+            })?;
+        }
+        let entries = &mut entries[..n];
+        let next = &*next;
+        let buckets = &*buckets;
+
+        // Probe: each outer row resolves its key against the build table
+        // and returns its joined rows, or its NULL-extended row when it is
+        // preserved and no candidate passed the join condition. Per-row
+        // decode and evaluation scratch recycle; the build table (allocated
+        // above the mark) survives. `Ok(false)` stops the join.
+        let probe_def = scope.defs.get(probe_t).expect("resolved");
+        let mut probe_schema = [ColType::Bool; MAX_COLUMNS];
+        for (ctype, column) in probe_schema
+            .iter_mut()
+            .zip(&probe_def.columns[..scope.row_width(probe_t)])
+        {
+            *ctype = column.ctype;
+        }
+        let probe_schema = &probe_schema[..scope.row_width(probe_t)];
+        let probe_derived = scope.derived[probe_t].is_some();
+        let mut visit_probe =
+            |rowid: Option<u64>, probe_row: BoundRow<'a>| -> Result<bool, SqlError> {
+                check_timeout()?;
+                let mut probe_values = [Datum::Null; MAX_COLUMNS];
+                decode_hash_source(
+                    probe_row,
+                    probe_schema,
+                    probe_derived,
+                    arena,
+                    &mut probe_values,
+                )?;
+                let mut key_vals = [Datum::Null; 8];
+                let mut keyed = true;
                 for i in 0..nkeys {
-                    key_vals[i] = buffer[keys[i].0];
+                    key_vals[i] = probe_values[keys[i].0];
                     if key_vals[i].is_null() {
-                        any_null = true;
+                        keyed = false;
                         break;
                     }
                 }
                 let mut matched_any = false;
-                if !any_null {
+                if keyed {
                     let hash = hash_key_collated_catalog(
                         storage,
                         txid,
@@ -7198,183 +7096,280 @@ fn scan_source_mode<'a>(
                         &hash_cols[..nkeys],
                         &key_collations[..nkeys],
                     )?;
-                    let mut idx = buckets[(hash as usize) & (buckets_len - 1)];
-                    while idx != u32::MAX {
-                        let entry = &entries[idx as usize];
-                        if entry.hash == hash {
-                            let mut build_buf = [Datum::Null; MAX_COLUMNS];
-                            decode_hash_source(
-                                entry.row,
-                                build_schema,
-                                build_derived_rows.is_some(),
-                                arena,
-                                &mut build_buf,
-                            )?;
-                            let mut matched = true;
-                            for i in 0..nkeys {
-                                if !compare_datums_collated(
-                                    storage,
-                                    txid,
-                                    key_collations[i],
-                                    &build_buf[keys[i].1],
-                                    &key_vals[i],
-                                )?
-                                .is_eq()
-                                {
-                                    matched = false;
-                                    break;
-                                }
-                            }
-                            if matched {
-                                let bound = &mut [None::<BoundRow>, None];
-                                let bound_rowids = &mut [None, None];
-                                bound[probe_t] = Some(BoundRow::Encoded(bytes));
-                                bound_rowids[probe_t] = rowid;
-                                bound[build_t] = Some(entry.row);
-                                bound_rowids[build_t] = entry.rowid;
-                                let row = assemble(
-                                    storage,
-                                    txid,
-                                    scope,
-                                    bound,
-                                    bound_rowids,
-                                    order,
-                                    2,
-                                    decode_buffers,
-                                    arena,
-                                )?;
-                                if let Some(on) = on {
-                                    let chained = Chained { inner: &row, outer };
-                                    match eval_full(on, arena, params, &chained, hooks)? {
-                                        Datum::Bool(true) => {}
-                                        Datum::Bool(false) | Datum::Null => {
-                                            idx = next[idx as usize];
-                                            continue;
-                                        }
-                                        _ => {
-                                            return Err(sql_err!(
-                                                sqlstate::DATATYPE_MISMATCH,
-                                                "argument of JOIN/ON must be type boolean"
-                                            ));
-                                        }
-                                    }
-                                }
-                                matched_any = true;
-                                if let Some(w) = where_clause {
-                                    let chained = Chained { inner: &row, outer };
-                                    if !where_passes(w, arena, params, &chained, hooks)? {
-                                        idx = next[idx as usize];
-                                        continue;
-                                    }
-                                }
-                                if !f(&row)? {
-                                    return Ok(false);
-                                }
+                    let mut index = buckets[(hash as usize) & (buckets_len - 1)];
+                    while index != u32::MAX {
+                        let candidate = index as usize;
+                        index = next[candidate];
+                        let entry = entries[candidate];
+                        if entry.hash != hash {
+                            continue;
+                        }
+                        // A bucket holds colliding hashes too: compare the keys.
+                        let mut build_values = [Datum::Null; MAX_COLUMNS];
+                        decode_hash_source(
+                            entry.row,
+                            build_schema,
+                            build_derived_rows.is_some(),
+                            arena,
+                            &mut build_values,
+                        )?;
+                        let mut keys_match = true;
+                        for key in 0..nkeys {
+                            if !compare_datums_collated(
+                                storage,
+                                txid,
+                                key_collations[key],
+                                &build_values[keys[key].1],
+                                &key_vals[key],
+                            )?
+                            .is_eq()
+                            {
+                                keys_match = false;
+                                break;
                             }
                         }
-                        idx = next[idx as usize];
+                        if !keys_match {
+                            continue;
+                        }
+                        let mut bound = [None::<BoundRow>; 2];
+                        let mut rowids = [None; 2];
+                        bound[probe_t] = Some(probe_row);
+                        rowids[probe_t] = rowid;
+                        bound[build_t] = Some(entry.row);
+                        rowids[build_t] = entry.rowid;
+                        let row = assemble(
+                            storage,
+                            txid,
+                            scope,
+                            &bound,
+                            &rowids,
+                            order,
+                            2,
+                            decode_buffers,
+                            arena,
+                        )?;
+                        let chained = Chained { inner: &row, outer };
+                        if let Some(condition) = on
+                            && !join_condition_holds(condition, arena, params, &chained, hooks)?
+                        {
+                            continue;
+                        }
+                        matched_any = true;
+                        entries[candidate].matched = true;
+                        if let Some(predicate) = where_clause
+                            && !where_passes(predicate, arena, params, &chained, hooks)?
+                        {
+                            continue;
+                        }
+                        if !f(&row)? {
+                            return Ok(false);
+                        }
                     }
                 }
-                // LEFT JOIN: no ON-passing match (NULL key, or all candidates
-                // rejected) → preserve the outer row with NULLs for the inner.
                 if !matched_any && plan.preserves_probe_rows {
-                    let bound = &mut [None::<BoundRow>, None];
-                    let bound_rowids = &mut [None, None];
-                    bound[probe_t] = Some(BoundRow::Encoded(bytes));
-                    bound_rowids[probe_t] = rowid;
+                    let mut bound = [None::<BoundRow>; 2];
+                    let mut rowids = [None; 2];
+                    bound[probe_t] = Some(probe_row);
+                    rowids[probe_t] = rowid;
                     let row = assemble(
                         storage,
                         txid,
                         scope,
-                        bound,
-                        bound_rowids,
+                        &bound,
+                        &rowids,
                         order,
                         2,
                         decode_buffers,
                         arena,
                     )?;
-                    if let Some(w) = where_clause {
+                    if let Some(predicate) = where_clause {
                         let chained = Chained { inner: &row, outer };
-                        if !where_passes(w, arena, params, &chained, hooks)? {
+                        if !where_passes(predicate, arena, params, &chained, hooks)? {
                             return Ok(true);
                         }
                     }
-                    if !f(&row)? {
-                        return Ok(false);
-                    }
+                    return f(&row);
                 }
                 Ok(true)
             };
-            if let Some(run) = scope.external_runs[probe_t] {
-                let mut reader = storage.external_run_reader()?;
-                storage
-                    .with_block_store(|blocks| reader.start(blocks, run))
-                    .expect("external run has a block store")?;
-                while let Some(bytes) = reader.row() {
-                    let keep = recycled(arena, recycle_rows, None, || {
-                        // The reader replaces its buffer on advance; any value
-                        // retained by the callback must borrow statement storage.
-                        let owned = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
-                        visit_probe(None, owned)
-                    })?;
-                    if !keep {
-                        break;
-                    }
-                    storage
-                        .with_block_store(|blocks| reader.advance(blocks))
-                        .expect("external run has a block store")?;
-                }
-            } else if let Some(rows) = scope.derived[probe_t] {
-                for &bytes in rows {
-                    if !recycled(arena, recycle_rows, None, || visit_probe(None, bytes))? {
-                        break;
-                    }
-                }
-            } else {
-                // Collect and sort the probe table's visible rows to match the
-                // nested loop's output order.
-                storage.record_relation_scan(
-                    txid,
-                    probe_slot,
-                    None,
-                    0,
-                    crate::sql::datetime::now_micros(),
-                )?;
-                let probe_count = storage.visible_row_count(probe_slot, txid)?;
-                let probe_snapshot = storage.table_row_snapshot(probe_slot, Some(arena))?;
-                let probe_ordered = arena
-                    .alloc_slice_with(probe_count.max(1), |_| {
-                        None::<crate::storage::OrderedRowSnapshot>
-                    })
-                    .map_err(|_| arena_full())?;
-                let mut probe_fill = 0usize;
-                storage.for_each_row_state(probe_slot, &mut |rowid, state| {
-                    if let Some(home) = storage.visible_row_home(probe_slot, rowid, state, txid)? {
-                        probe_ordered[probe_fill] = Some(probe_snapshot.retain(rowid, &home)?);
-                        probe_fill += 1;
-                    }
-                    Ok(ControlFlow::Continue(()))
-                })?;
-                probe_ordered[..probe_fill].sort_unstable_by_key(|row| {
-                    row.expect("row snapshots are initialized").sort_key()
-                });
-
-                for row in probe_ordered[..probe_fill].iter().copied().flatten() {
-                    let rowid = row.rowid();
-                    let home = row.read()?;
+        let probe_slot = scope.slots[probe_t];
+        let probed_all = if !probe_derived
+            && let Some(demand) = pax_demand.selected_mask(probe_t)
+            && let Some(scan) = storage.immutable_row_scan_in(probe_slot, arena)?
+        {
+            storage.record_relation_scan(
+                txid,
+                probe_slot,
+                None,
+                0,
+                crate::sql::datetime::now_micros(),
+            )?;
+            let mut stopped = false;
+            scan.for_each_spilled_row_batch(arena, recycle_rows, Some(demand), &mut |rows| {
+                for spilled in rows {
                     storage.record_relation_tuple_read(txid, probe_slot, None)?;
-                    if !recycled(arena, recycle_rows, None, || {
-                        let bytes = storage.row_bytes(probe_slot, rowid, home, arena)?;
-                        visit_probe(Some(rowid), bytes)
-                    })? {
-                        break;
+                    // Rows not yet in column blocks arrive encoded.
+                    let values = match spilled.representation {
+                        crate::storage::SpilledRowRepresentation::Values(values) => values,
+                        crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
+                            let mut decoded = [Datum::Null; MAX_COLUMNS];
+                            rowenc::decode(bytes, probe_schema, &mut decoded)?;
+                            &*arena
+                                .alloc_slice_copy(&decoded[..probe_schema.len()])
+                                .map_err(|_| arena_full())?
+                        }
+                    };
+                    if !visit_probe(Some(spilled.rowid), BoundRow::Values(values))? {
+                        stopped = true;
+                        return Ok(ControlFlow::Break(()));
                     }
+                }
+                Ok(ControlFlow::Continue(()))
+            })?;
+            !stopped
+        } else if let Some(run) = scope.external_runs[probe_t] {
+            let mut reader = storage.external_run_reader()?;
+            storage
+                .with_block_store(|blocks| reader.start(blocks, run))
+                .expect("external run has a block store")?;
+            let mut keep = true;
+            while let Some(bytes) = reader.row() {
+                keep = recycled(arena, recycle_rows, None, || {
+                    // The reader replaces its buffer on advance; any value
+                    // retained by the callback must borrow statement storage.
+                    let owned = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
+                    visit_probe(None, BoundRow::Encoded(owned))
+                })?;
+                if !keep {
+                    break;
+                }
+                storage
+                    .with_block_store(|blocks| reader.advance(blocks))
+                    .expect("external run has a block store")?;
+            }
+            keep
+        } else if let Some(rows) = scope.derived[probe_t] {
+            let mut keep = true;
+            for &bytes in rows {
+                keep = recycled(arena, recycle_rows, None, || {
+                    visit_probe(None, BoundRow::Encoded(bytes))
+                })?;
+                if !keep {
+                    break;
                 }
             }
-            Ok(true)
-        })()?;
-        let _ = completed;
+            keep
+        } else {
+            // Collect and sort the probe table's visible rows to match the
+            // nested loop's output order.
+            storage.record_relation_scan(
+                txid,
+                probe_slot,
+                None,
+                0,
+                crate::sql::datetime::now_micros(),
+            )?;
+            let probe_count = storage.visible_row_count(probe_slot, txid)?;
+            let probe_snapshot = storage.table_row_snapshot(probe_slot, Some(arena))?;
+            let probe_ordered = arena
+                .alloc_slice_with(probe_count.max(1), |_| {
+                    None::<crate::storage::OrderedRowSnapshot>
+                })
+                .map_err(|_| arena_full())?;
+            let mut probe_fill = 0usize;
+            storage.for_each_row_state(probe_slot, &mut |rowid, state| {
+                if let Some(home) = storage.visible_row_home(probe_slot, rowid, state, txid)? {
+                    probe_ordered[probe_fill] = Some(probe_snapshot.retain(rowid, &home)?);
+                    probe_fill += 1;
+                }
+                Ok(ControlFlow::Continue(()))
+            })?;
+            probe_ordered[..probe_fill]
+                .sort_unstable_by_key(|row| row.expect("row snapshots are initialized").sort_key());
+            let mut keep = true;
+            for row in probe_ordered[..probe_fill].iter().copied().flatten() {
+                let rowid = row.rowid();
+                let home = row.read()?;
+                storage.record_relation_tuple_read(txid, probe_slot, None)?;
+                keep = recycled(arena, recycle_rows, None, || {
+                    let bytes = storage.row_bytes(probe_slot, rowid, home, arena)?;
+                    visit_probe(Some(rowid), BoundRow::Encoded(bytes))
+                })?;
+                if !keep {
+                    break;
+                }
+            }
+            keep
+        };
+        if !probed_all || !keep_build {
+            return Ok(());
+        }
+        // The build rows no probe row matched, in their source's row order
+        // (the order a nested loop returns them in), with the probe side NULL.
+        let unmatched_count = entries.iter().filter(|entry| !entry.matched).count();
+        let unmatched = arena
+            .alloc_slice_with(unmatched_count, |_| 0u32)
+            .map_err(|_| arena_full())?;
+        for (slot, index) in unmatched.iter_mut().zip(
+            entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| !entry.matched)
+                .map(|(index, _)| index as u32),
+        ) {
+            *slot = index;
+        }
+        unmatched.sort_unstable_by_key(|&index| (entries[index as usize].rowid, index));
+        for &index in unmatched.iter() {
+            let entry = entries[index as usize];
+            let keep = recycled(arena, recycle_rows, None, || {
+                check_timeout()?;
+                let mut bound = [None::<BoundRow>; 2];
+                let mut rowids = [None; 2];
+                bound[build_t] = Some(entry.row);
+                rowids[build_t] = entry.rowid;
+                let row = assemble(
+                    storage,
+                    txid,
+                    scope,
+                    &bound,
+                    &rowids,
+                    order,
+                    2,
+                    decode_buffers,
+                    arena,
+                )?;
+                if let Some(predicate) = where_clause {
+                    let chained = Chained { inner: &row, outer };
+                    if !where_passes(predicate, arena, params, &chained, hooks)? {
+                        return Ok(true);
+                    }
+                }
+                f(&row)
+            })?;
+            if !keep {
+                break;
+            }
+        }
         Ok(())
+    }
+
+    /// A join condition's verdict for one candidate pair: only TRUE joins.
+    fn join_condition_holds<'a>(
+        condition: &Expr<'a>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        row: &impl ColumnLookup<'a>,
+        hooks: &EvalHooks<'_, 'a>,
+    ) -> Result<bool, SqlError> {
+        match eval_full(condition, arena, params, row, hooks)? {
+            Datum::Bool(true) => Ok(true),
+            Datum::Bool(false) | Datum::Null => Ok(false),
+            _ => Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "argument of JOIN/ON must be type boolean"
+            )),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8277,69 +8272,6 @@ fn scan_source_mode<'a>(
         Ok(true)
     }
 
-    // For every RIGHT/FULL join level, one match flag per row of that
-    // level's table (arena-backed, so no post-init allocation). An unmatched
-    // row null-pads the tables to its left and still joins the tables to its
-    // right (post-passes below, shallowest level first — so a deeper level's
-    // flags also accumulate matches found during a shallower post-pass).
-    let matched = arena
-        .alloc_slice_with(scope.n, |_| None)
-        .map_err(|_| arena_full())?;
-    let external_match_map = storage.spill_attached()
-        && from
-            .joins
-            .iter()
-            .any(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full));
-    for (i, j) in from.joins.iter().enumerate() {
-        if !matches!(j.kind, JoinKind::Right | JoinKind::Full) {
-            continue;
-        }
-        if external_match_map {
-            continue;
-        }
-        let t = i + 1;
-        let n_rows = if let Some(run) = scope.external_runs[t] {
-            usize::try_from(run.rows()).map_err(|_| arena_full())?
-        } else if let Some(rows) = scope.derived[t] {
-            rows.len()
-        } else {
-            storage.visible_row_count(scope.slots[t], txid)?
-        };
-        let flags = arena
-            .alloc_slice_with(n_rows, |_| false)
-            .map_err(|_| arena_full())?;
-        let rowids = if scope.external_runs[t].is_none() && scope.derived[t].is_none() {
-            let rowids = arena
-                .alloc_slice_with(n_rows, |_| 0u64)
-                .map_err(|_| arena_full())?;
-            let mut fill = 0usize;
-            storage.for_each_row_state(scope.slots[t], &mut |rowid, state| {
-                if storage
-                    .visible_row_home(scope.slots[t], rowid, state, txid)?
-                    .is_some()
-                {
-                    let cell = rowids.get_mut(fill).ok_or_else(|| {
-                        sql_err!(sqlstate::INTERNAL_ERROR, "join row count changed")
-                    })?;
-                    *cell = rowid;
-                    fill += 1;
-                }
-                Ok(core::ops::ControlFlow::Continue(()))
-            })?;
-            if fill != n_rows {
-                return Err(sql_err!(sqlstate::INTERNAL_ERROR, "join row count changed"));
-            }
-            rowids.sort_unstable();
-            Some(&*rowids)
-        } else {
-            None
-        };
-        matched[t] = Some(JoinMatchFlags {
-            flags: core::cell::Cell::from_mut(flags).as_slice_of_cells(),
-            rowids,
-        });
-    }
-
     // Predicate pushdown (inner/cross joins only): assign each error-safe WHERE
     // conjunct to the join level at which all its tables are bound, so it can
     // prune the search early instead of being checked only after the full
@@ -8564,6 +8496,68 @@ fn scan_source_mode<'a>(
             f,
         )?;
         return Ok(());
+    }
+    // For every RIGHT/FULL join level, one match flag per row of that
+    // level's table (arena-backed, so no post-init allocation). An unmatched
+    // row null-pads the tables to its left and still joins the tables to its
+    // right (post-passes below, shallowest level first — so a deeper level's
+    // flags also accumulate matches found during a shallower post-pass).
+    let matched = arena
+        .alloc_slice_with(scope.n, |_| None)
+        .map_err(|_| arena_full())?;
+    let external_match_map = storage.spill_attached()
+        && from
+            .joins
+            .iter()
+            .any(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full));
+    for (i, j) in from.joins.iter().enumerate() {
+        if !matches!(j.kind, JoinKind::Right | JoinKind::Full) {
+            continue;
+        }
+        if external_match_map {
+            continue;
+        }
+        let t = i + 1;
+        let n_rows = if let Some(run) = scope.external_runs[t] {
+            usize::try_from(run.rows()).map_err(|_| arena_full())?
+        } else if let Some(rows) = scope.derived[t] {
+            rows.len()
+        } else {
+            storage.visible_row_count(scope.slots[t], txid)?
+        };
+        let flags = arena
+            .alloc_slice_with(n_rows, |_| false)
+            .map_err(|_| arena_full())?;
+        let rowids = if scope.external_runs[t].is_none() && scope.derived[t].is_none() {
+            let rowids = arena
+                .alloc_slice_with(n_rows, |_| 0u64)
+                .map_err(|_| arena_full())?;
+            let mut fill = 0usize;
+            storage.for_each_row_state(scope.slots[t], &mut |rowid, state| {
+                if storage
+                    .visible_row_home(scope.slots[t], rowid, state, txid)?
+                    .is_some()
+                {
+                    let cell = rowids.get_mut(fill).ok_or_else(|| {
+                        sql_err!(sqlstate::INTERNAL_ERROR, "join row count changed")
+                    })?;
+                    *cell = rowid;
+                    fill += 1;
+                }
+                Ok(core::ops::ControlFlow::Continue(()))
+            })?;
+            if fill != n_rows {
+                return Err(sql_err!(sqlstate::INTERNAL_ERROR, "join row count changed"));
+            }
+            rowids.sort_unstable();
+            Some(&*rowids)
+        } else {
+            None
+        };
+        matched[t] = Some(JoinMatchFlags {
+            flags: core::cell::Cell::from_mut(flags).as_slice_of_cells(),
+            rowids,
+        });
     }
     let mut match_run = None;
     let mut initial_match_sorter = if external_match_map {

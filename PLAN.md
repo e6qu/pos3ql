@@ -572,12 +572,10 @@ SQL/JSON result types) are reported when the statement would run. In a
 `SELECT`, an unknown relation, a modifier's unknown type and an output column
 written before the failing modifier are reported first, as PostgreSQL's
 analysis order finds them; in other statements the modifier error comes first.
-PL/pgSQL's parameters are placeholders until PL/pgSQL loads in a session, as
-in PostgreSQL, but `ALTER ROLE`, `ALTER DATABASE`, `ALTER SYSTEM` and a
-routine's `SET` clause still check a `plpgsql.*` value as the loaded
-parameter would (PostgreSQL stores a placeholder's value unchecked), and
-loading warns once for an invalid value that several transaction levels hold
-where PostgreSQL warns for each level.
+Loading PL/pgSQL inside a transaction warns once for an invalid
+`plpgsql.*` value that both the session and the transaction set (`SET
+plpgsql.extra_warnings = 'bad'; BEGIN; SET plpgsql.extra_warnings = 'bad';`
+then PL/pgSQL code); PostgreSQL warns for each level.
 Writes to catalog views other than `pg_settings`, and to system catalogs,
 fail with `42P01`. `MERGE` into a view whose every action has an `INSTEAD OF`
 trigger, directly or through views above it, fails with `0A000` (`MERGE into

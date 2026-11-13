@@ -3154,11 +3154,13 @@ fn adopt_placeholder(
 ) -> Result<(), crate::pg::wire::WireFull> {
     let placeholder = custom_bit(slot);
     let boot = GucValues::new();
-    let mut last: Option<StackStr<CUSTOM_PARAMETER_VALUE_BYTES>> = None;
-    // Whether a level's value is now the parameter's own setting.
+    // Whether a level's value is now the parameter's own setting. A failure
+    // is reported only for a level PostgreSQL keeps a value of its own for:
+    // the reset value, the session value and each nesting level that set it.
     let mut adopt = |values: &mut GucValues,
                      base: &GucValues,
-                     set: bool|
+                     set: bool,
+                     warn: bool|
      -> Result<bool, crate::pg::wire::WireFull> {
         let raw = values.custom[slot];
         values.custom[slot] = StackStr::new();
@@ -3182,12 +3184,11 @@ fn adopt_placeholder(
                 true
             }
             Err(error) => {
-                if last == Some(raw) {
-                    let _ = crate::sql::eval::take_diagnostic();
-                } else {
+                if warn {
                     report(error)?;
+                } else {
+                    let _ = crate::sql::eval::take_diagnostic();
                 }
-                last = Some(raw);
                 false
             }
         })
@@ -3201,11 +3202,8 @@ fn adopt_placeholder(
         }
     };
     let mut cluster = state.cluster_defaults;
-    let adopted = adopt(
-        &mut cluster,
-        &boot,
-        state.cluster_overrides & placeholder != 0,
-    )?;
+    let cluster_set = state.cluster_overrides & placeholder != 0;
+    let adopted = adopt(&mut cluster, &boot, cluster_set, cluster_set)?;
     state.cluster_defaults = cluster;
     transfer(&mut state.cluster_overrides, adopted);
     let reset_mask = state.connection_overrides
@@ -3215,7 +3213,8 @@ fn adopt_placeholder(
         | state.client_overrides;
     let reset_raw = state.defaults.custom[slot];
     let mut defaults = state.defaults;
-    let reset_adopted = adopt(&mut defaults, &cluster, reset_mask & placeholder != 0)?;
+    let reset_set = reset_mask & placeholder != 0;
+    let reset_adopted = adopt(&mut defaults, &cluster, reset_set, reset_set)?;
     state.defaults = defaults;
     for mask in [
         &mut state.connection_overrides,
@@ -3227,30 +3226,43 @@ fn adopt_placeholder(
         transfer(mask, reset_adopted);
     }
     // A level holding the reset value takes the adopted reset value.
-    let mut level = |values: &mut GucValues| {
-        if values.custom[slot] == reset_raw {
-            adopt(values, &defaults, false)?;
+    let mut level = |values: &mut GucValues, warn: bool| {
+        if values.custom[slot] == reset_raw && !warn {
+            adopt(values, &defaults, false, false)?;
             Ok(reset_adopted)
         } else {
-            adopt(values, &defaults, true)
+            adopt(values, &defaults, true, warn)
         }
     };
+    // Each nesting level's value is the one the next level's savepoint
+    // saved, and the innermost's is the current value. A level holds its own
+    // value when it differs from the level outside it; the transaction's own
+    // level also when a SET inside it repeated the session value.
+    let mut outer = state.transaction.start.custom[slot];
+    let mut first = true;
+    let set_in_transaction = state.transaction.session_overrides & placeholder != 0;
     if state.transaction.active {
-        let adopted = level(&mut state.transaction.start)?;
+        let adopted = level(&mut state.transaction.start, false)?;
         transfer(&mut state.transaction.start_overrides, adopted);
-        let adopted = level(&mut state.transaction.session)?;
+        let adopted = level(&mut state.transaction.session, false)?;
         transfer(&mut state.transaction.session_overrides, adopted);
         for savepoint in state.transaction.savepoints[..state.transaction.savepoint_count]
             .iter_mut()
             .flatten()
         {
-            let adopted = level(&mut savepoint.session)?;
+            let adopted = level(&mut savepoint.session, false)?;
             transfer(&mut savepoint.session_overrides, adopted);
-            let adopted = level(&mut savepoint.current)?;
+            let raw = savepoint.current.custom[slot];
+            let warn = raw != outer || first && set_in_transaction;
+            outer = raw;
+            first = false;
+            let adopted = level(&mut savepoint.current, warn)?;
             transfer(&mut savepoint.current_overrides, adopted);
         }
     }
-    let adopted = level(&mut state.current)?;
+    let raw = state.current.custom[slot];
+    let warn = raw != outer || state.transaction.active && first && set_in_transaction;
+    let adopted = level(&mut state.current, warn)?;
     transfer(&mut state.session_overrides, adopted);
     let index = bit.trailing_zeros() as usize;
     let custom_index = GUC_BUILTIN_SETTING_COUNT + slot;

@@ -516,8 +516,9 @@ query text. In a `BEGIN ATOMIC` body only a `SELECT` of expressions
 without `FROM` is deparsed (`SELECT (x + 1);`, under the current names of
 the routines and types it named); other statements are printed one per line
 as written, keeping names that were since renamed, where PostgreSQL prints its analyzed form (`INSERT
-INTO t (a, b) VALUES (f.x, 'q'::text);`); a rule action other than `NOTIFY` and a single-table `INSERT ... VALUES`
-of one row, `UPDATE` or `DELETE` (`DO ALSO INSERT INTO log SELECT ...`) is
+INTO t (a, b) VALUES (f.x, 'q'::text);`); a rule action that reads more than one table besides its target, aliases a
+relation, uses `ON CONFLICT`, or whose query groups, orders, limits or
+combines rows (`DO ALSO INSERT INTO log SELECT a FROM t GROUP BY a`) is
 printed as written, and its pretty form fails with `0A000`; policy
 expressions are not deparsed. `EXPLAIN` of a
 statement a rewrite rule changes shows only the original statement's plan,

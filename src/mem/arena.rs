@@ -885,6 +885,12 @@ impl<'a> ArenaString<'a> {
         // UTF-8 validity: every push comes from a &str.
         unsafe { core::str::from_utf8_unchecked(self.bytes.as_slice()) }
     }
+
+    /// Drops the text past byte `len`, which must be a character boundary.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        assert!(self.as_str().is_char_boundary(len));
+        self.bytes.truncate(len);
+    }
 }
 
 impl core::fmt::Write for ArenaString<'_> {

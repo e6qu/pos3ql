@@ -40,6 +40,9 @@ pub(crate) enum Segment {
     /// A `WITH` query run once. EXPLAIN does not show these yet; the
     /// segment keeps their operators apart.
     Cte,
+    /// The query at this position of the queries rewrite rules turn the
+    /// statement into, which the top block holds.
+    Query(u16),
 }
 
 impl Segment {
@@ -50,6 +53,7 @@ impl Segment {
             Self::Source => 3 << 32,
             Self::Sublink => 4 << 32,
             Self::Cte => 5 << 32,
+            Self::Query(position) => (6 << 32) | position as u64,
         }
     }
 }
@@ -85,6 +89,8 @@ pub(crate) enum Role {
     Aggregate,
     /// The block's window evaluation.
     Window,
+    /// The block's set-returning functions in its SELECT list.
+    ProjectSet,
     /// The block's `ORDER BY` sort.
     Sort,
     /// The block's `DISTINCT`.
@@ -99,6 +105,8 @@ pub(crate) enum Role {
     SetInput(u16),
     /// A write's target.
     Modify,
+    /// The `VALUES` rows an `INSERT` writes.
+    Values,
 }
 
 /// A plan node's identity: its block and its role there.
@@ -166,6 +174,9 @@ impl Slot {
 struct Registry {
     slots: NonNull<[Slot]>,
     timing: bool,
+    /// For a statement rewrite rules turn into several queries, the
+    /// position of the next query to run.
+    next_query: Option<u16>,
 }
 
 thread_local! {
@@ -188,15 +199,50 @@ impl Drop for Restore {
 /// Runs `execute` with `slots` counting its operators, starting at the top
 /// block. `timing` measures each loop's time as well.
 pub(crate) fn analyze<R>(slots: &mut [Slot], timing: bool, execute: impl FnOnce() -> R) -> R {
+    install(slots, timing, None, execute)
+}
+
+/// [`analyze`] of a statement rewrite rules turn into several queries, each
+/// counted in its own block as [`next_query`] starts it.
+pub(crate) fn analyze_queries<R>(
+    slots: &mut [Slot],
+    timing: bool,
+    execute: impl FnOnce() -> R,
+) -> R {
+    install(slots, timing, Some(0), execute)
+}
+
+fn install<R>(
+    slots: &mut [Slot],
+    timing: bool,
+    next_query: Option<u16>,
+    execute: impl FnOnce() -> R,
+) -> R {
     let mut registry = Registry {
         slots: NonNull::from(slots),
         timing,
+        next_query,
     };
     let _restore = Restore {
         active: ACTIVE.with(|active| active.replace(Some(NonNull::from(&mut registry)))),
         block: BLOCK.with(|block| block.replace(BlockId::ROOT)),
     };
     execute()
+}
+
+/// Starts the next of the queries rewrite rules turned the analyzed
+/// statement into: its operators count in that query's block. The executor
+/// runs the queries in the order EXPLAIN lists them.
+pub(crate) fn next_query() {
+    let Some(mut registry) = ACTIVE.with(Cell::get) else {
+        return;
+    };
+    // SAFETY: see `node`; nothing else borrows the registry here.
+    let registry = unsafe { registry.as_mut() };
+    if let Some(position) = registry.next_query {
+        BLOCK.with(|block| block.set(BlockId::ROOT.child(Segment::Query(position))));
+        registry.next_query = Some(position.saturating_add(1));
+    }
 }
 
 /// Hides the counters from statements a routine or trigger body runs, until
@@ -424,13 +470,14 @@ impl Drop for Loop {
 }
 
 /// The nodes of a query block's operators above its scans and joins, in
-/// PostgreSQL's order from the top: limit, distinct, sort, window,
-/// aggregation.
+/// PostgreSQL's order from the top: limit, distinct, sort, set-returning
+/// projection, window, aggregation.
 #[derive(Clone, Copy)]
 pub(crate) struct Stages {
     pub(crate) limit: Node,
     pub(crate) unique: Node,
     pub(crate) sort: Node,
+    pub(crate) project_set: Node,
     pub(crate) window: Node,
     pub(crate) aggregate: Node,
 }
@@ -443,6 +490,7 @@ impl Stages {
                 limit: Node::NONE,
                 unique: Node::NONE,
                 sort: Node::NONE,
+                project_set: Node::NONE,
                 window: Node::NONE,
                 aggregate: Node::NONE,
             };
@@ -451,6 +499,7 @@ impl Stages {
             limit: node(Role::Limit),
             unique: node(Role::Unique),
             sort: node(Role::Sort),
+            project_set: node(Role::ProjectSet),
             window: node(Role::Window),
             aggregate: node(Role::Aggregate),
         }
@@ -458,10 +507,16 @@ impl Stages {
 
     /// The stage the limit reads its rows from.
     pub(crate) fn below_limit(&self) -> Node {
-        [self.unique, self.sort, self.window, self.aggregate]
-            .into_iter()
-            .find(|node| node.measured())
-            .unwrap_or(Node::NONE)
+        [
+            self.unique,
+            self.sort,
+            self.project_set,
+            self.window,
+            self.aggregate,
+        ]
+        .into_iter()
+        .find(|node| node.measured())
+        .unwrap_or(Node::NONE)
     }
 
     /// Opens one execution of every stage.
@@ -470,6 +525,7 @@ impl Stages {
             self.limit,
             self.unique,
             self.sort,
+            self.project_set,
             self.window,
             self.aggregate,
         ];
@@ -482,7 +538,7 @@ impl Stages {
 
 /// One open execution of a block's stages.
 #[must_use]
-pub(crate) struct StageLoops([Node; 5]);
+pub(crate) struct StageLoops([Node; 6]);
 
 impl Drop for StageLoops {
     fn drop(&mut self) {

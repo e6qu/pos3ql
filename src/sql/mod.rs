@@ -17020,6 +17020,7 @@ impl Engine {
             // PostgreSQL sends a SELECT action's rows before the statement's
             // command tag.
             Stmt::Select(select) => responder.without_command_complete(|responder| {
+                query::instrument::next_query();
                 let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
                 if select.from.is_some() {
                     query::select_query(
@@ -17044,6 +17045,7 @@ impl Engine {
                 }
             }),
             Stmt::SetQuery(query) => responder.without_command_complete(|responder| {
+                query::instrument::next_query();
                 let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
                 query::set_query(
                     storage,
@@ -17057,6 +17059,7 @@ impl Engine {
                 )
             }),
             Stmt::Notify { channel, payload } => {
+                query::instrument::next_query();
                 let payload = match payload {
                     Some(payload) => match notify::payload(payload) {
                         Ok(payload) => payload,
@@ -17374,6 +17377,7 @@ impl Engine {
                                 && trigger.events.contains(ast::TriggerEvents::INSERT)
                         })
                 {
+                    query::instrument::next_query();
                     return exec::instead_of_view_dml(
                         storage,
                         txn,
@@ -17474,6 +17478,7 @@ impl Engine {
                     Ok(None) => (insert, inherited, authorization),
                     Err(error) => return Ok(Err(error)),
                 };
+                query::instrument::next_query();
                 exec::insert(
                     storage,
                     txn,
@@ -17503,6 +17508,7 @@ impl Engine {
                                 && trigger.events.contains(ast::TriggerEvents::UPDATE)
                         })
                 {
+                    query::instrument::next_query();
                     return exec::instead_of_view_dml(
                         storage,
                         txn,
@@ -17603,6 +17609,7 @@ impl Engine {
                     Ok(None) => (update, inherited, authorization),
                     Err(error) => return Ok(Err(error)),
                 };
+                query::instrument::next_query();
                 exec::update(
                     storage,
                     txn,
@@ -17630,6 +17637,7 @@ impl Engine {
                                 && trigger.events.contains(ast::TriggerEvents::DELETE)
                         })
                 {
+                    query::instrument::next_query();
                     return exec::instead_of_view_dml(
                         storage,
                         txn,
@@ -17718,6 +17726,7 @@ impl Engine {
                     Ok(None) => (delete, authorization),
                     Err(error) => return Ok(Err(error)),
                 };
+                query::instrument::next_query();
                 exec::delete(
                     storage,
                     txn,
@@ -22408,7 +22417,7 @@ impl Engine {
                 }
                 // A statement a rewrite rule changes is explained as the
                 // queries the rule produces.
-                let rewritten = match explain::rewritten_queries(
+                let mut rewritten = match explain::rewritten_queries(
                     &self.storage,
                     txn.txid,
                     planned_statement,
@@ -22425,6 +22434,7 @@ impl Engine {
                                 &self.storage,
                                 txn.txid,
                                 planned_statement,
+                                query::instrument::BlockId::ROOT,
                                 arena,
                             )
                         });
@@ -22480,9 +22490,12 @@ impl Engine {
                     };
                     // The plan counts what each of its nodes does as the
                     // statement runs.
-                    let execution = match plan.as_mut() {
-                        Some(plan) => plan.analyze(arena, options.timing, run),
-                        None => Ok(run()),
+                    let execution = match (plan.as_mut(), rewritten.as_mut()) {
+                        (Some(plan), _) => plan.analyze(arena, options.timing, run),
+                        (None, Some(queries)) => {
+                            explain::analyze_rewritten(queries, arena, options.timing, run)
+                        }
+                        (None, None) => Ok(run()),
                     };
                     let output = responder.finish_discard_query_output();
                     let execution = match execution {

@@ -9379,6 +9379,7 @@ fn write_statistics_keys<const N: usize>(
                 pretty: true,
                 qualify: false,
                 domain_value: None,
+                folded: false,
                 bare: None,
             },
             source.as_str(),
@@ -9507,6 +9508,7 @@ pub(crate) fn extended_statistics_expressions_by_oid<'a>(
                     pretty: false,
                     qualify: false,
                     domain_value: None,
+                    folded: false,
                     bare: None,
                 },
                 expression.as_str(),
@@ -12615,6 +12617,7 @@ fn write_sql_body(
         pretty: false,
         qualify: false,
         domain_value: None,
+        folded: false,
         bare: None,
     };
     let dependencies = storage.snapshot_routine_dependencies_for(slot, txid, arena)?;
@@ -13197,6 +13200,7 @@ pub fn trigger_def_text<'a>(
                         pretty,
                         qualify: false,
                         domain_value: None,
+                        folded: false,
                         bare: None,
                     },
                     when.as_str(),
@@ -13340,6 +13344,7 @@ fn write_routine_arguments(
                 pretty: false,
                 qualify: false,
                 domain_value: None,
+                folded: false,
                 bare: None,
             };
             let deparsed = match storage
@@ -15686,6 +15691,7 @@ pub fn constraint_def_text<'a>(
                 pretty,
                 qualify: false,
                 domain_value: None,
+                folded: false,
                 bare: None,
             };
             match bound_table_expression_display(
@@ -15757,6 +15763,7 @@ pub fn constraint_def_text<'a>(
                 pretty,
                 qualify: false,
                 domain_value: Some(domain_base_oid(storage, &domain, txid)),
+                folded: false,
                 bare: None,
                 arena,
                 dependencies: None,
@@ -15838,6 +15845,7 @@ pub fn constraint_def_text<'a>(
                         pretty,
                         qualify: false,
                         domain_value: None,
+                        folded: false,
                         bare: None,
                     },
                     expression,
@@ -16609,6 +16617,7 @@ pub fn index_def_text<'a>(
                     pretty,
                     qualify: false,
                     domain_value: None,
+                    folded: false,
                     bare: None,
                 },
                 bound,
@@ -16699,6 +16708,7 @@ fn index_expression_display<'a>(
             pretty,
             qualify: false,
             domain_value: None,
+            folded: false,
             bare: None,
         },
         expression,
@@ -22921,6 +22931,7 @@ fn pg_attrdef<'a>(
                         pretty: false,
                         qualify: false,
                         domain_value: None,
+                        folded: false,
                         bare: None,
                         arena,
                         dependencies: None,

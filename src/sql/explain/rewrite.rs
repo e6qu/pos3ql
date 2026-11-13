@@ -929,7 +929,9 @@ impl<'a> Rewriter<'_, 'a> {
                 }
                 let rows = rows.as_slice();
                 let from = joined(None)?;
-                if from.is_none() && filter.is_none() {
+                // Execution reads a single row an action inserts from a
+                // query over the statement's rows, as PostgreSQL's `Result`.
+                if from.is_none() && filter.is_none() && rows.len() > 1 {
                     Stmt::Insert(Insert { rows, ..insert })
                 } else {
                     let [row] = rows else {
@@ -1183,10 +1185,11 @@ pub(super) fn insert_source_plan<'a>(
     txid: u32,
     insert: &Insert<'_>,
     select: &Select<'_>,
+    block: BlockId,
     arena: &'a Arena,
 ) -> Result<Plan<'a>, SqlError> {
     // Execution runs the source in its own block.
-    let source = BlockId::ROOT.child(Segment::Source);
+    let source = block.child(Segment::Source);
     let (plan, wrapper) = if select.set_body.is_some() {
         (plan_derived(storage, txid, select, source, arena)?, None)
     } else if pulled_up(storage, txid, select, arena)? {

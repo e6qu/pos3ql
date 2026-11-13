@@ -34343,12 +34343,23 @@ fn execute_plpgsql_dynamic_explain(
         } else {
             super::guc::PlannerSettings::EMPTY
         };
-        let mut plan = super::explain::plan_statement(
+        // A statement rewrite rules change is explained as their queries.
+        let mut rewritten = super::explain::rewritten_queries(
             context.storage(),
             context.txn.txid,
             planned.statement,
             context.arena,
         )?;
+        let mut plan = match rewritten {
+            Some(_) => None,
+            None => Some(super::explain::plan_statement(
+                context.storage(),
+                context.txn.txid,
+                planned.statement,
+                super::query::instrument::BlockId::ROOT,
+                context.arena,
+            )?),
+        };
         let actual = if options.analyze {
             let TriggerExecContext {
                 host,
@@ -34375,7 +34386,7 @@ fn execute_plpgsql_dynamic_explain(
             let touched_mark = txn.touched().len();
             let started = std::time::Instant::now();
             responder.begin_discard_query_output(options.serialize);
-            let execution = plan.analyze(arena, options.timing, || {
+            let run = || {
                 engine.execute_explained_statement(
                     planned.statement,
                     arena,
@@ -34385,7 +34396,14 @@ fn execute_plpgsql_dynamic_explain(
                     guc,
                     responder,
                 )
-            });
+            };
+            let execution = match (plan.as_mut(), rewritten.as_mut()) {
+                (Some(plan), _) => plan.analyze(arena, options.timing, run),
+                (None, Some(queries)) => {
+                    super::explain::analyze_rewritten(queries, arena, options.timing, run)
+                }
+                (None, None) => unreachable!("an unrewritten statement is planned"),
+            };
             let output = responder.finish_discard_query_output();
             match execution? {
                 Err(_) => {
@@ -34417,7 +34435,25 @@ fn execute_plpgsql_dynamic_explain(
         } else {
             None
         };
-        super::explain::visit_plan_rows(&plan, options, actual, &settings, context.arena, emit)
+        match (plan, rewritten) {
+            (Some(plan), _) => super::explain::visit_plan_rows(
+                &plan,
+                options,
+                actual,
+                &settings,
+                context.arena,
+                emit,
+            ),
+            (None, Some(queries)) => super::explain::visit_rewritten_rows(
+                &queries,
+                options,
+                actual,
+                &settings,
+                context.arena,
+                emit,
+            )?,
+            (None, None) => unreachable!("an unrewritten statement is planned"),
+        }
     })
 }
 
@@ -78705,7 +78741,8 @@ where
     'arena: 'values,
 {
     let column = &definition.columns()[base_index];
-    let (default, expression) = match view_default_for(storage, txid, view, definition, base_index)? {
+    let (default, expression) = match view_default_for(storage, txid, view, definition, base_index)?
+    {
         Some(default) => (default, view_expression),
         None => (column.default, table_expression),
     };
@@ -83514,7 +83551,12 @@ fn with_column_domain<R>(
     )?;
     let domain = storage
         .read_domain_definition(target, txid)?
-        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "domain default source is unavailable"))?;
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "domain default source is unavailable"
+            )
+        })?;
     read(&domain).map(Some)
 }
 
@@ -83550,8 +83592,13 @@ fn domain_type_default<'a>(
         return Ok(None);
     };
     let original = super::enum_values::checks::default_display(text.as_str(), arena)?;
-    let source =
-        super::enum_values::checks::resolve_default(text.as_str(), column.ctype, storage, txid, arena)?;
+    let source = super::enum_values::checks::resolve_default(
+        text.as_str(),
+        column.ctype,
+        storage,
+        txid,
+        arena,
+    )?;
     let inputs = super::type_inputs::rebase(
         original,
         source,
@@ -84248,8 +84295,13 @@ pub(crate) fn instead_of_view_dml<'a>(
                     }
                     Err(error) => return sql_fail(error),
                 };
+                let values_node = crate::sql::query::instrument::node(
+                    crate::sql::query::instrument::Role::Values,
+                );
+                let _values_loop = values_node.start();
                 (|| -> Outcome {
                     for (row_index, row) in insert.rows.iter().enumerate().skip(first) {
+                        values_node.row();
                         match row_progress::start_row(
                             progress.as_deref_mut(),
                             row_index,
@@ -86281,8 +86333,12 @@ where
     }
     let mut inserted = resumed.changed;
     let first_row = resumed.first;
+    let values_node =
+        crate::sql::query::instrument::node(crate::sql::query::instrument::Role::Values);
+    let _values_loop = values_node.start();
     let rows_outcome = (|| -> Outcome {
         for (index, row_exprs) in statement.rows.iter().enumerate().skip(first_row) {
+            values_node.row();
             match row_progress::start_row(
                 progress.as_deref_mut(),
                 index,

@@ -565,15 +565,22 @@ condition fails with `0A000` (PostgreSQL joins the list into the action as a
 or `DELETE ... USING` reads is pulled up only when its relations' names do
 not clash with the statement's own, where PostgreSQL renames them (`t_1`);
 otherwise its query runs under a `Subquery Scan`. Under `EXPLAIN ANALYZE` a rewritten statement runs
-once and its time, I/O and top node's rows are reported on its last query; its
-nodes carry no per-node figures. Otherwise `EXPLAIN ANALYZE`
+once, each of its queries counted in its own plan, and its time and I/O are
+reported on its last query. `EXPLAIN` in PL/pgSQL explains rewritten
+statements the same way. `EXPLAIN ANALYZE`
 counts, per plan node, the loops, rows and the rows its `Filter` and `Join
 Filter` removed while the statement runs, and prints `(never executed)` for
 nodes that did not run: scans (also a nested loop's inner rescans and
 parameterized index scans), nested-loop and hash joins with their `Hash` and
 `Materialize` inputs, aggregation, sorts, `DISTINCT`, limits, window
 evaluation, set operations, derived tables, `VALUES` lists, a write's target
-scan and an `INSERT`'s source query, in all four formats. Times are measured
+scan, an `INSERT`'s source query or `VALUES` rows, and a query without FROM
+(its one-row `Result`, with a non-constant `WHERE` as its `One-Time Filter`,
+and the `ProjectSet` that expands set-returning calls, which also appears
+over scans), in all four formats. A query without FROM drops sort, grouping
+and distinct keys that are planner constants, as PostgreSQL does (a constant
+`DISTINCT` becomes a `Limit`). Conditions print coerced numeric literals as
+the constants the planner folds them into (`'2'::double precision`). Times are measured
 per loop, to the first row and to the end; in pos3ql's push-based executor a
 node's time also includes the work of the nodes reading its rows. Not yet
 shown: subplans and InitPlans (a condition with a subquery prints no
@@ -582,8 +589,7 @@ Usage`, aggregate and `Materialize` storage lines that PostgreSQL measures in
 its own allocator, per-node `Buffers` and `WAL` (reported on the top node
 only), trigger time lines, an index-only scan's `Heap Fetches` and a bitmap
 heap scan's `Heap Blocks`. A node of a path the executor does not count (a
-FROM-less top query, a data-modifying `WITH`, a joined `UPDATE` or `DELETE`,
-`MERGE`) prints no actual figures, except the top node, which reports the
+data-modifying `WITH`, a joined `UPDATE` or `DELETE`, `MERGE`) prints no actual figures, except the top node, which reports the
 statement's rows; a `LIMIT` that stops `Unique` early leaves its `Sort`
 without figures, as pos3ql deduplicates before sorting. Where pos3ql's plan
 differs from PostgreSQL's cost-based one the figures are those of the plan it

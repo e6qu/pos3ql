@@ -887,6 +887,50 @@ pub(crate) use srf::{
 };
 use srf::{find_srf, has_project_set, prepare_project_set, table_func_def, table_func_def_outer};
 
+/// Whether a SELECT list calls a set-returning function, which PostgreSQL
+/// evaluates in a `ProjectSet` node.
+pub(crate) fn has_set_returning_items(
+    items: &[SelectItem<'_>],
+    storage: &Storage,
+    txid: u32,
+) -> bool {
+    has_project_set(items, storage, txid)
+}
+
+/// Whether a key of a FROM-less query is a constant PostgreSQL's planner
+/// drops from its sort and grouping keys: it reads no volatile function, set
+/// or subquery.
+pub(crate) fn fromless_key_is_constant(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<bool, SqlError> {
+    if expression_has_project_set(expression, storage, txid) {
+        return Ok(false);
+    }
+    if expression.contains_subquery() {
+        return Ok(false);
+    }
+    let columns = super::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    Ok(!predicate_safety::expression_properties(
+        expression,
+        &columns,
+        storage,
+        txid,
+        predicate_safety::AnalysisStage::RuntimeProjection,
+        arena,
+    )?
+    .volatile)
+}
+
 mod group;
 use group::{grouped_rows, grouped_select};
 
@@ -8196,6 +8240,10 @@ pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
         Some(w) => where_passes(w, arena, params, row, hooks)?,
         None => true,
     };
+    let aggregate = instrument::node(instrument::Role::Aggregate);
+    if pass {
+        instrument::node(instrument::Role::Result).row();
+    }
     if !statement.group_by.is_empty() && !pass {
         // Zero input rows grouped: zero groups, zero output rows (a plain
         // aggregate still emits its one row over the empty input).
@@ -8244,9 +8292,11 @@ pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
             Datum::Bool(true)
         );
         if !held {
+            aggregate.filtered();
             return Ok(None);
         }
     }
+    aggregate.row();
     Ok(Some((ptrs, values)))
 }
 
@@ -12482,6 +12532,7 @@ fn prepare_fromless_projection<'a, R: ColumnLookup<'a>>(
     {
         return Ok(srf::ProjectSet::empty());
     }
+    instrument::node(instrument::Role::Result).row();
     prepare_project_set(statement.items, storage, txid, arena, params, row, hooks)
 }
 
@@ -12702,6 +12753,13 @@ pub(crate) fn constant_select_resumable<'a>(
         merge_action: None,
     };
 
+    // EXPLAIN ANALYZE's nodes: the one-row `Result`, the stages above it
+    // and a `ProjectSet` expanding set-returning calls.
+    let mut stages = instrument::Stages::current();
+    // A `LIMIT 0` never runs the projection below it.
+    let projected = core::mem::replace(&mut stages.project_set, instrument::Node::NONE);
+    let _stages = stages.start();
+    let result_node = instrument::node(instrument::Role::Result);
     // Aggregates (or GROUP BY / HAVING) without FROM: PostgreSQL aggregates
     // over one virtual input row (zero when WHERE is false) and emits at most
     // one output row.
@@ -12759,6 +12817,8 @@ pub(crate) fn constant_select_resumable<'a>(
             );
         }
         responder.row_description(&columns[..n])?;
+        let _result = result_node.start();
+        let _projected = projected.start();
         let hook_data = match fromless_aggregate_hooks(
             statement,
             agg_nodes.as_slice(),
@@ -12805,6 +12865,7 @@ pub(crate) fn constant_select_resumable<'a>(
                 Ok(Err(error)) => return sql_fail(error),
                 Err(wire) => return Err(wire),
             }
+            stages.limit.row();
             rows = 1;
         }
         let tag = stack_format!(48, "SELECT {}", rows);
@@ -12913,6 +12974,8 @@ pub(crate) fn constant_select_resumable<'a>(
             Ok(l) => l,
             Err(e) => return sql_fail(e),
         };
+    let _result = (limit != 0).then(|| result_node.start());
+    let _projected = (limit != 0).then(|| projected.start());
     let project_set = if limit == 0 {
         srf::ProjectSet::empty()
     } else {
@@ -13008,6 +13071,7 @@ pub(crate) fn constant_select_resumable<'a>(
             Ok(live) => live,
             Err(error) => return sql_fail(error),
         };
+        stages.unique.rows(live as u64);
     }
     let out_rows = &mut out_rows[..live];
     let mut order_collations = [super::ast::Collation::None; MAX_PROJ];
@@ -13063,6 +13127,7 @@ pub(crate) fn constant_select_resumable<'a>(
         if let Err(error) = sorted {
             return sql_fail(error);
         }
+        stages.sort.rows(out_rows.len() as u64);
     }
 
     let start = (offset as usize).min(out_rows.len());
@@ -13097,6 +13162,7 @@ pub(crate) fn constant_select_resumable<'a>(
             Ok(Err(error)) => return sql_fail(error),
             Err(wire) => return Err(wire),
         }
+        stages.limit.row();
         rows += 1;
     }
     let tag = stack_format!(32, "SELECT {}", rows);
@@ -13484,6 +13550,9 @@ fn select_into_rows_mode<'a>(
                 inner: &super::eval::NoColumns,
                 outer,
             };
+            let stages = instrument::Stages::current();
+            let _stages = stages.start();
+            let _result = instrument::node(instrument::Role::Result).start();
             let Some((ptrs, values)) = fromless_aggregate_hooks(
                 statement,
                 agg_nodes.as_slice(),
@@ -13532,6 +13601,7 @@ fn select_into_rows_mode<'a>(
                     }
                 }
             }
+            stages.limit.row();
             emit(&vals[..n])?;
             return Ok(());
         };
@@ -13743,7 +13813,6 @@ fn select_into_rows_mode<'a>(
                     }
                 }
             }
-            result.row();
             if produced >= offset {
                 stages.limit.row();
                 emit(&vals[..n])?;

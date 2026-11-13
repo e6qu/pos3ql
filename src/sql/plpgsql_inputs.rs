@@ -166,20 +166,12 @@ pub(super) fn parse<'a>(
     arena: &'a Arena,
     dependencies: Option<&mut crate::storage::StoredQueryDependencies>,
 ) -> Result<super::parser::Parser<'a>, SqlError> {
-    super::parser::with_procedural_positionals(site.positionals, || {
-        parse_site(site, storage, txid, row, relations, arena, dependencies)
-    })
-}
-
-fn parse_site<'a>(
-    site: Site<'a>,
-    storage: &crate::storage::Storage,
-    txid: u32,
-    row: &dyn super::eval::ColumnLookup<'a>,
-    relations: Option<&'a [(&'a str, &'a super::ast::MaterializedCte<'a>)]>,
-    arena: &'a Arena,
-    mut dependencies: Option<&mut crate::storage::StoredQueryDependencies>,
-) -> Result<super::parser::Parser<'a>, SqlError> {
+    let mut dependencies = dependencies;
+    // Only the site's own text names the routine's parameters `$n`; what
+    // analysing it reads (stored views and routines) does not.
+    let positional = |parse: &mut dyn FnMut() -> Result<(), SqlError>| {
+        super::parser::with_procedural_positionals(site.positionals, parse)
+    };
     let mut parser = super::parser::Parser::new(site.text, arena)
         .map_err(|error| super::parse_error_to_sql(&error))?;
     parser.capture_type_inputs();
@@ -190,9 +182,16 @@ fn parse_site<'a>(
     };
     match site.kind {
         Kind::Expression => {
-            let expression = parser
-                .expression(0)
-                .map_err(|error| super::parse_error_to_sql(&error))?;
+            let mut parsed = None;
+            positional(&mut || {
+                parsed = Some(
+                    parser
+                        .expression(0)
+                        .map_err(|error| super::parse_error_to_sql(&error))?,
+                );
+                Ok(())
+            })?;
+            let expression = parsed.expect("parsed site expression");
             let expression = match relations {
                 Some(relations) => super::query::bind_materialized_expression(
                     expression, relations, storage, txid, arena,
@@ -213,10 +212,17 @@ fn parse_site<'a>(
                 )?;
             }
         }
-        Kind::Query | Kind::Statement => {
-            while let Some(statement) = parser
-                .next_stmt()
-                .map_err(|error| super::parse_error_to_sql(&error))?
+        Kind::Query | Kind::Statement => loop {
+            let mut next = None;
+            positional(&mut || {
+                next = parser
+                    .next_stmt()
+                    .map_err(|error| super::parse_error_to_sql(&error))?;
+                Ok(())
+            })?;
+            let Some(statement) = next else {
+                break;
+            };
             {
                 let statement = arena
                     .alloc(statement)
@@ -241,7 +247,7 @@ fn parse_site<'a>(
                     )?;
                 }
             }
-        }
+        },
     }
     Ok(parser)
 }

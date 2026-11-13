@@ -26348,10 +26348,10 @@ fn routine_positionals(routine: &crate::storage::RoutineDef) -> u32 {
 }
 
 /// The parameter `$n` names, where `name` is `$n`.
-fn positional_parameter<'p>(
-    parameters: &'p [RoutineParameterDef],
+fn positional_parameter(
+    parameters: &[RoutineParameterDef],
     name: SqlName,
-) -> Option<&'p RoutineParameterDef> {
+) -> Option<&RoutineParameterDef> {
     let number = name.as_str().strip_prefix('$')?;
     if number.starts_with('0') {
         return None;
@@ -33245,7 +33245,6 @@ fn execute_static_rewritten_write<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     targets: NewRowTarget<'_, '_, '_, 'a>,
     source: &'a str,
-    positionals: u32,
     captured: &'a [super::cursor::CursorLocal<'a>],
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     locals: &[TriggerLocalDecl],
@@ -33259,11 +33258,11 @@ fn execute_static_rewritten_write<'a>(
     let bound =
         super::cursor::bind_locals(arena, context.params, captured, static_write_arena_full)?;
     let inputs = super::type_inputs::bindings_for_active_source(source, arena)?.unwrap_or(&[]);
-    let statement = super::parser::with_procedural_positionals(positionals, || {
+    // The captured variables include `$n`, which the query reads as such.
+    let statement =
         super::parser::parse_cursor_command(source, arena, bound.bindings, inputs, |parser| {
             super::type_inputs::validate_restored(parser, context.storage(), txid)
-        })
-    })?;
+        })?;
     let returns = match statement {
         Stmt::Insert(statement) => !statement.returning.is_empty(),
         Stmt::Update(statement) => !statement.returning.is_empty(),
@@ -35211,7 +35210,6 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
 fn materialize_trigger_for_dml<'a>(
     context: &mut TriggerExecContext<'_, 'a, '_>,
     source: &'a str,
-    positionals: u32,
     captured: &'a [super::cursor::CursorLocal<'a>],
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     record_target: bool,
@@ -35223,11 +35221,11 @@ fn materialize_trigger_for_dml<'a>(
     let bound =
         super::cursor::bind_locals(arena, context.params, captured, static_write_arena_full)?;
     let inputs = super::type_inputs::bindings_for_active_source(source, arena)?.unwrap_or(&[]);
-    let statement = super::parser::with_procedural_positionals(positionals, || {
+    // The captured variables include `$n`, which the query reads as such.
+    let statement =
         super::parser::parse_cursor_command(source, arena, bound.bindings, inputs, |parser| {
             super::type_inputs::validate_restored(parser, context.storage(), txid)
-        })
-    })?;
+        })?;
     let (command, returns) = match statement {
         Stmt::Insert(statement) => ("INSERT", !statement.returning.is_empty()),
         Stmt::Update(statement) => ("UPDATE", !statement.returning.is_empty()),
@@ -38291,7 +38289,6 @@ fn execute_trigger_step_in<'a>(
                             records: &mut *records,
                         },
                         source,
-                        invocation.positionals,
                         captured,
                         transition_relations,
                         locals,
@@ -38558,7 +38555,6 @@ fn execute_trigger_step_in<'a>(
                             records: &mut *records,
                         },
                         source,
-                        invocation.positionals,
                         captured,
                         transition_relations,
                         locals,
@@ -38770,7 +38766,6 @@ fn execute_trigger_step_in<'a>(
                             records: &mut *records,
                         },
                         source,
-                        invocation.positionals,
                         captured,
                         transition_relations,
                         locals,
@@ -39284,7 +39279,6 @@ fn execute_trigger_step_in<'a>(
                             Some(materialize_trigger_for_dml(
                                 context,
                                 source,
-                                invocation.positionals,
                                 captured,
                                 transition_relations,
                                 record_target,

@@ -96,6 +96,7 @@ pub(super) fn sort_admitted(
             storage,
             columns.txid,
             super::predicate_safety::AnalysisStage::RuntimeProjection,
+            columns.arena,
         )
         .map(|properties| properties.volatile)
     };
@@ -105,7 +106,10 @@ pub(super) fn sort_admitted(
         Ok(
             retained_expression(expression, catalog, Some((storage, columns.txid)))
                 && retained_scalar_calls(expression, columns)?
-                && !crate::sql::eval::routine_input_handoff(expression, Some(catalog))
+                && !crate::sql::eval::routine_input_handoff_kept_subqueries(
+                    expression,
+                    Some(catalog),
+                )
                 && !volatile(expression)?,
         )
     };
@@ -194,6 +198,7 @@ impl<'a> SortState<'a> {
                 storage,
                 txid,
                 super::predicate_safety::AnalysisStage::RuntimeProjection,
+                arena,
             )
             .map(|properties| properties.volatile)
         };

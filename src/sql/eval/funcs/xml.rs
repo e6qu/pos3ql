@@ -283,21 +283,27 @@ pub(crate) fn dispatch<'a>(
                 push_escaped(&mut out, text, true);
                 out.write_char('"').map_err(|_| arena_full())?;
             }
-            if content_start == args.len() {
-                out.write_str("/>").map_err(|_| arena_full())?;
-                return finish(&out, arena);
-            }
-            out.write_char('>').map_err(|_| arena_full())?;
+            // An element whose content is absent or all NULL is written
+            // empty (`<e/>`), as PostgreSQL does.
+            let mut opened = false;
             for expression in &args[content_start..] {
                 if let Some((text, raw)) =
                     value_text(eval_full(expression, arena, params, row, hooks)?, arena)?
                 {
+                    if !opened {
+                        out.write_char('>').map_err(|_| arena_full())?;
+                        opened = true;
+                    }
                     if raw {
                         out.write_str(text).map_err(|_| arena_full())?;
                     } else {
                         push_escaped(&mut out, text, false);
                     }
                 }
+            }
+            if !opened {
+                out.write_str("/>").map_err(|_| arena_full())?;
+                return finish(&out, arena);
             }
             out.write_str("</").map_err(|_| arena_full())?;
             xml_name(&mut out, element_name);

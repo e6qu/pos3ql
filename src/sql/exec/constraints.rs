@@ -1601,16 +1601,27 @@ fn check_row_keys(
     } else {
         DuplicateKey::Write
     };
-    let mut defer = |name: SqlName| -> Result<bool, SqlError> {
-        if let Some(rowid) = row.stored()
-            && let Some(transaction) = txn.as_deref_mut()
-        {
-            let identity = transaction.constraint_identity(constraint_table as u32, name);
-            transaction.defer_constraint(identity, rowid)?;
-            return Ok(true);
-        }
-        Ok(false)
-    };
+    // A deferrable key of a stored row is checked now, and only a row that
+    // meets a possible conflict is queued for the recheck, as PostgreSQL's
+    // partial unique check queues only those rows. The recheck then reports
+    // that row against the one it met.
+    let mut defer_on_conflict =
+        |name: SqlName, check: Result<(), SqlError>| -> Result<(), SqlError> {
+            let Err(error) = check else {
+                return Ok(());
+            };
+            if let Some(rowid) = row.stored()
+                && let Some(transaction) = txn.as_deref_mut()
+                && (error.sqlstate == sqlstate::UNIQUE_VIOLATION
+                    || error.sqlstate == sqlstate::EXCLUSION_VIOLATION
+                    || error.sqlstate == sqlstate::INTERNAL_LOCK_WAIT)
+            {
+                crate::sql::eval::take_diagnostic();
+                let identity = transaction.constraint_identity(constraint_table as u32, name);
+                return transaction.defer_constraint(identity, rowid);
+            }
+            Err(error)
+        };
     for_each_row_key(storage, def, txid, &mut |key| match key {
         RowKey::Column(column) => {
             let name = def.column_key_name(column).ok_or_else(|| {
@@ -1635,10 +1646,7 @@ fn check_row_keys(
             )
         }
         RowKey::Table(key) => {
-            if key.timing.is_deferrable() && defer(key.name)? {
-                return Ok(());
-            }
-            enforce_key_uniqueness(
+            let checked = enforce_key_uniqueness(
                 storage,
                 table_index,
                 def,
@@ -1651,14 +1659,16 @@ fn check_row_keys(
                 key.name,
                 duplicate,
                 UniqueKeySource::Cache,
-            )
+            );
+            if key.timing.is_deferrable() {
+                defer_on_conflict(key.name, checked)
+            } else {
+                checked
+            }
         }
         RowKey::Exclusion(position) => {
             let exclusion = &def.exclusions()[position];
-            if exclusion.timing.is_deferrable() && defer(exclusion.name)? {
-                return Ok(());
-            }
-            enforce_exclusion_constraint(
+            let checked = enforce_exclusion_constraint(
                 storage,
                 table_index,
                 def,
@@ -1671,7 +1681,12 @@ fn check_row_keys(
                 arena,
                 row.validation_read(),
                 duplicate,
-            )
+            );
+            if exclusion.timing.is_deferrable() {
+                defer_on_conflict(exclusion.name, checked)
+            } else {
+                checked
+            }
         }
         RowKey::Index(index) => check_unique_index(
             storage,

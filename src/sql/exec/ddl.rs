@@ -1989,6 +1989,13 @@ fn attach_fkey(
                 parent.name
             ));
         }
+        if primary_key_is_deferrable(&parent_def) {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "cannot use a deferrable primary key for referenced table \"{}\"",
+                parent.name
+            ));
+        }
         n_parent = pk_n;
         for (i, &column_index) in pk[..pk_n].iter().enumerate() {
             pcol_names[i] = parent_def.columns()[column_index as usize].name.as_str();
@@ -2038,13 +2045,24 @@ fn attach_fkey(
         }
     }
 
-    // The referenced columns must be a unique key of the parent (PG 42830).
-    if !is_unique_key(&parent_def, &parent_idxs[..n_parent]) {
-        return Err(sql_err!(
-            crate::sql::eval::sqlstate::INVALID_FOREIGN_KEY,
-            "there is no unique constraint matching given keys for referenced table \"{}\"",
-            parent.name
-        ));
+    // The referenced columns must be a unique key of the parent (PG 42830)
+    // that is checked immediately.
+    match referenced_key(&parent_def, &parent_idxs[..n_parent]) {
+        ReferencedKey::Usable => {}
+        ReferencedKey::Deferrable => {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "cannot use a deferrable unique constraint for referenced table \"{}\"",
+                parent.name
+            ));
+        }
+        ReferencedKey::Missing => {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::INVALID_FOREIGN_KEY,
+                "there is no unique constraint matching given keys for referenced table \"{}\"",
+                parent.name
+            ));
+        }
     }
     let fname = match name {
         Some(n) => SqlName::parse(n)?,
@@ -2268,22 +2286,46 @@ pub(super) fn references_named_key<Definition0: crate::storage::DefinitionBackin
         .is_some_and(|key| key.name.as_str() == name)
 }
 
-fn is_unique_key<Definition0: crate::storage::DefinitionBacking>(
+/// Whether a set of columns is a unique key a foreign key can reference.
+enum ReferencedKey {
+    Usable,
+    /// Only a deferrable unique key matches; PostgreSQL rejects it.
+    Deferrable,
+    Missing,
+}
+
+fn referenced_key<Definition0: crate::storage::DefinitionBacking>(
     def: &crate::storage::TableDefinition<Definition0>,
     columns: &[u16],
-) -> bool {
+) -> ReferencedKey {
     if columns.len() == 1 {
         let c = &def.columns()[columns[0] as usize];
         if c.unique || c.primary {
-            return true;
+            return ReferencedKey::Usable;
         }
     }
-    def.uniques().iter().any(|uk| {
-        !uk.timing.is_deferrable() && uk.n_cols == columns.len() && {
-            let a = uk.columns();
-            columns.iter().all(|c| a.contains(c)) && a.iter().all(|c| columns.contains(c))
+    let mut found = ReferencedKey::Missing;
+    for key in def.uniques() {
+        let keyed = key.columns();
+        if key.n_cols == columns.len()
+            && columns.iter().all(|c| keyed.contains(c))
+            && keyed.iter().all(|c| columns.contains(c))
+        {
+            if !key.timing.is_deferrable() {
+                return ReferencedKey::Usable;
+            }
+            found = ReferencedKey::Deferrable;
         }
-    })
+    }
+    found
+}
+
+fn primary_key_is_deferrable<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
+) -> bool {
+    def.uniques()
+        .iter()
+        .any(|key| key.kind.is_primary() && key.timing.is_deferrable())
 }
 
 fn storage_timing(timing: AstConstraintTiming) -> crate::storage::ConstraintTiming {

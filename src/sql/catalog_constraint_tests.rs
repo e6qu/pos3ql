@@ -802,8 +802,8 @@ fn catalog_constraint_null_modes_keep_deferred_savepoint_semantics() {
         engine.commit_progress = CommitProgressMode::Reactor;
         let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
         session.success(&mut engine,
-            "CREATE TABLE null_deferred(a integer CONSTRAINT null_deferred_key UNIQUE NULLS NOT DISTINCT DEFERRABLE INITIALLY DEFERRED);
-             BEGIN; INSERT INTO null_deferred VALUES(NULL),(NULL)", true);
+            "CREATE TABLE null_deferred(a integer CONSTRAINT null_deferred_key UNIQUE NULLS NOT DISTINCT DEFERRABLE INITIALLY DEFERRED)", true);
+        session.success(&mut engine, "BEGIN; INSERT INTO null_deferred VALUES(NULL),(NULL)", true);
         assert_eq!(
             error_sqlstates(&session.execute(&mut engine, "COMMIT", true)),
             ["23505"]

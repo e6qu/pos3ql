@@ -229,7 +229,7 @@ struct Portal {
     /// Buffered result messages for max_rows paging (Execute suspension).
     result: FixedBuf,
     execution: PortalExecution,
-    completion: crate::util::StackStr<64>,
+    completion: crate::util::StackStr<{ crate::pg::respond::COMMAND_TAG_MAX }>,
     returned_rows: bool,
 }
 
@@ -5021,7 +5021,7 @@ impl Conn {
         let Some(stream) = self.result_streams.active_mut() else {
             return Some(self.finish_failed_query_stream(engine, total));
         };
-        let (step, transport_failed) = {
+        let (step, transport_failed, held) = {
             let writer = match (stream_early, self.tls.as_mut(), self.stream.as_mut()) {
                 (false, _, _) | (true, _, None) => ClientWriter::None,
                 (true, Some(session), Some(socket)) => ClientWriter::Tls { session, socket },
@@ -5032,6 +5032,9 @@ impl Conn {
                     .for_stream()
                     .guard_publication(engine.publication_required()),
             );
+            // The statement's tag waits for the Query's later statements or
+            // its commit, like any other simple-query statement's.
+            responder.hold_command_complete();
             let step = engine.continue_result_stream(
                 stream,
                 &mut self.arena,
@@ -5043,7 +5046,11 @@ impl Conn {
                 self.id,
                 lock_timeout_expired,
             );
-            (step, responder.transport_failed())
+            (
+                step,
+                responder.transport_failed(),
+                responder.take_held_command_complete(),
+            )
         };
         if transport_failed {
             return Some(Step::Close);
@@ -5051,6 +5058,7 @@ impl Conn {
         match step {
             Err(WireFull) => Some(Step::Close),
             Ok(crate::sql::StreamStep::Complete) => {
+                self.txn.held_command_complete = held.map(|tag| (statement, tag));
                 self.resume_statement = statement + 1;
                 None
             }
@@ -6514,7 +6522,7 @@ fn command_completion_in(mut bytes: &[u8]) -> Option<&str> {
     None
 }
 
-fn command_tag_rows(tag: &str, rows: u64) -> crate::util::StackStr<64> {
+fn command_tag_rows(tag: &str, rows: u64) -> crate::util::StackStr<{ crate::pg::respond::COMMAND_TAG_MAX }> {
     use core::fmt::Write as _;
 
     let Some((prefix, count)) = tag.rsplit_once(' ') else {
@@ -6900,6 +6908,17 @@ mod tests {
         message.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
         message.extend_from_slice(payload);
         message
+    }
+
+    /// The type bytes of the backend messages in `bytes`.
+    fn backend_kinds(mut bytes: &[u8]) -> Vec<u8> {
+        let mut kinds = Vec::new();
+        while bytes.len() >= 5 {
+            kinds.push(bytes[0]);
+            let length = i32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
+            bytes = &bytes[1 + length..];
+        }
+        kinds
     }
 
     fn has_backend_message(mut bytes: &[u8], kind: u8) -> bool {
@@ -8008,7 +8027,11 @@ mod tests {
                 let sql = format!("INSERT INTO atomic_commit_rows VALUES ({id})");
                 match protocol {
                     0 => {
-                        query(&mut conn, &mut engine, &sql, failed);
+                        // PostgreSQL commits before the last statement's
+                        // tag, so a failed commit reports no tag.
+                        let output = query(&mut conn, &mut engine, &sql, failed);
+                        let expected: &[u8] = if failed { b"EZ" } else { b"CZ" };
+                        assert_eq!(backend_kinds(&output), expected);
                     }
                     1 => {
                         let mut parse = vec![0];
@@ -8016,7 +8039,10 @@ mod tests {
                         parse.extend_from_slice(&[0, 0, 0]);
                         message(&mut conn, &mut engine, wire::FMSG_PARSE, &parse, false);
                         message(&mut conn, &mut engine, wire::FMSG_BIND, &[0; 8], false);
-                        message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], false);
+                        let executed =
+                            message(&mut conn, &mut engine, wire::FMSG_EXECUTE, &[0; 5], false);
+                        // Execute reports its tag; Sync commits afterwards.
+                        assert_eq!(backend_kinds(&executed), b"C");
                         let output = message(&mut conn, &mut engine, wire::FMSG_SYNC, &[], failed);
                         assert!(output.ends_with(b"Z\0\0\0\x05I"));
                     }
@@ -8052,19 +8078,37 @@ mod tests {
                 assert_eq!(first_value(&output), expected);
             }
         }
-        query(
+        // Only the last statement's tag waits for the commit.
+        let output = query(
+            &mut conn,
+            &mut engine,
+            "INSERT INTO atomic_commit_rows VALUES (3); INSERT INTO atomic_commit_rows VALUES (-3)",
+            true,
+        );
+        assert_eq!(backend_kinds(&output), b"CEZ");
+        let output = query(
+            &mut conn,
+            &mut engine,
+            "INSERT INTO atomic_commit_rows VALUES (-4); SELECT 1",
+            true,
+        );
+        assert_eq!(backend_kinds(&output), b"CTDEZ");
+        // BEGIN makes the Query's implicit transaction explicit, so ROLLBACK
+        // also erases the statement before it.
+        let output = query(
             &mut conn,
             &mut engine,
             "INSERT INTO atomic_commit_rows VALUES (3); BEGIN; ROLLBACK",
             false,
         );
+        assert_eq!(backend_kinds(&output), b"CCCZ");
         let output = query(
             &mut conn,
             &mut engine,
             "SELECT count(*) FROM atomic_commit_audit",
             false,
         );
-        assert_eq!(first_value(&output), "7");
+        assert_eq!(first_value(&output), "6");
     }
 
     #[test]

@@ -50340,7 +50340,9 @@ fn schema_rename_moves_catalog_identity_and_replays_from_object_storage() {
 }
 
 #[test]
-fn simple_query_begin_commits_prior_sequence_rename() {
+fn simple_query_begin_rolls_back_prior_sequence_rename() {
+    // BEGIN makes the Query's implicit transaction explicit, so ROLLBACK
+    // also erases the statements before it.
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
         &mut engine,
@@ -50353,11 +50355,12 @@ fn simple_query_begin_commits_prior_sequence_rename() {
          SELECT nextval('simple_query_target')",
     );
     assert_eq!(
-        data_rows(&output),
-        ["1"],
+        error_sqlstates(&output),
+        ["42P01"],
         "{}",
         String::from_utf8_lossy(&output)
     );
+    assert!(data_rows(&output).is_empty());
 }
 
 #[test]
@@ -63647,10 +63650,10 @@ fn unique_key_writer_waits_then_rechecks_the_committed_outcome() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut owner = ConfiguredTransactionSession::new(&config, &mut budget);
     let mut waiter = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    owner.success(&mut engine, "CREATE TABLE unique_wait (id int primary key)", true);
     owner.success(
         &mut engine,
-        "CREATE TABLE unique_wait (id int primary key); BEGIN; \
-         INSERT INTO unique_wait VALUES (1)",
+        "BEGIN; INSERT INTO unique_wait VALUES (1)",
         true,
     );
     let sql = "INSERT INTO unique_wait VALUES (1)";
@@ -98345,7 +98348,7 @@ fn parallel_commit_prepared_receipts_survive_slot_release_and_reuse() {
 }
 
 #[test]
-fn parallel_commit_begin_boundary_preserves_prefixes_and_sequence_gaps() {
+fn parallel_commit_begin_keeps_one_transaction_and_sequence_gaps() {
     fn resume(
         engine: &mut Engine,
         session: &mut ConfiguredTransactionSession,
@@ -98402,32 +98405,10 @@ fn parallel_commit_begin_boundary_preserves_prefixes_and_sequence_gaps() {
         );
         session.send.clear();
         engine.enable_async_durability();
+        // BEGIN makes the Query's transaction explicit instead of
+        // committing the INSERT before it, so ROLLBACK erases both inserts;
+        // the sequence keeps its gaps.
         let mut status = resume(&mut engine, &mut session, 0);
-        assert!(matches!(
-            status,
-            ExecutionStatus::Blocked {
-                completed_statements: 1,
-                wait: crate::sql::StatementWait::ObjectIo,
-                ..
-            }
-        ));
-        assert!(error_sqlstates(session.send.readable()).is_empty());
-        assert_eq!(message_types(session.send.readable()), [b'C']);
-        let prefix = session.send.readable().to_vec();
-        let lsn = engine.journal_lsn();
-        for _ in 0..2 {
-            status = resume(&mut engine, &mut session, 1);
-            assert!(matches!(
-                status,
-                ExecutionStatus::Blocked {
-                    completed_statements: 1,
-                    wait: crate::sql::StatementWait::ObjectIo,
-                    ..
-                }
-            ));
-            assert_eq!(session.send.readable(), prefix);
-            assert_eq!(engine.journal_lsn(), lsn);
-        }
         let mut complete = false;
         for _ in 0..8 {
             let skip = match status {
@@ -98445,7 +98426,6 @@ fn parallel_commit_begin_boundary_preserves_prefixes_and_sequence_gaps() {
                         output_mark,
                         crate::pg::overflow::OutputMark::new(session.send.len(), 0)
                     );
-                    assert!(session.transaction.staged_commit().is_some());
                     completed_statements
                 }
             };
@@ -98455,8 +98435,7 @@ fn parallel_commit_begin_boundary_preserves_prefixes_and_sequence_gaps() {
         }
         assert!(complete, "transaction boundaries did not finish");
         assert!(error_sqlstates(session.send.readable()).is_empty());
-        assert!(session.send.readable().starts_with(&prefix));
-        assert_eq!(data_rows(session.send.readable()), ["1|1", "2"]);
+        assert_eq!(data_rows(session.send.readable()), ["0|", "2"]);
         assert_eq!(
             message_types(session.send.readable())
                 .iter()

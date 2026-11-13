@@ -2530,7 +2530,7 @@ pub(crate) fn index_access_plan<'a>(
         // though they are not compile-time constants. Calls and subqueries can
         // change between candidate selection and recheck.
         expr_tables(operand, scope) == Some(0)
-            && !operand.contains_call()
+            && !operand.calls_routine()
             && !operand.contains_subquery()
     };
     let Some(predicate) = where_clause else {
@@ -2624,7 +2624,7 @@ pub(crate) fn parameterized_index_access_plan<'a>(
         }
     };
     let operand_bindings = |operand: &Expr<'a>| {
-        if operand.contains_call() || operand.contains_subquery() {
+        if operand.calls_routine() || operand.contains_subquery() {
             return None;
         }
         let mut tables = 0u64;
@@ -2817,7 +2817,7 @@ pub(crate) fn ordered_index_access_plan<'a>(
     };
     let operand_is_invariant = |operand: &Expr<'a>| {
         expr_tables(operand, scope) == Some(0)
-            && !operand.contains_call()
+            && !operand.calls_routine()
             && !operand.contains_subquery()
     };
     if let Some(predicate) = where_clause {
@@ -3027,6 +3027,9 @@ fn dml_index_operand_is_invariant(expression: &Expr<'_>) -> bool {
                     .all(|expression| dml_index_operand_is_invariant(expression))
         }
         Expr::Array(elements) => elements
+            .iter()
+            .all(|expression| dml_index_operand_is_invariant(expression)),
+        Expr::Call { args, .. } if expression.is_row_constructor() => args
             .iter()
             .all(|expression| dml_index_operand_is_invariant(expression)),
         Expr::Subscript { base, index } => {

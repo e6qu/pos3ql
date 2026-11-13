@@ -25,7 +25,7 @@ use super::group::row_passes_correlated_where;
 use super::subquery::{correlated_in_expression, correlated_scan_conjuncts};
 use super::{
     AggState, GroupedRewrite, Outcome, QueryScope, arena_full, collect_grouped_aggs,
-    collect_grouped_sublinks, merge_correlated, pax_column_demand, project_row, record_star_width,
+    collect_grouped_sublinks, pax_column_demand, project_row, record_star_width,
     rewrite_grouped_expr, scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
     sql_fail, sql_ok, window_row,
 };
@@ -1806,11 +1806,6 @@ pub(crate) fn project_window_rows<'a>(
 ) -> Result<WindowRows<'a>, SqlError> {
     let (scan_where, where_correlated) = window_scan_where(statement, correlated, arena)?;
     let pax_columns = window_pax_columns(statement, scope, from, win_nodes, arena)?;
-    // Per-row correlated-subquery scratch, allocated once and reused across
-    // both passes and the per-output-row merge below: per-row merges must not
-    // grow the statement arena.
-    let (where_scalars, where_lists) =
-        super::subquery::alloc_merge_scratch(Some(base), correlated, arena)?;
     // Flat-row column offsets per table.
     let offs = arena
         .alloc_slice_with(scope.n, |_| 0usize)
@@ -1838,15 +1833,11 @@ pub(crate) fn project_window_rows<'a>(
             if !row_passes_correlated_where(
                 where_correlated,
                 statement.where_clause,
-                storage,
-                txid,
                 arena,
                 params,
                 hooks,
                 row,
                 outer,
-                &mut *where_scalars,
-                &mut *where_lists,
             )? {
                 return Ok(true);
             }
@@ -1875,15 +1866,11 @@ pub(crate) fn project_window_rows<'a>(
             if !row_passes_correlated_where(
                 where_correlated,
                 statement.where_clause,
-                storage,
-                txid,
                 arena,
                 params,
                 hooks,
                 row,
                 outer,
-                &mut *where_scalars,
-                &mut *where_lists,
             )? {
                 return Ok(true);
             }
@@ -1985,19 +1972,7 @@ pub(crate) fn project_window_rows<'a>(
         let subs = if correlated.is_empty() {
             hooks.subs
         } else {
-            row_subs = merge_correlated(
-                correlated,
-                base,
-                &jr,
-                outer,
-                storage,
-                txid,
-                arena,
-                params,
-                &mut *where_scalars,
-                &mut *where_lists,
-                hooks.sequences,
-            )?;
+            row_subs = super::subquery::correlated_row(base, &jr, outer);
             Some(&row_subs)
         };
         let win_hooks = EvalHooks {
@@ -2265,10 +2240,6 @@ pub(crate) fn external_window_into<'a>(
 ) -> Result<u64, SqlError> {
     let (scan_where, where_correlated) = window_scan_where(statement, correlated, arena)?;
     let pax_columns = window_pax_columns(statement, scope, from, win_nodes, arena)?;
-    // Per-row correlated-subquery scratch, allocated once and reused across
-    // every scan pass below: per-row merges must not grow the statement arena.
-    let (where_scalars, where_lists) =
-        super::subquery::alloc_merge_scratch(Some(base), correlated, arena)?;
     // Flat-row column offsets per table.
     let offs = arena
         .alloc_slice_with(scope.n, |_| 0usize)
@@ -2377,15 +2348,11 @@ pub(crate) fn external_window_into<'a>(
                 if !row_passes_correlated_where(
                     where_correlated,
                     statement.where_clause,
-                    storage,
-                    txid,
                     arena,
                     params,
                     hooks,
                     row,
                     outer,
-                    &mut *where_scalars,
-                    &mut *where_lists,
                 )? {
                     return Ok(true);
                 }
@@ -2683,15 +2650,11 @@ pub(crate) fn external_window_into<'a>(
             if !row_passes_correlated_where(
                 where_correlated,
                 statement.where_clause,
-                storage,
-                txid,
                 arena,
                 params,
                 hooks,
                 row,
                 outer,
-                &mut *where_scalars,
-                &mut *where_lists,
             )? {
                 return Ok(true);
             }
@@ -2735,19 +2698,7 @@ pub(crate) fn external_window_into<'a>(
             let subs = if correlated.is_empty() {
                 hooks.subs
             } else {
-                row_subs = merge_correlated(
-                    correlated,
-                    base,
-                    row,
-                    outer,
-                    storage,
-                    txid,
-                    arena,
-                    params,
-                    &mut *where_scalars,
-                    &mut *where_lists,
-                    hooks.sequences,
-                )?;
+                row_subs = super::subquery::correlated_row(base, row, outer);
                 Some(&row_subs)
             };
             let win_hooks = EvalHooks {

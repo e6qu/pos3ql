@@ -4900,6 +4900,7 @@ fn materialize_lateral<'a, C: ColumnLookup<'a>>(
             deferred: slots,
             statement: slots,
             bindings: &[],
+            correlated: None,
         };
         let correlated = super::ProceduralSubqueries { storage, txid };
         let hooks = EvalHooks {
@@ -6305,10 +6306,10 @@ fn reads_no_query_column(
                     .lists
                     .iter()
                     .any(|list| core::ptr::eq(list.node.cast::<()>(), address))
-                || subs
-                    .deferred
-                    .iter()
-                    .any(|deferred| core::ptr::eq(deferred.node, address))
+                || subs.deferred.iter().any(|deferred| {
+                    // A correlated subquery is deferred too, and runs per row.
+                    core::ptr::eq(deferred.node, address) && deferred.cache.is_some()
+                })
         })
     };
     match expression {

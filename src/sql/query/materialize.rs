@@ -19,8 +19,8 @@ use crate::{sql_err, stack_format};
 
 use super::{
     Chained, JoinRow, Outcome, QueryScope, ResolvedColumn, arena_full, correlated_in_expression,
-    correlated_scan_conjuncts, correlated_where_passes, has_project_set, merge_correlated,
-    pax_column_demand, postpone_cost, prepare_project_set, project_row_skipping, record_star_width,
+    correlated_scan_conjuncts, correlated_where_passes, has_project_set, pax_column_demand,
+    postpone_cost, prepare_project_set, project_row_skipping, record_star_width,
     resolve_order_target, scan_source_recycling_with_indexed_candidates,
     scan_source_recycling_with_pax_columns, sql_fail, sql_ok,
 };
@@ -233,60 +233,26 @@ fn for_each_materialized_projection<'a>(
     postponed: Option<&[bool; MAX_PROJ]>,
     has_srf: bool,
     outer: Option<&dyn ColumnLookup<'a>>,
-    scalars: &mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)],
-    lists: &mut [crate::sql::eval::SubqueryList<'a>],
     consume: &mut impl FnMut(&JoinRow<'_, 'a, '_>, &[Datum<'a>], &[Datum<'a>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     if !where_correlated.is_empty()
         && !correlated_where_passes(
-            where_correlated,
             base,
             statement.where_clause,
             row,
             outer,
-            storage,
-            txid,
             arena,
             params,
             hooks,
-            &mut *scalars,
-            &mut *lists,
         )?
     {
         return Ok(());
     }
-    let row_subqueries;
-    let owned_hooks;
-    let row_hooks: &EvalHooks = if correlated.is_empty() {
-        hooks
-    } else {
-        row_subqueries = merge_correlated(
-            correlated,
-            base,
-            row,
-            outer,
-            storage,
-            txid,
-            arena,
-            params,
-            &mut *scalars,
-            &mut *lists,
-            hooks.sequences,
-        )?;
-        owned_hooks = EvalHooks {
-            group: None,
-            aggs: None,
-            subs: Some(&row_subqueries),
-            subquery_executor: hooks.subquery_executor,
-            windows: None,
-            catalog: hooks.catalog,
-            srf_index: None,
-            project_sets: None,
-            sequences: hooks.sequences,
-            merge_action: hooks.merge_action,
-        };
-        &owned_hooks
-    };
+    // The row's correlated subqueries run as its expressions reach them.
+    if !correlated.is_empty() {
+        super::subquery::bind_correlated_row(base, row, outer);
+    }
+    let row_hooks = hooks;
     let project_set = if has_srf {
         prepare_project_set(
             statement.items,
@@ -492,8 +458,6 @@ pub(super) struct LockedRowRecheck<'r, 'a> {
     params: &'r [Datum<'a>],
     hooks: &'r EvalHooks<'r, 'a>,
     outer: Option<&'r dyn ColumnLookup<'a>>,
-    scalars: &'a mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)],
-    lists: &'a mut [crate::sql::eval::SubqueryList<'a>],
     changed: &'a mut [Option<usize>],
 }
 
@@ -802,20 +766,6 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
     ) -> Result<Self, SqlError> {
         let plan =
             prepare_materialization(storage, txid, statement, scope, correlated, outer, arena)?;
-        let (n_where_scalars, n_where_lists) =
-            super::subquery::merge_scratch_lens(Some(base), plan.where_correlated);
-        let (n_row_scalars, n_row_lists) =
-            super::subquery::merge_scratch_lens(Some(base), correlated);
-        let scalars = arena
-            .alloc_slice_with(n_where_scalars.max(n_row_scalars), |_| {
-                (core::ptr::null(), Datum::Null, Datum::Null)
-            })
-            .map_err(|_| arena_full())?;
-        let lists = arena
-            .alloc_slice_with(n_where_lists.max(n_row_lists), |_| {
-                super::subquery::empty_subquery_list()
-            })
-            .map_err(|_| arena_full())?;
         let changed = arena
             .alloc_slice_with(scope.n, |_| None)
             .map_err(|_| arena_full())?;
@@ -829,8 +779,6 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
             params,
             hooks,
             outer,
-            scalars,
-            lists,
             changed,
         })
     }
@@ -1158,8 +1106,6 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
             },
             self.plan.has_srf,
             self.outer,
-            &mut *self.scalars,
-            &mut *self.lists,
             &mut |row, projected, keys| {
                 if rebuilt.is_none() {
                     rebuilt = Some(encode_materialized_row(
@@ -1952,23 +1898,6 @@ pub(crate) fn materialized_rows<'a>(
         any_postponed,
         has_srf,
     } = plan;
-    // Per-row correlated-subquery scratch, allocated once and reused for
-    // every row: per-row merges must not grow the statement arena. The
-    // WHERE gate and the row merge share the pair, so it is sized for the
-    // wider of the two.
-    let (n_where_scalars, n_where_lists) =
-        super::subquery::merge_scratch_lens(Some(base), where_correlated);
-    let (n_row_scalars, n_row_lists) = super::subquery::merge_scratch_lens(Some(base), correlated);
-    let merge_scalars = arena
-        .alloc_slice_with(n_where_scalars.max(n_row_scalars), |_| {
-            (core::ptr::null(), Datum::Null, Datum::Null)
-        })
-        .map_err(|_| arena_full())?;
-    let merge_lists = arena
-        .alloc_slice_with(n_where_lists.max(n_row_lists), |_| {
-            super::subquery::empty_subquery_list()
-        })
-        .map_err(|_| arena_full())?;
     let ordered_candidates = if !statement.distinct
         && statement.distinct_on.is_empty()
         && n_order > 0
@@ -2033,8 +1962,6 @@ pub(crate) fn materialized_rows<'a>(
             },
             has_srf,
             outer,
-            &mut *merge_scalars,
-            &mut *merge_lists,
             &mut |row, projected, keys| {
                 let output = encode_materialized_row(
                     scope,
@@ -2511,22 +2438,6 @@ pub(crate) fn external_materialized_into<'a>(
 ) -> Result<u64, SqlError> {
     let plan = prepare_materialization(storage, txid, statement, scope, correlated, outer, arena)?;
     let pax_columns = materialization_pax_columns(statement, scope, from, &plan);
-    // Per-row correlated-subquery scratch, allocated once and reused: per-row
-    // merges must not grow the statement arena. Sized for the wider of the
-    // WHERE gate and the row merge, which share the pair.
-    let (n_where_scalars, n_where_lists) =
-        super::subquery::merge_scratch_lens(Some(base), plan.where_correlated);
-    let (n_row_scalars, n_row_lists) = super::subquery::merge_scratch_lens(Some(base), correlated);
-    let merge_scalars = arena
-        .alloc_slice_with(n_where_scalars.max(n_row_scalars), |_| {
-            (core::ptr::null(), Datum::Null, Datum::Null)
-        })
-        .map_err(|_| arena_full())?;
-    let merge_lists = arena
-        .alloc_slice_with(n_where_lists.max(n_row_lists), |_| {
-            super::subquery::empty_subquery_list()
-        })
-        .map_err(|_| arena_full())?;
     let source_rowids = arena
         .alloc_slice_with(scope.n, |_| None)
         .map_err(|_| arena_full())?;
@@ -2613,8 +2524,6 @@ pub(crate) fn external_materialized_into<'a>(
                     None,
                     false,
                     outer,
-                    &mut *merge_scalars,
-                    &mut *merge_lists,
                     &mut |_row, projected, _keys| {
                         if logical_index >= offset {
                             keep_emitting = emit(projected, source_rowids)?;
@@ -2668,8 +2577,6 @@ pub(crate) fn external_materialized_into<'a>(
             },
             plan.has_srf,
             outer,
-            &mut *merge_scalars,
-            &mut *merge_lists,
             &mut |row, projected, keys| {
                 storage
                     .with_block_store(|blocks| {

@@ -18,8 +18,8 @@ use super::ast::{
     WindowFrame,
 };
 use super::eval::{
-    CatalogAccess, ColumnLookup, EvalHooks, PrivilegeRelation, SequenceAccess, SqlError,
-    SubqueryValues, eval_full, resolved_expression_collation, sqlstate,
+    CatalogAccess, ColumnLookup, EvalHooks, PrivilegeRelation, SequenceAccess, SqlError, eval_full,
+    resolved_expression_collation, sqlstate,
 };
 use super::exec::{MAX_PROJ, describe_items};
 use super::types::{ColDesc, ColType, Datum};
@@ -856,11 +856,11 @@ mod subquery;
 #[cfg(test)]
 pub(crate) use subquery::subquery_analyses;
 pub(crate) use subquery::{
-    DmlSubqueries, ProceduralSubqueries, SubqueryBinding, check_sublink_columns,
-    subquery_expression_type,
+    CorrelatedSubqueries, DmlSubqueries, ProceduralSubqueries, SubqueryBinding,
+    check_sublink_columns, subquery_expression_type,
 };
 use subquery::{
-    correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, merge_correlated,
+    correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes,
     prepare_outer_subqueries,
 };
 pub(crate) use subquery::{
@@ -1770,13 +1770,6 @@ pub(crate) fn reopen_reads_after_kept_work() {
 /// Changes whenever any statement starts an effect.
 pub(crate) fn statement_effect_epoch() -> u64 {
     STATEMENT_EFFECT_EPOCH.with(Cell::get)
-}
-
-/// Whether the running statement reads data-modifying `WITH` queries.
-pub(crate) fn statement_reads_write_queries() -> bool {
-    with_active_routine_invocations(|context| {
-        context.is_some_and(|(invocations, _)| invocations.reads_writes.get())
-    })
 }
 
 /// Whether the running statement attempt has invoked a routine whose result
@@ -8244,64 +8237,6 @@ fn patch_param_column_types<'a>(
     Ok(())
 }
 
-type CorrelatedScalarScratch<'a> = [(*const Expr<'a>, Datum<'a>, Datum<'a>)];
-type CorrelatedListScratch<'a> = [super::eval::SubqueryList<'a>];
-
-/// Materializes only the correlated subqueries needed for one source row.
-/// Streaming and row-emitting SELECT share this arena-backed seam, keeping
-/// per-row visibility and scratch bounds identical.
-#[allow(clippy::too_many_arguments)]
-fn correlated_row_subqueries<'a, 'scratch>(
-    correlated: &[&'a Expr<'a>],
-    base: &SubqueryValues<'a, 'a>,
-    row: &dyn ColumnLookup<'a>,
-    enclosing: Option<&dyn ColumnLookup<'a>>,
-    storage: &'a Storage,
-    txid: u32,
-    arena: &'a Arena,
-    params: &[Datum<'a>],
-    scalar_scratch: &'scratch mut CorrelatedScalarScratch<'a>,
-    list_scratch: &'scratch mut CorrelatedListScratch<'a>,
-    sequences: Option<&dyn SequenceAccess>,
-) -> Result<Option<SubqueryValues<'scratch, 'a>>, SqlError> {
-    if correlated.is_empty() {
-        Ok(None)
-    } else {
-        merge_correlated(
-            correlated,
-            base,
-            row,
-            enclosing,
-            storage,
-            txid,
-            arena,
-            params,
-            scalar_scratch,
-            list_scratch,
-            sequences,
-        )
-        .map(Some)
-    }
-}
-
-fn correlated_row_hooks<'scratch, 'a>(
-    base: &EvalHooks<'scratch, 'a>,
-    subqueries: &'scratch SubqueryValues<'scratch, 'a>,
-) -> EvalHooks<'scratch, 'a> {
-    EvalHooks {
-        group: None,
-        aggs: None,
-        subs: Some(subqueries),
-        subquery_executor: base.subquery_executor,
-        windows: None,
-        catalog: base.catalog,
-        srf_index: None,
-        project_sets: None,
-        sequences: base.sequences,
-        merge_action: base.merge_action,
-    }
-}
-
 /// PostgreSQL checks `EXECUTE` on every function a plan calls when the
 /// executor starts, so a revoked function fails even when no row reaches it.
 pub(super) fn require_select_routine_execute<'a>(
@@ -11669,22 +11604,6 @@ pub(crate) fn select_query_resumable<'a>(
         // scan path retains full rows until it proves an equivalent contract.
         let pax_columns =
             streaming_pax_columns(&scope, from, statement.items, statement.where_clause);
-        // Per-row correlated-subquery scratch, allocated once and reused: the
-        // per-row rewind below reclaims the merged values, not this scratch.
-        let (n_scalar_scratch, n_list_scratch) =
-            subquery::merge_scratch_lens(Some(&outer_subs.base), correlated);
-        let scalar_scratch: &mut CorrelatedScalarScratch = match arena
-            .alloc_slice_with(n_scalar_scratch, |_| {
-                (core::ptr::null(), Datum::Null, Datum::Null)
-            }) {
-            Ok(s) => s,
-            Err(_) => return sql_fail(arena_full()),
-        };
-        let list_scratch: &mut CorrelatedListScratch =
-            match arena.alloc_slice_with(n_list_scratch, |_| subquery::empty_subquery_list()) {
-                Ok(s) => s,
-                Err(_) => return sql_fail(arena_full()),
-            };
         let scan = scan_source_recycling_with_pax_columns(
             storage,
             &scope,
@@ -11702,44 +11621,21 @@ pub(crate) fn select_query_resumable<'a>(
                 }
                 if !where_correlated.is_empty()
                     && !correlated_where_passes(
-                        where_correlated,
                         &outer_subs.base,
                         statement.where_clause,
                         row,
                         None,
-                        storage,
-                        txid,
                         arena,
                         params,
                         &hooks,
-                        scalar_scratch,
-                        list_scratch,
                     )?
                 {
                     return Ok(true);
                 }
-                // Per-row hooks for correlated subqueries; then WHERE.
-                let row_subqueries = correlated_row_subqueries(
-                    correlated,
-                    &outer_subs.base,
-                    row,
-                    None,
-                    storage,
-                    txid,
-                    arena,
-                    params,
-                    scalar_scratch,
-                    list_scratch,
-                    hooks.sequences,
-                )?;
-                let row_hooks_owned;
-                let row_hooks: &EvalHooks = match row_subqueries.as_ref() {
-                    Some(subqueries) => {
-                        row_hooks_owned = correlated_row_hooks(&hooks, subqueries);
-                        &row_hooks_owned
-                    }
-                    None => &hooks,
-                };
+                // The row's correlated subqueries run as its expressions
+                // reach them.
+                subquery::bind_correlated_row(&outer_subs.base, row, None);
+                let row_hooks = &hooks;
                 // Number of output rows this source row yields (1, unless an
                 // `_pg_expandarray` expands it per array element).
                 let project_set = if projection_has_project_set {
@@ -13499,58 +13395,23 @@ fn select_into_rows_mode<'a>(
     // source row into one output row per array element.
     let srf_call = find_srf(statement.items);
     let projection_has_project_set = has_project_set(statement.items, storage, txid);
-    // Per-row correlated-subquery scratch, allocated once and reused across
-    // the scan (this path may run without per-row arena recycling).
-    let (n_scalar_scratch, n_list_scratch) =
-        subquery::merge_scratch_lens(Some(&outer_subs.base), correlated);
-    let scalar_scratch: &mut CorrelatedScalarScratch = arena
-        .alloc_slice_with(n_scalar_scratch, |_| {
-            (core::ptr::null(), Datum::Null, Datum::Null)
-        })
-        .map_err(|_| arena_full())?;
-    let list_scratch: &mut CorrelatedListScratch = arena
-        .alloc_slice_with(n_list_scratch, |_| subquery::empty_subquery_list())
-        .map_err(|_| arena_full())?;
     let mut visit = |row: &JoinRow<'_, 'a, '_>| {
         if !where_correlated.is_empty()
             && !correlated_where_passes(
-                where_correlated,
                 &outer_subs.base,
                 statement.where_clause,
                 row,
                 outer,
-                storage,
-                txid,
                 arena,
                 params,
                 &hooks,
-                scalar_scratch,
-                list_scratch,
             )?
         {
             return Ok(true);
         }
-        let row_subqueries = correlated_row_subqueries(
-            correlated,
-            &outer_subs.base,
-            row,
-            outer,
-            storage,
-            txid,
-            arena,
-            params,
-            scalar_scratch,
-            list_scratch,
-            hooks.sequences,
-        )?;
-        let row_hooks_owned;
-        let row_hooks: &EvalHooks = match row_subqueries.as_ref() {
-            Some(subqueries) => {
-                row_hooks_owned = correlated_row_hooks(&hooks, subqueries);
-                &row_hooks_owned
-            }
-            None => &hooks,
-        };
+        // The row's correlated subqueries run as its expressions reach them.
+        subquery::bind_correlated_row(&outer_subs.base, row, outer);
+        let row_hooks = &hooks;
         let mut projected = [Datum::Null; MAX_PROJ];
         let project_set = if projection_has_project_set {
             prepare_project_set(

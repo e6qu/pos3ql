@@ -9,7 +9,7 @@
 use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::Responder;
 use crate::sql::ast::{Collation, Expr, FromClause, GroupingSet, Select, SelectItem};
-use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, SubqueryList, eval_full, sqlstate};
+use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, eval_full, sqlstate};
 use crate::sql::types::Datum;
 use crate::sql_err;
 use crate::stack_format;
@@ -17,8 +17,7 @@ use crate::stack_format;
 use crate::sql::exec::MAX_PROJ;
 
 use super::aggregate::AggState;
-use super::plan::where_passes;
-use super::subquery::{correlated_in_expression, correlated_scan_conjuncts, merge_correlated};
+use super::subquery::{correlated_in_expression, correlated_scan_conjuncts};
 use super::{
     JoinRow, Outcome, QueryScope, ScopeSchema, arena_full, expr_contains_node, pax_column_demand,
     resolve_order_target, scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
@@ -46,57 +45,35 @@ pub(super) fn compare_group_rows(
 }
 
 /// With correlated subqueries in WHERE, the filter cannot run inside
-/// `scan_source` (their values change per row): re-evaluate those subqueries
-/// (`where_correlated`, only the ones inside WHERE) against this row, then
-/// apply WHERE under the merged hooks. With none this is a no-op (the scan
-/// already filtered).
-#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
+/// `scan_source` (their values change per row): apply WHERE to this row, its
+/// correlated subqueries running as the condition reaches them. With none
+/// this is a no-op (the scan already filtered).
 pub(super) fn row_passes_correlated_where<'a>(
     where_correlated: &'a [&'a Expr<'a>],
     where_clause: Option<&'a Expr<'a>>,
-    storage: &'a Storage,
-    txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     row: &JoinRow<'_, 'a, '_>,
     outer: Option<&dyn ColumnLookup<'a>>,
-    scalars: &mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)],
-    lists: &mut [SubqueryList<'a>],
 ) -> Result<bool, SqlError> {
     if where_correlated.is_empty() {
         return Ok(true);
     }
-    let Some(w) = where_clause else {
-        return Ok(true);
-    };
     let base = hooks.subs.expect("outer subqueries prepared");
     // Only the verdict escapes: the subqueries' values and the condition's
     // scratch are reclaimed even when the scan keeps each row's allocations.
     let mark = arena.mark();
-    let passes = (|| {
-        let row_subs = merge_correlated(
-            where_correlated,
-            base,
-            row,
-            outer,
-            storage,
-            txid,
-            arena,
-            params,
-            &mut *scalars,
-            &mut *lists,
-            hooks.sequences,
-        )?;
-        let h = EvalHooks {
-            subs: Some(&row_subs),
-            ..*hooks
-        };
-        let row = super::Chained { inner: row, outer };
-        where_passes(w, arena, params, &row, &h)
-    })();
-    // SAFETY: the merged values live only in `scalars` and `lists`, which
-    // the next merge overwrites before any read; nothing else escapes.
+    let passes = super::subquery::correlated_where_passes(
+        base,
+        where_clause,
+        row,
+        outer,
+        arena,
+        params,
+        hooks,
+    );
+    // SAFETY: nothing the evaluation allocated escapes its verdict.
     unsafe { arena.rewind_to(mark) };
     passes
 }
@@ -239,10 +216,6 @@ pub(super) fn groups_for_mask<'a>(
     let group_of: &mut [u32] = arena
         .alloc_slice_with(row_count, |_| 0u32)
         .map_err(|_| arena_full())?;
-    // Per-row correlated-subquery scratch, allocated once and reused: per-row
-    // merges must not grow the statement arena.
-    let (where_scalars, where_lists) =
-        super::subquery::alloc_merge_scratch(hooks.subs, correlated, arena)?;
     let (n_groups, rep_keys): (usize, &[&[u8]]) = if storage.spill_attached() && n_keys > 0 {
         let mut sorter = storage.external_sorter()?;
         sorter.reset();
@@ -273,15 +246,11 @@ pub(super) fn groups_for_mask<'a>(
                 if !row_passes_correlated_where(
                     where_correlated,
                     statement.where_clause,
-                    storage,
-                    txid,
                     arena,
                     params,
                     hooks,
                     row,
                     outer,
-                    &mut *where_scalars,
-                    &mut *where_lists,
                 )? {
                     return Ok(true);
                 }
@@ -290,19 +259,11 @@ pub(super) fn groups_for_mask<'a>(
                 let row_hooks: &EvalHooks = if key_correlated.is_empty() {
                     hooks
                 } else {
-                    row_subs = merge_correlated(
-                        key_correlated,
+                    row_subs = super::subquery::correlated_row(
                         hooks.subs.expect("outer subqueries prepared"),
                         row,
                         outer,
-                        storage,
-                        txid,
-                        arena,
-                        params,
-                        &mut *where_scalars,
-                        &mut *where_lists,
-                        hooks.sequences,
-                    )?;
+                    );
                     row_hooks_store = EvalHooks {
                         subs: Some(&row_subs),
                         ..*hooks
@@ -408,15 +369,11 @@ pub(super) fn groups_for_mask<'a>(
                     if !row_passes_correlated_where(
                         where_correlated,
                         statement.where_clause,
-                        storage,
-                        txid,
                         arena,
                         params,
                         hooks,
                         row,
                         outer,
-                        &mut *where_scalars,
-                        &mut *where_lists,
                     )? {
                         return Ok(true);
                     }
@@ -425,19 +382,11 @@ pub(super) fn groups_for_mask<'a>(
                     let row_hooks: &EvalHooks = if key_correlated.is_empty() {
                         hooks
                     } else {
-                        row_subs = merge_correlated(
-                            key_correlated,
+                        row_subs = super::subquery::correlated_row(
                             hooks.subs.expect("outer subqueries prepared"),
                             row,
                             outer,
-                            storage,
-                            txid,
-                            arena,
-                            params,
-                            &mut *where_scalars,
-                            &mut *where_lists,
-                            hooks.sequences,
-                        )?;
+                        );
                         row_hooks_store = EvalHooks {
                             subs: Some(&row_subs),
                             ..*hooks
@@ -640,15 +589,11 @@ pub(super) fn groups_for_mask<'a>(
             if !row_passes_correlated_where(
                 where_correlated,
                 statement.where_clause,
-                storage,
-                txid,
                 arena,
                 params,
                 hooks,
                 row,
                 outer,
-                &mut *where_scalars,
-                &mut *where_lists,
             )? {
                 return Ok(true);
             }
@@ -659,19 +604,11 @@ pub(super) fn groups_for_mask<'a>(
             let row_hooks: &EvalHooks = if row_correlated.is_empty() {
                 hooks
             } else {
-                row_subs = merge_correlated(
-                    row_correlated,
+                row_subs = super::subquery::correlated_row(
                     hooks.subs.expect("outer subqueries prepared"),
                     row,
                     outer,
-                    storage,
-                    txid,
-                    arena,
-                    params,
-                    &mut *where_scalars,
-                    &mut *where_lists,
-                    hooks.sequences,
-                )?;
+                );
                 row_hooks_store = EvalHooks {
                     subs: Some(&row_subs),
                     ..*hooks
@@ -763,10 +700,6 @@ pub(super) fn groups_for_mask<'a>(
     let per_group: &mut [&[&[u8]]] = arena
         .alloc_slice_with(n_groups, |_| empty_group)
         .map_err(|_| arena_full())?;
-    let (group_scalars, group_lists) =
-        super::subquery::alloc_merge_scratch(hooks.subs, output_correlated, arena)?;
-    let (having_scalars, having_lists) =
-        super::subquery::alloc_merge_scratch(hooks.subs, having_correlated, arena)?;
     let mut output_count = 0usize;
     for g in 0..n_groups {
         let mut key_vals = [Datum::Null; crate::sql::parser::MAX_GROUP_TERMS];
@@ -822,19 +755,11 @@ pub(super) fn groups_for_mask<'a>(
             let having_hooks = if having_correlated.is_empty() {
                 base_hooks
             } else {
-                having_subs = merge_correlated(
-                    having_correlated,
+                having_subs = super::subquery::correlated_row(
                     hooks.subs.expect("outer subqueries prepared"),
                     &group_row,
                     outer,
-                    storage,
-                    txid,
-                    arena,
-                    params,
-                    &mut *having_scalars,
-                    &mut *having_lists,
-                    hooks.sequences,
-                )?;
+                );
                 EvalHooks {
                     subs: Some(&having_subs),
                     ..base_hooks
@@ -855,19 +780,11 @@ pub(super) fn groups_for_mask<'a>(
         let group_hooks = if output_correlated.is_empty() {
             base_hooks
         } else {
-            merged_subs = merge_correlated(
-                output_correlated,
+            merged_subs = super::subquery::correlated_row(
                 hooks.subs.expect("outer subqueries prepared"),
                 &group_row,
                 outer,
-                storage,
-                txid,
-                arena,
-                params,
-                &mut *group_scalars,
-                &mut *group_lists,
-                hooks.sequences,
-            )?;
+            );
             EvalHooks {
                 subs: Some(&merged_subs),
                 ..base_hooks
@@ -1030,10 +947,6 @@ pub(super) fn grouped_rows<'a>(
         }
     }
     let row_correlated = row_correlated.as_slice();
-    // Per-row correlated-subquery scratch, allocated once and reused: per-row
-    // merges must not grow the statement arena.
-    let (where_scalars, where_lists) =
-        super::subquery::alloc_merge_scratch(hooks.subs, correlated, arena)?;
     let mut row_count = 0usize;
     // A global aggregate has one group even for an empty source. It needs no
     // per-row group assignments and must not execute its source just to size them.
@@ -1053,15 +966,11 @@ pub(super) fn grouped_rows<'a>(
                 if !row_passes_correlated_where(
                     where_correlated,
                     statement.where_clause,
-                    storage,
-                    txid,
                     arena,
                     params,
                     hooks,
                     row,
                     outer,
-                    &mut *where_scalars,
-                    &mut *where_lists,
                 )? {
                     return Ok(true);
                 }

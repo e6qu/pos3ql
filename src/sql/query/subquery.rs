@@ -1654,6 +1654,7 @@ pub fn prepare_subqueries<'a>(
             uncorrelated: false,
             command: None,
         },
+        &[],
     )
 }
 
@@ -1671,6 +1672,8 @@ fn eval_subquery_nodes<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
     timing: SubqueryTiming,
+    // Correlated subqueries the statement bound once, for a run `Now`.
+    bindings: &[SubqueryBinding<'a>],
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
     let defers = |_: &Expr<'_>| matches!(timing, SubqueryTiming::FirstRead { .. });
     let n_list_nodes = nodes
@@ -1800,14 +1803,31 @@ fn eval_subquery_nodes<'a>(
                 Expr::Subquery(select) => {
                     if storage.spill_attached() {
                         let (value, witness) = streaming_scalar_subquery(
-                            select, storage, txid, arena, params, depth, outer, sequences, None,
+                            select,
+                            storage,
+                            txid,
+                            arena,
+                            params,
+                            depth,
+                            outer,
+                            sequences,
+                            SubqueryBinding::of(bindings, select),
                         )?;
                         scalars[n_scalars] = (*node as *const _, value, witness);
                         n_scalars += 1;
                         return Ok(());
                     }
                     let (values, _, witness) = run_subquery(
-                        select, storage, txid, arena, params, depth, outer, 1, sequences, None,
+                        select,
+                        storage,
+                        txid,
+                        arena,
+                        params,
+                        depth,
+                        outer,
+                        1,
+                        sequences,
+                        SubqueryBinding::of(bindings, select),
                     )?;
                     if values.len() > 1 {
                         return Err(sql_err!(
@@ -1838,7 +1858,16 @@ fn eval_subquery_nodes<'a>(
                     }
                     let plan = array_subquery_plan(select, storage, txid, arena, outer)?;
                     let (values, _, _) = run_subquery(
-                        select, storage, txid, arena, params, depth, outer, 1, sequences, None,
+                        select,
+                        storage,
+                        txid,
+                        arena,
+                        params,
+                        depth,
+                        outer,
+                        1,
+                        sequences,
+                        SubqueryBinding::of(bindings, select),
                     )?;
                     let v = build_array_scalar(values, plan, storage, txid, arena)?;
                     scalars[n_scalars] = (*node as *const _, v, v);
@@ -1912,6 +1941,7 @@ fn eval_subquery_nodes<'a>(
         deferred,
         statement: outer.map_or(&[], |outer| outer.statement_subqueries()),
         bindings: &[],
+        correlated: None,
     })
 }
 
@@ -1944,24 +1974,6 @@ enum SubqueryTiming {
         uncorrelated: bool,
         command: Option<u32>,
     },
-}
-
-/// Whether running a scalar subquery early would reorder its effects: it
-/// calls a volatile function, or its statement reads data-modifying `WITH`
-/// queries, which run when first read. `IN` and quantified subqueries are
-/// prepared before their expressions.
-fn subquery_has_effects(node: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
-    let (Expr::Subquery(select)
-    | Expr::RowSubquery { select, .. }
-    | Expr::Exists(select)
-    | Expr::ArraySubquery(select)
-    | Expr::InSubquery { select, .. }
-    | Expr::QuantifiedSubquery { select, .. }) = node
-    else {
-        return false;
-    };
-    super::statement_reads_write_queries()
-        || super::cte::select_contains_volatile(select, storage, txid)
 }
 
 /// Runs a subquery only to determine whether it yields any row (EXISTS).
@@ -2606,9 +2618,40 @@ pub(super) fn prepare_outer_subqueries<'a>(
             uncorrelated: true,
             command: None,
         },
+        &[],
     )?;
     base.statement = statement;
     base.bindings = bind_correlated_subqueries(corr.as_slice(), storage, txid, arena, row_types)?;
+    // The correlated subqueries run where evaluation reaches them, for the
+    // row the query bound last, as PostgreSQL's subplans do.
+    if !corr.is_empty() {
+        let row =
+            core::cell::Cell::from_mut(arena.alloc(None::<BoundRow>).map_err(|_| arena_full())?);
+        let runner: &'a CorrelatedSubqueries<'a> = arena
+            .alloc(CorrelatedSubqueries {
+                storage,
+                txid,
+                bindings: base.bindings,
+                statement,
+                row,
+            })
+            .map_err(|_| arena_full())?;
+        let uncorrelated = base.deferred;
+        let correlated = corr.as_slice();
+        base.deferred = arena
+            .alloc_slice_with(uncorrelated.len() + correlated.len(), |index| {
+                uncorrelated.get(index).copied().unwrap_or_else(|| {
+                    super::super::eval::DeferredSubquery {
+                        node: (correlated[index - uncorrelated.len()] as *const Expr).cast(),
+                        executor: runner,
+                        owner: arena,
+                        cache: None,
+                    }
+                })
+            })
+            .map_err(|_| arena_full())?;
+        base.correlated = Some(runner);
+    }
     Ok(OuterSubs {
         base,
         correlated: corr.as_slice(),
@@ -2663,6 +2706,7 @@ pub(super) fn first_read_subqueries<'a>(
         deferred: statement_slots(nodes, storage, txid, arena)?,
         statement: &[],
         bindings: &[],
+        correlated: None,
     })
 }
 
@@ -2920,368 +2964,180 @@ impl super::super::eval::SubqueryExecution for StatementSubqueries<'_> {
     }
 }
 
-/// The exact scratch sizes `merge_correlated` fills for `base` + `correlated`
-/// (scalar slots, list slots). Callers allocate once per statement execution
-/// and reuse the slices across rows, so per-row merges never grow the arena.
-pub(super) fn merge_scratch_lens(
-    base: Option<&SubqueryValues<'_, '_>>,
-    correlated: &[&Expr<'_>],
-) -> (usize, usize) {
-    let Some(base) = base else {
-        return (0, 0);
-    };
-    let list_nodes = correlated
-        .iter()
-        .filter(|node| {
-            matches!(
-                node,
-                Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. }
+/// Runs a query's correlated subqueries where evaluation reaches them, as
+/// PostgreSQL's subplans run: a row that never reaches one (a `CASE` branch
+/// it does not take, a `COALESCE` argument after a non-NULL one) never runs
+/// it. Each row the query produces binds itself here before its expressions
+/// are evaluated ([`Self::bind_row`]), so a subquery reads that row and the
+/// rows enclosing it. The runner and its binding are fixed per statement;
+/// a run's values live in the evaluation's arena like any expression's.
+#[derive(Clone, Copy)]
+pub(crate) struct CorrelatedSubqueries<'a> {
+    storage: &'a Storage,
+    txid: u32,
+    bindings: &'a [SubqueryBinding<'a>],
+    statement: &'a [super::super::eval::DeferredSubquery<'a>],
+    row: &'a core::cell::Cell<Option<BoundRow>>,
+}
+
+/// The row a query is evaluating, and the rows enclosing it, with their
+/// lifetimes erased: valid while that row's expressions are evaluated.
+#[derive(Clone, Copy)]
+struct BoundRow {
+    row: *const (dyn ColumnLookup<'static> + 'static),
+    enclosing: Option<*const (dyn ColumnLookup<'static> + 'static)>,
+}
+
+impl<'a> CorrelatedSubqueries<'a> {
+    /// Makes `row`, inside `enclosing`, the row the correlated subqueries
+    /// read until the next binding. The caller evaluates the row's
+    /// expressions while both stay alive.
+    pub(crate) fn bind_row(
+        &self,
+        row: &dyn ColumnLookup<'a>,
+        enclosing: Option<&dyn ColumnLookup<'a>>,
+    ) {
+        // SAFETY: only the lifetimes are erased; `evaluate` dereferences the
+        // pointers while the caller evaluates this row, as `bind_row` requires.
+        let erase = |lookup: &dyn ColumnLookup<'a>| unsafe {
+            core::mem::transmute::<
+                *const (dyn ColumnLookup<'a> + '_),
+                *const (dyn ColumnLookup<'static> + 'static),
+            >(lookup)
+        };
+        self.row.set(Some(BoundRow {
+            row: erase(row),
+            enclosing: enclosing.map(erase),
+        }));
+    }
+}
+
+impl super::super::eval::SubqueryExecution for CorrelatedSubqueries<'_> {
+    fn evaluate<'x>(
+        &self,
+        expression: &Expr<'x>,
+        arena: &'x Arena,
+        params: &[Datum<'x>],
+        _row: &dyn ColumnLookup<'x>,
+        sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    ) -> Result<super::super::eval::SubqueryResult<'x>, SqlError> {
+        let Some(bound) = self.row.get() else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a correlated subquery ran before its query bound a row"
+            ));
+        };
+        // SAFETY: see `bind_row`: the bound rows outlive this evaluation, and
+        // the statement's storage, bindings and slots outlive every row.
+        let (row, enclosing, storage, bindings, statement) = unsafe {
+            (
+                &*core::mem::transmute::<
+                    *const (dyn ColumnLookup<'static> + 'static),
+                    *const (dyn ColumnLookup<'x> + 'static),
+                >(bound.row),
+                bound.enclosing.map(|enclosing| {
+                    &*core::mem::transmute::<
+                        *const (dyn ColumnLookup<'static> + 'static),
+                        *const (dyn ColumnLookup<'x> + 'static),
+                    >(enclosing)
+                }),
+                &*(self.storage as *const Storage),
+                core::mem::transmute::<&[SubqueryBinding<'_>], &'x [SubqueryBinding<'x>]>(
+                    self.bindings,
+                ),
+                core::mem::transmute::<
+                    &[super::super::eval::DeferredSubquery<'_>],
+                    &'x [super::super::eval::DeferredSubquery<'x>],
+                >(self.statement),
             )
-        })
-        .count();
-    (
-        base.scalars.len() + correlated.len() - list_nodes,
-        base.lists.len() + list_nodes,
-    )
+        };
+        let chained = Chained {
+            inner: row,
+            outer: enclosing,
+        };
+        let mut scope = None;
+        let outer =
+            super::super::eval::StatementSubqueryScope::wrap(&chained, statement, &mut scope);
+        let borrowed = eval_subquery_nodes(
+            &[expression],
+            storage,
+            self.txid,
+            arena,
+            params,
+            SUBQUERY_DEPTH,
+            Some(outer),
+            sequences,
+            SubqueryTiming::Now,
+            bindings,
+        )?;
+        let values = detach_subquery_values(borrowed, arena)?;
+        match (values.scalars, values.lists) {
+            ([(_, value, witness)], []) => Ok(super::super::eval::SubqueryResult::Scalar {
+                value: *value,
+                witness: *witness,
+            }),
+            ([], [list]) => Ok(super::super::eval::SubqueryResult::List(*list)),
+            _ => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "one subquery produced an invalid result shape"
+            )),
+        }
+    }
 }
 
-/// Per-row merge scratch [`merge_correlated`] fills: scalar and list slots
-/// keyed by subquery node address.
-pub(super) type ScalarSlots<'a> = [(*const Expr<'a>, Datum<'a>, Datum<'a>)];
-pub(super) type ListSlots<'a> = [SubqueryList<'a>];
-
-/// Allocates the reusable merge scratch [`merge_correlated`] fills, sized
-/// exactly by [`merge_scratch_lens`]. Callers allocate once per statement (or
-/// per grouping pass) and reuse the slices across rows, so per-row merges
-/// never grow the arena.
-pub(super) fn alloc_merge_scratch<'a>(
-    base: Option<&SubqueryValues<'_, '_>>,
-    correlated: &[&Expr<'_>],
-    arena: &'a Arena,
-) -> Result<(&'a mut ScalarSlots<'a>, &'a mut ListSlots<'a>), SqlError> {
-    let (n_scalars, n_lists) = merge_scratch_lens(base, correlated);
-    let scalars = arena
-        .alloc_slice_with(n_scalars, |_| (core::ptr::null(), Datum::Null, Datum::Null))
-        .map_err(|_| arena_full())?;
-    let lists = arena
-        .alloc_slice_with(n_lists, |_| empty_subquery_list())
-        .map_err(|_| arena_full())?;
-    Ok((scalars, lists))
-}
-
-/// Builds per-outer-row [`SubqueryValues`] by merging the pre-evaluated
-/// uncorrelated results with correlated subqueries evaluated against `outer`.
-/// The merged arrays live in caller-provided scratch sized by
-/// [`merge_scratch_lens`] (no arena growth for the bookkeeping; only the
-/// subquery result values themselves use the arena).
-#[allow(clippy::too_many_arguments)]
-#[expect(
-    clippy::unnecessary_cast,
-    reason = "the base values' node addresses were narrowed by covariance; the cast restores the statement-arena lifetime rustc requires"
-)]
-pub(super) fn merge_correlated<'a, 'b>(
-    correlated: &[&'a Expr<'a>],
+/// The query's subquery values for one of its rows: `row`, inside
+/// `enclosing`, becomes the row its correlated subqueries read (see
+/// [`CorrelatedSubqueries`]).
+pub(super) fn correlated_row<'b, 'a>(
     base: &SubqueryValues<'b, 'a>,
     row: &dyn ColumnLookup<'a>,
     enclosing: Option<&dyn ColumnLookup<'a>>,
-    storage: &'a Storage,
-    txid: u32,
-    arena: &'a Arena,
-    params: &[Datum<'a>],
-    scalars: &'b mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)],
-    lists: &'b mut [SubqueryList<'a>],
-    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
-) -> Result<SubqueryValues<'b, 'a>, SqlError> {
-    let mut ns = 0;
-    for (p, v, w) in base.scalars {
-        // Node addresses are identity keys; every base value was built from
-        // this statement's arena, so the widened pointer is the same address.
-        scalars[ns] = (*p as *const Expr<'a>, *v, *w);
-        ns += 1;
-    }
-    let mut nl = 0;
-    for list in base.lists {
-        lists[nl] = *list;
-        nl += 1;
-    }
-    // A correlated subquery sees the current row first, then every query
-    // enclosing the one that produced it, and the statement's slots for the
-    // uncorrelated subqueries nested in it.
-    let chained = Chained {
-        inner: row,
-        outer: enclosing,
-    };
-    let mut scope = None;
-    let outer =
-        super::super::eval::StatementSubqueryScope::wrap(&chained, base.statement, &mut scope);
-    for node in correlated {
-        if subquery_has_effects(node, storage, txid) {
-            continue;
-        }
-        match node {
-            Expr::RowSubquery { select, arity } => {
-                let (values, _, witness) = run_row_subquery(
-                    select,
-                    storage,
-                    txid,
-                    arena,
-                    params,
-                    SUBQUERY_DEPTH,
-                    Some(outer),
-                    *arity as usize,
-                    sequences,
-                )?;
-                if values.len() > 1 {
-                    return Err(sql_err!(
-                        crate::sql::eval::sqlstate::CARDINALITY_VIOLATION,
-                        "more than one row returned by a subquery used as an expression"
-                    ));
-                }
-                scalars[ns] = (
-                    *node as *const _,
-                    values.first().copied().unwrap_or(Datum::Null),
-                    witness,
-                );
-                ns += 1;
-            }
-            Expr::Subquery(select) => {
-                if storage.spill_attached() {
-                    let (value, witness) = streaming_scalar_subquery(
-                        select,
-                        storage,
-                        txid,
-                        arena,
-                        params,
-                        SUBQUERY_DEPTH,
-                        Some(outer),
-                        sequences,
-                        SubqueryBinding::of(base.bindings, select),
-                    )?;
-                    scalars[ns] = (*node as *const _, value, witness);
-                    ns += 1;
-                    continue;
-                }
-                let (values, _, witness) = run_subquery(
-                    select,
-                    storage,
-                    txid,
-                    arena,
-                    params,
-                    SUBQUERY_DEPTH,
-                    Some(outer),
-                    1,
-                    sequences,
-                    SubqueryBinding::of(base.bindings, select),
-                )?;
-                if values.len() > 1 {
-                    return Err(sql_err!(
-                        crate::sql::eval::sqlstate::CARDINALITY_VIOLATION,
-                        "more than one row returned by a subquery used as an expression"
-                    ));
-                }
-                scalars[ns] = (
-                    *node as *const _,
-                    values.first().copied().unwrap_or(Datum::Null),
-                    witness,
-                );
-                ns += 1;
-            }
-            Expr::Exists(select) => {
-                let found = subquery_exists(
-                    select,
-                    storage,
-                    txid,
-                    arena,
-                    params,
-                    SUBQUERY_DEPTH,
-                    Some(outer),
-                    sequences,
-                )?;
-                scalars[ns] = (*node as *const _, Datum::Bool(found), Datum::Bool(false));
-                ns += 1;
-            }
-            Expr::ArraySubquery(select) => {
-                if storage.spill_attached() {
-                    let (v, witness) = streaming_array_subquery(
-                        select,
-                        storage,
-                        txid,
-                        arena,
-                        params,
-                        SUBQUERY_DEPTH,
-                        Some(outer),
-                        sequences,
-                    )?;
-                    scalars[ns] = (*node as *const _, v, witness);
-                    ns += 1;
-                    continue;
-                }
-                let plan = array_subquery_plan(select, storage, txid, arena, Some(outer))?;
-                let (values, _, _) = run_subquery(
-                    select,
-                    storage,
-                    txid,
-                    arena,
-                    params,
-                    SUBQUERY_DEPTH,
-                    Some(outer),
-                    1,
-                    sequences,
-                    SubqueryBinding::of(base.bindings, select),
-                )?;
-                let v = build_array_scalar(values, plan, storage, txid, arena)?;
-                scalars[ns] = (*node as *const _, v, v);
-                ns += 1;
-            }
-            Expr::InSubquery {
-                operand, select, ..
-            }
-            | Expr::QuantifiedSubquery {
-                operand, select, ..
-            } => {
-                let original_select = *select;
-                let (select, arity) = row_projected(operand, original_select, arena)?;
-                let collations =
-                    subquery_collations(original_select, storage, txid, arena, Some(outer))?;
-                let row_witness = (arity > 1)
-                    .then(|| {
-                        row_subquery_witness(original_select, storage, txid, arena, Some(outer))
-                    })
-                    .transpose()?;
-                let column_types = list_column_types(
-                    original_select,
-                    row_witness,
-                    storage,
-                    txid,
-                    arena,
-                    Some(outer),
-                )?;
-                if storage.spill_attached() {
-                    lists[nl] = external_list_subquery(
-                        node,
-                        select,
-                        storage,
-                        txid,
-                        arena,
-                        params,
-                        SUBQUERY_DEPTH,
-                        arity,
-                        row_witness,
-                        column_types,
-                        collations,
-                        Some(outer),
-                        sequences,
-                    )?;
-                    nl += 1;
-                    continue;
-                }
-                let (values, saw_null, witness) = run_subquery(
-                    select,
-                    storage,
-                    txid,
-                    arena,
-                    params,
-                    SUBQUERY_DEPTH,
-                    Some(outer),
-                    arity,
-                    sequences,
-                    None,
-                )?;
-                lists[nl] = SubqueryList {
-                    node: (*node as *const Expr).cast(),
-                    values,
-                    probe: None,
-                    saw_null,
-                    witness: row_witness.unwrap_or(witness),
-                    column_types,
-                    collations,
-                };
-                nl += 1;
-            }
-            _ => unreachable!("correlated list holds only subquery nodes"),
-        }
-    }
-    let effects = correlated
-        .iter()
-        .filter(|node| subquery_has_effects(node, storage, txid))
-        .count();
-    let deferred: &'b [super::super::eval::DeferredSubquery<'b>] = if effects == 0 {
-        base.deferred
-    } else {
-        let executor: &'a dyn super::super::eval::SubqueryExecution = arena
-            .alloc(ProceduralSubqueries { storage, txid })
-            .map_err(|_| arena_full())?;
-        let mut correlated_effects = correlated
-            .iter()
-            .filter(|node| subquery_has_effects(node, storage, txid));
-        // Each outer row runs its correlated subqueries afresh.
-        &*arena
-            .alloc_slice_with(base.deferred.len() + effects, |index| {
-                base.deferred.get(index).copied().unwrap_or_else(|| {
-                    super::super::eval::DeferredSubquery {
-                        node: correlated_effects
-                            .next()
-                            .map_or(core::ptr::null(), |node| (*node as *const Expr).cast()),
-                        executor,
-                        owner: arena,
-                        cache: None,
-                    }
-                })
-            })
-            .map_err(|_| arena_full())?
-    };
-    Ok(SubqueryValues {
-        scalars: &scalars[..ns],
-        lists: &lists[..nl],
-        deferred,
+) -> SubqueryValues<'b, 'a> {
+    bind_correlated_row(base, row, enclosing);
+    SubqueryValues {
+        scalars: base.scalars,
+        lists: base.lists,
+        deferred: base.deferred,
         statement: base.statement,
         bindings: base.bindings,
-    })
+        correlated: base.correlated,
+    }
 }
 
-/// Evaluates a predicate after materializing only the correlated subqueries it
-/// contains. Keeping this at the subquery choke point makes every scan path
-/// apply WHERE before it evaluates correlated projection or ordering work.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn correlated_where_passes<'a>(
-    correlated: &[&'a Expr<'a>],
-    base: &SubqueryValues<'a, 'a>,
-    predicate: Option<&'a Expr<'a>>,
-    row: &impl ColumnLookup<'a>,
+/// Binds `row`, inside `enclosing`, as the row a query's correlated
+/// subqueries read (see [`CorrelatedSubqueries`]).
+pub(super) fn bind_correlated_row<'a>(
+    base: &SubqueryValues<'_, 'a>,
+    row: &dyn ColumnLookup<'a>,
     enclosing: Option<&dyn ColumnLookup<'a>>,
-    storage: &'a Storage,
-    txid: u32,
+) {
+    if let Some(correlated) = base.correlated {
+        correlated.bind_row(row, enclosing);
+    }
+}
+
+/// Evaluates a `WHERE` that reads correlated subqueries for one row: they
+/// run as its evaluation reaches them. Keeping this at the subquery choke
+/// point makes every scan path apply `WHERE` before it evaluates correlated
+/// projection or ordering work.
+pub(super) fn correlated_where_passes<'a>(
+    base: &SubqueryValues<'_, 'a>,
+    predicate: Option<&'a Expr<'a>>,
+    row: &dyn ColumnLookup<'a>,
+    enclosing: Option<&dyn ColumnLookup<'a>>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
-    scalars: &mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)],
-    lists: &mut [SubqueryList<'a>],
 ) -> Result<bool, SqlError> {
     let Some(predicate) = predicate else {
         return Ok(true);
     };
-    let values = merge_correlated(
-        correlated,
-        base,
-        row,
-        enclosing,
-        storage,
-        txid,
-        arena,
-        params,
-        scalars,
-        lists,
-        hooks.sequences,
-    )?;
-    let where_hooks = EvalHooks {
-        subs: Some(&values),
-        ..*hooks
-    };
+    bind_correlated_row(base, row, enclosing);
     let row = Chained {
         inner: row,
         outer: enclosing,
     };
-    where_passes(predicate, arena, params, &row, &where_hooks)
+    where_passes(predicate, arena, params, &row, hooks)
 }
 
 /// A representative zero value of a column type, used to coerce an IN operand
@@ -5011,6 +4867,7 @@ pub(crate) fn uncorrelated_subquery_hooks<'a>(
             uncorrelated: true,
             command,
         },
+        &[],
     )?;
     detach_subquery_values(borrowed, arena)
 }
@@ -5102,6 +4959,7 @@ pub(super) fn detach_subquery_values<'a>(
         deferred: borrowed.deferred,
         statement: borrowed.statement,
         bindings: borrowed.bindings,
+        correlated: borrowed.correlated,
     })
 }
 
@@ -5176,6 +5034,7 @@ impl super::super::eval::SubqueryExecution for ProceduralSubqueries<'_> {
             Some(outer),
             sequences,
             SubqueryTiming::Now,
+            &[],
         )?;
         let values = detach_subquery_values(borrowed, arena)?;
         match (values.scalars, values.lists) {

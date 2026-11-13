@@ -3532,6 +3532,10 @@ pub struct SubqueryValues<'h, 'a> {
     /// The correlated scalar and `ARRAY` subqueries analysed once for the
     /// statement, before any outer row.
     pub(crate) bindings: &'a [crate::sql::query::SubqueryBinding<'a>],
+    /// Runs the query's correlated subqueries where evaluation reaches them,
+    /// against the row the query bound last
+    /// ([`crate::sql::query::CorrelatedSubqueries::bind_row`]).
+    pub(crate) correlated: Option<&'a crate::sql::query::CorrelatedSubqueries<'a>>,
 }
 
 /// A subquery run when evaluation first reaches it. An uncorrelated one runs
@@ -6745,6 +6749,7 @@ fn eval_full_inner<'a>(
                     deferred: &[],
                     statement: &[],
                     bindings: &[],
+                    correlated: None,
                 }
             }
             // The operand reads the query's other subqueries, so it is
@@ -6822,6 +6827,7 @@ fn eval_full_inner<'a>(
                     deferred: &[],
                     statement: &[],
                     bindings: &[],
+                    correlated: None,
                 }
             }
             SubqueryResult::List(list) => {
@@ -6835,6 +6841,7 @@ fn eval_full_inner<'a>(
                     deferred: &[],
                     statement: &[],
                     bindings: &[],
+                    correlated: None,
                 }
             }
         };

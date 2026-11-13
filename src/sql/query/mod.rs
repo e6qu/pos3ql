@@ -858,7 +858,7 @@ pub(crate) use subquery::{
 };
 use subquery::{
     correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, merge_correlated,
-    prepare_outer_subqueries, subquery_witness,
+    prepare_outer_subqueries,
 };
 pub(crate) use subquery::{
     expression_has_correlated_subquery, subquery_hooks_outer, subquery_hooks_with_outer,
@@ -8201,19 +8201,11 @@ pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
     Ok(Some((ptrs, values)))
 }
 
-fn array_subquery_column_type(witness: Datum) -> Option<ColType> {
-    match super::exec::coltype_of_oid(witness.type_oid())? {
-        ColType::Array(element) => Some(ColType::Array(element)),
-        scalar => super::types::ArrElem::from_coltype(scalar).map(ColType::Array),
-    }
-}
-
-/// Values established before RowDescription refine otherwise unknown columns.
-#[allow(clippy::too_many_arguments, reason = "query pipeline plumbing")]
-fn patch_subquery_column_types<'a>(
+/// A bare parameter whose type the description left as text takes its
+/// bound value's type.
+fn patch_param_column_types<'a>(
     items: &'a [SelectItem<'a>],
     scope: Option<&QueryScope<'a>>,
-    subs: &SubqueryValues,
     params: &[Datum],
     storage: &'a Storage,
     txid: u32,
@@ -8233,60 +8225,6 @@ fn patch_subquery_column_types<'a>(
                 slot += record_star_width(base, scope, storage, txid, arena)?;
             }
             SelectItem::Expr { expression, .. } => {
-                if slot < columns.len()
-                    && matches!(**expression, Expr::Subquery(_) | Expr::ArraySubquery(_))
-                {
-                    let node: *const Expr = *expression;
-                    match subs
-                        .scalars
-                        .iter()
-                        .find(|(p, _, _)| core::ptr::eq(*p, node))
-                    {
-                        Some((_, v, w)) => {
-                            let typed = if v.is_null() { w } else { v };
-                            let ct = if matches!(**expression, Expr::ArraySubquery(_)) {
-                                array_subquery_column_type(*typed)
-                            } else {
-                                super::exec::coltype_of_oid(typed.type_oid())
-                            };
-                            if !typed.is_null()
-                                && let Some(ct) = ct
-                            {
-                                columns[slot] = ColDesc::of_type(columns[slot].name, ct);
-                            }
-                        }
-                        // A correlated subquery has no pre-evaluated value;
-                        // infer its column type from the inner select's item.
-                        None => {
-                            if let Expr::Subquery(sub) | Expr::ArraySubquery(sub) = &**expression
-                                && let Some(SelectItem::Expr {
-                                    expression: inner, ..
-                                }) = sub.items.first()
-                                && let Some(from) = sub.from
-                                && let Ok(inner_scope) =
-                                    QueryScope::resolve_schema(storage, &from, txid, arena, None)
-                                && let Ok(witness) = subquery_witness(
-                                    storage,
-                                    txid,
-                                    inner,
-                                    Some(&inner_scope),
-                                    arena,
-                                )
-                            {
-                                let ct = if matches!(**expression, Expr::ArraySubquery(_)) {
-                                    array_subquery_column_type(witness)
-                                } else {
-                                    super::exec::coltype_of_oid(witness.type_oid())
-                                };
-                                if !witness.is_null()
-                                    && let Some(ct) = ct
-                                {
-                                    columns[slot] = ColDesc::of_type(columns[slot].name, ct);
-                                }
-                            }
-                        }
-                    }
-                }
                 if slot < columns.len()
                     && let Expr::Param(n) = **expression
                     && let Some(v) = params.get(n as usize - 1)
@@ -11399,9 +11337,11 @@ pub(crate) fn select_query_resumable<'a>(
     // Subqueries first (uncorrelated, evaluated once).
     let n_items = statement.items.len();
     let n_order = statement.order_by.len();
-    let sub_exprs = match arena.alloc_slice_with(4 + n_items + n_order + 2 * scope.n, |_| {
-        Option::<&Expr>::None
-    }) {
+    let n_group = statement.group_by.len();
+    let sub_exprs = match arena
+        .alloc_slice_with(4 + n_items + n_order + n_group + 2 * scope.n, |_| {
+            Option::<&Expr>::None
+        }) {
         Ok(s) => s,
         Err(_) => return sql_fail(arena_full()),
     };
@@ -11419,11 +11359,26 @@ pub(crate) fn select_query_resumable<'a>(
             sub_exprs[4 + n_items + i] = Some(ob.expression);
         }
     }
-    let sample_start = 4 + n_items + n_order;
+    // Grouping keys may carry subqueries too, as may a bare ordinal's item.
+    for (i, key) in statement.group_by.iter().enumerate() {
+        if !matches!(key, Expr::Int(_)) {
+            sub_exprs[4 + n_items + n_order + i] = Some(key);
+        }
+    }
+    let sample_start = 4 + n_items + n_order + n_group;
     collect_table_sample_expressions(from, &mut sub_exprs[sample_start..]);
     // Uncorrelated subqueries are evaluated once; correlated ones are deferred
     // and re-evaluated per outer row during the scan.
-    let outer_subs = match prepare_outer_subqueries(sub_exprs, storage, txid, arena, params, seq) {
+    let outer_subs = match prepare_outer_subqueries(
+        sub_exprs,
+        statement.from.as_ref(),
+        storage,
+        txid,
+        arena,
+        params,
+        None,
+        seq,
+    ) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
@@ -11488,10 +11443,9 @@ pub(crate) fn select_query_resumable<'a>(
     ) {
         return sql_fail(e);
     }
-    if let Err(error) = patch_subquery_column_types(
+    if let Err(error) = patch_param_column_types(
         statement.items,
         Some(&scope),
-        &outer_subs.base,
         params,
         storage,
         txid,
@@ -12148,10 +12102,9 @@ pub(crate) fn constant_select_resumable<'a>(
     ) {
         return sql_fail(e);
     }
-    if let Err(error) = patch_subquery_column_types(
+    if let Err(error) = patch_param_column_types(
         statement.items,
         None,
-        &subs,
         params,
         storage,
         txid,
@@ -13019,8 +12972,10 @@ fn select_into_rows_mode<'a>(
         )?;
         let statement = resolve_group_ordinals(statement, Some(&scope), arena, storage, txid)?;
         check_key_types(statement, &scope, arena, storage, txid)?;
+        let n_items = statement.items.len();
+        let n_group = statement.group_by.len();
         let sub_exprs = arena
-            .alloc_slice_with(2 + statement.items.len() + 2 * scope.n, |_| None)
+            .alloc_slice_with(2 + n_items + n_group + 2 * scope.n, |_| None)
             .map_err(|_| arena_full())?;
         sub_exprs[0] = statement.where_clause;
         sub_exprs[1] = statement.having;
@@ -13029,8 +12984,22 @@ fn select_into_rows_mode<'a>(
                 sub_exprs[2 + i] = Some(expression);
             }
         }
-        collect_table_sample_expressions(from, &mut sub_exprs[2 + statement.items.len()..]);
-        let outer_subs = prepare_outer_subqueries(sub_exprs, storage, txid, arena, params, seq)?;
+        for (i, key) in statement.group_by.iter().enumerate() {
+            if !matches!(key, Expr::Int(_)) {
+                sub_exprs[2 + n_items + i] = Some(key);
+            }
+        }
+        collect_table_sample_expressions(from, &mut sub_exprs[2 + n_items + n_group..]);
+        let outer_subs = prepare_outer_subqueries(
+            sub_exprs,
+            statement.from.as_ref(),
+            storage,
+            txid,
+            arena,
+            params,
+            outer,
+            seq,
+        )?;
         let hooks = EvalHooks {
             group: None,
             aggs: None,
@@ -13230,7 +13199,16 @@ fn select_into_rows_mode<'a>(
             arena,
         },
     };
-    let outer_subs = prepare_outer_subqueries(sub_exprs, storage, txid, arena, params, seq)?;
+    let outer_subs = prepare_outer_subqueries(
+        sub_exprs,
+        statement.from.as_ref(),
+        storage,
+        txid,
+        arena,
+        params,
+        outer,
+        seq,
+    )?;
     let correlated = outer_subs.correlated;
     let where_correlated = correlated_in_expression(statement.where_clause, correlated, arena)?;
     let hooks = EvalHooks {

@@ -1718,6 +1718,19 @@ fn eval_subquery_nodes<'a>(
                         )
                     }),
                 };
+                // The statement keeps a slot for an uncorrelated subquery
+                // nested in a query it runs for each row.
+                if once
+                    && let Some(node) = node
+                    && let Some(slot) = outer.and_then(|outer| {
+                        super::super::eval::DeferredSubquery::find(
+                            outer.statement_subqueries(),
+                            node,
+                        )
+                    })
+                {
+                    return slot;
+                }
                 let cache = if !once {
                     None
                 } else {
@@ -1890,6 +1903,7 @@ fn eval_subquery_nodes<'a>(
         scalars,
         lists,
         deferred,
+        statement: outer.map_or(&[], |outer| outer.statement_subqueries()),
     })
 }
 
@@ -2518,12 +2532,20 @@ pub(super) struct OuterSubs<'a> {
 
 /// Splits a query's subqueries into uncorrelated (evaluated once here) and
 /// correlated (deferred to per-row evaluation during the scan).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a query's subqueries are prepared against its FROM items and enclosing row"
+)]
 pub(super) fn prepare_outer_subqueries<'a>(
     exprs: &[Option<&'a Expr<'a>>],
+    from: Option<&'a crate::sql::ast::FromClause<'a>>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    // The enclosing row of a query run for one; it carries the statement's
+    // slots for the uncorrelated subqueries nested in such a query.
+    outer: Option<&dyn ColumnLookup<'a>>,
     sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
 ) -> Result<OuterSubs<'a>, SqlError> {
     let mut nodes = ArenaList::new(arena);
@@ -2539,20 +2561,29 @@ pub(super) fn prepare_outer_subqueries<'a>(
             uncorr.push(node).map_err(|_| arena_full())?;
         }
     }
-    let base = eval_subquery_nodes(
+    let statement = match outer.map(|outer| outer.statement_subqueries()) {
+        Some(slots) if !slots.is_empty() => slots,
+        _ => nested_statement_slots(corr.as_slice(), from, storage, txid, arena)?,
+    };
+    let mut scope = None;
+    let outer = outer.map(|outer| {
+        super::super::eval::StatementSubqueryScope::wrap(outer, statement, &mut scope)
+    });
+    let mut base = eval_subquery_nodes(
         uncorr.as_slice(),
         storage,
         txid,
         arena,
         params,
         SUBQUERY_DEPTH,
-        None,
+        outer,
         sequences,
         SubqueryTiming::FirstRead {
             uncorrelated: true,
             command: None,
         },
     )?;
+    base.statement = statement;
     Ok(OuterSubs {
         base,
         correlated: corr.as_slice(),
@@ -2601,6 +2632,27 @@ pub(super) fn first_read_subqueries<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
+    Ok(SubqueryValues {
+        scalars: &[],
+        lists: &[],
+        deferred: statement_slots(nodes, storage, txid, arena)?,
+        statement: &[],
+    })
+}
+
+/// A slot for each of `nodes`, uncorrelated subqueries run when first read
+/// and kept for the statement: their state and results live in `arena`'s
+/// persistent tail and retained bytes, which per-row rewinds and resumed
+/// attempts do not reclaim.
+fn statement_slots<'a>(
+    nodes: &[&'a Expr<'a>],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [super::super::eval::DeferredSubquery<'a>], SqlError> {
+    if nodes.is_empty() {
+        return Ok(&[]);
+    }
     // SAFETY: the engine's storage outlives every statement and reader that
     // keeps these subqueries, and each run detaches its result before any
     // borrow of storage escapes.
@@ -2616,19 +2668,205 @@ pub(super) fn first_read_subqueries<'a>(
         })
         .map_err(|_| arena_full())?;
     let caches = core::cell::Cell::from_mut(caches).as_slice_of_cells();
-    let deferred = arena
+    Ok(arena
         .alloc_persistent_slice_with(nodes.len(), |index| super::super::eval::DeferredSubquery {
             node: (nodes[index] as *const Expr).cast(),
             executor,
             owner: arena,
             cache: Some(&caches[index]),
         })
-        .map_err(|_| arena_full())?;
-    Ok(SubqueryValues {
-        scalars: &[],
-        lists: &[],
-        deferred,
-    })
+        .map_err(|_| arena_full())?)
+}
+
+/// Slots for the uncorrelated subqueries nested, at any depth, in the
+/// `correlated` subqueries of a query, its `LATERAL` FROM subqueries and
+/// its FROM function arguments, which all run again for each row of the
+/// query (or of the items to their left). Each one reads only its own FROM
+/// items, so its value holds for the statement: PostgreSQL runs it once as
+/// an initPlan however many times the query around it runs, and here every
+/// run of that query finds the one slot.
+pub(super) fn nested_statement_slots<'a>(
+    correlated: &[&'a Expr<'a>],
+    from: Option<&'a crate::sql::ast::FromClause<'a>>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [super::super::eval::DeferredSubquery<'a>], SqlError> {
+    fn function_arguments<'a>(
+        table: &'a crate::sql::ast::TableRef<'a>,
+        found: &mut ArenaList<'a, &'a Expr<'a>>,
+    ) -> Result<(), SqlError> {
+        for argument in table.func_args.unwrap_or(&[]) {
+            collect_subqueries(argument, found)?;
+        }
+        for function in table.rows_from.unwrap_or(&[]) {
+            function_arguments(function, found)?;
+        }
+        Ok(())
+    }
+    let mut runs_per_row = ArenaList::new(arena);
+    for &node in correlated {
+        runs_per_row.push(node).map_err(|_| arena_full())?;
+    }
+    let mut lateral = ArenaList::new(arena);
+    if let Some(from) = from {
+        for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
+            if let Some(select) = table.subquery.filter(|_| table.lateral) {
+                lateral.push(select).map_err(|_| arena_full())?;
+            }
+            function_arguments(table, &mut runs_per_row)?;
+        }
+    }
+    if runs_per_row.is_empty() && lateral.is_empty() {
+        return Ok(&[]);
+    }
+    let mut found = ArenaList::new(arena);
+    let mut selects = ArenaList::new(arena);
+    for &select in lateral.as_slice() {
+        selects.push(select).map_err(|_| arena_full())?;
+    }
+    sort_nested_sublinks(
+        runs_per_row.as_slice(),
+        &mut found,
+        &mut selects,
+        storage,
+        txid,
+        arena,
+    )?;
+    let mut next = 0;
+    while let Some(&select) = selects.as_slice().get(next) {
+        next += 1;
+        let mut nodes = ArenaList::new(arena);
+        collect_select_sublinks(select, &mut nodes, &mut selects)?;
+        sort_nested_sublinks(
+            nodes.as_slice(),
+            &mut found,
+            &mut selects,
+            storage,
+            txid,
+            arena,
+        )?;
+    }
+    statement_slots(found.as_slice(), storage, txid, arena)
+}
+
+/// Adds each uncorrelated subquery of `nodes` to `found` and the query of
+/// each correlated one to `selects`, whose subqueries run again with it.
+fn sort_nested_sublinks<'a>(
+    nodes: &[&'a Expr<'a>],
+    found: &mut ArenaList<'a, &'a Expr<'a>>,
+    selects: &mut ArenaList<'a, &'a Select<'a>>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    for &node in nodes {
+        // A correlation that cannot be read here counts as one.
+        if matches!(
+            subquery_node_correlated(node, storage, txid, arena),
+            Ok(false)
+        ) {
+            if !found
+                .as_slice()
+                .iter()
+                .any(|&seen| core::ptr::eq(seen, node))
+            {
+                found.push(node).map_err(|_| arena_full())?;
+            }
+        } else if let Some(select) = sublink_select(node) {
+            selects.push(select).map_err(|_| arena_full())?;
+        }
+    }
+    Ok(())
+}
+
+fn sublink_select<'a>(node: &'a Expr<'a>) -> Option<&'a Select<'a>> {
+    match node {
+        Expr::Subquery(select)
+        | Expr::Exists(select)
+        | Expr::ArraySubquery(select)
+        | Expr::RowSubquery { select, .. }
+        | Expr::InSubquery { select, .. }
+        | Expr::QuantifiedSubquery { select, .. } => Some(select),
+        _ => None,
+    }
+}
+
+/// Collects the subqueries in `select`'s own expressions into `nodes`, and
+/// into `selects` the queries it runs as part of itself: its derived tables,
+/// `WITH` bodies and set-operation branches.
+fn collect_select_sublinks<'a>(
+    select: &'a Select<'a>,
+    nodes: &mut ArenaList<'a, &'a Expr<'a>>,
+    selects: &mut ArenaList<'a, &'a Select<'a>>,
+) -> Result<(), SqlError> {
+    fn from_item<'a>(
+        table: &'a crate::sql::ast::TableRef<'a>,
+        nodes: &mut ArenaList<'a, &'a Expr<'a>>,
+        selects: &mut ArenaList<'a, &'a Select<'a>>,
+    ) -> Result<(), SqlError> {
+        if let Some(sample) = table.sample {
+            collect_subqueries(sample.percentage, nodes)?;
+            if let Some(repeatable) = sample.repeatable {
+                collect_subqueries(repeatable, nodes)?;
+            }
+        }
+        for argument in table.func_args.unwrap_or(&[]) {
+            collect_subqueries(argument, nodes)?;
+        }
+        for function in table.rows_from.unwrap_or(&[]) {
+            from_item(function, nodes, selects)?;
+        }
+        if let Some(select) = table.subquery {
+            selects.push(select).map_err(|_| arena_full())?;
+        }
+        Ok(())
+    }
+    if let Some(from) = select.from.as_ref() {
+        from_item(&from.base, nodes, selects)?;
+        for join in from.joins {
+            from_item(&join.table, nodes, selects)?;
+            if let Some(on) = join.on {
+                collect_subqueries(on, nodes)?;
+            }
+        }
+    }
+    let items = select.items.iter().filter_map(|item| match item {
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+            Some(*expression)
+        }
+        _ => None,
+    });
+    for expression in items
+        .chain(select.where_clause)
+        .chain(select.having)
+        .chain(select.group_by.iter().copied())
+        .chain(select.distinct_on.iter().copied())
+        .chain(select.order_by.iter().map(|order| order.expression))
+        .chain(select.limit)
+        .chain(select.offset)
+    {
+        collect_subqueries(expression, nodes)?;
+    }
+    for cte in select.with {
+        selects.push(cte.query).map_err(|_| arena_full())?;
+    }
+    if let Some(tree) = select.set_body {
+        fn leaves<'a>(
+            tree: &'a SetTree<'a>,
+            selects: &mut ArenaList<'a, &'a Select<'a>>,
+        ) -> Result<(), SqlError> {
+            match tree {
+                SetTree::Select(select) => selects.push(select).map_err(|_| arena_full()),
+                SetTree::Op { left, right, .. } => {
+                    leaves(left, selects)?;
+                    leaves(right, selects)
+                }
+            }
+        }
+        leaves(tree, selects)?;
+    }
+    Ok(())
 }
 
 /// Runs a top-level statement's uncorrelated subqueries: they read no row
@@ -2741,12 +2979,15 @@ pub(super) fn merge_correlated<'a, 'b>(
         nl += 1;
     }
     // A correlated subquery sees the current row first, then every query
-    // enclosing the one that produced it.
+    // enclosing the one that produced it, and the statement's slots for the
+    // uncorrelated subqueries nested in it.
     let chained = Chained {
         inner: row,
         outer: enclosing,
     };
-    let outer: &dyn ColumnLookup<'a> = &chained;
+    let mut scope = None;
+    let outer =
+        super::super::eval::StatementSubqueryScope::wrap(&chained, base.statement, &mut scope);
     for node in correlated {
         if subquery_has_effects(node, storage, txid) {
             continue;
@@ -2963,6 +3204,7 @@ pub(super) fn merge_correlated<'a, 'b>(
         scalars: &scalars[..ns],
         lists: &lists[..nl],
         deferred,
+        statement: base.statement,
     })
 }
 
@@ -4760,6 +5002,7 @@ pub(super) fn detach_subquery_values<'a>(
         scalars: &*scalars,
         lists: &*lists,
         deferred: borrowed.deferred,
+        statement: borrowed.statement,
     })
 }
 

@@ -3089,15 +3089,9 @@ impl<'a> RetainedSelect<'a> {
             &mut columns,
             crate::sql::exec::DescriptionTarget::Sql,
         )?;
-        let subqueries = SubqueryValues {
-            scalars: &[],
-            lists: &[],
-            deferred: &[],
-        };
-        patch_subquery_column_types(
+        patch_param_column_types(
             statement.items,
             Some(&scope),
-            &subqueries,
             params,
             storage,
             txid,
@@ -3449,15 +3443,9 @@ impl<'a> RetainedSelect<'a> {
             &mut description,
             crate::sql::exec::DescriptionTarget::Sql,
         )?;
-        let subqueries = SubqueryValues {
-            scalars: &[],
-            lists: &[],
-            deferred: &[],
-        };
-        patch_subquery_column_types(
+        patch_param_column_types(
             statement.items,
             Some(&scope),
-            &subqueries,
             params,
             storage,
             txid,

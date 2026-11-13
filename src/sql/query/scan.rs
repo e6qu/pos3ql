@@ -4544,6 +4544,13 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
             .or_else(|| self.outer?.outer_aggregate(call))
     }
 
+    fn statement_subqueries(&self) -> &'a [crate::sql::eval::DeferredSubquery<'a>] {
+        match self.inner.statement_subqueries() {
+            [] => self.outer.map_or(&[], |outer| outer.statement_subqueries()),
+            slots => slots,
+        }
+    }
+
     fn check_unassigned_row_field(
         &self,
         qualifier: &str,
@@ -4883,7 +4890,22 @@ fn materialize_lateral<'a, C: ColumnLookup<'a>>(
     }
     if tref.is_function_source() {
         // A lateral SRF (`LATERAL generate_series(1, t.n)`) evaluates its
-        // arguments against the outer row.
+        // arguments against the outer row. An uncorrelated subquery among
+        // them runs once for the statement, in its slot; a correlated one
+        // for each outer row.
+        let slots = outer.statement_subqueries();
+        let arguments = crate::sql::eval::SubqueryValues {
+            scalars: &[],
+            lists: &[],
+            deferred: slots,
+            statement: slots,
+        };
+        let correlated = super::ProceduralSubqueries { storage, txid };
+        let hooks = EvalHooks {
+            subs: Some(&arguments),
+            subquery_executor: Some(base_hooks.subquery_executor.unwrap_or(&correlated)),
+            ..*base_hooks
+        };
         return super::table_func_rows_outer(
             tref,
             storage,
@@ -4891,7 +4913,7 @@ fn materialize_lateral<'a, C: ColumnLookup<'a>>(
             arena,
             params,
             outer,
-            Some(base_hooks),
+            Some(&hooks),
             None,
             None,
         );
@@ -7658,6 +7680,13 @@ fn scan_source_mode<'a>(
                 inner: &outer_row,
                 outer,
             };
+            // The item's uncorrelated subqueries run once for the statement.
+            let mut slots = None;
+            let lateral_outer = crate::sql::eval::StatementSubqueryScope::wrap(
+                &chained,
+                hooks.subs.map_or(&[], |subs| subs.statement),
+                &mut slots,
+            );
             match materialize_lateral_source(
                 storage,
                 txid,
@@ -7665,7 +7694,7 @@ fn scan_source_mode<'a>(
                 scope.stored_width(t),
                 arena,
                 params,
-                &chained,
+                &lateral_outer,
                 hooks,
             )? {
                 LateralRows::External(run) => {

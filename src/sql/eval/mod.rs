@@ -895,6 +895,16 @@ pub trait ColumnLookup<'a> {
         None
     }
 
+    /// The statement's slots for the uncorrelated subqueries nested in the
+    /// queries it runs again for each row (correlated and `LATERAL`
+    /// subqueries, set operations, functions in `FROM`). A nested query
+    /// prepared for a row reuses its slot, so each runs once per statement,
+    /// as PostgreSQL's initPlans do, however many rows run the query around
+    /// it.
+    fn statement_subqueries(&self) -> &'a [DeferredSubquery<'a>] {
+        &[]
+    }
+
     /// Declared size/precision, or the registered shape of a record column.
     fn column_type_mod(&self, _qualifier: Option<&str>, _name: &str) -> i32 {
         -1
@@ -1746,6 +1756,20 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
 impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
     fn outer_aggregate(&self, call: *const Expr<'_>) -> Option<Datum<'a>> {
         (**self).outer_aggregate(call)
+    }
+
+    fn statement_subqueries(&self) -> &'a [DeferredSubquery<'a>] {
+        (**self).statement_subqueries()
+    }
+
+    fn check_unassigned_row_field(
+        &self,
+        qualifier: &str,
+        name: &str,
+        catalog: Option<&dyn CatalogAccess>,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        (**self).check_unassigned_row_field(qualifier, name, catalog, arena)
     }
 
     fn procedural_variable(
@@ -3501,6 +3525,10 @@ pub struct SubqueryValues<'h, 'a> {
     /// query's uncorrelated scalar subqueries, so an expression no row
     /// reaches never runs its subquery.
     pub deferred: &'h [DeferredSubquery<'h>],
+    /// The statement's slots for the uncorrelated subqueries nested in the
+    /// queries it runs for each row; see
+    /// [`ColumnLookup::statement_subqueries`].
+    pub statement: &'a [DeferredSubquery<'a>],
 }
 
 /// A subquery run when evaluation first reaches it. An uncorrelated one runs
@@ -3512,6 +3540,222 @@ pub struct DeferredSubquery<'h> {
     pub(crate) executor: &'h dyn SubqueryExecution,
     pub(crate) owner: &'h Arena,
     pub(crate) cache: Option<&'h core::cell::Cell<DeferredSubqueryCache>>,
+}
+
+impl<'h> DeferredSubquery<'h> {
+    /// The statement slot in `slots` for `node`: the slot made for that very
+    /// node, or else the one slot for the same sublink, which `node` copies
+    /// after a per-row rewrite. A sublink written twice (a `BETWEEN` operand
+    /// is compared twice) has a slot per copy, as PostgreSQL plans one
+    /// subquery per copy, so a rewritten copy of it matches none.
+    pub(crate) fn find(slots: &[Self], node: &Expr<'_>) -> Option<Self> {
+        let address = (node as *const Expr<'_>).cast::<()>();
+        if let Some(slot) = slots.iter().find(|slot| core::ptr::eq(slot.node, address)) {
+            return Some(*slot);
+        }
+        let sublink = Sublink::of(node)?;
+        let mut same = slots.iter().filter(|slot| {
+            // SAFETY: a slot's node is an expression of the statement that
+            // owns the slot, which outlives every query that reads it.
+            Sublink::of(unsafe { &*slot.node.cast::<Expr<'_>>() }) == Some(sublink)
+        });
+        let slot = same.next()?;
+        same.next().is_none().then(|| Self {
+            node: address,
+            ..*slot
+        })
+    }
+}
+
+/// Which sublink a subquery expression is. A query rewritten for an outer
+/// row (a FROM subquery merged into it, a restriction pushed into one)
+/// copies the nodes over the columns it substitutes, so an `IN` whose
+/// operand reads a merged column gets a new node each row; the subquery's
+/// own `SELECT` reads none of those columns, so the rewrite keeps it, and it
+/// names the sublink however often the node around it is copied.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Sublink {
+    select: *const crate::sql::ast::Select<'static>,
+    kind: SublinkKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SublinkKind {
+    Scalar,
+    Row(u8),
+    Exists,
+    Array,
+    In { negated: bool },
+    Quantified { operator: BinaryOp, all: bool },
+}
+
+impl Sublink {
+    fn of(node: &Expr<'_>) -> Option<Self> {
+        let (select, kind) = match *node {
+            Expr::Subquery(select) => (select, SublinkKind::Scalar),
+            Expr::RowSubquery { select, arity } => (select, SublinkKind::Row(arity)),
+            Expr::Exists(select) => (select, SublinkKind::Exists),
+            Expr::ArraySubquery(select) => (select, SublinkKind::Array),
+            Expr::InSubquery {
+                select, negated, ..
+            } => (select, SublinkKind::In { negated }),
+            Expr::QuantifiedSubquery {
+                select,
+                operator,
+                all,
+                ..
+            } => (select, SublinkKind::Quantified { operator, all }),
+            _ => return None,
+        };
+        Some(Self {
+            select: (select as *const crate::sql::ast::Select<'_>).cast(),
+            kind,
+        })
+    }
+}
+
+/// A row lookup that also carries the statement's slots for nested
+/// uncorrelated subqueries ([`ColumnLookup::statement_subqueries`]) into a
+/// query run for that row.
+pub(crate) struct StatementSubqueryScope<'r, 'a> {
+    pub(crate) row: &'r dyn ColumnLookup<'a>,
+    pub(crate) slots: &'a [DeferredSubquery<'a>],
+}
+
+impl<'a> StatementSubqueryScope<'_, 'a> {
+    /// `row`, carrying `slots` unless it already carries the statement's.
+    pub(crate) fn wrap<'r>(
+        row: &'r dyn ColumnLookup<'a>,
+        slots: &'a [DeferredSubquery<'a>],
+        scope: &'r mut Option<StatementSubqueryScope<'r, 'a>>,
+    ) -> &'r dyn ColumnLookup<'a> {
+        if slots.is_empty() || !row.statement_subqueries().is_empty() {
+            return row;
+        }
+        &*scope.insert(StatementSubqueryScope { row, slots })
+    }
+}
+
+impl<'a> ColumnLookup<'a> for StatementSubqueryScope<'_, 'a> {
+    fn statement_subqueries(&self) -> &'a [DeferredSubquery<'a>] {
+        self.slots
+    }
+
+    fn outer_aggregate(&self, call: *const Expr<'_>) -> Option<Datum<'a>> {
+        self.row.outer_aggregate(call)
+    }
+
+    fn check_unassigned_row_field(
+        &self,
+        qualifier: &str,
+        name: &str,
+        catalog: Option<&dyn CatalogAccess>,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        self.row
+            .check_unassigned_row_field(qualifier, name, catalog, arena)
+    }
+
+    fn procedural_variable(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::sql::guc::VariableConflict> {
+        self.row.procedural_variable(qualifier, name)
+    }
+
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        self.row.column_type_mod(qualifier, name)
+    }
+
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.row.resolve_column_type(qualifier, name)
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.row.is_empty_scope()
+    }
+
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        self.row.lookup(qualifier, name)
+    }
+
+    fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'a>, SqlError> {
+        self.row.recursive_state(qualifier, index)
+    }
+
+    fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        self.row.whole_row_present(table)
+    }
+
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn CatalogAccess>,
+    ) -> Option<(StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        self.row.whole_row_field_metadata(table, index, catalog)
+    }
+
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a [super::types::RecordField<'a>]>, SqlError> {
+        self.row.whole_row_fields(table, arena)
+    }
+
+    fn whole_row_expansion_fields(
+        &self,
+        table: &str,
+        arena: &'a Arena,
+    ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
+        self.row.whole_row_expansion_fields(table, arena)
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        self.row.col_type(qualifier, name)
+    }
+
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        self.row.column_type_oid(qualifier, name)
+    }
+
+    fn row_variable(&self, name: &str) -> Option<RowVariable> {
+        self.row.row_variable(name)
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        self.row.collation(qualifier, name)
+    }
+
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.row.whole_row_is_scalar(table)
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.row.whole_row_type(table)
+    }
+
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        self.row.whole_row_relation(table)
+    }
+
+    fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
+        self.row.column_identity(qualifier, name)
+    }
+
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
+        self.row.column_user_type(qualifier, name)
+    }
 }
 
 /// An uncorrelated deferred subquery's saved result in `owner`'s persistent
@@ -6481,13 +6725,22 @@ fn eval_full_inner<'a>(
             .any(|(node, _, _)| core::ptr::eq(*node, expression))
     }) {
         let scalars;
-        let values = match deferred.evaluate(expression, arena, params, row, hooks.sequences)? {
+        // A subquery run for this row reaches the statement's slots for the
+        // uncorrelated subqueries nested in it.
+        let mut scope = None;
+        let outer = StatementSubqueryScope::wrap(
+            row,
+            hooks.subs.map_or(&[], |subs| subs.statement),
+            &mut scope,
+        );
+        let values = match deferred.evaluate(expression, arena, params, outer, hooks.sequences)? {
             SubqueryResult::Scalar { value, witness } => {
                 scalars = [(expression as *const Expr, value, witness)];
                 SubqueryValues {
                     scalars: &scalars,
                     lists: &[],
                     deferred: &[],
+                    statement: &[],
                 }
             }
             // The operand reads the query's other subqueries, so it is
@@ -6538,7 +6791,13 @@ fn eval_full_inner<'a>(
                     .any(|list| core::ptr::eq(list.node, (expression as *const Expr).cast()))
         })
     {
-        let result = executor.evaluate(expression, arena, params, row, hooks.sequences)?;
+        let mut scope = None;
+        let outer = StatementSubqueryScope::wrap(
+            row,
+            hooks.subs.map_or(&[], |subs| subs.statement),
+            &mut scope,
+        );
+        let result = executor.evaluate(expression, arena, params, outer, hooks.sequences)?;
         let mut scalars = [(expression as *const Expr, Datum::Null, Datum::Null)];
         let mut lists = [SubqueryList {
             node: core::ptr::null(),
@@ -6557,6 +6816,7 @@ fn eval_full_inner<'a>(
                     scalars: &scalars,
                     lists: &[],
                     deferred: &[],
+                    statement: &[],
                 }
             }
             SubqueryResult::List(list) => {
@@ -6568,6 +6828,7 @@ fn eval_full_inner<'a>(
                     scalars: &[],
                     lists: &lists,
                     deferred: &[],
+                    statement: &[],
                 }
             }
         };

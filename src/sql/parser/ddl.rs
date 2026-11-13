@@ -175,6 +175,7 @@ pub(super) struct ColumnClauses<'a> {
     pub(super) default: Option<&'a Expr<'a>>,
     pub(super) default_text: Option<&'a str>,
     pub(super) generated_text: Option<&'a str>,
+    pub(super) generated_kind: crate::storage::Generation,
     pub(super) identity: Option<crate::sql::ast::IdentitySpec<'a>>,
 }
 
@@ -5554,16 +5555,14 @@ impl<'a> Parser<'a> {
                 let _ = self.expression(0)?;
                 let text = self.text[start..self.peek_at].trim_end();
                 self.expect_op(")")?;
-                if !self.eat_ident("stored")? {
-                    // PostgreSQL 18 makes VIRTUAL the default.
-                    let at = self.peek_at;
+                // PostgreSQL 18 makes VIRTUAL the default.
+                let kind = if self.eat_ident("stored")? {
+                    crate::storage::Generation::Stored
+                } else {
                     let _ = self.eat_ident("virtual")?;
-                    let mut error =
-                        ParseError::new(at, "virtual generated columns are not supported");
-                    error.sqlstate = sqlstate::FEATURE_NOT_SUPPORTED;
-                    return Err(error);
-                }
-                return Ok(ColGen::Generated(text));
+                    crate::storage::Generation::Virtual
+                };
+                return Ok(ColGen::Generated(text, kind));
             }
             true
         } else {
@@ -8632,6 +8631,7 @@ impl<'a> Parser<'a> {
                     default: clauses.default,
                     default_text: clauses.default_text,
                     generated_text: clauses.generated_text,
+                    generated_kind: clauses.generated_kind,
                     identity: clauses.identity,
                 },
             )?;
@@ -8914,6 +8914,7 @@ impl<'a> Parser<'a> {
             default: None,
             default_text: None,
             generated_text: None,
+            generated_kind: crate::storage::Generation::Virtual,
             identity: None,
         };
         let mut null_clause = None;
@@ -9012,8 +9013,9 @@ impl<'a> Parser<'a> {
                 self.push(constraints, constraint)?;
             } else if self.eat_ident("generated")? {
                 match self.generated_clause()? {
-                    crate::sql::ast::ColGen::Generated(text) => {
+                    crate::sql::ast::ColGen::Generated(text, kind) => {
                         clauses.generated_text = Some(text);
+                        clauses.generated_kind = kind;
                     }
                     crate::sql::ast::ColGen::Identity(spec) => clauses.identity = Some(spec),
                 }

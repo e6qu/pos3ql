@@ -88,6 +88,65 @@ pub(super) fn validate_generated_refs<Definition0: crate::storage::DefinitionBac
             })
             .unwrap_or(stored.as_str());
         let expression = crate::sql::parser::parse_expr(text, arena)?;
+        let column_oid = storage
+            .routine_type_oid(c.ctype, c.user_type, txid)
+            .unwrap_or_else(|| c.ctype.oid());
+        let user_type = |type_oid: i32| crate::storage::NamedTypeKind::from_oid(type_oid);
+        if c.default.is_virtual() && (c.primary || c.unique) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "{} on virtual generated columns are not supported",
+                if c.primary {
+                    "primary keys"
+                } else {
+                    "unique constraints"
+                }
+            ));
+        }
+        if c.default.is_virtual() {
+            // PostgreSQL 18 limits what a virtual column may compute with.
+            match user_type(column_oid) {
+                Some((crate::storage::NamedTypeKind::Domain, _, false)) => {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "virtual generated column \"{}\" cannot have a domain type",
+                        c.name.as_str()
+                    ));
+                }
+                Some(_) => {
+                    return Err(crate::sql::error_position::with_detail(
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "virtual generated column \"{}\" cannot have a user-defined type",
+                            c.name.as_str()
+                        ),
+                        format_args!(
+                            "Virtual generated columns that make use of user-defined types are not yet supported."
+                        ),
+                    ));
+                }
+                None => {}
+            }
+            if let Some(function) = expression.find_function(&|name| {
+                let name = name.rsplit('.').next().unwrap_or(name);
+                crate::sql::catalog::builtin_callable_signatures(name)
+                    .next()
+                    .is_none()
+            }) {
+                return Err(crate::sql::error_position::with_detail(
+                    crate::sql::error_position::at_reference(
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "generation expression uses user-defined function"
+                        ),
+                        function,
+                    ),
+                    format_args!(
+                        "Virtual generated columns that make use of user-defined functions are not yet supported."
+                    ),
+                ));
+            }
+        }
         let columns = super::CatalogCols {
             definition: Some(crate::storage::RelationDefinition::from_definition(def)),
             alias: None,
@@ -126,9 +185,30 @@ pub(super) fn validate_generated_refs<Definition0: crate::storage::DefinitionBac
         if let Some(e) = offending {
             return Err(e);
         }
-        let target_oid = storage
-            .routine_type_oid(c.ctype, c.user_type, txid)
-            .unwrap_or_else(|| c.ctype.oid());
+        // A cast or operator PostgreSQL marks stable (`a::text::regclass`)
+        // makes the expression depend on more than the row.
+        if crate::sql::planner_inputs::inline::index_expression_is_mutable(
+            expression, &columns, storage, txid, arena,
+        )?
+        .unwrap_or(false)
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "generation expression is not immutable"
+            ));
+        }
+        if c.default.is_virtual() && user_type(source_oid).is_some() {
+            return Err(crate::sql::error_position::with_detail(
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "generation expression uses user-defined type"
+                ),
+                format_args!(
+                    "Virtual generated columns that make use of user-defined types are not yet supported."
+                ),
+            ));
+        }
+        let target_oid = column_oid;
         if !crate::sql::catalog::can_coerce_assignment(storage, txid, source_oid, target_oid) {
             return Err(crate::sql::error_position::with_hint(
                 sql_err!(
@@ -355,7 +435,10 @@ pub(super) fn build_column(
                 c.name
             ));
         }
-        ColumnDefault::Generated(resolve_generated(gtext, storage, txid, arena)?)
+        ColumnDefault::Generated {
+            expression: resolve_generated(gtext, storage, txid, arena)?,
+            kind: c.generated_kind,
+        }
     } else {
         let column_default = resolve_default(
             c.name,
@@ -1427,6 +1510,7 @@ pub(super) fn attach_constraints(
                 }
                 has_primary = true;
                 let (indices, n) = resolve_cols(def, columns)?;
+                reject_virtual_columns(def, &indices[..n], "primary keys")?;
                 for &column_index in &indices[..n] {
                     def.columns[column_index as usize].not_null =
                         def.columns[column_index as usize].not_null.add_local();
@@ -1480,6 +1564,7 @@ pub(super) fn attach_constraints(
                 nulls_not_distinct,
             } => {
                 let (indices, n) = resolve_cols(def, columns)?;
+                reject_virtual_columns(def, &indices[..n], "unique constraints")?;
                 let stored_timing = storage_timing(*timing);
                 let equivalent_flag = n == 1
                     && !*nulls_not_distinct
@@ -1616,6 +1701,7 @@ pub(super) fn attach_constraints(
                         def.name.as_str()
                     ));
                 }
+                let (indices, n) = resolve_cols(def, columns)?;
                 attach_fkey(
                     storage,
                     def,
@@ -1631,6 +1717,8 @@ pub(super) fn attach_constraints(
                     exclude,
                     arena,
                 )?;
+                // The referenced key is checked first, as PostgreSQL does.
+                reject_virtual_columns(def, &indices[..n], "foreign key constraints")?;
             }
             TableConstraint::Exclusion {
                 source_position: _,
@@ -2292,4 +2380,24 @@ fn storage_validation(validation: AstConstraintValidation) -> crate::storage::Co
         }
         AstConstraintValidation::NotEnforced => crate::storage::ConstraintValidation::NotEnforced,
     }
+}
+
+/// PostgreSQL 18's refusal of a key, index or statistics over a virtual
+/// generated column, whose values the row does not hold.
+pub(crate) fn reject_virtual_columns<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
+    columns: &[u16],
+    what: &str,
+) -> Result<(), SqlError> {
+    if columns
+        .iter()
+        .any(|&column| def.columns()[usize::from(column)].default.is_virtual())
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "{} on virtual generated columns are not supported",
+            what
+        ));
+    }
+    Ok(())
 }

@@ -120,8 +120,8 @@ Other payload rules:
   another partition. Other bits are rejected. Recovery and restored prepared
   transactions keep the move flag, so a statement that waited for the row
   fails with PostgreSQL's `40001` instead of skipping it.
-- **Table definition payload** is version 17: version byte, ten-byte catalog
-  position, name, then the definition. Other versions are rejected.
+- **Table definition payload** is version 18: version byte, ten-byte catalog
+  position, name, then the definition. Other versions are rejected. Each column records its generation kind (0, or the `attgenerated` code `s` or `v`) after its NOT NULL inheritance byte.
 - **Domain payload** uses marker 251; earlier layouts are rejected. A mandatory
   checked-default input section follows the constraint identities (an empty
   section is explicit).
@@ -163,7 +163,7 @@ inserts a missing writer.
 | `mv6` | Materialized-view catalog position and backing-table position. |
 | `vw15` | View position and stamp, return-rule position and stamp, encoded query, schema, search path, name, security, security barrier, check option and query origin (0 `CREATE VIEW`, 1 `_RETURN` rule; it decides whether `pg_get_viewdef` qualifies columns), then each column by ordinal: name, checked default, `pg_attrdef` stamp (zero without a default), type OID, type length, type modifier and collation code. |
 | `hidx <table-slot> <0-or-1>` | Required once per table, including tables without indexes. The large-object page table requires `0`. |
-| `col4` | Hexadecimal column name and NOT NULL constraint name (empty when nullable). Extra fields are rejected. |
+| `col5` | Type, flags, generation kind (0, or `pg_attribute.attgenerated`'s `s` or `v` code), then the remaining column fields; hexadecimal column name and NOT NULL constraint name (empty when nullable). Extra fields are rejected. |
 | `attributes2` | Entry count and each attribute entry as sixteen hex digits. |
 | `implicit_index POSITION CREATED_AT` | Constraint-created index identities, including the current TOAST index. |
 | `inline_key_name ATTRIBUTE HEX_NAME` | One per active inline primary or unique key. |

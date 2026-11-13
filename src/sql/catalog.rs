@@ -24644,7 +24644,14 @@ fn pg_attribute<'a>(
                         },
                         arena,
                     )?, // attidentity: always 'a' / by default 'd'
-                    text(if c.default.is_generated() { "s" } else { "" }, arena)?, // attgenerated
+                    text(
+                        match c.default.generation() {
+                            Some(crate::storage::Generation::Stored) => "s",
+                            Some(crate::storage::Generation::Virtual) => "v",
+                            None => "",
+                        },
+                        arena,
+                    )?, // attgenerated
                     text(
                         match c.storage {
                             crate::sql::ast::ColumnStorage::Plain => "p",

@@ -551,6 +551,17 @@ reads that COPY's rows. AFTER row triggers cannot change them. These rows use
 `copy_transition_bytes` plus `txn_rows` records reserved per connection and per
 subscription worker; exhaustion returns `54000` and aborts the COPY.
 
+A generated column is `VIRTUAL` unless `STORED` is written, as in PostgreSQL
+18: `CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2))` lists `b` with
+`attgenerated = 'v'`. Queries read its computed value; a trigger's `OLD` and
+`NEW` hold NULL for it, a failing-row detail prints `virtual`, and COPY reads
+and writes no generated column. Indexes, keys, foreign keys, extended
+statistics, domain or user-defined types, user-defined functions in its
+expression, `DROP EXPRESSION`, and `SET EXPRESSION` on a table with CHECK
+constraints are refused with PostgreSQL's errors. Because the expression is
+immutable and reads only its own row, pos3ql keeps the computed value in the
+row; this is not visible to SQL.
+
 Deferred constraints run before every commit, including after COPY and at an
 extended-protocol Sync. A failed check rolls back the command instead of
 confirming a partial import. COPY keeps its original user, `search_path`,

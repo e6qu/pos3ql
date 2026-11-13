@@ -4514,12 +4514,23 @@ impl Checkpointer {
                     }
                     def.persistence = code;
                 }
-                Some("col4") => {
+                Some("col5") => {
                     let Some((_, _, def, seen)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("col outside table"));
                     };
                     let type_code: u8 = parse_field(words.next(), "col type")?;
                     let not_null: u8 = parse_field(words.next(), "col notnull")?;
+                    let generation = match parse_field::<u8>(words.next(), "col generation")? {
+                        0 => None,
+                        code => Some(crate::storage::Generation::from_code(code).ok_or(
+                            CheckpointSetupError::Corrupt("invalid column generation kind"),
+                        )?),
+                    };
+                    if generation.is_some() != (not_null & 32 != 0) {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "column generation kind does not match its flags",
+                        ));
+                    }
                     let not_null_inheritable: u8 =
                         parse_field(words.next(), "col not-null inheritable")?;
                     if not_null_inheritable > 1 {
@@ -4641,7 +4652,7 @@ impl Checkpointer {
                     let default = ColumnDefault::from_parts(
                         default_from_hex(default_hex)?,
                         default_expr,
-                        not_null & 32 != 0,
+                        generation,
                     )
                     .ok_or(CheckpointSetupError::Corrupt(
                         "invalid column default state",
@@ -10980,9 +10991,12 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "col4 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                        "col5 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                         c.ctype.code(),
                         flags,
+                        c.default
+                            .generation()
+                            .map_or(0, crate::storage::Generation::code),
                         u8::from(c.not_null_inheritable),
                         not_null_name_hex.as_str(),
                         c.type_mod,
@@ -19186,10 +19200,10 @@ fn load_view(
             };
             defaults[index] = match tag {
                 0 if value == "0" && expression.is_none() => ColumnDefault::NONE,
-                1 => ColumnDefault::from_parts(default_from_hex(value)?, expression, false).ok_or(
+                1 => ColumnDefault::from_parts(default_from_hex(value)?, expression, None).ok_or(
                     CheckpointSetupError::Corrupt("invalid view constant default"),
                 )?,
-                2 if value == "0" => ColumnDefault::from_parts(None, expression, false).ok_or(
+                2 if value == "0" => ColumnDefault::from_parts(None, expression, None).ok_or(
                     CheckpointSetupError::Corrupt("invalid view expression default"),
                 )?,
                 _ => return Err(CheckpointSetupError::Corrupt("invalid view column default")),
@@ -19576,7 +19590,7 @@ impl core::fmt::Display for ManifestViewColumns {
                         write!(output, "{byte:02x}")?;
                     }
                 }
-                ColumnDefault::Generated(_) => {
+                ColumnDefault::Generated { .. } => {
                     return Err(core::fmt::Error);
                 }
             }

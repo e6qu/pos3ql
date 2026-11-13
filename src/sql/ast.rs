@@ -4907,9 +4907,11 @@ pub struct ColumnDef<'a> {
     /// The raw source text of the DEFAULT expression, for storing non-constant
     /// defaults and for `pg_get_expr` / `\d` reconstruction.
     pub default_text: Option<&'a str>,
-    /// `GENERATED ALWAYS AS (expr) STORED`: the raw source text of the generation
-    /// expression, computed from the row's other columns at insert/update.
+    /// `GENERATED ALWAYS AS (expr) [STORED | VIRTUAL]`: the raw source text of
+    /// the generation expression, computed from the row's other columns.
     pub generated_text: Option<&'a str>,
+    /// The generation kind; `VIRTUAL` when neither keyword is written.
+    pub generated_kind: crate::storage::Generation,
     /// `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [(options)]`.
     pub identity: Option<IdentitySpec<'a>>,
 }
@@ -4927,8 +4929,8 @@ pub struct IdentitySpec<'a> {
 
 /// The result of parsing a `GENERATED` column clause.
 pub enum ColGen<'a> {
-    /// `ALWAYS AS (expr) STORED`.
-    Generated(&'a str),
+    /// `ALWAYS AS (expr) [STORED | VIRTUAL]`.
+    Generated(&'a str, crate::storage::Generation),
     /// `{ ALWAYS | BY DEFAULT } AS IDENTITY [(options)]`.
     Identity(IdentitySpec<'a>),
 }
@@ -6719,7 +6721,7 @@ impl<'a> Expr<'a> {
         self.find_function(&is_volatile_function)
     }
 
-    fn find_function(&self, matches: &dyn Fn(&str) -> bool) -> Option<&str> {
+    pub(crate) fn find_function(&self, matches: &dyn Fn(&str) -> bool) -> Option<&str> {
         match self {
             Expr::Call { name, args, .. } => {
                 if matches(name) {

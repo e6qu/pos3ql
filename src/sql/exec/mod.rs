@@ -4589,9 +4589,15 @@ fn resolve_partition_scheme<Definition0: crate::storage::DefinitionBacking>(
             .default
             .is_generated()
         {
-            return Err(sql_err!(
-                sqlstate::INVALID_OBJECT_DEFINITION,
-                "cannot use generated column in partition key"
+            return Err(crate::sql::error_position::with_detail(
+                crate::sql::error_position::at_subject(
+                    sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "cannot use generated column in partition key"
+                    ),
+                    name,
+                ),
+                format_args!("Column \"{}\" is a generated column.", name),
             ));
         }
     }
@@ -4978,6 +4984,43 @@ fn prepare_trigger_firing<'values, 'schema, 'rows>(
     new: Option<&'rows mut [Datum<'values>]>,
     transition_rows: Option<TransitionRows<'values>>,
 ) -> Result<trigger_firing::TriggerFiring<'values, 'schema, 'rows>, SqlError> {
+    // A trigger's OLD and NEW hold no virtual generated column's value, which
+    // PostgreSQL computes only when a query reads the table. A BEFORE
+    // trigger's NEW is recomputed afterwards, so it is cleared in place.
+    let columns = definition.columns();
+    let (old, new) = if columns.iter().any(|column| column.default.is_virtual()) {
+        let without_virtual = |values: &[Datum<'values>]| {
+            let copied = context
+                .arena
+                .alloc_slice_copy(values)
+                .map_err(|_| super::query::arena_full_pub())?;
+            for (value, column) in copied.iter_mut().zip(columns) {
+                if column.default.is_virtual() {
+                    *value = Datum::Null;
+                }
+            }
+            Ok::<_, SqlError>(copied)
+        };
+        let old = match old {
+            Some(old) => Some(&*without_virtual(old)?),
+            None => None,
+        };
+        let new = match new {
+            Some(values) if before => {
+                for (value, column) in values.iter_mut().zip(columns) {
+                    if column.default.is_virtual() {
+                        *value = Datum::Null;
+                    }
+                }
+                Some(values)
+            }
+            Some(values) => Some(without_virtual(values)?),
+            None => None,
+        };
+        (old, new)
+    } else {
+        (old, new)
+    };
     let routine = context
         .storage()
         .routine_for(usize::from(trigger.function), context.txn.txid);
@@ -21063,10 +21106,18 @@ fn validate_trigger_when(
                         .column_index(name)
                         .is_some_and(|column| definition.columns()[column].default.is_generated()))
             {
-                reference_error = Some(sql_err!(
+                let error = sql_err!(
                     sqlstate::INVALID_OBJECT_DEFINITION,
                     "BEFORE trigger's WHEN condition cannot reference NEW generated columns"
-                ));
+                );
+                reference_error = Some(if name == "new" {
+                    error
+                } else {
+                    crate::sql::error_position::with_detail(
+                        crate::sql::error_position::at_subject(error, qualifier.unwrap_or(name)),
+                        format_args!("Column \"{}\" is a generated column.", name),
+                    )
+                });
             }
         }
     });
@@ -56474,7 +56525,7 @@ fn rewrite_sequence_default_references(
                     changed |= rewritten != expression;
                     crate::storage::ColumnDefault::Expression(rewritten)
                 }
-                crate::storage::ColumnDefault::Generated(expression) => {
+                crate::storage::ColumnDefault::Generated { expression, kind } => {
                     let rewritten = rewrite_sequence_default_reference(
                         expression.as_str(),
                         storage,
@@ -56485,7 +56536,10 @@ fn rewrite_sequence_default_references(
                         arena,
                     )?;
                     changed |= rewritten != expression;
-                    crate::storage::ColumnDefault::Generated(rewritten)
+                    crate::storage::ColumnDefault::Generated {
+                        expression: rewritten,
+                        kind,
+                    }
                 }
             };
         }
@@ -62941,15 +62995,18 @@ fn rewrite_table_owned_column_references(
                     arena,
                 )?)
             }
-            crate::storage::ColumnDefault::Generated(expression) => {
-                crate::storage::ColumnDefault::Generated(rewrite_table_column_reference(
-                    expression.as_str(),
-                    &current,
-                    &target_shape,
-                    rename,
-                    catalog,
-                    arena,
-                )?)
+            crate::storage::ColumnDefault::Generated { expression, kind } => {
+                crate::storage::ColumnDefault::Generated {
+                    expression: rewrite_table_column_reference(
+                        expression.as_str(),
+                        &current,
+                        &target_shape,
+                        rename,
+                        catalog,
+                        arena,
+                    )?,
+                    kind,
+                }
             }
         };
     }
@@ -63924,7 +63981,7 @@ fn rewrite_composite_dependent_tables(
                     changed |= rewritten != expression;
                     crate::storage::ColumnDefault::Expression(rewritten)
                 }
-                crate::storage::ColumnDefault::Generated(expression) => {
+                crate::storage::ColumnDefault::Generated { expression, kind } => {
                     let rewritten = rewrite_typed_composite_field_selectors(
                         expression.as_str(),
                         &columns,
@@ -63933,7 +63990,10 @@ fn rewrite_composite_dependent_tables(
                         arena,
                     )?;
                     changed |= rewritten != expression;
-                    crate::storage::ColumnDefault::Generated(rewritten)
+                    crate::storage::ColumnDefault::Generated {
+                        expression: rewritten,
+                        kind,
+                    }
                 }
             };
         }
@@ -65140,6 +65200,12 @@ pub fn create_statistics(
                         column
                     ));
                 };
+                if table_definition.columns()[column].default.is_virtual() {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "statistics creation on virtual generated columns is not supported"
+                    ));
+                }
                 ExtendedStatisticsKey::Column(table_definition.columns()[column].name)
             }
             StatisticsKey::Expression(expression) => {
@@ -65165,6 +65231,18 @@ pub fn create_statistics(
                         return sql_fail(sql_err!(
                             sqlstate::FEATURE_NOT_SUPPORTED,
                             "statistics creation on system columns is not supported"
+                        ));
+                    }
+                    Ok(variables)
+                        if table_definition.columns().iter().enumerate().any(
+                            |(index, column)| {
+                                column.default.is_virtual() && variables.columns().contains(index)
+                            },
+                        ) =>
+                    {
+                        return sql_fail(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "statistics creation on virtual generated columns is not supported"
                         ));
                     }
                     Ok(_) => {}
@@ -65970,6 +66048,27 @@ pub fn create_index(
         return sql_fail(error);
     }
     let tdef = (*storage.table_def(table_index, txn.txid)).clone();
+    // PostgreSQL 18 indexes no virtual generated column, by key, key
+    // expression or predicate.
+    let reads_virtual = |expression: &Expr<'_>| {
+        ddl::expression_variables(expression, &tdef).is_ok_and(|variables| {
+            tdef.columns().iter().enumerate().any(|(index, column)| {
+                column.default.is_virtual() && variables.columns().contains(index)
+            })
+        })
+    };
+    if command.columns.iter().any(|index_column| {
+        let simple = crate::sql::exec::index_expression_column_name(index_column.expression);
+        tdef.column_index(simple)
+            .is_some_and(|column| tdef.columns()[column].default.is_virtual())
+            || reads_virtual(index_column.expression)
+    }) || command.predicate.is_some_and(reads_virtual)
+    {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "indexes on virtual generated columns are not supported"
+        ));
+    }
     let phased = command.build == crate::sql::ast::IndexBuildMode::Concurrent
         && tdef.persistence != crate::storage::RelationPersistence::Temporary;
     if tdef.partition.is_partitioned()
@@ -71325,11 +71424,17 @@ pub fn copy_begin(
     let definitions = storage.table_definition_images();
     let def = definitions.definition(storage, table_index, txid)?;
     let mut targets = [0usize; MAX_COLUMNS];
+    // COPY reads and writes no generated column: the default list omits
+    // them, and naming one is an error.
     let n_targets = if statement.columns.is_empty() {
-        for (i, t) in targets.iter_mut().enumerate().take(def.n_columns) {
-            *t = i;
+        let mut count = 0;
+        for (index, column) in def.columns().iter().enumerate() {
+            if !column.default.is_generated() {
+                targets[count] = index;
+                count += 1;
+            }
         }
-        def.n_columns
+        count
     } else {
         for (i, name) in statement.columns.iter().enumerate() {
             let Some(col) = def.column_index(name) else {
@@ -71348,6 +71453,16 @@ pub fn copy_begin(
                     sqlstate::DUPLICATE_COLUMN,
                     "column \"{}\" specified more than once",
                     name
+                ));
+            }
+            if def.columns()[col].default.is_generated() {
+                return Err(crate::sql::error_position::with_detail(
+                    sql_err!(
+                        sqlstate::INVALID_COLUMN_REFERENCE,
+                        "column \"{}\" is a generated column",
+                        name
+                    ),
+                    format_args!("Generated columns cannot be used in COPY."),
                 ));
             }
             targets[i] = col;
@@ -71406,17 +71521,6 @@ pub fn copy_begin(
     let opts = &statement.options;
     let fmt = CopyFmt::resolve(def, statement.table.name, opts)?;
     let filter = CopyFilter::resolve(statement, def)?;
-    if !statement.to {
-        for &target in &targets[..n_targets] {
-            if def.columns()[target].default.is_generated() {
-                return Err(sql_err!(
-                    sqlstate::GENERATED_ALWAYS,
-                    "cannot insert a non-DEFAULT value into column \"{}\"",
-                    def.columns()[target].name.as_str()
-                ));
-            }
-        }
-    }
     Ok(CopySetup {
         clock: super::datetime::statement_clock(),
         snapshot_lease: Mutex::new(None),
@@ -74948,13 +75052,32 @@ fn reject_generated_write<Definition0: crate::storage::DefinitionBacking>(
     column: usize,
 ) -> Result<(), SqlError> {
     if def.columns()[column].default.is_generated() {
-        return Err(sql_err!(
-            sqlstate::GENERATED_ALWAYS,
-            "cannot insert a non-DEFAULT value into column \"{}\"",
-            def.columns()[column].name.as_str()
+        return Err(generated_write_error(
+            "cannot insert a non-DEFAULT value into column",
+            def.columns()[column].name.as_str(),
         ));
     }
     Ok(())
+}
+
+/// PostgreSQL's 428C9 refusal of an `UPDATE` to a generated column.
+fn generated_update_error(column: &str) -> SqlError {
+    crate::sql::error_position::with_detail(
+        sql_err!(
+            sqlstate::GENERATED_ALWAYS,
+            "column \"{}\" can only be updated to DEFAULT",
+            column
+        ),
+        format_args!("Column \"{}\" is a generated column.", column),
+    )
+}
+
+/// PostgreSQL's 428C9 refusal of an explicit value for a generated column.
+fn generated_write_error(message: &str, column: &str) -> SqlError {
+    crate::sql::error_position::with_detail(
+        sql_err!(sqlstate::GENERATED_ALWAYS, "{} \"{}\"", message, column),
+        format_args!("Column \"{}\" is a generated column.", column),
+    )
 }
 
 /// A two-table column lookup for MERGE's ON / WHEN-condition / SET expressions:
@@ -77463,10 +77586,8 @@ pub(crate) fn merge<'a>(
                                     if def.columns()[ci].default.is_generated()
                                         && !matches!(expression, Expr::DefaultMarker)
                                     {
-                                        return sql_fail(sql_err!(
-                                            sqlstate::GENERATED_ALWAYS,
-                                            "column \"{}\" can only be updated to DEFAULT",
-                                            def.columns()[ci].name.as_str()
+                                        return sql_fail(generated_update_error(
+                                            def.columns()[ci].name.as_str(),
                                         ));
                                     }
                                     let value = if matches!(expression, Expr::DefaultMarker) {
@@ -82201,10 +82322,8 @@ pub(crate) fn update<'a>(
         if def.columns()[targets[a]].default.is_generated()
             && !matches!(expression, Expr::DefaultMarker)
         {
-            return sql_fail(sql_err!(
-                sqlstate::GENERATED_ALWAYS,
-                "column \"{}\" can only be updated to DEFAULT",
-                def.columns()[targets[a]].name.as_str()
+            return sql_fail(generated_update_error(
+                def.columns()[targets[a]].name.as_str(),
             ));
         }
     }
@@ -86121,6 +86240,27 @@ fn inherit_partition_constraints<Definition0: crate::storage::DefinitionBacking>
                 child.name.as_str()
             ));
         }
+        if let (Some(parent_kind), Some(child_kind)) =
+            (expected.default.generation(), actual.default.generation())
+            && parent_kind != child_kind
+        {
+            let name = |kind| match kind {
+                crate::storage::Generation::Stored => "STORED",
+                crate::storage::Generation::Virtual => "VIRTUAL",
+            };
+            return Err(crate::sql::error_position::with_detail(
+                sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "column \"{}\" inherits from generated column of different kind",
+                    expected.name.as_str()
+                ),
+                format_args!(
+                    "Parent column is {}, child column is {}.",
+                    name(parent_kind),
+                    name(child_kind)
+                ),
+            ));
+        }
         if expected.not_null.is_required() {
             if matches!(mode, PartitionInheritance::Attach)
                 && !child.columns[index].not_null.is_required()
@@ -89488,12 +89628,26 @@ fn alter_table_relation(
                         statement.table.name
                     ));
                 }
+                if new_def.columns[i].default.is_virtual() && new_def.n_checks > 0 {
+                    return sql_fail(virtual_generated_alteration(
+                        "SET EXPRESSION",
+                        " in tables with check constraints",
+                        column,
+                        statement.table.name,
+                    ));
+                }
                 let expression =
                     match ddl::resolve_generated(expression_text, storage, txn.txid, arena) {
                         Ok(expression) => expression,
                         Err(error) => return sql_fail(error),
                     };
-                new_def.columns[i].default = crate::storage::ColumnDefault::Generated(expression);
+                // SET EXPRESSION keeps the column's generation kind.
+                let kind = new_def.columns[i]
+                    .default
+                    .generation()
+                    .unwrap_or(crate::storage::Generation::Stored);
+                new_def.columns[i].default =
+                    crate::storage::ColumnDefault::Generated { expression, kind };
                 renew_default_identity(&mut new_def, &def, source[i]);
                 if let Err(error) =
                     record_table_input_override(&mut input_overrides, i, expression_text, arena)
@@ -89526,6 +89680,14 @@ fn alter_table_relation(
                         "column \"{}\" of relation \"{}\" is not a generated column",
                         column,
                         statement.table.name
+                    ));
+                }
+                if new_def.columns[i].default.is_virtual() {
+                    return sql_fail(virtual_generated_alteration(
+                        "DROP EXPRESSION",
+                        "",
+                        column,
+                        statement.table.name,
                     ));
                 }
                 // PostgreSQL preserves the already-materialized datum. Only
@@ -94869,7 +95031,8 @@ fn check_not_null<Definition0: crate::storage::DefinitionBacking>(
 ) -> Result<(), SqlError> {
     for (i, c) in def.columns().iter().enumerate() {
         if c.not_null.is_required() && values[i].is_null() {
-            let detail = constraints::failing_row_detail(&values[..def.columns().len()])?;
+            let detail =
+                constraints::failing_row_detail(def.columns(), &values[..def.columns().len()])?;
             crate::sql::eval::stash_object_diagnostic(
                 Some(detail.as_str()),
                 crate::sql::eval::ErrorObjects::table_column(
@@ -96471,4 +96634,26 @@ fn expression_names_target<'a>(
         Ok(())
     });
     found
+}
+
+/// PostgreSQL's refusal of an `ALTER COLUMN` form for a virtual generated
+/// column.
+fn virtual_generated_alteration(
+    form: &str,
+    qualification: &str,
+    column: &str,
+    relation: &str,
+) -> SqlError {
+    crate::sql::error_position::with_detail(
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "ALTER TABLE / {} is not supported for virtual generated columns{}",
+            form,
+            qualification
+        ),
+        format_args!(
+            "Column \"{}\" of relation \"{}\" is a virtual generated column.",
+            column, relation
+        ),
+    )
 }

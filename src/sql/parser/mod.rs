@@ -7437,6 +7437,7 @@ impl<'a> Parser<'a> {
                     default: clauses.default,
                     default_text: clauses.default_text,
                     generated_text: clauses.generated_text,
+                    generated_kind: clauses.generated_kind,
                     identity: clauses.identity,
                 },
                 if_not_exists,
@@ -7684,7 +7685,7 @@ impl<'a> Parser<'a> {
                     crate::sql::ast::ColGen::Identity(spec) => {
                         Ok(AlterAction::AddIdentity { column, spec })
                     }
-                    crate::sql::ast::ColGen::Generated(_) => {
+                    crate::sql::ast::ColGen::Generated(..) => {
                         Err(self.err_here("a column cannot be turned into a generated column"))
                     }
                 }

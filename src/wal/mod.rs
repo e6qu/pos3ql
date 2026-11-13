@@ -267,7 +267,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 17;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 18;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -1191,6 +1191,7 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
         n += 2; // attstattarget
         n += 9; // attoptions presence byte plus two float4 bit patterns
         n += 2; // attstorage + attcompression
+        n += 1; // attgenerated
         // User-defined column: name, then a format marker and schema.
         if let Some(identity) = c.user_type {
             n += 1 + identity.storage_name().as_str().len();
@@ -1307,6 +1308,11 @@ fn append_table_payload<B: DefinitionBacking>(
         ok &= buffer.append(&[c.ctype.code(), flags]);
         ok &= buffer.append(&[c.not_null.code()]);
         ok &= buffer.append(&[u8::from(c.not_null_inheritable)]);
+        // The generation kind (`pg_attribute.attgenerated`), zero when none.
+        ok &= buffer.append(&[c
+            .default
+            .generation()
+            .map_or(0, crate::storage::Generation::code)]);
         ok &= name_bytes(
             buffer,
             def.not_null_names.as_ref()[column]
@@ -8355,6 +8361,14 @@ fn decode_op_inner<'a>(
                     _ => return None,
                 };
                 at += 1;
+                let generation = match *payload.get(at)? {
+                    0 => None,
+                    code => Some(crate::storage::Generation::from_code(code)?),
+                };
+                at += 1;
+                if generation.is_some() != (meta[1] & 16 != 0) {
+                    return None;
+                }
                 let name = take_name(&mut at)?;
                 let not_null_name = if name.is_empty() {
                     None
@@ -8412,8 +8426,7 @@ fn decode_op_inner<'a>(
                 } else {
                     None
                 };
-                let default =
-                    ColumnDefault::from_parts(default_value, default_expr, meta[1] & 16 != 0)?;
+                let default = ColumnDefault::from_parts(default_value, default_expr, generation)?;
                 def.not_null_names[i] = not_null_name;
                 def.columns[i] = ColumnMeta {
                     name: SqlName::parse(col_name).ok()?,
@@ -12585,7 +12598,7 @@ fn encoded_view_default_len(default: crate::storage::ColumnDefault) -> usize {
             1 + encoded_default_len(&Some(value)) + 2 + expression.as_str().len()
         }
         crate::storage::ColumnDefault::Expression(expression) => 1 + 2 + expression.as_str().len(),
-        crate::storage::ColumnDefault::Generated(_) => {
+        crate::storage::ColumnDefault::Generated { .. } => {
             unreachable!("view columns cannot carry generated expressions")
         }
     }
@@ -12721,7 +12734,7 @@ fn append_view_default(buffer: &mut FixedBuf, default: crate::storage::ColumnDef
                 && buffer.append(&(bytes.len() as u16).to_le_bytes())
                 && buffer.append(bytes)
         }
-        crate::storage::ColumnDefault::Generated(_) => {
+        crate::storage::ColumnDefault::Generated { .. } => {
             unreachable!("view columns cannot carry generated expressions")
         }
     }
@@ -12746,14 +12759,14 @@ fn decode_view_default(payload: &[u8], at: &mut usize) -> Option<crate::storage:
         0 => Some(crate::storage::ColumnDefault::NONE),
         1 => {
             let value = decode_default(payload, at)??;
-            crate::storage::ColumnDefault::from_parts(Some(value), Some(expression(at)?), false)
+            crate::storage::ColumnDefault::from_parts(Some(value), Some(expression(at)?), None)
         }
         2 | 3 => {
             let expression = expression(at)?;
             if (tag == 3) != crate::sql::enum_values::checks::is_bound(expression.as_str()) {
                 return None;
             }
-            crate::storage::ColumnDefault::from_parts(None, Some(expression), false)
+            crate::storage::ColumnDefault::from_parts(None, Some(expression), None)
         }
         _ => None,
     }

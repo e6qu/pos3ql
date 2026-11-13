@@ -558,10 +558,9 @@ IDENTITY USING INDEX` (`index "t_pkey" does not exist`). A view's
 set, and omits an explicit `security_invoker=false`. A `CHECK` constraint
 marked `NO INHERIT` fails with `0A000`, and exclusion constraints support only
 GiST over range columns (`EXCLUDE USING btree (a WITH =)` fails with `0A000`).
-`pg_constraint` omits the system catalogs' own not-null constraints. Virtual generated
-columns, PostgreSQL 18's default when `STORED` is not written, fail with
-`0A000`: every read path would compute them from the stored row, and the
-durable table format has no virtual column kind yet. A derived table computes output
+`pg_constraint` omits the system catalogs' own not-null constraints. A BEFORE
+trigger's `WHEN` condition naming a generated column of `NEW` reports its
+error without a cursor position. A derived table computes output
 columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1
 FROM (SELECT 10 / t.x) s)` fails with division by zero on a zero `x` where
 PostgreSQL, which drops unread subquery outputs, returns the row. A

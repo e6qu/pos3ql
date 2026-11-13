@@ -3001,8 +3001,13 @@ pub(crate) fn dml_join_scope<'a>(
     let from = arena
         .alloc(FromClause { base, joins })
         .map_err(|_| super::arena_full())?;
-    let from = super::cte::expand_from_schema(from, storage, txid, arena)?;
-    let scope = super::QueryScope::resolve_dml_schema(storage, from, txid, arena, outer)?;
+    let from = super::cte::expand_dml_from_schema(from, storage, txid, arena)?;
+    let scope = if crate::sql::is_pg_settings(target) {
+        // Its rule reads the view, which no write can target directly.
+        super::QueryScope::resolve_schema(storage, from, txid, arena, outer)?
+    } else {
+        super::QueryScope::resolve_dml_schema(storage, from, txid, arena, outer)?
+    };
     Ok((scope, from))
 }
 
@@ -5219,6 +5224,8 @@ fn visit_resolved_column(
     };
     match resolved {
         super::ResolvedColumn::Table(table, column) => mark(table, column),
+        // A system column; the FROM item records the relation itself.
+        super::ResolvedColumn::TableOid(_) => Ok(()),
         super::ResolvedColumn::Merged(merged) => {
             for &(table, column) in scope.merged[merged].parts {
                 mark(table, column)?;
@@ -6138,4 +6145,32 @@ fn resolve_sequence_reference(
             }
         },
     )
+}
+
+/// The number of values each row of an INSERT without a column list
+/// supplies: its `VALUES` row width or its query's output width.
+pub(super) fn insert_source_width(
+    insert: &crate::sql::ast::Insert<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<usize, SqlError> {
+    let path = crate::storage::execution_path();
+    match (insert.rows.first(), insert.select) {
+        (Some(row), _) => Ok(row.len()),
+        (None, Some(select)) => select_output_width(
+            select,
+            storage,
+            txid,
+            arena,
+            CollectionContext {
+                path: &path,
+                transition: None,
+                bindings: None,
+                enclosing: None,
+                rule_action: false,
+            },
+        ),
+        (None, None) => Ok(0),
+    }
 }

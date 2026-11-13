@@ -594,7 +594,8 @@ pub(crate) fn description_type_oids(
     output: &mut [i32],
 ) -> Result<usize, SqlError> {
     let mut names = [None; crate::pg::respond::MAX_RESULT_COLS];
-    description_columns(description, &mut names, output)
+    let mut type_mods = [-1; crate::pg::respond::MAX_RESULT_COLS];
+    description_columns(description, &mut names, output, &mut type_mods)
 }
 
 /// Decodes one protocol description. SQL records use the cursor's separately
@@ -603,6 +604,7 @@ fn description_columns<'a>(
     description: &'a [u8],
     names: &mut [Option<&'a str>],
     type_oids: &mut [i32],
+    type_mods: &mut [i32],
 ) -> Result<usize, SqlError> {
     let corrupt = || {
         sql_err!(
@@ -618,7 +620,7 @@ fn description_columns<'a>(
         return Err(corrupt());
     }
     let count = u16::from_be_bytes(description[5..7].try_into().unwrap()) as usize;
-    if count > names.len() || count > type_oids.len() {
+    if count > names.len() || count > type_oids.len() || count > type_mods.len() {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "cursor row description has more than {} columns",
@@ -636,6 +638,7 @@ fn description_columns<'a>(
         at += name_len + 1;
         let fields = description.get(at..at + 18).ok_or_else(corrupt)?;
         type_oids[index] = i32::from_be_bytes(fields[6..10].try_into().unwrap());
+        type_mods[index] = i32::from_be_bytes(fields[12..16].try_into().unwrap());
         at += 18;
     }
     if at != description.len() {
@@ -1761,6 +1764,7 @@ impl CursorPool {
         name: &str,
         names: &mut [Option<&'a str>],
         type_oids: &mut [i32],
+        type_mods: &mut [i32],
     ) -> Result<usize, SqlError> {
         let at = self.find(name).ok_or_else(|| {
             sql_err!(
@@ -1770,7 +1774,7 @@ impl CursorPool {
             )
         })?;
         let slot = &self.slots[at];
-        let count = description_columns(slot.description.readable(), names, type_oids)?;
+        let count = description_columns(slot.description.readable(), names, type_oids, type_mods)?;
         let declared = slot.query.result_type_oids()?.ok_or_else(|| {
             sql_err!(
                 sqlstate::INTERNAL_ERROR,

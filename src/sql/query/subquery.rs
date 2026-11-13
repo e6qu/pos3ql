@@ -263,6 +263,7 @@ fn composite_slot_witness<'a>(
     let mut fields = [RecordField {
         name: "",
         type_oid: 0,
+        type_mod: -1,
         value: Datum::Null,
     }; MAX_PROJ];
     let mut collations = [Collation::None; MAX_PROJ];
@@ -280,6 +281,7 @@ fn composite_slot_witness<'a>(
                         "composite field type is absent from the catalog"
                     )
                 })?,
+            type_mod: -1,
             value: type_witness(field.ctype)?,
         };
         collations[count] = if field.ctype.is_collatable() {
@@ -342,6 +344,7 @@ fn scope_record_witness<'a>(
         let mut fields = [RecordField {
             name: "",
             type_oid: 0,
+            type_mod: -1,
             value: Datum::Null,
         }; MAX_PROJ];
         let mut collations = [Collation::None; MAX_PROJ];
@@ -356,6 +359,7 @@ fn scope_record_witness<'a>(
                             "whole-row field type is absent from the catalog"
                         )
                     })?,
+                type_mod: -1,
                 value: type_witness(column.ctype)?,
             };
             collations[index] = column.collation;
@@ -471,6 +475,7 @@ fn external_list_subquery<'a>(
                 let mut fields = [RecordField {
                     name: "",
                     type_oid: 0,
+                    type_mod: -1,
                     value: Datum::Null,
                 }; MAX_PROJ];
                 for (column, field) in fields.iter_mut().enumerate().take(row_arity) {
@@ -479,6 +484,7 @@ fn external_list_subquery<'a>(
                         type_oid: row_witness_fields
                             .and_then(|fields| fields.get(column))
                             .map_or_else(|| values[column].type_oid(), |field| field.type_oid),
+                        type_mod: -1,
                         value: values[column],
                     };
                 }
@@ -1464,6 +1470,7 @@ fn row_subquery_witness<'a>(
     let mut fields = [RecordField {
         name: "",
         type_oid: 0,
+        type_mod: -1,
         value: Datum::Null,
     }; MAX_PROJ];
     if let Some(tree) = select.set_body {
@@ -1484,6 +1491,7 @@ fn row_subquery_witness<'a>(
             fields[index] = RecordField {
                 name: column.name,
                 type_oid: column.type_oid,
+                type_mod: column.type_mod,
                 value,
             };
         }
@@ -1511,6 +1519,7 @@ fn row_subquery_witness<'a>(
             fields[index] = RecordField {
                 name: column.name,
                 type_oid: column.type_oid,
+                type_mod: column.type_mod,
                 value: catalog_type_witness(storage, txid, column.type_oid)?,
             };
         }
@@ -1539,6 +1548,7 @@ fn row_subquery_witness<'a>(
                     .map_err(|_| arena_full())?,
             },
             type_oid,
+            type_mod: -1,
             value,
         };
     }
@@ -3916,7 +3926,8 @@ pub(crate) fn subquery_expression_type<'a>(
                 crate::sql::query::scope::ResolvedColumn::Table(table, column) => {
                     scope.defs.get(table).expect("resolved source").columns[column].user_type
                 }
-                crate::sql::query::scope::ResolvedColumn::Merged(_) => None,
+                crate::sql::query::scope::ResolvedColumn::Merged(_)
+                | crate::sql::query::scope::ResolvedColumn::TableOid(_) => None,
             };
             storage
                 .routine_type_oid(scope.output_type(entry), user_type, txid)
@@ -4083,12 +4094,14 @@ fn run_scalar_record_subquery<'a>(
             let mut fields = [RecordField {
                 name: "",
                 type_oid: 0,
+                type_mod: -1,
                 value: Datum::Null,
             }; MAX_PROJ];
             for (column, field_value) in row.iter().copied().enumerate() {
                 fields[column] = RecordField {
                     name: witness_fields[column].name,
                     type_oid: witness_fields[column].type_oid,
+                    type_mod: witness_fields[column].type_mod,
                     value: crate::sql::exec::detach_routine_datum(field_value, arena)?,
                 };
             }
@@ -4160,12 +4173,14 @@ fn run_record_subquery<'a>(
             let mut fields = [RecordField {
                 name: "",
                 type_oid: 0,
+                type_mod: -1,
                 value: Datum::Null,
             }; MAX_PROJ];
             for (column, value) in values.iter().copied().enumerate() {
                 fields[column] = RecordField {
                     name: witness_fields[column].name,
                     type_oid: witness_fields[column].type_oid,
+                    type_mod: witness_fields[column].type_mod,
                     value,
                 };
             }
@@ -4878,12 +4893,18 @@ fn set_record_rows<'a>(
     }
     let record = |values: &mut dyn FnMut(usize) -> Result<Datum<'a>, SqlError>|
      -> Result<Datum<'a>, SqlError> {
-        let mut fields = [RecordField { name: "", type_oid: 0, value: Datum::Null }; MAX_PROJ];
+        let mut fields = [RecordField {
+            name: "",
+            type_oid: 0,
+            type_mod: -1,
+            value: Datum::Null,
+        }; MAX_PROJ];
         for (column, field) in fields[..target.len()].iter_mut().enumerate() {
             let value = values(column)?;
             *field = RecordField {
                 name: names[column],
                 type_oid: target[column].oid(),
+                type_mod: -1,
                 value,
             };
         }

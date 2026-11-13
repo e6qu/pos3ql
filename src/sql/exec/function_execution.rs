@@ -113,6 +113,7 @@ impl ReturnBinding {
                     .alloc_slice_with(outputs.len(), |_| RecordField {
                         name: "",
                         type_oid: 0,
+                        type_mod: -1,
                         value: Datum::Null,
                     })
                     .map_err(|_| super::super::query::arena_full_pub())?;
@@ -122,6 +123,7 @@ impl ReturnBinding {
                             .alloc_str(output.name.as_str())
                             .map_err(|_| super::super::query::arena_full_pub())?,
                         type_oid: output.type_oid,
+                        type_mod: -1,
                         value: output
                             .local
                             .map_or(Datum::Null, |index| execution.values[index]),

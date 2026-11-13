@@ -929,9 +929,7 @@ pub(crate) fn take_annotation(sqlstate: &str, message: &dyn core::fmt::Display) 
 /// column and a missing or invalid FROM-clause entry.
 pub(crate) fn column_reference(error: SqlError, qualifier: Option<&str>, name: &str) -> SqlError {
     use crate::sql::eval::sqlstate;
-    // PL/pgSQL reports a record variable's missing field without a position.
-    let message = error.message.as_str();
-    if message.starts_with("record \"") && message.contains("\" has no field \"") {
+    if is_record_field_failure(&error) {
         return error;
     }
     if matches!(
@@ -955,6 +953,15 @@ pub(crate) fn column_reference(error: SqlError, qualifier: Option<&str>, name: &
     } else {
         error
     }
+}
+
+/// A procedural record's missing field: PostgreSQL resolves the field while
+/// planning the expression that names it and reports it without a position.
+pub(crate) fn is_record_field_failure(error: &SqlError) -> bool {
+    let message = error.message.as_str();
+    error.sqlstate == crate::sql::eval::sqlstate::UNDEFINED_COLUMN
+        && message.starts_with("record \"")
+        && message.contains("\" has no field \"")
 }
 
 /// A cast's type modifier is applied after the constant's input, when the

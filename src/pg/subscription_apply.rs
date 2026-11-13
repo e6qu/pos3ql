@@ -331,6 +331,11 @@ impl SubscriptionApply {
         )?;
         guc.set_config("search_path", Some(""), false)
             .expect("empty worker search path is valid");
+        // PostgreSQL's apply worker runs as a replica: only triggers and rules
+        // enabled REPLICA or ALWAYS fire, so foreign key checks and actions
+        // (ORIGIN triggers) leave rows exactly as the publisher sent them.
+        guc.set_config("session_replication_role", Some("replica"), false)
+            .expect("replica is a valid replication role");
         Ok(Self {
             stream,
             txn: TxnState::new_with_config(budget, config)?,

@@ -218,7 +218,7 @@ fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str>
     Ok((state, token))
 }
 
-pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v39";
+pub(crate) const MANIFEST_HEADER: &str = "pos3ql-manifest-v41";
 
 struct ManifestMetadata {
     lsn: u64,
@@ -6091,6 +6091,19 @@ impl Checkpointer {
                         .ok_or(CheckpointSetupError::Corrupt("bad fkey timing"))?;
                     fk.validation = crate::storage::ConstraintValidation::from_code(validation)
                         .ok_or(CheckpointSetupError::Corrupt("bad fkey validation"))?;
+                    for mode in &mut fk.trigger_enabled {
+                        let code: u8 = parse_field(words.next(), "fkey trigger mode")?;
+                        *mode = crate::storage::TriggerEnabled::from_code(code)
+                            .ok_or(CheckpointSetupError::Corrupt("bad fkey trigger mode"))?;
+                    }
+                    let n_set: usize = parse_field(words.next(), "fkey nset")?;
+                    if n_set > n_cols {
+                        return Err(CheckpointSetupError::Corrupt("bad fkey nset"));
+                    }
+                    fk.n_delete_set_cols = n_set;
+                    for c in fk.delete_set_cols.iter_mut().take(n_set) {
+                        *c = parse_field(words.next(), "fkey set col")?;
+                    }
                     let hex_name = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("fkey name missing"))?;
@@ -11175,16 +11188,22 @@ impl Checkpointer {
                     format_args!("xdep {}", ManifestInputBytes(&bytes[..length])),
                 )?;
             }
-            // `fkey <ncols> <c..> <nparent> <p..> <actions> <timing> <validation> <names>`
+            // `fkey <ncols> <c..> <nparent> <p..> <actions> <timing> <validation>
+            // <four trigger modes> <nset> <set..> <names>`; each position takes
+            // at most six bytes.
             for fk in definition.fkeys() {
                 use core::fmt::Write;
-                let mut columns = StackStr::<64>::new();
+                let mut columns = StackStr::<{ crate::storage::MAX_INDEX_COLS * 6 }>::new();
                 for c in fk.columns() {
                     let _ = write!(columns, "{c} ");
                 }
-                let mut pcols = StackStr::<64>::new();
+                let mut pcols = StackStr::<{ crate::storage::MAX_INDEX_COLS * 6 }>::new();
                 for c in fk.parent_cols() {
                     let _ = write!(pcols, "{c} ");
+                }
+                let mut set_columns = StackStr::<{ crate::storage::MAX_INDEX_COLS * 6 }>::new();
+                for c in fk.delete_set_cols() {
+                    let _ = write!(set_columns, "{c} ");
                 }
                 let mut hex_name = StackStr::<130>::new();
                 for b in fk.name.as_str().as_bytes() {
@@ -11201,7 +11220,7 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "fkey {} {}{} {}{} {} {} {} {} {} {}",
+                        "fkey {} {}{} {}{} {} {} {} {} {} {} {} {} {}{} {} {}",
                         fk.n_cols,
                         columns.as_str(),
                         fk.n_parent_cols,
@@ -11210,6 +11229,12 @@ impl Checkpointer {
                         fk.on_update.code(),
                         fk.timing.code(),
                         fk.validation.code(),
+                        fk.trigger_enabled[0].code(),
+                        fk.trigger_enabled[1].code(),
+                        fk.trigger_enabled[2].code(),
+                        fk.trigger_enabled[3].code(),
+                        fk.n_delete_set_cols,
+                        set_columns.as_str(),
                         hex_name.as_str(),
                         hparent.as_str(),
                         hparent_schema.as_str()
@@ -12635,7 +12660,8 @@ impl Checkpointer {
                     (1u8, view.schema, view.name)
                 }
             };
-            let function = storage.routine(usize::from(trigger.function));
+            let (function_schema, function_name) =
+                storage.trigger_function_name(trigger.function, 0);
             let mut hname = StackStr::<130>::new();
             let mut hschema = StackStr::<130>::new();
             let mut htable = StackStr::<130>::new();
@@ -12661,10 +12687,10 @@ impl Checkpointer {
             for byte in relation_name.as_str().as_bytes() {
                 let _ = write!(htable, "{byte:02x}");
             }
-            for byte in function.schema.as_str().as_bytes() {
+            for byte in function_schema.as_str().as_bytes() {
                 let _ = write!(hfunction_schema, "{byte:02x}");
             }
-            for byte in function.name.as_str().as_bytes() {
+            for byte in function_name.as_str().as_bytes() {
                 let _ = write!(hfunction, "{byte:02x}");
             }
             if let Some(old) = trigger.transition_tables.old() {
@@ -18750,18 +18776,8 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
         ));
     }
     let function = storage
-        .routine_slot_by_signature(&function_schema, &function_name, &[], 0)
-        .ok_or(CheckpointSetupError::Corrupt(
-            "trigger function does not exist",
-        ))?;
-    if !matches!(
-        storage.routine(function).kind,
-        crate::storage::RoutineKind::Trigger
-    ) {
-        return Err(CheckpointSetupError::Corrupt(
-            "trigger function is not trigger typed",
-        ));
-    }
+        .trigger_function_named(&function_schema, &function_name, 0)
+        .map_err(CheckpointSetupError::Corrupt)?;
     storage
         .restore_trigger(
             identity,
@@ -21213,7 +21229,7 @@ mod stored_dependency_tests {
             )
             .unwrap();
         let manifest = format!(
-            "pos3ql-manifest-v39\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
+            "pos3ql-manifest-v41\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nvix 0 1 0 0 - {} 1 7\ntypes_end\nend\n",
             index_gc_hex(old.roster)
         );
         // Two backups and two readers share the same graph at the four-block limit.
@@ -22052,7 +22068,7 @@ mod stored_dependency_tests {
             );
             let empty_list =
                 b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>";
-            let manifest = b"pos3ql-manifest-v39\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
+            let manifest = b"pos3ql-manifest-v41\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
             let body: &[u8] = match phase {
                 "rows" | "index" => &root_body,
                 "manifest" => manifest,
@@ -22183,7 +22199,7 @@ mod stored_dependency_tests {
         let mut budget = Budget::new(Checkpointer::budget_bytes(&config));
         let mut checkpoint = Checkpointer::new(&config, &mut budget).unwrap();
         assert_eq!(budget.remaining(), 0);
-        let manifest = b"pos3ql-manifest-v39\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
+        let manifest = b"pos3ql-manifest-v41\nlsn 0\nnext_rowid 1\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n";
         for index in 0..65 {
             checkpoint
                 .client
@@ -22792,7 +22808,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let mut manifest = String::from("pos3ql-manifest-v39\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
+                    let mut manifest = String::from("pos3ql-manifest-v41\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\n");
                     for (oid, name) in [(first_oid, first_name), (second_oid, second_name)] {
                         let encoded = name
                             .as_bytes()
@@ -22818,7 +22834,7 @@ mod stored_dependency_tests {
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
                     assert!(matches!(checkpointer.load_manifest_text(&mut storage,
-                        "pos3ql-manifest-v39\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
+                        "pos3ql-manifest-v41\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nsset 73616d706c65 6669727374\nsset 73616d706c65 7365636f6e64\ntypes_end\nend\n"),
                         Err(CheckpointSetupError::Corrupt("duplicate system setting record"))));
                     assert_eq!(storage.system_settings().find(|(_, image)| image.live).unwrap().1
                         .value.as_str(), "first");
@@ -22827,7 +22843,7 @@ mod stored_dependency_tests {
                     let mut budget = Budget::new(bytes);
                     let mut storage = Storage::new(&config, &mut budget, 0).unwrap();
                     let mut checkpointer = Checkpointer::new(&config, &mut budget).unwrap();
-                    let manifest = format!("pos3ql-manifest-v39\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
+                    let manifest = format!("pos3ql-manifest-v41\nlsn 0\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 10 1 2 0 5 10 6669727374\nptx {transaction_id} 1 2 0 5 10 {gid}\ntypes_end\nend\n");
                     match checkpointer.load_manifest_text(&mut storage, &manifest) {
                         Err(CheckpointSetupError::ObjectStore(message)) => {
                             assert!(message.contains("duplicate prepared transaction catalog identity"));
@@ -23033,7 +23049,9 @@ mod stored_dependency_tests {
                 "pos3ql-manifest-v36",
                 "pos3ql-manifest-v37",
                 "pos3ql-manifest-v38",
-                "pos3ql-manifest-v39 trailing",
+                "pos3ql-manifest-v39",
+                "pos3ql-manifest-v40",
+                "pos3ql-manifest-v41 trailing",
             ] {
                 let rejected = stack_format!(512, "{header}\n{body}");
                 assert!(matches!(
@@ -23115,11 +23133,11 @@ mod stored_dependency_tests {
 
     #[test]
     fn backup_commit_floor_includes_prepared_transactions_and_logical_slots() {
-        let manifest = b"pos3ql-manifest-v39\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let manifest = b"pos3ql-manifest-v41\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nptx 7 41 50 0 5 10 78\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_lsn(manifest).unwrap(), 100);
         assert_eq!(manifest_commit_retention_floor(manifest).unwrap(), 40);
 
-        let slot_only = b"pos3ql-manifest-v39\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
+        let slot_only = b"pos3ql-manifest-v41\nlsn 100\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\nrslot 736c6f74 60 70 0\ntypes_end\nend\n";
         assert_eq!(manifest_commit_retention_floor(slot_only).unwrap(), 60);
     }
 
@@ -23533,7 +23551,7 @@ mod stored_dependency_tests {
         let mut manifest = FixedBuf::new(&mut budget, "manifest", 1024).unwrap();
         manifest
             .append(
-                b"pos3ql-manifest-v39\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
+                b"pos3ql-manifest-v41\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\ncatalog_sequence 0\nrole_sequence 16384\nwriter 00000000000000000000000000000001\ntypes_end\nend\n",
             );
         let before = manifest.readable().to_vec();
         retag_manifest_root(&mut manifest, replacement).unwrap();

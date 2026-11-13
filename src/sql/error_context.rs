@@ -351,6 +351,22 @@ impl Frame for CopyFrame<'_> {
     }
 }
 
+/// A PL/pgSQL function compiled for a call it cannot serve, as PostgreSQL's
+/// `plpgsql_compile_callback` reports such an error.
+pub(crate) struct PlpgsqlCompilationFrame<'a> {
+    pub(crate) name: &'a str,
+}
+
+impl Frame for PlpgsqlCompilationFrame<'_> {
+    fn write_line(&self, out: &mut dyn Write, _positioned: bool) -> fmt::Result {
+        write!(
+            out,
+            "compilation of PL/pgSQL function \"{}\" near line 1",
+            self.name
+        )
+    }
+}
+
 struct Node {
     frame: *const (dyn Frame + 'static),
     previous: *const Node,

@@ -114,6 +114,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
                 }
                 Ok(Datum::Null)
             }
+            ResolvedColumn::TableOid(t) => self.scope.flat_relation_oid(t),
         }
     }
 
@@ -154,7 +155,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
             ResolvedColumn::Table(table, column) => {
                 self.scope.defs.get(table)?.columns.get(column)?.user_type
             }
-            ResolvedColumn::Merged(_) => None,
+            ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_) => None,
         }
     }
 
@@ -162,6 +163,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
         match self.scope.find_column_unsuggested(qualifier, name).ok()? {
             ResolvedColumn::Table(table, column) => Some((table as u32, column as u32)),
             ResolvedColumn::Merged(merged) => Some((u32::MAX, merged as u32)),
+            ResolvedColumn::TableOid(table) => Some((table as u32, u32::MAX)),
         }
     }
 
@@ -227,6 +229,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
             .alloc_slice_with(width, |_| crate::sql::types::RecordField {
                 name: "",
                 type_oid: 0,
+                type_mod: -1,
                 value: Datum::Null,
             })
             .map_err(|_| arena_full())?;
@@ -741,7 +744,11 @@ fn union_all_branches_rerun(
 /// Whether `expression` calls an aggregate outside a nested subquery. The
 /// subquery's own columns are not in scope here, so a call is classified by
 /// name: a built-in aggregate or any visible user-defined aggregate.
-fn expression_has_aggregate_use(expression: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
+pub(super) fn expression_has_aggregate_use(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> bool {
     if let Expr::Call {
         name,
         args,
@@ -1012,6 +1019,7 @@ impl<'r, 'a> LockedRowRecheck<'r, 'a> {
                 unreachable!("a changed source is bound");
             };
             let context = crate::sql::exec::RowCtx {
+                table_oid: None,
                 def: scope.defs.get(table).expect("resolved"),
                 values,
                 alias: None,
@@ -1175,6 +1183,7 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
                     catalog,
                 )
             }
+            super::scope::ResolvedColumn::TableOid(_) => None,
             super::scope::ResolvedColumn::Merged(_) => Some((
                 crate::util::StackStr::from_str(self.0.output_name(entry)),
                 crate::sql::exec::StaticTypeMeta {
@@ -1254,13 +1263,16 @@ impl<'a> ColumnLookup<'a> for ScopeSchema<'_, '_> {
             super::scope::ResolvedColumn::Table(table, column) => {
                 self.0.defs.get(table)?.columns.get(column)?.user_type
             }
-            super::scope::ResolvedColumn::Merged(_) => None,
+            super::scope::ResolvedColumn::Merged(_) | super::scope::ResolvedColumn::TableOid(_) => {
+                None
+            }
         }
     }
     fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
         match self.0.find_column_unsuggested(qualifier, name).ok()? {
             super::scope::ResolvedColumn::Table(t, c) => Some((t as u32, c as u32)),
             super::scope::ResolvedColumn::Merged(m) => Some((u32::MAX, m as u32)),
+            super::scope::ResolvedColumn::TableOid(table) => Some((table as u32, u32::MAX)),
         }
     }
     fn whole_row_is_scalar(&self, table: &str) -> bool {
@@ -1411,7 +1423,9 @@ impl<'a> ColumnLookup<'a> for ScopePrefix<'_, '_> {
             super::scope::ResolvedColumn::Table(table, column) => {
                 self.scope.defs.get(table)?.columns.get(column)?.user_type
             }
-            super::scope::ResolvedColumn::Merged(_) => None,
+            super::scope::ResolvedColumn::Merged(_) | super::scope::ResolvedColumn::TableOid(_) => {
+                None
+            }
         }
     }
 
@@ -1419,6 +1433,7 @@ impl<'a> ColumnLookup<'a> for ScopePrefix<'_, '_> {
         match self.entry(qualifier, name).ok()? {
             super::scope::ResolvedColumn::Table(t, c) => Some((t as u32, c as u32)),
             super::scope::ResolvedColumn::Merged(m) => Some((u32::MAX, m as u32)),
+            super::scope::ResolvedColumn::TableOid(table) => Some((table as u32, u32::MAX)),
         }
     }
 

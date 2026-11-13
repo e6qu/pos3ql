@@ -1514,7 +1514,7 @@ fn predicate_column(
                 }
                 match scope.find_column(*qualifier, name).ok()? {
                     query::ResolvedColumn::Table(table, column) => Some((table, column, operator)),
-                    query::ResolvedColumn::Merged(_) => None,
+                    query::ResolvedColumn::Merged(_) | query::ResolvedColumn::TableOid(_) => None,
                 }
             };
             side(left, right, *operator).or_else(|| side(right, left, reverse(*operator)))
@@ -2079,6 +2079,9 @@ pub(super) fn plan_select<'a>(
         )?),
         None => None,
     };
+    if let Some(scope) = scope.as_ref() {
+        query::validate_static_grouping(statement, scope, storage, txid, arena)?;
+    }
     let capacity = scope
         .as_ref()
         .map_or(MAX_EXPLAIN_STAGES, |scope| scope.n * 3 + MAX_EXPLAIN_STAGES);
@@ -4761,7 +4764,12 @@ fn rule_rewritten_statements<'a>(
         Some(crate::storage::ResolvedRelation::Table(slot)) => slot,
         Some(crate::storage::ResolvedRelation::View(view))
             if storage
-                .firing_rules_for(RuleTarget::View(view as u16), event, false, txid)
+                .firing_rules_for(
+                    RuleTarget::View(view as u16),
+                    event,
+                    crate::sql::guc::active_session_replication_role()?,
+                    txid,
+                )
                 .next()
                 .is_some() =>
         {
@@ -4774,7 +4782,12 @@ fn rule_rewritten_statements<'a>(
     };
     let target = RuleTarget::Table(slot as u16);
     if storage
-        .firing_rules_for(target, event, false, txid)
+        .firing_rules_for(
+            target,
+            event,
+            crate::sql::guc::active_session_replication_role()?,
+            txid,
+        )
         .next()
         .is_none()
     {
@@ -4974,7 +4987,12 @@ fn rule_rewritten_statements<'a>(
     let mut actions = crate::mem::arena::ArenaList::new(arena);
     let mut suppressed = false;
     let mut exclusions: Option<&'a Expr<'a>> = None;
-    for (_, rule) in storage.firing_rules_for(target, event, false, txid) {
+    for (_, rule) in storage.firing_rules_for(
+        target,
+        event,
+        crate::sql::guc::active_session_replication_role()?,
+        txid,
+    ) {
         let rule = rule.definition_for(txid);
         let rule_condition = match rule.condition_sql() {
             Some(sql) => {
@@ -5149,7 +5167,12 @@ fn rule_rewritten_statements<'a>(
                     };
                 if matches!(action_target, RuleTarget::View(_))
                     || storage
-                        .firing_rules_for(action_target, action_event, false, txid)
+                        .firing_rules_for(
+                            action_target,
+                            action_event,
+                            crate::sql::guc::active_session_replication_role()?,
+                            txid,
+                        )
                         .next()
                         .is_some()
                 {

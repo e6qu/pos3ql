@@ -563,16 +563,19 @@ fn object_address_record<'a>(
             crate::sql::types::RecordField {
                 name: "classid",
                 type_oid: crate::sql::types::oid::OID,
+                type_mod: -1,
                 value: Datum::Oid(class_id as u32),
             },
             crate::sql::types::RecordField {
                 name: "objid",
                 type_oid: crate::sql::types::oid::OID,
+                type_mod: -1,
                 value: Datum::Oid(object_id as u32),
             },
             crate::sql::types::RecordField {
                 name: "objsubid",
                 type_oid: crate::sql::types::oid::INT4,
+                type_mod: -1,
                 value: Datum::Int4(sub_id),
             },
         ])
@@ -602,11 +605,13 @@ fn identify_object_record<'a>(
                 crate::sql::types::RecordField {
                     name: "type",
                     type_oid: crate::sql::types::oid::TEXT,
+                    type_mod: -1,
                     value: Datum::Text(object_type),
                 },
                 crate::sql::types::RecordField {
                     name: "object_names",
                     type_oid: crate::sql::types::oid::TEXT_ARRAY,
+                    type_mod: -1,
                     value: if object.identity.is_empty() {
                         Datum::Null
                     } else {
@@ -619,6 +624,7 @@ fn identify_object_record<'a>(
                 crate::sql::types::RecordField {
                     name: "object_args",
                     type_oid: crate::sql::types::oid::TEXT_ARRAY,
+                    type_mod: -1,
                     value: if object.identity.is_empty() {
                         Datum::Null
                     } else {
@@ -636,11 +642,13 @@ fn identify_object_record<'a>(
                 crate::sql::types::RecordField {
                     name: "type",
                     type_oid: crate::sql::types::oid::TEXT,
+                    type_mod: -1,
                     value: Datum::Text(object_type),
                 },
                 crate::sql::types::RecordField {
                     name: "schema",
                     type_oid: crate::sql::types::oid::TEXT,
+                    type_mod: -1,
                     value: match object.schema_name.as_ref() {
                         Some(value) => {
                             Datum::Text(arena.alloc_str(value.as_str()).map_err(|_| arena_full())?)
@@ -651,6 +659,7 @@ fn identify_object_record<'a>(
                 crate::sql::types::RecordField {
                     name: "name",
                     type_oid: crate::sql::types::oid::TEXT,
+                    type_mod: -1,
                     value: match object_name {
                         Some(value) => {
                             Datum::Text(arena.alloc_str(value).map_err(|_| arena_full())?)
@@ -661,6 +670,7 @@ fn identify_object_record<'a>(
                 crate::sql::types::RecordField {
                     name: "identity",
                     type_oid: crate::sql::types::oid::TEXT,
+                    type_mod: -1,
                     value: if object.identity.is_empty() {
                         Datum::Null
                     } else {
@@ -1508,6 +1518,7 @@ pub(crate) fn dispatch<'a>(
                         name: columns[field].0,
                         type_oid: columns[field].1.oid(),
                         value: values[field],
+                        type_mod: -1,
                     })
                     .map_err(|_| crate::sql::eval::arena_full())?;
                 Ok(Datum::Record(fields))
@@ -2010,7 +2021,9 @@ pub(crate) fn dispatch<'a>(
                         eval_full(args[1], arena, params, row, hooks)?,
                         Datum::Bool(true)
                     );
-                match session_setting(name_value) {
+                match session_setting(name_value)
+                    .or_else(|| crate::sql::guc::active_custom_setting(name_value))
+                {
                     Some(v) => Ok(Datum::Text(
                         arena.alloc_str(v.as_str()).map_err(|_| arena_full())?,
                     )),
@@ -2065,6 +2078,18 @@ pub(crate) fn dispatch<'a>(
                         ));
                     }
                 };
+                if crate::sql::guc::requires_set_privilege(name) {
+                    hooks
+                        .catalog
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "set_config of \"{}\" has no session catalog",
+                                name
+                            )
+                        })?
+                        .authorize_parameter_set(name)?;
+                }
                 let configured = crate::sql::guc::set_active_config(name, value, local)?;
                 Ok(Datum::Text(
                     arena

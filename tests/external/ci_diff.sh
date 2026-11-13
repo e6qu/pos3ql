@@ -606,6 +606,43 @@ else
   bad "foreign procedural subtransaction cleanup"
   cat "$WORK/foreign_subtransaction_reference.out" "$WORK/foreign_subtransaction_pos3ql.out"
 fi
+# The same remote table is a plain partition in PostgreSQL and a foreign
+# partition in pos3ql.
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -q -v ON_ERROR_STOP=1 \
+  -c 'DROP TABLE IF EXISTS public.pos3ql_fdw_mixed' \
+  -c 'CREATE TABLE public.pos3ql_fdw_mixed (id integer, note text)' \
+  > "$WORK/foreign_mixed_setup.out" 2>&1
+psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -q -v ON_ERROR_STOP=1 \
+  -c 'IMPORT FOREIGN SCHEMA public LIMIT TO (pos3ql_fdw_mixed) FROM SERVER reference_server INTO public' \
+  >> "$WORK/foreign_mixed_setup.out" 2>&1
+for side in reference pos3ql; do
+  if [[ $side == reference ]]; then host=$PGHOST port=$PGPORT; else host=127.0.0.1 port=$P3_PORT; fi
+  psql -h "$host" -p "$port" -U "$PGUSER" -d postgres -X -Atq -F '|' \
+    -v ON_ERROR_STOP=1 -f "$EXT/foreign-row-progress.sql" \
+    > "$WORK/foreign_row_progress_$side.out" 2>&1 || echo "status $?" >> "$WORK/foreign_row_progress_$side.out"
+done
+if diff -u "$WORK/foreign_row_progress_reference.out" "$WORK/foreign_row_progress_pos3ql.out" \
+  && [[ "$(tail -1 "$WORK/foreign_row_progress_reference.out")" == 0 ]]; then
+  ok "foreign writes keep changed rows across routine calls"
+else
+  bad "foreign write row progress"
+fi
+# PostgreSQL refuses MERGE when a result relation is a foreign partition.
+foreign_mixed_merge=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -q 2>&1 <<'SQL'
+BEGIN;
+CREATE TABLE fdw_merge_parent (id integer, note text) PARTITION BY RANGE (id);
+ALTER TABLE fdw_merge_parent ATTACH PARTITION pos3ql_fdw_mixed FOR VALUES FROM (0) TO (2000);
+MERGE INTO fdw_merge_parent USING (VALUES (1)) v(x) ON id = x
+  WHEN MATCHED THEN UPDATE SET note = 'm';
+ROLLBACK;
+SQL
+)
+if [[ "$foreign_mixed_merge" == *'ERROR:  cannot execute MERGE on relation "pos3ql_fdw_mixed"'*'DETAIL:  This operation is not supported for foreign tables.'* ]]; then
+  ok "MERGE over a foreign partition fails as in PostgreSQL"
+else
+  bad "MERGE over a foreign partition"
+  printf '%s\n' "$foreign_mixed_merge"
+fi
 cat > "$WORK/foreign_merge.sql" <<'SQL'
 BEGIN;
 SAVEPOINT outer_foreign_merge;

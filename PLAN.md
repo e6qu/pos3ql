@@ -142,30 +142,25 @@ is owned.
   of writes inside functions called from a restartable statement still reads
   synchronously: a step's foreign key check that waited resumed the step at a
   completion position past its last row and then waited again without a new
-  GET, a loop the download bound does not see. `ON DELETE`/`ON UPDATE` `CASCADE`, `SET NULL` and
-  `SET DEFAULT` run as queued events at the statement's end, as
-  PostgreSQL 18.6's `RI_ConstraintTrigger_a_*` events (never deferred), but
-  rewrite the referencing rows directly. PostgreSQL runs each as a `DELETE`
-  or `UPDATE` of the referencing table: rules rewrite it (a `DO INSTEAD
-  NOTHING` rule fails it with `XX000`), its `BEFORE` triggers fire then,
-  `BEFORE STATEMENT` once per table and operation in the statement, and its
-  `AFTER ROW` and `AFTER STATEMENT` events join the end of the statement's
-  queue (`AFTER STATEMENT` once per table and operation, after the last such
-  change, with the merged transition rows); an error inside it carries the
-  action query as `CONTEXT`. That needs the action to run through the
-  nested write path with its events tagged at the outer statement's depth,
-  and statement triggers queued as events. `ON DELETE SET NULL (columns)`
-  and `SET DEFAULT (columns)` fail with `42601` (no column list is stored).
-  A data-modifying `WITH` sub-statement fires
-  its `AFTER ROW` and `AFTER STATEMENT` triggers at its own end, where
-  PostgreSQL fires them after the main statement's rows (its foreign key
-  checks already wait for the statement's end).
+  GET, a loop the download bound does not see. A data-modifying `WITH`
+  sub-statement that the main statement reads runs to completion when first
+  read, so its `AFTER` events queue before the main statement's own, and
+  its volatile calls run before the main statement's later ones; PostgreSQL
+  runs it as the main statement reads its rows, so both interleave (one
+  that nothing reads already runs after the main statement, last one first,
+  as in PostgreSQL). Matching that order needs sub-statements that run as
+  their rows are read, by the
+  [design](docs/architecture.md#write-sub-statements-that-run-as-their-rows-are-read):
+  producer nodes over retained selections, and a streaming
+  `INSERT ... SELECT` source.
   `INSTEAD OF` view rows, DDL, COPY, replication apply and deferred
   triggers read synchronously. A routine call inside the rows
   keeps the changed rows (row progress), also for views and rules written
-  from PL/pgSQL and SQL-language bodies. Extend row
-  progress to foreign tables and to data-modifying `WITH` inside routine
-  bodies: a routine call after their first row change fails with `0A000`
+  from PL/pgSQL and SQL-language bodies, and for foreign tables, which keep
+  their selected remote rows, also beside the local rows' stored images of
+  a table mixing local and foreign children. Extend row progress to
+  data-modifying `WITH` inside routine bodies: a routine call after their
+  first row change fails with `0A000`
   (`SQL row expression requires retained write progress`), because
   restarting would hide the earlier rows from the call. Multi-step
   statements nested deeper than `write_step_levels` fail the same way with
@@ -617,6 +612,27 @@ SQL/JSON result types) are reported when the statement would run. In a
 `SELECT`, an unknown relation, a modifier's unknown type and an output column
 written before the failing modifier are reported first, as PostgreSQL's
 analysis order finds them; in other statements the modifier error comes first.
+Before a session first runs PL/pgSQL, PostgreSQL does not know the
+`plpgsql.*` parameters (`SHOW plpgsql.variable_conflict` fails with `42704`,
+`SET` stores a placeholder that loading converts and `pg_settings` lists only
+placeholders); pos3ql knows them from startup. PL/pgSQL's extra checks
+(`shadowed_variables`, `too_many_rows`, `strict_multi_assignment` in
+`plpgsql.extra_warnings` and `plpgsql.extra_errors`) fail with `0A000`.
+Writes to catalog views other than `pg_settings`, and to system catalogs,
+fail with `42P01`. A write through a view on another view that writes the
+lower view with its own `INSTEAD OF` trigger or rewrite rule fails with
+`0A000` (`writing through view "v2" into view "v1", which has INSTEAD OF
+triggers or rewrite rules, is not supported`); PostgreSQL rewrites onto the
+lower view and fires its trigger or rule.
+A constant assigned to a PL/pgSQL variable (`v := 'abcdefgh'` for
+`varchar(5)`) that fails the variable's modifier reports `LINE`/`QUERY`
+instead of PostgreSQL's `PL/pgSQL assignment` context; an immutable call
+(`upper('abcdefgh')`) misses that context for variables and `NEW` fields; and
+`NEW.n := 'zz'` for an `integer` field lacks PostgreSQL's `LINE`/`QUERY`.
+`ROW(...)::t` for a table's row type fails
+with `42846`, and `COALESCE` of two different tables' rows is accepted where
+PostgreSQL fails with `42846` (`COALESCE could not convert type b to a`).
+A field selection error (`(1).x`) has no cursor position.
 A `RETURNING` list routed through a rule's `RETURNING` list reads the rule's
 relation only: `UPDATE v ... FROM o RETURNING o.label`, `*` beside `FROM` or
 `USING` sources, and subqueries in that list fail with `0A000` where
@@ -626,11 +642,16 @@ the expression in `CONTEXT`. Selecting a field of a named composite cast to
 `record` (`(ROW(1, 2)::t::record).id`) fails as an unknown field. Reading a
 field of a NULL `record` parameter names the expression in `CONTEXT`, which
 PostgreSQL omits because it raises the error while evaluating, not planning.
-A foreign key between two different composite types fails with `0A000`
-where PostgreSQL compares them field by field.
-A user table's `tableoid` system column fails with `0A000`
-(`SELECT tableoid::regclass FROM partitioned` names no partition); catalogs
-expose it. COPY to or from a server file or program,
+`PREPARE p(t1) AS UPDATE t SET c = $1` with a parameter type the column
+cannot take is accepted until it runs, and the error it then reports (also
+from a cascaded `ON UPDATE CASCADE` between two composite types) has no
+position: parameters carry no source position for assignment analysis.
+A window query, or an `UPDATE ... FROM` or `DELETE ... USING` `RETURNING`
+list, that reads the `tableoid` of a partitioned table or inheritance parent
+in a `FROM` item fails with `0A000`: those paths flatten each joined row
+without the leaf it came from (`JoinRowValues::Flat`, materialized joined
+rows); carrying the leaf oid as a hidden trailing value there fixes it.
+COPY to or from a server file or program,
 `COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
 RETURNING` a non-JSON, non-string type are rejected with `0A000`.
 A string literal passed to a `regclass` parameter (`nextval('missing')`) is

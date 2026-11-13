@@ -1,0 +1,53 @@
+-- Custom parameters with a qualified name are PostgreSQL's placeholders:
+-- any session may set them, they survive the transaction that defined them
+-- (with their value rolled back) and RESET returns them to empty.
+SET myapp.tenant = '7';
+SHOW myapp.tenant;
+SELECT current_setting('myapp.tenant'), current_setting('myapp.missing', true);
+SELECT current_setting('myapp.missing');
+SHOW myapp.missing;
+SELECT set_config('myapp.tenant', 'abc', false);
+SELECT current_setting('myapp.tenant');
+RESET myapp.tenant;
+SHOW myapp.tenant;
+BEGIN;
+SET LOCAL myapp.scoped = 'local';
+SHOW myapp.scoped;
+SELECT set_config('myapp.scoped', 'x', true);
+COMMIT;
+SHOW myapp.scoped;
+BEGIN;
+SET myapp.rolled = 'one';
+ROLLBACK;
+SHOW myapp.rolled;
+SET myapp.saved = 'outer';
+BEGIN;
+SET myapp.saved = 'first';
+SAVEPOINT s;
+SET myapp.saved = 'second';
+ROLLBACK TO SAVEPOINT s;
+SHOW myapp.saved;
+COMMIT;
+SHOW myapp.saved;
+SET "MyApp.Mixed" = 'q';
+SHOW "MyApp.Mixed";
+SET a.b.c = 'deep';
+SHOW a.b.c;
+SET myapp.number = 5;
+SHOW myapp.number;
+SET myapp.list = a, b;
+SET myapp = 'x';
+SET "my-app.x" = '1';
+SET "1app.x" = '1';
+SET myapp.tenant TO DEFAULT;
+SHOW myapp.tenant;
+CREATE FUNCTION custom_inside() RETURNS text LANGUAGE sql
+  SET myapp.routine = 'inside' AS $$ SELECT current_setting('myapp.routine') $$;
+SELECT custom_inside();
+SHOW myapp.routine;
+SELECT count(*) FROM pg_settings WHERE name LIKE 'myapp.%';
+RESET ALL;
+SHOW myapp.saved;
+DISCARD ALL;
+SHOW myapp.number;
+DROP FUNCTION custom_inside();

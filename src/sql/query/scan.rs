@@ -1139,6 +1139,8 @@ fn pax_column_demand_bounded(
                         return false;
                     }
                 }
+                // The row's table, not a stored column.
+                Ok(ResolvedColumn::TableOid(_)) => {}
                 Err(error)
                     if error.sqlstate == sqlstate::UNDEFINED_COLUMN
                         && qualifier.is_none()
@@ -2731,7 +2733,9 @@ pub(crate) fn parameterized_index_access_plan<'a>(
         operand.for_each_column_reference(&mut |qualifier, name| match scope
             .find_column(qualifier, name)
         {
-            Ok(ResolvedColumn::Table(source, _)) => tables |= 1u64 << source,
+            Ok(ResolvedColumn::Table(source, _) | ResolvedColumn::TableOid(source)) => {
+                tables |= 1u64 << source
+            }
             Ok(ResolvedColumn::Merged(merged)) => {
                 for &(source, _) in scope.merged[merged].parts {
                     tables |= 1u64 << source;
@@ -4384,6 +4388,12 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
                         let start = buffer_offsets[position];
                         Some(&buffers[start..start + width])
                     }
+                    Some(BoundRow::Values(values)) if self.scope.stores_rows(table) => {
+                        // A leaf of an inheritance tree carries its oid past
+                        // the relation's columns.
+                        let width = self.scope.defs.get(table).expect("resolved").n_columns;
+                        Some(&values[..width.min(values.len())])
+                    }
                     Some(BoundRow::Values(values)) => Some(values),
                     None => Some(&[]),
                 }
@@ -4398,6 +4408,40 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
 }
 
 impl<'v> JoinRow<'_, 'v, '_> {
+    /// The `tableoid` of a stored table's current row: the leaf of an
+    /// inheritance tree it was read from, or the table itself. Null for an
+    /// outer join's null-extended row.
+    pub(crate) fn table_oid(&self, table: usize) -> Result<Datum<'v>, SqlError> {
+        let missing = || {
+            sql_err!(
+                sqlstate::INVALID_COLUMN_REFERENCE,
+                "column \"tableoid\" referenced before its table is joined"
+            )
+        };
+        match self.values {
+            JoinRowValues::Bound {
+                bound,
+                order,
+                count,
+                ..
+            } => {
+                if !order[..count].contains(&table) {
+                    return Err(missing());
+                }
+                let width = self.scope.defs.get(table).expect("resolved").n_columns;
+                match bound[table] {
+                    None => Ok(Datum::Null),
+                    Some(BoundRow::Values(values)) if values.len() > width => Ok(values[width]),
+                    Some(_) => self.scope.relation_oid(table),
+                }
+            }
+            JoinRowValues::Flat { offsets, .. } => {
+                offsets.get(table).ok_or_else(missing)?;
+                self.scope.flat_relation_oid(table)
+            }
+        }
+    }
+
     /// The value of one join-tree output column: a merged USING column is its
     /// first non-null contributor.
     pub(crate) fn output_value(&self, entry: ResolvedColumn) -> Datum<'v> {
@@ -4415,6 +4459,8 @@ impl<'v> JoinRow<'_, 'v, '_> {
                 .map(|&part| one(part))
                 .find(|value| !value.is_null())
                 .unwrap_or(Datum::Null),
+            // Star expansion and join outputs never hold a system column.
+            ResolvedColumn::TableOid(table) => self.table_oid(table).unwrap_or(Datum::Null),
         }
     }
 }
@@ -4501,6 +4547,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         };
         match self.visible_column(qualifier, name)? {
             ResolvedColumn::Table(t, c) => one(t, c),
+            ResolvedColumn::TableOid(t) => self.table_oid(t),
             // Merged USING/NATURAL column: the first non-null contributor.
             ResolvedColumn::Merged(m) => {
                 let mc = &self.scope.merged[m];
@@ -4550,7 +4597,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
                 .and_then(|&(table, column)| self.scope.defs.get(table)?.columns.get(column))
                 .map(|column| column.collation)
                 .unwrap_or(crate::sql::ast::Collation::None),
-            None => crate::sql::ast::Collation::None,
+            Some(ResolvedColumn::TableOid(_)) | None => crate::sql::ast::Collation::None,
         }
     }
 
@@ -4571,7 +4618,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
                 .get(t)
                 .and_then(|def| def.columns.get(c).and_then(|col| col.user_type)),
             // A USING/NATURAL-merged column carries no single domain identity.
-            ResolvedColumn::Merged(_) => None,
+            ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_) => None,
         }
     }
 
@@ -4618,6 +4665,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
             let mut fields = [crate::sql::types::RecordField {
                 name: "",
                 type_oid: 0,
+                type_mod: -1,
                 value: Datum::Null,
             }; MAX_COLUMNS];
             for (index, field) in fields.iter_mut().enumerate().take(alias.n_columns) {
@@ -4645,6 +4693,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         let mut fields = [crate::sql::types::RecordField {
             name: "",
             type_oid: 0,
+            type_mod: -1,
             value: Datum::Null,
         }; MAX_COLUMNS];
         for (i, field) in fields.iter_mut().enumerate().take(source.n_columns) {
@@ -4675,6 +4724,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
             .alloc_slice_with(source.n_columns, |index| crate::sql::types::RecordField {
                 name: "",
                 type_oid: columns[index].ctype.oid(),
+                type_mod: columns[index].type_mod,
                 value: Datum::Null,
             })
             .map_err(|_| arena_full())?;
@@ -6338,18 +6388,15 @@ pub(crate) fn select_hash_join_plan<'a>(
     if scope.lateral[first_table] || scope.lateral[second_table] {
         return Ok(None);
     }
-    // A partitioned source owns rows in several leaf maps. Its physical row
-    // identity is not representable by the hash run's rowid-only payload.
-    // Derived sources have no storage slot, so classify that boundary before
-    // asking storage for partition metadata.
-    let is_partition_parent = |source: usize| {
+    // A partitioned table or inheritance parent owns rows in several leaf
+    // maps, which the hash plan's single-table scans and rowid-only payload
+    // do not read. Derived sources have no storage slot, so classify that
+    // boundary before asking storage for descendants.
+    let reads_tree = |source: usize| {
         scope.derived[source].is_none()
-            && storage
-                .table_def(scope.slots[source], txid)
-                .partition
-                .is_partitioned()
+            && storage.relation_has_descendants(scope.slots[source], txid)
     };
-    if is_partition_parent(first_table) || is_partition_parent(second_table) {
+    if reads_tree(first_table) || reads_tree(second_table) {
         return Ok(None);
     }
     const MAX_HASH_ENTRIES: usize = 1 << 15;
@@ -7788,6 +7835,7 @@ fn scan_source_mode<'a>(
                 arena,
             )?;
             let context = crate::sql::exec::RowCtx {
+                table_oid: None,
                 def: scope
                     .defs
                     .get(source)
@@ -8276,10 +8324,7 @@ fn scan_source_mode<'a>(
             if source_ref(from, order[depth]).inheritance == RelationInheritance::Descendants
                 && storage.relation_has_descendants(slot, txid)
             {
-                let leaves = arena
-                    .alloc_slice_with(storage.table_count(), |_| usize::MAX)
-                    .map_err(|_| arena_full())?;
-                let n_leaves = if let Some(leaf) = exact_partition_leaf(
+                let leaves = if let Some(leaf) = exact_partition_leaf(
                     storage,
                     scope,
                     order[depth],
@@ -8289,10 +8334,9 @@ fn scan_source_mode<'a>(
                     hooks,
                     txid,
                 )? {
-                    leaves[0] = leaf;
-                    1
+                    &*arena.alloc_slice_copy(&[leaf]).map_err(|_| arena_full())?
                 } else {
-                    storage.relation_leaf_slots(slot, txid, leaves)?
+                    crate::sql::exec::relation_leaves_in_order(storage, slot, txid, arena)?
                 };
                 let mut index = 0usize;
                 let mut aborted = false;
@@ -8301,40 +8345,80 @@ fn scan_source_mode<'a>(
                     .defs
                     .stored(order[depth])
                     .expect("resolved logical relation");
-                for &leaf in &leaves[..n_leaves] {
-                    storage.record_relation_scan(
-                        txid,
-                        leaf,
-                        None,
-                        0,
-                        crate::sql::datetime::now_micros(),
-                    )?;
+                for &leaf in leaves {
                     let physical = definitions.definition(storage, leaf, txid)?;
+                    let foreign = physical.kind == crate::storage::TableKind::Foreign;
+                    // PostgreSQL keeps no scan statistics for foreign tables.
+                    if !foreign {
+                        storage.record_relation_scan(
+                            txid,
+                            leaf,
+                            None,
+                            0,
+                            crate::sql::datetime::now_micros(),
+                        )?;
+                    }
                     let mapping = crate::storage::RelationColumnMap::new(logical, physical, arena)?;
+                    let leaf_oid =
+                        Datum::Oid(crate::sql::catalog::user_table_oid(storage, leaf) as u32);
                     let mut schema = [ColType::Bool; MAX_COLUMNS];
                     physical.schema(&mut schema);
                     let schema = &schema[..physical.n_columns];
-                    let scan = storage.captured_row_scan_in(leaf, txid, arena)?;
-                    let mut visit =
-                        |rowid, physical_values: &[Datum<'a>]| -> Result<bool, SqlError> {
-                            check_timeout()?;
+                    let mut visit = |rowid: Option<u64>,
+                                     physical_values: &[Datum<'a>]|
+                     -> Result<bool, SqlError> {
+                        check_timeout()?;
+                        if !foreign {
                             storage.record_relation_tuple_read(txid, leaf, None)?;
-                            let this = index;
-                            index += 1;
-                            recycled(arena, recycle_rows, retain_match, || {
-                                let values = arena
-                                    .alloc_slice_with(logical.n_columns, |_| Datum::Null)
-                                    .map_err(|_| arena_full())?;
-                                mapping.project(physical_values, values);
-                                refresh_catalog_object_names(storage, txid, values, arena)?;
-                                visit_candidate!(this, BoundRow::Values(values), Some(rowid))
-                            })
-                        };
+                        }
+                        let this = index;
+                        index += 1;
+                        recycled(arena, recycle_rows, retain_match, || {
+                            // The leaf's oid follows the columns, as the row's
+                            // `tableoid`.
+                            let values = arena
+                                .alloc_slice_with(logical.n_columns + 1, |_| Datum::Null)
+                                .map_err(|_| arena_full())?;
+                            mapping.project(physical_values, &mut values[..logical.n_columns]);
+                            values[logical.n_columns] = leaf_oid;
+                            refresh_catalog_object_names(
+                                storage,
+                                txid,
+                                &mut values[..logical.n_columns],
+                                arena,
+                            )?;
+                            visit_candidate!(this, BoundRow::Values(values), rowid)
+                        })
+                    };
+                    // A foreign child's rows come from its server, as a
+                    // foreign table read on its own does.
+                    if foreign {
+                        let rows = crate::sql::foreign::materialize(
+                            storage,
+                            leaf,
+                            txid,
+                            arena,
+                            hooks.sequences,
+                        )?;
+                        for bytes in rows {
+                            let mut values = [Datum::Null; MAX_COLUMNS];
+                            let width = crate::sql::exec::decode_projected_row_into(
+                                bytes,
+                                arena,
+                                &mut values,
+                            )?;
+                            if !visit(None, &values[..width])? {
+                                return Ok(false);
+                            }
+                        }
+                        continue;
+                    }
+                    let scan = storage.captured_row_scan_in(leaf, txid, arena)?;
                     let flow = scan.for_each_overlay(&mut |rowid, home| {
                         let bytes = storage.row_bytes(leaf, rowid, home, arena)?;
                         let mut values = [Datum::Null; MAX_COLUMNS];
                         rowenc::decode(bytes, schema, &mut values)?;
-                        if !visit(rowid, &values[..physical.n_columns])? {
+                        if !visit(Some(rowid), &values[..physical.n_columns])? {
                             return Ok(core::ops::ControlFlow::Break(()));
                         }
                         Ok(core::ops::ControlFlow::Continue(()))
@@ -8352,7 +8436,7 @@ fn scan_source_mode<'a>(
                                 }
                                 crate::storage::SpilledRowRepresentation::Values(values) => values,
                             };
-                            if !visit(row.rowid, values)? {
+                            if !visit(Some(row.rowid), values)? {
                                 aborted = true;
                                 return Ok(core::ops::ControlFlow::Break(()));
                             }
@@ -8982,6 +9066,7 @@ fn scan_source_mode<'a>(
                         arena,
                     )?;
                     let context = crate::sql::exec::RowCtx {
+                        table_oid: None,
                         def: scope.defs.get(d).expect("row-security source is resolved"),
                         values: row.table_values(d).expect("row-security row is bound"),
                         alias: None,

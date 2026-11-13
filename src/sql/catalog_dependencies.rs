@@ -698,14 +698,17 @@ pub(crate) fn for_each_dependency(
             }
             crate::storage::TriggerTarget::View(view) => view_oid(storage, usize::from(view)),
         };
-        push!(
-            2620,
-            trigger_oid,
-            PG_PROC_OID,
-            crate::storage::routine_oid(&storage.routine_for(usize::from(trigger.function), txid)),
-            0,
-            "n",
-        )?;
+        // A built-in function is pinned, so PostgreSQL records no dependency.
+        if let crate::storage::TriggerFunction::Routine(function) = trigger.function {
+            push!(
+                2620,
+                trigger_oid,
+                PG_PROC_OID,
+                crate::storage::routine_oid(&storage.routine_for(usize::from(function), txid)),
+                0,
+                "n",
+            )?;
+        }
         push!(2620, trigger_oid, PG_CLASS_OID, relation_oid, 0, "a")?;
         // The columns a `WHEN` condition reads through `NEW` and `OLD`.
         if let (Some(when), crate::storage::TriggerTarget::Table(table)) =
@@ -793,16 +796,16 @@ pub(crate) fn for_each_dependency(
                 txid,
             )?;
             let child_relation_oid = user_table_oid(storage, child);
-            push!(
-                2620,
-                clone_oid,
-                PG_PROC_OID,
-                crate::storage::routine_oid(
-                    &storage.routine_for(usize::from(trigger.function), txid),
-                ),
-                0,
-                "n",
-            )?;
+            if let crate::storage::TriggerFunction::Routine(function) = trigger.function {
+                push!(
+                    2620,
+                    clone_oid,
+                    PG_PROC_OID,
+                    crate::storage::routine_oid(&storage.routine_for(usize::from(function), txid)),
+                    0,
+                    "n",
+                )?;
+            }
             if let crate::storage::TriggerKind::Constraint {
                 referenced_table, ..
             } = trigger.kind

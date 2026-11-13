@@ -4366,6 +4366,9 @@ pub enum TableConstraint<'a> {
         /// Referenced columns; empty means "the parent's primary key".
         parent_cols: &'a [&'a str],
         on_delete: FkAction,
+        /// The referencing columns `ON DELETE SET NULL (...)` or `SET
+        /// DEFAULT (...)` changes; empty means all of them.
+        delete_set_columns: &'a [&'a str],
         on_update: FkAction,
         timing: ConstraintTiming,
         validation: ConstraintValidation,
@@ -5332,6 +5335,8 @@ pub struct OnConflictTarget<'a> {
 pub struct Update<'a> {
     pub source_position: SourcePosition,
     pub table: QualName<'a>,
+    /// `UPDATE ONLY` leaves inheritance children out.
+    pub inheritance: RelationInheritance,
     pub alias: Option<&'a str>,
     pub assignments: &'a [(&'a str, &'a Expr<'a>)],
     /// Extra tables joined for the assignment/WHERE (`UPDATE t SET ... FROM e`).
@@ -5343,6 +5348,8 @@ pub struct Update<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Delete<'a> {
     pub table: QualName<'a>,
+    /// `DELETE FROM ONLY` leaves inheritance children out.
+    pub inheritance: RelationInheritance,
     pub alias: Option<&'a str>,
     /// Extra tables joined for the WHERE (`DELETE FROM t USING e`).
     pub using: Option<&'a FromClause<'a>>,

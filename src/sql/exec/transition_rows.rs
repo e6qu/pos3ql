@@ -39,34 +39,21 @@ impl<'a> TransitionRowSets<'a> {
     }
 }
 
-/// Pre-sized transition row slots. Each DML path derives capacity from its
-/// candidate count, so capture cannot grow a pool; encoded rows live in the
-/// fixed statement arena and exhaustion is a named error.
+/// Transition row directories, grown in the statement arena as rows are
+/// captured, so a write whose rows stream from their source needs no count up
+/// front. Directories survive per-row rewinds; encoded rows live in the fixed
+/// statement arena and exhaustion is a named error.
 pub(super) struct TransitionCapture<'a> {
-    old: &'a mut [&'a [u8]],
-    old_len: usize,
-    new: &'a mut [&'a [u8]],
-    new_len: usize,
+    old: crate::mem::arena::ArenaList<'a, &'a [u8]>,
+    new: crate::mem::arena::ArenaList<'a, &'a [u8]>,
 }
 
 impl<'a> TransitionCapture<'a> {
-    pub(super) fn new(
-        arena: &'a Arena,
-        old_capacity: usize,
-        new_capacity: usize,
-    ) -> Result<Self, SqlError> {
-        let old = arena
-            .alloc_slice_with(old_capacity, |_| &[][..])
-            .map_err(|_| super::super::query::arena_full_pub())?;
-        let new = arena
-            .alloc_slice_with(new_capacity, |_| &[][..])
-            .map_err(|_| super::super::query::arena_full_pub())?;
-        Ok(Self {
-            old,
-            old_len: 0,
-            new,
-            new_len: 0,
-        })
+    pub(super) const fn new(arena: &'a Arena) -> Self {
+        Self {
+            old: crate::mem::arena::ArenaList::new_persistent(arena),
+            new: crate::mem::arena::ArenaList::new_persistent(arena),
+        }
     }
 
     pub(super) fn push_old(
@@ -74,16 +61,10 @@ impl<'a> TransitionCapture<'a> {
         values: &[Datum<'_>],
         arena: &'a Arena,
     ) -> Result<(), SqlError> {
-        if self.old_len == self.old.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "OLD TABLE exceeds its pre-sized statement capture"
-            ));
-        }
         let row = encode_projected_pub(values, arena)?;
-        self.old[self.old_len] = row;
-        self.old_len += 1;
-        Ok(())
+        self.old
+            .push(row)
+            .map_err(|_| super::super::query::arena_full_pub())
     }
 
     pub(super) fn push_new(
@@ -91,27 +72,21 @@ impl<'a> TransitionCapture<'a> {
         values: &[Datum<'_>],
         arena: &'a Arena,
     ) -> Result<(), SqlError> {
-        if self.new_len == self.new.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "NEW TABLE exceeds its pre-sized statement capture"
-            ));
-        }
         let row = encode_projected_pub(values, arena)?;
-        self.new[self.new_len] = row;
-        self.new_len += 1;
-        Ok(())
+        self.new
+            .push(row)
+            .map_err(|_| super::super::query::arena_full_pub())
     }
 
-    pub(super) fn lengths(&self) -> (usize, usize) {
-        (self.old_len, self.new_len)
+    pub(super) const fn lengths(&self) -> (usize, usize) {
+        (self.old.len(), self.new.len())
     }
 
     /// The rows captured before `lengths`, for a write that keeps them.
     pub(super) fn prefix(&self, lengths: (usize, usize)) -> TransitionRows<'_> {
         TransitionRows {
-            old: &self.old[..lengths.0],
-            new: &self.new[..lengths.1],
+            old: &self.old.borrowed_slice()[..lengths.0],
+            new: &self.new.borrowed_slice()[..lengths.1],
         }
     }
 
@@ -121,25 +96,14 @@ impl<'a> TransitionCapture<'a> {
         rows: TransitionRows<'_>,
         arena: &'a Arena,
     ) -> Result<(), SqlError> {
-        if self.old.len() - self.old_len < rows.old.len()
-            || self.new.len() - self.new_len < rows.new.len()
-        {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "saved transition rows exceed the resumed capture"
-            ));
-        }
+        let full = |_| super::super::query::arena_full_pub();
         for row in rows.old {
-            self.old[self.old_len] = arena
-                .alloc_slice_copy(row)
-                .map_err(|_| super::super::query::arena_full_pub())?;
-            self.old_len += 1;
+            let row = arena.alloc_slice_copy(row).map_err(full)?;
+            self.old.push(row).map_err(full)?;
         }
         for row in rows.new {
-            self.new[self.new_len] = arena
-                .alloc_slice_copy(row)
-                .map_err(|_| super::super::query::arena_full_pub())?;
-            self.new_len += 1;
+            let row = arena.alloc_slice_copy(row).map_err(full)?;
+            self.new.push(row).map_err(full)?;
         }
         Ok(())
     }
@@ -147,8 +111,8 @@ impl<'a> TransitionCapture<'a> {
     pub(super) fn into_rows(self) -> TransitionRows<'a> {
         // Consuming the writer prevents later mutation of a published row set.
         TransitionRows {
-            old: &self.old[..self.old_len],
-            new: &self.new[..self.new_len],
+            old: self.old.as_slice(),
+            new: self.new.as_slice(),
         }
     }
 }

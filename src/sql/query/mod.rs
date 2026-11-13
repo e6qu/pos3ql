@@ -95,8 +95,13 @@ pub(crate) use catalog_images::{
 };
 pub(crate) use scope::prebuild_statement_catalog_images;
 mod cte;
+mod view_write;
 pub(crate) use cte::{CteReader, dml_cte_runs_after, select_relations, set_query_relations};
 pub(crate) use cte::{bind_stored_level_expression, captured_type_oid};
+pub use view_write::{
+    UpdatableView, ViewRewrite, ViewWrite, and_where, function_view_write_error,
+    resolve_view_for_dml, view_column_is_updatable, view_is_auto_updatable,
+};
 mod dependencies;
 mod procedural_names;
 pub(crate) use procedural_names::{
@@ -432,7 +437,7 @@ impl StoredQueryRenameScope<'_, '_> {
                         .is_none_or(|aliases| selected >= aliases.len()))
                 .then_some((self.current.slots[source], selected)))
             }
-            Ok(ResolvedColumn::Merged(_)) => Ok(None),
+            Ok(ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_)) => Ok(None),
             Err(error)
                 if matches!(
                     error.sqlstate.as_str(),
@@ -1498,6 +1503,7 @@ impl<'a> RoutineResultShape<'a> {
             .alloc_slice_with(columns.len(), |_| super::types::RecordField {
                 name: "",
                 type_oid: super::types::oid::UNKNOWN,
+                type_mod: -1,
                 value: Datum::Null,
             })
             .map_err(|_| arena_full())?;
@@ -1569,6 +1575,7 @@ impl<'a> RoutineResultShape<'a> {
                         } else {
                             values[index].type_oid()
                         },
+                        type_mod: -1,
                         value: Datum::Null,
                     })
                     .map_err(|_| arena_full())?;
@@ -3745,6 +3752,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     .push(super::types::RecordField {
                         name,
                         type_oid: field_oid,
+                        type_mod: -1,
                         value: Datum::Null,
                     })
                     .map_err(|_| arena_full())?;
@@ -3768,6 +3776,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 .push(super::types::RecordField {
                     name,
                     type_oid: column.type_oid,
+                    type_mod: column.type_mod,
                     value: Datum::Null,
                 })
                 .map_err(|_| arena_full())?;
@@ -4190,7 +4199,9 @@ impl StorageCatalog<'_, '_, '_, '_> {
             .security_definer
             .then(|| super::eval::funcs::system::enter_current_user(owner));
         let _config = (!routine.configs().is_empty())
-            .then(|| super::guc::enter_active_routine_configs(routine.configs()))
+            .then(|| {
+                super::guc::enter_active_routine_configs(self.storage, self.txid, routine.configs())
+            })
             .transpose()?;
         let result_contract = match routine.kind {
             crate::storage::RoutineKind::Function { result }
@@ -5172,6 +5183,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 super::types::RecordField {
                     name: "",
                     type_oid: super::types::oid::UNKNOWN,
+                    type_mod: -1,
                     value: Datum::Null,
                 }
             })
@@ -5659,7 +5671,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                         argument_mapping,
                         variadic,
                         bound_strict,
-                    } => (oid, argument_mapping, variadic, bound_strict),
+                    } => {
+                        reject_trigger_function_call(self.storage, oid, self.txid)?;
+                        (oid, argument_mapping, variadic, bound_strict)
+                    }
                     super::eval::RoutineCallTarget::Operator { schema, name } => {
                         let collations = arena
                             .alloc_slice_with(arguments.len(), |_| super::ast::Collation::None)
@@ -7237,6 +7252,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             crate::storage::PrivilegeSet::LARGE_OBJECT_ALL,
             privileges,
         )
+    }
+
+    fn authorize_parameter_set(&self, parameter: &str) -> Result<(), SqlError> {
+        crate::sql::guc::SettingAuthorization::set(self.storage, parameter, self.txid).map(|_| ())
     }
 
     fn has_parameter_privilege(
@@ -9570,8 +9589,8 @@ pub(super) fn resolve_position_target<'a>(
                         }
                         // The merged column as the star produced it. Its bare
                         // name can be ambiguous with another FROM item's column.
-                        merged @ ResolvedColumn::Merged(_) => {
-                            scope.copied_output_expression(merged, arena)
+                        entry @ (ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_)) => {
+                            scope.copied_output_expression(entry, arena)
                         }
                     };
                 }
@@ -9686,209 +9705,53 @@ fn common_using_type(a: ColType, b: ColType) -> Option<ColType> {
     None
 }
 
-/// A view that PostgreSQL treats as auto-updatable: a single base table, no
-/// aggregation/DISTINCT/GROUP BY/HAVING/LIMIT/joins, and every output column a
-/// plain base column. `where_clause` is the view's own filter, to be AND-ed
-/// into DML; `columns` are the exposed base columns.
-pub struct UpdatableView<'a> {
-    /// The base table, fully qualified from the view's own resolution so the
-    /// rewritten DML binds the same table regardless of the session's path.
-    pub base: QualName<'a>,
-    pub where_clause: Option<&'a Expr<'a>>,
-    pub columns: &'a [&'a str],
-    /// Base relation names in the same ordinal positions as `columns`.
-    pub base_columns: &'a [&'a str],
-    /// Durable defaults for the exposed columns, applied before base-table
-    /// defaults when INSERT leaves a view column unspecified.
-    pub defaults: crate::storage::ViewColumns,
-    pub(crate) default_inputs: &'a [(
-        crate::storage::StoredInputSection,
-        &'a [super::type_inputs::Binding<'a>],
-    )],
-    pub check_option: Option<crate::storage::ViewCheckOption>,
-}
-
-/// If `name` is a view, resolve it for DML: `Ok(Some(..))` when auto-updatable,
-/// `Err` (0A000) when it is a view but not auto-updatable, `Ok(None)` when it
-/// is not a view at all (the DML then targets a table normally).
-/// Description and catalog callers share this metadata-only resolution.
-/// Execution locks its target before resolving or selecting rewrite rules.
-pub fn resolve_view_for_dml<'a>(
+/// PostgreSQL's error for a trigger function read as a `FROM` source.
+pub(super) fn trigger_function_source_error(
     storage: &Storage,
-    name: QualName,
+    slot: usize,
+    written: &str,
     txid: u32,
-    arena: &'a Arena,
-) -> Result<Option<UpdatableView<'a>>, SqlError> {
-    let view_slot = match storage.resolve_relation(name.schema, name.name, txid) {
-        Some(crate::storage::ResolvedRelation::View(slot)) => slot,
-        _ => return Ok(None),
+) -> Option<SqlError> {
+    let routine = storage.routine_for(slot, txid);
+    let type_name = match routine.kind {
+        crate::storage::RoutineKind::Trigger => "trigger",
+        crate::storage::RoutineKind::EventTrigger => "event_trigger",
+        _ => return None,
     };
-    let check_option = storage.view(view_slot).check_option_for(txid);
-    // The body re-resolves under the view creator's search path.
-    let user = crate::sql::eval::funcs::system::session_user_owned();
-    let query = storage.snapshot_view_query(view_slot, txid, arena)?;
-    let view_path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
-    // Copy the definition into the arena so the parsed AST no longer borrows
-    // storage (the caller then takes a mutable storage borrow to run the DML).
-    let sql = arena
-        .alloc_str(query.sql.as_str())
-        .map_err(|_| arena_full())?;
-    let name = name.name;
-    let not_updatable = || {
+    Some(crate::sql::error_position::at_subject(
         sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot change view \"{}\": it is not auto-updatable",
-            name
-        )
-    };
-    let input_source = query.input_source.unwrap_or(sql);
-    let dependencies = query.dependencies;
-    let sel = parse_stored_query(sql, input_source, storage, txid, dependencies.view(), arena)?;
-    let sel = expand_stored_query(sel, storage, txid, view_path, dependencies.view(), arena)?;
-    if sel.set_body.is_some()
-        || sel.distinct
-        || !sel.group_by.is_empty()
-        || sel.having.is_some()
-        || sel.limit.is_some()
-        || sel.offset.is_some()
-    {
-        return Err(not_updatable());
-    }
-    let Some(from) = &sel.from else {
-        return Err(not_updatable());
-    };
-    if !from.joins.is_empty() || from.base.subquery.is_some() {
-        return Err(not_updatable());
-    }
-    let Some(crate::storage::ResolvedRelation::Table(ti)) =
-        storage.resolve_relation_under(&view_path, from.base.schema, from.base.table, txid)
-    else {
-        return Err(not_updatable());
-    };
-    let base_def = storage.table_def(ti, txid);
-    let base = QualName {
-        schema: Some(
-            arena
-                .alloc_str(base_def.schema.as_str())
-                .map_err(|_| arena_full())?,
+            sqlstate::DATATYPE_MISMATCH,
+            "function \"{}\" in FROM has unsupported return type {}",
+            routine.name_for(txid).as_str(),
+            type_name
         ),
-        name: arena
-            .alloc_str(base_def.name.as_str())
-            .map_err(|_| arena_full())?,
+        written,
+    ))
+}
+
+/// A trigger or event trigger function runs only from its trigger; a call
+/// fails as PostgreSQL's PL/pgSQL compiler fails it.
+fn reject_trigger_function_call(storage: &Storage, oid: i32, txid: u32) -> Result<(), SqlError> {
+    let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
+        return Ok(());
     };
-    let mut base_columns = [""; MAX_PROJ];
-    let mut n = 0;
-    for it in sel.items {
-        match it {
-            SelectItem::Wildcard(_) => {
-                for c in base_def.columns() {
-                    if n == MAX_PROJ {
-                        return Err(not_updatable());
-                    }
-                    // Copy into the arena so it does not borrow storage.
-                    let base_column = arena.alloc_str(c.name.as_str()).map_err(|_| arena_full())?;
-                    if base_columns[..n].contains(&base_column) {
-                        return Err(not_updatable());
-                    }
-                    base_columns[n] = base_column;
-                    n += 1;
-                }
-            }
-            // The output must be a plain base column; catalog aliases map it
-            // back to the same base name at the DML boundary.
-            SelectItem::Expr {
-                expression: Expr::Column { name: cn, .. },
-                alias: _,
-            } => {
-                if n == MAX_PROJ {
-                    return Err(not_updatable());
-                }
-                if base_columns[..n].contains(cn) {
-                    return Err(not_updatable());
-                }
-                base_columns[n] = cn;
-                n += 1;
-            }
-            _ => return Err(not_updatable()),
-        }
-    }
-    let view_image = storage.view(view_slot);
-    let columns = view_image.columns_for(txid);
-    if columns.len() != n {
-        return Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "view \"{}\" has an invalid output-column definition",
-            name
-        ));
-    }
-    let mut exposed_columns = [""; MAX_PROJ];
-    for (target, column) in exposed_columns.iter_mut().zip(columns.names()) {
-        *target = arena.alloc_str(column.as_str()).map_err(|_| arena_full())?;
-    }
-    let columns = arena
-        .alloc_slice_copy(&exposed_columns[..n])
-        .map_err(|_| arena_full())?;
-    let base_columns = arena
-        .alloc_slice_copy(&base_columns[..n])
-        .map_err(|_| arena_full())?;
-    Ok(Some(UpdatableView {
-        base,
-        where_clause: sel.where_clause,
-        columns,
-        base_columns,
-        defaults: *storage.view(view_slot).columns_for(txid),
-        default_inputs: storage
-            .view(view_slot)
-            .default_inputs_for(txid)
-            .detached_sections(arena)?,
-        check_option,
-    }))
-}
-
-/// Whether a view satisfies the same structural predicate used by DML
-/// rewriting. Catalog rendering must use this predicate too, otherwise
-/// `information_schema.views` can disagree with executable behavior.
-pub fn view_is_auto_updatable(
-    storage: &Storage,
-    schema: &str,
-    name: &str,
-    txid: u32,
-    arena: &Arena,
-) -> Result<bool, SqlError> {
-    match resolve_view_for_dml(
-        storage,
-        QualName {
-            schema: Some(schema),
-            name,
-        },
-        txid,
-        arena,
+    let routine = storage.routine_for(slot, txid);
+    if !matches!(
+        routine.kind,
+        crate::storage::RoutineKind::Trigger | crate::storage::RoutineKind::EventTrigger
     ) {
-        Ok(Some(_)) => Ok(true),
-        Ok(None) => Ok(false),
-        Err(error) if error.sqlstate == sqlstate::FEATURE_NOT_SUPPORTED => Ok(false),
-        Err(error) => Err(error),
+        return Ok(());
     }
-}
-
-/// Combines a view's filter with a DML's WHERE (AND), for view DML rewriting.
-pub fn and_where<'a>(
-    view_where: Option<&'a Expr<'a>>,
-    dml_where: Option<&'a Expr<'a>>,
-    arena: &'a Arena,
-) -> Result<Option<&'a Expr<'a>>, SqlError> {
-    match (view_where, dml_where) {
-        (None, w) | (w, None) => Ok(w),
-        (Some(a), Some(b)) => {
-            let e = Expr::Binary {
-                source_position: crate::sql::ast::SourcePosition::UNKNOWN,
-                operator: super::ast::BinaryOp::And,
-                left: a,
-                right: b,
-            };
-            Ok(Some(&*arena.alloc(e).map_err(|_| arena_full())?))
-        }
-    }
+    let name = routine.name_for(txid);
+    let frame = crate::sql::error_context::PlpgsqlCompilationFrame {
+        name: name.as_str(),
+    };
+    crate::sql::error_context::within(&frame, || {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "trigger functions can only be called as triggers"
+        ))
+    })
 }
 
 /// Rejects pseudo-type view outputs after the query-descriptor boundary.
@@ -10053,6 +9916,7 @@ where
     match &sel.from {
         Some(from) => {
             let scope = QueryScope::resolve_schema(storage, from, txid, arena, None)?;
+            validate_static_grouping(sel, &scope, storage, txid, arena)?;
             describe_select_items(
                 sel.items,
                 Some(&scope),
@@ -10073,6 +9937,48 @@ where
             description_target,
         ),
     }
+}
+
+/// PostgreSQL checks a grouped query's ungrouped columns while analyzing it,
+/// so a statement that only describes the query (`CREATE VIEW`, `PREPARE`)
+/// fails as running it would.
+pub(crate) fn validate_static_grouping<'a>(
+    statement: &'a Select<'a>,
+    scope: &QueryScope<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let columns = subquery::SubqueryColumns {
+        scope: Some(scope),
+        outer: None,
+        catalog: super::exec::CatalogCols {
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        },
+    };
+    let mut agg_nodes = ArenaList::new(arena);
+    for item in statement.items {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
+            collect_aggs(expression, &mut agg_nodes, storage, txid, &columns)?;
+        }
+    }
+    if let Some(having) = statement.having {
+        collect_aggs(having, &mut agg_nodes, storage, txid, &columns)?;
+    }
+    if statement.group_by.is_empty()
+        && statement.grouping_sets.is_empty()
+        && statement.having.is_none()
+        && agg_nodes.as_slice().is_empty()
+    {
+        return Ok(());
+    }
+    let statement = resolve_group_ordinals(statement, Some(scope), arena, storage, txid)?;
+    group::validate_grouped_columns(statement, scope, agg_nodes.as_slice(), storage, txid, arena)
 }
 
 #[expect(
@@ -14148,6 +14054,8 @@ fn project_row_skipping<'a>(
                             .find(|value| !value.is_null())
                             .unwrap_or(Datum::Null)
                     }
+                    // A star never expands to a system column.
+                    ResolvedColumn::TableOid(t) => row.table_oid(t).unwrap_or(Datum::Null),
                 };
                 for index in 0..scope.qualified_star_columns(q)? {
                     if n == MAX_PROJ {
@@ -14187,6 +14095,7 @@ fn project_row_skipping<'a>(
                                 .find(|v| !v.is_null())
                                 .unwrap_or(Datum::Null)
                         }
+                        ResolvedColumn::TableOid(t) => row.table_oid(t).unwrap_or(Datum::Null),
                     };
                     n += 1;
                 }
@@ -15617,7 +15526,7 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
             scope::ResolvedColumn::Table(table, column) => {
                 self.0.defs.get(table)?.columns.get(column)?.type_mod
             }
-            scope::ResolvedColumn::Merged(_) => -1,
+            scope::ResolvedColumn::Merged(_) | scope::ResolvedColumn::TableOid(_) => -1,
         };
         Some(super::exec::StaticTypeMeta {
             ctype,
@@ -16157,7 +16066,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_, '_> {
                 ResolvedColumn::Table(table, column) => {
                     Some(scope.defs.get(table)?.columns[column].type_mod)
                 }
-                ResolvedColumn::Merged(_) => None,
+                ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_) => None,
             }
         }
         match self.scope.find_column(qualifier, name) {
@@ -16192,7 +16101,7 @@ fn scope_column_metadata(
                 column.type_mod,
             )
         }
-        ResolvedColumn::Merged(_) => (ctype.oid(), -1),
+        ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_) => (ctype.oid(), -1),
     };
     Some(super::exec::StaticTypeMeta {
         ctype,
@@ -16212,7 +16121,7 @@ fn scope_column_type_mod(
         Ok(ResolvedColumn::Table(table, column)) => {
             scope.defs.get(table).expect("resolved").columns[column].type_mod
         }
-        Ok(ResolvedColumn::Merged(_)) => -1,
+        Ok(ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_)) => -1,
         Err(error)
             if matches!(
                 error.sqlstate.as_str(),

@@ -250,6 +250,43 @@ Syntax and errors:
   earlier writes, runs once for its row as in PostgreSQL: the write stops at
   that row, the whole trigger body runs, and the write continues with the
   row the body returned. Its notices, sequence values and writes appear once.
+- A trigger function may `RETURN` any row-valued expression, as in
+  PostgreSQL: `RETURN coalesce(NEW, OLD)` serves INSERT, UPDATE and DELETE
+  alike, and NULL skips the row in a `BEFORE` trigger. A `BEFORE INSERT` or
+  `UPDATE` trigger's row becomes the written row. A row whose column count or
+  types (by position) differ from the table's fails with `42804` (`returned
+  row structure does not match the structure of the triggering table`) at
+  function exit, and a non-row value fails at the `RETURN`. A whole-row
+  reference such as `NEW` or `t` keeps each column's declared domain, enum or
+  composite type.
+- A superuser-only parameter such as `session_replication_role` or
+  `track_functions` needs the privilege to set it (superuser, or `GRANT SET
+  ON PARAMETER`) everywhere PostgreSQL checks: `SET`, `RESET`, `set_config`,
+  connection options, a routine's `SET` clause at `CREATE` and `ALTER` and
+  again at every call (the owner's privilege under `SECURITY DEFINER`, the
+  caller's otherwise), and `ALTER ROLE ... SET` / `ALTER DATABASE ... SET`.
+  Each fails with `42501` (`permission denied to set parameter "..."`), as
+  does `ALTER SYSTEM` without `ALTER SYSTEM` on the parameter. A revoked
+  grant stops calls of a function whose `SET` clause needed it.
+- The built-in `suppress_redundant_updates_trigger()` skips an `UPDATE`
+  whose new row is stored identically to the old one, as in PostgreSQL:
+  `CREATE TRIGGER z BEFORE UPDATE ON t FOR EACH ROW EXECUTE FUNCTION
+  suppress_redundant_updates_trigger()` makes `UPDATE t SET a = a` report
+  `UPDATE 0`. Values compare as stored, so `1.5` and `1.50` differ. Any other
+  event, timing or level fails with `39P01` when it fires.
+- `session_replication_role` (superusers, or roles granted `SET` on it)
+  chooses which triggers and rules fire, as in PostgreSQL: `replica` fires
+  those enabled `REPLICA` or `ALWAYS`; `origin` (the default) and `local`
+  fire those enabled `ORIGIN` or `ALWAYS`. Foreign key checks and actions are
+  `ORIGIN` triggers, so `SET session_replication_role = replica` loads rows
+  without them, for example an order line before its order. A superuser's
+  `ALTER TABLE orders DISABLE TRIGGER ALL` (as `pg_dump --disable-triggers`
+  emits) also stops the foreign keys' `RI_ConstraintTrigger_*` checks on a
+  referencing table or actions on a referenced one; other roles get `42501`
+  (`permission denied: "RI_ConstraintTrigger_c_..." is a system trigger`),
+  and `USER` leaves them alone. A view's
+  `INSTEAD OF` trigger that does not fire leaves the row unwritten without an
+  error.
 - A trigger's `NEW` and `OLD` have the table's row type in every firing. One
   without a row (`OLD` in an `INSERT` trigger, `NEW` in a `DELETE` trigger,
   both in a statement trigger) is NULL, and so are its fields; a field the
@@ -304,8 +341,19 @@ Syntax and errors:
   `#variable_conflict use_column` at the start of the body, or the superuser
   setting `plpgsql.variable_conflict = use_column`, reads the column instead;
   `use_variable` reads the variable everywhere, so with variable `a = 2`,
-  `SELECT sum(a) FROM t` adds 2 per row and `GROUP BY a` makes one group. The
-  setting exists from startup, as if PL/pgSQL were preloaded.
+  `SELECT sum(a) FROM t` adds 2 per row and `GROUP BY a` makes one group.
+  PL/pgSQL's settings (`plpgsql.variable_conflict`,
+  `plpgsql.print_strict_params`, `plpgsql.check_asserts`,
+  `plpgsql.extra_warnings`, `plpgsql.extra_errors`) exist from startup.
+- PL/pgSQL "loads" in a session the first time the session runs or creates
+  PL/pgSQL code, as PostgreSQL loads its library: placeholders named
+  `plpgsql.anything` (for example from `SET plpgsql.foo = 'x'`) are then
+  removed with `WARNING: invalid configuration parameter name "plpgsql.foo",
+  removing it`, and a later `SET plpgsql.bar = 'y'` fails with `42602`
+  (`"plpgsql" is a reserved prefix.`). `plpgsql.check_asserts = off` skips
+  `ASSERT` statements. PL/pgSQL's extra checks are not implemented:
+  `plpgsql.extra_warnings` and `plpgsql.extra_errors` accept only `none`, and
+  any other valid value fails with `0A000`.
 - A PL/pgSQL function keeps the `plpgsql.variable_conflict` and
   `plpgsql.print_strict_params` values it was compiled under, as PostgreSQL's
   per-session function cache does: the creating session compiles it at
@@ -970,6 +1018,7 @@ why none of these numbers is a throughput rate.
 | `search_path` | 128 bytes | `22023` |
 | `application_name` after PostgreSQL's [ASCII cleaning](https://github.com/postgres/postgres/blob/REL_18_6/src/common/string.c#L81) (`\xhh` escapes) | 64 bytes | `22023`, prior value kept |
 | Connection startup option word | 256 bytes | `54000` |
+| Custom parameters (`SET myapp.tenant = '7'`) a session defines; name; value | 8; 63 bytes; 128 bytes | `54000` |
 | Timeout settings | 2,147,483,647 ms | `22023`; enabling a disabled-only timeout is `0A000` |
 | Simultaneously tracked function calls (`track_functions`) per SQL worker | 1,024 | `54000` |
 | Error message text, including a `RAISE` message | 27,824 bytes | `54000` |
@@ -1128,7 +1177,13 @@ PostgreSQL physical standby cannot replay pos3ql's journal.
   tools are not provided. Row identities are not exposed as fake heap addresses.
   A query naming one of these columns of a table fails with `0A000` (`system
   column "ctid" is not supported`); as in PostgreSQL, a table column cannot
-  take a system column's name (`42701`).
+  take a system column's name (`42701`). The `tableoid` system column is
+  provided: it is the oid of the table that holds the row, so
+  `SELECT tableoid::regclass, count(*) FROM measurements GROUP BY 1` counts
+  the rows of each partition, inheritance child or foreign child. Window
+  queries and the `FROM` items of `UPDATE ... FROM` and `DELETE ... USING`
+  read it only from tables without children; over a partitioned table or an
+  inheritance parent there they fail with `0A000`.
 - PostgreSQL parallel query, JIT, and planner/executor hooks do not exist.
   Cost estimates differ from PostgreSQL. `EXPLAIN` shows the plan pos3ql
   runs: scan filters (`Filter: (a = 1)`), a hash join's `Hash Cond` and `Hash`

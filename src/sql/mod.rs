@@ -181,7 +181,7 @@ fn publish_execution_identity(identity: ExecutionIdentity) {
     set_execution_database_oid(identity.database_oid);
 }
 
-use ast::{Delete, Expr, Insert, Stmt, TransactionIsolation, TransactionTarget, Update};
+use ast::{Expr, Insert, Stmt, TransactionIsolation, TransactionTarget};
 use eval::{
     EvalHooks, NO_HOOKS, NO_PARAMS, NoColumns, SequenceAccess, SqlError, SqlState, eval, sqlstate,
 };
@@ -1763,11 +1763,7 @@ fn has_event_trigger(
             .any(|(_, trigger)| {
                 trigger.event == event
                     && trigger.tags.matches(tag)
-                    && if txn.replication_apply {
-                        trigger.enabled.fires_for_replication()
-                    } else {
-                        trigger.enabled.fires_for_origin()
-                    }
+                    && trigger.enabled.fires_in(guc.session_replication_role())
             })
 }
 
@@ -2834,6 +2830,7 @@ fn publication_row_matches(
         let result = (|| {
             let expression = parser::parse_expr(filter, arena)?;
             let row = exec::RowCtx {
+                table_oid: None,
                 def: crate::storage::RelationDefinition::from_definition(&definition),
                 values,
                 alias: None,
@@ -4638,6 +4635,18 @@ impl Engine {
             connection_limit: attributes.connection_limit,
             password: attributes.password,
         })
+    }
+
+    /// Whether login role `role` may set the superuser-only parameter `name`
+    /// before its session starts: a superuser, or a role granted SET on it.
+    pub(crate) fn login_may_set_parameter(&self, role: &RoleLogin, name: &str) -> bool {
+        role.superuser
+            || self.storage.role_has_parameter_privilege(
+                usize::from(role.slot),
+                name,
+                crate::sql::ast::ParameterPrivileges::SET,
+                0,
+            )
     }
 
     pub(crate) fn database_login(&self, name: &str) -> Option<DatabaseLogin> {
@@ -9686,8 +9695,11 @@ impl Engine {
             mark.constraint_completions,
             mark.constraint_modes,
             mark.constraint_renames,
-            mark.trigger_events,
-            mark.pending_row_events,
+            (
+                mark.trigger_events,
+                mark.pending_row_events,
+                mark.statement_tables,
+            ),
         );
         txn.rewind_notifications(
             mark.notifications,
@@ -10575,27 +10587,8 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        if crate::sql::guc::requires_set_privilege(name)
-            && self
-                .storage
-                .current_role_slot(txn.txid)
-                .is_some_and(|role| {
-                    !self.storage.role(role).attributes_to(txn.txid).superuser
-                        && crate::sql::ast::ParameterName::parse(name).is_none_or(|parameter| {
-                            !self.storage.has_parameter_privilege(
-                                parameter,
-                                role,
-                                crate::sql::ast::ParameterPrivileges::SET,
-                                txn.txid,
-                            )
-                        })
-                })
-        {
-            return Ok(Err(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "permission denied to set parameter \"{}\"",
-                name
-            )));
+        if let Err(error) = guc::SettingAuthorization::set(&self.storage, name, txn.txid) {
+            return Ok(Err(error));
         }
         if local && !txn.is_explicit() {
             responder.warning(
@@ -10723,29 +10716,10 @@ impl Engine {
         guc: &GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        if name.is_some_and(crate::sql::guc::requires_set_privilege)
-            && self
-                .storage
-                .current_role_slot(txn.txid)
-                .is_some_and(|role| {
-                    !self.storage.role(role).attributes_to(txn.txid).superuser
-                        && name
-                            .and_then(crate::sql::ast::ParameterName::parse)
-                            .is_none_or(|parameter| {
-                                !self.storage.has_parameter_privilege(
-                                    parameter,
-                                    role,
-                                    crate::sql::ast::ParameterPrivileges::SET,
-                                    txn.txid,
-                                )
-                            })
-                })
+        if let Some(name) = name
+            && let Err(error) = guc::SettingAuthorization::set(&self.storage, name, txn.txid)
         {
-            return Ok(Err(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "permission denied to set parameter \"{}\"",
-                name.unwrap_or("")
-            )));
+            return Ok(Err(error));
         }
         if let Some(name) = name
             && guc.transaction_reset_owned(name).is_some()
@@ -15149,12 +15123,14 @@ impl Engine {
 
     /// Describe (statement or portal): RowDescription for SELECT/SHOW,
     /// NoData otherwise. Returns whether it succeeded.
+    #[allow(clippy::too_many_arguments)]
     pub fn describe(
         &mut self,
         text: &str,
         arena: &Arena,
         txn: &TxnState,
         cursors: Option<&cursor::CursorPool>,
+        guc: &GucState,
         responder: &mut Responder,
         bound_inputs: &[u8],
     ) -> Result<bool, WireFull> {
@@ -15325,7 +15301,8 @@ impl Engine {
                 Ok(true)
             }
             Stmt::Show(name) => {
-                let title = match guc::canonical_setting_name(name) {
+                // A custom parameter keeps the spelling that defined it.
+                let title = match guc.show_title(name) {
                     Ok(title) => title,
                     Err(error) => {
                         responder.error(error.sqlstate, error.message.as_str())?;
@@ -15962,7 +15939,7 @@ impl Engine {
                 .firing_rules_for(
                     target,
                     crate::storage::RewriteEvent::Insert,
-                    txn.replication_apply,
+                    guc.session_replication_role(),
                     txn.txid,
                 )
                 .next()
@@ -15971,7 +15948,7 @@ impl Engine {
                     .firing_rules_for(
                         target,
                         crate::storage::RewriteEvent::Update,
-                        txn.replication_apply,
+                        guc.session_replication_role(),
                         txn.txid,
                     )
                     .next()
@@ -15984,7 +15961,7 @@ impl Engine {
             }
         }
         if storage
-            .firing_rules_for(target, event, txn.replication_apply, txn.txid)
+            .firing_rules_for(target, event, guc.session_replication_role(), txn.txid)
             .next()
             .is_none()
         {
@@ -16229,7 +16206,7 @@ impl Engine {
                 Err(error) => return Ok(Err(error)),
             };
         let suppress_original = storage
-            .firing_rules_for(target, event, txn.replication_apply, txn.txid)
+            .firing_rules_for(target, event, guc.session_replication_role(), txn.txid)
             .any(|(_, rule)| {
                 let definition = rule.definition_for(txn.txid);
                 definition.mode == crate::storage::RewriteMode::Instead
@@ -16237,7 +16214,7 @@ impl Engine {
             });
         if outer_returns_rows {
             let returning_rules = storage
-                .firing_rules_for(target, event, txn.replication_apply, txn.txid)
+                .firing_rules_for(target, event, guc.session_replication_role(), txn.txid)
                 .filter(|(_, rule)| rule.definition_for(txn.txid).returning_action.is_some())
                 .count();
             if returning_rules > 1 {
@@ -16247,7 +16224,7 @@ impl Engine {
                 )));
             }
             let instead = storage
-                .firing_rules_for(target, event, txn.replication_apply, txn.txid)
+                .firing_rules_for(target, event, guc.session_replication_role(), txn.txid)
                 .any(|(_, rule)| {
                     rule.definition_for(txn.txid).mode == crate::storage::RewriteMode::Instead
                 });
@@ -16275,7 +16252,7 @@ impl Engine {
         let insert_event = event == crate::storage::RewriteEvent::Insert;
         let mut original_filter: Option<&Expr<'a>> = None;
         for (rule_slot, rule) in
-            storage.firing_rules_for(target, event, txn.replication_apply, txn.txid)
+            storage.firing_rules_for(target, event, guc.session_replication_role(), txn.txid)
         {
             let definition = rule.definition_for(txn.txid);
             if definition.mode != crate::storage::RewriteMode::Instead
@@ -16430,7 +16407,7 @@ impl Engine {
         let mut instead_rows = None;
         loop {
             let selected = storage
-                .firing_rules_for(target, event, txn.replication_apply, txn.txid)
+                .firing_rules_for(target, event, guc.session_replication_role(), txn.txid)
                 .filter(|(_, rule)| {
                     last_name.is_none_or(|last| {
                         rule.definition_for(txn.txid).name.as_str() > last.as_str()
@@ -17214,6 +17191,7 @@ impl Engine {
                         .any(|(_, trigger)| {
                             matches!(trigger.level, ast::TriggerLevel::Row)
                                 && matches!(trigger.timing, ast::TriggerTiming::InsteadOf)
+                                && trigger.events.contains(ast::TriggerEvents::INSERT)
                         })
                 {
                     return exec::instead_of_view_dml(
@@ -17231,58 +17209,49 @@ impl Engine {
                         progress,
                     );
                 }
-                let (insert, view_check) =
-                    match query::resolve_view_for_dml(storage, insert.table, txn.txid, arena) {
-                        Ok(Some(view)) => {
-                            let view_check = Some(exec::ViewCheck {
-                                predicate: view.check_option.and(view.where_clause),
-                                view_name: insert.table.name,
-                                defaults: exec::ViewInsertDefaults {
-                                    base_columns: view.base_columns,
-                                    columns: view.defaults,
-                                    inputs: view.default_inputs,
-                                },
-                            });
-                            let rewritten = match query::rewrite_view_dml(
-                                statement,
-                                insert.table.name,
-                                view.base.name,
-                                view.base.schema.expect("view base is qualified"),
-                                view.columns,
-                                view.base_columns,
-                                storage,
-                                txn.txid,
-                                arena,
-                            ) {
-                                Ok(Stmt::Insert(rewritten)) => rewritten,
-                                Ok(_) => unreachable!("insert rewrite keeps its statement kind"),
-                                Err(error) => return Ok(Err(error)),
-                            };
-                            let columns = if rewritten.columns.is_empty() {
-                                view.base_columns
-                            } else {
-                                rewritten.columns
-                            };
-                            let rewritten = match arena.alloc(Insert {
-                                source_position: rewritten.source_position,
-                                table: view.base,
-                                alias: rewritten.alias,
-                                columns,
-                                rows: rewritten.rows,
-                                select: rewritten.select,
-                                on_conflict: rewritten.on_conflict,
-                                returning: rewritten.returning,
-                                overriding: rewritten.overriding,
-                                values_defaults: rewritten.values_defaults,
-                            }) {
-                                Ok(rewritten) => &*rewritten,
-                                Err(_) => return Ok(Err(query::arena_full_pub())),
-                            };
-                            (rewritten, view_check)
+                let (insert, view_check, authorization) = match query::resolve_view_for_dml(
+                    storage,
+                    insert.table,
+                    txn.txid,
+                    arena,
+                    query::ViewWrite::Insert,
+                ) {
+                    Ok(Some(view)) => {
+                        let rewrite = match query::rewrite_view_dml(
+                            statement,
+                            insert.table.name,
+                            &view,
+                            storage,
+                            txn.txid,
+                            arena,
+                        ) {
+                            Ok(rewrite) => rewrite,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        let Stmt::Insert(rewritten) = rewrite.statement else {
+                            unreachable!("insert rewrite keeps its statement kind")
+                        };
+                        let authorization = match exec::require_nested_view_privileges(
+                            storage,
+                            &view,
+                            &rewrite.written,
+                            query::ViewWrite::Insert,
+                            authorization,
+                            statement,
+                            txn.txid,
+                            arena,
+                        ) {
+                            Ok(authorization) => authorization,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        match view.view_check(storage, txn.txid, arena) {
+                            Ok(check) => (rewritten, Some(check), authorization),
+                            Err(error) => return Ok(Err(error)),
                         }
-                        Ok(None) => (insert, None),
-                        Err(error) => return Ok(Err(error)),
-                    };
+                    }
+                    Ok(None) => (insert, None, authorization),
+                    Err(error) => return Ok(Err(error)),
+                };
                 exec::insert(
                     storage,
                     txn,
@@ -17309,6 +17278,7 @@ impl Engine {
                         .any(|(_, trigger)| {
                             matches!(trigger.level, ast::TriggerLevel::Row)
                                 && matches!(trigger.timing, ast::TriggerTiming::InsteadOf)
+                                && trigger.events.contains(ast::TriggerEvents::UPDATE)
                         })
                 {
                     return exec::instead_of_view_dml(
@@ -17326,58 +17296,49 @@ impl Engine {
                         progress,
                     );
                 }
-                let (update, view_check) =
-                    match query::resolve_view_for_dml(storage, update.table, txn.txid, arena) {
-                        Ok(Some(view)) => {
-                            let view_check = view.check_option.map(|_| exec::ViewCheck {
-                                predicate: view.where_clause,
-                                view_name: update.table.name,
-                                defaults: exec::ViewInsertDefaults {
-                                    base_columns: view.base_columns,
-                                    columns: view.defaults,
-                                    inputs: view.default_inputs,
-                                },
-                            });
-                            let rewritten = match query::rewrite_view_dml(
-                                statement,
-                                update.table.name,
-                                view.base.name,
-                                view.base.schema.expect("view base is qualified"),
-                                view.columns,
-                                view.base_columns,
-                                storage,
-                                txn.txid,
-                                arena,
-                            ) {
-                                Ok(Stmt::Update(rewritten)) => rewritten,
-                                Ok(_) => unreachable!("update rewrite keeps its statement kind"),
-                                Err(error) => return Ok(Err(error)),
-                            };
-                            let where_clause = match query::and_where(
-                                view.where_clause,
-                                rewritten.where_clause,
-                                arena,
-                            ) {
-                                Ok(where_clause) => where_clause,
-                                Err(error) => return Ok(Err(error)),
-                            };
-                            let rewritten = match arena.alloc(Update {
-                                source_position: rewritten.source_position,
-                                table: view.base,
-                                alias: update.alias,
-                                assignments: rewritten.assignments,
-                                from: rewritten.from,
-                                where_clause,
-                                returning: rewritten.returning,
-                            }) {
-                                Ok(rewritten) => &*rewritten,
-                                Err(_) => return Ok(Err(query::arena_full_pub())),
-                            };
-                            (rewritten, view_check)
+                let (update, view_check, authorization) = match query::resolve_view_for_dml(
+                    storage,
+                    update.table,
+                    txn.txid,
+                    arena,
+                    query::ViewWrite::Update,
+                ) {
+                    Ok(Some(view)) => {
+                        let rewrite = match query::rewrite_view_dml(
+                            statement,
+                            update.table.name,
+                            &view,
+                            storage,
+                            txn.txid,
+                            arena,
+                        ) {
+                            Ok(rewrite) => rewrite,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        let Stmt::Update(rewritten) = rewrite.statement else {
+                            unreachable!("update rewrite keeps its statement kind")
+                        };
+                        let authorization = match exec::require_nested_view_privileges(
+                            storage,
+                            &view,
+                            &rewrite.written,
+                            query::ViewWrite::Update,
+                            authorization,
+                            statement,
+                            txn.txid,
+                            arena,
+                        ) {
+                            Ok(authorization) => authorization,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        match view.view_check(storage, txn.txid, arena) {
+                            Ok(check) => (rewritten, Some(check), authorization),
+                            Err(error) => return Ok(Err(error)),
                         }
-                        Ok(None) => (update, None),
-                        Err(error) => return Ok(Err(error)),
-                    };
+                    }
+                    Ok(None) => (update, None, authorization),
+                    Err(error) => return Ok(Err(error)),
+                };
                 exec::update(
                     storage,
                     txn,
@@ -17402,6 +17363,7 @@ impl Engine {
                         .any(|(_, trigger)| {
                             matches!(trigger.level, ast::TriggerLevel::Row)
                                 && matches!(trigger.timing, ast::TriggerTiming::InsteadOf)
+                                && trigger.events.contains(ast::TriggerEvents::DELETE)
                         })
                 {
                     return exec::instead_of_view_dml(
@@ -17419,46 +17381,45 @@ impl Engine {
                         progress,
                     );
                 }
-                let delete =
-                    match query::resolve_view_for_dml(storage, delete.table, txn.txid, arena) {
-                        Ok(Some(view)) => {
-                            let rewritten = match query::rewrite_view_dml(
-                                statement,
-                                delete.table.name,
-                                view.base.name,
-                                view.base.schema.expect("view base is qualified"),
-                                view.columns,
-                                view.base_columns,
-                                storage,
-                                txn.txid,
-                                arena,
-                            ) {
-                                Ok(Stmt::Delete(rewritten)) => rewritten,
-                                Ok(_) => unreachable!("delete rewrite keeps its statement kind"),
-                                Err(error) => return Ok(Err(error)),
-                            };
-                            let where_clause = match query::and_where(
-                                view.where_clause,
-                                rewritten.where_clause,
-                                arena,
-                            ) {
-                                Ok(where_clause) => where_clause,
-                                Err(error) => return Ok(Err(error)),
-                            };
-                            match arena.alloc(Delete {
-                                table: view.base,
-                                alias: delete.alias,
-                                using: rewritten.using,
-                                where_clause,
-                                returning: rewritten.returning,
-                            }) {
-                                Ok(rewritten) => &*rewritten,
-                                Err(_) => return Ok(Err(query::arena_full_pub())),
-                            }
+                let (delete, authorization) = match query::resolve_view_for_dml(
+                    storage,
+                    delete.table,
+                    txn.txid,
+                    arena,
+                    query::ViewWrite::Delete,
+                ) {
+                    Ok(Some(view)) => {
+                        let rewrite = match query::rewrite_view_dml(
+                            statement,
+                            delete.table.name,
+                            &view,
+                            storage,
+                            txn.txid,
+                            arena,
+                        ) {
+                            Ok(rewrite) => rewrite,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        let Stmt::Delete(rewritten) = rewrite.statement else {
+                            unreachable!("delete rewrite keeps its statement kind")
+                        };
+                        match exec::require_nested_view_privileges(
+                            storage,
+                            &view,
+                            &rewrite.written,
+                            query::ViewWrite::Delete,
+                            authorization,
+                            statement,
+                            txn.txid,
+                            arena,
+                        ) {
+                            Ok(authorization) => (rewritten, authorization),
+                            Err(error) => return Ok(Err(error)),
                         }
-                        Ok(None) => delete,
-                        Err(error) => return Ok(Err(error)),
-                    };
+                    }
+                    Ok(None) => (delete, authorization),
+                    Err(error) => return Ok(Err(error)),
+                };
                 exec::delete(
                     storage,
                     txn,
@@ -17481,7 +17442,46 @@ impl Engine {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// `UPDATE pg_settings` runs PostgreSQL's `pg_settings_u` rule:
+    /// `SELECT set_config(old.name, new.setting, false)` for each row whose
+    /// new name equals its old one, then `UPDATE 0` from the `DO INSTEAD
+    /// NOTHING` rule `pg_settings_n`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the rule's query runs with every execution service"
+    )]
+    fn update_pg_settings(
+        &mut self,
+        update: &ast::Update<'_>,
+        arena: &Arena,
+        params: &[Datum],
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let select = match pg_settings_rule_query(update, arena) {
+            Ok(select) => select,
+            Err(error) => return Ok(Err(error)),
+        };
+        responder.begin_command_completion_capture();
+        let outcome =
+            self.execute_select(select, arena, params, txn, sqlprep, cursors, guc, responder)?;
+        if outcome.is_err() {
+            return Ok(outcome);
+        }
+        if responder.take_command_completion_tag(arena, false).is_err() {
+            return Ok(Err(crate::sql::eval::arena_full()));
+        }
+        responder.command_complete("UPDATE 0")?;
+        Ok(Ok(()))
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a SELECT runs with every execution service"
+    )]
     fn execute_select(
         &mut self,
         statement: &ast::Select<'_>,
@@ -17579,8 +17579,8 @@ impl Engine {
                 arena,
                 params,
                 txn,
+                (&mut *sqlprep, &mut *cursors),
                 guc,
-                cursors,
                 Some(&invocations),
                 responder,
             )?;
@@ -18016,7 +18016,27 @@ impl Engine {
                 }
             }
         }
-        let direct_relation = match statement {
+        // A data-modifying `WITH` whose main write reads every
+        // data-modifying query hands that write's completion over too, so
+        // their AFTER events run on the engine. Queries nothing reads run
+        // after the main write, so their statement keeps its own completion.
+        let main_statement = match statement {
+            Stmt::With { ctes, statement }
+                if !(0..ctes.len()).any(|index| {
+                    ctes[index].dml.is_some()
+                        && query::dml_cte_runs_after(
+                            ctes,
+                            index,
+                            query::CteReader::Statement(statement),
+                        )
+                }) =>
+            {
+                *statement
+            }
+            Stmt::With { .. } => statement,
+            statement => statement,
+        };
+        let direct_relation = match main_statement {
             Stmt::Insert(insert) => Some(insert.table),
             Stmt::Update(update) => Some(update.table),
             Stmt::Delete(delete) => Some(delete.table),
@@ -18045,7 +18065,7 @@ impl Engine {
                         .firing_rules_for(
                             crate::storage::RuleTarget::Table(table as u16),
                             event,
-                            txn.replication_apply,
+                            guc.session_replication_role(),
                             txn.txid,
                         )
                         .next()
@@ -18130,8 +18150,8 @@ impl Engine {
                                 arena,
                                 params,
                                 txn,
+                                (&mut *sqlprep, &mut *cursors),
                                 guc,
-                                cursors,
                                 responder,
                                 None,
                                 Some(&mut progress),
@@ -18141,8 +18161,8 @@ impl Engine {
                                 arena,
                                 params,
                                 txn,
+                                (&mut *sqlprep, &mut *cursors),
                                 guc,
-                                cursors,
                                 Some(&invocations),
                                 responder,
                             )?,
@@ -18725,8 +18745,8 @@ impl Engine {
         arena: &'statement Arena,
         params: &[Datum],
         txn: &mut TxnState,
+        (sqlprep, cursors): StatementServices<'_>,
         guc: &GucState,
-        cursors: &mut cursor::CursorPool,
         invocations: Option<&'statement query::RoutineInvocationState>,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
@@ -18770,7 +18790,7 @@ impl Engine {
                     arena,
                     params,
                     guc,
-                    cursors,
+                    (&mut *sqlprep, &mut *cursors),
                     responder,
                 ))
             },
@@ -18876,7 +18896,11 @@ impl Engine {
         let check_body = guc.check_function_bodies() && routine.language != ast::RoutineLanguage::C;
         let result = (|| {
             let _config = if declaration.body_kind == crate::storage::RoutineBodyKind::String {
-                match guc.enter_routine_configs(&declaration.configs[..declaration.config_count]) {
+                match guc.enter_routine_configs(
+                    &self.storage,
+                    txn.txid,
+                    &declaration.configs[..declaration.config_count],
+                ) {
                     Ok(scope) => Some(scope),
                     Err(error) => return Ok(Err(error)),
                 }
@@ -19792,7 +19816,7 @@ impl Engine {
             .attributes
             .security_definer
             .then(|| eval::funcs::system::enter_current_user(owner));
-        let config = match guc.enter_routine_configs(routine.configs()) {
+        let config = match guc.enter_routine_configs(&self.storage, txn.txid, routine.configs()) {
             Ok(scope) => scope,
             Err(error) => return Ok(Err(error)),
         };
@@ -19915,19 +19939,34 @@ impl Engine {
         arena: &Arena,
         params: &[Datum],
         txn: &mut TxnState,
+        (sqlprep, cursors): StatementServices<'_>,
         guc: &GucState,
-        cursors: &mut cursor::CursorPool,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         match statement {
-            Stmt::Select(select) => {
-                self.execute_select_once(select, arena, params, txn, guc, cursors, None, responder)
-            }
+            Stmt::Select(select) => self.execute_select_once(
+                select,
+                arena,
+                params,
+                txn,
+                (sqlprep, cursors),
+                guc,
+                None,
+                responder,
+            ),
             // A set query runs as the Select form subqueries carry, so its
             // data-modifying CTEs and routine calls run as a SELECT's do.
             Stmt::SetQuery(query) => match query::set_query_select(query, arena) {
-                Ok(select) => self
-                    .execute_select_once(select, arena, params, txn, guc, cursors, None, responder),
+                Ok(select) => self.execute_select_once(
+                    select,
+                    arena,
+                    params,
+                    txn,
+                    (sqlprep, cursors),
+                    guc,
+                    None,
+                    responder,
+                ),
                 Err(error) => Ok(Err(error)),
             },
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
@@ -19967,7 +20006,16 @@ impl Engine {
                 )
             }
             Stmt::With { ctes, statement } => self.execute_with_data_modification(
-                ctes, statement, arena, params, txn, guc, cursors, responder, None, None,
+                ctes,
+                statement,
+                arena,
+                params,
+                txn,
+                (sqlprep, cursors),
+                guc,
+                responder,
+                None,
+                None,
             ),
             _ => Ok(Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -19987,8 +20035,8 @@ impl Engine {
         arena: &'a Arena,
         params: &[Datum<'a>],
         txn: &mut TxnState,
+        (sqlprep, cursors): StatementServices<'_>,
         guc: &GucState,
-        cursors: &mut cursor::CursorPool,
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
         progress: Option<&mut exec::RowProgress>,
@@ -20065,7 +20113,7 @@ impl Engine {
             arena,
             params,
             guc,
-            cursors,
+            (sqlprep, cursors),
             responder,
         );
         if let Err(error) = &finished
@@ -20101,12 +20149,12 @@ impl Engine {
         arena: &'a Arena,
         params: &[Datum<'a>],
         guc: &GucState,
-        cursors: &mut cursor::CursorPool,
+        (sqlprep, cursors): StatementServices<'_>,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
-        // The sub-statements' foreign key checks wait for the statement's
-        // end and run after the unread queries, as PostgreSQL fires them
-        // before completing the statement.
+        // The sub-statements' AFTER events wait for the statement's end and
+        // run after the unread queries with the engine's executor, as
+        // PostgreSQL fires them before completing the statement.
         let (depth, command) = (txn.trigger_depth(), txn.command_id());
         let finished = self
             .run_unread_dml_ctes(
@@ -20116,13 +20164,15 @@ impl Engine {
                 if dml_mats.is_empty() {
                     return Ok(());
                 }
-                exec::constraints::fire_statement_foreign_key_events(
-                    &mut self.storage,
+                exec::fire_statement_after_events(
+                    self,
+                    guc,
+                    sqlprep,
+                    cursors,
                     txn,
-                    depth,
-                    command,
+                    (depth, command),
                     arena,
-                    guc.seq_session(),
+                    responder,
                 )
             });
         let error = match finished {
@@ -20487,7 +20537,7 @@ impl Engine {
             let config = if resuming {
                 None
             } else {
-                match guc.enter_routine_configs(routine.configs()) {
+                match guc.enter_routine_configs(&self.storage, txn.txid, routine.configs()) {
                     Ok(scope) => Some(scope),
                     Err(error) => return Ok(Err(error)),
                 }
@@ -21004,11 +21054,7 @@ impl Engine {
             .filter(|(_, trigger)| {
                 trigger.event == event
                     && trigger.tags.matches(tag)
-                    && if txn.replication_apply {
-                        trigger.enabled.fires_for_replication()
-                    } else {
-                        trigger.enabled.fires_for_origin()
-                    }
+                    && trigger.enabled.fires_in(guc.session_replication_role())
                     && last_name.is_none_or(|last: SqlName| trigger.name.as_str() > last.as_str())
             })
             .min_by(|(_, left), (_, right)| left.name.as_str().cmp(right.name.as_str()))
@@ -21031,7 +21077,9 @@ impl Engine {
                 .security_definer
                 .then(|| eval::funcs::system::enter_current_user(owner));
             let _configuration = (!routine.configs().is_empty())
-                .then(|| guc::enter_active_routine_configs(routine.configs()))
+                .then(|| {
+                    guc::enter_active_routine_configs(&self.storage, txn.txid, routine.configs())
+                })
                 .transpose()?;
             exec::execute_event_trigger(
                 self,
@@ -21236,6 +21284,48 @@ impl Engine {
     /// Outer Result: wire-level trouble. Inner Result: SQL-level error.
     #[allow(clippy::too_many_arguments)]
     fn execute_stmt(
+        &mut self,
+        statement: &Stmt,
+        arena: &Arena,
+        params: &[Datum],
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        routine_transaction_context: exec::PlpgsqlTransactionContext,
+        responder: &mut Responder,
+        timeout_entry: StatementTimeoutEntry,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        // PL/pgSQL loads before a DO block or a PL/pgSQL routine's validator
+        // runs, and after any other statement that first ran PL/pgSQL.
+        guc::take_plpgsql_use();
+        if match statement {
+            Stmt::Do { .. } => true,
+            Stmt::CreateRoutine(routine) => routine.language == ast::RoutineLanguage::PlPgSql,
+            _ => false,
+        } {
+            guc.load_plpgsql(responder)?;
+        }
+        let result = self.execute_stmt_loaded(
+            statement,
+            arena,
+            params,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            routine_transaction_context,
+            responder,
+            timeout_entry,
+        );
+        if guc::take_plpgsql_use() {
+            guc.load_plpgsql(responder)?;
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_stmt_loaded(
         &mut self,
         statement: &Stmt,
         arena: &Arena,
@@ -22066,8 +22156,8 @@ impl Engine {
                             arena,
                             execution_params,
                             txn,
+                            (&mut *sqlprep, &mut *cursors),
                             guc,
-                            cursors,
                             responder,
                         )
                     });
@@ -22115,7 +22205,16 @@ impl Engine {
                 statement, arena, params, txn, sqlprep, cursors, guc, responder,
             ),
             Stmt::With { ctes, statement } => self.execute_with_data_modification(
-                ctes, statement, arena, params, txn, guc, cursors, responder, capture, None,
+                ctes,
+                statement,
+                arena,
+                params,
+                txn,
+                (sqlprep, cursors),
+                guc,
+                responder,
+                capture,
+                None,
             ),
             Stmt::Select(select) => {
                 self.execute_select(select, arena, params, txn, sqlprep, cursors, guc, responder)
@@ -23506,6 +23605,14 @@ impl Engine {
                     responder,
                 )
             }
+            Stmt::Insert(insert) if is_pg_settings(insert.table) => Ok(Err(
+                query::function_view_write_error("pg_settings", query::ViewWrite::Insert),
+            )),
+            Stmt::Delete(delete) if is_pg_settings(delete.table) => Ok(Err(
+                query::function_view_write_error("pg_settings", query::ViewWrite::Delete),
+            )),
+            Stmt::Update(update) if is_pg_settings(update.table) => self
+                .update_pg_settings(update, arena, params, txn, sqlprep, cursors, guc, responder),
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_)
                 if reset_workspace =>
             {
@@ -26970,7 +27077,7 @@ impl Engine {
                         arena,
                         params,
                         guc,
-                        cursors,
+                        (&mut *sqlprep, &mut *cursors),
                         responder,
                     )
                 },
@@ -27286,7 +27393,7 @@ impl Engine {
             Ok(value) => value,
             Err(error) => return Ok(Err(error)),
         };
-        let title = match guc::canonical_setting_name(name) {
+        let title = match guc.show_title(name) {
             Ok(title) => title,
             Err(error) => return Ok(Err(error)),
         };
@@ -27399,6 +27506,154 @@ fn fixed_setting(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The per-connection prepared statements and cursors a statement's trigger
+/// bodies and referential actions may use through the engine.
+type StatementServices<'s> = (&'s mut SqlPreparedPool, &'s mut cursor::CursorPool);
+
+/// Whether an `UPDATE` targets the built-in `pg_settings` view, which the
+/// search path always finds in `pg_catalog` first.
+pub(crate) fn is_pg_settings(table: ast::QualName<'_>) -> bool {
+    table.name == "pg_settings" && matches!(table.schema, None | Some("pg_catalog"))
+}
+
+/// The query of `pg_settings_u` for one `UPDATE pg_settings`: the updated
+/// `setting` (or the old one) is applied to each row the `WHERE` selects
+/// whose updated `name` still equals its old one.
+pub(crate) fn pg_settings_rule_query<'a>(
+    update: &ast::Update<'a>,
+    arena: &'a Arena,
+) -> Result<&'a ast::Select<'a>, SqlError> {
+    if !update.returning.items.is_empty() {
+        crate::sql::eval::stash_diagnostic(
+            None,
+            Some(crate::util::StackStr::from_str(
+                "You need an unconditional ON UPDATE DO INSTEAD rule with a RETURNING clause.",
+            )),
+        );
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot perform UPDATE RETURNING on relation \"pg_settings\""
+        ));
+    }
+    if update.from.is_some() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "UPDATE pg_settings with FROM is not supported"
+        ));
+    }
+    let template = parser::parse_query(
+        "SELECT set_config(name, setting, false) FROM pg_catalog.pg_settings WHERE name = name",
+        arena,
+    )?;
+    let ast::SelectItem::Expr {
+        expression:
+            call @ ast::Expr::Call {
+                args: [name, setting, local],
+                ..
+            },
+        ..
+    } = template.items[0]
+    else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "pg_settings rule template did not parse as one call"
+        ));
+    };
+    let mut new_name = None;
+    let mut new_setting = *setting;
+    for &(column, value) in update.assignments {
+        if !PG_SETTINGS_COLUMNS.contains(&column) {
+            return Err(crate::sql::error_position::at_subject(
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" of relation \"pg_settings\" does not exist",
+                    column
+                ),
+                column,
+            ));
+        }
+        match column {
+            "name" => new_name = Some(value),
+            "setting" => new_setting = value,
+            _ => {}
+        }
+    }
+    let arguments = arena
+        .alloc_slice_copy(&[*name, new_setting, *local])
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let mut call = *call;
+    if let ast::Expr::Call { args, .. } = &mut call {
+        *args = arguments;
+    }
+    let call = &*arena
+        .alloc(call)
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let renamed = match (new_name, template.where_clause) {
+        (
+            Some(new_name),
+            Some(ast::Expr::Binary {
+                source_position,
+                operator,
+                right,
+                ..
+            }),
+        ) => Some(
+            &*arena
+                .alloc(ast::Expr::Binary {
+                    source_position: *source_position,
+                    operator: *operator,
+                    left: new_name,
+                    right,
+                })
+                .map_err(|_| crate::sql::eval::arena_full())?,
+        ),
+        _ => None,
+    };
+    let where_clause = query::and_where(update.where_clause, renamed, arena)?;
+    let items = arena
+        .alloc_slice_copy(&[ast::SelectItem::Expr {
+            expression: call,
+            alias: None,
+        }])
+        .map_err(|_| crate::sql::eval::arena_full())?;
+    let mut from = template.from.ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "pg_settings rule template has no FROM"
+        )
+    })?;
+    from.base.alias = update.alias;
+    let mut select = *template;
+    select.items = items;
+    select.from = Some(from);
+    select.where_clause = where_clause;
+    arena
+        .alloc(select)
+        .map(|select| &*select)
+        .map_err(|_| crate::sql::eval::arena_full())
+}
+
+/// `pg_settings`'s columns, which an `UPDATE` may assign.
+const PG_SETTINGS_COLUMNS: [&str; 17] = [
+    "name",
+    "setting",
+    "unit",
+    "category",
+    "short_desc",
+    "extra_desc",
+    "context",
+    "vartype",
+    "source",
+    "min_val",
+    "max_val",
+    "enumvals",
+    "boot_val",
+    "reset_val",
+    "sourcefile",
+    "sourceline",
+    "pending_restart",
+];
+
 /// Every setting readable through `SHOW`, `SHOW ALL`, and `current_setting` —
 /// the fixed server parameters plus the per-session GUCs, in `SHOW ALL`'s
 /// case-insensitive name order. Names carry PostgreSQL's canonical case for
@@ -27478,6 +27733,9 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "parallel_tuple_cost",
     "password_encryption",
     "plan_cache_mode",
+    "plpgsql.check_asserts",
+    "plpgsql.extra_errors",
+    "plpgsql.extra_warnings",
     "plpgsql.print_strict_params",
     "plpgsql.variable_conflict",
     "random_page_cost",
@@ -27488,6 +27746,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "server_encoding",
     "server_version",
     "server_version_num",
+    "session_replication_role",
     "standard_conforming_strings",
     "statement_timeout",
     "synchronize_seqscans",
@@ -29933,25 +30192,17 @@ fn apply_wal_op(
                     ));
                 }
             };
-            let Some(function_slot) =
-                storage.routine_slot_by_signature(function_schema, function, &[], 0)
-            else {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    "journal trigger references unknown function \"{}.{}\"",
-                    function_schema,
-                    function
-                ));
-            };
-            if !matches!(
-                storage.routine(function_slot).kind,
-                crate::storage::RoutineKind::Trigger
-            ) {
-                return Err(sql_err!(
-                    sqlstate::INVALID_OBJECT_DEFINITION,
-                    "journal trigger function has invalid return type"
-                ));
-            }
+            let function_slot = storage
+                .trigger_function_named(function_schema, function, 0)
+                .map_err(|defect| {
+                    sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "journal trigger references \"{}.{}\": {}",
+                        function_schema,
+                        function,
+                        defect
+                    )
+                })?;
             let kind = if constraint {
                 let referenced_table = match (referenced_schema, referenced_table) {
                     (Some(schema), Some(table)) => {
@@ -32441,7 +32692,8 @@ fn check_cte_rules(storage: &Storage, dml: &Stmt<'_>, txn: &TxnState) -> Result<
         }
         _ => return Ok(()),
     };
-    let rules = || storage.firing_rules_for(target, event, txn.replication_apply, txn.txid);
+    let replication_role = crate::sql::guc::active_session_replication_role()?;
+    let rules = || storage.firing_rules_for(target, event, replication_role, txn.txid);
     if rules().next().is_none() {
         return Ok(());
     }
@@ -32629,7 +32881,12 @@ fn reject_with_query_rules(
     let mut conditional_instead = false;
     let mut also = false;
     let mut unconditional_instead = false;
-    for (_, rule) in storage.firing_rules_for(target, event, txn.replication_apply, txn.txid) {
+    for (_, rule) in storage.firing_rules_for(
+        target,
+        event,
+        crate::sql::guc::active_session_replication_role()?,
+        txn.txid,
+    ) {
         let definition = rule.definition_for(txn.txid);
         statements += definition.action_sql().count();
         match definition.mode {

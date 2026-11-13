@@ -27,7 +27,7 @@ use crc32c::crc32c;
 
 /// On-disk record header length shared by recovery and logical decoding.
 pub(crate) const HEADER_LEN: usize = 24;
-pub(crate) const RECORD_VERSION: u8 = 31;
+pub(crate) const RECORD_VERSION: u8 = 32;
 
 /// One contiguous, committed journal range ready for immutable publication.
 /// Construction is private to the journal, so callers cannot pair an LSN with
@@ -270,7 +270,7 @@ wal_record_kinds! {
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 19;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 20;
 const DOMAIN_PAYLOAD_VERSION: u8 = u8::MAX - 4;
 const NO_DOMAIN_BASE_CREATION: u32 = 0;
 
@@ -1223,7 +1223,9 @@ fn table_payload_len<B: DefinitionBacking>(def: &TableDefinition<B>) -> usize {
             + fk.parent.as_str().len()
             + 1
             + fk.n_parent_cols * 2
-            + 4;
+            + 8
+            + 1
+            + fk.n_delete_set_cols * 2;
     }
     // exclusion constraints
     n += 1;
@@ -1537,7 +1539,15 @@ fn append_table_payload<B: DefinitionBacking>(
             fk.on_update.code(),
             fk.timing.code(),
             fk.validation.code(),
+            fk.trigger_enabled[0].code(),
+            fk.trigger_enabled[1].code(),
+            fk.trigger_enabled[2].code(),
+            fk.trigger_enabled[3].code(),
         ]);
+        ok &= buffer.append(&[fk.n_delete_set_cols as u8]);
+        for &c in fk.delete_set_cols() {
+            ok &= buffer.append(&c.to_le_bytes());
+        }
     }
     ok &= buffer.append(&[def.n_exclusions as u8]);
     for exclusion in def.exclusions() {
@@ -8695,12 +8705,25 @@ fn decode_op_inner<'a>(
                     *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
                     at += 2;
                 }
-                let acts = payload.get(at..at + 4)?;
-                at += 4;
+                let acts = payload.get(at..at + 8)?;
+                at += 8;
                 fk.on_delete = FkAction::from_code(acts[0])?;
                 fk.on_update = FkAction::from_code(acts[1])?;
                 fk.timing = crate::storage::ConstraintTiming::from_code(acts[2])?;
                 fk.validation = crate::storage::ConstraintValidation::from_code(acts[3])?;
+                for (mode, &code) in fk.trigger_enabled.iter_mut().zip(&acts[4..]) {
+                    *mode = crate::storage::TriggerEnabled::from_code(code)?;
+                }
+                let n_set = *payload.get(at)? as usize;
+                at += 1;
+                if n_set > nc {
+                    return None;
+                }
+                fk.n_delete_set_cols = n_set;
+                for c in fk.delete_set_cols.iter_mut().take(n_set) {
+                    *c = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
+                    at += 2;
+                }
                 *slot = fk;
             }
             let n_exclusions = *payload.get(at)? as usize;

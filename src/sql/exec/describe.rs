@@ -360,31 +360,38 @@ pub(crate) fn describe_data_modification_columns<'a>(
     if returning.is_empty() {
         return Ok(0);
     }
-    let (target, returning, target_alias, from) =
-        match crate::sql::query::resolve_view_for_dml(storage, target, txid, arena) {
-            Ok(Some(view)) => {
-                let rewritten = crate::sql::query::rewrite_view_dml(
-                    statement,
-                    target.name,
-                    view.base.name,
-                    view.base.schema.expect("view base is qualified"),
-                    view.columns,
-                    view.base_columns,
-                    storage,
-                    txid,
-                    arena,
-                )?;
-                let (returning, target_alias, from) = match rewritten {
-                    Stmt::Insert(insert) => (insert.returning, insert.alias, None),
-                    Stmt::Update(update) => (update.returning, update.alias, update.from),
-                    Stmt::Delete(delete) => (delete.returning, delete.alias, delete.using),
-                    _ => unreachable!("view rewrite keeps its statement kind"),
-                };
-                (view.base, returning, target_alias, from)
-            }
-            Ok(None) => (target, returning, target_alias, from),
-            Err(error) => return Err(error),
-        };
+    let (target, returning, target_alias, from) = match crate::sql::query::resolve_view_for_dml(
+        storage,
+        target,
+        txid,
+        arena,
+        match statement {
+            Stmt::Insert(_) => crate::sql::query::ViewWrite::Insert,
+            Stmt::Update(_) => crate::sql::query::ViewWrite::Update,
+            _ => crate::sql::query::ViewWrite::Delete,
+        },
+    ) {
+        Ok(Some(view)) => {
+            let rewritten = crate::sql::query::rewrite_view_dml(
+                statement,
+                target.name,
+                &view,
+                storage,
+                txid,
+                arena,
+            )?
+            .statement;
+            let (returning, target_alias, from) = match rewritten {
+                Stmt::Insert(insert) => (insert.returning, insert.alias, None),
+                Stmt::Update(update) => (update.returning, update.alias, update.from),
+                Stmt::Delete(delete) => (delete.returning, delete.alias, delete.using),
+                _ => unreachable!("view rewrite keeps its statement kind"),
+            };
+            (view.base, returning, target_alias, from)
+        }
+        Ok(None) => (target, returning, target_alias, from),
+        Err(error) => return Err(error),
+    };
     if let Some(from) = from {
         return crate::sql::exec::describe_dml_from_returning(
             storage,
@@ -3751,6 +3758,16 @@ fn record_shape_metadata_dyn(
             record_shape_metadata_dyn(argument, columns, visit)
         }
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name,
+            args,
+            ..
+        } if row_preserving_syntax(name)
+            && let Some(typed) = first_typed_argument(args) =>
+        {
+            record_shape_metadata_dyn(typed, columns, visit)
+        }
+        Expr::Call {
             kind,
             name,
             bound_oid,
@@ -3995,6 +4012,37 @@ pub fn record_field_metadata(
             );
         }
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name,
+            args,
+            ..
+        } if row_preserving_syntax(name)
+            && let Some(typed) = first_typed_argument(args) =>
+        {
+            return record_field_metadata(typed, field, columns).map_err(|error| {
+                if error.sqlstate != sqlstate::UNDEFINED_COLUMN {
+                    return error;
+                }
+                // PostgreSQL names the common row type, not the argument.
+                match infer_type_res(typed, columns).and_then(|(type_oid, _)| {
+                    if type_oid == oid::RECORD {
+                        Ok(None)
+                    } else {
+                        columns.type_name_fixed(type_oid)
+                    }
+                }) {
+                    Ok(Some(type_name)) => sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" not found in data type {}",
+                        field,
+                        type_name.as_str()
+                    ),
+                    Ok(None) => error,
+                    Err(error) => error,
+                }
+            });
+        }
+        Expr::Call {
             kind,
             name,
             bound_oid,
@@ -4150,6 +4198,22 @@ pub fn record_field_metadata(
         }
         _ => could_not_identify(field),
     })
+}
+
+/// `COALESCE`, `NULLIF`, `GREATEST` and `LEAST` return their arguments'
+/// common type, so a row result keeps the first argument's fields and their
+/// declared types: `(coalesce(NEW, OLD)).label` has the column's domain.
+fn row_preserving_syntax(name: &str) -> bool {
+    matches!(name, "coalesce" | "nullif" | "greatest" | "least")
+}
+
+/// The first argument that is not an untyped `NULL`, which decides the
+/// common type when the others are.
+fn first_typed_argument<'e, 'a>(arguments: &'e [&'e Expr<'a>]) -> Option<&'e Expr<'a>> {
+    arguments
+        .iter()
+        .copied()
+        .find(|argument| !matches!(argument, Expr::Null))
 }
 
 pub fn record_field_type(
@@ -4369,10 +4433,12 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
                 qualifier,
             ));
         }
-        self.definition
-            .column_index(name)
-            .map(|index| self.definition.columns()[index].ctype)
-            .ok_or_else(|| {
+        match self.definition.column_index(name) {
+            Some(index) => Ok(self.definition.columns()[index].ctype),
+            // The written row's `tableoid` system column, also of its `old`
+            // and `new` images.
+            None if name == "tableoid" => Ok(ColType::Oid),
+            None => {
                 let error = match qualifier {
                     Some(qualifier) => sql_err!(
                         sqlstate::UNDEFINED_COLUMN,
@@ -4386,14 +4452,15 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
                         name
                     ),
                 };
-                crate::sql::column_suggestion::from_relation(
+                Err(crate::sql::column_suggestion::from_relation(
                     error,
                     qualifier,
                     name,
                     self.alias.unwrap_or(self.definition.name.as_str()),
                     &self.definition.columns()[..self.definition.n_columns],
-                )
-            })
+                ))
+            }
+        }
     }
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
         self.resolve(qualifier, name).ok()?;
@@ -4874,6 +4941,29 @@ pub(crate) fn user_routine_call_result(
     routine
         .and_then(|routine| routine.function_result_contract())
         .or_else(|| {
+            // PostgreSQL resolves a call to a trigger function, typed
+            // `trigger` or `event_trigger`; running it fails.
+            if bound_oid.is_none() && arguments.is_empty() && argument_names.is_empty() {
+                for (kind, pseudo) in [
+                    (
+                        crate::storage::RoutineCallKind::Trigger,
+                        crate::sql::types::PseudoType::Trigger,
+                    ),
+                    (
+                        crate::storage::RoutineCallKind::EventTrigger,
+                        crate::sql::types::PseudoType::EventTrigger,
+                    ),
+                ] {
+                    if let crate::storage::RoutineCallSelection::Stored(_) =
+                        storage.select_routine_call(name, &[], &[], false, txid, kind)
+                    {
+                        return Some(crate::storage::RoutineResult {
+                            ctype: ColType::Pseudo(pseudo),
+                            user_type: None,
+                        });
+                    }
+                }
+            }
             // A stored query binds an aggregate call to its OID.
             if let Some(oid) = bound_oid {
                 // Its declared result is exact unless polymorphic.

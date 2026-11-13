@@ -140,6 +140,30 @@ pub(super) fn routine_exit_error(
     invocation: TriggerInvocation<'_>,
     error: SqlError,
 ) -> SqlError {
+    exit_phase_error(
+        context,
+        invocation,
+        error,
+        "while casting return value to function's return type",
+    )
+}
+
+/// Runs a trigger function's check of its returned row, which PostgreSQL
+/// reports `during function exit`.
+pub(super) fn at_trigger_exit<T>(
+    context: &TriggerExecContext<'_, '_, '_>,
+    invocation: TriggerInvocation<'_>,
+    run: impl FnOnce() -> Result<T, SqlError>,
+) -> Result<T, SqlError> {
+    run().map_err(|error| exit_phase_error(context, invocation, error, "during function exit"))
+}
+
+fn exit_phase_error(
+    context: &TriggerExecContext<'_, '_, '_>,
+    invocation: TriggerInvocation<'_>,
+    error: SqlError,
+    phase: &'static str,
+) -> SqlError {
     if error.sqlstate.internal_control().is_some() {
         return error;
     }
@@ -152,35 +176,11 @@ pub(super) fn routine_exit_error(
     } else {
         ProceduralActivity::Phase {
             source: None,
-            text: "while casting return value to function's return type",
+            text: phase,
         }
     };
     let frame = ProceduralFrame::new(signature, None, activity, invocation.print_strict_params);
     crate::sql::error_context::with_frame(&frame, || crate::sql::error_context::capture(error))
-}
-
-/// Checks a BEFORE trigger's returned row, which PostgreSQL reports
-/// `during function exit`.
-pub(super) fn at_trigger_exit<T>(
-    context: &TriggerExecContext<'_, '_, '_>,
-    invocation: TriggerInvocation<'_>,
-    run: impl FnOnce() -> Result<T, SqlError>,
-) -> Result<T, SqlError> {
-    run().map_err(|error| {
-        if error.sqlstate.internal_control().is_some() {
-            return error;
-        }
-        let signature = match procedural_signature(context, invocation) {
-            Ok(signature) => signature,
-            Err(signature_error) => return signature_error,
-        };
-        let activity = ProceduralActivity::Phase {
-            source: None,
-            text: "during function exit",
-        };
-        let frame = ProceduralFrame::new(signature, None, activity, invocation.print_strict_params);
-        crate::sql::error_context::with_frame(&frame, || crate::sql::error_context::capture(error))
-    })
 }
 
 /// PostgreSQL's name for a statement in a context line (`plpgsql_stmt_typename`).

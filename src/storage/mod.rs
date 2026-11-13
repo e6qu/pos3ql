@@ -2045,9 +2045,19 @@ pub struct ForeignKey {
     pub parent_cols: [u16; MAX_INDEX_COLS],
     pub n_parent_cols: usize,
     pub on_delete: FkAction,
+    /// The referencing columns `ON DELETE SET NULL (...)` or `SET DEFAULT
+    /// (...)` changes, in written order (PostgreSQL's `confdelsetcols`);
+    /// none means every key column.
+    pub delete_set_cols: [u16; MAX_INDEX_COLS],
+    pub n_delete_set_cols: usize,
     pub on_update: FkAction,
     pub timing: ConstraintTiming,
     pub validation: ConstraintValidation,
+    /// The firing modes of the foreign key's four RI triggers, indexed by
+    /// [`ForeignKeyTrigger::ordinal`] (PostgreSQL's `tgenabled`): `ALTER
+    /// TABLE ... ENABLE/DISABLE TRIGGER` on the referencing or referenced
+    /// table changes them.
+    pub(crate) trigger_enabled: [TriggerEnabled; 4],
 }
 
 impl ForeignKey {
@@ -2061,13 +2071,24 @@ impl ForeignKey {
         parent_cols: [0u16; MAX_INDEX_COLS],
         n_parent_cols: 0,
         on_delete: FkAction::NoAction,
+        delete_set_cols: [0u16; MAX_INDEX_COLS],
+        n_delete_set_cols: 0,
         on_update: FkAction::NoAction,
         timing: ConstraintTiming::NotDeferrable,
         validation: ConstraintValidation::EnforcedValidated,
+        trigger_enabled: [TriggerEnabled::Origin; 4],
     };
+
+    pub(crate) const fn trigger_enabled(&self, trigger: ForeignKeyTrigger) -> TriggerEnabled {
+        self.trigger_enabled[trigger.ordinal()]
+    }
 
     pub fn columns(&self) -> &[u16] {
         &self.columns[..self.n_cols]
+    }
+
+    pub fn delete_set_cols(&self) -> &[u16] {
+        &self.delete_set_cols[..self.n_delete_set_cols]
     }
 
     pub fn parent_cols(&self) -> &[u16] {
@@ -6221,12 +6242,13 @@ impl RuleEnabled {
         }
     }
 
-    pub(crate) const fn fires_for_origin(self) -> bool {
-        matches!(self, Self::Origin | Self::Always)
-    }
-
-    pub(crate) const fn fires_for_replication(self) -> bool {
-        matches!(self, Self::Replica | Self::Always)
+    /// PostgreSQL's firing test under `session_replication_role`.
+    pub(crate) const fn fires_in(self, role: crate::sql::guc::SessionReplicationRole) -> bool {
+        if role.is_replica() {
+            matches!(self, Self::Replica | Self::Always)
+        } else {
+            matches!(self, Self::Origin | Self::Always)
+        }
     }
 }
 
@@ -8465,6 +8487,58 @@ pub(crate) fn trigger_constraint_oid(trigger_oid: i32) -> i32 {
 
 pub(crate) fn policy_oid(policy: &PolicyDef) -> i32 {
     OidBand::Policy.oid(policy.created_at)
+}
+
+impl Storage {
+    /// Resolves a durable trigger function reference (`schema`, `name`, no
+    /// arguments) from a journal or checkpoint: a built-in trigger function,
+    /// or a stored routine returning `trigger`. The error names the defect.
+    pub(crate) fn trigger_function_named(
+        &self,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Result<TriggerFunction, &'static str> {
+        if let Some(builtin) = BuiltinTriggerFunction::named(schema, name) {
+            return Ok(TriggerFunction::Builtin(builtin));
+        }
+        let slot = self
+            .routine_slot_by_signature(schema, name, &[], txid)
+            .ok_or("trigger function does not exist")?;
+        if !matches!(self.routine(slot).kind, RoutineKind::Trigger) {
+            return Err("trigger function is not trigger typed");
+        }
+        TriggerFunction::routine_slot(slot).map_err(|_| "trigger function slot is out of range")
+    }
+
+    /// The schema and name of the function a trigger runs, as `txid` sees
+    /// them.
+    pub(crate) fn trigger_function_name(
+        &self,
+        function: TriggerFunction,
+        txid: u32,
+    ) -> (SqlName, SqlName) {
+        match function {
+            TriggerFunction::Routine(slot) => {
+                let routine = self.routine(usize::from(slot));
+                (routine.schema_for(txid), routine.name_for(txid))
+            }
+            TriggerFunction::Builtin(builtin) => (
+                SqlName::parse("pg_catalog").expect("pg_catalog is a valid name"),
+                SqlName::parse(builtin.name()).expect("built-in trigger function names are valid"),
+            ),
+        }
+    }
+}
+
+/// The `pg_proc` OID of the function a trigger runs.
+pub(crate) fn trigger_function_oid(storage: &Storage, function: TriggerFunction, txid: u32) -> i32 {
+    match function {
+        TriggerFunction::Routine(slot) => {
+            routine_oid(&storage.routine_for(usize::from(slot), txid))
+        }
+        TriggerFunction::Builtin(builtin) => builtin.oid(),
+    }
 }
 
 pub(crate) fn routine_oid(routine: &RoutineDef) -> i32 {
@@ -11317,6 +11391,68 @@ impl TriggerTarget {
     }
 }
 
+/// The function a trigger runs: a stored routine, or one of PostgreSQL's
+/// built-in trigger functions in `pg_catalog`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TriggerFunction {
+    Routine(u16),
+    Builtin(BuiltinTriggerFunction),
+}
+
+impl TriggerFunction {
+    /// Builds a routine reference from a routine catalog slot.
+    pub(crate) fn routine_slot(slot: usize) -> Result<Self, SqlError> {
+        u16::try_from(slot).map(Self::Routine).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "routine slot exceeds trigger capacity"
+            )
+        })
+    }
+
+    pub(crate) const fn routine(self) -> Option<usize> {
+        match self {
+            Self::Routine(slot) => Some(slot as usize),
+            Self::Builtin(_) => None,
+        }
+    }
+}
+
+/// PostgreSQL's built-in trigger functions that pos3ql runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BuiltinTriggerFunction {
+    /// `suppress_redundant_updates_trigger()`: a `BEFORE UPDATE` row trigger
+    /// that skips an update whose new row is identical to the old one.
+    SuppressRedundantUpdates,
+}
+
+impl BuiltinTriggerFunction {
+    pub(crate) const fn oid(self) -> i32 {
+        match self {
+            Self::SuppressRedundantUpdates => 1291,
+        }
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::SuppressRedundantUpdates => "suppress_redundant_updates_trigger",
+        }
+    }
+
+    pub(crate) const fn from_oid(oid: i32) -> Option<Self> {
+        match oid {
+            1291 => Some(Self::SuppressRedundantUpdates),
+            _ => None,
+        }
+    }
+
+    /// The built-in trigger function `schema.name` names, if any.
+    pub(crate) fn named(schema: &str, name: &str) -> Option<Self> {
+        (schema == "pg_catalog" && name == Self::SuppressRedundantUpdates.name())
+            .then_some(Self::SuppressRedundantUpdates)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TriggerDef {
     pub(crate) database: DatabaseOid,
@@ -11324,7 +11460,7 @@ pub(crate) struct TriggerDef {
     pub(crate) name: SqlName,
     pub(crate) target: TriggerTarget,
     pub(crate) kind: TriggerKind,
-    pub(crate) function: u16,
+    pub(crate) function: TriggerFunction,
     pub(crate) timing: crate::sql::ast::TriggerTiming,
     pub(crate) level: crate::sql::ast::TriggerLevel,
     pub(crate) events: crate::sql::ast::TriggerEvents,
@@ -11347,7 +11483,7 @@ pub(crate) struct PendingTriggerDefinition {
 pub(crate) struct TriggerDefinition {
     pub(crate) name: SqlName,
     pub(crate) kind: TriggerKind,
-    pub(crate) function: u16,
+    pub(crate) function: TriggerFunction,
     pub(crate) timing: crate::sql::ast::TriggerTiming,
     pub(crate) level: crate::sql::ast::TriggerLevel,
     pub(crate) events: crate::sql::ast::TriggerEvents,
@@ -11388,12 +11524,13 @@ impl TriggerEnabled {
         }
     }
 
-    pub(crate) const fn fires_for_origin(self) -> bool {
-        matches!(self, Self::Origin | Self::Always)
-    }
-
-    pub(crate) const fn fires_for_replication(self) -> bool {
-        matches!(self, Self::Replica | Self::Always)
+    /// PostgreSQL's firing test under `session_replication_role`.
+    pub(crate) const fn fires_in(self, role: crate::sql::guc::SessionReplicationRole) -> bool {
+        if role.is_replica() {
+            matches!(self, Self::Replica | Self::Always)
+        } else {
+            matches!(self, Self::Origin | Self::Always)
+        }
     }
 }
 
@@ -11417,7 +11554,7 @@ pub(crate) struct TriggerSpec {
     pub(crate) name: SqlName,
     pub(crate) target: TriggerTarget,
     pub(crate) kind: TriggerKind,
-    pub(crate) function: usize,
+    pub(crate) function: TriggerFunction,
     pub(crate) timing: crate::sql::ast::TriggerTiming,
     pub(crate) level: crate::sql::ast::TriggerLevel,
     pub(crate) events: crate::sql::ast::TriggerEvents,
@@ -11638,7 +11775,7 @@ impl TriggerDef {
         name: SqlName::EMPTY,
         target: TriggerTarget::Table(u16::MAX),
         kind: TriggerKind::Ordinary,
-        function: u16::MAX,
+        function: TriggerFunction::Routine(u16::MAX),
         timing: crate::sql::ast::TriggerTiming::Before,
         level: crate::sql::ast::TriggerLevel::Row,
         events: crate::sql::ast::TriggerEvents::from_bits(1).expect("INSERT event is valid"),
@@ -15917,6 +16054,25 @@ pub(crate) fn information_schema_on_path() -> bool {
 
 pub(crate) fn replace_execution_path(path: PathContext) -> PathContext {
     EXECUTION_PATH.with(|current| current.replace(path))
+}
+
+std::thread_local! {
+    static NO_FORCE_ROW_SECURITY: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Restores the caller's row security forcing when dropped.
+pub(crate) struct NoForceRowSecurityScope(bool);
+
+impl Drop for NoForceRowSecurityScope {
+    fn drop(&mut self) {
+        NO_FORCE_ROW_SECURITY.with(|current| current.set(self.0));
+    }
+}
+
+/// Exempts a table's owner from `FORCE ROW LEVEL SECURITY` while the scope
+/// lives, as PostgreSQL's referential queries run (`SECURITY_NOFORCE_RLS`).
+pub(crate) fn enter_no_force_row_security() -> NoForceRowSecurityScope {
+    NoForceRowSecurityScope(NO_FORCE_ROW_SECURITY.with(|current| current.replace(true)))
 }
 
 fn execution_visibility() -> VisibilityContext {
@@ -25964,16 +26120,18 @@ impl Storage {
                         )
                     }
                 };
-                let source_routine_oid =
-                    routine_oid(&self.routine(usize::from(definition.function)));
-                definition.function = self
-                    .routine_slot_by_oid(source_routine_oid, txid)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "template trigger routine was not cloned"
-                        )
-                    })? as u16;
+                if let TriggerFunction::Routine(source) = definition.function {
+                    let source_routine_oid = routine_oid(&self.routine(usize::from(source)));
+                    definition.function = TriggerFunction::routine_slot(
+                        self.routine_slot_by_oid(source_routine_oid, txid)
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "template trigger routine was not cloned"
+                                )
+                            })?,
+                    )?;
+                }
                 let mut trigger_catalog = self
                     .trigger_catalog
                     .lock()
@@ -30108,6 +30266,34 @@ impl Storage {
                     }
                 },
             )
+    }
+
+    /// Whether the current role holds `required` on the parameter `name`:
+    /// as superuser, by grant, or with no role at all (internal work such as
+    /// logical replication apply).
+    pub(crate) fn current_role_has_parameter_privilege(
+        &self,
+        name: &str,
+        required: crate::sql::ast::ParameterPrivileges,
+        txid: u32,
+    ) -> bool {
+        self.current_role_slot(txid)
+            .is_none_or(|role| self.role_has_parameter_privilege(role, name, required, txid))
+    }
+
+    /// Whether `role` holds `required` on the parameter `name`, as superuser
+    /// or by grant.
+    pub(crate) fn role_has_parameter_privilege(
+        &self,
+        role: usize,
+        name: &str,
+        required: crate::sql::ast::ParameterPrivileges,
+        txid: u32,
+    ) -> bool {
+        self.role(role).attributes_to(txid).superuser
+            || crate::sql::ast::ParameterName::parse(name).is_some_and(|parameter| {
+                self.has_parameter_privilege(parameter, role, required, txid)
+            })
     }
 
     pub(crate) fn has_parameter_privilege(
@@ -38085,58 +38271,8 @@ impl Storage {
         Ok(true)
     }
 
-    /// Expands a logical relation through both ordinary inheritance and
-    /// partition attachment without allocating. A non-partitioned relation
-    /// contributes its own rows before its descendants; partitioned relations
-    /// contribute only their leaves. The caller supplies bounded storage sized
-    /// from the configured table catalog.
-    pub fn relation_leaf_slots(
-        &self,
-        root: usize,
-        txid: u32,
-        out: &mut [usize],
-    ) -> Result<usize, SqlError> {
-        fn visit(
-            storage: &Storage,
-            root: usize,
-            txid: u32,
-            out: &mut [usize],
-            n: &mut usize,
-        ) -> Result<(), SqlError> {
-            if out[..*n].contains(&root) {
-                return Ok(());
-            }
-            if !storage.table_def(root, txid).partition.is_partitioned() {
-                if *n == out.len() {
-                    return Err(sql_err!(
-                        crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "relation scan exceeds configured table capacity"
-                    ));
-                }
-                out[*n] = root;
-                *n += 1;
-            }
-            for child in 0..storage.table_count() {
-                if !storage.relation_visible_to_current_session(child, txid) {
-                    continue;
-                }
-                let child_def = storage.table_def(child, txid);
-                let partition_child = child_def.partition.attachment.is_some_and(|attachment| {
-                    usize::from(attachment.parent) == root && attachment.state.routable()
-                });
-                if !partition_child && !child_def.inheritance.contains(root) {
-                    continue;
-                }
-                visit(storage, child, txid, out, n)?;
-            }
-            Ok(())
-        }
-        let mut n = 0;
-        visit(self, root, txid, out, &mut n)?;
-        Ok(n)
-    }
-
-    /// Routes writes by partition bounds; scans use `relation_leaf_slots`.
+    /// Routes writes by partition bounds; scans and writes of a relation's
+    /// rows read its leaves through `sql::exec::relation_leaves_in_order`.
     pub fn partition_leaf_slots(
         &self,
         root: usize,
@@ -49264,7 +49400,8 @@ impl Storage {
         if attributes.superuser || attributes.bypass_row_level_security {
             return false;
         }
-        state.forced || self.object_owner(self.table_access_object(table, txid), txid) != role
+        (state.forced && !NO_FORCE_ROW_SECURITY.with(core::cell::Cell::get))
+            || self.object_owner(self.table_access_object(table, txid), txid) != role
     }
 
     pub(crate) fn policy_slot_on(&self, table: usize, name: &str, txid: u32) -> Option<usize> {
@@ -49934,12 +50071,7 @@ impl Storage {
             name: spec.name,
             target: spec.target,
             kind: spec.kind,
-            function: u16::try_from(spec.function).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "routine slot exceeds trigger capacity"
-                )
-            })?,
+            function: spec.function,
             timing: spec.timing,
             level: spec.level,
             events: spec.events,
@@ -50121,12 +50253,7 @@ impl Storage {
                 spec.name.as_str()
             ));
         }
-        let function = u16::try_from(spec.function).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "routine slot exceeds trigger capacity"
-            )
-        })?;
+        let function = spec.function;
         let prior = trigger.pending_definition;
         catalog.definitions[slot].pending_definition = Some(PendingTriggerDefinition {
             txid,
@@ -50291,12 +50418,7 @@ impl Storage {
             name: spec.name,
             target: spec.target,
             kind: spec.kind,
-            function: u16::try_from(spec.function).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "routine slot exceeds trigger capacity"
-                )
-            })?,
+            function: spec.function,
             timing: spec.timing,
             level: spec.level,
             events: spec.events,
@@ -56988,18 +57110,13 @@ impl Storage {
         &self,
         target: RuleTarget,
         event: RewriteEvent,
-        replication_apply: bool,
+        role: crate::sql::guc::SessionReplicationRole,
         txid: u32,
     ) -> impl Iterator<Item = (usize, RuleDef)> + '_ {
         self.rules_for(target, event, txid)
             .filter(move |(_, rule)| {
                 let definition = rule.definition_for(txid);
-                definition.is_view_return()
-                    || if replication_apply {
-                        definition.enabled.fires_for_replication()
-                    } else {
-                        definition.enabled.fires_for_origin()
-                    }
+                definition.is_view_return() || definition.enabled.fires_in(role)
             })
     }
 

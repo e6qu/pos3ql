@@ -630,6 +630,7 @@ pub mod sqlstate {
     pub const CANT_CHANGE_RUNTIME_PARAM: &str = "55P02";
     pub const CARDINALITY_VIOLATION: &str = "21000";
     pub const TRIGGERED_DATA_CHANGE_VIOLATION: &str = "27000";
+    pub const TRIGGER_PROTOCOL_VIOLATED: &str = "39P01";
     pub const CHECK_VIOLATION: &str = "23514";
     pub const EXCLUSION_VIOLATION: &str = "23P01";
     pub const DUPLICATE_PREPARED_STATEMENT: &str = "42P05";
@@ -2191,6 +2192,17 @@ pub(crate) fn is_sql_syntax_call(expression: &Expr<'_>) -> bool {
     )
 }
 
+/// The type modifier PostgreSQL's `exprTypmod` gives an expression: a
+/// column's declared modifier, a cast's target modifier, otherwise none.
+pub(crate) fn expression_type_mod<'v>(expression: &Expr<'_>, row: &dyn ColumnLookup<'v>) -> i32 {
+    match expression {
+        Expr::Column { qualifier, name } => row.column_type_mod(*qualifier, name),
+        Expr::Cast { type_mod, .. } | Expr::BoundLiteral { type_mod, .. } => *type_mod,
+        Expr::Collate { operand, .. } => expression_type_mod(operand, row),
+        _ => -1,
+    }
+}
+
 pub(crate) fn sql_syntax_call_name(name: &str) -> bool {
     matches!(
         name,
@@ -3328,6 +3340,14 @@ pub trait CatalogAccess {
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
+    }
+
+    /// Fails unless the current role may set `parameter` (`set_config`).
+    fn authorize_parameter_set(&self, _parameter: &str) -> Result<(), SqlError> {
+        Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "parameter privileges require the session catalog"
+        ))
     }
 
     /// The comment text on the object with this OID and column `subid` (0 for
@@ -5982,6 +6002,7 @@ fn materialize_acl_value<'a>(
                 .alloc_slice_with(fields.len(), |_| RecordField {
                     name: "",
                     type_oid: 0,
+                    type_mod: -1,
                     value: Datum::Null,
                 })
                 .map_err(|_| arena_full())?;
@@ -5998,6 +6019,7 @@ fn materialize_acl_value<'a>(
                 .alloc_slice_with(fields.len(), |_| RecordField {
                     name: "",
                     type_oid: 0,
+                    type_mod: -1,
                     value: Datum::Null,
                 })
                 .map_err(|_| arena_full())?;
@@ -10891,11 +10913,13 @@ fn call<'a>(
                     super::types::RecordField {
                         name: "x",
                         type_oid,
+                        type_mod: -1,
                         value,
                     },
                     super::types::RecordField {
                         name: "n",
                         type_oid: super::types::oid::INT4,
+                        type_mod: -1,
                         value: Datum::Int4(ordinal),
                     },
                 ])
@@ -11206,11 +11230,13 @@ fn call<'a>(
                     super::types::RecordField {
                         name: "key",
                         type_oid: super::types::oid::TEXT,
+                        type_mod: -1,
                         value: Datum::Text(key),
                     },
                     super::types::RecordField {
                         name: "value",
                         type_oid: value_oid,
+                        type_mod: -1,
                         value: *value,
                     },
                 ])
@@ -11247,21 +11273,25 @@ fn call<'a>(
                     super::types::RecordField {
                         name: "grantor",
                         type_oid: super::types::oid::OID,
+                        type_mod: -1,
                         value: Datum::Oid(value.grantor),
                     },
                     super::types::RecordField {
                         name: "grantee",
                         type_oid: super::types::oid::OID,
+                        type_mod: -1,
                         value: Datum::Oid(value.grantee),
                     },
                     super::types::RecordField {
                         name: "privilege_type",
                         type_oid: super::types::oid::TEXT,
+                        type_mod: -1,
                         value: Datum::Text(value.privilege),
                     },
                     super::types::RecordField {
                         name: "is_grantable",
                         type_oid: super::types::oid::BOOL,
+                        type_mod: -1,
                         value: Datum::Bool(value.grantable),
                     },
                 ])
@@ -11306,11 +11336,13 @@ fn call<'a>(
                     super::types::RecordField {
                         name: "option_name",
                         type_oid: super::types::oid::TEXT,
+                        type_mod: -1,
                         value: option_name,
                     },
                     super::types::RecordField {
                         name: "option_value",
                         type_oid: super::types::oid::TEXT,
+                        type_mod: -1,
                         value: option_value,
                     },
                 ])
@@ -11341,11 +11373,13 @@ fn call<'a>(
                     super::types::RecordField {
                         name: "last_value",
                         type_oid: super::types::oid::INT8,
+                        type_mod: -1,
                         value: Datum::Int8(last_value),
                     },
                     super::types::RecordField {
                         name: "is_called",
                         type_oid: super::types::oid::BOOL,
+                        type_mod: -1,
                         value: Datum::Bool(is_called),
                     },
                 ])
@@ -11370,6 +11404,29 @@ fn unsupported_builtin_function(oid: i32, hooks: &EvalHooks<'_, '_>) -> SqlError
             oid
         );
     };
+    // PostgreSQL's built-in trigger functions check how they were called.
+    match oid {
+        1291 => {
+            return sql_err!(
+                sqlstate::TRIGGER_PROTOCOL_VIOLATED,
+                "suppress_redundant_updates_trigger: must be called as trigger"
+            );
+        }
+        1250 | 1644..=1655 => {
+            return sql_err!(
+                sqlstate::TRIGGER_PROTOCOL_VIOLATED,
+                "function \"{}\" was not called by trigger manager",
+                signature.name
+            );
+        }
+        3752 | 3753 => {
+            return sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "tsvector_update_trigger: not fired by trigger manager"
+            );
+        }
+        _ => {}
+    }
     let mut message = crate::util::StackStr::<192>::new();
     let _ = write!(message, "function {}(", signature.name);
     for (index, &argument) in signature.arguments.iter().enumerate() {
@@ -13777,6 +13834,15 @@ fn regtype_builtin_name(type_oid: i32) -> Option<&'static str> {
         oid::ANYCOMPATIBLERANGE => "anycompatiblerange",
         oid::ANYCOMPATIBLEMULTIRANGE => "anycompatiblemultirange",
         oid::FDW_HANDLER => "fdw_handler",
+        oid::TRIGGER => "trigger",
+        oid::EVENT_TRIGGER => "event_trigger",
+        oid::ANY => "\"any\"",
+        oid::UNKNOWN => "unknown",
+        2275 => "cstring",
+        2280 => "language_handler",
+        325 => "index_am_handler",
+        269 => "table_am_handler",
+        3310 => "tsm_handler",
         _ => return None,
     })
 }

@@ -8957,7 +8957,7 @@ impl<'a> Parser<'a> {
     fn update(&mut self) -> Result<Stmt<'a>, ParseError> {
         let source_position = crate::sql::ast::SourcePosition::new(Some(self.peek_at));
         self.expect_ident("update")?;
-        let table = self.qual_name("table name")?;
+        let (table, inheritance) = self.dml_target_relation()?;
         let alias =
             if self.eat_ident("as")? || matches!(self.peeked, Tok::Ident(word) if word != "set") {
                 Some(self.col_ident("table alias")?)
@@ -8982,6 +8982,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Update(Update {
             source_position,
             table,
+            inheritance,
             alias,
             assignments,
             from,
@@ -9561,10 +9562,29 @@ impl<'a> Parser<'a> {
         Ok(name)
     }
 
+    /// The target of `UPDATE` or `DELETE`: PostgreSQL's `relation_expr`,
+    /// `[ONLY] name [*]` or `ONLY (name)`.
+    fn dml_target_relation(&mut self) -> Result<(QualName<'a>, RelationInheritance), ParseError> {
+        let inheritance = if self.eat_ident("only")? {
+            RelationInheritance::Only
+        } else {
+            RelationInheritance::Descendants
+        };
+        let parenthesized = inheritance == RelationInheritance::Only && self.eat_op("(")?;
+        let table = self.qual_name("table name")?;
+        if parenthesized {
+            self.expect_op(")")?;
+        }
+        if inheritance == RelationInheritance::Descendants {
+            let _ = self.eat_op("*")?;
+        }
+        Ok((table, inheritance))
+    }
+
     fn delete(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("delete")?;
         self.expect_ident("from")?;
-        let table = self.qual_name("table name")?;
+        let (table, inheritance) = self.dml_target_relation()?;
         let alias = if self.eat_ident("as")?
             || matches!(self.peeked, Tok::Ident(word) if word != "using" && word != "where" && word != "returning")
         {
@@ -9587,6 +9607,7 @@ impl<'a> Parser<'a> {
         let returning = self.returning()?;
         Ok(Stmt::Delete(Delete {
             table,
+            inheritance,
             alias,
             using,
             where_clause,
@@ -10124,7 +10145,7 @@ impl<'a> Parser<'a> {
                     at: self.peek_at,
                     message: stack_format!(
                         PARSE_MESSAGE_BYTES,
-                        "parameter \"{}\" requires a single value",
+                        "SET {} takes only one argument",
                         name
                     ),
                     sqlstate: sqlstate::INVALID_PARAMETER_VALUE,

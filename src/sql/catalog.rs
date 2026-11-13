@@ -13099,22 +13099,42 @@ pub fn trigger_def_text<'a>(
     output
         .write_str("EXECUTE FUNCTION ")
         .map_err(|_| super::eval::arena_full())?;
-    let routine = storage.routine_for(usize::from(trigger.function), txid);
+    // PostgreSQL qualifies the function only when its bare name would
+    // select another one.
+    let (schema, name, selected) = match trigger.function {
+        crate::storage::TriggerFunction::Routine(slot) => {
+            let routine = storage.routine_for(usize::from(slot), txid);
+            (
+                routine.schema,
+                routine.name,
+                crate::storage::RoutineCallSelection::Stored(usize::from(slot)),
+            )
+        }
+        crate::storage::TriggerFunction::Builtin(builtin) => (
+            crate::storage::SqlName::parse("pg_catalog").expect("pg_catalog is a valid name"),
+            crate::storage::SqlName::parse(builtin.name())
+                .expect("built-in trigger function names are valid"),
+            crate::storage::RoutineCallSelection::Builtin {
+                oid: builtin.oid(),
+                schema: "pg_catalog",
+            },
+        ),
+    };
     if storage.select_routine_call(
-        routine.name.as_str(),
+        name.as_str(),
         &[],
         &[],
         false,
         txid,
         crate::storage::RoutineCallKind::Trigger,
-    ) != crate::storage::RoutineCallSelection::Stored(usize::from(trigger.function))
+    ) != selected
     {
-        write_identifier(&mut output, routine.schema.as_str());
+        write_identifier(&mut output, schema.as_str());
         output
             .write_char('.')
             .map_err(|_| super::eval::arena_full())?;
     }
-    write_identifier(&mut output, routine.name.as_str());
+    write_identifier(&mut output, name.as_str());
     output
         .write_char('(')
         .map_err(|_| super::eval::arena_full())?;
@@ -15265,6 +15285,7 @@ fn inherited_foreign_key_parent_oid(
                 && parent.parent == child.parent
                 && parent.parent_cols() == child.parent_cols()
                 && parent.on_delete == child.on_delete
+                && parent.delete_set_cols() == child.delete_set_cols()
                 && parent.on_update == child.on_update
         })
         .map_or(0, |constraint| constraint.oid())
@@ -15495,6 +15516,16 @@ pub fn constraint_def_text<'a>(
         }
         let _ = s.write_str(")");
         let _ = s.write_str(fk_action_suffix(fk.on_delete, "DELETE"));
+        if !fk.delete_set_cols().is_empty() {
+            let _ = s.write_str(" (");
+            for (k, &c) in fk.delete_set_cols().iter().enumerate() {
+                if k > 0 {
+                    let _ = s.write_str(", ");
+                }
+                write_identifier(&mut s, child.columns()[c as usize].name.as_str());
+            }
+            let _ = s.write_char(')');
+        }
         let _ = s.write_str(fk_action_suffix(fk.on_update, "UPDATE"));
         append_constraint_attributes(&mut s, fk.timing, fk.validation);
         return Ok(Some(alloc_rendered(
@@ -20632,7 +20663,15 @@ fn pg_constraint_values<'a>(
                 foreign_key_operator_array(storage, txid, info, &fk, 0, arena)?,
                 foreign_key_operator_array(storage, txid, info, &fk, 1, arena)?,
                 foreign_key_operator_array(storage, txid, info, &fk, 2, arena)?,
-                Datum::Null,
+                if fk.delete_set_cols().is_empty() {
+                    Datum::Null
+                } else {
+                    attnum_array(
+                        fk.delete_set_cols(),
+                        &storage.table_def(info.child_slot, txid),
+                        arena,
+                    )?
+                },
                 Datum::Null,
                 Datum::Null,
             ],
@@ -23764,7 +23803,14 @@ fn pg_trigger<'a>(
                 })
                 .map_or(0, |index| index.oid);
             let constraint_oid = foreign_key.oid();
+            // A partition's cloned constraint checks rows on the partition;
+            // the referenced table's actions belong to the parent constraint.
+            let cloned =
+                inherited_foreign_key_parent_oid(storage, txid, child_slot, foreign_key) != 0;
             for trigger in crate::storage::ForeignKeyTrigger::ALL {
+                if cloned && trigger.ordinal() < 2 {
+                    continue;
+                }
                 if count == rows.len() {
                     return Err(catalog_capacity_exceeded("pg_trigger"));
                 }
@@ -23800,7 +23846,12 @@ fn pg_trigger<'a>(
                         text(name.as_str(), arena)?,
                         Datum::Int4(function),
                         Datum::Int2(trigger_type),
-                        Datum::Bpchar("O"),
+                        Datum::Bpchar(match foreign_key.trigger_enabled(trigger) {
+                            crate::storage::TriggerEnabled::Origin => "O",
+                            crate::storage::TriggerEnabled::Replica => "R",
+                            crate::storage::TriggerEnabled::Always => "A",
+                            crate::storage::TriggerEnabled::Disabled => "D",
+                        }),
                         Datum::Bool(true),
                         Datum::Int4(constrained_relation),
                         Datum::Int4(parent_index),
@@ -23840,7 +23891,7 @@ fn pg_trigger<'a>(
                 view_oid(storage, slot)
             }
         };
-        let function = storage.routine(usize::from(trigger.function));
+        let function_oid = crate::storage::trigger_function_oid(storage, trigger.function, txid);
         let (constraint_oid, constraint_timing, referenced_oid) = match trigger.kind {
             crate::storage::TriggerKind::Ordinary => {
                 (0, crate::storage::ConstraintTiming::NotDeferrable, 0)
@@ -23926,7 +23977,7 @@ fn pg_trigger<'a>(
                 Datum::Int4(relation_oid),
                 Datum::Int4(0),
                 text(trigger.name_to(txid).as_str(), arena)?,
-                Datum::Int4(crate::storage::routine_oid(&function)),
+                Datum::Int4(function_oid),
                 Datum::Int2(trigger_type),
                 Datum::Bpchar(match trigger.enabled_to(txid) {
                     crate::storage::TriggerEnabled::Origin => "O",
@@ -28514,7 +28565,10 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "synchronize_seqscans" => "on",
             "track_functions" => "none",
             "plpgsql.variable_conflict" => "error",
+            "session_replication_role" => "origin",
             "plpgsql.print_strict_params" => "off",
+            "plpgsql.check_asserts" => "on",
+            "plpgsql.extra_warnings" | "plpgsql.extra_errors" => "none",
             "TimeZone" => "UTC",
             "work_mem" => "4096",
             "transaction_isolation" => "read committed",
@@ -28528,6 +28582,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 | "event_triggers"
                 | "integer_datetimes"
                 | "plpgsql.print_strict_params"
+                | "plpgsql.check_asserts"
                 | "is_superuser"
                 | "row_security"
                 | "standard_conforming_strings"
@@ -28546,6 +28601,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 | "password_encryption"
                 | "track_functions"
                 | "plpgsql.variable_conflict"
+                | "session_replication_role"
                 | "xmloption"
         ) {
             "enum"
@@ -28579,7 +28635,10 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "postmaster"
         } else if matches!(
             name,
-            "event_triggers" | "track_functions" | "plpgsql.variable_conflict"
+            "event_triggers"
+                | "track_functions"
+                | "plpgsql.variable_conflict"
+                | "session_replication_role"
         ) {
             "superuser"
         } else {
@@ -28659,6 +28718,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             _ if planner.is_some() => planner.as_ref().map_or(&[], |planner| planner.enum_names),
             "track_functions" => &["none", "pl", "all"],
             "plpgsql.variable_conflict" => &crate::sql::guc::VariableConflict::NAMES,
+            "session_replication_role" => &crate::sql::guc::SessionReplicationRole::NAMES,
             _ => &[],
         };
         let enum_values = if enum_names.is_empty() {
@@ -28689,10 +28749,15 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                             planner.as_ref().map_or("", |planner| planner.category)
                         }
                         "track_functions" => "Statistics / Monitoring",
-                        "plpgsql.variable_conflict" | "plpgsql.print_strict_params" => {
-                            "Customized Options"
-                        }
+                        "plpgsql.variable_conflict"
+                        | "plpgsql.print_strict_params"
+                        | "plpgsql.check_asserts"
+                        | "plpgsql.extra_warnings"
+                        | "plpgsql.extra_errors" => "Customized Options",
                         "work_mem" => "Resource Usage / Memory",
+                        "session_replication_role" => {
+                            "Client Connection Defaults / Statement Behavior"
+                        }
                         _ => "Client Connection Defaults",
                     },
                     arena,
@@ -28705,8 +28770,18 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                         "plpgsql.variable_conflict" => {
                             "Sets handling of conflicts between PL/pgSQL variable names and table column names."
                         }
+                        "session_replication_role" => {
+                            "Sets the session's behavior for triggers and rewrite rules."
+                        }
                         "plpgsql.print_strict_params" => {
                             "Print information about parameters in the DETAIL part of the error messages generated on INTO ... STRICT failures."
+                        }
+                        "plpgsql.check_asserts" => "Perform checks given in ASSERT statements.",
+                        "plpgsql.extra_warnings" => {
+                            "List of programming constructs that should produce a warning."
+                        }
+                        "plpgsql.extra_errors" => {
+                            "List of programming constructs that should produce an error."
                         }
                         _ => "",
                     },

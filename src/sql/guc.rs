@@ -293,6 +293,81 @@ pub(crate) struct PlpgsqlSettings {
     pub(crate) print_strict_params: bool,
 }
 
+/// `plpgsql.check_asserts` of the running statement's session: whether
+/// PL/pgSQL `ASSERT` statements are evaluated, read when one runs.
+pub(crate) fn active_check_asserts() -> Result<bool, SqlError> {
+    with_active_state(|guc| Ok(guc.store.borrow().current.plpgsql_check_asserts))
+}
+
+/// `plpgsql.extra_warnings` and `plpgsql.extra_errors`, kept as written.
+/// pos3ql runs none of PL/pgSQL's extra checks, so only `none` is accepted;
+/// any other valid setting fails loudly instead of being ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlpgsqlExtraChecks(StackStr<16>);
+
+impl PlpgsqlExtraChecks {
+    fn none() -> Self {
+        Self(StackStr::from_str("none"))
+    }
+
+    /// PostgreSQL's `plpgsql_extra_checks_check_hook`.
+    fn parse(name: &str, value: &str) -> Result<Self, SqlError> {
+        if value.eq_ignore_ascii_case("none") {
+            return Ok(Self(StackStr::from_str(value)));
+        }
+        let invalid = |detail: StackStr<160>| {
+            crate::sql::eval::stash_diagnostic(Some(StackStr::from_str(detail.as_str())), None);
+            sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "invalid value for parameter \"{}\": \"{}\"",
+                name,
+                value
+            )
+        };
+        if !value.eq_ignore_ascii_case("all") {
+            let mut items = 0usize;
+            for item in value.split(',') {
+                let item = item.trim_matches(|c: char| c.is_ascii_whitespace());
+                if item.is_empty() {
+                    return Err(invalid(StackStr::from_str("List syntax is invalid.")));
+                }
+                items += 1;
+                if [
+                    "shadowed_variables",
+                    "too_many_rows",
+                    "strict_multi_assignment",
+                ]
+                .iter()
+                .any(|known| item.eq_ignore_ascii_case(known))
+                {
+                    continue;
+                }
+                return Err(invalid(
+                    if item.eq_ignore_ascii_case("all") || item.eq_ignore_ascii_case("none") {
+                        crate::stack_format!(
+                            160,
+                            "Key word \"{}\" cannot be combined with other key words.",
+                            item
+                        )
+                    } else {
+                        crate::stack_format!(160, "Unrecognized key word: \"{}\".", item)
+                    },
+                ));
+            }
+            debug_assert!(items > 0);
+        }
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "PL/pgSQL extra checks are not supported: parameter \"{}\" accepts only \"none\"",
+            name
+        ))
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
 /// The session's PL/pgSQL settings, for a trigger function compiled while a
 /// statement runs.
 pub(crate) fn active_plpgsql_settings() -> Result<PlpgsqlSettings, SqlError> {
@@ -317,6 +392,24 @@ pub(crate) fn active_track_functions() -> TrackFunctions {
         }
         // SAFETY: `enter_eval_scope` owns the pointer's dynamic extent.
         unsafe { &*pointer }.track_functions()
+    })
+}
+
+/// The active session's `session_replication_role`, read where triggers,
+/// rules and foreign key checks are selected. Every statement, COMMIT and
+/// replication apply installs its session settings first.
+pub(crate) fn active_session_replication_role() -> Result<SessionReplicationRole, SqlError> {
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "trigger selection has no session settings"
+            ));
+        }
+        // SAFETY: `enter_eval_scope` or `enter_settings_scope` owns the
+        // pointer's dynamic extent.
+        Ok(unsafe { &*pointer }.session_replication_role())
     })
 }
 
@@ -361,6 +454,36 @@ pub fn set_active_config(
         let result = guc.set_config(name, value, local)?;
         publish_active_setting(guc, name);
         Ok(result)
+    })
+}
+
+thread_local! {
+    static PLPGSQL_USED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Records that the running statement compiled PL/pgSQL, which loads it as
+/// PostgreSQL loads its library on first use.
+pub(crate) fn note_plpgsql_use() {
+    PLPGSQL_USED.with(|used| used.set(true));
+}
+
+/// Takes the [`note_plpgsql_use`] record of the running statement.
+pub(crate) fn take_plpgsql_use() -> bool {
+    PLPGSQL_USED.with(|used| used.replace(false))
+}
+
+/// The value of a custom parameter the running statement's session defined,
+/// read live: custom parameters are not in the published setting snapshot.
+pub(crate) fn active_custom_setting(name: &str) -> Option<StackStr<256>> {
+    if !is_custom_name(name) {
+        return None;
+    }
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        // SAFETY: `enter_eval_scope` keeps the GucState alive while installed.
+        (!pointer.is_null())
+            .then(|| unsafe { &*pointer }.get_owned(name))
+            .flatten()
     })
 }
 
@@ -789,8 +912,14 @@ struct GucValues {
     password_encryption: PasswordEncryption,
     track_functions: TrackFunctions,
     plpgsql_variable_conflict: VariableConflict,
+    session_replication_role: SessionReplicationRole,
     plpgsql_print_strict_params: bool,
     planner: planner::PlannerValues,
+    plpgsql_check_asserts: bool,
+    plpgsql_extra_warnings: PlpgsqlExtraChecks,
+    plpgsql_extra_errors: PlpgsqlExtraChecks,
+    /// Values of the session's custom parameters, by [`CustomNames`] slot.
+    custom: [StackStr<CUSTOM_PARAMETER_VALUE_BYTES>; CUSTOM_PARAMETER_SLOTS],
 }
 
 /// `plpgsql.variable_conflict` and a PL/pgSQL body's `#variable_conflict`:
@@ -819,6 +948,40 @@ impl VariableConflict {
         [Self::Error, Self::UseVariable, Self::UseColumn]
             .into_iter()
             .find(|mode| value.eq_ignore_ascii_case(mode.as_str()))
+    }
+}
+
+/// PostgreSQL's `session_replication_role`: which triggers and rewrite rules
+/// fire. `replica` fires only those enabled REPLICA or ALWAYS, the mode logical
+/// replication workers run in; `origin` and `local` fire those enabled ORIGIN
+/// (the default) or ALWAYS. Foreign key triggers are ORIGIN, so `replica`
+/// skips foreign key checks and actions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionReplicationRole {
+    Origin,
+    Replica,
+    Local,
+}
+
+impl SessionReplicationRole {
+    pub(crate) const NAMES: [&'static str; 3] = ["origin", "replica", "local"];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Origin => "origin",
+            Self::Replica => "replica",
+            Self::Local => "local",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        [Self::Origin, Self::Replica, Self::Local]
+            .into_iter()
+            .find(|role| value.eq_ignore_ascii_case(role.as_str()))
+    }
+
+    pub(crate) const fn is_replica(self) -> bool {
+        matches!(self, Self::Replica)
     }
 }
 
@@ -923,6 +1086,11 @@ impl GucValues {
             track_functions,
             plpgsql_variable_conflict,
             plpgsql_print_strict_params,
+            plpgsql_check_asserts,
+            plpgsql_extra_warnings,
+            plpgsql_extra_errors,
+            session_replication_role,
+            custom,
             planner
         )
     }
@@ -957,8 +1125,13 @@ impl GucValues {
             password_encryption: PasswordEncryption::ScramSha256,
             track_functions: TrackFunctions::None,
             plpgsql_variable_conflict: VariableConflict::Error,
+            session_replication_role: SessionReplicationRole::Origin,
             plpgsql_print_strict_params: false,
             planner: planner::PlannerValues::DEFAULTS,
+            plpgsql_check_asserts: true,
+            plpgsql_extra_warnings: PlpgsqlExtraChecks::none(),
+            plpgsql_extra_errors: PlpgsqlExtraChecks::none(),
+            custom: [StackStr::new(); CUSTOM_PARAMETER_SLOTS],
         };
         let _ = write!(values.datestyle, "ISO, MDY");
         let _ = write!(values.timezone, "UTC");
@@ -970,6 +1143,9 @@ impl GucValues {
     }
 }
 
+/// One bit per setting in the masks that track session, local, routine and
+/// override state.
+type GucMask = u128;
 const GUC_DATESTYLE: GucMask = 1 << 0;
 const GUC_INTERVALSTYLE: GucMask = 1 << 1;
 const GUC_TIMEZONE: GucMask = 1 << 2;
@@ -1001,13 +1177,160 @@ const GUC_TRACK_FUNCTIONS: GucMask = 1 << 27;
 const GUC_PLPGSQL_VARIABLE_CONFLICT: GucMask = 1 << 28;
 const GUC_WORK_MEM: GucMask = 1 << 29;
 const GUC_PLPGSQL_PRINT_STRICT_PARAMS: GucMask = 1 << 30;
+const GUC_SESSION_REPLICATION_ROLE: GucMask = 1 << 31;
+const GUC_PLPGSQL_CHECK_ASSERTS: GucMask = 1 << 32;
+const GUC_PLPGSQL_EXTRA_WARNINGS: GucMask = 1 << 33;
+const GUC_PLPGSQL_EXTRA_ERRORS: GucMask = 1 << 34;
 /// The first planner setting's bit; the rest follow in table order.
-const GUC_PLANNER_FIRST: usize = 31;
-const GUC_SETTING_COUNT: usize = GUC_PLANNER_FIRST + planner::PLANNER_SETTING_COUNT;
-const GUC_ALL: GucMask = (1 << GUC_SETTING_COUNT) - 1;
+const GUC_PLANNER_FIRST: usize = 35;
+/// The built-in settings: the named bits, then the planner settings.
+const GUC_BUILTIN_SETTING_COUNT: usize = GUC_PLANNER_FIRST + planner::PLANNER_SETTING_COUNT;
+#[cfg(test)]
+const GUC_BUILTIN_ALL: GucMask =
+    GucMask::MAX >> (GucMask::BITS as usize - GUC_BUILTIN_SETTING_COUNT);
 
-/// One bit per session setting.
-type GucMask = u128;
+/// Custom parameters (`SET myapp.tenant = '7'`) a session can define. Like
+/// PostgreSQL's placeholders they live for the session once defined, also
+/// when the transaction that defined them rolls back; the next definition past
+/// this count fails with `54000`.
+pub(crate) const CUSTOM_PARAMETER_SLOTS: usize = 8;
+/// The longest custom parameter name and value, in bytes; longer ones fail
+/// with `54000`.
+pub(crate) const CUSTOM_PARAMETER_NAME_BYTES: usize = 63;
+pub(crate) const CUSTOM_PARAMETER_VALUE_BYTES: usize = 128;
+
+const fn custom_bit(slot: usize) -> GucMask {
+    1 << (GUC_BUILTIN_SETTING_COUNT + slot)
+}
+
+/// The session's custom parameter names. Values are transactional and live
+/// in [`GucValues`]; a defined name never goes away.
+struct CustomNames {
+    names: RefCell<[StackStr<CUSTOM_PARAMETER_NAME_BYTES>; CUSTOM_PARAMETER_SLOTS]>,
+    count: Cell<usize>,
+    /// Slots whose placeholder loading PL/pgSQL removed; they stay used.
+    removed: Cell<u8>,
+    /// PL/pgSQL has loaded in this session, reserving the `plpgsql` prefix.
+    plpgsql_loaded: Cell<bool>,
+}
+
+const _: () = assert!(CUSTOM_PARAMETER_SLOTS <= u8::BITS as usize);
+
+/// The prefix PL/pgSQL reserves when it loads, as PostgreSQL's
+/// `MarkGUCPrefixReserved("plpgsql")` does.
+const PLPGSQL_PREFIX: &str = "plpgsql";
+
+fn has_plpgsql_prefix(name: &str) -> bool {
+    name.split_once('.')
+        .is_some_and(|(prefix, _)| prefix.eq_ignore_ascii_case(PLPGSQL_PREFIX))
+}
+
+impl CustomNames {
+    fn new() -> Self {
+        Self {
+            names: RefCell::new([StackStr::new(); CUSTOM_PARAMETER_SLOTS]),
+            count: Cell::new(0),
+            removed: Cell::new(0),
+            plpgsql_loaded: Cell::new(false),
+        }
+    }
+
+    fn find(&self, name: &str) -> Option<usize> {
+        let names = self.names.borrow();
+        let removed = self.removed.get();
+        names[..self.count.get()]
+            .iter()
+            .enumerate()
+            .position(|(slot, defined)| {
+                removed & (1 << slot) == 0 && defined.as_str().eq_ignore_ascii_case(name)
+            })
+    }
+
+    /// The slot of a custom parameter, defining it as PostgreSQL's
+    /// placeholder when first named.
+    fn define(&self, name: &str) -> Result<usize, SqlError> {
+        if let Some(slot) = self.find(name) {
+            return Ok(slot);
+        }
+        validate_custom_name(name)?;
+        if self.plpgsql_loaded.get() && has_plpgsql_prefix(name) {
+            crate::sql::eval::stash_diagnostic(
+                Some(StackStr::from_str("\"plpgsql\" is a reserved prefix.")),
+                None,
+            );
+            return Err(sql_err!(
+                sqlstate::INVALID_NAME,
+                "invalid configuration parameter name \"{}\"",
+                name
+            ));
+        }
+        let count = self.count.get();
+        if count == CUSTOM_PARAMETER_SLOTS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many custom parameters (limit {})",
+                CUSTOM_PARAMETER_SLOTS
+            ));
+        }
+        if name.len() > CUSTOM_PARAMETER_NAME_BYTES {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "custom parameter name exceeds {} bytes",
+                CUSTOM_PARAMETER_NAME_BYTES
+            ));
+        }
+        self.names.borrow_mut()[count] = StackStr::from_str(name);
+        self.count.set(count + 1);
+        Ok(count)
+    }
+}
+
+/// Whether `name` is a custom parameter's: qualified, and not a built-in.
+fn is_custom_name(name: &str) -> bool {
+    name.contains('.') && guc_bit(name) == 0 && !is_read_only(name)
+}
+
+/// PostgreSQL's `valid_custom_variable_name`. PostgreSQL reserves a
+/// prefix only once the extension owning it loads; pos3ql loads none.
+fn validate_custom_name(name: &str) -> Result<(), SqlError> {
+    let mut separated = false;
+    let mut part_start = true;
+    let mut valid = true;
+    for byte in name.bytes() {
+        if byte == b'.' {
+            if part_start {
+                valid = false;
+                break;
+            }
+            separated = true;
+            part_start = true;
+        } else if byte.is_ascii_alphabetic() || byte == b'_' || byte >= 0x80 {
+            part_start = false;
+        } else if !part_start && (byte.is_ascii_digit() || byte == b'$') {
+        } else {
+            valid = false;
+            break;
+        }
+    }
+    if !valid || part_start || !separated {
+        crate::sql::eval::stash_diagnostic(
+            Some(StackStr::from_str(
+                "Custom parameter names must be two or more simple identifiers separated by dots.",
+            )),
+            None,
+        );
+        return Err(sql_err!(
+            sqlstate::INVALID_NAME,
+            "invalid configuration parameter name \"{}\"",
+            name
+        ));
+    }
+    Ok(())
+}
+/// Each custom parameter slot owns one mask bit after the built-in ones.
+const GUC_SETTING_COUNT: usize = GUC_BUILTIN_SETTING_COUNT + CUSTOM_PARAMETER_SLOTS;
+const GUC_ALL: GucMask = GucMask::MAX >> (GucMask::BITS as usize - GUC_SETTING_COUNT);
+const _: () = assert!(GUC_SETTING_COUNT <= GucMask::BITS as usize);
 
 #[derive(Clone, Copy)]
 struct SettingActions {
@@ -1135,6 +1458,14 @@ fn guc_bit(name: &str) -> GucMask {
         GUC_PLPGSQL_PRINT_STRICT_PARAMS
     } else if let Some(index) = planner::planner_index(name) {
         1 << (GUC_PLANNER_FIRST + index)
+    } else if name.eq_ignore_ascii_case("plpgsql.check_asserts") {
+        GUC_PLPGSQL_CHECK_ASSERTS
+    } else if name.eq_ignore_ascii_case("plpgsql.extra_warnings") {
+        GUC_PLPGSQL_EXTRA_WARNINGS
+    } else if name.eq_ignore_ascii_case("plpgsql.extra_errors") {
+        GUC_PLPGSQL_EXTRA_ERRORS
+    } else if name.eq_ignore_ascii_case("session_replication_role") {
+        GUC_SESSION_REPLICATION_ROLE
     } else {
         0
     }
@@ -1144,10 +1475,84 @@ pub(crate) fn knows_parameter(name: &str) -> bool {
     guc_bit(name) != 0
 }
 
+/// Whether `name` is a well-formed custom parameter name, which privileges
+/// may name before any session defines the parameter.
+pub(crate) fn is_valid_custom_parameter(name: &str) -> bool {
+    is_custom_name(name)
+        && validate_custom_name(name)
+            .map_err(|_| crate::sql::eval::take_diagnostic())
+            .is_ok()
+}
+
 pub(crate) fn requires_set_privilege(name: &str) -> bool {
     name.eq_ignore_ascii_case("event_triggers")
         || name.eq_ignore_ascii_case("track_functions")
         || name.eq_ignore_ascii_case("plpgsql.variable_conflict")
+        || name.eq_ignore_ascii_case("session_replication_role")
+}
+
+/// Proof that the acting role may store or apply a value for the parameter it
+/// names. Every path that validates a value for later application (routine,
+/// role and database settings, `ALTER SYSTEM`) takes one, so none can skip
+/// PostgreSQL's privilege check.
+#[derive(Clone, Copy)]
+pub(crate) struct SettingAuthorization<'n> {
+    name: &'n str,
+}
+
+impl<'n> SettingAuthorization<'n> {
+    /// PostgreSQL's SET check: any role may set an ordinary parameter; a
+    /// superuser-only one needs a superuser or a role granted `SET` on it.
+    pub(crate) fn set(
+        storage: &crate::storage::Storage,
+        name: &'n str,
+        txid: u32,
+    ) -> Result<Self, SqlError> {
+        if requires_set_privilege(name)
+            && !storage.current_role_has_parameter_privilege(
+                name,
+                crate::sql::ast::ParameterPrivileges::SET,
+                txid,
+            )
+        {
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied to set parameter \"{}\"",
+                name
+            ));
+        }
+        Ok(Self { name })
+    }
+
+    /// `ALTER SYSTEM` on one parameter: a superuser, or a role granted
+    /// `ALTER SYSTEM` on it.
+    pub(crate) fn alter_system(
+        storage: &crate::storage::Storage,
+        name: &'n str,
+        txid: u32,
+    ) -> Result<Self, SqlError> {
+        if !storage.current_role_has_parameter_privilege(
+            name,
+            crate::sql::ast::ParameterPrivileges::ALTER_SYSTEM,
+            txid,
+        ) {
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied to set parameter \"{}\"",
+                name
+            ));
+        }
+        Ok(Self { name })
+    }
+
+    pub(crate) fn name(self) -> &'n str {
+        self.name
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unchecked(name: &'n str) -> Self {
+        Self { name }
+    }
 }
 
 fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: GucMask) {
@@ -1194,11 +1599,20 @@ fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: GucMask) {
     );
     copy!(GUC_PASSWORD_ENCRYPTION, password_encryption);
     copy!(GUC_TRACK_FUNCTIONS, track_functions);
+    copy!(GUC_SESSION_REPLICATION_ROLE, session_replication_role);
     copy!(GUC_PLPGSQL_VARIABLE_CONFLICT, plpgsql_variable_conflict);
     copy!(GUC_PLPGSQL_PRINT_STRICT_PARAMS, plpgsql_print_strict_params);
     for index in 0..planner::PLANNER_SETTING_COUNT {
         if mask & (1 << (GUC_PLANNER_FIRST + index)) != 0 {
             target.planner.0[index] = source.planner.0[index];
+        }
+    }
+    copy!(GUC_PLPGSQL_CHECK_ASSERTS, plpgsql_check_asserts);
+    copy!(GUC_PLPGSQL_EXTRA_WARNINGS, plpgsql_extra_warnings);
+    copy!(GUC_PLPGSQL_EXTRA_ERRORS, plpgsql_extra_errors);
+    for slot in 0..CUSTOM_PARAMETER_SLOTS {
+        if mask & custom_bit(slot) != 0 {
+            target.custom[slot] = source.custom[slot];
         }
     }
 }
@@ -1292,6 +1706,7 @@ pub struct GucState {
     /// This connection's `currval`/`lastval` state.
     seq_session: SeqSession,
     random: Cell<PrngState>,
+    custom: CustomNames,
 }
 
 pub(crate) struct RoutineConfigScope {
@@ -1570,9 +1985,63 @@ impl GucState {
         self.store.borrow().transaction.savepoints.as_ptr() as usize
     }
 
+    /// The mask bit of a built-in or defined custom parameter (zero for
+    /// anything else).
+    fn bit(&self, name: &str) -> GucMask {
+        match self.custom.find(name) {
+            Some(slot) if is_custom_name(name) => custom_bit(slot),
+            _ => guc_bit(name),
+        }
+    }
+
+    /// The column title `SHOW name` reports: a custom parameter's name as it
+    /// was defined, otherwise the canonical name.
+    pub(crate) fn show_title(&self, name: &str) -> Result<crate::storage::SqlName, SqlError> {
+        if is_custom_name(name)
+            && let Some(slot) = self.custom.find(name)
+        {
+            return crate::storage::SqlName::parse(self.custom.names.borrow()[slot].as_str());
+        }
+        canonical_setting_name(name)
+    }
+
+    /// Loads PL/pgSQL into the session once: its prefix becomes reserved and
+    /// each placeholder under it is removed with PostgreSQL's warning.
+    pub(crate) fn load_plpgsql(
+        &self,
+        responder: &mut crate::pg::respond::Responder,
+    ) -> Result<(), crate::pg::wire::WireFull> {
+        if self.custom.plpgsql_loaded.replace(true) {
+            return Ok(());
+        }
+        for slot in 0..self.custom.count.get() {
+            let name = self.custom.names.borrow()[slot];
+            if self.custom.removed.get() & (1 << slot) != 0 || !has_plpgsql_prefix(name.as_str()) {
+                continue;
+            }
+            self.custom
+                .removed
+                .set(self.custom.removed.get() | (1 << slot));
+            crate::sql::eval::stash_diagnostic(
+                Some(StackStr::from_str("\"plpgsql\" is now a reserved prefix.")),
+                None,
+            );
+            responder.warning(
+                sqlstate::INVALID_NAME,
+                crate::stack_format!(
+                    160,
+                    "invalid configuration parameter name \"{}\", removing it",
+                    name.as_str()
+                )
+                .as_str(),
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn source(&self, name: &str) -> &'static str {
         let state = self.store.borrow();
-        let bit = guc_bit(name);
+        let bit = self.bit(name);
         if state.session_overrides & bit != 0 {
             "session"
         } else if state.client_overrides & bit != 0 {
@@ -1591,7 +2060,7 @@ impl GucState {
     }
 
     pub(crate) fn reset_owned(&self, name: &str) -> Option<StackStr<256>> {
-        owned_setting(&self.store.borrow().defaults, name)
+        owned_setting(&self.store.borrow().defaults, &self.custom, name)
     }
 
     pub fn new() -> Self {
@@ -1634,6 +2103,7 @@ impl GucState {
             authenticated_user: Cell::new(crate::storage::SessionIdentity::bootstrap()),
             seq_session: SeqSession::new(),
             random: Cell::new(PrngState::UNINITIALIZED),
+            custom: CustomNames::new(),
         }
     }
 
@@ -1865,6 +2335,10 @@ impl GucState {
         self.store.borrow().current.track_functions
     }
 
+    pub(crate) fn session_replication_role(&self) -> SessionReplicationRole {
+        self.store.borrow().current.session_replication_role
+    }
+
     pub(crate) fn plpgsql_settings(&self) -> PlpgsqlSettings {
         let current = self.store.borrow().current;
         PlpgsqlSettings {
@@ -1983,10 +2457,10 @@ impl GucState {
         if name.eq_ignore_ascii_case("seed") {
             return self.assign("seed", Some("unavailable"), local);
         }
-        self.capture_setting_value(name)?;
+        self.capture_value(name)?;
         let mut state = self.store.borrow_mut();
         let values = state.current;
-        finish_setting_change(&mut state, values, guc_bit(name), local, false)
+        finish_setting_change(&mut state, values, self.bit(name), local, false)
     }
 
     pub(crate) fn transaction_reset_owned(&self, name: &str) -> Option<StackStr<256>> {
@@ -2024,12 +2498,12 @@ impl GucState {
         }
         let mut state = self.store.borrow_mut();
         let mut values = state.current;
-        change_setting(&mut values, &state.defaults, name, value)?;
+        change_setting(&mut values, &state.defaults, &self.custom, name, value)?;
         super::txn::validate_isolation_mode(
             self.transaction_mode,
             values.default_transaction_isolation,
         )?;
-        let bit = guc_bit(name);
+        let bit = self.bit(name);
         let resetting = value.is_none();
         finish_setting_change(&mut state, values, bit, local, resetting)
     }
@@ -2071,9 +2545,15 @@ impl GucState {
     pub(crate) fn set_cluster_default(&self, name: &str, raw: &str) -> Result<(), SqlError> {
         let mut state = self.store.borrow_mut();
         let mut cluster = state.cluster_defaults;
-        change_setting(&mut cluster, &GucValues::new(), name, Some(raw))?;
+        change_setting(
+            &mut cluster,
+            &GucValues::new(),
+            &self.custom,
+            name,
+            Some(raw),
+        )?;
         state.cluster_defaults = cluster;
-        state.cluster_overrides |= guc_bit(name);
+        state.cluster_overrides |= self.bit(name);
         Self::recompute_cluster_defaults(&mut state);
         Ok(())
     }
@@ -2092,8 +2572,8 @@ impl GucState {
     ) -> Result<(), SqlError> {
         let mut state = self.store.borrow_mut();
         let mut values = state.defaults;
-        change_setting(&mut values, &state.defaults, name, Some(raw))?;
-        let bit = guc_bit(name);
+        change_setting(&mut values, &state.defaults, &self.custom, name, Some(raw))?;
+        let bit = self.bit(name);
         state.connection_overrides |= bit;
         state.database_overrides &= !bit;
         state.role_overrides &= !bit;
@@ -2327,7 +2807,16 @@ impl GucState {
         self.store.borrow().current.check_function_bodies
     }
 
-    pub(crate) fn capture_setting_value(&self, name: &str) -> Result<StackStr<256>, SqlError> {
+    /// The current value of an authorized parameter, validated for storing in
+    /// a routine, role or database setting (`SET name FROM CURRENT`).
+    pub(crate) fn capture_setting_value(
+        &self,
+        authorization: SettingAuthorization<'_>,
+    ) -> Result<StackStr<256>, SqlError> {
+        self.capture_value(authorization.name)
+    }
+
+    fn capture_value(&self, name: &str) -> Result<StackStr<256>, SqlError> {
         let value = self.get_owned(name).ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -2335,30 +2824,64 @@ impl GucState {
                 name
             )
         })?;
-        self.validate_setting_value(name, Some(value.as_str()))?;
+        self.check_setting_value(name, Some(value.as_str()))?;
         Ok(value)
     }
 
-    pub(crate) fn validate_system_reset(&self, name: &str) -> Result<(), SqlError> {
-        match read_only_parameter_context(name) {
+    pub(crate) fn validate_system_reset(
+        &self,
+        authorization: SettingAuthorization<'_>,
+    ) -> Result<(), SqlError> {
+        match read_only_parameter_context(authorization.name) {
             Some(ReadOnlyParameterContext::Startup) => Ok(()),
             Some(ReadOnlyParameterContext::Internal) | None => {
-                self.validate_setting_value(name, None)
+                self.validate_setting_value(authorization, None)
             }
         }
     }
 
+    /// Checks a value (or a reset when `None`) for an authorized parameter
+    /// without changing the session.
     pub(crate) fn validate_setting_value(
         &self,
-        name: &str,
+        authorization: SettingAuthorization<'_>,
         value: Option<&str>,
     ) -> Result<(), SqlError> {
-        let state = self.store.borrow();
-        let mut values = state.current;
-        change_setting(&mut values, &state.defaults, name, value)
+        self.check_setting_value(authorization.name, value)
     }
 
+    fn check_setting_value(&self, name: &str, value: Option<&str>) -> Result<(), SqlError> {
+        let state = self.store.borrow();
+        let mut values = state.current;
+        change_setting(&mut values, &state.defaults, &self.custom, name, value)
+    }
+
+    /// Applies a routine's `SET` clauses for one call. Each needs the current
+    /// role's privilege to set it, as PostgreSQL checks at every call: a
+    /// `SECURITY DEFINER` routine checks its owner, others their caller.
     pub(crate) fn enter_routine_configs(
+        &self,
+        storage: &crate::storage::Storage,
+        txid: u32,
+        configs: &[crate::storage::RoutineConfig],
+    ) -> Result<RoutineConfigScope, SqlError> {
+        for config in configs {
+            SettingAuthorization::set(storage, config.name.as_str(), txid)?;
+        }
+        self.apply_routine_configs(configs)
+    }
+
+    /// Applies routine settings whose privilege the caller does not check:
+    /// unit tests of the setting machinery alone.
+    #[cfg(test)]
+    pub(crate) fn enter_unchecked_routine_configs(
+        &self,
+        configs: &[crate::storage::RoutineConfig],
+    ) -> Result<RoutineConfigScope, SqlError> {
+        self.apply_routine_configs(configs)
+    }
+
+    fn apply_routine_configs(
         &self,
         configs: &[crate::storage::RoutineConfig],
     ) -> Result<RoutineConfigScope, SqlError> {
@@ -2371,10 +2894,11 @@ impl GucState {
             change_setting(
                 &mut current,
                 &state.defaults,
+                &self.custom,
                 config.name.as_str(),
                 Some(config.value.as_str()),
             )?;
-            configured |= guc_bit(config.name.as_str());
+            configured |= self.bit(config.name.as_str());
         }
         state.current = current;
         drop(state);
@@ -2408,6 +2932,8 @@ impl GucState {
 }
 
 pub(crate) fn enter_active_routine_configs(
+    storage: &crate::storage::Storage,
+    txid: u32,
     configs: &[crate::storage::RoutineConfig],
 ) -> Result<RoutineConfigScope, SqlError> {
     ACTIVE_GUC.with(|active| {
@@ -2420,16 +2946,38 @@ pub(crate) fn enter_active_routine_configs(
         }
         // SAFETY: EvalScope owns this dynamic extent and every returned scope
         // is consumed before evaluation returns.
-        unsafe { &*pointer }.enter_routine_configs(configs)
+        unsafe { &*pointer }.enter_routine_configs(storage, txid, configs)
     })
 }
 
 fn change_setting(
     values: &mut GucValues,
     defaults: &GucValues,
+    custom: &CustomNames,
     name: &str,
     value: Option<&str>,
 ) -> Result<(), SqlError> {
+    if is_custom_name(name) {
+        // Setting or resetting a custom parameter defines it, as
+        // PostgreSQL's placeholders are.
+        let slot = custom.define(name)?;
+        values.custom[slot] = match value {
+            None => defaults.custom[slot],
+            Some(value) => {
+                let stored = StackStr::from_str(value);
+                if stored.is_truncated() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "value of custom parameter \"{}\" exceeds {} bytes",
+                        name,
+                        CUSTOM_PARAMETER_VALUE_BYTES
+                    ));
+                }
+                stored
+            }
+        };
+        return Ok(());
+    }
     match value {
         Some(value) => apply_setting(values, defaults, name, value),
         None => reset_setting(values, defaults, name),
@@ -2486,12 +3034,20 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
         values.password_encryption = defaults.password_encryption;
     } else if name.eq_ignore_ascii_case("track_functions") {
         values.track_functions = defaults.track_functions;
+    } else if name.eq_ignore_ascii_case("session_replication_role") {
+        values.session_replication_role = defaults.session_replication_role;
     } else if name.eq_ignore_ascii_case("plpgsql.variable_conflict") {
         values.plpgsql_variable_conflict = defaults.plpgsql_variable_conflict;
     } else if name.eq_ignore_ascii_case("plpgsql.print_strict_params") {
         values.plpgsql_print_strict_params = defaults.plpgsql_print_strict_params;
     } else if let Some(index) = planner::planner_index(name) {
         values.planner.0[index] = defaults.planner.0[index];
+    } else if name.eq_ignore_ascii_case("plpgsql.check_asserts") {
+        values.plpgsql_check_asserts = defaults.plpgsql_check_asserts;
+    } else if name.eq_ignore_ascii_case("plpgsql.extra_warnings") {
+        values.plpgsql_extra_warnings = defaults.plpgsql_extra_warnings;
+    } else if name.eq_ignore_ascii_case("plpgsql.extra_errors") {
+        values.plpgsql_extra_errors = defaults.plpgsql_extra_errors;
     } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
         // Storage scans are deterministic and never synchronize their starts.
     } else if name.eq_ignore_ascii_case("standard_conforming_strings")
@@ -2764,9 +3320,27 @@ fn apply_setting(
         };
         return Ok(());
     }
+    if name.eq_ignore_ascii_case("session_replication_role") {
+        values.session_replication_role = SessionReplicationRole::parse(v).ok_or_else(|| {
+            invalid_enum_value("session_replication_role", v, "origin, replica, local")
+        })?;
+        return Ok(());
+    }
     if name.eq_ignore_ascii_case("plpgsql.print_strict_params") {
         values.plpgsql_print_strict_params =
             parse_boolean_setting("plpgsql.print_strict_params", v)?;
+        return Ok(());
+    }
+    if name.eq_ignore_ascii_case("plpgsql.check_asserts") {
+        values.plpgsql_check_asserts = parse_boolean_setting("plpgsql.check_asserts", v)?;
+        return Ok(());
+    }
+    if name.eq_ignore_ascii_case("plpgsql.extra_warnings") {
+        values.plpgsql_extra_warnings = PlpgsqlExtraChecks::parse("plpgsql.extra_warnings", v)?;
+        return Ok(());
+    }
+    if name.eq_ignore_ascii_case("plpgsql.extra_errors") {
+        values.plpgsql_extra_errors = PlpgsqlExtraChecks::parse("plpgsql.extra_errors", v)?;
         return Ok(());
     }
     if name.eq_ignore_ascii_case("plpgsql.variable_conflict") {
@@ -2798,7 +3372,7 @@ impl GucState {
     /// The current value for `SHOW name`, or None if the parameter is unknown
     /// here (the caller falls back to fixed server parameters).
     pub fn get_owned(&self, name: &str) -> Option<StackStr<256>> {
-        owned_setting(&self.store.borrow().current, name)
+        owned_setting(&self.store.borrow().current, &self.custom, name)
     }
 
     /// Value-rendering settings for the wire layer (DateStyle + zone).
@@ -2829,7 +3403,12 @@ impl GucState {
     }
 }
 
-fn owned_setting(values: &GucValues, name: &str) -> Option<StackStr<256>> {
+fn owned_setting(values: &GucValues, custom: &CustomNames, name: &str) -> Option<StackStr<256>> {
+    if is_custom_name(name) {
+        return custom
+            .find(name)
+            .map(|slot| StackStr::from_str(values.custom[slot].as_str()));
+    }
     if name.eq_ignore_ascii_case("standard_conforming_strings") {
         Some(StackStr::from_str("on"))
     } else if name.eq_ignore_ascii_case("datestyle") {
@@ -2935,6 +3514,8 @@ fn owned_setting(values: &GucValues, name: &str) -> Option<StackStr<256>> {
         }))
     } else if name.eq_ignore_ascii_case("track_functions") {
         Some(StackStr::from_str(values.track_functions.as_str()))
+    } else if name.eq_ignore_ascii_case("session_replication_role") {
+        Some(StackStr::from_str(values.session_replication_role.as_str()))
     } else if name.eq_ignore_ascii_case("plpgsql.variable_conflict") {
         Some(StackStr::from_str(
             values.plpgsql_variable_conflict.as_str(),
@@ -2945,6 +3526,16 @@ fn owned_setting(values: &GucValues, name: &str) -> Option<StackStr<256>> {
         } else {
             "off"
         }))
+    } else if name.eq_ignore_ascii_case("plpgsql.check_asserts") {
+        Some(StackStr::from_str(if values.plpgsql_check_asserts {
+            "on"
+        } else {
+            "off"
+        }))
+    } else if name.eq_ignore_ascii_case("plpgsql.extra_warnings") {
+        Some(StackStr::from_str(values.plpgsql_extra_warnings.as_str()))
+    } else if name.eq_ignore_ascii_case("plpgsql.extra_errors") {
+        Some(StackStr::from_str(values.plpgsql_extra_errors.as_str()))
     } else if name.eq_ignore_ascii_case("seed") {
         Some(StackStr::from_str("unavailable"))
     } else {
@@ -3908,7 +4499,7 @@ mod ownership_tests {
             super::super::SETTING_NAMES
                 .iter()
                 .fold(0, |mask, name| mask | guc_bit(name)),
-            GUC_ALL
+            GUC_BUILTIN_ALL
         );
         let guc = GucState::new();
         let mut budget = Budget::new(
@@ -3942,7 +4533,7 @@ mod ownership_tests {
             guc.set_config("application_name", Some("outer"), false)
                 .unwrap();
             {
-                let _scope = guc.enter_routine_configs(&configs).unwrap();
+                let _scope = guc.enter_unchecked_routine_configs(&configs).unwrap();
                 guc.set_config("bytea_output", Some("escape"), true)
                     .unwrap();
                 publish_active_setting(&guc, "bytea_output");
@@ -3996,14 +4587,19 @@ mod ownership_tests {
         let other = GucState::new();
         let mut budget = Budget::new(
             2 * super::super::txn::TxnState::budget_bytes_with_large_objects(1, 1, 1)
-                + LeasePool::budget_bytes(16 << 10, 4),
+                + LeasePool::budget_bytes(
+                    (4 * core::mem::size_of::<RoutineConfigImage>()).next_multiple_of(4 << 10),
+                    4,
+                ),
         );
         let mut txn =
             super::super::txn::TxnState::new_with_large_objects(&mut budget, 1, 1, 1).unwrap();
         let mut other_txn =
             super::super::txn::TxnState::new_with_large_objects(&mut budget, 1, 1, 1).unwrap();
+        // Room for two saved images at once, as each pause copies the next.
+        let pool_bytes = (4 * core::mem::size_of::<RoutineConfigImage>()).next_multiple_of(4 << 10);
         let controls =
-            LeasePool::new(&mut budget, Purpose::EXECUTION_CONTROL, 16 << 10, 4).unwrap();
+            LeasePool::new(&mut budget, Purpose::EXECUTION_CONTROL, pool_bytes, 4).unwrap();
         let _session = crate::sql::eval::funcs::system::retain_session_evaluation();
         let _evaluation = enter_eval_scope(&guc, &mut txn);
         let configs = [crate::storage::RoutineConfig {
@@ -4028,14 +4624,14 @@ mod ownership_tests {
             guc.set_config("application_name", Some("outer"), false)
                 .unwrap();
             let mut saved = {
-                let scope = guc.enter_routine_configs(&configs).unwrap();
+                let scope = guc.enter_unchecked_routine_configs(&configs).unwrap();
                 guc.set_config("bytea_output", Some("escape"), true)
                     .unwrap();
                 publish_active_setting(&guc, "bytea_output");
                 guc.set_config("client_min_messages", Some("warning"), false)
                     .unwrap();
                 publish_active_setting(&guc, "client_min_messages");
-                let held = controls.lease::<u8>(16 << 10).unwrap();
+                let held = controls.lease::<u8>(pool_bytes).unwrap();
                 let image = scope.save().unwrap();
                 assert!(controls.copy_slice(&[image]).is_err());
                 assert_eq!(
@@ -4169,7 +4765,7 @@ mod ownership_tests {
             guc.set_config("application_name", Some("outer"), false)
                 .unwrap();
             {
-                let _scope = guc.enter_routine_configs(&configs).unwrap();
+                let _scope = guc.enter_unchecked_routine_configs(&configs).unwrap();
                 // Equal values are still explicit SET actions, overriding SAVE.
                 guc.set_config("application_name", Some("outer"), false)
                     .unwrap();
@@ -4185,7 +4781,7 @@ mod ownership_tests {
 
             guc.begin_transaction();
             {
-                let _scope = guc.enter_routine_configs(&configs).unwrap();
+                let _scope = guc.enter_unchecked_routine_configs(&configs).unwrap();
                 guc.savepoint();
                 guc.set_config("application_name", Some("outer"), false)
                     .unwrap();
@@ -4202,7 +4798,7 @@ mod ownership_tests {
             guc.set_session_authorization(authorization, false);
             guc.set_role(local_role, true);
             {
-                let _scope = guc.enter_routine_configs(&configs).unwrap();
+                let _scope = guc.enter_unchecked_routine_configs(&configs).unwrap();
                 guc.reset_all().unwrap();
             }
             assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "");
@@ -4217,7 +4813,7 @@ mod ownership_tests {
                 .unwrap();
             guc.restore_statement_settings(mark);
             {
-                let _scope = guc.enter_routine_configs(&configs).unwrap();
+                let _scope = guc.enter_unchecked_routine_configs(&configs).unwrap();
             }
             assert_eq!(guc.get_owned("application_name").unwrap().as_str(), "outer");
             guc.store.borrow_mut().actions.next = u64::MAX;
@@ -4244,6 +4840,33 @@ mod ownership_tests {
 #[cfg(all(test, not(all(miri, feature = "miri-ownership"))))]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn custom_parameters_survive_rollback_and_exhaust_with_a_named_error() {
+        let guc = GucState::new();
+        guc.begin_transaction();
+        guc.set_config("app.rolled", Some("one"), false).unwrap();
+        guc.rollback_transaction();
+        // The definition outlives the transaction; its value does not.
+        assert_eq!(guc.get_owned("app.rolled").unwrap().as_str(), "");
+        assert!(guc.get_owned("app.never").is_none());
+        for slot in 1..CUSTOM_PARAMETER_SLOTS {
+            let name = crate::stack_format!(32, "app.p{slot}");
+            guc.set_config(name.as_str(), Some("v"), false).unwrap();
+        }
+        let error = guc
+            .set_config("app.one_more", Some("v"), false)
+            .unwrap_err();
+        assert_eq!(error.sqlstate.as_str(), sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        let long = "x".repeat(CUSTOM_PARAMETER_VALUE_BYTES + 1);
+        let error = guc
+            .set_config("app.rolled", Some(&long), false)
+            .unwrap_err();
+        assert_eq!(error.sqlstate.as_str(), sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        let error = guc.set_config("app.", Some("v"), false).unwrap_err();
+        assert_eq!(error.sqlstate.as_str(), sqlstate::INVALID_NAME);
+        let _ = crate::sql::eval::take_diagnostic();
+    }
 
     #[test]
     fn statement_retry_restores_settings_and_the_random_stream() {

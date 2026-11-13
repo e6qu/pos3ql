@@ -212,7 +212,9 @@ is owned.
     correlated subquery binds its result type, executor, aggregate calls,
     row type or list collations once per statement, but still resolves its
     FROM scope and evaluates its operators unbound each time a row reaches
-    it; rewinding a retained child tree per outer row removes that analysis,
+    it, and one nested in another correlated subquery is bound again for each
+    run of the enclosing one (about 15 ms per outer row in a debug build);
+    rewinding a retained child tree per outer row removes that analysis,
     set operations other than `UNION ALL` (and `UNION ALL` under
     `ORDER BY`, in a declared cursor, or with volatile or routine-calling
     expressions), sorts in object-store mode (external runs

@@ -91213,11 +91213,14 @@ pub fn eval_offset_pub<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
+    // The enclosing row of a subquery, whose columns the bound may read.
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<u64, SqlError> {
     let Some(expression) = offset else {
         return Ok(0);
     };
-    match eval_full(expression, arena, params, &NoColumns, hooks)? {
+    let row: &dyn ColumnLookup<'a> = outer.unwrap_or(&NoColumns);
+    match eval_full(expression, arena, params, &row, hooks)? {
         Datum::Null => Ok(0),
         Datum::Int2(v) if v >= 0 => Ok(v as u64),
         Datum::Int4(v) if v >= 0 => Ok(v as u64),
@@ -91301,11 +91304,14 @@ pub fn eval_limit_pub<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
+    // The enclosing row of a subquery, whose columns the bound may read.
+    outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<u64, SqlError> {
     let Some(expression) = limit else {
         return Ok(u64::MAX);
     };
-    match eval_full(expression, arena, params, &NoColumns, hooks)? {
+    let row: &dyn ColumnLookup<'a> = outer.unwrap_or(&NoColumns);
+    match eval_full(expression, arena, params, &row, hooks)? {
         Datum::Null => Ok(u64::MAX),
         Datum::Int2(v) if v >= 0 => Ok(v as u64),
         Datum::Int4(v) if v >= 0 => Ok(v as u64),

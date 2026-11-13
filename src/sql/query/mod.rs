@@ -11369,6 +11369,8 @@ pub(crate) fn select_query_resumable<'a>(
     collect_table_sample_expressions(from, &mut sub_exprs[sample_start..]);
     // Uncorrelated subqueries are evaluated once; correlated ones are deferred
     // and re-evaluated per outer row during the scan.
+    // A join condition's correlated subquery runs for each pair of rows.
+    let join_subqueries = ProceduralSubqueries { storage, txid };
     let outer_subs = match prepare_outer_subqueries(
         sub_exprs,
         statement.from.as_ref(),
@@ -11399,7 +11401,7 @@ pub(crate) fn select_query_resumable<'a>(
         group: None,
         aggs: None,
         subs: Some(&outer_subs.base),
-        subquery_executor: None,
+        subquery_executor: Some(&join_subqueries),
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
@@ -11463,14 +11465,16 @@ pub(crate) fn select_query_resumable<'a>(
     }
     responder.row_description(&columns[..n_cols])?;
 
-    let offset = match super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks) {
-        Ok(o) => o,
-        Err(e) => return sql_fail(e),
-    };
-    let limit = match super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks) {
-        Ok(l) => l,
-        Err(e) => return sql_fail(e),
-    };
+    let offset =
+        match super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, None) {
+            Ok(o) => o,
+            Err(e) => return sql_fail(e),
+        };
+    let limit =
+        match super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, None) {
+            Ok(l) => l,
+            Err(e) => return sql_fail(e),
+        };
 
     // LIMIT 0 returns no rows without scanning or projecting anything, as
     // PostgreSQL does — so a per-row error in an unreturned row does not
@@ -12339,14 +12343,16 @@ pub(crate) fn constant_select_resumable<'a>(
         }
     }
 
-    let offset = match super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks) {
-        Ok(o) => o,
-        Err(e) => return sql_fail(e),
-    };
-    let limit = match super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks) {
-        Ok(l) => l,
-        Err(e) => return sql_fail(e),
-    };
+    let offset =
+        match super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, None) {
+            Ok(o) => o,
+            Err(e) => return sql_fail(e),
+        };
+    let limit =
+        match super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, None) {
+            Ok(l) => l,
+            Err(e) => return sql_fail(e),
+        };
     let project_set = if limit == 0 {
         srf::ProjectSet::empty()
     } else {
@@ -12718,8 +12724,10 @@ fn select_into_rows_mode<'a>(
         }
         let (mut rows, _target, n) =
             setops::materialize_set_body_tied(storage, txid, tree, arena, params, seq, outer)?;
-        let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-        let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
+        let offset =
+            super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
+        let limit =
+            super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
         // A trailing ORDER BY needs one final sort over the combined multiset.
         let columns_owned = if statement.order_by.is_empty() {
             None
@@ -12928,8 +12936,9 @@ fn select_into_rows_mode<'a>(
                 ..hooks
             };
             let offset =
-                super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-            let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
+                super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
+            let limit =
+                super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
             if limit == 0 || offset > 0 {
                 return Ok(());
             }
@@ -12990,6 +12999,7 @@ fn select_into_rows_mode<'a>(
             }
         }
         collect_table_sample_expressions(from, &mut sub_exprs[2 + n_items + n_group..]);
+        let join_subqueries = ProceduralSubqueries { storage, txid };
         let outer_subs = prepare_outer_subqueries(
             sub_exprs,
             statement.from.as_ref(),
@@ -13004,7 +13014,7 @@ fn select_into_rows_mode<'a>(
             group: None,
             aggs: None,
             subs: Some(&outer_subs.base),
-            subquery_executor: None,
+            subquery_executor: Some(&join_subqueries),
             windows: None,
             catalog: Some(&catalog),
             srf_index: None,
@@ -13025,8 +13035,10 @@ fn select_into_rows_mode<'a>(
             outer_subs.correlated,
             outer,
         )?;
-        let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-        let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
+        let offset =
+            super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
+        let limit =
+            super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
         let start = (offset as usize).min(rows.len());
         let n = ((rows.len() - start) as u64).min(limit) as usize;
         for row in &rows[start..start + n] {
@@ -13076,8 +13088,10 @@ fn select_into_rows_mode<'a>(
                 emit,
             );
         }
-        let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-        let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
+        let offset =
+            super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
+        let limit =
+            super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
         if limit == 0 {
             return Ok(());
         }
@@ -13157,8 +13171,9 @@ fn select_into_rows_mode<'a>(
         return Ok(());
     };
 
-    let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-    let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
+    let offset =
+        super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
+    let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
     if limit == 0 {
         // Plan the schema without materializing derived inputs or evaluating
         // subqueries/projections that Limit will never request.
@@ -13199,6 +13214,7 @@ fn select_into_rows_mode<'a>(
             arena,
         },
     };
+    let join_subqueries = ProceduralSubqueries { storage, txid };
     let outer_subs = prepare_outer_subqueries(
         sub_exprs,
         statement.from.as_ref(),
@@ -13215,7 +13231,7 @@ fn select_into_rows_mode<'a>(
         group: None,
         aggs: None,
         subs: Some(&outer_subs.base),
-        subquery_executor: None,
+        subquery_executor: Some(&join_subqueries),
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,

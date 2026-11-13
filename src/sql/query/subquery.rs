@@ -192,7 +192,7 @@ fn spooled_column_witness<'a>(
             arena,
             None,
             crate::sql::exec::DescriptionTarget::Sql,
-            None,
+            outer,
         )?;
         if let Some((ColType::Composite(slot), _)) =
             crate::sql::exec::catalog_column_type(storage, txid, columns[0].type_oid)
@@ -1462,6 +1462,7 @@ fn row_subquery_witness<'a>(
     }; MAX_PROJ];
     if let Some(tree) = select.set_body {
         let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
+        // Each branch may read the enclosing row, as a correlated subquery does.
         let count = super::setops::describe_set_body(
             storage,
             tree,
@@ -1470,7 +1471,7 @@ fn row_subquery_witness<'a>(
             arena,
             None,
             crate::sql::exec::DescriptionTarget::Sql,
-            None,
+            outer,
         )?;
         for (index, column) in columns[..count].iter().enumerate() {
             let value = catalog_type_witness(storage, txid, column.type_oid)?;
@@ -2552,18 +2553,32 @@ pub(super) fn prepare_outer_subqueries<'a>(
     for expression in exprs.iter().flatten() {
         collect_subqueries(expression, &mut nodes)?;
     }
+    let output_nodes = nodes.len();
+    for on in from
+        .into_iter()
+        .flat_map(|from| from.joins.iter().filter_map(|join| join.on))
+    {
+        collect_subqueries(on, &mut nodes)?;
+    }
     let mut uncorr = ArenaList::new(arena);
     let mut corr = ArenaList::new(arena);
-    for &node in nodes.as_slice() {
+    // A join condition's correlated subquery runs for each pair of rows it
+    // compares, through the query's subquery executor; the others run once
+    // for each row the query produces.
+    let mut per_row = ArenaList::new(arena);
+    for (index, &node) in nodes.as_slice().iter().enumerate() {
         if subquery_node_correlated(node, storage, txid, arena)? {
-            corr.push(node).map_err(|_| arena_full())?;
+            if index < output_nodes {
+                corr.push(node).map_err(|_| arena_full())?;
+            }
+            per_row.push(node).map_err(|_| arena_full())?;
         } else {
             uncorr.push(node).map_err(|_| arena_full())?;
         }
     }
     let statement = match outer.map(|outer| outer.statement_subqueries()) {
         Some(slots) if !slots.is_empty() => slots,
-        _ => nested_statement_slots(corr.as_slice(), from, storage, txid, arena)?,
+        _ => nested_statement_slots(per_row.as_slice(), from, storage, txid, arena)?,
     };
     let mut scope = None;
     let outer = outer.map(|outer| {
@@ -4301,13 +4316,27 @@ fn run_subquery<'a>(
         .from
         .as_ref()
         .map_or(0, |from| 2 * (from.joins.len() + 1));
+    let joins = select.from.as_ref().map_or(&[][..], |from| from.joins);
+    let bounds = 4 + select.order_by.len() + joins.len();
     let inner_expressions = arena
-        .alloc_slice_with(2 + sample_capacity, |_| None)
+        .alloc_slice_with(bounds + sample_capacity, |_| None)
         .map_err(|_| arena_full())?;
     inner_expressions[0] = Some(item);
     inner_expressions[1] = select.where_clause;
+    inner_expressions[2] = select.limit;
+    inner_expressions[3] = select.offset;
+    // A join condition's subquery runs for each pair of rows it compares.
+    for (slot, expression) in inner_expressions[4..bounds].iter_mut().zip(
+        select
+            .order_by
+            .iter()
+            .map(|order| Some(order.expression))
+            .chain(joins.iter().map(|join| join.on)),
+    ) {
+        *slot = expression;
+    }
     if let Some(from) = &select.from {
-        collect_table_sample_expressions(from, &mut inner_expressions[2..]);
+        collect_table_sample_expressions(from, &mut inner_expressions[bounds..]);
     }
     let inner_subs = prepare_subqueries(
         inner_expressions,
@@ -4338,6 +4367,18 @@ fn run_subquery<'a>(
             return Err(sql_err!(
                 sqlstate::SYNTAX_ERROR,
                 "SELECT * with no tables specified is not valid"
+            ));
+        }
+        // OFFSET and LIMIT apply to the one row, and run before it as
+        // PostgreSQL's Limit does.
+        let offset =
+            crate::sql::exec::eval_offset_pub(select.offset, arena, params, &hooks, outer)?;
+        let limit = crate::sql::exec::eval_limit_pub(select.limit, arena, params, &hooks, outer)?;
+        if offset > 0 || limit == 0 {
+            return Ok((
+                &[],
+                false,
+                subquery_witness_with_outer(storage, txid, item, None, outer, arena)?,
             ));
         }
         // FROM-less: one row (outer columns still visible if correlated).
@@ -4510,8 +4551,9 @@ fn run_subquery<'a>(
         };
         let v = eval_full(item, arena, params, &base, &agg_hooks)?;
         // OFFSET and LIMIT apply to the aggregate's one row.
-        let offset = crate::sql::exec::eval_offset_pub(select.offset, arena, params, &hooks)?;
-        let limit = crate::sql::exec::eval_limit_pub(select.limit, arena, params, &hooks)?;
+        let offset =
+            crate::sql::exec::eval_offset_pub(select.offset, arena, params, &hooks, outer)?;
+        let limit = crate::sql::exec::eval_limit_pub(select.limit, arena, params, &hooks, outer)?;
         let rows = usize::from(offset == 0 && limit > 0);
         let out = arena
             .alloc_slice_copy(&[v][..rows])
@@ -4614,8 +4656,9 @@ fn run_subquery<'a>(
     }
 
     // Apply OFFSET/LIMIT over the ordered rows.
-    let offset = crate::sql::exec::eval_offset_pub(select.offset, arena, params, &hooks)? as usize;
-    let limit = crate::sql::exec::eval_limit_pub(select.limit, arena, params, &hooks)?;
+    let offset =
+        crate::sql::exec::eval_offset_pub(select.offset, arena, params, &hooks, outer)? as usize;
+    let limit = crate::sql::exec::eval_limit_pub(select.limit, arena, params, &hooks, outer)?;
     let start = offset.min(count);
     let n = ((count - start) as u64).min(limit) as usize;
     let mut saw_null = false;
@@ -4798,8 +4841,9 @@ fn set_window<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<(usize, usize), SqlError> {
-    let offset = crate::sql::exec::eval_offset_pub(outer_select.offset, arena, params, hooks)?;
-    let limit = crate::sql::exec::eval_limit_pub(outer_select.limit, arena, params, hooks)?;
+    let offset =
+        crate::sql::exec::eval_offset_pub(outer_select.offset, arena, params, hooks, None)?;
+    let limit = crate::sql::exec::eval_limit_pub(outer_select.limit, arena, params, hooks, None)?;
     let start = (offset as usize).min(total);
     Ok((start, ((total - start) as u64).min(limit) as usize))
 }

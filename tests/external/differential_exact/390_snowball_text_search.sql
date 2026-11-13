@@ -52,6 +52,13 @@ select to_tsvector('danish', 'Børnene legede på gaderne') @@ to_tsquery('danis
 select alias, token, dictionaries, dictionary, lexemes from ts_debug('russian', 'Running красивые дома 42');
 select alias, token, dictionaries, dictionary, lexemes from ts_debug('hindi', 'word शब्दों');
 -- Catalog rows initdb creates.
+-- initdb numbers the Snowball objects after the platform's collations; these
+-- OIDs must match the pinned reference image.
+select 'dsnowball_init'::regproc::oid as init, 'dsnowball_lexize'::regproc::oid as lexize,
+       (select tmplinit::oid from pg_ts_template where tmplname = 'snowball') as template_init,
+       'snowball'::text as template, (select oid from pg_ts_template where tmplname = 'snowball') as template_oid,
+       'english_stem'::regdictionary::oid as english_stem, 'english'::regconfig::oid as english,
+       'yiddish'::regconfig::oid as yiddish;
 select cfgname, cfgnamespace::regnamespace, cfgowner::regrole, cfgparser::regproc, obj_description(oid, 'pg_ts_config') from pg_ts_config order by cfgname;
 select dictname, dictnamespace::regnamespace, dictowner::regrole, t.tmplname, dictinitoption, obj_description(d.oid, 'pg_ts_dict') from pg_ts_dict d join pg_ts_template t on t.oid = d.dicttemplate order by dictname;
 select tmplname, tmplinit, tmpllexize, obj_description(oid, 'pg_ts_template') from pg_ts_template order by tmplname;

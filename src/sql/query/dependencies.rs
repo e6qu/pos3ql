@@ -3066,64 +3066,10 @@ fn collect_select<'a>(
             ..context
         };
 
-        for item in select.items {
-            match item {
-                SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
-                    collect_expression(
-                        expression,
-                        storage,
-                        txid,
-                        visible_ctes,
-                        dependencies,
-                        arena,
-                        nested,
-                    )?;
-                }
-                SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {}
-            }
-        }
-        for expression in select.distinct_on {
-            collect_expression(
-                expression,
-                storage,
-                txid,
-                visible_ctes,
-                dependencies,
-                arena,
-                nested,
-            )?;
-        }
-        for expression in select
-            .where_clause
-            .into_iter()
-            .chain(select.group_by.iter().copied())
-            .chain(select.having)
-            .chain(select.order_by.iter().map(|order| order.expression))
-            .chain(select.limit)
-            .chain(select.offset)
-        {
-            collect_expression(
-                expression,
-                storage,
-                txid,
-                visible_ctes,
-                dependencies,
-                arena,
-                nested,
-            )?;
-        }
-        if let Some(tree) = select.set_body {
-            collect_set_tree(
-                tree,
-                storage,
-                txid,
-                visible_ctes,
-                dependencies,
-                arena,
-                context,
-            )?;
-        }
+        // The level's relations come first: a subquery's outer references
+        // mark columns of relations the query already depends on.
         if let Some(from) = select.from {
+            // A LATERAL item's outer references name this level's items.
             collect_table_ref(
                 &from.base,
                 storage,
@@ -3131,7 +3077,7 @@ fn collect_select<'a>(
                 visible_ctes,
                 dependencies,
                 arena,
-                context,
+                if from.base.lateral { nested } else { context },
             )?;
             for join in from.joins {
                 collect_table_ref(
@@ -3141,7 +3087,7 @@ fn collect_select<'a>(
                     visible_ctes,
                     dependencies,
                     arena,
-                    context,
+                    if join.table.lateral { nested } else { context },
                 )?;
                 if let Some(on) = join.on {
                     collect_expression(
@@ -3203,6 +3149,22 @@ fn collect_select<'a>(
                     .chain(select.offset)
                     .chain(from.joins.iter().filter_map(|join| join.on))
                 {
+                    // `GROUP BY name` and `ORDER BY name` may name an output
+                    // column, whose expression the target list recorded.
+                    if let Expr::Column {
+                        qualifier: None,
+                        name,
+                    } = expression
+                        && select.items.iter().any(|item| {
+                            matches!(item, SelectItem::Expr { alias: Some(alias), .. } if alias == name)
+                        })
+                        && crate::sql::error_position::preserving_pending(|| {
+                            scope.find_column(None, name)
+                        })
+                        .is_err()
+                    {
+                        continue;
+                    }
                     record_column_references(
                         expression,
                         scope,
@@ -3221,6 +3183,63 @@ fn collect_select<'a>(
                 select,
                 dependencies,
                 arena,
+            )?;
+        }
+        for item in select.items {
+            match item {
+                SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                    collect_expression(
+                        expression,
+                        storage,
+                        txid,
+                        visible_ctes,
+                        dependencies,
+                        arena,
+                        nested,
+                    )?;
+                }
+                SelectItem::Wildcard(_) | SelectItem::TableWildcard(_) => {}
+            }
+        }
+        for expression in select.distinct_on {
+            collect_expression(
+                expression,
+                storage,
+                txid,
+                visible_ctes,
+                dependencies,
+                arena,
+                nested,
+            )?;
+        }
+        for expression in select
+            .where_clause
+            .into_iter()
+            .chain(select.group_by.iter().copied())
+            .chain(select.having)
+            .chain(select.order_by.iter().map(|order| order.expression))
+            .chain(select.limit)
+            .chain(select.offset)
+        {
+            collect_expression(
+                expression,
+                storage,
+                txid,
+                visible_ctes,
+                dependencies,
+                arena,
+                nested,
+            )?;
+        }
+        if let Some(tree) = select.set_body {
+            collect_set_tree(
+                tree,
+                storage,
+                txid,
+                visible_ctes,
+                dependencies,
+                arena,
+                context,
             )?;
         }
         collect_routine_dependencies(

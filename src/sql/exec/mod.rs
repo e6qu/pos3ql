@@ -53014,6 +53014,55 @@ impl ColTypeResolver for RuleConditionColumns<'_> {
     }
 }
 
+/// A reference to the rule's `OLD` or `NEW` row in a member of a rule
+/// action's set operation, which PostgreSQL rejects: the rows belong to the
+/// action's own query level.
+fn set_member_rule_row<'a>(statement: &'a crate::sql::ast::Stmt<'a>) -> Option<&'a Expr<'a>> {
+    use crate::sql::ast::{SetTree, Stmt};
+    fn in_expression<'a>(expression: &'a Expr<'a>) -> Option<&'a Expr<'a>> {
+        let row = |name: &str| name.eq_ignore_ascii_case("old") || name.eq_ignore_ascii_case("new");
+        match expression {
+            Expr::Column {
+                qualifier: Some(qualifier),
+                ..
+            } if row(qualifier) => return Some(expression),
+            Expr::WholeRow(name) if row(name) => return Some(expression),
+            _ => {}
+        }
+        let mut found = None;
+        let _ = super::query::walk_children(expression, &mut |child| {
+            if found.is_none() {
+                found = in_expression(child);
+            }
+            Ok(())
+        });
+        found
+    }
+    fn in_tree<'a>(tree: &'a SetTree<'a>) -> Option<&'a Expr<'a>> {
+        match tree {
+            SetTree::Op { left, right, .. } => in_tree(left).or_else(|| in_tree(right)),
+            SetTree::Select(select) => select
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    crate::sql::ast::SelectItem::Expr { expression, .. } => Some(*expression),
+                    _ => None,
+                })
+                .chain(select.where_clause)
+                .chain(select.having)
+                .chain(select.group_by.iter().copied())
+                .find_map(in_expression),
+        }
+    }
+    let tree = match statement {
+        Stmt::Insert(insert) => insert.select.and_then(|select| select.set_body)?,
+        Stmt::Select(select) => select.set_body?,
+        Stmt::SetQuery(query) => query.body,
+        _ => return None,
+    };
+    in_tree(tree)
+}
+
 fn stored_rule_definition<'a>(
     storage: &Storage,
     txn: &TxnState,
@@ -53153,6 +53202,15 @@ fn stored_rule_definition<'a>(
     }
     condition_columns.scope.set(RuleNameScope::Action);
     for action in rule.actions {
+        if let Some(reference) = set_member_rule_row(action.statement) {
+            return Err(crate::sql::error_position::at_expression(
+                sql_err!(
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                    "UNION/INTERSECT/EXCEPT member statement cannot refer to other relations of same query level"
+                ),
+                reference,
+            ));
+        }
         condition_columns.used_old.set(false);
         condition_columns.used_new.set(false);
         super::query::analyse_rule_action(

@@ -38,6 +38,8 @@ type OrderLimit<'a> = (
     Option<&'a Expr<'a>>,
     Option<&'a Expr<'a>>,
     bool,
+    // `LIMIT ALL` was written.
+    bool,
 );
 /// PostgreSQL bounds the fully expanded grouping-set product at 4,096 and a
 /// single CUBE at 12 elements.
@@ -3022,6 +3024,7 @@ impl<'a> Parser<'a> {
             locking: &[],
             written: crate::sql::ast::WrittenQuery {
                 values: false,
+                limit_all: false,
                 grouping: grouping_written,
             },
         })
@@ -3110,11 +3113,13 @@ impl<'a> Parser<'a> {
         let mut limit = None;
         let mut offset = None;
         let mut with_ties = false;
+        let mut limit_all = false;
         loop {
-            if limit.is_none() && self.eat_ident("limit")? {
+            if limit.is_none() && !limit_all && self.eat_ident("limit")? {
                 // `LIMIT ALL` is the standard spelling of "no limit"; it leaves
                 // the clause unset rather than binding an expression.
                 if self.eat_ident("all")? {
+                    limit_all = true;
                     continue;
                 }
                 limit = Some(self.expression(0)?);
@@ -3150,7 +3155,7 @@ impl<'a> Parser<'a> {
         if with_ties && order_by.is_empty() {
             return Err(self.err_here("WITH TIES cannot be specified without ORDER BY clause"));
         }
-        Ok((order_by, limit, offset, with_ties))
+        Ok((order_by, limit, offset, with_ties, limit_all))
     }
 
     /// Parses ASC, DESC, or PostgreSQL's ordering-operator spelling shared by
@@ -3228,7 +3233,7 @@ impl<'a> Parser<'a> {
         let saved_allow = self.allow_into;
         self.allow_into = false;
         let body = self.set_union()?;
-        let (order_by, limit, offset, with_ties) = self.order_limit()?;
+        let (order_by, limit, offset, with_ties, limit_all) = self.order_limit()?;
         // Row-locking clauses come last, after ORDER BY / LIMIT / OFFSET.
         let locking = self.locking_clauses()?;
         self.allow_into = saved_allow;
@@ -3237,6 +3242,7 @@ impl<'a> Parser<'a> {
             let mut sel = **s;
             sel.order_by = order_by;
             sel.limit = limit;
+            sel.written.limit_all = limit_all;
             sel.offset = offset;
             sel.with_ties = with_ties;
             sel.locking = locking;
@@ -3260,7 +3266,10 @@ impl<'a> Parser<'a> {
             with: &[],
             set_body: Some(body),
             locking,
-            written: crate::sql::ast::WrittenQuery::PLAIN,
+            written: crate::sql::ast::WrittenQuery {
+                limit_all,
+                ..crate::sql::ast::WrittenQuery::PLAIN
+            },
         })
     }
 
@@ -3526,7 +3535,7 @@ impl<'a> Parser<'a> {
         let saved_into = self.into_clause.take();
         self.allow_into = true;
         let body = self.set_union()?;
-        let (order_by, limit, offset, with_ties) = self.order_limit()?;
+        let (order_by, limit, offset, with_ties, limit_all) = self.order_limit()?;
         let locking = self.locking_clauses()?;
         let stmt_end = self.peek_at;
         self.allow_into = saved_allow;
@@ -3559,6 +3568,7 @@ impl<'a> Parser<'a> {
             let mut sel = **s;
             sel.order_by = order_by;
             sel.limit = limit;
+            sel.written.limit_all = limit_all;
             sel.offset = offset;
             sel.with_ties = with_ties;
             sel.locking = locking;
@@ -3656,10 +3666,10 @@ impl<'a> Parser<'a> {
             let enclosing_windows =
                 core::mem::replace(&mut self.windows, ArenaList::new(self.arena));
             let inner = self.set_union()?;
-            let (order_by, limit, offset, with_ties) = self.order_limit()?;
+            let (order_by, limit, offset, with_ties, limit_all) = self.order_limit()?;
             self.windows = enclosing_windows;
             self.expect_op(")")?;
-            if order_by.is_empty() && limit.is_none() && offset.is_none() {
+            if order_by.is_empty() && limit.is_none() && offset.is_none() && !limit_all {
                 return Ok(inner);
             }
             let sel = match inner {
@@ -3667,6 +3677,7 @@ impl<'a> Parser<'a> {
                     let mut sel = **s;
                     sel.order_by = order_by;
                     sel.limit = limit;
+                    sel.written.limit_all = limit_all;
                     sel.offset = offset;
                     sel.with_ties = with_ties;
                     sel
@@ -3689,7 +3700,10 @@ impl<'a> Parser<'a> {
                     with: &[],
                     set_body: Some(op),
                     locking: &[],
-                    written: crate::sql::ast::WrittenQuery::PLAIN,
+                    written: crate::sql::ast::WrittenQuery {
+                        limit_all,
+                        ..crate::sql::ast::WrittenQuery::PLAIN
+                    },
                 },
             };
             let boxed = self
@@ -3747,7 +3761,7 @@ impl<'a> Parser<'a> {
                     locking: &[],
                     written: crate::sql::ast::WrittenQuery {
                         values: true,
-                        grouping: &[],
+                        ..crate::sql::ast::WrittenQuery::PLAIN
                     },
                 };
                 let leaf = self.alloc_set(SetTree::Select(
@@ -8236,7 +8250,7 @@ impl<'a> Parser<'a> {
                         items: items.as_slice(),
                         written: crate::sql::ast::WrittenQuery {
                             values: true,
-                            grouping: &[],
+                            ..crate::sql::ast::WrittenQuery::PLAIN
                         },
                         ..Select::EMPTY
                     })
@@ -8258,7 +8272,7 @@ impl<'a> Parser<'a> {
         let saved_allow = self.allow_into;
         self.allow_into = false;
         let body = self.set_union_after(first)?;
-        let (order_by, limit, offset, with_ties) = self.order_limit()?;
+        let (order_by, limit, offset, with_ties, limit_all) = self.order_limit()?;
         let locking = self.locking_clauses()?;
         self.allow_into = saved_allow;
         self.windows = enclosing_windows;
@@ -8269,6 +8283,10 @@ impl<'a> Parser<'a> {
             with_ties,
             set_body: Some(body),
             locking,
+            written: crate::sql::ast::WrittenQuery {
+                limit_all,
+                ..crate::sql::ast::WrittenQuery::PLAIN
+            },
             ..Select::EMPTY
         })
     }

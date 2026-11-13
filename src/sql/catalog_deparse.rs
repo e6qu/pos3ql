@@ -255,6 +255,19 @@ fn numeric_rank(type_oid: i32) -> Option<u8> {
     })
 }
 
+/// The array type whose elements have `element`'s type.
+fn array_of(element: i32) -> Option<i32> {
+    crate::sql::types::ArrElem::from_coltype(ColType::from_oid(element)?)?.try_array_oid()
+}
+
+/// The element type of an array type.
+fn element_of(array: i32) -> Option<i32> {
+    match ColType::from_oid(array)? {
+        ColType::Array(element) => Some(element.element_oid()),
+        _ => None,
+    }
+}
+
 /// The type PostgreSQL's operators see: `varchar` relabels to `text`.
 fn operator_type(type_oid: i32) -> i32 {
     if type_oid == oid::VARCHAR {
@@ -280,10 +293,12 @@ impl Context<'_> {
         }
         if let Some((source, column)) = self.joined_source(qualifier, name) {
             return match source.columns {
-                Columns::Table(table) => {
-                    super::catalog_column_type_oid(self.storage, &table.columns()[column], self.txid)
-                        .map(Some)
-                }
+                Columns::Table(table) => super::catalog_column_type_oid(
+                    self.storage,
+                    &table.columns()[column],
+                    self.txid,
+                )
+                .map(Some),
                 Columns::Derived(columns) => Ok(columns[column].type_oid),
             };
         }
@@ -334,9 +349,7 @@ impl Context<'_> {
                     Some(qualifier) => joined.addressable && joined.name == qualifier,
                     None => joined.unqualified,
                 };
-                let Some(column) = reachable
-                    .then(|| joined.columns.position(name))
-                    .flatten()
+                let Some(column) = reachable.then(|| joined.columns.position(name)).flatten()
                 else {
                     continue;
                 };
@@ -398,7 +411,10 @@ impl Context<'_> {
             self.joined
                 .iter()
                 .find(|joined| {
-                    joined.level == level && !joined.cte && joined.addressable && joined.name == name
+                    joined.level == level
+                        && !joined.cte
+                        && joined.addressable
+                        && joined.name == name
                 })
                 .map(|joined| RowSource {
                     printed: joined.printed,
@@ -507,9 +523,9 @@ impl Context<'_> {
             | Expr::Like { .. }
             | Expr::Match { .. } => Some(oid::BOOL),
             Expr::Str(_) | Expr::Null => None,
-            _ if self.whole_row(expression).is_some() => self
-                .whole_row(expression)
-                .and_then(|row| row.row_type),
+            _ if self.whole_row(expression).is_some() => {
+                self.whole_row(expression).and_then(|row| row.row_type)
+            }
             Expr::Column { qualifier, name } => self.column_type(*qualifier, name)?,
             Expr::Field { .. } => match self.row_field(expression) {
                 Some(field) => self.column_type(None, field)?,
@@ -571,8 +587,52 @@ impl Context<'_> {
                 star: true,
                 ..
             } => Some(oid::INT8),
-            Expr::Call { .. } => match self.selected_builtin(expression)? {
-                Some(routine) => Some(routine.result_oid),
+            Expr::Array(items) => {
+                let mut found = None;
+                for item in *items {
+                    if let Some(element) = self.type_of(item)? {
+                        found = array_of(element);
+                        break;
+                    }
+                }
+                found
+            }
+            Expr::Call { args, .. } => match self.selected_builtin(expression)? {
+                Some(routine) => {
+                    match crate::storage::PolymorphicType::from_oid(routine.result_oid) {
+                        // A polymorphic result takes its element type from the
+                        // polymorphic arguments, as `enforce_generic_type_consistency`
+                        // resolves it.
+                        Some(
+                            result @ (crate::storage::PolymorphicType::Element
+                            | crate::storage::PolymorphicType::Array),
+                        ) => {
+                            let mut element = None;
+                            for (argument, parameter) in args.iter().zip(routine.arguments) {
+                                let found =
+                                    match crate::storage::PolymorphicType::from_oid(*parameter) {
+                                        Some(crate::storage::PolymorphicType::Element) => {
+                                            self.type_of(argument)?
+                                        }
+                                        Some(crate::storage::PolymorphicType::Array) => {
+                                            self.type_of(argument)?.and_then(element_of)
+                                        }
+                                        _ => None,
+                                    };
+                                if found.is_some() {
+                                    element = found;
+                                    break;
+                                }
+                            }
+                            match result {
+                                crate::storage::PolymorphicType::Element => element,
+                                _ => element.and_then(array_of),
+                            }
+                        }
+                        Some(_) => None,
+                        None => Some(routine.result_oid),
+                    }
+                }
                 None => self.selected_routine(expression)?.and_then(|(_, routine)| {
                     self.storage
                         .routine_function_result_oid(&routine, self.txid)
@@ -1251,9 +1311,12 @@ impl Context<'_> {
                     if index != 0 {
                         output.push(", ")?;
                     }
+                    // Polymorphic and `"any"` parameters take the argument
+                    // as it is.
                     let expected = (crate::storage::PolymorphicType::from_oid(*parameter)
-                        .is_none())
-                    .then_some(*parameter);
+                        .is_none()
+                        && *parameter != oid::ANY)
+                        .then_some(*parameter);
                     self.write(argument, expected, output)?;
                 }
                 self.call_close(expression, output)
@@ -1374,9 +1437,6 @@ impl Context<'_> {
                 if *negated {
                     self.open(output)?;
                     output.push("NOT ")?;
-                    if self.pretty {
-                        output.push("(")?;
-                    }
                 }
                 output.push("(")?;
                 self.write(operand, None, output)?;
@@ -1384,9 +1444,6 @@ impl Context<'_> {
                 query::sublink(self, select, output)?;
                 output.push("))")?;
                 if *negated {
-                    if self.pretty {
-                        output.push(")")?;
-                    }
                     self.close(output)?;
                 }
                 Ok(())
@@ -1599,6 +1656,11 @@ fn simple(expression: &Expr<'_>, parent: Parent, first: bool) -> bool {
         Expr::Binary { operator: kind, .. } => operator_symbol(*kind).is_some_and(operator),
         Expr::Like { .. } | Expr::Match { .. } => operator("~~"),
         Expr::IsNull { .. }
+        | Expr::Exists(_)
+        | Expr::Subquery(_)
+        | Expr::ArraySubquery(_)
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. }
         | Expr::Case {
             origin:
                 crate::sql::ast::CaseOrigin::BooleanTest { .. }
@@ -1729,6 +1791,7 @@ pub(crate) fn view_definition<'a>(
         query::Naming {
             names: Some(column_names),
             visible: true,
+            unknown: false,
         },
         false,
         arena,
@@ -1964,12 +2027,18 @@ pub(crate) fn rule_action_definition<'a>(
                 (_, Some(select)) => {
                     // The source query reads its own FROM items and the
                     // rule's rows, not the target.
+                    // The INSERT level's target keeps its name reserved.
+                    let mut around = [rows[0], rows[1], rows[2]];
+                    around[2].unqualified = false;
+                    around[2].addressable = false;
+                    around[2].level = 1;
                     writer.query(
-                        &rows[..2],
+                        &around,
                         select,
                         query::Naming {
                             names: None,
                             visible: false,
+                            unknown: true,
                         },
                         true,
                         arena,
@@ -2052,6 +2121,7 @@ pub(crate) fn rule_action_definition<'a>(
                 query::Naming {
                     names: None,
                     visible: true,
+                    unknown: false,
                 },
                 false,
                 arena,

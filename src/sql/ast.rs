@@ -3223,6 +3223,8 @@ pub struct Select<'a> {
 pub struct WrittenQuery<'a> {
     /// The level is one row of a `VALUES` list.
     pub values: bool,
+    /// `LIMIT ALL`, which executes as no limit.
+    pub limit_all: bool,
     /// The `GROUP BY` elements, by position in `group_by`, when the clause
     /// holds grouping sets.
     pub grouping: &'a [GroupingElement<'a>],
@@ -3231,6 +3233,7 @@ pub struct WrittenQuery<'a> {
 impl WrittenQuery<'_> {
     pub const PLAIN: Self = Self {
         values: false,
+        limit_all: false,
         grouping: &[],
     };
 }

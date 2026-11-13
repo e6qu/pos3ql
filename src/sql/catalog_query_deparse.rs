@@ -48,6 +48,9 @@ pub(super) struct Naming<'n> {
     pub names: Option<&'n [&'n str]>,
     /// `colNamesVisible`: whether a column's own name needs no `AS`.
     pub visible: bool,
+    /// An `INSERT ... SELECT` source, whose untyped literals stay unknown
+    /// until the target columns coerce them.
+    pub unknown: bool,
 }
 
 impl Output<'_> {
@@ -96,7 +99,8 @@ impl Output<'_> {
     /// The length of the current output line.
     fn line(&self) -> usize {
         let text = self.text.as_str();
-        text.rfind('\n').map_or(text.len(), |at| text.len() - at - 1)
+        text.rfind('\n')
+            .map_or(text.len(), |at| text.len() - at - 1)
     }
 }
 
@@ -227,7 +231,11 @@ impl<'r> Writer<'r> {
 
     /// Binds a top-level expression's routines and types to the identities
     /// the view captured.
-    fn bind<'x>(&self, expression: &'x Expr<'x>, arena: &'x Arena) -> Result<&'x Expr<'x>, SqlError> {
+    fn bind<'x>(
+        &self,
+        expression: &'x Expr<'x>,
+        arena: &'x Arena,
+    ) -> Result<&'x Expr<'x>, SqlError> {
         match self.dependencies {
             Some(dependencies) if !expression.contains_subquery() => {
                 crate::sql::query::bind_stored_expression(
@@ -351,8 +359,9 @@ impl<'r> Writer<'r> {
             for &(entry, column) in part {
                 let joined = &scope[usize::from(entry)];
                 let name = joined.columns.name(usize::from(column));
-                let qualifier = (joined.addressable && joined.columns.merged(usize::from(column)).is_none())
-                    .then_some(joined.name);
+                let qualifier = (joined.addressable
+                    && joined.columns.merged(usize::from(column)).is_none())
+                .then_some(joined.name);
                 let expression = arena
                     .alloc(Expr::Column { qualifier, name })
                     .map_err(full)?;
@@ -390,7 +399,8 @@ impl<'r> Writer<'r> {
                     targets
                         .push(Output1 {
                             expression,
-                            name: alias.unwrap_or_else(|| crate::sql::exec::derived_name(expression)),
+                            name: alias
+                                .unwrap_or_else(|| crate::sql::exec::derived_name(expression)),
                             column,
                             case_block,
                         })
@@ -566,7 +576,9 @@ impl<'r> Writer<'r> {
                     output.push(", ")?;
                 }
                 let position = match order.expression {
-                    Expr::Int(position) if *position >= 1 && (*position as usize) <= names.len() => {
+                    Expr::Int(position)
+                        if *position >= 1 && (*position as usize) <= names.len() =>
+                    {
                         *position as usize
                     }
                     Expr::Column {
@@ -637,6 +649,7 @@ impl<'r> Writer<'r> {
                 Naming {
                     names: None,
                     visible: true,
+                    unknown: false,
                 },
                 true,
                 arena,
@@ -730,6 +743,7 @@ impl<'r> Writer<'r> {
                     Naming {
                         names: Some(names),
                         visible: false,
+                        unknown: naming.unknown,
                     },
                     names,
                     arena,
@@ -887,6 +901,10 @@ impl<'r> Writer<'r> {
             output.keyword(" OFFSET ", -STD, STD, 0)?;
             context.write(offset, None, output)?;
         }
+        if select.written.limit_all {
+            output.keyword(" LIMIT ", -STD, STD, 0)?;
+            output.push("ALL")?;
+        }
         if let Some(limit) = select.limit {
             if select.with_ties {
                 output.keyword(" FETCH FIRST ", -STD, STD, 0)?;
@@ -985,7 +1003,20 @@ impl<'r> Writer<'r> {
         for (index, target) in targets.iter().enumerate() {
             output.push(if index == 0 { " " } else { ", " })?;
             let mut piece = output.piece();
-            let attribute = if target.case_block {
+            let attribute = if naming.unknown && matches!(target.expression, Expr::Str(_)) {
+                let Expr::Str(text) = target.expression else {
+                    unreachable!("checked literal");
+                };
+                piece.push("'")?;
+                for (index, part) in text.split('\'').enumerate() {
+                    if index != 0 {
+                        piece.push("''")?;
+                    }
+                    piece.push(part)?;
+                }
+                piece.push("'")?;
+                Some("?column?")
+            } else if target.case_block {
                 context.write(target.expression, None, &mut piece)?;
                 None
             } else if let Some(row) = context.whole_row(target.expression) {
@@ -994,7 +1025,8 @@ impl<'r> Writer<'r> {
                 context.write(target.expression, None, &mut piece)?;
                 match row.row_type {
                     Some(row_type) if row_type != oid::RECORD => {
-                        match super::super::user_type_name_fixed(self.storage, self.txid, row_type)? {
+                        match super::super::user_type_name_fixed(self.storage, self.txid, row_type)?
+                        {
                             Some(name) => {
                                 piece.push("::")?;
                                 piece.push(name.as_str())?;
@@ -1144,7 +1176,10 @@ impl<'r> Writer<'r> {
 
 /// A scope for the leaves of a set operation: the level's `WITH` queries
 /// and everything around it, one level further out.
-fn nested_scope<'x>(scope: &'x [Joined<'x>], arena: &'x Arena) -> Result<&'x [Joined<'x>], SqlError> {
+fn nested_scope<'x>(
+    scope: &'x [Joined<'x>],
+    arena: &'x Arena,
+) -> Result<&'x [Joined<'x>], SqlError> {
     nested(scope, arena)
 }
 
@@ -1190,9 +1225,7 @@ fn segments<'x>(
             start = index + 1;
         }
     }
-    segments
-        .push((base, &from.joins[start..]))
-        .map_err(full)?;
+    segments.push((base, &from.joins[start..])).map_err(full)?;
     Ok(segments.as_slice())
 }
 
@@ -1250,7 +1283,12 @@ impl<'r: 'x, 'x> Builder<'r, 'x> {
         )
     }
 
-    fn derived(&mut self, alias: Option<&'x str>, name: &'x str, columns: &'x [Column<'x>]) -> Result<Option<Part<'x>>, SqlError> {
+    fn derived(
+        &mut self,
+        alias: Option<&'x str>,
+        name: &'x str,
+        columns: &'x [Column<'x>],
+    ) -> Result<Option<Part<'x>>, SqlError> {
         let printed = self.named(alias, name)?;
         let entry = self.push(Joined {
             name: alias.unwrap_or(name),
@@ -1325,15 +1363,16 @@ impl<'r: 'x, 'x> Builder<'r, 'x> {
                 };
                 let target = |(entry, column): (u16, u16)| {
                     let joined = &entries[usize::from(entry)];
-                    joined
-                        .columns
-                        .merged(usize::from(column))
-                        .unwrap_or((Some(joined.printed), joined.columns.name(usize::from(column))))
+                    joined.columns.merged(usize::from(column)).unwrap_or((
+                        Some(joined.printed),
+                        joined.columns.name(usize::from(column)),
+                    ))
                 };
-                let column_type = |(entry, column): (u16, u16)| match entries[usize::from(entry)].columns {
-                    Columns::Derived(columns) => columns[usize::from(column)].type_oid,
-                    Columns::Table(_) => None,
-                };
+                let column_type =
+                    |(entry, column): (u16, u16)| match entries[usize::from(entry)].columns {
+                        Columns::Derived(columns) => columns[usize::from(column)].type_oid,
+                        Columns::Table(_) => None,
+                    };
                 merged
                     .push(Column {
                         name,
@@ -1426,7 +1465,12 @@ impl<'r: 'x, 'x> Builder<'r, 'x> {
                     })
                     .map_err(full)?;
             }
-            let Some(columns) = rename(columns.as_slice(), item.col_alias.unwrap_or(&[]), self.arena)? else {
+            let Some(columns) = rename(
+                columns.as_slice(),
+                item.col_alias.unwrap_or(&[]),
+                self.arena,
+            )?
+            else {
                 return Ok(None);
             };
             return self.derived(Some(alias), alias, columns);
@@ -1465,7 +1509,8 @@ impl<'r: 'x, 'x> Builder<'r, 'x> {
         let Some(relation) = self.relation(item)? else {
             return Ok(None);
         };
-        let Some(columns) = rename(relation.columns, item.col_alias.unwrap_or(&[]), self.arena)? else {
+        let Some(columns) = rename(relation.columns, item.col_alias.unwrap_or(&[]), self.arena)?
+        else {
             return Ok(None);
         };
         let printed = self.named(item.alias, relation.name)?;
@@ -1493,7 +1538,8 @@ impl<'r: 'x, 'x> Builder<'r, 'x> {
                 dependencies.entries().iter().find(|dependency| {
                     matches!(
                         dependency.class,
-                        crate::storage::DependencyClass::Table | crate::storage::DependencyClass::View
+                        crate::storage::DependencyClass::Table
+                            | crate::storage::DependencyClass::View
                     ) && dependency.referenced_schema.as_str() == item.schema.unwrap_or("")
                         && dependency.referenced_name.as_str() == item.table
                 })
@@ -1514,7 +1560,9 @@ impl<'r: 'x, 'x> Builder<'r, 'x> {
                     columns
                         .push(Column {
                             name: alloc(column.name.as_str())?,
-                            type_oid: Some(super::super::catalog_column_type_oid(storage, column, txid)?),
+                            type_oid: Some(super::super::catalog_column_type_oid(
+                                storage, column, txid,
+                            )?),
                             merged: None,
                         })
                         .map_err(full)?;
@@ -1595,7 +1643,12 @@ impl<'r: 'x, 'x> Builder<'r, 'x> {
                 })
                 .map_err(full)?;
         }
-        let Some(columns) = rename(columns.as_slice(), item.col_alias.unwrap_or(&[]), self.arena)? else {
+        let Some(columns) = rename(
+            columns.as_slice(),
+            item.col_alias.unwrap_or(&[]),
+            self.arena,
+        )?
+        else {
             return Ok(None);
         };
         let name = match item.rows_from {
@@ -1622,7 +1675,11 @@ struct Relation<'x> {
 fn find(entries: &[Joined<'_>], part: Part<'_>, name: &str) -> Option<(u16, u16)> {
     let mut found = None;
     for &(entry, column) in part {
-        if entries[usize::from(entry)].columns.name(usize::from(column)) == name {
+        if entries[usize::from(entry)]
+            .columns
+            .name(usize::from(column))
+            == name
+        {
             if found.is_some() {
                 return None;
             }
@@ -1759,6 +1816,41 @@ impl<'r: 'x, 'c, 'x> Printer<'r, 'c, 'x> {
         Ok(())
     }
 
+    /// Whether a function's arguments reference this level's items.
+    fn reads_level(&self, item: &TableRef<'_>) -> bool {
+        fn reads(context: &Context<'_>, expression: &Expr<'_>) -> bool {
+            let own = match expression {
+                Expr::Column { qualifier, name } => context
+                    .joined_source(*qualifier, name)
+                    .is_some_and(|(source, _)| source.level == 0),
+                Expr::WholeRow(name) => context
+                    .joined
+                    .iter()
+                    .any(|joined| joined.level == 0 && joined.addressable && joined.name == *name),
+                _ => false,
+            };
+            let mut found = own;
+            if !found {
+                let _ = crate::sql::query::walk_children(expression, &mut |child| {
+                    found |= reads(context, child);
+                    Ok(())
+                });
+            }
+            found
+        }
+        let functions: &[TableRef<'_>] = match item.rows_from {
+            Some(functions) => functions,
+            None => core::slice::from_ref(item),
+        };
+        functions.iter().any(|function| {
+            function
+                .func_args
+                .unwrap_or(&[])
+                .iter()
+                .any(|argument| reads(self.context, argument))
+        })
+    }
+
     fn column_aliases(&self, entry: &Joined<'_>, output: &mut Output<'_>) -> Result<(), SqlError> {
         output.push("(")?;
         for index in 0..entry.columns.len() {
@@ -1800,7 +1892,10 @@ impl<'r: 'x, 'c, 'x> Printer<'r, 'c, 'x> {
             return Ok(());
         }
         let entry = self.take();
-        if item.lateral && (item.subquery.is_some() || item.is_function_source()) {
+        // A function reading this level's items is implicitly LATERAL.
+        if (item.lateral && (item.subquery.is_some() || item.is_function_source()))
+            || (item.is_function_source() && self.reads_level(item))
+        {
             output.push("LATERAL ")?;
         }
         if let Some(subquery) = item.subquery {
@@ -1812,6 +1907,7 @@ impl<'r: 'x, 'c, 'x> Printer<'r, 'c, 'x> {
                 Naming {
                     names: None,
                     visible: true,
+                    unknown: false,
                 },
                 true,
                 self.arena,
@@ -1929,12 +2025,10 @@ fn values_type(
         };
         found = Some(match found {
             None => type_oid,
-            Some(current) => {
-                match (super::numeric_rank(current), super::numeric_rank(type_oid)) {
-                    (Some(left), Some(right)) if right > left => type_oid,
-                    _ => current,
-                }
-            }
+            Some(current) => match (super::numeric_rank(current), super::numeric_rank(type_oid)) {
+                (Some(left), Some(right)) if right > left => type_oid,
+                _ => current,
+            },
         });
     }
     Ok(Some(found.unwrap_or(oid::TEXT)))
@@ -1960,11 +2054,15 @@ fn values_list(
             if column != 0 {
                 output.push(",")?;
             }
-            let type_oid = values_type(context, rows, column)?;
             if matches!(expression, Expr::DefaultMarker) {
                 output.push("DEFAULT")?;
-            } else {
+            } else if matches!(expression, Expr::Str(_) | Expr::Null) {
+                let type_oid = values_type(context, rows, column)?;
                 context.write(expression, type_oid, output)?;
+            } else {
+                // `get_values_def` hides the implicit coercion to the
+                // column's common type.
+                context.write(expression, None, output)?;
             }
         }
         output.push(")")?;
@@ -1973,7 +2071,11 @@ fn values_list(
 }
 
 /// `get_rule_sortgroupclause`.
-fn sort_group(context: &Context<'_>, expression: &Expr<'_>, output: &mut Output<'_>) -> Result<(), SqlError> {
+fn sort_group(
+    context: &Context<'_>,
+    expression: &Expr<'_>,
+    output: &mut Output<'_>,
+) -> Result<(), SqlError> {
     match expression {
         Expr::Int(_) | Expr::Str(_) | Expr::Null | Expr::NumericLit(_) | Expr::Float(_) => {
             output.unsupported()
@@ -2002,7 +2104,11 @@ fn sort_group(context: &Context<'_>, expression: &Expr<'_>, output: &mut Output<
 }
 
 /// `get_rule_orderby`'s direction: the default `<` ordering prints nothing.
-fn order_direction(order: &OrderBy<'_>, _type_oid: Option<i32>, output: &mut Output<'_>) -> Result<(), SqlError> {
+fn order_direction(
+    order: &OrderBy<'_>,
+    _type_oid: Option<i32>,
+    output: &mut Output<'_>,
+) -> Result<(), SqlError> {
     if order.descending {
         output.push(" DESC")?;
         if !order.nulls_first {
@@ -2160,10 +2266,10 @@ pub(super) fn sublink<'x>(
         Naming {
             names: None,
             visible: false,
+            unknown: false,
         },
         true,
         arena,
         output,
     )
 }
-

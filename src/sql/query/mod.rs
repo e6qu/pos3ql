@@ -11117,7 +11117,9 @@ fn check_select_types<'a>(
             txid,
         )?)?;
     }
-    for g in statement.group_by {
+    // `GROUP BY 1` and `GROUP BY name` name output columns.
+    let grouped = resolve_group_ordinals(statement, Some(scope), arena, storage, txid)?;
+    for g in grouped.group_by {
         check(g)?;
     }
     for key in statement.distinct_on {

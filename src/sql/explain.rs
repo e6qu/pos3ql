@@ -67,6 +67,11 @@ struct PlanNode {
     /// The node's identity in execution, for the nodes whose work
     /// `EXPLAIN ANALYZE` measures.
     key: Option<NodeKey>,
+    /// Qualifications as `VERBOSE` prints them, where that differs: with
+    /// every column qualified by its relation.
+    verbose_quals: [(QualLabel, StackStr<512>); 3],
+    /// The schema of `relation`, which `VERBOSE` prints.
+    schema: StackStr<64>,
 }
 
 /// A node's `Sort Key` or `Group Key` items, separated by
@@ -169,12 +174,37 @@ impl PlanNode {
         }
     }
 
+    /// This node with `qual` under `label` as `VERBOSE` prints it.
+    fn with_verbose_qual(mut self, label: QualLabel, qual: Option<StackStr<512>>) -> Self {
+        if let Some(qual) = qual
+            && let Some(slot) = self
+                .verbose_quals
+                .iter_mut()
+                .find(|(held, _)| *held == label || *held == QualLabel::None)
+        {
+            *slot = (label, qual);
+        }
+        self
+    }
+
     /// The labelled qualifications, in display order.
     fn qualifications(&self) -> impl Iterator<Item = (QualLabel, &str)> {
+        self.shown_qualifications(false)
+    }
+
+    /// The labelled qualifications as printed with or without `VERBOSE`.
+    fn shown_qualifications(&self, verbose: bool) -> impl Iterator<Item = (QualLabel, &str)> {
         self.quals
             .iter()
             .filter(|(label, _)| *label != QualLabel::None)
-            .map(|(label, qual)| (*label, qual.as_str()))
+            .map(move |(label, qual)| {
+                let shown = self
+                    .verbose_quals
+                    .iter()
+                    .find(|(held, _)| verbose && held == label)
+                    .map_or(qual.as_str(), |(_, verbose)| verbose.as_str());
+                (*label, shown)
+            })
     }
 
     const EMPTY: Self = Self {
@@ -194,6 +224,8 @@ impl PlanNode {
         quals: NO_QUALS,
         keys: PlanKeys::NONE,
         key: None,
+        verbose_quals: NO_QUALS,
+        schema: StackStr::new(),
     };
 }
 
@@ -342,7 +374,22 @@ impl<'a> Plan<'a> {
         let counters = self
             .measured
             .filter(|_| node.key.is_some())
-            .map(|measured| measured[index]);
+            .map(|measured| measured[index])
+            .map(|mut counters| {
+                // Execution filters a `VALUES` list's rows as it builds them:
+                // its scan removed the rows of the list it did not return.
+                if node.name.as_str() == "Values Scan"
+                    && node
+                        .qualifications()
+                        .any(|(label, _)| label == QualLabel::Filter)
+                {
+                    counters.filtered = node
+                        .rows
+                        .saturating_mul(counters.loops)
+                        .saturating_sub(counters.rows);
+                }
+                counters
+            });
         if let Some(counters) = counters.filter(|counters| counters.loops != 0) {
             return NodeActual::Ran(counters);
         }
@@ -1264,7 +1311,7 @@ fn joined_index_conditions<'a>(
         indexes.iter().zip(conditions.iter_mut()).zip(relations)
     {
         if let Some(index) = index {
-            *condition = index_condition(&context, exposed, index, arena)?;
+            *condition = index_condition(&context, exposed, index, false, arena)?;
         }
     }
     Ok(())
@@ -1332,7 +1379,7 @@ enum DerivedNames {
     Bare,
     /// A subquery's, whose query adds range table entries of its own.
     Qualified,
-    /// A pulled-up `VALUES` list's: `"*VALUES*".column1`, ...
+    /// A pulled-up `VALUES` list's: `column1`, ...
     Values,
 }
 
@@ -1345,6 +1392,7 @@ fn derived_relation_filter<'a>(
     definition: crate::storage::RelationDefinition<'_>,
     names: DerivedNames,
     condition: Option<&'a Expr<'a>>,
+    verbose: bool,
     arena: &'a Arena,
 ) -> Result<Option<StackStr<512>>, SqlError> {
     let Some(condition) = condition else {
@@ -1364,7 +1412,8 @@ fn derived_relation_filter<'a>(
             let printed = arena
                 .alloc_str_display(format_args!("column{}", index + 1))
                 .map_err(|_| arena_full())?;
-            column.merged = Some((Some("*VALUES*"), printed));
+            // `VERBOSE` qualifies by the list's own name.
+            column.merged = Some((verbose.then_some("*VALUES*"), printed));
         }
     }
     let resolve = |qualifier: Option<&str>, name: &str| -> Option<usize> {
@@ -1399,7 +1448,7 @@ fn derived_relation_filter<'a>(
         parameters: &[],
         joined: &joined,
         pretty: false,
-        qualify: names == DerivedNames::Qualified,
+        qualify: verbose || names == DerivedNames::Qualified,
         domain_value: None,
         bare: None,
     };
@@ -1413,6 +1462,7 @@ fn single_relation_quals<'a>(
     table: &'a crate::storage::TableDef,
     condition: Option<&'a Expr<'a>>,
     index: Option<&query::IndexAccessPlan<'a>>,
+    verbose: bool,
     arena: &'a Arena,
 ) -> Result<(Option<StackStr<512>>, Option<StackStr<512>>), SqlError> {
     let Some(condition) = condition else {
@@ -1453,12 +1503,12 @@ fn single_relation_quals<'a>(
         parameters: &[],
         joined: &joined,
         pretty: false,
-        qualify: false,
+        qualify: verbose,
         domain_value: None,
         bare: None,
     };
     let index_cond = match index {
-        Some(index) => index_condition(&context, exposed, index, arena)?,
+        Some(index) => index_condition(&context, exposed, index, verbose, arena)?,
         None => None,
     };
     Ok((
@@ -1475,6 +1525,7 @@ fn push_scan(plan: &mut Plan<'_>, mut scan: PlanNode) -> Result<(), SqlError> {
     let bitmap_rows = scan.rows;
     let bitmap_cost = scan.total_cost * 0.4;
     let mut index_cond = None;
+    let mut verbose_index_cond = None;
     if !bitmap_index.as_str().is_empty()
         && let Some(entry) = scan
             .quals
@@ -1483,6 +1534,14 @@ fn push_scan(plan: &mut Plan<'_>, mut scan: PlanNode) -> Result<(), SqlError> {
     {
         entry.0 = QualLabel::RecheckCond;
         index_cond = Some(entry.1);
+        if let Some(entry) = scan
+            .verbose_quals
+            .iter_mut()
+            .find(|(label, _)| *label == QualLabel::IndexCond)
+        {
+            entry.0 = QualLabel::RecheckCond;
+            verbose_index_cond = Some(entry.1);
+        }
     }
     plan.push(scan)?;
     if !bitmap_index.as_str().is_empty() {
@@ -1496,7 +1555,8 @@ fn push_scan(plan: &mut Plan<'_>, mut scan: PlanNode) -> Result<(), SqlError> {
                 rows: bitmap_rows,
                 ..PlanNode::EMPTY
             }
-            .with_qual(QualLabel::IndexCond, index_cond),
+            .with_qual(QualLabel::IndexCond, index_cond)
+            .with_verbose_qual(QualLabel::IndexCond, verbose_index_cond),
         )?;
     }
     Ok(())
@@ -1509,6 +1569,7 @@ fn index_condition<'a>(
     context: &crate::sql::catalog::deparse::Context<'_>,
     exposed: &str,
     index: &query::IndexAccessPlan<'a>,
+    verbose: bool,
     arena: &'a Arena,
 ) -> Result<Option<StackStr<512>>, SqlError> {
     let mut conditions = [&Expr::Null; MAX_CONJUNCTS];
@@ -1533,8 +1594,9 @@ fn index_condition<'a>(
             .map_err(|_| arena_full())?;
         count += 1;
     }
+    // `VERBOSE` qualifies the indexed column too.
     let context = crate::sql::catalog::deparse::Context {
-        bare: Some(exposed),
+        bare: (!verbose).then_some(exposed),
         ..*context
     };
     deparse_qual(&context, &conditions[..count], arena)
@@ -2242,10 +2304,12 @@ fn scan_node<'a>(
     let cpu_rows = if use_index { index_rows } else { rows };
     let cpu_cost = cpu_rows as f64 * 0.01;
     let mut relation = StackStr::new();
+    let mut schema = StackStr::new();
     let mut alias = StackStr::new();
     match scope.defs.stored(table).filter(|_| !derived) {
         Some(definition) => {
             let _ = write!(relation, "{}", definition.name.as_str());
+            let _ = write!(schema, "{}", definition.schema.as_str());
             if scope.names[table] != definition.name.as_str() {
                 let _ = write!(alias, "{}", scope.names[table]);
             }
@@ -2292,6 +2356,8 @@ fn scan_node<'a>(
         quals: NO_QUALS,
         keys: PlanKeys::NONE,
         key: None,
+        verbose_quals: NO_QUALS,
+        schema,
     };
     let used = index_identity
         .filter(|_| use_index)
@@ -2310,6 +2376,7 @@ pub(super) fn plan_select<'a>(
     let started = std::time::Instant::now();
     // Execution plans the same query: simple subqueries merged into it and
     // outer joins its conditions narrow reduced.
+    let written = statement;
     let statement = query::pull_up_subqueries(statement, storage, txid, arena, None)?;
     let scope = match &statement.from {
         Some(from) => Some(QueryScope::resolve_schema(
@@ -2324,7 +2391,14 @@ pub(super) fn plan_select<'a>(
         .as_ref()
         .map_or(MAX_EXPLAIN_STAGES, |scope| scope.n * 3 + MAX_EXPLAIN_STAGES);
     let mut plan = Plan::new(arena, capacity)?;
-    let (width, output) = projected_shape(statement, scope.as_ref(), storage, txid, arena)?;
+    let (width, mut output) = projected_shape(statement, scope.as_ref(), storage, txid, arena)?;
+    if let (Some(scope), Some(from)) = (scope.as_ref(), statement.from.as_ref())
+        && scope.n == 1
+        && let Some(list) = from.base.subquery.and_then(values_list)
+        && let Some(named) = values_output(statement, scope, list)
+    {
+        output = named;
+    }
     let scoped_columns = scope.as_ref().map(|scope| query::CatalogScopeCols {
         scope,
         outer: None,
@@ -2713,6 +2787,9 @@ pub(super) fn plan_select<'a>(
     let n = scope.as_ref().map_or(0, |scope| scope.n);
     // The WHERE conjuncts PostgreSQL attaches to each scan and to each join,
     // when every conjunct can be placed and printed.
+    // A single relation's index condition and filter as `VERBOSE` prints
+    // them.
+    let mut verbose_quals: (Option<StackStr<512>>, Option<StackStr<512>>) = (None, None);
     let index_conds = arena
         .alloc_slice_with(n.max(1), |_| None::<StackStr<512>>)
         .map_err(|_| arena_full())?;
@@ -2768,6 +2845,17 @@ pub(super) fn plan_select<'a>(
                 def,
                 statement.where_clause,
                 scan_indexes[0].as_ref(),
+                false,
+                arena,
+            )?;
+            verbose_quals = single_relation_quals(
+                storage,
+                txid,
+                exposed,
+                def,
+                statement.where_clause,
+                scan_indexes[0].as_ref(),
+                true,
                 arena,
             )?;
         } else if scope.n == 1
@@ -2786,7 +2874,46 @@ pub(super) fn plan_select<'a>(
                     Some(_) => DerivedNames::Qualified,
                     None => DerivedNames::Bare,
                 },
-                statement.where_clause,
+                // Execution pushes a condition into a `VALUES` list's rows;
+                // PostgreSQL filters its scan by it.
+                if from.base.subquery.and_then(values_list).is_some()
+                    && written
+                        .from
+                        .as_ref()
+                        .is_some_and(|written| written.joins.is_empty())
+                {
+                    written.where_clause
+                } else {
+                    statement.where_clause
+                },
+                false,
+                arena,
+            )?;
+            verbose_quals.1 = derived_relation_filter(
+                storage,
+                txid,
+                scope.names[0],
+                definition,
+                match from.base.subquery {
+                    // PostgreSQL scans a pulled-up `VALUES` list as
+                    // `*VALUES*`, its columns named `column1`, ...
+                    Some(body) if values_list(body).is_some() => DerivedNames::Values,
+                    Some(_) => DerivedNames::Qualified,
+                    None => DerivedNames::Bare,
+                },
+                // Execution pushes a condition into a `VALUES` list's rows;
+                // PostgreSQL filters its scan by it.
+                if from.base.subquery.and_then(values_list).is_some()
+                    && written
+                        .from
+                        .as_ref()
+                        .is_some_and(|written| written.joins.is_empty())
+                {
+                    written.where_clause
+                } else {
+                    statement.where_clause
+                },
+                true,
                 arena,
             )?;
         } else if inner_joins && (0..scope.n).all(|table| relation(table).is_some()) {
@@ -2948,6 +3075,11 @@ pub(super) fn plan_select<'a>(
             scan = scan
                 .with_qual(QualLabel::IndexCond, index_conds[table].take())
                 .with_qual(QualLabel::Filter, filters[table].take());
+            if n == 1 {
+                scan = scan
+                    .with_verbose_qual(QualLabel::IndexCond, verbose_quals.0.take())
+                    .with_verbose_qual(QualLabel::Filter, verbose_quals.1.take());
+            }
             if position >= 1 {
                 // A hash join hashes its inner relation; a nested loop
                 // rescans its inner sequential scan from a materialized copy.
@@ -2997,6 +3129,7 @@ pub(super) fn plan_select<'a>(
                     plan.nodes[at] = PlanNode {
                         name: values.name,
                         alias: values.alias,
+                        rows: values.rows,
                         ..node
                     };
                 }
@@ -3400,6 +3533,8 @@ fn physical_scan_node(
         quals: NO_QUALS,
         keys: PlanKeys::NONE,
         key: None,
+        verbose_quals: NO_QUALS,
+        schema: StackStr::from_str(storage.table_def(slot, txid).schema.as_str()),
     }
 }
 
@@ -3551,6 +3686,8 @@ fn push_set_tree(
                     PlanKeys::NONE
                 },
                 key: Some(NodeKey::new(block, role)),
+                verbose_quals: NO_QUALS,
+                schema: StackStr::new(),
             };
             plan.nodes[at] = node;
             if hashed_union {
@@ -3609,6 +3746,41 @@ fn union_group_keys(tree: &SetTree<'_>) -> PlanKeys {
         return PlanKeys::NONE;
     }
     keys
+}
+
+/// The `VERBOSE` output of a query reading only a `VALUES` list, which
+/// PostgreSQL pulls up and names `"*VALUES*".column1`, ...: when every item
+/// is a star or a column of the list.
+fn values_output(
+    statement: &Select<'_>,
+    scope: &QueryScope<'_>,
+    list: &SetTree<'_>,
+) -> Option<StackStr<256>> {
+    let (_, width) = values_rows(list)?;
+    let definition = scope.defs.get(0)?;
+    let mut output = StackStr::<256>::new();
+    let mut push = |column: usize| {
+        if !output.as_str().is_empty() {
+            let _ = write!(output, ", ");
+        }
+        let _ = write!(output, "\"*VALUES*\".column{}", column + 1);
+    };
+    for item in statement.items {
+        match item {
+            SelectItem::Wildcard(_) => (0..width).for_each(&mut push),
+            SelectItem::Expr {
+                expression: Expr::Column { qualifier, name },
+                ..
+            } if qualifier.is_none_or(|qualifier| qualifier == scope.names[0]) => {
+                let column = definition.columns[..definition.n_columns]
+                    .iter()
+                    .position(|column| column.name.as_str() == *name)?;
+                push(column);
+            }
+            _ => return None,
+        }
+    }
+    (!output.is_truncated()).then_some(output)
 }
 
 /// The rows of a `VALUES` list of several rows, which the parser keeps as a
@@ -3795,6 +3967,32 @@ pub(super) fn plan_set_query<'a>(
         plan.nodes[at] = node;
         child = node;
     }
+    // PostgreSQL names each range table entry uniquely: a relation the
+    // branches read again gets a numeric suffix (`t1_1`).
+    for at in 0..plan.count {
+        let node = plan.nodes[at];
+        if node.relation.as_str().is_empty() {
+            continue;
+        }
+        let name = node.exposed_name();
+        let earlier = plan.nodes[..at]
+            .iter()
+            .filter(|earlier| !earlier.relation.as_str().is_empty())
+            .filter(|earlier| {
+                let exposed = earlier.exposed_name();
+                exposed == name
+                    || exposed
+                        .strip_prefix(name)
+                        .and_then(|suffix| suffix.strip_prefix('_'))
+                        .is_some_and(|suffix| suffix.bytes().all(|byte| byte.is_ascii_digit()))
+            })
+            .count();
+        if earlier != 0 {
+            let mut alias = StackStr::new();
+            let _ = write!(alias, "{name}_{earlier}");
+            plan.nodes[at].alias = alias;
+        }
+    }
     plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
     Ok(plan)
 }
@@ -3892,6 +4090,10 @@ pub(super) fn plan_modification<'a>(
         quals: NO_QUALS,
         keys: PlanKeys::NONE,
         key: Some(NodeKey::new(BlockId::ROOT, Role::Modify)),
+        verbose_quals: NO_QUALS,
+        schema: relation_slot(storage, txid, target.schema, target.name)
+            .map(|slot| StackStr::from_str(storage.table_def(slot, txid).schema.as_str()))
+            .unwrap_or_default(),
     };
     plan.push(target_node)?;
     if let Some(from) = joined_from {
@@ -4061,7 +4263,7 @@ pub(super) fn plan_modification<'a>(
                 if let Some(index) = scan_indexes[table + 1].as_ref() {
                     source_nodes[table] = source_nodes[table].with_qual(
                         QualLabel::IndexCond,
-                        index_condition(&context, relations[table + 1].0, index, arena)?,
+                        index_condition(&context, relations[table + 1].0, index, false, arena)?,
                     );
                 }
             }
@@ -4220,10 +4422,23 @@ pub(super) fn plan_modification<'a>(
                 &definition,
                 predicate,
                 index.as_ref().map(|(plan, _)| plan),
+                false,
+                arena,
+            )?;
+            let (verbose_index_cond, verbose_filter) = single_relation_quals(
+                storage,
+                txid,
+                alias.unwrap_or(target.name),
+                &definition,
+                predicate,
+                index.as_ref().map(|(plan, _)| plan),
+                true,
                 arena,
             )?;
             scan.with_qual(QualLabel::IndexCond, index_cond)
                 .with_qual(QualLabel::Filter, filter)
+                .with_verbose_qual(QualLabel::IndexCond, verbose_index_cond)
+                .with_verbose_qual(QualLabel::Filter, verbose_filter)
         };
         push_scan(&mut plan, child)?;
         child
@@ -4273,7 +4488,12 @@ fn text_line(node: &PlanNode, options: ExplainOptions, actual: NodeActual) -> St
         crate::sql::catalog::write_identifier(&mut line, node.alias.as_str());
     }
     if !node.relation.as_str().is_empty() {
-        let _ = write!(line, " on {}", node.relation.as_str());
+        let _ = write!(line, " on ");
+        if options.verbose && !node.schema.as_str().is_empty() {
+            crate::sql::catalog::write_identifier(&mut line, node.schema.as_str());
+            let _ = write!(line, ".");
+        }
+        let _ = write!(line, "{}", node.relation.as_str());
         if !node.alias.as_str().is_empty() {
             let _ = write!(line, " {}", node.alias.as_str());
         }
@@ -4380,7 +4600,7 @@ pub(super) fn visit_text_rows<E>(
             }
             emit(line.as_str())?;
         }
-        for (label, text) in node.qualifications() {
+        for (label, text) in node.shown_qualifications(options.verbose) {
             let mut qual = StackStr::<2048>::new();
             for _ in 0..property_indent(node.depth) {
                 let _ = write!(qual, " ");
@@ -5046,6 +5266,9 @@ fn structured_node(
             },
             node.relation.as_str(),
         );
+        if options.verbose && !node.schema.as_str().is_empty() {
+            document.text("Schema", node.schema.as_str());
+        }
     }
     if !node.exposed_name().is_empty() {
         document.text("Alias", node.exposed_name());
@@ -5107,7 +5330,7 @@ fn structured_node(
     if node.constant_false {
         document.text("One-Time Filter", "false");
     }
-    for (label, text) in node.qualifications() {
+    for (label, text) in node.shown_qualifications(options.verbose) {
         document.text(label.text(), text);
         if let Some((removed_label, removed)) = removed_count(node, node_actual, label) {
             document.number(removed_label, stack_format!(32, "{removed:.0}"));

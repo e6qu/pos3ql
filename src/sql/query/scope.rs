@@ -117,28 +117,36 @@ fn encode_catalog_rows<'a>(
     Ok(encoded)
 }
 
-/// Builds, at the start of a query that calls a user routine, the image of
-/// every `pg_catalog` relation it reads, directly or through views, under the
-/// statement's catalog snapshot: a routine the query calls that changes the
-/// catalog leaves the query's own scans reading the catalog as it began, as
-/// PostgreSQL's statement snapshot does. Other statements' scans build the
-/// same images when they first read a relation, which nothing they run can
-/// have changed.
+/// Builds, at the start of a query that calls a user routine or of a data
+/// change, the image of every `pg_catalog` relation it reads, directly or
+/// through views, under the statement's catalog snapshot: a routine or
+/// trigger that changes the catalog leaves the statement's own scans reading
+/// the catalog as it began, as PostgreSQL's statement snapshot does. Other
+/// statements' scans build the same images when they first read a relation,
+/// which nothing they run can have changed.
 pub(crate) fn prebuild_statement_catalog_images(
     statement: &crate::sql::ast::Stmt<'_>,
     storage: &Storage,
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    // Only a query that can run a user routine can change the catalog
-    // before its own scans read it.
-    let crate::sql::ast::Stmt::Select(select) = statement else {
-        return Ok(());
-    };
-    if !super::cte::select_contains_function(select, &|name, arguments| {
-        storage.has_callable_candidate(name, arguments, txid)
-    }) {
-        return Ok(());
+    // Only a statement that can run a user routine can change the catalog
+    // before its own scans read it. A plain query is judged by its calls; a
+    // compound query or a data change (whose triggers run routines) always
+    // takes its images first.
+    use crate::sql::ast::Stmt;
+    match statement {
+        Stmt::Select(select)
+            if super::cte::select_contains_function(select, &|name, arguments| {
+                storage.has_callable_candidate(name, arguments, txid)
+            }) => {}
+        Stmt::SetQuery(_)
+        | Stmt::With { .. }
+        | Stmt::Insert(_)
+        | Stmt::Update(_)
+        | Stmt::Delete(_)
+        | Stmt::Merge(_) => {}
+        _ => return Ok(()),
     }
     super::catalog_images::pin_statement_images();
     let path = storage.path();

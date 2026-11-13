@@ -501,10 +501,13 @@ the stored constraint keeps no element expressions. A statement's own catalog sc
 catalog as the statement began (images built at its start), so `SELECT mk(g),
 (SELECT count(*) FROM pg_class WHERE relname LIKE 'made_%') FROM
 generate_series(1, 3) g`, where `mk` creates a table, counts none, as
-PostgreSQL's statement snapshot does; a volatile routine's queries see the
-change. A STABLE or IMMUTABLE SQL function's catalog query still reads the
-catalog as it is when it runs, where PostgreSQL reads it under the calling
-statement's snapshot. `pg_get_viewdef` uses PostgreSQL's
+PostgreSQL's statement snapshot does, and so does a data change whose
+trigger creates tables; a volatile routine's queries see the change. A
+STABLE or IMMUTABLE SQL function's catalog query still reads the catalog as
+it is when it runs, where PostgreSQL reads it under the calling statement's
+snapshot: prebuilding the images its body reads is not enough, because the
+call runs after the statement pauses for an earlier routine and its reads
+do not reach the statement's pinned images. `pg_get_viewdef` uses PostgreSQL's
 layout, including its wrap column, only for a view
 over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
 comma or `USING` joins, subqueries or set operations; other views return their

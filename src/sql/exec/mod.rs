@@ -33954,10 +33954,17 @@ pub(super) fn trigger_record_row<'a>(
             .routine_type_oid(column.ctype, column.user_type, txid)
             .unwrap_or(column.ctype.oid());
         let returned_mod = field_mods.get(index).copied().unwrap_or(-1);
+        // A domain column's attribute has no modifier of its own; its base
+        // type's modifier belongs to the domain.
+        let column_mod = if column.user_type.is_some() {
+            -1
+        } else {
+            column.type_mod
+        };
         // PostgreSQL's `build_attrmap_by_position`: a constrained column
         // requires the same modifier; an unconstrained one accepts any.
         if (field.type_oid != declared && field.type_oid != column.ctype.oid())
-            || (column.type_mod >= 0 && returned_mod != column.type_mod)
+            || (column_mod >= 0 && returned_mod != column_mod)
         {
             let returned = if returned_mod >= 0 {
                 crate::sql::catalog::format_type_oid(storage, txid, field.type_oid, returned_mod)
@@ -33965,7 +33972,7 @@ pub(super) fn trigger_record_row<'a>(
                 crate::sql::catalog::format_type_name(storage, txid, field.type_oid)?
             };
             let expected =
-                crate::sql::catalog::format_type_oid(storage, txid, declared, column.type_mod);
+                crate::sql::catalog::format_type_oid(storage, txid, declared, column_mod);
             return Err(mismatch(format_args!(
                 "Returned type {} does not match expected type {} in column \"{}\" (position {}).",
                 returned.as_str(),

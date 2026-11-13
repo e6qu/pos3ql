@@ -712,11 +712,14 @@ fn join_quals<'a>(
     let context = crate::sql::catalog::deparse::Context {
         storage,
         txid,
+        arena,
+        dependencies: None,
         table: None,
         parameters: &[],
         joined,
         pretty: false,
         qualify: true,
+        domain_value: None,
         bare: None,
     };
     quals.hash_cond = deparse_qual(&context, &hash_conds[..hash_count], arena)?;
@@ -731,6 +734,69 @@ fn join_quals<'a>(
         }
     }
     Ok(Some(quals))
+}
+
+/// The `Hash Cond` and `Join Filter` of an outer hash join of two relations
+/// with no WHERE clause: its condition's equalities between the probe and
+/// build relations, outer side first, and its other conjuncts. None when a
+/// conjunct reads only one side, which PostgreSQL places elsewhere.
+fn outer_hash_quals<'a>(
+    storage: &Storage,
+    txid: u32,
+    relations: &[(&'a str, &'a crate::storage::TableDef)],
+    probe: usize,
+    condition: &'a Expr<'a>,
+    arena: &'a Arena,
+) -> Result<Option<(StackStr<512>, Option<StackStr<512>>)>, SqlError> {
+    let resolve =
+        |qualifier: Option<&str>, name: &str| resolve_relation(relations, qualifier, name);
+    let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
+    let mut count = 0;
+    if split_conjuncts(condition, &mut conjuncts, &mut count).is_none() {
+        return Ok(None);
+    }
+    let mut hash_conds = [&Expr::Null; MAX_CONJUNCTS];
+    let mut hash_count = 0;
+    let mut filters = [&Expr::Null; MAX_CONJUNCTS];
+    let mut filter_count = 0;
+    for &conjunct in &conjuncts[..count] {
+        if relation_mask(conjunct, &resolve) != Some(0b11) {
+            return Ok(None);
+        }
+        if let Some(equality) = equijoin(conjunct, &resolve, probe, arena)? {
+            hash_conds[hash_count] = equality;
+            hash_count += 1;
+        } else {
+            filters[filter_count] = conjunct;
+            filter_count += 1;
+        }
+    }
+    let joined = arena
+        .alloc_slice_with(relations.len(), |index| {
+            crate::sql::catalog::deparse::Joined::new(relations[index].0, relations[index].1)
+        })
+        .map_err(|_| arena_full())?;
+    let context = crate::sql::catalog::deparse::Context {
+        storage,
+        txid,
+        arena,
+        dependencies: None,
+        table: None,
+        parameters: &[],
+        joined,
+        pretty: false,
+        qualify: true,
+        bare: None,
+        domain_value: None,
+    };
+    let Some(hash_cond) = deparse_qual(&context, &hash_conds[..hash_count], arena)? else {
+        return Ok(None);
+    };
+    let join_filter = deparse_qual(&context, &filters[..filter_count], arena)?;
+    if filter_count != 0 && join_filter.is_none() {
+        return Ok(None);
+    }
+    Ok(Some((hash_cond, join_filter)))
 }
 
 /// Each relation's scan filter: its own conjuncts in PostgreSQL's order,
@@ -764,6 +830,9 @@ fn scan_filters<'a>(
                 pretty: false,
                 qualify: false,
                 bare: None,
+                domain_value: None,
+                arena,
+                dependencies: None,
             };
             deparse_qual(&context, own, arena)?
         } else {
@@ -791,6 +860,9 @@ fn scan_filters<'a>(
                 pretty: false,
                 qualify: true,
                 bare: Some(exposed),
+                domain_value: None,
+                arena,
+                dependencies: None,
             };
             deparse_qual(&context, all, arena)?
         };
@@ -1029,6 +1101,9 @@ fn outer_join_quals<'a>(
         pretty: false,
         qualify: true,
         bare: None,
+        domain_value: None,
+        arena,
+        dependencies: None,
     };
     quals.hash_cond = deparse_qual(&context, &hash_conds[..hash_count], arena)?;
     if hash_count != 0 && quals.hash_cond.is_none() {
@@ -1073,6 +1148,9 @@ fn joined_index_conditions<'a>(
         pretty: false,
         qualify: true,
         bare: None,
+        domain_value: None,
+        arena,
+        dependencies: None,
     };
     for ((index, condition), (exposed, _)) in
         indexes.iter().zip(conditions.iter_mut()).zip(relations)
@@ -1136,11 +1214,14 @@ fn single_relation_quals<'a>(
     let context = crate::sql::catalog::deparse::Context {
         storage,
         txid,
+        arena,
+        dependencies: None,
         table: Some(table),
         parameters: &[],
         joined: &joined,
         pretty: false,
         qualify: false,
+        domain_value: None,
         bare: None,
     };
     let index_cond = match index {
@@ -1435,7 +1516,7 @@ fn predicate_column(
                 }
                 match scope.find_column(*qualifier, name).ok()? {
                     query::ResolvedColumn::Table(table, column) => Some((table, column, operator)),
-                    query::ResolvedColumn::Merged(_) => None,
+                    query::ResolvedColumn::Merged(_) | query::ResolvedColumn::TableOid(_) => None,
                 }
             };
             side(left, right, *operator).or_else(|| side(right, left, reverse(*operator)))
@@ -1993,6 +2074,9 @@ pub(super) fn plan_select<'a>(
     let started = std::time::Instant::now();
     // Execution plans the same query: simple subqueries merged into it and
     // outer joins its conditions narrow reduced.
+    // A pulled-up VALUES list's filter is the condition as written: the
+    // pull-up pushes it into the list for execution.
+    let written_where = statement.where_clause;
     let statement = query::pull_up_subqueries(statement, storage, txid, arena, None)?;
     let scope = match &statement.from {
         Some(from) => Some(QueryScope::resolve_schema(
@@ -2000,6 +2084,9 @@ pub(super) fn plan_select<'a>(
         )?),
         None => None,
     };
+    if let Some(scope) = scope.as_ref() {
+        query::validate_static_grouping(statement, scope, storage, txid, arena)?;
+    }
     let capacity = scope
         .as_ref()
         .map_or(MAX_EXPLAIN_STAGES, |scope| scope.n * 3 + MAX_EXPLAIN_STAGES);
@@ -2095,6 +2182,7 @@ pub(super) fn plan_select<'a>(
     let mut object_requests = 0u64;
     let mut cache_blocks = 0u64;
     let mut hash_join = false;
+    let mut hash_join_name = "Hash Join";
     let table_count = scope.as_ref().map_or(0, |scope| scope.n);
     let table_order = arena
         .alloc_slice_with(table_count, |index| index)
@@ -2172,6 +2260,7 @@ pub(super) fn plan_select<'a>(
             table_order[0] = layout.probe_table;
             table_order[1] = layout.build_table;
             hash_join = true;
+            hash_join_name = plan.node_name();
         }
     }
 
@@ -2200,14 +2289,18 @@ pub(super) fn plan_select<'a>(
             &mut stages,
             &mut stage_count,
             PlanNode {
-                name: StackStr::from_str(join_node(
-                    statement
-                        .from
-                        .as_ref()
-                        .and_then(|from| from.joins.last())
-                        .map(|join| join.kind),
-                    hash_join,
-                )),
+                name: StackStr::from_str(if hash_join {
+                    hash_join_name
+                } else {
+                    join_node(
+                        statement
+                            .from
+                            .as_ref()
+                            .and_then(|from| from.joins.last())
+                            .map(|join| join.kind),
+                        false,
+                    )
+                }),
                 total_cost,
                 rows: estimated_rows,
                 width,
@@ -2429,6 +2522,19 @@ pub(super) fn plan_select<'a>(
                 scan_indexes[0].as_ref(),
                 arena,
             )?;
+        } else if scope.n == 1
+            && let Some(from) = statement.from.as_ref()
+            && from.base.subquery.and_then(values_list).is_some()
+        {
+            // A pulled-up VALUES list filters its own rows.
+            filters[0] = rewrite::values_filter(
+                storage,
+                txid,
+                scope.names[0],
+                &from.base,
+                written_where,
+                arena,
+            )?;
         } else if inner_joins && (0..scope.n).all(|table| relation(table).is_some()) {
             let relations = arena
                 .alloc_slice_with(scope.n, |table| relation(table).expect("stored relation"))
@@ -2482,6 +2588,29 @@ pub(super) fn plan_select<'a>(
                 stages[0] = stages[0].with_qual(QualLabel::HashCond, quals.hash_cond);
             }
             joined_index_conditions(storage, txid, relations, scan_indexes, index_conds, arena)?;
+        } else if hash_join
+            && scope.n == 2
+            && statement.where_clause.is_none()
+            && let Some(join) = statement.from.as_ref().and_then(|from| from.joins.first())
+            && matches!(
+                join.kind,
+                crate::sql::ast::JoinKind::Left
+                    | crate::sql::ast::JoinKind::Right
+                    | crate::sql::ast::JoinKind::Full
+            )
+            && let Some(condition) = join.on.or(scope.join_on[0])
+            && let (Some(first), Some(second)) = (relation(0), relation(1))
+            && let Some((hash_cond, join_filter)) = outer_hash_quals(
+                storage,
+                txid,
+                &[first, second],
+                table_order[0],
+                condition,
+                arena,
+            )?
+        {
+            stages[0] = stages[0].with_qual(QualLabel::HashCond, Some(hash_cond));
+            join_filters[1] = join_filter;
         }
     }
     for (depth, stage) in stages[..stage_count].iter().rev().enumerate() {
@@ -2745,6 +2874,9 @@ fn plan_keys(
             pretty: false,
             qualify: verbose || scope.n > 1,
             bare: None,
+            domain_value: None,
+            arena,
+            dependencies: None,
         };
         for (index, &(key, order)) in keys.iter().enumerate() {
             let expression = match key {
@@ -3488,6 +3620,9 @@ pub(super) fn plan_modification<'a>(
                 pretty: false,
                 qualify: true,
                 bare: None,
+                domain_value: None,
+                arena,
+                dependencies: None,
             };
             for table in 0..scope.n {
                 if let Some(index) = scan_indexes[table + 1].as_ref() {
@@ -3568,6 +3703,20 @@ pub(super) fn plan_modification<'a>(
         plan.nodes[0].total_cost = join.total_cost;
         plan.nodes[0].object_requests = join.object_requests;
         plan.nodes[0].cache_blocks = join.cache_blocks;
+        // A FROM item's own query runs under its Subquery Scan.
+        let items = core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table));
+        for (table, item) in items.enumerate().take(scope.n) {
+            let Some(body) = item.subquery.filter(|body| values_list(body).is_none()) else {
+                continue;
+            };
+            plan = with_derived_plan(
+                plan,
+                scope.names[table],
+                false,
+                plan_derived(storage, txid, body, arena)?,
+                arena,
+            )?;
+        }
         plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         return Ok(plan);
     }
@@ -3924,9 +4073,10 @@ pub(super) fn plan_statement<'a>(
         Stmt::Select(select) => {
             let select = if select.with.iter().any(|cte| cte.dml.is_some()) {
                 return plan_data_modifying_cte_select(select, arena);
-            } else if select.with.is_empty() {
+            } else if select.with.is_empty() && !storage.has_any_view() {
                 select
             } else {
+                // A view is read through its query (its `_RETURN` rule).
                 query::expand_ctes(select, storage, txid, arena)?
             };
             plan_select(storage, txid, select, arena)
@@ -3947,6 +4097,20 @@ pub(super) fn plan_statement<'a>(
                 ..*set_query
             };
             plan_set_query(storage, txid, &planned, arena)
+        }
+        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_)
+            if storage.has_any_view() =>
+        {
+            // The views a statement reads are read through their queries;
+            // its target stays as written.
+            let expanded =
+                query::expand_dml_ctes_schema(statement, &[], storage, txid, None, None, arena)?;
+            plan_modification(
+                storage,
+                txid,
+                rewrite::pull_up_sources(storage, txid, expanded, arena)?,
+                arena,
+            )
         }
         Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
             plan_modification(storage, txid, statement, arena)
@@ -4377,6 +4541,14 @@ fn node_kind(node: &PlanNode) -> NodeKind<'_> {
         "Hash Left Join" => {
             kind.node_type = "Hash Join";
             kind.join_type = Some("Left");
+        }
+        "Hash Right Join" => {
+            kind.node_type = "Hash Join";
+            kind.join_type = Some("Right");
+        }
+        "Hash Full Join" => {
+            kind.node_type = "Hash Join";
+            kind.join_type = Some("Full");
         }
         _ => {}
     }

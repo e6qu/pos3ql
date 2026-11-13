@@ -11,6 +11,7 @@
 use crate::mem::arena::Arena;
 use crate::sql::ast::{QualName, Stmt, TriggerEvents, TriggerLevel, TriggerTiming};
 use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql::guc::SessionReplicationRole;
 use crate::sql::txn::MAX_RULE_NESTING;
 use crate::sql_err;
 use crate::storage::{ResolvedRelation, RewriteEvent, RewriteMode, RuleTarget, Storage};
@@ -102,14 +103,14 @@ pub(crate) fn rules_in_order(
     storage: &Storage,
     target: RuleTarget,
     event: RewriteEvent,
-    replication_apply: bool,
+    role: SessionReplicationRole,
     txid: u32,
     mut visit: impl FnMut(usize, crate::storage::RuleDefinition) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     let mut last: Option<crate::storage::SqlName> = None;
     loop {
         let next = storage
-            .firing_rules_for(target, event, replication_apply, txid)
+            .firing_rules_for(target, event, role, txid)
             .map(|(slot, rule)| (slot, rule.definition_for(txid)))
             .filter(|(_, definition)| {
                 last.is_none_or(|last| definition.name.as_str() > last.as_str())
@@ -143,31 +144,13 @@ pub(crate) fn view_has_instead_trigger(
     })
 }
 
-/// PostgreSQL's refusal to update a view through its own query when a
-/// conditional `INSTEAD` rule would have to be inverted into it.
-fn conditional_instead_view(name: &str, event: RewriteEvent) -> SqlError {
-    let (verb, object, command) = match event {
-        RewriteEvent::Insert => ("insert into", "inserting into", "INSERT"),
-        RewriteEvent::Update => ("update", "updating", "UPDATE"),
-        _ => ("delete from", "deleting from", "DELETE"),
-    };
-    let error = sql_err!(
-        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
-        "cannot {} view \"{}\"",
-        verb,
-        name
-    );
-    let error = crate::sql::error_position::with_detail(
-        error,
-        format_args!("Views with conditional DO INSTEAD rules are not automatically updatable."),
-    );
-    crate::sql::error_position::with_computed_hint(
-        error,
-        format_args!(
-            "To enable {} the view, provide an INSTEAD OF {} trigger or an unconditional ON {} DO INSTEAD rule.",
-            object, command, command
-        ),
-    )
+/// What a write of `event` is, for the view errors PostgreSQL reports.
+pub(crate) const fn view_write(event: RewriteEvent) -> crate::sql::query::ViewWrite {
+    match event {
+        RewriteEvent::Insert => crate::sql::query::ViewWrite::Insert,
+        RewriteEvent::Update => crate::sql::query::ViewWrite::Update,
+        _ => crate::sql::query::ViewWrite::Delete,
+    }
 }
 
 /// The relations and events the walk is inside of, as PostgreSQL's
@@ -180,7 +163,7 @@ struct Events {
 struct Walk<'s, 'v> {
     storage: &'s Storage,
     txid: u32,
-    replication_apply: bool,
+    role: SessionReplicationRole,
     arena: &'s Arena,
     events: Events,
     /// Whether the statement itself has a RETURNING list.
@@ -193,7 +176,7 @@ struct Walk<'s, 'v> {
 pub(crate) fn walk_rewritten(
     storage: &Storage,
     txid: u32,
-    replication_apply: bool,
+    role: SessionReplicationRole,
     statement: &Stmt<'_>,
     arena: &Arena,
     visit: &mut dyn FnMut(RewrittenQuery) -> Result<(), SqlError>,
@@ -202,7 +185,7 @@ pub(crate) fn walk_rewritten(
     let mut walk = Walk {
         storage,
         txid,
-        replication_apply,
+        role,
         arena,
         events: Events {
             entries: [(RuleTarget::Table(0), RewriteEvent::Insert); MAX_RULE_NESTING],
@@ -234,7 +217,7 @@ pub(crate) fn walk_rewritten(
 pub(crate) fn statement_is_rewritten(
     storage: &Storage,
     txid: u32,
-    replication_apply: bool,
+    role: SessionReplicationRole,
     statement: &Stmt<'_>,
 ) -> bool {
     let Some((name, event)) = statement_target(statement) else {
@@ -242,7 +225,7 @@ pub(crate) fn statement_is_rewritten(
     };
     match storage.resolve_relation(name.schema, name.name, txid) {
         Some(ResolvedRelation::Table(slot)) => storage
-            .firing_rules_for(RuleTarget::Table(slot as u16), event, replication_apply, txid)
+            .firing_rules_for(RuleTarget::Table(slot as u16), event, role, txid)
             .next()
             .is_some(),
         Some(ResolvedRelation::View(_)) => true,
@@ -273,24 +256,17 @@ impl Walk<'_, '_> {
         let mut instead = false;
         let mut qualified = false;
         let mut returning_rules = 0usize;
-        rules_in_order(
-            storage,
-            target,
-            event,
-            self.replication_apply,
-            txid,
-            |_, definition| {
-                if definition.mode == RewriteMode::Instead {
-                    if definition.condition.is_some() {
-                        qualified = true;
-                    } else {
-                        instead = true;
-                    }
+        rules_in_order(storage, target, event, self.role, txid, |_, definition| {
+            if definition.mode == RewriteMode::Instead {
+                if definition.condition.is_some() {
+                    qualified = true;
+                } else {
+                    instead = true;
                 }
-                returning_rules += usize::from(definition.returning_action.is_some());
-                Ok(())
-            },
-        )?;
+            }
+            returning_rules += usize::from(definition.returning_action.is_some());
+            Ok(())
+        })?;
         // Only the statement's own RETURNING list is routed through a
         // rule's; PostgreSQL drops the lists of the actions it rewrites.
         let returning = self.returning && self.events.depth == 0;
@@ -308,7 +284,10 @@ impl Walk<'_, '_> {
                 if !instead && !view_has_instead_trigger(storage, view, event, txid) =>
             {
                 if qualified {
-                    return Err(conditional_instead_view(name, event));
+                    return Err(crate::sql::query::conditional_instead_view_error(
+                        name,
+                        view_write(event),
+                    ));
                 }
                 let view_name = storage.view(view).name_for(txid);
                 let view_schema = storage.view(view).schema_for(txid);
@@ -320,6 +299,7 @@ impl Walk<'_, '_> {
                     },
                     txid,
                     self.arena,
+                    view_write(event),
                 )?
                 .expect("a view resolves as a view");
                 let base = storage
@@ -345,17 +325,10 @@ impl Walk<'_, '_> {
         }
         let has_actions = base.is_some() || {
             let mut any = false;
-            rules_in_order(
-                storage,
-                target,
-                event,
-                self.replication_apply,
-                txid,
-                |_, definition| {
-                    any |= definition.action_sql().next().is_some();
-                    Ok(())
-                },
-            )?;
+            rules_in_order(storage, target, event, self.role, txid, |_, definition| {
+                any |= definition.action_sql().next().is_some();
+                Ok(())
+            })?;
             any
         };
         if has_actions {
@@ -424,8 +397,8 @@ impl Walk<'_, '_> {
         let storage = self.storage;
         let txid = self.txid;
         let arena = self.arena;
-        let replication_apply = self.replication_apply;
-        rules_in_order(storage, target, event, replication_apply, txid, |slot, definition| {
+        let role = self.role;
+        rules_in_order(storage, target, event, role, txid, |slot, definition| {
             let source = match (definition.mode, definition.condition.is_some()) {
                 (RewriteMode::Instead, true) => QuerySource::QualifiedInsteadRule,
                 (RewriteMode::Instead, false) => QuerySource::InsteadRule,
@@ -474,7 +447,7 @@ impl Walk<'_, '_> {
 pub(crate) fn check_with_query(
     storage: &Storage,
     txid: u32,
-    replication_apply: bool,
+    role: SessionReplicationRole,
     statement: &Stmt<'_>,
     arena: &Arena,
 ) -> Result<(), SqlError> {
@@ -482,27 +455,20 @@ pub(crate) fn check_with_query(
     let mut first = None;
     let mut conditional = false;
     let mut also = false;
-    walk_rewritten(
-        storage,
-        txid,
-        replication_apply,
-        statement,
-        arena,
-        &mut |query| {
-            count += 1;
-            first.get_or_insert(query.command);
-            // PostgreSQL names the first query that came from a qualified
-            // INSTEAD or an ALSO rule.
-            if !conditional && !also {
-                match query.source {
-                    QuerySource::QualifiedInsteadRule => conditional = true,
-                    QuerySource::NonInsteadRule => also = true,
-                    _ => {}
-                }
+    walk_rewritten(storage, txid, role, statement, arena, &mut |query| {
+        count += 1;
+        first.get_or_insert(query.command);
+        // PostgreSQL names the first query that came from a qualified
+        // INSTEAD or an ALSO rule.
+        if !conditional && !also {
+            match query.source {
+                QuerySource::QualifiedInsteadRule => conditional = true,
+                QuerySource::NonInsteadRule => also = true,
+                _ => {}
             }
-            Ok(())
-        },
-    )?;
+        }
+        Ok(())
+    })?;
     let unsupported = |what: &str| {
         sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,

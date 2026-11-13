@@ -12,11 +12,50 @@ struct Candidate {
     selected: RoutineCallSelection,
     rank: usize,
     argument_oids: [i32; MAX_ROUTINE_ARGUMENTS],
-    argument_names: [SqlName; MAX_ROUTINE_ARGUMENTS],
+    names: CandidateNames,
     defaulted: [bool; MAX_ROUTINE_ARGUMENTS],
     count: usize,
     variadic_element: Option<i32>,
     is_procedure: bool,
+}
+
+/// Where a candidate's parameter names are read when a call names its
+/// arguments. Resolution moves candidates many times per call, so they do
+/// not carry the names themselves.
+#[derive(Clone, Copy)]
+enum CandidateNames {
+    Builtin(&'static [&'static str]),
+    Stored { slot: usize, include_outputs: bool },
+}
+
+/// The parameter names of the stored routine in `slot`, in candidate order.
+fn stored_parameter_names(
+    storage: &Storage,
+    slot: usize,
+    transaction: u32,
+    include_outputs: bool,
+) -> Option<[SqlName; MAX_ROUTINE_ARGUMENTS]> {
+    let signature = {
+        let catalog = storage
+            .routines
+            .lock()
+            .expect("routine catalog lock poisoned");
+        RoutineInputSignature::from_definition(catalog.get(slot)?, transaction)
+    };
+    let mut names = [SqlName::EMPTY; MAX_ROUTINE_ARGUMENTS];
+    let count = if include_outputs {
+        signature.parameter_count
+    } else {
+        signature.argument_count
+    };
+    for (index, name) in names.iter_mut().enumerate().take(count) {
+        *name = if include_outputs {
+            signature.parameters[index].name
+        } else {
+            signature.parameter_for_input(index)?.name
+        };
+    }
+    Some(names)
 }
 
 pub(super) fn map_parameter_positions<'parameter>(
@@ -95,7 +134,10 @@ impl Candidate {
             selected: RoutineCallSelection::Stored(slot),
             rank,
             argument_oids: [0; MAX_ROUTINE_ARGUMENTS],
-            argument_names: [SqlName::EMPTY; MAX_ROUTINE_ARGUMENTS],
+            names: CandidateNames::Stored {
+                slot,
+                include_outputs,
+            },
             defaulted: [false; MAX_ROUTINE_ARGUMENTS],
             count: if include_outputs {
                 signature.parameter_count
@@ -118,7 +160,6 @@ impl Candidate {
             };
             candidate.argument_oids[index] =
                 storage.routine_argument_oid(&argument, transaction)?;
-            candidate.argument_names[index] = parameter.name;
             candidate.defaulted[index] = parameter.mode.has_default();
             if matches!(parameter.mode, RoutineParameterMode::Variadic { .. }) {
                 candidate.variadic_element = Some(match argument.polymorphic_type() {
@@ -153,20 +194,13 @@ impl Candidate {
             },
             rank,
             argument_oids: [0; MAX_ROUTINE_ARGUMENTS],
-            argument_names: [SqlName::EMPTY; MAX_ROUTINE_ARGUMENTS],
+            names: CandidateNames::Builtin(names),
             defaulted: [false; MAX_ROUTINE_ARGUMENTS],
             count: arguments.len(),
             variadic_element: signature.variadic_element,
             is_procedure: signature.kind == b'p',
         };
         candidate.argument_oids[..candidate.count].copy_from_slice(arguments);
-        for (index, name) in names.iter().enumerate() {
-            candidate.argument_names[index] = if name.is_empty() {
-                SqlName::EMPTY
-            } else {
-                SqlName::parse(name).expect("registered PostgreSQL parameter name fits")
-            };
-        }
         if include_outputs {
             let mut input = 0;
             for (index, mode) in signature.catalog.modes.iter().enumerate() {
@@ -190,9 +224,6 @@ impl Candidate {
     fn argument_count(&self) -> usize {
         self.count
     }
-    fn parameter_name(&self, index: usize) -> &str {
-        self.argument_names[index].as_str()
-    }
     fn has_default(&self, index: usize) -> bool {
         self.defaulted[index]
     }
@@ -211,6 +242,41 @@ impl Candidate {
 
     fn mapping(
         &self,
+        storage: &Storage,
+        transaction: u32,
+        names: &[Option<&str>],
+        count: usize,
+        explicit_variadic: bool,
+    ) -> Option<[u8; MAX_ROUTINE_ARGUMENTS]> {
+        match self.names {
+            CandidateNames::Builtin(written) => self.map_names(
+                &|index| written.get(index).copied().unwrap_or(""),
+                names,
+                count,
+                explicit_variadic,
+            ),
+            // Only a call that names its arguments reads parameter names.
+            CandidateNames::Stored { .. } if names.iter().all(Option::is_none) => {
+                self.map_names(&|_| "", names, count, explicit_variadic)
+            }
+            CandidateNames::Stored {
+                slot,
+                include_outputs,
+            } => {
+                let stored = stored_parameter_names(storage, slot, transaction, include_outputs)?;
+                self.map_names(
+                    &|index| stored[index].as_str(),
+                    names,
+                    count,
+                    explicit_variadic,
+                )
+            }
+        }
+    }
+
+    fn map_names<'name>(
+        &self,
+        name: &dyn Fn(usize) -> &'name str,
         names: &[Option<&str>],
         count: usize,
         explicit_variadic: bool,
@@ -218,7 +284,7 @@ impl Candidate {
         map_parameter_positions(
             self.argument_count(),
             self.variadic_index(),
-            |index| Some((self.parameter_name(index), self.has_default(index))),
+            |index| Some((name(index), self.has_default(index))),
             names,
             count,
             explicit_variadic,
@@ -233,7 +299,9 @@ impl Candidate {
         actual: &[i32],
         explicit_variadic: bool,
     ) -> bool {
-        let Some(mapping) = self.mapping(names, actual.len(), explicit_variadic) else {
+        let Some(mapping) =
+            self.mapping(storage, transaction, names, actual.len(), explicit_variadic)
+        else {
             return false;
         };
         let mut binding = PolymorphicBinding::EMPTY;
@@ -266,7 +334,7 @@ impl Candidate {
         explicit_variadic: bool,
     ) -> (usize, usize, usize) {
         let mapping = self
-            .mapping(names, actual.len(), explicit_variadic)
+            .mapping(storage, transaction, names, actual.len(), explicit_variadic)
             .expect("admitted input mapping");
         let mut exact = 0;
         let mut preferred = 0;
@@ -289,15 +357,18 @@ impl Candidate {
 
     fn same_expanded_signature(
         &self,
+        storage: &Storage,
+        transaction: u32,
         other: &Self,
         names: &[Option<&str>],
         count: usize,
         explicit_variadic: bool,
     ) -> bool {
-        let Some(left) = self.mapping(names, count, explicit_variadic) else {
+        let Some(left) = self.mapping(storage, transaction, names, count, explicit_variadic) else {
             return false;
         };
-        let Some(right) = other.mapping(names, count, explicit_variadic) else {
+        let Some(right) = other.mapping(storage, transaction, names, count, explicit_variadic)
+        else {
             return false;
         };
         left[..count]
@@ -453,7 +524,9 @@ impl Storage {
         explicit_variadic: bool,
     ) -> Option<[u8; MAX_ROUTINE_ARGUMENTS]> {
         let signature = crate::sql::catalog::builtin_callable_by_oid(routine_oid)?;
-        Candidate::builtin(0, signature, false).mapping(
+        let written = signature.argument_names;
+        Candidate::builtin(0, signature, false).map_names(
+            &|index| written.get(index).copied().unwrap_or(""),
             argument_names,
             written_count,
             explicit_variadic,
@@ -501,7 +574,13 @@ impl Storage {
         if !candidate.accepts(self, txid, argument_names, actual_oids, explicit_variadic) {
             return None;
         }
-        let mapping = candidate.mapping(argument_names, actual_oids.len(), explicit_variadic)?;
+        let mapping = candidate.mapping(
+            self,
+            txid,
+            argument_names,
+            actual_oids.len(),
+            explicit_variadic,
+        )?;
         let mut declared = [oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
         for (input, mapped) in declared.iter_mut().zip(mapping).take(actual_oids.len()) {
             *input = candidate.parameter_oid(usize::from(mapped), !explicit_variadic);
@@ -602,7 +681,13 @@ impl Storage {
             return Some(signature.result_oid);
         };
         let candidate = Candidate::builtin(0, signature, false);
-        let mapping = candidate.mapping(argument_names, argument_oids.len(), explicit_variadic)?;
+        let mapping = candidate.mapping(
+            self,
+            transaction,
+            argument_names,
+            argument_oids.len(),
+            explicit_variadic,
+        )?;
         let mut binding = PolymorphicBinding::EMPTY;
         for (actual, input) in argument_oids.iter().zip(mapping) {
             let expected = candidate.parameter_oid(usize::from(input), !explicit_variadic);
@@ -638,7 +723,13 @@ impl Storage {
         let routine = self.routine_for(slot, txid);
         let signature = RoutineInputSignature::from_definition(&routine, txid);
         let candidate = Candidate::stored(self, txid, slot, 0, &signature, true)?;
-        let mapping = candidate.mapping(argument_names, actual_oids.len(), explicit_variadic)?;
+        let mapping = candidate.mapping(
+            self,
+            txid,
+            argument_names,
+            actual_oids.len(),
+            explicit_variadic,
+        )?;
         let mut expected = [oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
         for (index, actual) in actual_oids.iter().enumerate() {
             let declared = candidate.parameter_oid(usize::from(mapping[index]), !explicit_variadic);
@@ -691,6 +782,8 @@ impl Storage {
                             && other.variadic_index().is_none()
                             && candidate.variadic_index().is_some())
                     && candidate.same_expanded_signature(
+                        self,
+                        transaction,
                         &other,
                         argument_names,
                         argument_oids.len(),
@@ -735,7 +828,13 @@ impl Storage {
             let mut string = false;
             for candidate in candidates().filter(|candidate| competitive(candidate)) {
                 let mapping = candidate
-                    .mapping(argument_names, argument_oids.len(), explicit_variadic)
+                    .mapping(
+                        self,
+                        transaction,
+                        argument_names,
+                        argument_oids.len(),
+                        explicit_variadic,
+                    )
                     .expect("admitted input mapping");
                 let expected =
                     candidate.parameter_oid(usize::from(mapping[index]), !explicit_variadic);
@@ -757,7 +856,13 @@ impl Storage {
                     .filter(|candidate| competitive(candidate))
                     .any(|candidate| {
                         let mapping = candidate
-                            .mapping(argument_names, argument_oids.len(), explicit_variadic)
+                            .mapping(
+                                self,
+                                transaction,
+                                argument_names,
+                                argument_oids.len(),
+                                explicit_variadic,
+                            )
                             .expect("admitted input mapping");
                         let expected = candidate
                             .parameter_oid(usize::from(mapping[index]), !explicit_variadic);
@@ -765,13 +870,24 @@ impl Storage {
                     });
             }
         }
-        let mut selected = RoutineCallSelection::Absent;
-        let mut selected_procedure = false;
-        for candidate in candidates().filter(|candidate| competitive(candidate)) {
+        // `func_select_candidate`: when every unknown input resolved to one
+        // category, keep the candidates that match it; when none match, or
+        // a conflict left some input unresolved, all candidates stay.
+        let resolved = argument_oids
+            .iter()
+            .enumerate()
+            .all(|(index, actual)| *actual != oid::UNKNOWN || unknown_categories[index].is_some());
+        let matches_unknowns = |candidate: &Candidate| {
             let mapping = candidate
-                .mapping(argument_names, argument_oids.len(), explicit_variadic)
+                .mapping(
+                    self,
+                    transaction,
+                    argument_names,
+                    argument_oids.len(),
+                    explicit_variadic,
+                )
                 .expect("admitted input mapping");
-            if argument_oids.iter().enumerate().any(|(index, actual)| {
+            !argument_oids.iter().enumerate().any(|(index, actual)| {
                 if *actual != oid::UNKNOWN {
                     return false;
                 }
@@ -780,15 +896,51 @@ impl Storage {
                 unknown_categories[index]
                     .is_some_and(|chosen| category(self, transaction, expected) != chosen)
                     || unknown_preferred[index] && !preferred_type(expected)
-            }) {
-                continue;
+            })
+        };
+        let filtered = resolved
+            && candidates()
+                .any(|candidate| competitive(&candidate) && matches_unknowns(&candidate));
+        let remaining = |candidate: &Candidate| {
+            competitive(candidate) && (!filtered || matches_unknowns(candidate))
+        };
+        let mut remaining_candidates = candidates().filter(|candidate| remaining(candidate));
+        let mut chosen = remaining_candidates.next();
+        if chosen.is_some() && remaining_candidates.next().is_some() {
+            chosen = None;
+            // Last gasp: with known and unknown inputs whose known types all
+            // agree, treat the unknowns as that type and accept a unique
+            // implicitly coercible candidate.
+            let mut known = argument_oids
+                .iter()
+                .copied()
+                .filter(|actual| *actual != oid::UNKNOWN);
+            if let Some(known_type) = known.next()
+                && known.all(|actual| actual == known_type)
+                && argument_oids.contains(&oid::UNKNOWN)
+            {
+                let assumed = [known_type; MAX_ROUTINE_ARGUMENTS];
+                let assumed = &assumed[..argument_oids.len()];
+                let mut coercible = candidates().filter(|candidate| {
+                    remaining(candidate)
+                        && candidate.accepts(
+                            self,
+                            transaction,
+                            argument_names,
+                            assumed,
+                            explicit_variadic,
+                        )
+                });
+                chosen = coercible.next().filter(|_| coercible.next().is_none());
             }
-            if selected != RoutineCallSelection::Absent {
+            if chosen.is_none() {
                 return RoutineCallSelection::Ambiguous;
             }
-            selected = candidate.selected();
-            selected_procedure = candidate.is_procedure;
         }
+        let (selected, selected_procedure) = chosen
+            .map_or((RoutineCallSelection::Absent, false), |candidate| {
+                (candidate.selected(), candidate.is_procedure)
+            });
         if selected != RoutineCallSelection::Absent
             && matches!(kind, RoutineCallKind::Procedure) != selected_procedure
         {

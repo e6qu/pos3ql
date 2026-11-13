@@ -753,10 +753,12 @@ fn a_prepared_partition_move_keeps_its_marker_across_restart() {
         let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
         writer.success(
             &mut engine,
-            &format!(
-                "{PARTITIONS}; INSERT INTO pt VALUES (1, 1, 1), (2, 1, 2); \
-                 BEGIN; UPDATE pt SET k = 2 WHERE id = 1; PREPARE TRANSACTION 'move'"
-            ),
+            &format!("{PARTITIONS}; INSERT INTO pt VALUES (1, 1, 1), (2, 1, 2)"),
+            false,
+        );
+        writer.success(
+            &mut engine,
+            "BEGIN; UPDATE pt SET k = 2 WHERE id = 1; PREPARE TRANSACTION 'move'",
             false,
         );
         drop(writer);

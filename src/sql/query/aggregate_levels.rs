@@ -46,6 +46,9 @@ enum Clause {
     FunctionInFrom,
     FromSubquery,
     Filter,
+    /// A clause of a data-modifying statement, by PostgreSQL's name for it
+    /// (`UPDATE`, `RETURNING`, `VALUES`).
+    DataModification(&'static str),
 }
 
 impl Clause {
@@ -60,6 +63,7 @@ impl Clause {
             Self::FunctionInFrom => Some("functions in FROM"),
             Self::FromSubquery => Some("FROM clause of their own query level"),
             Self::Filter => Some("FILTER"),
+            Self::DataModification(clause) => Some(clause),
             Self::Target | Self::Having | Self::OrderBy | Self::DistinctOn => None,
         }
     }
@@ -306,6 +310,62 @@ pub(super) fn assign_aggregate_levels<'a>(
         Ok(rewritten) => Ok(rewritten),
         Err(Failure(error)) => Err(error),
     }
+}
+
+/// Raises PostgreSQL's placement errors for aggregates in the clauses of a
+/// data-modifying statement whose relations `target` lists: each clause is a
+/// `WHERE` (`None`) or a named statement clause, where no aggregate of the
+/// statement's own level may appear, whether written there or in a
+/// subquery whose aggregate reads only the statement's columns.
+pub(crate) fn check_data_modification_aggregates<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    target: &'a FromClause<'a>,
+    clauses: &[(Option<&'static str>, &'a Expr<'a>)],
+) -> Result<(), SqlError> {
+    let analysis = Analysis {
+        storage,
+        txid,
+        arena,
+    };
+    if !clauses
+        .iter()
+        .any(|(_, expression)| analysis.expression_needs_analysis(expression, true))
+    {
+        return Ok(());
+    }
+    let mark = arena.mark();
+    let result = (|| {
+        let scope;
+        let columns = match QueryScope::resolve_schema(storage, target, txid, arena, None) {
+            Ok(resolved) => {
+                scope = resolved;
+                Columns::Rows(&scope)
+            }
+            Err(_) => Columns::Unresolved,
+        };
+        let level = Level {
+            columns,
+            clause: Clause::Target,
+            depth: 0,
+            parent: None,
+        };
+        for &(clause, expression) in clauses {
+            let clause = clause.map_or(Clause::Where, Clause::DataModification);
+            let mut reach = Reach::default();
+            if let Err(Failure(error)) =
+                analysis.expression(expression, &level.in_clause(clause), &mut reach)
+            {
+                return Err(error);
+            }
+        }
+        Ok(())
+    })();
+    // SAFETY: the analysis only checks; nothing allocated since `mark` is
+    // kept.
+    unsafe { arena.rewind_to(mark) };
+    result
 }
 
 /// Visits each aggregate call that a nested query of `expression` reads from

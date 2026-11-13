@@ -7,6 +7,8 @@ use std::sync::Arc;
 pub(super) struct LoopRows {
     bytes: SharedSlice<u8>,
     count: usize,
+    /// The query's column count, which a scalar variable is checked against.
+    width: usize,
 }
 
 impl LoopRows {
@@ -56,11 +58,16 @@ impl LoopRows {
         Ok(Self {
             bytes: bytes.freeze(),
             count: rows.values.len(),
+            width: rows.width,
         })
     }
 
     pub(super) fn len(&self) -> usize {
         self.count
+    }
+
+    pub(super) fn width(&self) -> usize {
+        self.width
     }
 
     pub(super) fn is_empty(&self) -> bool {

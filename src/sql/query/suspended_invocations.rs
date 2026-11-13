@@ -159,11 +159,13 @@ mod ownership_tests {
                         super::super::super::types::RecordField {
                             name: "nullable_domain",
                             type_oid: 123456,
+                            type_mod: -1,
                             value: Datum::Null,
                         },
                         super::super::super::types::RecordField {
                             name: "payload",
                             type_oid: super::super::super::types::oid::TEXT,
+                            type_mod: -1,
                             value: Datum::Text(text),
                         },
                     ];

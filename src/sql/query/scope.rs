@@ -88,6 +88,235 @@ fn catalog_scan(
     }
 }
 
+/// Synthesized catalog rows in the tagged row encoding scans read.
+fn encode_catalog_rows<'a>(
+    synth: &crate::sql::catalog::SynthTable<'a>,
+    arena: &'a Arena,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    const EMPTY: &[u8] = &[];
+    let encoded = arena
+        .alloc_slice_with(synth.rows.len(), |_| EMPTY)
+        .map_err(|_| arena_full())?;
+    for (i, r) in synth.rows.iter().enumerate() {
+        if r.len() > MAX_COLUMNS {
+            return Err(arena_full());
+        }
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        for (column, value) in r.iter().copied().enumerate() {
+            // Catalog builders may compute identifiers as signed integers,
+            // but tagged rows must carry the advertised oid representation
+            // before joins and expression evaluation.
+            values[column] = if synth.def.columns[column].ctype == ColType::Oid {
+                super::super::eval::cast_to(value, ColType::Oid, arena)?
+            } else {
+                value
+            };
+        }
+        encoded[i] = crate::sql::exec::encode_projected_pub(&values[..r.len()], arena)?;
+    }
+    Ok(encoded)
+}
+
+/// Builds, at the start of a query that calls a user routine or of a data
+/// change, the image of every `pg_catalog` relation it reads, directly or
+/// through views, under the statement's catalog snapshot: a routine or
+/// trigger that changes the catalog leaves the statement's own scans reading
+/// the catalog as it began, as PostgreSQL's statement snapshot does. Other
+/// statements' scans build the same images when they first read a relation,
+/// which nothing they run can have changed.
+pub(crate) fn prebuild_statement_catalog_images(
+    statement: &crate::sql::ast::Stmt<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    // Only a statement that can run a user routine can change the catalog
+    // before its own scans read it. A plain query is judged by its calls; a
+    // compound query or a data change (whose triggers run routines) always
+    // takes its images first.
+    use crate::sql::ast::Stmt;
+    match statement {
+        Stmt::Select(select)
+            if super::cte::select_contains_function(select, &|name, arguments| {
+                storage.has_callable_candidate(name, arguments, txid)
+            }) => {}
+        Stmt::SetQuery(_)
+        | Stmt::With { .. }
+        | Stmt::Insert(_)
+        | Stmt::Update(_)
+        | Stmt::Delete(_)
+        | Stmt::Merge(_) => {}
+        _ => return Ok(()),
+    }
+    super::catalog_images::pin_statement_images();
+    prebuild_statement_relations(statement, storage, txid, 0, arena)
+}
+
+/// Builds the images `statement` reads and those read by the non-volatile
+/// SQL functions it calls, which run under the statement's snapshot.
+fn prebuild_statement_relations(
+    statement: &crate::sql::ast::Stmt<'_>,
+    storage: &Storage,
+    txid: u32,
+    depth: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let path = storage.path();
+    let mut failure = None;
+    super::cte::statement_relations_of(statement, &mut |table| {
+        if failure.is_none()
+            && let Err(error) = prebuild_relation(table, &path, storage, txid, depth, arena)
+        {
+            failure = Some(error);
+        }
+        0
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if depth >= MAX_PREBUILD_VIEW_DEPTH {
+        return Ok(());
+    }
+    let failure = core::cell::RefCell::new(None);
+    let call = |name: &str, arity: usize| {
+        if failure.borrow().is_none()
+            && let Err(error) = prebuild_function_bodies(name, arity, storage, txid, depth, arena)
+        {
+            *failure.borrow_mut() = Some(error);
+        }
+        // Visit every call.
+        false
+    };
+    super::cte::statement_contains_function(statement, &call);
+    failure.into_inner().map_or(Ok(()), Err)
+}
+
+/// Builds the images read by the bodies of the non-volatile SQL functions
+/// that a call of `name` with `arity` arguments could select.
+fn prebuild_function_bodies(
+    name: &str,
+    arity: usize,
+    storage: &Storage,
+    txid: u32,
+    depth: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let mut bodies = crate::mem::arena::ArenaList::new(arena);
+    storage.visit_stable_sql_function_bodies(name, arity, txid, &mut |kind, body| {
+        let text = match kind {
+            crate::storage::RoutineBodyKind::Return => arena
+                .alloc_str_display(format_args!("SELECT {body}"))
+                .map_err(|_| arena_full())?,
+            crate::storage::RoutineBodyKind::String | crate::storage::RoutineBodyKind::Atomic => {
+                arena.alloc_str(body).map_err(|_| arena_full())?
+            }
+        };
+        bodies.push(text).map_err(|_| arena_full())
+    })?;
+    for &body in bodies.as_slice() {
+        // A body that does not parse fails when the function is called.
+        let Ok(mut parser) = crate::sql::parser::Parser::new(body, arena) else {
+            continue;
+        };
+        while let Ok(Some(statement)) = parser.next_stmt() {
+            prebuild_statement_relations(&statement, storage, txid, depth + 1, arena)?;
+        }
+    }
+    Ok(())
+}
+
+const MAX_PREBUILD_VIEW_DEPTH: usize = 16;
+
+fn prebuild_relation(
+    table: &TableRef<'_>,
+    path: &crate::storage::PathContext,
+    storage: &Storage,
+    txid: u32,
+    depth: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    if table.cte.is_some() || table.subquery.is_some() || table.is_function_source() {
+        return Ok(());
+    }
+    match storage.resolve_relation_under(path, table.schema, table.table, txid) {
+        Some(crate::storage::ResolvedRelation::Catalog) => {
+            let Some(namespace) = path.catalog_namespace(table.schema, table.table) else {
+                return Ok(());
+            };
+            use crate::sql::catalog_snapshot::CatalogScan;
+            let mut sequential_rows = None;
+            for scan in [CatalogScan::Sequential, CatalogScan::Index] {
+                let Some(key) = super::catalog_images::ImageKey::new(
+                    storage,
+                    namespace,
+                    table.table,
+                    scan,
+                    txid,
+                ) else {
+                    return Ok(());
+                };
+                if let Some(rows) = super::catalog_images::cached(arena, key) {
+                    sequential_rows = Some(rows);
+                    continue;
+                }
+                // Without committed history to restore, both scans read the
+                // same rows.
+                if scan == CatalogScan::Index
+                    && storage.commit_snapshot() == u64::MAX
+                    && let Some(rows) = sequential_rows
+                {
+                    super::catalog_images::share(arena, key, rows)?;
+                    continue;
+                }
+                let mark = arena.mark();
+                let retained = crate::sql::catalog::synthesize(
+                    storage,
+                    Some(namespace),
+                    table.table,
+                    txid,
+                    scan,
+                    arena,
+                )
+                .and_then(|synth| encode_catalog_rows(&synth, arena))
+                .and_then(|encoded| super::catalog_images::retain(arena, key, encoded));
+                // SAFETY: the image was copied into the catalog image arena;
+                // nothing allocated since `mark` is referenced.
+                unsafe { arena.rewind_to(mark) };
+                sequential_rows = Some(retained?);
+            }
+            Ok(())
+        }
+        Some(crate::storage::ResolvedRelation::View(slot)) if depth < MAX_PREBUILD_VIEW_DEPTH => {
+            let query = storage.snapshot_view_query(slot, txid, arena)?;
+            let sql = arena
+                .alloc_str(query.sql.as_str())
+                .map_err(|_| arena_full())?;
+            let user = crate::sql::eval::funcs::system::session_user_owned();
+            let view_path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
+            let body = super::parse_stored_query(
+                sql,
+                query.input_source.unwrap_or(sql),
+                storage,
+                txid,
+                query.dependencies.view(),
+                arena,
+            )?;
+            let mut failure = None;
+            super::cte::select_relations(body, &mut |inner| {
+                if failure.is_none()
+                    && let Err(error) =
+                        prebuild_relation(inner, &view_path, storage, txid, depth + 1, arena)
+                {
+                    failure = Some(error);
+                }
+                0
+            });
+            failure.map_or(Ok(()), Err)
+        }
+        _ => Ok(()),
+    }
+}
+
 /// 42P10 for a column alias list longer than its table's columns. The
 /// query an `INSERT` with subscripted targets reads instead reports
 /// PostgreSQL's `INSERT has more target columns than expressions` at the
@@ -204,12 +433,16 @@ pub(super) struct UsingAlias<'d> {
 }
 
 /// A column name resolved against a query scope: a plain table column
-/// (table index, column index), or a USING/NATURAL-merged join column
-/// (index into `QueryScope::merged`).
+/// (table index, column index), a USING/NATURAL-merged join column (index
+/// into `QueryScope::merged`), or the `tableoid` system column of a stored
+/// relation's FROM item (its table index): the oid of the physical table
+/// that holds the row, which for a partition or inheritance tree is the
+/// leaf the row was read from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ResolvedColumn {
     Table(usize, usize),
     Merged(usize),
+    TableOid(usize),
 }
 
 pub(crate) fn materialized_definition<'a>(
@@ -563,7 +796,9 @@ impl<'a> DerivedTableOuter<'_, '_, '_, 'a> {
             .siblings
             .find_column_in(0..self.preceding, qualifier, name)
         {
-            Ok(ResolvedColumn::Table(table, _)) => self.reachable(table),
+            Ok(ResolvedColumn::Table(table, _) | ResolvedColumn::TableOid(table)) => {
+                self.reachable(table)
+            }
             Ok(ResolvedColumn::Merged(merged)) => self.siblings.merged[merged]
                 .parts
                 .iter()
@@ -744,9 +979,10 @@ impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
         }
     }
 
-    fn statement_subqueries(&self) -> &'a [crate::sql::eval::DeferredSubquery<'a>] {
+    fn statement_subqueries(&self) -> crate::sql::eval::StatementScope<'a> {
         self.enclosing
-            .map_or(&[], |enclosing| enclosing.statement_subqueries())
+            .map(|enclosing| enclosing.statement_subqueries())
+            .unwrap_or_default()
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
@@ -1125,7 +1361,7 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
             ResolvedColumn::Table(table, column) => {
                 self.0.defs.get(table)?.columns.get(column)?.user_type
             }
-            ResolvedColumn::Merged(_) => None,
+            ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_) => None,
         }
     }
 
@@ -1548,7 +1784,7 @@ impl<'d> QueryScope<'d> {
         for index in 0..inner.star_columns() {
             origins
                 .push(match inner.star_entry(index) {
-                    ResolvedColumn::Merged(_) => None,
+                    ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_) => None,
                     ResolvedColumn::Table(table, column) => Some(
                         arena
                             .alloc_str(inner.column_reference_name(table, column).0)
@@ -1646,7 +1882,7 @@ impl<'d> QueryScope<'d> {
         let mut origins = ArenaList::new(arena);
         for index in 0..visible {
             let origin = match inner.star_entry(index) {
-                ResolvedColumn::Merged(_) => None,
+                ResolvedColumn::Merged(_) | ResolvedColumn::TableOid(_) => None,
                 ResolvedColumn::Table(inner_table, inner_column) => {
                     let (qualifier, name) = inner.column_reference_name(inner_table, inner_column);
                     let columns = self
@@ -2466,7 +2702,13 @@ impl<'d> QueryScope<'d> {
                     tref.table
                 )
             })?;
-        let synth = if materialize {
+        let image_key = materialize
+            .then(|| {
+                super::catalog_images::ImageKey::new(storage, namespace, tref.table, scan, txid)
+            })
+            .flatten();
+        let retained_rows = image_key.and_then(|key| super::catalog_images::cached(arena, key));
+        let synth = if materialize && retained_rows.is_none() {
             crate::sql::catalog::synthesize(
                 storage,
                 Some(namespace),
@@ -2502,29 +2744,14 @@ impl<'d> QueryScope<'d> {
             .alloc_slice_with(columns.len(), |column| columns[column].name.as_str())
             .map_err(|_| arena_full())?;
         let image = self.defs.images.retain_relation(&definition)?;
-        let rows: &'a [&'a [u8]] = if materialize {
-            const EMPTY: &[u8] = &[];
-            let encoded = arena
-                .alloc_slice_with(synth.rows.len(), |_| EMPTY)
-                .map_err(|_| arena_full())?;
-            for (i, r) in synth.rows.iter().enumerate() {
-                if r.len() > MAX_COLUMNS {
-                    return Err(arena_full());
-                }
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                for (column, value) in r.iter().copied().enumerate() {
-                    // Catalog builders may compute identifiers as signed
-                    // integers, but tagged rows must carry the advertised oid
-                    // representation before joins and expression evaluation.
-                    values[column] = if synth.def.columns[column].ctype == ColType::Oid {
-                        super::super::eval::cast_to(value, ColType::Oid, arena)?
-                    } else {
-                        value
-                    };
-                }
-                encoded[i] = crate::sql::exec::encode_projected_pub(&values[..r.len()], arena)?;
+        let rows: &'a [&'a [u8]] = if let Some(rows) = retained_rows {
+            rows
+        } else if materialize {
+            let encoded = encode_catalog_rows(&synth, arena)?;
+            match image_key {
+                Some(key) => super::catalog_images::retain(arena, key, encoded)?,
+                None => encoded,
             }
-            encoded
         } else {
             &[]
         };
@@ -3082,6 +3309,12 @@ impl<'d> QueryScope<'d> {
                 let (first_part, prior_parts) = match left {
                     ResolvedColumn::Table(t, c) => (Some((t, c)), &[][..]),
                     ResolvedColumn::Merged(m) => (None, self.merged[m].parts),
+                    ResolvedColumn::TableOid(_) => {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "a join's output has a system column"
+                        ));
+                    }
                 };
                 let parts = scratch_arena
                     .alloc_slice_with(
@@ -3178,6 +3411,7 @@ impl<'d> QueryScope<'d> {
         match entry {
             ResolvedColumn::Table(t, c) => self.defs.column_name(t, c),
             ResolvedColumn::Merged(m) => self.merged[m].name,
+            ResolvedColumn::TableOid(_) => "tableoid",
         }
     }
 
@@ -3186,6 +3420,7 @@ impl<'d> QueryScope<'d> {
         match entry {
             ResolvedColumn::Table(t, c) => self.defs.get(t).expect("resolved").columns[c].ctype,
             ResolvedColumn::Merged(m) => self.merged[m].ctype,
+            ResolvedColumn::TableOid(_) => ColType::Oid,
         }
     }
 
@@ -3202,6 +3437,7 @@ impl<'d> QueryScope<'d> {
                     self.defs.get(table).expect("resolved").columns[column].collation
                 })
                 .unwrap_or(crate::sql::ast::Collation::None),
+            ResolvedColumn::TableOid(_) => crate::sql::ast::Collation::None,
         }
     }
 
@@ -3286,6 +3522,12 @@ impl<'d> QueryScope<'d> {
                     name: self.defs.column_name(t, c),
                 })
                 .map_err(|_| arena_full())?),
+            ResolvedColumn::TableOid(t) => Ok(&*arena
+                .alloc(Expr::Column {
+                    qualifier: Some(self.names[t]),
+                    name: "tableoid",
+                })
+                .map_err(|_| arena_full())?),
             ResolvedColumn::Merged(m) => {
                 let mc = &self.merged[m];
                 let args = arena
@@ -3340,6 +3582,17 @@ impl<'d> QueryScope<'d> {
         };
         match entry {
             ResolvedColumn::Table(table, index) => column(table, index),
+            ResolvedColumn::TableOid(table) => {
+                let qualifier = arena
+                    .alloc_str(self.names[table])
+                    .map_err(|_| arena_full())?;
+                Ok(&*arena
+                    .alloc(Expr::Column {
+                        qualifier: Some(qualifier),
+                        name: "tableoid",
+                    })
+                    .map_err(|_| arena_full())?)
+            }
             ResolvedColumn::Merged(merged) => {
                 let parts = self.merged[merged].parts;
                 let args = arena
@@ -3399,6 +3652,11 @@ impl<'d> QueryScope<'d> {
     /// Whether entry `t` answers to qualifier `q`. A plain qualifier matches
     /// the exposed name; a composed `schema.table` qualifier (a three-part
     /// reference) matches only an unaliased base table of that schema.
+    /// Whether any FROM entry answers to qualifier `q`.
+    pub(crate) fn has_entry_named(&self, q: &str) -> bool {
+        (0..self.n).any(|t| self.entry_answers_to(t, q))
+    }
+
     fn entry_answers_to(&self, t: usize, q: &str) -> bool {
         if self.target_aliases.contains(&q) {
             return t == 0;
@@ -3588,6 +3846,13 @@ impl<'d> QueryScope<'d> {
         self.storage.domain_base_type_for_oid(type_oid, self.txid)
     }
 
+    pub(crate) fn select_common_type(
+        &self,
+        inputs: &[i32],
+    ) -> Result<i32, crate::storage::CommonTypeFailure> {
+        self.storage.select_common_type(inputs, self.txid)
+    }
+
     pub fn func_scalar_type(&self, name: &str) -> Option<ColType> {
         self.func_scalar_column(name)
             .map(|column| self.output_type(column))
@@ -3615,6 +3880,29 @@ impl<'d> QueryScope<'d> {
         self.find_column_among(self.n, qualifier, name)
     }
 
+    /// [`Self::find_column`] for a caller that may still find the column
+    /// elsewhere or discards the error: a missing column's spelling
+    /// suggestion, which compares every visible column name, is built only
+    /// where the error is reported.
+    pub(crate) fn find_column_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ResolvedColumn, SqlError> {
+        self.find_column_among_unsuggested(self.n, qualifier, name)
+    }
+
+    /// [`Self::find_column_among`] without the spelling suggestion.
+    pub(crate) fn find_column_among_unsuggested(
+        &self,
+        visible: usize,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ResolvedColumn, SqlError> {
+        self.find_column_prefix(visible, qualifier, name)
+            .map_err(|error| crate::sql::error_position::column_reference(error, qualifier, name))
+    }
+
     /// [`Self::find_column`] over the first `visible` FROM items only: a
     /// `LATERAL` body reads just the items to its left, never its own or a
     /// later item's columns.
@@ -3624,16 +3912,24 @@ impl<'d> QueryScope<'d> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ResolvedColumn, SqlError> {
-        self.find_column_prefix(visible, qualifier, name)
-            .map_err(|error| {
-                let mut suggestion =
-                    crate::sql::column_suggestion::ColumnSuggestion::new(qualifier, name);
-                self.suggest_columns(&mut suggestion);
-                crate::sql::error_position::with_column_suggestion(
-                    crate::sql::error_position::column_reference(error, qualifier, name),
-                    &suggestion,
-                )
-            })
+        self.find_column_among_unsuggested(visible, qualifier, name)
+            .map_err(|error| self.suggested(error, qualifier, name))
+    }
+
+    /// A missing column's error with the spelling suggestion this scope's
+    /// FROM items offer, as it is reported.
+    pub(crate) fn suggested(
+        &self,
+        error: SqlError,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> SqlError {
+        if error.sqlstate.as_str() != crate::sql::eval::sqlstate::UNDEFINED_COLUMN {
+            return error;
+        }
+        let mut suggestion = crate::sql::column_suggestion::ColumnSuggestion::new(qualifier, name);
+        self.suggest_columns(&mut suggestion);
+        crate::sql::error_position::with_column_suggestion(error, &suggestion)
     }
 
     /// Offers every FROM item, a parenthesized join through its members, to
@@ -3725,7 +4021,14 @@ impl<'d> QueryScope<'d> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ResolvedColumn, SqlError> {
-        self.find_relation_column(items, qualifier, name)
+        self.find_relation_column(items.clone(), qualifier, name)
+            .or_else(|error| {
+                if error.sqlstate == sqlstate::UNDEFINED_COLUMN && name == "tableoid" {
+                    self.find_table_oid(items, qualifier)?.ok_or(error)
+                } else {
+                    Err(error)
+                }
+            })
             .map_err(|error| {
                 if error.sqlstate == sqlstate::UNDEFINED_COLUMN
                     && self.names_system_column(qualifier, name)
@@ -3739,6 +4042,79 @@ impl<'d> QueryScope<'d> {
                     error
                 }
             })
+    }
+
+    /// The `tableoid` system column of the stored table among `items` that
+    /// `qualifier` names, or of the only stored table when unqualified.
+    /// `None` when no such table is in reach.
+    fn find_table_oid(
+        &self,
+        items: core::ops::Range<usize>,
+        qualifier: Option<&str>,
+    ) -> Result<Option<ResolvedColumn>, SqlError> {
+        let items = items.start..items.end.min(self.n);
+        match qualifier {
+            Some(qualifier) if self.using_alias(qualifier).is_some() => Ok(None),
+            Some(qualifier) => {
+                let Ok(source) = self.source(qualifier) else {
+                    return Ok(None);
+                };
+                Ok(
+                    (items.contains(&source.table) && self.stores_rows(source.table))
+                        .then_some(ResolvedColumn::TableOid(source.table)),
+                )
+            }
+            None => {
+                let mut found = None;
+                for table in items.filter(|&table| self.stores_rows(table)) {
+                    if found.is_some() {
+                        return Err(sql_err!(
+                            crate::sql::eval::sqlstate::AMBIGUOUS_COLUMN,
+                            "column reference \"tableoid\" is ambiguous"
+                        ));
+                    }
+                    found = Some(ResolvedColumn::TableOid(table));
+                }
+                Ok(found)
+            }
+        }
+    }
+
+    /// The oid of a stored FROM item's own table, the `tableoid` of every
+    /// row it reads itself.
+    pub(crate) fn relation_oid<'v>(&self, table: usize) -> Result<Datum<'v>, SqlError> {
+        if !self.stores_rows(table) {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "tableoid of a FROM item that stores no rows"
+            ));
+        }
+        Ok(Datum::Oid(
+            crate::sql::catalog::user_table_oid(self.storage, self.slots[table]) as u32,
+        ))
+    }
+
+    /// [`Self::relation_oid`] for a row whose values were flattened without
+    /// the leaf it came from: exact only for a table without descendants.
+    pub(crate) fn flat_relation_oid<'v>(&self, table: usize) -> Result<Datum<'v>, SqlError> {
+        if self
+            .storage
+            .relation_has_descendants(self.slots[table], self.txid)
+        {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "tableoid of an inheritance tree or partitioned table is not supported in this query"
+            ));
+        }
+        self.relation_oid(table)
+    }
+
+    /// Whether a FROM item reads a stored table (ordinary, partitioned or
+    /// foreign), whose rows carry a `tableoid`.
+    pub(crate) fn stores_rows(&self, table: usize) -> bool {
+        self.derived[table].is_none()
+            && self.slots[table] != usize::MAX
+            && self.defs.stored(table).is_some()
     }
 
     /// Whether `name` is a PostgreSQL system column of a relation the
@@ -3773,7 +4149,9 @@ impl<'d> QueryScope<'d> {
         let items = items.start..items.end.min(self.n);
         // A merged column is visible when every item it merges is.
         let entry_visible = |entry: ResolvedColumn| match entry {
-            ResolvedColumn::Table(table, _) => items.contains(&table),
+            ResolvedColumn::Table(table, _) | ResolvedColumn::TableOid(table) => {
+                items.contains(&table)
+            }
             ResolvedColumn::Merged(merged) => self.merged[merged]
                 .parts
                 .iter()

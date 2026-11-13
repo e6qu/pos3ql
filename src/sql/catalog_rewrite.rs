@@ -420,7 +420,8 @@ pub(super) fn rule_definition<'a>(
     let mut body = crate::sql::array::elements(raw, element);
     let condition = body.next().expect("body condition was counted");
     let actions = crate::sql::array::len(raw) - 1;
-    let rule_table = match crate::sql::query::privilege_relation(
+    // The rule relation's columns, which its `OLD` and `NEW` rows read.
+    let relation_table = match crate::sql::query::privilege_relation(
         storage,
         transaction,
         PrivilegeRelation::Oid(relation_oid),
@@ -430,28 +431,51 @@ pub(super) fn rule_definition<'a>(
         }
         _ => None,
     };
-    // Each action as PostgreSQL deparses it, or its saved text when its
-    // shape is outside the deparser's coverage.
-    let mut deparsed_actions = [None; crate::storage::MAX_RULE_ACTIONS];
+    let rule_columns = match relation_table.as_deref() {
+        Some(table) => super::deparse::Columns::Table(table),
+        None => match super::view_slot_by_oid(storage, transaction, relation_oid) {
+            Some(slot) => {
+                let view = storage.view(slot);
+                let columns = view.columns_for(transaction);
+                let names = columns.names();
+                let types = columns.types();
+                let derived = arena
+                    .alloc_slice_with(names.len(), |_| super::deparse::Column {
+                        name: "",
+                        type_oid: None,
+                        merged: None,
+                    })
+                    .map_err(|_| arena_full())?;
+                for (index, target) in derived.iter_mut().enumerate() {
+                    target.name = arena
+                        .alloc_str(names[index].as_str())
+                        .map_err(|_| arena_full())?;
+                    target.type_oid = types.get(index).map(|column| column.oid());
+                }
+                super::deparse::Columns::Derived(derived)
+            }
+            None => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "cache lookup failed for relation {}",
+                    relation_oid
+                ));
+            }
+        },
+    };
+    // Each action as PostgreSQL deparses it.
+    let mut deparsed_actions = [""; crate::storage::MAX_RULE_ACTIONS];
     for (slot, action) in deparsed_actions.iter_mut().zip(body) {
         let source = string(action)?;
-        *slot = match rule_table.as_deref() {
-            Some(table) => super::deparse::rule_action_definition(
-                storage,
-                transaction,
-                table,
-                source,
-                pretty,
-                arena,
-            )?,
-            None => None,
-        };
-        if pretty && slot.is_none() {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "pretty formatting of rewrite rule actions is not supported"
-            ));
-        }
+        *slot = super::deparse::rule_action_definition(
+            storage,
+            transaction,
+            rule_columns,
+            source,
+            pretty,
+            arena,
+        )?
+        .ok_or_else(|| undeparsable_rule(name))?;
     }
     let mut output = StackStr::<{ crate::storage::RULE_SQL_MAX + 512 }>::new();
     let _ = output.write_str("CREATE RULE ");
@@ -467,54 +491,30 @@ pub(super) fn rule_definition<'a>(
         value => {
             // `NEW` and `OLD` name the rule relation's row in the condition.
             let source = string(value)?;
-            let table = match crate::sql::query::privilege_relation(
-                storage,
-                transaction,
-                PrivilegeRelation::Oid(relation_oid),
-            )? {
-                Some(crate::storage::ResolvedRelation::Table(slot)) => {
-                    Some(storage.table_def(slot, transaction))
-                }
-                _ => None,
-            };
-            let deparsed = match table.as_deref() {
-                Some(definition) => {
-                    let joined = [
-                        super::deparse::Joined::new("new", definition),
-                        super::deparse::Joined::new("old", definition),
-                    ];
-                    super::deparse::deparse(
-                        &super::deparse::Context {
-                            storage,
-                            txid: transaction,
-                            table: Some(definition),
-                            parameters: &[],
-                            joined: &joined,
-                            pretty,
-                            qualify: false,
-                            bare: None,
-                        },
-                        source,
-                        super::deparse::Destination::Condition,
-                        arena,
-                    )?
-                }
-                None => None,
-            };
-            match deparsed {
-                Some(condition) => {
-                    let _ = write!(output, "\n   WHERE {condition}");
-                }
-                None if pretty => {
-                    return Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "pretty formatting of this rewrite rule condition is not supported"
-                    ));
-                }
-                None => {
-                    let _ = write!(output, "\n   WHERE ({source})");
-                }
-            }
+            let joined = [
+                super::deparse::Joined::rule_columns("new", rule_columns),
+                super::deparse::Joined::rule_columns("old", rule_columns),
+            ];
+            let deparsed = super::deparse::deparse(
+                &super::deparse::Context {
+                    storage,
+                    txid: transaction,
+                    arena,
+                    dependencies: None,
+                    table: relation_table.as_deref(),
+                    parameters: &[],
+                    joined: &joined,
+                    pretty,
+                    qualify: false,
+                    domain_value: None,
+                    bare: None,
+                },
+                source,
+                super::deparse::Destination::Condition,
+                arena,
+            )?
+            .ok_or_else(|| undeparsable_rule(name))?;
+            let _ = write!(output, "\n   WHERE {deparsed}");
         }
     }
     let _ = write!(
@@ -524,36 +524,24 @@ pub(super) fn rule_definition<'a>(
     );
     // `appendContextKeyword` drops trailing spaces before a line break.
     let write_action = |output: &mut StackStr<{ crate::storage::RULE_SQL_MAX + 512 }>,
-                        index: usize,
-                        saved: &str| {
-        match deparsed_actions[index] {
-            Some(text) => {
-                if text.starts_with('\n') {
-                    let kept = output.as_str().trim_end_matches(' ').len();
-                    output.truncate(kept);
-                }
-                let _ = output.write_str(text);
-            }
-            None => {
-                let _ = output.write_str(saved);
-            }
+                        index: usize| {
+        let text = deparsed_actions[index];
+        if text.starts_with('\n') {
+            let kept = output.as_str().trim_end_matches(' ').len();
+            output.truncate(kept);
         }
+        let _ = output.write_str(text);
     };
     if actions == 0 {
         let _ = output.write_str("NOTHING;");
     } else if actions == 1 {
-        let saved = string(body.next().expect("counted action"))?;
-        write_action(&mut output, 0, saved);
+        write_action(&mut output, 0);
         let _ = output.write_char(';');
     } else {
         let _ = output.write_char('(');
-        for (index, action) in body.enumerate() {
-            write_action(&mut output, index, string(action)?);
-            let _ = output.write_str(if deparsed_actions[index].is_some() {
-                ";\n"
-            } else {
-                ";"
-            });
+        for index in 0..actions {
+            write_action(&mut output, index);
+            let _ = output.write_str(";\n");
         }
         let _ = output.write_str(");");
     }
@@ -567,4 +555,14 @@ pub(super) fn rule_definition<'a>(
         .alloc_str(output.as_str())
         .map(Some)
         .map_err(|_| arena_full())
+}
+
+/// A rule whose action or condition the deparser cannot print. Printing its
+/// stored text instead would show names and forms PostgreSQL does not.
+fn undeparsable_rule(name: &str) -> SqlError {
+    sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "deparsing rewrite rule \"{}\" is not supported",
+        name
+    )
 }

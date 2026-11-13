@@ -25,12 +25,12 @@ mod cast;
 pub mod funcs;
 pub use cast::{cast, cast_to, fit_bits, int_to_bits};
 pub(crate) use cast::{
-    cast_to_text, parse_bytea, parse_int_bounded, parse_int_literal, parse_oid, parse_uuid,
-    validate_bits, validate_catalog_reference_cast, validate_geometry_cast,
+    cast_to_text, parse_bits_text, parse_bytea, parse_int_bounded, parse_int_literal, parse_oid,
+    parse_uuid, validate_bits, validate_catalog_reference_cast, validate_geometry_cast,
     validate_geometry_type_cast,
 };
 
-mod args;
+pub(crate) mod args;
 mod operators;
 pub(crate) use args::*;
 
@@ -621,6 +621,7 @@ pub mod sqlstate {
     pub const QUERY_CANCELED: &str = "57014";
     pub const ADMIN_SHUTDOWN: &str = "57P01";
     pub const IO_ERROR: &str = "58030";
+    pub const CONFIG_FILE_ERROR: &str = "F0000";
     pub const INTERNAL_ERROR: &str = "XX000";
     pub const ACTIVE_SQL_TRANSACTION: &str = "25001";
     pub const READ_ONLY_SQL_TRANSACTION: &str = "25006";
@@ -629,6 +630,7 @@ pub mod sqlstate {
     pub const CANT_CHANGE_RUNTIME_PARAM: &str = "55P02";
     pub const CARDINALITY_VIOLATION: &str = "21000";
     pub const TRIGGERED_DATA_CHANGE_VIOLATION: &str = "27000";
+    pub const TRIGGER_PROTOCOL_VIOLATED: &str = "39P01";
     pub const CHECK_VIOLATION: &str = "23514";
     pub const EXCLUSION_VIOLATION: &str = "23P01";
     pub const DUPLICATE_PREPARED_STATEMENT: &str = "42P05";
@@ -706,6 +708,22 @@ fn same_resolved_column<'a>(row: &impl ColumnLookup<'a>, a: &Expr, b: &Expr) -> 
 pub(crate) struct EnclosingRow<'s, 'a>(pub(crate) &'s dyn ColumnLookup<'a>);
 
 impl<'b, 'a: 'b> ColumnLookup<'b> for EnclosingRow<'_, 'a> {
+    fn resolve_column_type_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.0.resolve_column_type_unsuggested(qualifier, name)
+    }
+
+    fn lookup_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Datum<'b>, SqlError> {
+        self.0.lookup_unsuggested(qualifier, name)
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'b>, SqlError> {
         self.0.lookup(qualifier, name)
     }
@@ -877,6 +895,27 @@ impl<'b, 'a: 'b> ColumnLookup<'b> for RoutineVariables<'_, 'a> {
 pub trait ColumnLookup<'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError>;
 
+    /// [`Self::lookup`] for a caller that may still find the column in an
+    /// enclosing scope: a missing column's spelling suggestion is left to the
+    /// caller that reports the error.
+    fn lookup_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Datum<'a>, SqlError> {
+        self.lookup(qualifier, name)
+    }
+
+    /// [`Self::resolve_column_type`] without the spelling suggestion, as
+    /// [`Self::lookup_unsuggested`].
+    fn resolve_column_type_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.resolve_column_type(qualifier, name)
+    }
+
     /// Offers this scope's FROM items, then the enclosing queries' ones, to
     /// a missing column's spelling suggestion.
     fn suggest_columns(
@@ -908,9 +947,11 @@ pub trait ColumnLookup<'a> {
     /// subqueries, set operations, functions in `FROM`). A nested query
     /// prepared for a row reuses its slot, so each runs once per statement,
     /// as PostgreSQL's initPlans do, however many rows run the query around
-    /// it.
-    fn statement_subqueries(&self) -> &'a [DeferredSubquery<'a>] {
-        &[]
+    /// it. The scope also carries the statement's bindings for the
+    /// correlated subqueries nested in those queries, so each is analysed
+    /// once per statement however many rows run its enclosing query.
+    fn statement_subqueries(&self) -> StatementScope<'a> {
+        StatementScope::default()
     }
 
     /// Declared size/precision, or the registered shape of a record column.
@@ -1609,6 +1650,13 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
             .and_then(|catalog| catalog.domain_base_type(type_oid))
     }
 
+    fn select_common_type(&self, inputs: &[i32]) -> Result<i32, crate::storage::CommonTypeFailure> {
+        match self.catalog {
+            Some(catalog) => catalog.select_common_type(inputs),
+            None => crate::storage::builtin_select_common_type(inputs),
+        }
+    }
+
     fn operator_first_argument_type(
         &self,
         name: &str,
@@ -1773,7 +1821,7 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
         (**self).suggest_columns(suggestion);
     }
 
-    fn statement_subqueries(&self) -> &'a [DeferredSubquery<'a>] {
+    fn statement_subqueries(&self) -> StatementScope<'a> {
         (**self).statement_subqueries()
     }
 
@@ -1804,6 +1852,22 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
         name: &str,
     ) -> Result<ColType, SqlError> {
         (**self).resolve_column_type(qualifier, name)
+    }
+
+    fn resolve_column_type_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        (**self).resolve_column_type_unsuggested(qualifier, name)
+    }
+
+    fn lookup_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Datum<'a>, SqlError> {
+        (**self).lookup_unsuggested(qualifier, name)
     }
 
     fn is_empty_scope(&self) -> bool {
@@ -2135,6 +2199,17 @@ pub(crate) fn is_sql_syntax_call(expression: &Expr<'_>) -> bool {
     )
 }
 
+/// The type modifier PostgreSQL's `exprTypmod` gives an expression: a
+/// column's declared modifier, a cast's target modifier, otherwise none.
+pub(crate) fn expression_type_mod<'v>(expression: &Expr<'_>, row: &dyn ColumnLookup<'v>) -> i32 {
+    match expression {
+        Expr::Column { qualifier, name } => row.column_type_mod(*qualifier, name),
+        Expr::Cast { type_mod, .. } | Expr::BoundLiteral { type_mod, .. } => *type_mod,
+        Expr::Collate { operand, .. } => expression_type_mod(operand, row),
+        _ => -1,
+    }
+}
+
 pub(crate) fn sql_syntax_call_name(name: &str) -> bool {
     matches!(
         name,
@@ -2320,6 +2395,15 @@ pub trait CatalogAccess {
     }
     fn listening_channel_count(&self) -> usize {
         0
+    }
+    /// Rows of `pg_available_extensions()` (or, with `versions`,
+    /// `pg_available_extension_versions()`).
+    fn available_extension_rows<'a>(
+        &self,
+        _versions: bool,
+        _arena: &'a crate::mem::arena::Arena,
+    ) -> Result<&'a [&'a [Datum<'a>]], SqlError> {
+        Ok(&[])
     }
     fn listening_channel_at(&self, _index: usize) -> Option<crate::sql::notify::Channel> {
         None
@@ -3265,6 +3349,14 @@ pub trait CatalogAccess {
         Ok(None)
     }
 
+    /// Fails unless the current role may set `parameter` (`set_config`).
+    fn authorize_parameter_set(&self, _parameter: &str) -> Result<(), SqlError> {
+        Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "parameter privileges require the session catalog"
+        ))
+    }
+
     /// The comment text on the object with this OID and column `subid` (0 for
     /// the object itself), or `None`. `catalog_name` selects the owning
     /// catalog (`pg_class`, `pg_namespace`, or `pg_type`). Backs
@@ -3397,6 +3489,10 @@ pub trait CatalogAccess {
     /// `(is_array, type_oid)`, or `None` when PostgreSQL finds none.
     fn compatible_element_oid(&self, inputs: &[(bool, i32)]) -> Option<i32> {
         crate::storage::builtin_compatible_element_oid(inputs)
+    }
+    /// PostgreSQL's `select_common_type` over input type OIDs.
+    fn select_common_type(&self, inputs: &[i32]) -> Result<i32, crate::storage::CommonTypeFailure> {
+        crate::storage::builtin_select_common_type(inputs)
     }
     /// Resolves a durable schema-qualified identity without reparsing it as
     /// SQL text.
@@ -3541,9 +3637,9 @@ pub struct SubqueryValues<'h, 'a> {
     /// reaches never runs its subquery.
     pub deferred: &'h [DeferredSubquery<'h>],
     /// The statement's slots for the uncorrelated subqueries nested in the
-    /// queries it runs for each row; see
-    /// [`ColumnLookup::statement_subqueries`].
-    pub statement: &'a [DeferredSubquery<'a>],
+    /// queries it runs for each row, and its bindings for the correlated
+    /// ones; see [`ColumnLookup::statement_subqueries`].
+    pub statement: StatementScope<'a>,
     /// The correlated scalar and `ARRAY` subqueries analysed once for the
     /// statement, before any outer row.
     pub(crate) bindings: &'a [crate::sql::query::SubqueryBinding<'a>],
@@ -3587,6 +3683,15 @@ impl<'h> DeferredSubquery<'h> {
             ..*slot
         })
     }
+}
+
+/// Whether `left` and `right` are the same sublink, one perhaps a per-row
+/// rewritten copy of the other (see [`Sublink`]).
+pub(crate) fn same_sublink(left: &Expr<'_>, right: &Expr<'_>) -> bool {
+    core::ptr::eq(
+        (left as *const Expr<'_>).cast::<()>(),
+        (right as *const Expr<'_>).cast::<()>(),
+    ) || Sublink::of(left).is_some_and(|sublink| Sublink::of(right) == Some(sublink))
 }
 
 /// Which sublink a subquery expression is. A query rewritten for an outer
@@ -3636,31 +3741,65 @@ impl Sublink {
     }
 }
 
-/// A row lookup that also carries the statement's slots for nested
-/// uncorrelated subqueries ([`ColumnLookup::statement_subqueries`]) into a
-/// query run for that row.
+/// The statement state a query run again for each row inherits: slots for
+/// the uncorrelated subqueries nested in it and bindings for the correlated
+/// ones.
+#[derive(Clone, Copy, Default)]
+pub struct StatementScope<'a> {
+    pub(crate) slots: &'a [DeferredSubquery<'a>],
+    pub(crate) bindings: Option<crate::sql::query::NestedBindings<'a>>,
+}
+
+impl StatementScope<'_> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.slots.is_empty() && self.bindings.is_none()
+    }
+}
+
+/// A row lookup that also carries the statement's scope for nested
+/// subqueries ([`ColumnLookup::statement_subqueries`]) into a query run for
+/// that row.
 pub(crate) struct StatementSubqueryScope<'r, 'a> {
     pub(crate) row: &'r dyn ColumnLookup<'a>,
-    pub(crate) slots: &'a [DeferredSubquery<'a>],
+    pub(crate) scope: StatementScope<'a>,
 }
 
 impl<'a> StatementSubqueryScope<'_, 'a> {
-    /// `row`, carrying `slots` unless it already carries the statement's.
+    /// `row`, carrying `statement` unless it already carries the statement's.
     pub(crate) fn wrap<'r>(
         row: &'r dyn ColumnLookup<'a>,
-        slots: &'a [DeferredSubquery<'a>],
+        statement: StatementScope<'a>,
         scope: &'r mut Option<StatementSubqueryScope<'r, 'a>>,
     ) -> &'r dyn ColumnLookup<'a> {
-        if slots.is_empty() || !row.statement_subqueries().is_empty() {
+        if statement.is_empty() || !row.statement_subqueries().is_empty() {
             return row;
         }
-        &*scope.insert(StatementSubqueryScope { row, slots })
+        &*scope.insert(StatementSubqueryScope {
+            row,
+            scope: statement,
+        })
     }
 }
 
 impl<'a> ColumnLookup<'a> for StatementSubqueryScope<'_, 'a> {
-    fn statement_subqueries(&self) -> &'a [DeferredSubquery<'a>] {
-        self.slots
+    fn resolve_column_type_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.row.resolve_column_type_unsuggested(qualifier, name)
+    }
+
+    fn lookup_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Datum<'a>, SqlError> {
+        self.row.lookup_unsuggested(qualifier, name)
+    }
+
+    fn statement_subqueries(&self) -> StatementScope<'a> {
+        self.scope
     }
 
     fn outer_aggregate(&self, call: *const Expr<'_>) -> Option<Datum<'a>> {
@@ -4721,10 +4860,11 @@ fn validate_enum_operator_types<'a>(
     let right_type = expression_type_identity(right, row, hooks)?.record_field_oid();
     // PostgreSQL's anyenum operators require an enum declaration. A domain's
     // enum representation is insufficient, even when both operands have it.
-    if [left_type, right_type]
-        .iter()
-        .any(|oid| matches!(catalog.domain_base_type(*oid), Some(ColType::Enum(_))))
-    {
+    // Built-in types (below the first user OID) include no enum domain.
+    if [left_type, right_type].iter().any(|oid| {
+        *oid >= crate::storage::FIRST_NORMAL_OBJECT_ID
+            && matches!(catalog.domain_base_type(*oid), Some(ColType::Enum(_)))
+    }) {
         let left_name = catalog.type_name(left_type, arena)?.unwrap_or("unknown");
         let right_name = catalog.type_name(right_type, arena)?.unwrap_or("unknown");
         return Err(sql_err!(
@@ -5605,20 +5745,11 @@ fn eval_binary_values<'a>(
         row,
         hooks,
     )?;
-    // A number or boolean is never an enum's value, so neither operand's
-    // declared type can be an enum or a domain over one.
-    let not_enum = |value: &Datum<'_>| {
-        matches!(
-            value,
-            Datum::Bool(_)
-                | Datum::Int2(_)
-                | Datum::Int4(_)
-                | Datum::Int8(_)
-                | Datum::Float4(_)
-                | Datum::Float8(_)
-        )
-    };
-    if comparison_collation.is_some() && !(not_enum(&l) && not_enum(&r)) {
+    // Only an enum member (or a NULL, of any type) can have an enum or a
+    // domain over one as its declared type, so other values skip the
+    // per-row type lookup.
+    let may_be_enum = |value: &Datum<'_>| matches!(value, Datum::Enum { .. } | Datum::Null);
+    if comparison_collation.is_some() && (may_be_enum(&l) || may_be_enum(&r)) {
         validate_enum_operator_types(operator, left, right, row, hooks, arena)?;
     }
     if nulls == OperatorNulls::ReturnNull {
@@ -5656,6 +5787,22 @@ fn eval_binary_values<'a>(
                 ColType::Enum(Some(creation)) => coerce_enum_value(creation, r, hooks, arena)?,
                 _ => cast_to(r, target, arena)?,
             };
+        }
+    }
+    if operator == BinaryOp::TextSearchMatch {
+        // `text @@ tsquery` parses the text with the session's configuration.
+        let vector = |value: Datum<'a>| -> Result<Datum<'a>, SqlError> {
+            Ok(match value {
+                Datum::Text(document) => Datum::TsVector(crate::sql::full_text::restore_vector(
+                    funcs::full_text::current_config_vector(document, arena, hooks)?,
+                )),
+                other => other,
+            })
+        };
+        match (l, r) {
+            (Datum::Text(_), Datum::TsQuery(_)) => l = vector(l)?,
+            (Datum::TsQuery(_), Datum::Text(_)) => r = vector(r)?,
+            _ => {}
         }
     }
     if operator == BinaryOp::Concat {
@@ -5866,6 +6013,7 @@ fn materialize_acl_value<'a>(
                 .alloc_slice_with(fields.len(), |_| RecordField {
                     name: "",
                     type_oid: 0,
+                    type_mod: -1,
                     value: Datum::Null,
                 })
                 .map_err(|_| arena_full())?;
@@ -5882,6 +6030,7 @@ fn materialize_acl_value<'a>(
                 .alloc_slice_with(fields.len(), |_| RecordField {
                     name: "",
                     type_oid: 0,
+                    type_mod: -1,
                     value: Datum::Null,
                 })
                 .map_err(|_| arena_full())?;
@@ -6013,8 +6162,53 @@ pub fn eval_full<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     eval_full_unpositioned(expression, arena, params, row, hooks).map_err(|error| {
         let error = complete_function_mismatch(error, expression, row, hooks);
+        let error = literal_operand_error(error, expression, arena, row);
         crate::sql::error_position::expression_error(error, expression)
     })
+}
+
+/// Positions a data error at an operator's untyped literal operand when the
+/// literal itself fails input as the other operand's type, as PostgreSQL
+/// converts it while analysing the operator (`1 + 'x'`). An error the
+/// operator raises from valid inputs (`1 / '0'`) keeps no position.
+fn literal_operand_error<'a>(
+    error: SqlError,
+    expression: &Expr<'a>,
+    arena: &'a Arena,
+    row: &impl ColumnLookup<'a>,
+) -> SqlError {
+    let Expr::Binary { left, right, .. } = expression else {
+        return error;
+    };
+    if !error.sqlstate.as_str().starts_with("22") {
+        return error;
+    }
+    let (literal, other) = match (*left, *right) {
+        (Expr::Str(literal), other) | (other, Expr::Str(literal))
+            if !matches!(other, Expr::Str(_)) =>
+        {
+            (literal, other)
+        }
+        _ => return error,
+    };
+    let Some(target) = static_type(other, row) else {
+        return error;
+    };
+    if matches!(target, ColType::Text | ColType::Pseudo(_) | ColType::Record) {
+        return error;
+    }
+    let mark = arena.mark();
+    let fails_alike = crate::sql::error_position::preserving_pending(|| {
+        cast_to(Datum::Text(literal), target, arena)
+            .is_err_and(|input| input.sqlstate == error.sqlstate && input.message == error.message)
+    });
+    // The probe's value is discarded with its scratch.
+    unsafe { arena.rewind_to(mark) };
+    if fails_alike {
+        crate::sql::error_position::at_subject(error, literal)
+    } else {
+        error
+    }
 }
 
 /// Completes the signature of a [`function_argument_mismatch`] raised by a
@@ -6772,7 +6966,7 @@ fn eval_full_inner<'a>(
         let mut scope = None;
         let outer = StatementSubqueryScope::wrap(
             row,
-            hooks.subs.map_or(&[], |subs| subs.statement),
+            hooks.subs.map(|subs| subs.statement).unwrap_or_default(),
             &mut scope,
         );
         let values = match deferred.evaluate(expression, arena, params, outer, hooks.sequences)? {
@@ -6782,7 +6976,7 @@ fn eval_full_inner<'a>(
                     scalars: &scalars,
                     lists: &[],
                     deferred: &[],
-                    statement: &[],
+                    statement: StatementScope::default(),
                     bindings: &[],
                     correlated: None,
                 }
@@ -6838,7 +7032,7 @@ fn eval_full_inner<'a>(
         let mut scope = None;
         let outer = StatementSubqueryScope::wrap(
             row,
-            hooks.subs.map_or(&[], |subs| subs.statement),
+            hooks.subs.map(|subs| subs.statement).unwrap_or_default(),
             &mut scope,
         );
         let result = executor.evaluate(expression, arena, params, outer, hooks.sequences)?;
@@ -6860,7 +7054,7 @@ fn eval_full_inner<'a>(
                     scalars: &scalars,
                     lists: &[],
                     deferred: &[],
-                    statement: &[],
+                    statement: StatementScope::default(),
                     bindings: &[],
                     correlated: None,
                 }
@@ -6874,7 +7068,7 @@ fn eval_full_inner<'a>(
                     scalars: &[],
                     lists: &lists,
                     deferred: &[],
-                    statement: &[],
+                    statement: StatementScope::default(),
                     bindings: &[],
                     correlated: None,
                 }
@@ -10775,11 +10969,13 @@ fn call<'a>(
                     super::types::RecordField {
                         name: "x",
                         type_oid,
+                        type_mod: -1,
                         value,
                     },
                     super::types::RecordField {
                         name: "n",
                         type_oid: super::types::oid::INT4,
+                        type_mod: -1,
                         value: Datum::Int4(ordinal),
                     },
                 ])
@@ -11090,11 +11286,13 @@ fn call<'a>(
                     super::types::RecordField {
                         name: "key",
                         type_oid: super::types::oid::TEXT,
+                        type_mod: -1,
                         value: Datum::Text(key),
                     },
                     super::types::RecordField {
                         name: "value",
                         type_oid: value_oid,
+                        type_mod: -1,
                         value: *value,
                     },
                 ])
@@ -11131,21 +11329,25 @@ fn call<'a>(
                     super::types::RecordField {
                         name: "grantor",
                         type_oid: super::types::oid::OID,
+                        type_mod: -1,
                         value: Datum::Oid(value.grantor),
                     },
                     super::types::RecordField {
                         name: "grantee",
                         type_oid: super::types::oid::OID,
+                        type_mod: -1,
                         value: Datum::Oid(value.grantee),
                     },
                     super::types::RecordField {
                         name: "privilege_type",
                         type_oid: super::types::oid::TEXT,
+                        type_mod: -1,
                         value: Datum::Text(value.privilege),
                     },
                     super::types::RecordField {
                         name: "is_grantable",
                         type_oid: super::types::oid::BOOL,
+                        type_mod: -1,
                         value: Datum::Bool(value.grantable),
                     },
                 ])
@@ -11190,11 +11392,13 @@ fn call<'a>(
                     super::types::RecordField {
                         name: "option_name",
                         type_oid: super::types::oid::TEXT,
+                        type_mod: -1,
                         value: option_name,
                     },
                     super::types::RecordField {
                         name: "option_value",
                         type_oid: super::types::oid::TEXT,
+                        type_mod: -1,
                         value: option_value,
                     },
                 ])
@@ -11225,11 +11429,13 @@ fn call<'a>(
                     super::types::RecordField {
                         name: "last_value",
                         type_oid: super::types::oid::INT8,
+                        type_mod: -1,
                         value: Datum::Int8(last_value),
                     },
                     super::types::RecordField {
                         name: "is_called",
                         type_oid: super::types::oid::BOOL,
+                        type_mod: -1,
                         value: Datum::Bool(is_called),
                     },
                 ])
@@ -11254,6 +11460,29 @@ fn unsupported_builtin_function(oid: i32, hooks: &EvalHooks<'_, '_>) -> SqlError
             oid
         );
     };
+    // PostgreSQL's built-in trigger functions check how they were called.
+    match oid {
+        1291 => {
+            return sql_err!(
+                sqlstate::TRIGGER_PROTOCOL_VIOLATED,
+                "suppress_redundant_updates_trigger: must be called as trigger"
+            );
+        }
+        1250 | 1644..=1655 => {
+            return sql_err!(
+                sqlstate::TRIGGER_PROTOCOL_VIOLATED,
+                "function \"{}\" was not called by trigger manager",
+                signature.name
+            );
+        }
+        3752 | 3753 => {
+            return sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "tsvector_update_trigger: not fired by trigger manager"
+            );
+        }
+        _ => {}
+    }
     let mut message = crate::util::StackStr::<192>::new();
     let _ = write!(message, "function {}(", signature.name);
     for (index, &argument) in signature.arguments.iter().enumerate() {
@@ -13547,22 +13776,22 @@ pub(crate) fn regobject_cast<'a>(
         ColType::Regconfig => (if let Some(catalog) = catalog {
             catalog.text_search_configuration_name(object_oid)
         } else {
-            match object_oid {
-                3748 => Some(crate::util::StackStr::from_str("simple")),
-                13_248 => Some(crate::util::StackStr::from_str("english")),
-                _ => None,
-            }
+            crate::sql::full_text::builtin_object(
+                crate::sql::ast::TextSearchObjectKind::Configuration,
+                object_oid,
+            )
+            .map(|definition| crate::util::StackStr::from_str(definition.name().as_str()))
         })
         .map(|name| arena.alloc_str(name.as_str()).map_err(|_| arena_full()))
         .transpose()?,
         ColType::Regdictionary => (if let Some(catalog) = catalog {
             catalog.text_search_dictionary_name(object_oid)
         } else {
-            match object_oid {
-                3765 => Some(crate::util::StackStr::from_str("simple")),
-                13_247 => Some(crate::util::StackStr::from_str("english_stem")),
-                _ => None,
-            }
+            crate::sql::full_text::builtin_object(
+                crate::sql::ast::TextSearchObjectKind::Dictionary,
+                object_oid,
+            )
+            .map(|definition| crate::util::StackStr::from_str(definition.name().as_str()))
         })
         .map(|name| arena.alloc_str(name.as_str()).map_err(|_| arena_full()))
         .transpose()?,
@@ -13661,6 +13890,15 @@ fn regtype_builtin_name(type_oid: i32) -> Option<&'static str> {
         oid::ANYCOMPATIBLERANGE => "anycompatiblerange",
         oid::ANYCOMPATIBLEMULTIRANGE => "anycompatiblemultirange",
         oid::FDW_HANDLER => "fdw_handler",
+        oid::TRIGGER => "trigger",
+        oid::EVENT_TRIGGER => "event_trigger",
+        oid::ANY => "\"any\"",
+        oid::UNKNOWN => "unknown",
+        2275 => "cstring",
+        2280 => "language_handler",
+        325 => "index_am_handler",
+        269 => "table_am_handler",
+        3310 => "tsm_handler",
         _ => return None,
     })
 }

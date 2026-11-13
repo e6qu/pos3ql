@@ -82,13 +82,20 @@ fn truncate_restart_uses_sequence_ownership_even_without_a_default() {
          SELECT nextval('restart_values_id_seq'); \
          ALTER SEQUENCE restart_values_id_seq OWNED BY restart_values.id; \
          TRUNCATE restart_values RESTART IDENTITY; \
-         SELECT nextval('restart_values_id_seq'); \
-         BEGIN; TRUNCATE restart_values RESTART IDENTITY; \
+         SELECT nextval('restart_values_id_seq')",
+            true
+        )),
+        ["1", "1", "41", "42", "1"]
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "BEGIN; TRUNCATE restart_values RESTART IDENTITY; \
          SELECT nextval('restart_values_id_seq'); ROLLBACK; \
          SELECT nextval('restart_values_id_seq')",
             true
         )),
-        ["1", "1", "41", "42", "1", "1", "2"]
+        ["1", "2"]
     );
 }
 
@@ -235,15 +242,22 @@ fn canonical_defaults_and_ownership_survive_cold_prepared_decisions() {
                     data_rows(&session.success(
                         &mut engine,
                         "CREATE SCHEMA counters; CREATE TABLE saved_default(id serial); \
-                     INSERT INTO saved_default DEFAULT VALUES RETURNING id; \
-                     BEGIN; ALTER SEQUENCE saved_default_id_seq OWNED BY NONE; \
+                     INSERT INTO saved_default DEFAULT VALUES RETURNING id",
+                        false
+                    )),
+                    ["1"]
+                );
+                assert_eq!(
+                    data_rows(&session.success(
+                        &mut engine,
+                        "BEGIN; ALTER SEQUENCE saved_default_id_seq OWNED BY NONE; \
                      ALTER SEQUENCE saved_default_id_seq RENAME TO saved_counter; \
                      ALTER SEQUENCE saved_counter SET SCHEMA counters; \
                      INSERT INTO saved_default DEFAULT VALUES RETURNING id; \
                      PREPARE TRANSACTION 'saved-default'",
                         false
                     )),
-                    ["1", "2"]
+                    ["2"]
                 );
                 if checkpoint {
                     assert!(engine.checkpoint().unwrap());

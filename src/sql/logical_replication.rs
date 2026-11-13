@@ -167,11 +167,13 @@ fn slot_record<'a>(
         crate::sql::types::RecordField {
             name: "slot_name",
             type_oid: oid::NAME,
+            type_mod: -1,
             value: Datum::Text(name),
         },
         crate::sql::types::RecordField {
             name: lsn_name,
             type_oid: oid::PG_LSN,
+            type_mod: -1,
             value: Datum::PgLsn(lsn),
         },
     ];

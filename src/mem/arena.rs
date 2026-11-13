@@ -223,6 +223,45 @@ impl Arena {
         Ok(each(&region.arena))
     }
 
+    /// Lends a fixed block of `capacity` bytes from this arena's front to a
+    /// child arena whose rewinds never touch the parent's later allocations.
+    /// The child and its bytes are ordinary front allocations: they stay
+    /// valid until the parent rewinds below them, and are never dropped.
+    pub(crate) fn alloc_front_block(&self, capacity: usize) -> Result<&Arena, ArenaFull> {
+        let capacity = capacity.next_multiple_of(ARENA_ALIGN);
+        if capacity == 0 {
+            return Err(self.full(1));
+        }
+        let layout =
+            Layout::from_size_align(capacity, ARENA_ALIGN).map_err(|_| self.full(capacity))?;
+        let base = self.alloc_raw(layout)?;
+        let header = self.alloc_raw(Layout::new::<Arena>())?.cast::<Arena>();
+        // SAFETY: the header slot is fresh, aligned and sized for an Arena.
+        // Arena memory is never dropped, so the child never runs Arena::drop
+        // and never frees the parent's bytes it borrows.
+        unsafe {
+            header.write(Arena {
+                what: self.what,
+                base,
+                capacity,
+                offset: Cell::new(0),
+                tail_offset: Cell::new(capacity),
+                high_water: Cell::new(0),
+                region_active: Cell::new(false),
+                borrowed: None,
+                retained_front: Cell::new(0),
+                retention_identity: retention_identity(),
+                interned: Cell::new(None),
+            });
+            Ok(&*header)
+        }
+    }
+
+    /// Bytes still available to front allocations.
+    pub(crate) fn remaining(&self) -> usize {
+        self.allocation_limit().saturating_sub(self.offset.get())
+    }
+
     /// Reclaims a scoped workspace while retaining only its encoded output.
     /// The output is moved into this arena, including when this is a borrowed
     /// row arena; temporary child-persistent values do not pin its workspace.
@@ -450,6 +489,46 @@ impl Arena {
                 ptr.add(i).write(fill(i));
             }
             Ok(core::slice::from_raw_parts_mut(ptr, len))
+        }
+    }
+
+    /// A fixed `bytes` workspace carved from the owning arena's durable tail,
+    /// for statement state built by code that allocates through an ordinary
+    /// arena (an analysis run part-way through a statement). Its allocations,
+    /// including its own marks and rewinds, never touch this arena's front,
+    /// so per-row rewinds cannot reclaim them; the owner's reset does.
+    pub(crate) fn persistent_workspace(
+        &self,
+        what: &'static str,
+        bytes: usize,
+    ) -> Result<&Arena, ArenaFull> {
+        let owner = self.retention_owner();
+        let capacity = bytes.next_multiple_of(ARENA_ALIGN);
+        let layout =
+            Layout::from_size_align(capacity, ARENA_ALIGN).map_err(|_| owner.full(capacity))?;
+        let base = owner.alloc_raw_tail(layout)?;
+        let header = owner
+            .alloc_raw_tail(Layout::new::<Arena>())?
+            .cast::<Arena>();
+        // SAFETY: both ranges are disjoint, aligned tail allocations of the
+        // owner, live until its `reset`, which takes `&mut self` and so ends
+        // every borrow returned here. The header is never dropped: its
+        // storage belongs to the owner and must not be freed through it.
+        unsafe {
+            header.write(Arena {
+                what,
+                base,
+                capacity,
+                offset: Cell::new(0),
+                tail_offset: Cell::new(capacity),
+                high_water: Cell::new(0),
+                region_active: Cell::new(false),
+                borrowed: None,
+                retained_front: Cell::new(0),
+                retention_identity: retention_identity(),
+                interned: Cell::new(None),
+            });
+            Ok(&*header)
         }
     }
 

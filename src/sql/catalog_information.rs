@@ -161,6 +161,28 @@ pub(super) fn schemata<'a>(
     output.finish("schemata", true)
 }
 
+/// PostgreSQL's `pg_column_is_updatable` for the column numbered `number`.
+fn column_is_updatable(
+    storage: &Storage,
+    transaction: u32,
+    relation: PrivilegeRelation<'_>,
+    number: i16,
+    arena: &Arena,
+) -> Result<bool, SqlError> {
+    match crate::sql::query::privilege_relation(storage, transaction, relation)? {
+        Some(crate::storage::ResolvedRelation::View(slot)) => {
+            crate::sql::query::view_column_is_updatable(
+                storage,
+                slot,
+                (number as usize).saturating_sub(1),
+                transaction,
+                arena,
+            )
+        }
+        _ => relation_is_updatable(storage, transaction, relation, arena),
+    }
+}
+
 fn relation_is_updatable(
     storage: &Storage,
     transaction: u32,
@@ -169,14 +191,7 @@ fn relation_is_updatable(
 ) -> Result<bool, SqlError> {
     match crate::sql::query::privilege_relation(storage, transaction, relation)? {
         Some(crate::storage::ResolvedRelation::View(slot)) => {
-            let view = storage.view(slot);
-            crate::sql::query::view_is_auto_updatable(
-                storage,
-                view.schema_for(transaction).as_str(),
-                view.name_for(transaction).as_str(),
-                transaction,
-                arena,
-            )
+            crate::sql::query::view_is_auto_updatable(storage, slot, transaction, arena)
         }
         Some(crate::storage::ResolvedRelation::Table(table)) => {
             let Some((_, binding)) = storage.foreign_table(table as u16, transaction) else {
@@ -676,7 +691,7 @@ pub(super) fn columns_view<'a>(
                 continue;
             }
             let updatable = matches!(kind, b'r' | b'p')
-                || relation_is_updatable(storage, transaction, relation_identity, arena)?;
+                || column_is_updatable(storage, transaction, relation_identity, number, arena)?;
             for values in sources
                 .namespaces
                 .matching((class.integer("relnamespace")? as u32, 0))

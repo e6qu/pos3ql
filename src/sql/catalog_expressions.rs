@@ -554,11 +554,14 @@ pub(super) fn deparse<'a>(
                         &super::deparse::Context {
                             storage,
                             txid: transaction,
+                            arena,
+                            dependencies: None,
                             table: None,
                             parameters: &[],
                             joined: &[],
                             pretty: false,
                             qualify: false,
+                            domain_value: None,
                             bare: None,
                         },
                         element,
@@ -588,11 +591,14 @@ pub(super) fn deparse<'a>(
         let context = super::deparse::Context {
             storage,
             txid: transaction,
+            arena,
+            dependencies: None,
             table: table.as_deref(),
             parameters: &[],
             joined: &[],
             pretty,
             qualify: false,
+            domain_value: None,
             bare: None,
         };
         let destination = match destination {

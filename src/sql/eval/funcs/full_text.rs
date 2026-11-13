@@ -2,6 +2,7 @@
 
 use crate::sql::ast::Expr;
 use crate::sql::full_text::{self, QueryInput, TextSearchConfig};
+use crate::sql::text_parser;
 use crate::sql::types::{ArrElem, Datum};
 use crate::sql_err;
 
@@ -68,11 +69,7 @@ fn config(
     let resolved = if let Some(catalog) = hooks.catalog {
         catalog.resolve_text_search_configuration(schema, unqualified)
     } else {
-        match (schema, TextSearchConfig::parse(name)) {
-            (None | Some("pg_catalog"), Some(TextSearchConfig::Simple)) => Some(3_748),
-            (None | Some("pg_catalog"), Some(TextSearchConfig::English)) => Some(13_248),
-            _ => None,
-        }
+        TextSearchConfig::parse(name).map(TextSearchConfig::oid)
     };
     resolved.map(Some).ok_or_else(|| {
         sql_err!(
@@ -113,10 +110,12 @@ fn dictionary(
     let resolved = if let Some(catalog) = hooks.catalog {
         catalog.resolve_text_search_dictionary(schema, unqualified)
     } else {
-        match (schema, unqualified) {
-            (None | Some("pg_catalog"), "simple") => Some(3_765),
-            (None | Some("pg_catalog"), "english_stem") => Some(13_247),
-            _ => None,
+        match schema {
+            None | Some("pg_catalog") => full_text::builtin_object_oid(
+                crate::sql::ast::TextSearchObjectKind::Dictionary,
+                unqualified,
+            ),
+            Some(_) => None,
         }
     };
     resolved.map(Some).ok_or_else(|| {
@@ -125,6 +124,34 @@ fn dictionary(
             "text search dictionary \"{}\" does not exist",
             name
         )
+    })
+}
+
+#[derive(Clone, Copy)]
+enum Literal {
+    Vector,
+    Query,
+}
+
+/// An unknown-typed string literal argument takes its parameter's type, as
+/// PostgreSQL's function resolution coerces it; a typed argument is left for
+/// the caller's type check.
+fn unknown_literal<'a>(
+    expression: &Expr<'_>,
+    value: Datum<'a>,
+    kind: Literal,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let (Expr::Str(_), Datum::Text(text)) = (expression, value) else {
+        return Ok(value);
+    };
+    Ok(match kind {
+        Literal::Vector => Datum::TsVector(full_text::restore_vector(full_text::canonical_vector(
+            text, arena,
+        )?)),
+        Literal::Query => Datum::TsQuery(full_text::restore_query(full_text::canonical_query(
+            text, arena,
+        )?)),
     })
 }
 
@@ -138,26 +165,26 @@ fn normalize<'a>(
     if let Some(catalog) = hooks.catalog {
         return catalog.normalize_text_search_token(configuration_oid, token_type, token, arena);
     }
-    match configuration_oid {
-        3_748 | 13_248 => {
-            if !matches!(token_type, 1..=11 | 15..=22) {
-                return Ok(full_text::TextSearchLexeme::Unmapped);
-            }
-            let config = if configuration_oid == 3_748 {
-                TextSearchConfig::Simple
-            } else {
-                TextSearchConfig::English
-            };
-            Ok(match full_text::normalize_token(token, config, arena)? {
-                Some(lexeme) => full_text::TextSearchLexeme::Lexeme(lexeme),
-                None => full_text::TextSearchLexeme::StopWord,
-            })
-        }
-        _ => Err(sql_err!(
+    match TextSearchConfig::from_oid(configuration_oid) {
+        Some(config) => full_text::normalize_builtin(config, token_type, token, arena),
+        None => Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "text-search catalog access is unavailable"
         )),
     }
+}
+
+/// `to_tsvector(document)` under `default_text_search_config`, as `text @@
+/// tsquery` computes it.
+pub(crate) fn current_config_vector<'a>(
+    document: &str,
+    arena: &'a crate::mem::arena::Arena,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<&'a str, SqlError> {
+    let config = current_config(hooks)?;
+    full_text::to_tsvector_with(document, arena, |token_type, token, arena| {
+        normalize(config, token_type, token, arena, hooks)
+    })
 }
 
 fn current_config(hooks: &EvalHooks<'_, '_>) -> Result<i32, SqlError> {
@@ -660,6 +687,10 @@ pub(crate) fn dispatch<'a>(
             "ts_rank" | "ts_rank_cd" => {
                 arity(name, args.len(), 2..=4)?;
                 let first = eval_full(args[0], arena, params, row, hooks)?;
+                let vector_index = usize::from(
+                    args.len() == 4
+                        || args.len() == 3 && matches!(first, Datum::Array { .. } | Datum::Null),
+                );
                 let (weights, vector, query, normalization) = match args.len() {
                     2 => (
                         [0.1, 0.2, 0.4, 1.0],
@@ -702,6 +733,8 @@ pub(crate) fn dispatch<'a>(
                     }
                     _ => unreachable!("rank arity guard"),
                 };
+                let vector = unknown_literal(args[vector_index], vector, Literal::Vector, arena)?;
+                let query = unknown_literal(args[vector_index + 1], query, Literal::Query, arena)?;
                 let (Datum::TsVector(vector), Datum::TsQuery(query)) = (vector, query) else {
                     if vector.is_null() || query.is_null() {
                         return Ok(Datum::Null);
@@ -745,6 +778,13 @@ pub(crate) fn dispatch<'a>(
                         };
                         (configuration, second, query, options)
                     };
+                let query_index = if args.len() == 2 || matches!(second, Datum::TsQuery(_)) {
+                    1
+                } else {
+                    2
+                };
+                let query_value =
+                    unknown_literal(args[query_index], query_value, Literal::Query, arena)?;
                 let document = match document_value {
                     Datum::Null => return Ok(Datum::Null),
                     Datum::Text(document) | Datum::Bpchar(document) => (document, None),
@@ -766,122 +806,35 @@ pub(crate) fn dispatch<'a>(
                         "ts_headline requires tsquery"
                     ));
                 };
-                let mut start = "<b>";
-                let mut stop = "</b>";
-                let mut fragment_delimiter = " ... ";
-                let mut min_words = 15i32;
-                let mut max_words = 35i32;
-                let mut short_word = 3i32;
-                let mut max_fragments = 0i32;
-                let mut highlight_all = false;
-                if let Some(option_text) = options {
-                    for option in option_text.split(',') {
-                        let (key, value) = option.split_once('=').ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::INVALID_PARAMETER_VALUE,
-                                "invalid ts_headline option: {}",
-                                option.trim()
-                            )
-                        })?;
-                        let key = key.trim();
-                        let value = value.trim();
-                        if key.eq_ignore_ascii_case("StartSel") {
-                            start = value;
-                        } else if key.eq_ignore_ascii_case("StopSel") {
-                            stop = value;
-                        } else if key.eq_ignore_ascii_case("FragmentDelimiter") {
-                            fragment_delimiter = value;
-                        } else if key.eq_ignore_ascii_case("HighlightAll") {
-                            highlight_all = value == "1"
-                                || value.eq_ignore_ascii_case("on")
-                                || value.eq_ignore_ascii_case("true")
-                                || value.eq_ignore_ascii_case("t")
-                                || value.eq_ignore_ascii_case("y")
-                                || value.eq_ignore_ascii_case("yes");
-                        } else {
-                            let parsed = value.parse::<i32>().map_err(|_| {
-                                sql_err!(
-                                    sqlstate::INVALID_TEXT_REPRESENTATION,
-                                    "invalid input syntax for type integer: \"{}\"",
-                                    value
-                                )
-                            })?;
-                            if key.eq_ignore_ascii_case("MinWords") {
-                                min_words = parsed;
-                            } else if key.eq_ignore_ascii_case("MaxWords") {
-                                max_words = parsed;
-                            } else if key.eq_ignore_ascii_case("ShortWord") {
-                                short_word = parsed;
-                            } else if key.eq_ignore_ascii_case("MaxFragments") {
-                                max_fragments = parsed;
-                            } else {
-                                return Err(sql_err!(
-                                    sqlstate::INVALID_PARAMETER_VALUE,
-                                    "unrecognized headline parameter: \"{}\"",
-                                    key
-                                ));
-                            }
-                        }
-                    }
-                }
-                if start.len() > i16::MAX as usize
-                    || stop.len() > i16::MAX as usize
-                    || fragment_delimiter.len() > i16::MAX as usize
-                {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "headline selection marker is too long"
-                    ));
-                }
-                if !highlight_all {
-                    if min_words >= max_words {
-                        return Err(sql_err!(
-                            sqlstate::INVALID_PARAMETER_VALUE,
-                            "MinWords must be less than MaxWords"
-                        ));
-                    }
-                    if min_words <= 0 {
-                        return Err(sql_err!(
-                            sqlstate::INVALID_PARAMETER_VALUE,
-                            "MinWords must be positive"
-                        ));
-                    }
-                    if short_word < 0 {
-                        return Err(sql_err!(
-                            sqlstate::INVALID_PARAMETER_VALUE,
-                            "ShortWord must be >= 0"
-                        ));
-                    }
-                    if max_fragments < 0 {
-                        return Err(sql_err!(
-                            sqlstate::INVALID_PARAMETER_VALUE,
-                            "MaxFragments must be >= 0"
-                        ));
-                    }
-                }
-                let headline_options = full_text::HeadlineOptions {
-                    start,
-                    stop,
-                    fragment_delimiter,
-                    min_words: min_words.max(1) as usize,
-                    max_words: max_words.max(1) as usize,
-                    short_word: short_word.max(0) as usize,
-                    max_fragments: max_fragments.max(0) as usize,
-                    highlight_all,
-                };
-                let mut headline = |document, arena| {
-                    full_text::headline_with(
-                        document,
-                        query.as_str(),
-                        headline_options,
-                        arena,
-                        |token_type, token, arena| {
-                            normalize(configuration, token_type, token, arena, hooks)
-                        },
-                    )
+                let configuration_normalize = |token_type, token: &str, arena| {
+                    normalize(configuration, token_type, token, arena, hooks)
                 };
                 let Some(jsonb) = document.1 else {
-                    return Ok(Datum::Text(headline(document.0, arena)?));
+                    return Ok(Datum::Text(text_parser::headline(
+                        document.0,
+                        query.as_str(),
+                        text_parser::HeadlineOptions::Text(options),
+                        &mut text_parser::HeadlineState::default(),
+                        arena,
+                        configuration_normalize,
+                    )?));
+                };
+                // The JSON variants parse the options before visiting any
+                // string and count lexeme positions across strings.
+                let options = text_parser::HeadlineOptions::Parsed(match options {
+                    Some(text) => text_parser::parse_headline_options(text, arena)?,
+                    None => &[],
+                });
+                let mut state = text_parser::HeadlineState::default();
+                let mut headline = |document, arena| {
+                    text_parser::headline(
+                        document,
+                        query.as_str(),
+                        options,
+                        &mut state,
+                        arena,
+                        configuration_normalize,
+                    )
                 };
                 let value = if jsonb {
                     crate::sql::json::parse(document.0, arena)?
@@ -912,11 +865,11 @@ pub(crate) fn dispatch<'a>(
                 let display = if let Some(catalog) = hooks.catalog {
                     catalog.text_search_configuration_name(oid)
                 } else {
-                    match oid {
-                        3_748 => Some(crate::util::StackStr::from_str("simple")),
-                        13_248 => Some(crate::util::StackStr::from_str("english")),
-                        _ => None,
-                    }
+                    full_text::builtin_object(
+                        crate::sql::ast::TextSearchObjectKind::Configuration,
+                        oid,
+                    )
+                    .map(|definition| crate::util::StackStr::from_str(definition.name().as_str()))
                 }
                 .ok_or_else(|| {
                     sql_err!(
@@ -1123,23 +1076,13 @@ pub(crate) fn dispatch<'a>(
                 let lexeme = if let Some(catalog) = hooks.catalog {
                     catalog.lexize_text_search_dictionary(dictionary_oid, token, arena)?
                 } else {
-                    match dictionary_oid {
-                        3_765 => match full_text::normalize_token(
-                            token,
-                            TextSearchConfig::Simple,
-                            arena,
-                        )? {
-                            Some(value) => full_text::TextSearchLexeme::Lexeme(value),
-                            None => full_text::TextSearchLexeme::StopWord,
-                        },
-                        13_247 => match full_text::normalize_token(
-                            token,
-                            TextSearchConfig::English,
-                            arena,
-                        )? {
-                            Some(value) => full_text::TextSearchLexeme::Lexeme(value),
-                            None => full_text::TextSearchLexeme::StopWord,
-                        },
+                    match full_text::builtin_object(
+                        crate::sql::ast::TextSearchObjectKind::Dictionary,
+                        dictionary_oid,
+                    ) {
+                        Some(crate::storage::TextSearchDefinition::Dictionary {
+                            behavior, ..
+                        }) => full_text::lexize_dictionary(behavior, token, arena)?,
                         _ => {
                             return Err(sql_err!(
                                 sqlstate::UNDEFINED_OBJECT,

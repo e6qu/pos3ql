@@ -9,6 +9,7 @@ use core::fmt::Write as _;
 
 use crate::mem::arena::{Arena, ArenaList};
 use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql::text_parser::{self, MAX_PARSED_WORD_BYTES};
 use crate::sql::types::Datum;
 use crate::sql_err;
 use crate::util::StackStr;
@@ -73,17 +74,16 @@ const MAX_QUERY_DEPTH: usize = 64;
 // Text input reserves one byte for PostgreSQL's internal terminator. Binary
 // input carries that terminator separately and can fill the 11-bit field.
 const MAX_TEXT_LEXEME_BYTES: usize = 2_046;
-/// PostgreSQL's parser skips, with a NOTICE, a document word this long.
-const MAX_PARSED_WORD_BYTES: usize = 2_048;
 const MAX_WIRE_LEXEME_BYTES: usize = 2_047;
+/// A dictionary may return a lexeme of up to `MAXSTRLEN` (2,047) bytes, which
+/// the binary `tsvector` PostgreSQL builds can hold.
+const PARSED_LEXEME_BYTES: usize = MAX_PARSED_WORD_BYTES;
 const MAX_LEXEME_POSITIONS: usize = 256;
 const MAX_TEXT_SEARCH_STORAGE_BYTES: usize = (1 << 20) - 1;
 
+/// A built-in text search configuration: `simple` or a Snowball language's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TextSearchConfig {
-    Simple,
-    English,
-}
+pub struct TextSearchConfig(i32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextSearchLexeme<'a> {
@@ -93,22 +93,35 @@ pub enum TextSearchLexeme<'a> {
 }
 
 impl TextSearchConfig {
+    pub const SIMPLE: Self = Self(3_748);
+    /// `english` follows `english_stem`, the seventh Snowball dictionary.
+    pub const ENGLISH: Self = Self(crate::sql::catalog::FIRST_SNOWBALL_DICTIONARY_OID + 13);
+
+    /// The built-in configuration with this name, matched as an unquoted,
+    /// optionally `pg_catalog`-qualified identifier.
     pub fn parse(name: &str) -> Option<Self> {
-        let unqualified = name.rsplit('.').next().unwrap_or(name);
-        if unqualified.eq_ignore_ascii_case("simple") {
-            Some(Self::Simple)
-        } else if unqualified.eq_ignore_ascii_case("english") {
-            Some(Self::English)
-        } else {
-            None
+        let unqualified = match name.rsplit_once('.') {
+            Some((schema, unqualified)) if schema.eq_ignore_ascii_case("pg_catalog") => unqualified,
+            Some(_) => return None,
+            None => name,
+        };
+        let mut lower = StackStr::<64>::new();
+        for character in unqualified.chars() {
+            lower.write_char(character.to_ascii_lowercase()).ok()?;
         }
+        builtin_object_oid(
+            crate::sql::ast::TextSearchObjectKind::Configuration,
+            lower.as_str(),
+        )
+        .map(Self)
     }
 
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Simple => "simple",
-            Self::English => "english",
-        }
+    pub fn from_oid(oid: i32) -> Option<Self> {
+        builtin_object(crate::sql::ast::TextSearchObjectKind::Configuration, oid).map(|_| Self(oid))
+    }
+
+    pub const fn oid(self) -> i32 {
+        self.0
     }
 }
 
@@ -1568,483 +1581,151 @@ pub fn matches(vector_text: &str, query_text: &str, arena: &Arena) -> Result<boo
     }
 }
 
-fn token_char(character: char) -> bool {
-    character.is_alphanumeric() || character == '_'
+/// `str_tolower` under the default collation: pos3ql databases use the C
+/// ctype, which lower-cases ASCII letters only.
+fn lower_token<'a>(token: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    if !token.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return arena
+            .alloc_str(token)
+            .map_err(|_| arena_full("text-search lexeme"));
+    }
+    let bytes = arena
+        .alloc_slice_with(token.len(), |index| {
+            token.as_bytes()[index].to_ascii_lowercase()
+        })
+        .map_err(|_| arena_full("text-search lexeme"))?;
+    Ok(core::str::from_utf8(bytes).expect("ASCII lower-casing keeps UTF-8"))
 }
 
-fn is_english_stop_word(word: &str) -> bool {
-    matches!(
-        word,
-        "a" | "about"
-            | "above"
-            | "after"
-            | "again"
-            | "against"
-            | "all"
-            | "am"
-            | "an"
-            | "and"
-            | "any"
-            | "are"
-            | "as"
-            | "at"
-            | "be"
-            | "because"
-            | "been"
-            | "before"
-            | "being"
-            | "below"
-            | "between"
-            | "both"
-            | "but"
-            | "by"
-            | "can"
-            | "did"
-            | "do"
-            | "does"
-            | "doing"
-            | "don"
-            | "down"
-            | "during"
-            | "each"
-            | "few"
-            | "for"
-            | "from"
-            | "further"
-            | "had"
-            | "has"
-            | "have"
-            | "having"
-            | "he"
-            | "her"
-            | "here"
-            | "hers"
-            | "herself"
-            | "him"
-            | "himself"
-            | "his"
-            | "how"
-            | "i"
-            | "if"
-            | "in"
-            | "into"
-            | "is"
-            | "it"
-            | "its"
-            | "itself"
-            | "me"
-            | "more"
-            | "just"
-            | "most"
-            | "my"
-            | "myself"
-            | "no"
-            | "nor"
-            | "not"
-            | "now"
-            | "of"
-            | "off"
-            | "on"
-            | "once"
-            | "only"
-            | "or"
-            | "other"
-            | "our"
-            | "ours"
-            | "ourselves"
-            | "out"
-            | "over"
-            | "own"
-            | "same"
-            | "she"
-            | "should"
-            | "so"
-            | "some"
-            | "such"
-            | "than"
-            | "that"
-            | "the"
-            | "their"
-            | "theirs"
-            | "them"
-            | "themselves"
-            | "then"
-            | "there"
-            | "these"
-            | "they"
-            | "this"
-            | "those"
-            | "through"
-            | "to"
-            | "s"
-            | "t"
-            | "too"
-            | "under"
-            | "until"
-            | "up"
-            | "very"
-            | "was"
-            | "we"
-            | "were"
-            | "what"
-            | "when"
-            | "where"
-            | "which"
-            | "while"
-            | "who"
-            | "whom"
-            | "why"
-            | "will"
-            | "with"
-            | "you"
-            | "your"
-            | "yours"
-            | "yourself"
-            | "yourselves"
-    )
-}
-
-fn english_stem(word: &str) -> StackStr<MAX_TEXT_LEXEME_BYTES> {
-    let mut stem = StackStr::<MAX_TEXT_LEXEME_BYTES>::from_str(word);
-    if !word.is_ascii() || word.len() <= 2 {
-        return stem;
-    }
-    if let Some(exception) = porter_exception_one(word) {
-        return StackStr::from_str(exception);
-    }
-    let (r1, r2) = porter_regions(word);
-    if stem.as_str().ends_with("'s'") {
-        stem.truncate(stem.len() - 3);
-    } else if stem.as_str().ends_with("'s") {
-        stem.truncate(stem.len() - 2);
-    } else if stem.as_str().ends_with('\'') {
-        stem.truncate(stem.len() - 1);
-    }
-    if porter_replace(&mut stem, "sses", "ss", 0) {
-    } else if stem.as_str().ends_with("ied") || stem.as_str().ends_with("ies") {
-        let start = stem.len() - 3;
-        stem.truncate(start);
-        let _ = stem.write_str(if start > 1 { "i" } else { "ie" });
-    } else if !stem.as_str().ends_with("us")
-        && !stem.as_str().ends_with("ss")
-        && stem.as_str().ends_with('s')
-    {
-        let end = stem.len() - 2;
-        if porter_has_vowel(stem.as_str(), 0, end) {
-            stem.truncate(stem.len() - 1);
-        }
-    }
-    if !porter_exception_two(stem.as_str()) {
-        if porter_replace(&mut stem, "eedly", "ee", r1)
-            || porter_replace(&mut stem, "eed", "ee", r1)
-        {
-        } else {
-            let removed = ["ingly", "edly", "ing", "ed"].into_iter().find(|suffix| {
-                stem.as_str().ends_with(suffix)
-                    && porter_has_vowel(stem.as_str(), 0, stem.len() - suffix.len())
-            });
-            if let Some(suffix) = removed {
-                stem.truncate(stem.len() - suffix.len());
-                if stem.as_str().ends_with("at")
-                    || stem.as_str().ends_with("bl")
-                    || stem.as_str().ends_with("iz")
-                {
-                    let _ = stem.write_char('e');
-                } else if ["bb", "dd", "ff", "gg", "mm", "nn", "pp", "rr", "tt"]
-                    .iter()
-                    .any(|ending| stem.as_str().ends_with(ending))
-                {
-                    stem.truncate(stem.len() - 1);
-                } else if r1 >= stem.len() && porter_short_syllable(stem.as_str()) {
-                    let _ = stem.write_char('e');
-                }
-            }
-        }
-    }
-    if stem.len() > 2 && stem.as_str().ends_with('y') {
-        let before = stem.as_str().as_bytes()[stem.len() - 2];
-        if !porter_vowel(stem.as_str(), stem.len() - 2) && before != b'y' {
-            stem.truncate(stem.len() - 1);
-            let _ = stem.write_char('i');
-        }
-    }
-    for (suffix, replacement) in [
-        ("ization", "ize"),
-        ("ational", "ate"),
-        ("fulness", "ful"),
-        ("ousness", "ous"),
-        ("iveness", "ive"),
-        ("tional", "tion"),
-        ("biliti", "ble"),
-        ("lessli", "less"),
-        ("entli", "ent"),
-        ("ation", "ate"),
-        ("alism", "al"),
-        ("aliti", "al"),
-        ("ousli", "ous"),
-        ("iviti", "ive"),
-        ("fulli", "ful"),
-        ("enci", "ence"),
-        ("anci", "ance"),
-        ("abli", "able"),
-        ("izer", "ize"),
-        ("ator", "ate"),
-        ("alli", "al"),
-        ("bli", "ble"),
-    ] {
-        if porter_replace(&mut stem, suffix, replacement, r1) {
-            break;
-        }
-    }
-    if stem.as_str().ends_with("ogi") {
-        let start = stem.len() - 3;
-        if start >= r1 && start > 0 && stem.as_str().as_bytes()[start - 1] == b'l' {
-            stem.truncate(start);
-            let _ = stem.write_str("og");
-        }
-    } else if stem.as_str().ends_with("li") {
-        let start = stem.len() - 2;
-        if start >= r1 && start > 0 && b"cdeghkmnrt".contains(&stem.as_str().as_bytes()[start - 1])
-        {
-            stem.truncate(start);
-        }
-    }
-    for (suffix, replacement, region) in [
-        ("ational", "ate", r1),
-        ("tional", "tion", r1),
-        ("alize", "al", r1),
-        ("icate", "ic", r1),
-        ("iciti", "ic", r1),
-        ("ical", "ic", r1),
-        ("ful", "", r1),
-        ("ness", "", r1),
-        ("ative", "", r2),
-    ] {
-        if porter_replace(&mut stem, suffix, replacement, region) {
-            break;
-        }
-    }
-    let mut removed_step_four = false;
-    for suffix in [
-        "ement", "ance", "ence", "able", "ible", "ment", "ant", "ent", "ism", "ate", "iti", "ous",
-        "ive", "ize", "al", "er", "ic",
-    ] {
-        if porter_replace(&mut stem, suffix, "", r2) {
-            removed_step_four = true;
-            break;
-        }
-    }
-    if !removed_step_four && stem.as_str().ends_with("ion") {
-        let start = stem.len() - 3;
-        if start >= r2 && start > 0 && matches!(stem.as_str().as_bytes()[start - 1], b's' | b't') {
-            stem.truncate(start);
-        }
-    }
-    if stem.as_str().ends_with('e') {
-        let start = stem.len() - 1;
-        if start >= r2 || (start >= r1 && !porter_short_syllable(&stem.as_str()[..start])) {
-            stem.truncate(start);
-        }
-    } else if stem.as_str().ends_with("ll") && stem.len() > r2 {
-        stem.truncate(stem.len() - 1);
-    }
-    stem
-}
-
-fn porter_vowel(word: &str, index: usize) -> bool {
-    let bytes = word.as_bytes();
-    match bytes[index] {
-        b'a' | b'e' | b'i' | b'o' | b'u' => true,
-        b'y' => {
-            let mut start = index;
-            while start > 0 && bytes[start] == b'y' {
-                start -= 1;
-            }
-            if bytes[start] == b'y' {
-                index % 2 == 1
-            } else {
-                let preceding_is_vowel = matches!(bytes[start], b'a' | b'e' | b'i' | b'o' | b'u');
-                if (index - start) % 2 == 1 {
-                    !preceding_is_vowel
-                } else {
-                    preceding_is_vowel
-                }
-            }
-        }
-        _ => false,
-    }
-}
-
-fn porter_has_vowel(word: &str, start: usize, end: usize) -> bool {
-    (start..end.min(word.len())).any(|index| porter_vowel(word, index))
-}
-
-fn porter_regions(word: &str) -> (usize, usize) {
-    let first = if word.starts_with("gener") {
-        5
-    } else if word.starts_with("commun") {
-        6
-    } else if word.starts_with("arsen") {
-        5
-    } else {
-        porter_region_after(word, 0)
-    };
-    (first, porter_region_after(word, first))
-}
-
-fn porter_region_after(word: &str, from: usize) -> usize {
-    for index in from.saturating_add(1)..word.len() {
-        if porter_vowel(word, index - 1) && !porter_vowel(word, index) {
-            return index + 1;
-        }
-    }
-    word.len()
-}
-
-fn porter_short_syllable(word: &str) -> bool {
-    let length = word.len();
-    if length >= 3 {
-        let last = word.as_bytes()[length - 1];
-        !porter_vowel(word, length - 3)
-            && porter_vowel(word, length - 2)
-            && !porter_vowel(word, length - 1)
-            && !matches!(last, b'w' | b'x' | b'y')
-    } else {
-        length == 2 && porter_vowel(word, 0) && !porter_vowel(word, 1)
-    }
-}
-
-fn porter_replace(
-    word: &mut StackStr<MAX_TEXT_LEXEME_BYTES>,
-    suffix: &str,
-    replacement: &str,
-    region: usize,
-) -> bool {
-    if !word.as_str().ends_with(suffix) {
-        return false;
-    }
-    let start = word.len() - suffix.len();
-    if start < region {
-        return false;
-    }
-    word.truncate(start);
-    let _ = word.write_str(replacement);
-    true
-}
-
-fn porter_exception_one(word: &str) -> Option<&'static str> {
-    Some(match word {
-        "skis" => "ski",
-        "skies" => "sky",
-        "dying" => "die",
-        "lying" => "lie",
-        "tying" => "tie",
-        "idly" => "idl",
-        "gently" => "gentl",
-        "ugly" => "ugli",
-        "early" => "earli",
-        "only" => "onli",
-        "singly" => "singl",
-        "sky" => "sky",
-        "news" => "news",
-        "howe" => "howe",
-        "atlas" => "atlas",
-        "cosmos" => "cosmos",
-        "bias" => "bias",
-        "andes" => "andes",
-        _ => return None,
-    })
-}
-
-fn porter_exception_two(word: &str) -> bool {
-    matches!(
-        word,
-        "inning" | "outing" | "canning" | "herring" | "earring" | "proceed" | "exceed" | "succeed"
-    )
-}
-
-pub(crate) fn normalize_token<'a>(
+/// One dictionary's result for a token, as `dsimple_lexize` and
+/// `dsnowball_lexize` compute it.
+pub(crate) fn lexize_dictionary<'a>(
+    behavior: crate::storage::TextSearchDictionaryBehavior,
     token: &str,
-    config: TextSearchConfig,
     arena: &'a Arena,
-) -> Result<Option<&'a str>, SqlError> {
-    let mut lower = StackStr::<MAX_TEXT_LEXEME_BYTES>::new();
-    for character in token.chars().flat_map(char::to_lowercase) {
-        lower
-            .write_char(character)
-            .map_err(|_| capacity("text-search lexeme"))?;
-    }
-    if config == TextSearchConfig::English && is_english_stop_word(lower.as_str()) {
-        return Ok(None);
-    }
-    let stemmed = if config == TextSearchConfig::English {
-        english_stem(lower.as_str())
-    } else {
-        lower
+) -> Result<TextSearchLexeme<'a>, SqlError> {
+    use crate::sql::snowball::{MAX_STEMMED_INPUT_BYTES, STEM_BUFFER_BYTES};
+    use crate::storage::TextSearchDictionaryBehavior as Behavior;
+    let lower = lower_token(token, arena)?;
+    let stopword = |list: Option<crate::sql::snowball::StopwordList>| {
+        lower.is_empty() || list.is_some_and(|list| list.contains(lower))
     };
-    Ok(Some(
-        arena
-            .alloc_str(stemmed.as_str())
-            .map_err(|_| arena_full("text-search lexeme"))?,
-    ))
-}
-
-fn token_type(token: &str) -> u8 {
-    if numeric_token(token) {
-        let unsigned = token.trim_start_matches(['+', '-']);
-        let dots = unsigned.bytes().filter(|byte| *byte == b'.').count();
-        if unsigned.bytes().any(|byte| matches!(byte, b'e' | b'E')) {
-            7 // sfloat
-        } else if dots > 1 {
-            8 // version
-        } else if dots == 1 {
-            20 // float
-        } else if token
-            .as_bytes()
-            .first()
-            .is_some_and(|byte| matches!(byte, b'+' | b'-'))
-        {
-            21 // int
+    match behavior {
+        Behavior::Simple { accept, stopwords } => Ok(if stopword(stopwords) {
+            TextSearchLexeme::StopWord
+        } else if accept {
+            TextSearchLexeme::Lexeme(lower)
         } else {
-            22 // uint
+            TextSearchLexeme::Unmapped
+        }),
+        // A longer word is surely not a word in any language; PostgreSQL
+        // returns it lower-cased without consulting stopwords or the stemmer.
+        Behavior::Snowball { .. } if token.len() > MAX_STEMMED_INPUT_BYTES => {
+            Ok(TextSearchLexeme::Lexeme(lower))
         }
-    } else if token.contains('.') && token.chars().any(char::is_alphabetic) {
-        6 // host
-    } else if token.bytes().all(|byte| byte.is_ascii_alphabetic()) {
-        1 // asciiword
-    } else if token.chars().all(char::is_alphabetic) {
-        2 // word
-    } else if token.bytes().all(|byte| byte.is_ascii_digit()) {
-        22 // uint
-    } else {
-        3 // numword
+        Behavior::Snowball { stopwords, .. } if stopword(stopwords) => {
+            Ok(TextSearchLexeme::StopWord)
+        }
+        Behavior::Snowball { language, .. } => {
+            let mut stem = [0u8; STEM_BUFFER_BYTES];
+            let len = language.stem(lower, &mut stem).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "text-search word exceeds the {}-byte Snowball stemmer buffer",
+                    STEM_BUFFER_BYTES
+                )
+            })?;
+            let stem = core::str::from_utf8(&stem[..len]).map_err(|_| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "Snowball stemmer produced invalid UTF-8"
+                )
+            })?;
+            Ok(TextSearchLexeme::Lexeme(
+                arena
+                    .alloc_str(stem)
+                    .map_err(|_| arena_full("text-search lexeme"))?,
+            ))
+        }
     }
 }
 
-fn numeric_token(token: &str) -> bool {
-    let unsigned = token.strip_prefix(['+', '-']).unwrap_or(token);
-    if unsigned.is_empty() {
-        return false;
+/// Runs a configuration's dictionaries for one token type in order: the first
+/// dictionary that recognizes the token (a lexeme or a stopword) decides.
+pub(crate) fn lexize_mapped<'a>(
+    mappings: &crate::storage::TextSearchMappings,
+    token_type: u8,
+    token: &str,
+    arena: &'a Arena,
+    mut dictionary: impl FnMut(i32) -> Result<crate::storage::TextSearchDictionaryBehavior, SqlError>,
+) -> Result<TextSearchLexeme<'a>, SqlError> {
+    let index = usize::from(token_type.checked_sub(1).ok_or_else(invalid_token_type)?);
+    if index >= crate::storage::TEXT_SEARCH_TOKEN_TYPES {
+        return Err(invalid_token_type());
     }
-    if let Some((mantissa, exponent)) = unsigned.split_once(['e', 'E']) {
-        if exponent.contains(['e', 'E']) {
-            return false;
+    for oid in &mappings.dictionaries[index][..usize::from(mappings.counts[index])] {
+        match lexize_dictionary(dictionary(*oid)?, token, arena)? {
+            TextSearchLexeme::Unmapped => {}
+            recognized => return Ok(recognized),
         }
-        let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
-        return !exponent.is_empty()
-            && exponent.bytes().all(|byte| byte.is_ascii_digit())
-            && mantissa
-                .split('.')
-                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-            && mantissa.bytes().filter(|byte| *byte == b'.').count() <= 1;
     }
-    unsigned
-        .split('.')
-        .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    Ok(TextSearchLexeme::Unmapped)
 }
 
-fn builtin_token_is_mapped(token_type: u8) -> bool {
-    matches!(token_type, 1..=11 | 15..=22)
+fn invalid_token_type() -> SqlError {
+    sql_err!(
+        sqlstate::INTERNAL_ERROR,
+        "invalid text-search parser token type"
+    )
+}
+
+/// The built-in object of `kind` with this OID, as initdb creates it.
+pub(crate) fn builtin_object(
+    kind: crate::sql::ast::TextSearchObjectKind,
+    oid: i32,
+) -> Option<crate::storage::TextSearchDefinition> {
+    (0..crate::storage::BUILTIN_TEXT_SEARCH_OBJECTS)
+        .filter_map(crate::storage::builtin_text_search_definition)
+        .find(|definition| definition.kind() == kind && definition.oid() == oid)
+}
+
+/// The OID of the built-in `pg_catalog` object of `kind` named `name`.
+pub(crate) fn builtin_object_oid(
+    kind: crate::sql::ast::TextSearchObjectKind,
+    name: &str,
+) -> Option<i32> {
+    (0..crate::storage::BUILTIN_TEXT_SEARCH_OBJECTS)
+        .filter_map(crate::storage::builtin_text_search_definition)
+        .find(|definition| definition.kind() == kind && definition.name().as_str() == name)
+        .map(crate::storage::TextSearchDefinition::oid)
+}
+
+/// Normalizes a token with a built-in configuration, without a catalog.
+pub(crate) fn normalize_builtin<'a>(
+    config: TextSearchConfig,
+    token_type: u8,
+    token: &str,
+    arena: &'a Arena,
+) -> Result<TextSearchLexeme<'a>, SqlError> {
+    let Some(crate::storage::TextSearchDefinition::Configuration { mappings, .. }) = builtin_object(
+        crate::sql::ast::TextSearchObjectKind::Configuration,
+        config.oid(),
+    ) else {
+        unreachable!("every built-in configuration has a catalog definition");
+    };
+    lexize_mapped(
+        &mappings,
+        token_type,
+        token,
+        arena,
+        |oid| match builtin_object(crate::sql::ast::TextSearchObjectKind::Dictionary, oid) {
+            Some(crate::storage::TextSearchDefinition::Dictionary { behavior, .. }) => Ok(behavior),
+            _ => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "text-search configuration references a missing dictionary"
+            )),
+        },
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -2062,17 +1743,11 @@ fn document_tokens_with<'a>(
 ) -> Result<DocumentLexemes<'a>, SqlError> {
     let mut tokens = ArenaList::new(arena);
     let mut position = 0u32;
-    let mut emit = |kind: u8, source: &str| -> Result<(), SqlError> {
-        if source.is_empty() {
-            return Ok(());
-        }
+    let mut parser = text_parser::TextParser::new(document, arena);
+    while let Some((kind, source)) = parser.next_token()? {
         if source.len() >= MAX_PARSED_WORD_BYTES {
-            return crate::sql::eval::raise_eval_message_with_detail(
-                crate::sql::eval::EvalMessageLevel::Notice,
-                crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                format_args!("word is too long to be indexed"),
-                "Words longer than 2047 characters are ignored.",
-            );
+            text_parser::long_word_notice()?;
+            continue;
         }
         match normalize(kind, source, arena)? {
             TextSearchLexeme::Unmapped => {}
@@ -2087,131 +1762,6 @@ fn document_tokens_with<'a>(
                     .map_err(|_| arena_full("text-search document"))?;
             }
         }
-        Ok(())
-    };
-    let bytes = document.as_bytes();
-    let mut at = 0usize;
-    while at < bytes.len() {
-        if bytes[at].is_ascii_whitespace() {
-            let begin = at;
-            while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
-                at += 1;
-            }
-            emit(12, &document[begin..at])?;
-            continue;
-        }
-        if bytes[at] == b'<'
-            && let Some(relative) = bytes[at..].iter().position(|byte| *byte == b'>')
-        {
-            let end = at + relative + 1;
-            emit(13, &document[at..end])?;
-            at = end;
-            continue;
-        }
-        if bytes[at] == b'&'
-            && let Some(relative) = bytes[at..].iter().position(|byte| *byte == b';')
-        {
-            let end = at + relative + 1;
-            emit(23, &document[at..end])?;
-            at = end;
-            continue;
-        }
-        if !bytes[at].is_ascii_alphanumeric()
-            && bytes[at] < 0x80
-            && !(matches!(bytes[at], b'/' | b'-' | b'+')
-                && bytes.get(at + 1).is_some_and(u8::is_ascii_alphanumeric))
-        {
-            let begin = at;
-            at += 1;
-            while at < bytes.len()
-                && !bytes[at].is_ascii_alphanumeric()
-                && !bytes[at].is_ascii_whitespace()
-                && !matches!(bytes[at], b'<' | b'&')
-            {
-                at += 1;
-            }
-            emit(12, &document[begin..at])?;
-            continue;
-        }
-        let begin = at;
-        while at < bytes.len()
-            && !bytes[at].is_ascii_whitespace()
-            && !matches!(bytes[at], b'<' | b'>' | b'&')
-        {
-            at += 1;
-        }
-        let mut end = at;
-        while end > begin
-            && matches!(
-                bytes[end - 1],
-                b',' | b';' | b'!' | b'?' | b')' | b']' | b'}'
-            )
-        {
-            end -= 1;
-        }
-        let source = &document[begin..end];
-        if let Some(protocol_end) = source.find("://") {
-            let protocol_end = protocol_end + 3;
-            emit(14, &source[..protocol_end])?;
-            let url = &source[protocol_end..];
-            if !url.is_empty() {
-                emit(5, url)?;
-                let host_end = url.find('/').unwrap_or(url.len());
-                emit(6, &url[..host_end])?;
-                if host_end < url.len() {
-                    emit(18, &url[host_end..])?;
-                }
-            }
-        } else if source.contains('@')
-            && source
-                .split_once('@')
-                .is_some_and(|(left, right)| !left.is_empty() && right.contains('.'))
-        {
-            emit(4, source)?;
-        } else if source.starts_with('/') {
-            emit(19, source)?;
-        } else if source.contains('/') {
-            emit(5, source)?;
-            let host_end = source.find('/').expect("contains slash");
-            emit(6, &source[..host_end])?;
-            emit(18, &source[host_end..])?;
-        } else if numeric_token(source) {
-            emit(token_type(source), source)?;
-        } else if source.contains('-')
-            && source
-                .split('-')
-                .all(|part| !part.is_empty() && part.chars().all(char::is_alphabetic))
-        {
-            let unicode = source.bytes().any(|byte| !byte.is_ascii());
-            emit(if unicode { 17 } else { 16 }, source)?;
-            for part in source.split('-') {
-                emit(if unicode { 10 } else { 11 }, part)?;
-            }
-        } else if source.split_once('-').is_some_and(|(left, right)| {
-            left.chars().all(char::is_alphabetic) && right.bytes().all(|byte| byte.is_ascii_digit())
-        }) {
-            let (left, _) = source.split_once('-').expect("checked hyphen");
-            emit(token_type(left), left)?;
-            emit(21, &source[left.len()..])?;
-        } else if source.contains('-') {
-            let mut piece_start = 0usize;
-            for (separator, _) in source
-                .match_indices('-')
-                .chain(core::iter::once((source.len(), "")))
-            {
-                if separator > piece_start {
-                    let part = &source[piece_start..separator];
-                    emit(token_type(part), part)?;
-                }
-                piece_start = separator + 1;
-            }
-        } else {
-            emit(token_type(source), source)?;
-        }
-        if end < at {
-            emit(12, &document[end..at])?;
-        }
-        at = at.max(end);
     }
     Ok(tokens.as_slice())
 }
@@ -2222,12 +1772,14 @@ pub(crate) struct ParserToken<'a> {
     pub text: &'a str,
 }
 
+/// The default parser's tokens (`ts_parse`), long ones included.
 pub(crate) fn parse_document<'a>(
     document: &str,
     arena: &'a Arena,
 ) -> Result<&'a [ParserToken<'a>], SqlError> {
     let mut tokens = ArenaList::new(arena);
-    let _ = document_tokens_with(document, arena, |kind, text, arena| {
+    let mut parser = text_parser::TextParser::new(document, arena);
+    while let Some((kind, text)) = parser.next_token()? {
         tokens
             .push(ParserToken {
                 kind,
@@ -2236,36 +1788,11 @@ pub(crate) fn parse_document<'a>(
                     .map_err(|_| arena_full("text-search parser output"))?,
             })
             .map_err(|_| arena_full("text-search parser output"))?;
-        Ok(TextSearchLexeme::Unmapped)
-    })?;
+    }
     Ok(tokens.as_slice())
 }
 
-pub(crate) const TOKEN_TYPES: [(&str, &str); 23] = [
-    ("asciiword", "Word, all ASCII"),
-    ("word", "Word, all letters"),
-    ("numword", "Word, letters and digits"),
-    ("email", "Email address"),
-    ("url", "URL"),
-    ("host", "Host"),
-    ("sfloat", "Scientific notation"),
-    ("version", "Version number"),
-    ("hword_numpart", "Hyphenated word part, letters and digits"),
-    ("hword_part", "Hyphenated word part, all letters"),
-    ("hword_asciipart", "Hyphenated word part, all ASCII"),
-    ("blank", "Space symbols"),
-    ("tag", "XML tag"),
-    ("protocol", "Protocol head"),
-    ("numhword", "Hyphenated word, letters and digits"),
-    ("asciihword", "Hyphenated word, all ASCII"),
-    ("hword", "Hyphenated word, all letters"),
-    ("url_path", "URL path"),
-    ("file", "File or path name"),
-    ("float", "Decimal notation"),
-    ("int", "Signed integer"),
-    ("uint", "Unsigned integer"),
-    ("entity", "XML entity"),
-];
+pub(crate) use text_parser::TOKEN_TYPES;
 
 fn document_tokens<'a>(
     config: TextSearchConfig,
@@ -2273,13 +1800,7 @@ fn document_tokens<'a>(
     arena: &'a Arena,
 ) -> Result<DocumentLexemes<'a>, SqlError> {
     document_tokens_with(document, arena, |kind, token, arena| {
-        if !builtin_token_is_mapped(kind) {
-            return Ok(TextSearchLexeme::Unmapped);
-        }
-        Ok(match normalize_token(token, config, arena)? {
-            Some(lexeme) => TextSearchLexeme::Lexeme(lexeme),
-            None => TextSearchLexeme::StopWord,
-        })
+        normalize_builtin(config, kind, token, arena)
     })
 }
 
@@ -2305,7 +1826,7 @@ pub fn to_tsvector<'a>(
         raw.push_byte(b':')?;
         write_u16(&mut raw, token.position)?;
     }
-    canonical_vector(raw.finish(), arena)
+    canonical_vector_with_limit(raw.finish(), PARSED_LEXEME_BYTES, arena)
 }
 
 pub(crate) fn to_tsvector_with<'a>(
@@ -2479,7 +2000,7 @@ pub(crate) fn json_to_tsvector_with<'a>(
             .saturating_add(1)
             .min(16_383);
     }
-    canonical_vector(raw.finish(), arena)
+    canonical_vector_with_limit(raw.finish(), PARSED_LEXEME_BYTES, arena)
 }
 
 fn vector_from_document_tokens<'a>(
@@ -2502,7 +2023,7 @@ fn vector_from_document_tokens<'a>(
         raw.push_byte(b':')?;
         write_u16(&mut raw, token.position)?;
     }
-    canonical_vector(raw.finish(), arena)
+    canonical_vector_with_limit(raw.finish(), PARSED_LEXEME_BYTES, arena)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2510,24 +2031,6 @@ pub enum QueryInput {
     Plain,
     Phrase,
     Websearch,
-}
-
-pub fn text_to_query<'a>(
-    config: TextSearchConfig,
-    source: &str,
-    mode: QueryInput,
-    arena: &'a Arena,
-) -> Result<&'a str, SqlError> {
-    let mut normalize = |kind: u8, token: &str, arena: &'a Arena| {
-        if !builtin_token_is_mapped(kind) {
-            return Ok(TextSearchLexeme::Unmapped);
-        }
-        Ok(match normalize_token(token, config, arena)? {
-            Some(lexeme) => TextSearchLexeme::Lexeme(lexeme),
-            None => TextSearchLexeme::StopWord,
-        })
-    };
-    text_to_query_normalized(source, mode, arena, &mut normalize)
 }
 
 pub(crate) fn text_to_query_with<'a>(
@@ -3532,229 +3035,6 @@ impl<'a> QueryRewriter<'a> {
             None => self.tree.format(self.root),
         }
     }
-}
-
-pub fn headline<'a>(
-    document: &str,
-    query_text: &str,
-    start: &str,
-    stop: &str,
-    arena: &'a Arena,
-) -> Result<&'a str, SqlError> {
-    headline_with(
-        document,
-        query_text,
-        HeadlineOptions {
-            start,
-            stop,
-            ..HeadlineOptions::DEFAULT
-        },
-        arena,
-        |kind, token, arena| {
-            if !builtin_token_is_mapped(kind) {
-                return Ok(TextSearchLexeme::Unmapped);
-            }
-            Ok(
-                match normalize_token(token, TextSearchConfig::English, arena)? {
-                    Some(lexeme) => TextSearchLexeme::Lexeme(lexeme),
-                    None => TextSearchLexeme::StopWord,
-                },
-            )
-        },
-    )
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct HeadlineOptions<'a> {
-    pub start: &'a str,
-    pub stop: &'a str,
-    pub fragment_delimiter: &'a str,
-    pub min_words: usize,
-    pub max_words: usize,
-    pub short_word: usize,
-    pub max_fragments: usize,
-    pub highlight_all: bool,
-}
-
-impl HeadlineOptions<'static> {
-    pub(crate) const DEFAULT: Self = Self {
-        start: "<b>",
-        stop: "</b>",
-        fragment_delimiter: " ... ",
-        min_words: 15,
-        max_words: 35,
-        short_word: 3,
-        max_fragments: 0,
-        highlight_all: false,
-    };
-}
-
-#[derive(Clone, Copy)]
-struct HeadlineWord {
-    start: usize,
-    end: usize,
-    hit: bool,
-}
-
-pub(crate) fn headline_with<'a>(
-    document: &str,
-    query_text: &str,
-    options: HeadlineOptions<'_>,
-    arena: &'a Arena,
-    mut normalize: impl FnMut(u8, &str, &'a Arena) -> Result<TextSearchLexeme<'a>, SqlError>,
-) -> Result<&'a str, SqlError> {
-    let query = parse_query(query_text, arena)?;
-    let mut terms = ArenaList::new(arena);
-    for node in query.nodes() {
-        if let QueryNode::Lexeme { text, prefix, .. } = *node {
-            terms
-                .push((text, prefix))
-                .map_err(|_| arena_full("ts_headline"))?;
-        }
-    }
-    let mut words = ArenaList::new(arena);
-    let mut begin = None;
-    for (offset, character) in document
-        .char_indices()
-        .chain(core::iter::once((document.len(), ' ')))
-    {
-        if token_char(character) {
-            begin.get_or_insert(offset);
-            continue;
-        }
-        let Some(start) = begin.take() else { continue };
-        let word = &document[start..offset];
-        let hit = match normalize(token_type(word), word, arena)? {
-            TextSearchLexeme::Lexeme(lexeme) => terms
-                .as_slice()
-                .iter()
-                .any(|(term, prefix)| lexeme == *term || *prefix && lexeme.starts_with(term)),
-            TextSearchLexeme::Unmapped | TextSearchLexeme::StopWord => false,
-        };
-        words
-            .push(HeadlineWord {
-                start,
-                end: offset,
-                hit,
-            })
-            .map_err(|_| arena_full("ts_headline"))?;
-    }
-    if words.is_empty() {
-        return arena
-            .alloc_str(document)
-            .map_err(|_| arena_full("ts_headline"));
-    }
-
-    let mut fragments = ArenaList::new(arena);
-    if options.highlight_all {
-        fragments
-            .push((0, words.len() - 1))
-            .map_err(|_| arena_full("ts_headline"))?;
-    } else if options.max_fragments == 0 {
-        let first_hit = words.as_slice().iter().position(|word| word.hit);
-        let start = first_hit.unwrap_or(0);
-        let mut end = (start + options.min_words.saturating_sub(1)).min(words.len() - 1);
-        let mut begin = start;
-        if end + 1 - begin < options.min_words {
-            begin = end.saturating_add(1).saturating_sub(options.min_words);
-        }
-        if end + 1 - begin > options.max_words {
-            end = begin + options.max_words - 1;
-        }
-        fragments
-            .push((begin, end))
-            .map_err(|_| arena_full("ts_headline"))?;
-    } else {
-        for (hit, word) in words.as_slice().iter().enumerate() {
-            if !word.hit || fragments.len() == options.max_fragments {
-                continue;
-            }
-            let before = options.max_words.saturating_sub(1) / 2;
-            let mut begin = hit.saturating_sub(before);
-            let mut end = (begin + options.max_words.saturating_sub(1)).min(words.len() - 1);
-            begin = end
-                .saturating_add(1)
-                .saturating_sub(options.max_words)
-                .min(begin);
-            if let Some(previous) = fragments
-                .as_mut_slice()
-                .map_err(|_| arena_full("ts_headline"))?
-                .last_mut()
-                && begin <= previous.1
-            {
-                previous.1 = previous.1.max(end);
-                continue;
-            }
-            if end + 1 - begin < options.min_words {
-                end = (begin + options.min_words - 1).min(words.len() - 1);
-            }
-            fragments
-                .push((begin, end))
-                .map_err(|_| arena_full("ts_headline"))?;
-        }
-        if fragments.is_empty() {
-            fragments
-                .push((0, options.min_words.saturating_sub(1).min(words.len() - 1)))
-                .map_err(|_| arena_full("ts_headline"))?;
-        }
-    }
-
-    let mut out = ArenaText::new(
-        arena,
-        document
-            .len()
-            .saturating_add(
-                document
-                    .len()
-                    .saturating_mul(options.start.len().saturating_add(options.stop.len())),
-            )
-            .saturating_add(
-                fragments
-                    .len()
-                    .saturating_mul(options.fragment_delimiter.len()),
-            )
-            .saturating_add(1),
-        "ts_headline",
-    )?;
-    for (begin, end) in fragments
-        .as_mut_slice()
-        .map_err(|_| arena_full("ts_headline"))?
-    {
-        while *end > *begin
-            && *end + 1 - *begin > options.min_words
-            && !words.as_slice()[*end].hit
-            && words.as_slice()[*end].end - words.as_slice()[*end].start <= options.short_word
-        {
-            *end -= 1;
-        }
-    }
-    for (fragment, (begin, end)) in fragments.as_slice().iter().copied().enumerate() {
-        if fragment > 0 {
-            out.push_str(options.fragment_delimiter)?;
-        }
-        let byte_start = words.as_slice()[begin].start;
-        let mut byte_end = words.as_slice()[end].end;
-        for character in document[byte_end..].chars() {
-            if token_char(character) || character.is_whitespace() {
-                break;
-            }
-            byte_end += character.len_utf8();
-        }
-        let mut at = byte_start;
-        for word in &words.as_slice()[begin..=end] {
-            out.push_str(&document[at..word.start])?;
-            if word.hit {
-                out.push_str(options.start)?;
-            }
-            out.push_str(&document[word.start..word.end])?;
-            if word.hit {
-                out.push_str(options.stop)?;
-            }
-            at = word.end;
-        }
-        out.push_str(&document[at..byte_end])?;
-    }
-    Ok(out.finish())
 }
 
 pub fn vector_length(source: &str, arena: &Arena) -> Result<i32, SqlError> {
@@ -5021,7 +4301,7 @@ mod tests {
         let arena = arena();
         let source = "skies dying lying tying idly gently ugly early only singly relational conditional rational valenci hesitanci digitizer conformabli radicalli differentli vileli analogousli vietnamization predication operator feudalism decisiveness hopefulness callousness formaliti sensitiviti sensibiliti triplicate formative formalize electriciti electrical hopeful goodness revival allowance inference airliner gyroscopic adjustable defensible irritant replacement adjustment dependent adoption homologou communism activate angulariti homologous effective bowdlerize probate rate cease controll roll";
         assert_eq!(
-            to_tsvector(TextSearchConfig::English, source, &arena).unwrap(),
+            to_tsvector(TextSearchConfig::ENGLISH, source, &arena).unwrap(),
             "'activ':53 'adjust':44,48 'adopt':50 'airlin':42 'allow':40 'analog':21 'angular':54 'bowdler':57 'callous':28 'ceas':60 'communism':52 'condit':12 'conform':17 'control':61 'decis':26 'defens':45 'depend':49 'die':2 'differ':19 'digit':16 'earli':8 'effect':56 'electr':35,36 'feudal':25 'formal':29,34 'format':33 'gentl':6 'good':38 'gyroscop':43 'hesit':15 'homolog':55 'homologou':51 'hope':27,37 'idl':5 'infer':41 'irrit':46 'lie':3 'oper':24 'predic':23 'probat':58 'radic':18 'rate':59 'ration':13 'relat':11 'replac':47 'reviv':39 'roll':62 'sensibl':31 'sensit':30 'singl':10 'sky':1 'tie':4 'triplic':32 'ugli':7 'valenc':14 'vietnam':22 'vile':20"
         );
     }
@@ -5031,7 +4311,7 @@ mod tests {
         let arena = arena();
         let source = "foo@example.com https://example.com/a-b file.txt 12.34 -4.5 1.2.3 abc-def ghi-42 42-jkl <tag> &amp; host.local /tmp/a.txt";
         assert_eq!(
-            to_tsvector(TextSearchConfig::Simple, source, &arena).unwrap(),
+            to_tsvector(TextSearchConfig::SIMPLE, source, &arena).unwrap(),
             "'-4.5':7 '-42':13 '/a-b':4 '/tmp/a.txt':17 '1.2.3':8 '12.34':6 '42':14 'abc':10 'abc-def':9 'def':11 'example.com':3 'example.com/a-b':2 'file.txt':5 'foo@example.com':1 'ghi':12 'host.local':16 'jkl':15"
         );
     }

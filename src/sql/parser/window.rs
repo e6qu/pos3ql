@@ -158,7 +158,10 @@ impl<'a> Parser<'a> {
             }
             self.expect_ident("as")?;
             self.expect_op("(")?;
-            let spec = self.window_spec_body()?;
+            let spec = WindowSpec {
+                name: Some(name),
+                ..self.window_spec_body()?
+            };
             let entry = Some((name, self.arena_window(spec)?));
             self.windows
                 .push(entry)
@@ -220,7 +223,8 @@ impl<'a> Parser<'a> {
                 _ => FrameUnits::Groups,
             };
             self.advance()?;
-            let (start, end) = if self.eat_ident("between")? {
+            let between = self.eat_ident("between")?;
+            let (start, end) = if between {
                 let start = self.frame_bound()?;
                 self.expect_ident("and")?;
                 let end = self.frame_bound()?;
@@ -274,6 +278,7 @@ impl<'a> Parser<'a> {
             };
             Some(WindowFrame {
                 units,
+                between,
                 start,
                 end,
                 exclusion,
@@ -288,6 +293,9 @@ impl<'a> Parser<'a> {
         };
         let Some((name, base)) = copied else {
             return Ok(WindowSpec {
+                name: None,
+                base: None,
+                copied_order: false,
                 partition_by,
                 order_by,
                 frame,
@@ -341,6 +349,9 @@ impl<'a> Parser<'a> {
             });
         }
         Ok(WindowSpec {
+            name: None,
+            base: Some(name),
+            copied_order: order_by.is_empty() && !base.order_by.is_empty(),
             partition_by: base.partition_by,
             order_by: if order_by.is_empty() {
                 base.order_by

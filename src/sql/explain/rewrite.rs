@@ -32,16 +32,18 @@ pub(super) fn rewritten_statements<'a>(
     statement: &'a Stmt<'a>,
     arena: &'a Arena,
 ) -> Result<Option<&'a [&'a Stmt<'a>]>, SqlError> {
-    if !rule_rewrite::statement_is_rewritten(storage, txid, false, statement) {
+    let role = crate::sql::guc::active_session_replication_role()?;
+    if !rule_rewrite::statement_is_rewritten(storage, txid, role, statement) {
         return Ok(None);
     }
     // The rewriter's own errors (recursion, views it cannot update, RETURNING
     // lists) come before anything is planned.
-    rule_rewrite::walk_rewritten(storage, txid, false, statement, arena, &mut |_| Ok(()))?;
+    rule_rewrite::walk_rewritten(storage, txid, role, statement, arena, &mut |_| Ok(()))?;
     let mut out = ArenaList::new(arena);
     Rewriter {
         storage,
         txid,
+        role,
         arena,
     }
     .query(statement, &mut out)?;
@@ -57,6 +59,7 @@ pub(super) fn rewritten_statements<'a>(
 struct Rewriter<'s, 'a> {
     storage: &'s Storage,
     txid: u32,
+    role: crate::sql::guc::SessionReplicationRole,
     arena: &'a Arena,
 }
 
@@ -68,7 +71,7 @@ enum Inserted<'a> {
     /// A query's output expressions over its own FROM items.
     Query {
         items: &'a [&'a Expr<'a>],
-        from: Option<FromClause<'a>>,
+        from: Option<&'a FromClause<'a>>,
         where_clause: Option<&'a Expr<'a>>,
     },
 }
@@ -104,11 +107,18 @@ enum TargetJoin {
     None,
 }
 
-fn alloc<'a, T>(arena: &'a Arena, value: T) -> Result<&'a T, SqlError> {
-    arena.alloc(value).map(|value| &*value).map_err(|_| arena_full())
+fn alloc<T: Copy>(arena: &Arena, value: T) -> Result<&T, SqlError> {
+    arena
+        .alloc(value)
+        .map(|value| &*value)
+        .map_err(|_| arena_full())
 }
 
-fn column<'a>(arena: &'a Arena, qualifier: &'a str, name: &'a str) -> Result<&'a Expr<'a>, SqlError> {
+fn column<'a>(
+    arena: &'a Arena,
+    qualifier: &'a str,
+    name: &'a str,
+) -> Result<&'a Expr<'a>, SqlError> {
     alloc(
         arena,
         Expr::Column {
@@ -191,7 +201,10 @@ fn action_expressions<'a>(statement: &Stmt<'a>, visit: &mut dyn FnMut(&'a Expr<'
         select.having.into_iter().for_each(&mut *visit);
         select.group_by.iter().copied().for_each(&mut *visit);
         if let Some(from) = &select.from {
-            from.joins.iter().filter_map(|join| join.on).for_each(&mut *visit);
+            from.joins
+                .iter()
+                .filter_map(|join| join.on)
+                .for_each(&mut *visit);
         }
     }
     match statement {
@@ -204,7 +217,10 @@ fn action_expressions<'a>(statement: &Stmt<'a>, visit: &mut dyn FnMut(&'a Expr<'
             }
         }
         Stmt::Update(update) => {
-            update.assignments.iter().for_each(|(_, value)| visit(value));
+            update
+                .assignments
+                .iter()
+                .for_each(|(_, value)| visit(value));
             update.where_clause.into_iter().for_each(&mut *visit);
         }
         Stmt::Delete(delete) => delete.where_clause.into_iter().for_each(&mut *visit),
@@ -270,7 +286,13 @@ fn derived<'a>(
     TableRef {
         subquery: Some(body),
         col_alias: columns,
-        ..query::rule_relation_ref(QualName { schema: None, name: alias }, Some(alias))
+        ..query::rule_relation_ref(
+            QualName {
+                schema: None,
+                name: alias,
+            },
+            Some(alias),
+        )
     }
 }
 
@@ -287,7 +309,10 @@ fn values_query<'a>(
                 alias: None,
             })
             .map_err(|_| arena_full())?;
-        let leaf = alloc(arena, SetTree::Select(alloc(arena, query::rule_select(items, None, None))?))?;
+        let leaf = alloc(
+            arena,
+            SetTree::Select(alloc(arena, query::rule_select(items, None, None))?),
+        )?;
         tree = Some(match tree {
             None => leaf,
             Some(left) => alloc(
@@ -302,9 +327,8 @@ fn values_query<'a>(
             )?,
         });
     }
-    let tree = tree.ok_or_else(|| {
-        sql_err!(sqlstate::INTERNAL_ERROR, "a VALUES list has no rows")
-    })?;
+    let tree =
+        tree.ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "a VALUES list has no rows"))?;
     alloc(
         arena,
         Select {
@@ -337,74 +361,93 @@ impl<'a> Rewriter<'_, 'a> {
             return push(out, statement);
         };
         let (relation, target) = match storage.resolve_relation(name.schema, name.name, txid) {
-            Some(ResolvedRelation::Table(slot)) => {
-                (ResolvedRelation::Table(slot), RuleTarget::Table(slot as u16))
-            }
+            Some(ResolvedRelation::Table(slot)) => (
+                ResolvedRelation::Table(slot),
+                RuleTarget::Table(slot as u16),
+            ),
             Some(ResolvedRelation::View(slot)) => {
                 (ResolvedRelation::View(slot), RuleTarget::View(slot as u16))
             }
             _ => return push(out, statement),
         };
+        let rewritten = match relation {
+            ResolvedRelation::View(_) => true,
+            _ => storage
+                .firing_rules_for(target, event, self.role, txid)
+                .next()
+                .is_some(),
+        };
+        if !rewritten {
+            return push(out, statement);
+        }
         let original = self.original(statement, relation, event)?;
         let mut products = ArenaList::new(self.arena);
         let mut instead = false;
         let mut exclusions: Option<&'a Expr<'a>> = None;
-        rule_rewrite::rules_in_order(storage, target, event, false, txid, |slot, definition| {
-            let condition = match definition.condition_sql() {
-                Some(sql) => {
-                    let sql = self.arena.alloc_str(sql).map_err(|_| arena_full())?;
-                    Some(crate::sql::parser::parse_expr(sql, self.arena)?)
-                }
-                None => None,
-            };
-            let substituted = condition
-                .map(|condition| self.substitute(&original, condition))
-                .transpose()?;
-            if definition.mode == RewriteMode::Instead {
-                match substituted {
-                    None => instead = true,
-                    // `AddInvertedQual`: the original keeps the rows for
-                    // which the condition is not true.
-                    Some(condition) => {
-                        let whens = self
-                            .arena
-                            .alloc_slice_copy(&[(condition, &Expr::Bool(false))])
-                            .map_err(|_| arena_full())?;
-                        let not_true = alloc(
-                            self.arena,
-                            Expr::Case {
-                                operand: None,
-                                whens,
-                                otherwise: Some(&Expr::Bool(true)),
-                                origin: CaseOrigin::BooleanTest {
-                                    value: true,
-                                    negated: true,
+        rule_rewrite::rules_in_order(
+            storage,
+            target,
+            event,
+            self.role,
+            txid,
+            |slot, definition| {
+                let condition = match definition.condition_sql() {
+                    Some(sql) => {
+                        let sql = self.arena.alloc_str(sql).map_err(|_| arena_full())?;
+                        Some(crate::sql::parser::parse_expr(sql, self.arena)?)
+                    }
+                    None => None,
+                };
+                let substituted = condition
+                    .map(|condition| self.substitute(&original, condition))
+                    .transpose()?;
+                if definition.mode == RewriteMode::Instead {
+                    match substituted {
+                        None => instead = true,
+                        // `AddInvertedQual`: the original keeps the rows for
+                        // which the condition is not true.
+                        Some(condition) => {
+                            let whens = self
+                                .arena
+                                .alloc_slice_copy(&[(condition, &Expr::Bool(false))])
+                                .map_err(|_| arena_full())?;
+                            let not_true = alloc(
+                                self.arena,
+                                Expr::Case {
+                                    operand: None,
+                                    whens,
+                                    otherwise: Some(&Expr::Bool(true)),
+                                    origin: CaseOrigin::BooleanTest {
+                                        value: true,
+                                        negated: true,
+                                    },
                                 },
-                            },
-                        )?;
-                        exclusions = query::and_where(exclusions, Some(not_true), self.arena)?;
+                            )?;
+                            exclusions = query::and_where(exclusions, Some(not_true), self.arena)?;
+                        }
                     }
                 }
-            }
-            let dependencies = storage.snapshot_rule_dependencies(slot, txid, self.arena)?;
-            for sql in definition.action_sql() {
-                let action = query::parse_stored_rule_statement(
-                    &definition,
-                    sql,
-                    storage,
-                    txid,
-                    dependencies.view(),
-                    self.arena,
-                )?;
-                let action = self.bind_action_target(action, dependencies.view())?;
-                let product = self.action(&original, action, condition, substituted)?;
-                products.push(product).map_err(|_| arena_full())?;
-            }
-            Ok(())
-        })?;
+                let dependencies = storage.snapshot_rule_dependencies(slot, txid, self.arena)?;
+                for sql in definition.action_sql() {
+                    let action = query::parse_stored_rule_statement(
+                        &definition,
+                        sql,
+                        storage,
+                        txid,
+                        dependencies.view(),
+                        self.arena,
+                    )?;
+                    let action = self.bind_action_target(action, dependencies.view())?;
+                    let product = self.action(&original, action, condition, substituted)?;
+                    products.push(product).map_err(|_| arena_full())?;
+                }
+                Ok(())
+            },
+        )?;
         let base = match relation {
             ResolvedRelation::View(view)
-                if !instead && !rule_rewrite::view_has_instead_trigger(storage, view, event, txid) =>
+                if !instead
+                    && !rule_rewrite::view_has_instead_trigger(storage, view, event, txid) =>
             {
                 instead = true;
                 Some(self.view_base(statement)?)
@@ -464,7 +507,11 @@ impl<'a> Rewriter<'_, 'a> {
             ResolvedRelation::Catalog => return Ok(action),
         };
         let bound = QualName {
-            schema: Some(self.arena.alloc_str(schema.as_str()).map_err(|_| arena_full())?),
+            schema: Some(
+                self.arena
+                    .alloc_str(schema.as_str())
+                    .map_err(|_| arena_full())?,
+            ),
             name: self
                 .arena
                 .alloc_str(relation.as_str())
@@ -526,8 +573,8 @@ impl<'a> Rewriter<'_, 'a> {
                 (&*names, &*defaults)
             }
             ResolvedRelation::View(slot) => {
-                let mut descriptions = [crate::sql::types::ColDesc::new("", 0, 0);
-                    crate::sql::exec::MAX_PROJ];
+                let mut descriptions =
+                    [crate::sql::types::ColDesc::new("", 0, 0); crate::sql::exec::MAX_PROJ];
                 let count = crate::sql::catalog::describe_view(
                     &self.storage.view(slot),
                     self.txid,
@@ -568,15 +615,19 @@ impl<'a> Rewriter<'_, 'a> {
                 original.exposed = update.alias.unwrap_or(update.table.name);
                 original.target = Some(query::rule_relation_ref(update.table, update.alias));
                 original.extras = update.from.copied();
-                original.condition =
-                    update.where_clause.map(|condition| self.qualify(&original, condition)).transpose()?;
+                original.condition = update
+                    .where_clause
+                    .map(|condition| self.qualify(&original, condition))
+                    .transpose()?;
             }
             Stmt::Delete(delete) => {
                 original.exposed = delete.alias.unwrap_or(delete.table.name);
                 original.target = Some(query::rule_relation_ref(delete.table, delete.alias));
                 original.extras = delete.using.copied();
-                original.condition =
-                    delete.where_clause.map(|condition| self.qualify(&original, condition)).transpose()?;
+                original.condition = delete
+                    .where_clause
+                    .map(|condition| self.qualify(&original, condition))
+                    .transpose()?;
             }
             _ => unreachable!("only INSERT, UPDATE and DELETE are rewritten"),
         }
@@ -584,10 +635,20 @@ impl<'a> Rewriter<'_, 'a> {
     }
 
     /// How the INSERT's rows read as `NEW`.
-    fn inserted(&self, insert: &Insert<'a>, original: &Original<'a>) -> Result<Inserted<'a>, SqlError> {
+    fn inserted(
+        &self,
+        insert: &Insert<'a>,
+        original: &Original<'a>,
+    ) -> Result<Inserted<'a>, SqlError> {
         let arena = self.arena;
         if let Some(select) = insert.select {
-            if pulled_up(self.storage, self.txid, select, arena)? {
+            // Views the query reads are read through their queries.
+            let probe = if self.storage.has_any_view() {
+                query::expand_ctes(select, self.storage, self.txid, arena)?
+            } else {
+                select
+            };
+            if pulled_up(self.storage, self.txid, probe, arena)? {
                 let items = arena
                     .alloc_slice_with(select.items.len(), |index| match select.items[index] {
                         SelectItem::Expr { expression, .. } => expression,
@@ -596,7 +657,7 @@ impl<'a> Rewriter<'_, 'a> {
                     .map_err(|_| arena_full())?;
                 return Ok(Inserted::Query {
                     items,
-                    from: select.from,
+                    from: select.from.as_ref(),
                     where_clause: select.where_clause,
                 });
             }
@@ -608,7 +669,9 @@ impl<'a> Rewriter<'_, 'a> {
                 .all(|item| matches!(item, SelectItem::Expr { .. }));
             let names: &'a [&'a str] = if named {
                 arena
-                    .alloc_slice_with(select.items.len(), |index| output_name(&select.items[index]))
+                    .alloc_slice_with(select.items.len(), |index| {
+                        output_name(&select.items[index])
+                    })
                     .map_err(|_| arena_full())?
             } else {
                 original.inserted_columns
@@ -622,7 +685,10 @@ impl<'a> Rewriter<'_, 'a> {
             }
             return Ok(Inserted::Query {
                 items,
-                from: Some(single_from(derived(select, "*SELECT*", columns))),
+                from: Some(alloc(
+                    arena,
+                    single_from(derived(select, "*SELECT*", columns)),
+                )?),
                 where_clause: None,
             });
         }
@@ -647,10 +713,14 @@ impl<'a> Rewriter<'_, 'a> {
                 // Several rows are scanned from their `*VALUES*` list.
                 let mut defaulted_rows = ArenaList::new(arena);
                 for row in rows {
-                    defaulted_rows.push(defaulted(row)?).map_err(|_| arena_full())?;
+                    defaulted_rows
+                        .push(defaulted(row)?)
+                        .map_err(|_| arena_full())?;
                 }
                 let width = rows.first().map_or(0, |row| row.len());
-                let names = arena.alloc_slice_with(width, |_| "").map_err(|_| arena_full())?;
+                let names = arena
+                    .alloc_slice_with(width, |_| "")
+                    .map_err(|_| arena_full())?;
                 let items = arena
                     .alloc_slice_with(width, |_| &Expr::Null)
                     .map_err(|_| arena_full())?;
@@ -661,7 +731,10 @@ impl<'a> Rewriter<'_, 'a> {
                 let body = values_query(defaulted_rows.as_slice(), arena)?;
                 Ok(Inserted::Query {
                     items,
-                    from: Some(single_from(derived(body, "*VALUES*", Some(names)))),
+                    from: Some(alloc(
+                        arena,
+                        single_from(derived(body, "*VALUES*", Some(names))),
+                    )?),
                     where_clause: None,
                 })
             }
@@ -677,7 +750,11 @@ impl<'a> Rewriter<'_, 'a> {
     }
 
     /// The original's unqualified target columns, named through its target.
-    fn qualify(&self, original: &Original<'a>, expression: &'a Expr<'a>) -> Result<&'a Expr<'a>, SqlError> {
+    fn qualify(
+        &self,
+        original: &Original<'a>,
+        expression: &'a Expr<'a>,
+    ) -> Result<&'a Expr<'a>, SqlError> {
         qualify_columns(expression, original.columns, original.exposed, self.arena)
     }
 
@@ -720,27 +797,34 @@ impl<'a> Rewriter<'_, 'a> {
 
     /// `expression` with the rule's OLD and NEW replaced by the original's
     /// row.
-    fn substitute(&self, original: &Original<'a>, expression: &'a Expr<'a>) -> Result<&'a Expr<'a>, SqlError> {
-        crate::sql::ast::rewrite_expression(expression, self.arena, &mut |node: &'a Expr<'a>| -> Result<
-            Option<&'a Expr<'a>>,
-            RewriteFailure,
-        > {
-            match node {
-                Expr::Column {
-                    qualifier: Some(qualifier),
-                    name,
-                } if qualifier.eq_ignore_ascii_case("old") => {
-                    self.old_value(original, name).map(Some).map_err(RewriteFailure)
+    fn substitute(
+        &self,
+        original: &Original<'a>,
+        expression: &'a Expr<'a>,
+    ) -> Result<&'a Expr<'a>, SqlError> {
+        crate::sql::ast::rewrite_expression(
+            expression,
+            self.arena,
+            &mut |node: &'a Expr<'a>| -> Result<Option<&'a Expr<'a>>, RewriteFailure> {
+                match node {
+                    Expr::Column {
+                        qualifier: Some(qualifier),
+                        name,
+                    } if qualifier.eq_ignore_ascii_case("old") => self
+                        .old_value(original, name)
+                        .map(Some)
+                        .map_err(RewriteFailure),
+                    Expr::Column {
+                        qualifier: Some(qualifier),
+                        name,
+                    } if qualifier.eq_ignore_ascii_case("new") => self
+                        .new_value(original, name)
+                        .map(Some)
+                        .map_err(RewriteFailure),
+                    _ => Ok(None),
                 }
-                Expr::Column {
-                    qualifier: Some(qualifier),
-                    name,
-                } if qualifier.eq_ignore_ascii_case("new") => {
-                    self.new_value(original, name).map(Some).map_err(RewriteFailure)
-                }
-                _ => Ok(None),
-            }
-        })
+            },
+        )
         .map_err(|RewriteFailure(error)| error)
     }
 
@@ -795,7 +879,7 @@ impl<'a> Rewriter<'_, 'a> {
         ) = match original.inserted {
             Some(Inserted::Query {
                 from, where_clause, ..
-            }) => (from, None, where_clause),
+            }) => (from.copied(), None, where_clause),
             Some(Inserted::Row(_)) => (None, None, None),
             None => {
                 let transition: &[&str] = if original.event == RewriteEvent::Update {
@@ -809,11 +893,12 @@ impl<'a> Rewriter<'_, 'a> {
                 });
                 let join = if reads_target {
                     TargetJoin::Last
-                } else if written_condition.is_some_and(|condition| {
-                    mentions(condition, &["old", "new"], &[])
-                }) || original.condition.is_some_and(|condition| {
-                    mentions(condition, &[original.exposed], &[])
-                }) {
+                } else if written_condition
+                    .is_some_and(|condition| mentions(condition, &["old", "new"], &[]))
+                    || original
+                        .condition
+                        .is_some_and(|condition| mentions(condition, &[original.exposed], &[]))
+                {
                     TargetJoin::First
                 } else {
                     TargetJoin::None
@@ -870,7 +955,12 @@ impl<'a> Rewriter<'_, 'a> {
                     ..insert
                 })
             }
-            Stmt::Select(select) => Stmt::Select(*self.action_select(original, select, &joined, filter)?),
+            Stmt::Select(_) => {
+                let Stmt::Select(select) = action else {
+                    unreachable!("matched above");
+                };
+                Stmt::Select(*self.action_select(original, select, &joined, filter)?)
+            }
             Stmt::Update(update) => {
                 let target = update.alias.unwrap_or(update.table.name);
                 let columns = self.relation_columns(update.table)?;
@@ -878,11 +968,14 @@ impl<'a> Rewriter<'_, 'a> {
                     .alloc_slice_with(update.assignments.len(), |index| update.assignments[index])
                     .map_err(|_| arena_full())?;
                 for (_, value) in assignments.iter_mut() {
-                    *value = self.substitute(original, qualify_columns(value, columns, target, arena)?)?;
+                    *value =
+                        self.substitute(original, qualify_columns(value, columns, target, arena)?)?;
                 }
                 let own = update
                     .where_clause
-                    .map(|own| self.substitute(original, qualify_columns(own, columns, target, arena)?))
+                    .map(|own| {
+                        self.substitute(original, qualify_columns(own, columns, target, arena)?)
+                    })
                     .transpose()?;
                 let from = joined(update.from.copied())?;
                 Stmt::Update(Update {
@@ -897,7 +990,9 @@ impl<'a> Rewriter<'_, 'a> {
                 let columns = self.relation_columns(delete.table)?;
                 let own = delete
                     .where_clause
-                    .map(|own| self.substitute(original, qualify_columns(own, columns, target, arena)?))
+                    .map(|own| {
+                        self.substitute(original, qualify_columns(own, columns, target, arena)?)
+                    })
                     .transpose()?;
                 let using = joined(delete.using.copied())?;
                 Stmt::Delete(Delete {
@@ -947,7 +1042,10 @@ impl<'a> Rewriter<'_, 'a> {
 
     fn relation_columns(&self, name: QualName<'a>) -> Result<&'a [&'a str], SqlError> {
         let arena = self.arena;
-        match self.storage.resolve_relation(name.schema, name.name, self.txid) {
+        match self
+            .storage
+            .resolve_relation(name.schema, name.name, self.txid)
+        {
             Some(ResolvedRelation::Table(slot)) => {
                 let definition = self.storage.table_def(slot, self.txid);
                 let columns = definition.columns();
@@ -962,8 +1060,8 @@ impl<'a> Rewriter<'_, 'a> {
                 Ok(names)
             }
             Some(ResolvedRelation::View(slot)) => {
-                let mut descriptions = [crate::sql::types::ColDesc::new("", 0, 0);
-                    crate::sql::exec::MAX_PROJ];
+                let mut descriptions =
+                    [crate::sql::types::ColDesc::new("", 0, 0); crate::sql::exec::MAX_PROJ];
                 let count = crate::sql::catalog::describe_view(
                     &self.storage.view(slot),
                     self.txid,
@@ -981,7 +1079,11 @@ impl<'a> Rewriter<'_, 'a> {
 
     /// The original restricted to the rows no qualified INSTEAD rule
     /// takes (PostgreSQL's `qual_product`).
-    fn restricted(&self, original: &Original<'a>, exclusions: &'a Expr<'a>) -> Result<&'a Stmt<'a>, SqlError> {
+    fn restricted(
+        &self,
+        original: &Original<'a>,
+        exclusions: &'a Expr<'a>,
+    ) -> Result<&'a Stmt<'a>, SqlError> {
         let arena = self.arena;
         let rewritten = match original.statement {
             Stmt::Update(update) => Stmt::Update(Update {
@@ -999,7 +1101,7 @@ impl<'a> Rewriter<'_, 'a> {
                         items,
                         from,
                         where_clause,
-                    }) => (items, from, where_clause),
+                    }) => (items, from.copied(), where_clause),
                     None => unreachable!("an INSERT reads its rows"),
                 };
                 let items = arena
@@ -1027,44 +1129,21 @@ impl<'a> Rewriter<'_, 'a> {
         let Some((name, _)) = rule_rewrite::statement_target(statement) else {
             unreachable!("a view rewrite reads a data-changing statement");
         };
-        let view = query::resolve_view_for_dml(self.storage, name, self.txid, arena)?
-            .expect("a view target resolves as a view");
-        let rewritten = query::rewrite_view_dml(
-            statement,
-            name.name,
-            view.base.name,
-            view.base.schema.expect("view base is qualified"),
-            view.columns,
-            view.base_columns,
+        let Some((_, event)) = rule_rewrite::statement_target(statement) else {
+            unreachable!("a view rewrite reads a data-changing statement");
+        };
+        let view = query::resolve_view_for_dml(
             self.storage,
+            name,
             self.txid,
             arena,
-        )?;
-        let base = match (statement, rewritten) {
-            (Stmt::Insert(_), Stmt::Insert(rewritten)) => Stmt::Insert(Insert {
-                table: view.base,
-                columns: if rewritten.columns.is_empty() {
-                    view.base_columns
-                } else {
-                    rewritten.columns
-                },
-                ..*rewritten
-            }),
-            (Stmt::Update(update), Stmt::Update(rewritten)) => Stmt::Update(Update {
-                table: view.base,
-                alias: update.alias,
-                where_clause: query::and_where(view.where_clause, rewritten.where_clause, arena)?,
-                ..*rewritten
-            }),
-            (Stmt::Delete(delete), Stmt::Delete(rewritten)) => Stmt::Delete(Delete {
-                table: view.base,
-                alias: delete.alias,
-                where_clause: query::and_where(view.where_clause, rewritten.where_clause, arena)?,
-                ..*rewritten
-            }),
-            _ => unreachable!("a view rewrite keeps its statement kind"),
-        };
-        alloc(arena, base)
+            rule_rewrite::view_write(event),
+        )?
+        .expect("a view target resolves as a view");
+        Ok(
+            query::rewrite_view_dml(statement, name.name, &view, self.storage, self.txid, arena)?
+                .statement,
+        )
     }
 }
 
@@ -1157,10 +1236,15 @@ fn lone_derived<'s>(select: &'s Select<'s>) -> Option<(&'s str, &'s Select<'s>)>
     (from.joins.is_empty()
         && select.where_clause.is_none()
         && super::values_list(body).is_none()
-        && select
-            .items
-            .iter()
-            .all(|item| matches!(item, SelectItem::Expr { expression: Expr::Column { .. }, .. })))
+        && select.items.iter().all(|item| {
+            matches!(
+                item,
+                SelectItem::Expr {
+                    expression: Expr::Column { .. },
+                    ..
+                }
+            )
+        }))
     .then(|| (from.base.alias.unwrap_or("unnamed_subquery"), body))
 }
 
@@ -1203,8 +1287,13 @@ fn passes_columns(
             return Ok(false);
         }
         for (item, inner) in select.items.iter().zip(derived.items) {
-            let (SelectItem::Expr { expression: Expr::Column { name, .. }, .. }, SelectItem::Expr { .. }) =
-                (item, inner)
+            let (
+                SelectItem::Expr {
+                    expression: Expr::Column { name, .. },
+                    ..
+                },
+                SelectItem::Expr { .. },
+            ) = (item, inner)
             else {
                 return Ok(false);
             };
@@ -1217,7 +1306,9 @@ fn passes_columns(
         return Ok(false);
     }
     let scope = match &source.from {
-        Some(from) => Some(query::QueryScope::resolve_schema(storage, from, txid, arena, None)?),
+        Some(from) => Some(query::QueryScope::resolve_schema(
+            storage, from, txid, arena, None,
+        )?),
         None => None,
     };
     for (item, column) in source.items.iter().zip(columns) {
@@ -1259,4 +1350,147 @@ fn passes_columns(
         }
     }
     Ok(true)
+}
+
+/// The `Filter` of a `VALUES` list's scan: `condition`'s conjuncts over
+/// the list's own columns (`column1`, ...), as PostgreSQL prints the scan
+/// of the list it pulled up, whatever the list's alias calls them.
+pub(super) fn values_filter(
+    storage: &Storage,
+    txid: u32,
+    alias: &str,
+    item: &TableRef<'_>,
+    condition: Option<&Expr<'_>>,
+    arena: &Arena,
+) -> Result<Option<StackStr<512>>, SqlError> {
+    use crate::sql::catalog::deparse::{Column, Columns, Joined};
+    let Some(condition) = condition else {
+        return Ok(None);
+    };
+    let Some(mut tree) = item.subquery.and_then(super::values_list) else {
+        return Ok(None);
+    };
+    let first = loop {
+        match tree {
+            SetTree::Select(first) => break first,
+            SetTree::Op { left, .. } => tree = left,
+        }
+    };
+    let mut conjuncts = [&Expr::Null; super::MAX_CONJUNCTS];
+    let mut count = 0;
+    if super::split_conjuncts(condition, &mut conjuncts, &mut count).is_none() {
+        return Ok(None);
+    }
+    super::order_restrictions(&mut conjuncts[..count]);
+    let mark = arena.mark();
+    let result = (|| {
+        let empty = crate::sql::exec::CatalogCols {
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        };
+        let columns = arena
+            .alloc_slice_with(first.items.len(), |_| Column {
+                name: "",
+                type_oid: None,
+                merged: None,
+            })
+            .map_err(|_| arena_full())?;
+        for (index, column) in columns.iter_mut().enumerate() {
+            let own = values_column_name(index, arena)?;
+            column.name = item
+                .col_alias
+                .and_then(|aliases| aliases.get(index).copied())
+                .unwrap_or(own);
+            // A column the alias renames still prints as the list's own.
+            column.merged = Some((None, own));
+            if let SelectItem::Expr { expression, .. } = first.items[index] {
+                // An untyped literal's column is text.
+                column.type_oid = crate::sql::exec::infer_type_res(expression, &empty)
+                    .ok()
+                    .map(|(type_oid, _)| match type_oid {
+                        crate::sql::types::oid::UNKNOWN => crate::sql::types::oid::TEXT,
+                        other => other,
+                    });
+            }
+        }
+        let joined = [Joined {
+            name: alias,
+            printed: alias,
+            columns: Columns::Derived(columns),
+            unqualified: true,
+            addressable: true,
+            level: 0,
+            row_type: None,
+            hides: 0,
+            cte: false,
+        }];
+        let context = crate::sql::catalog::deparse::Context {
+            storage,
+            txid,
+            table: None,
+            parameters: &[],
+            joined: &joined,
+            pretty: false,
+            qualify: false,
+            bare: Some(alias),
+            domain_value: None,
+            arena,
+            dependencies: None,
+        };
+        super::deparse_qual(&context, &conjuncts[..count], arena)
+    })();
+    // SAFETY: the filter text was copied out of the arena.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
+
+/// An UPDATE's FROM or a DELETE's USING items with the simple queries among
+/// them (the views read) merged into the statement, as PostgreSQL's
+/// `pull_up_subqueries` does for the joined relations.
+pub(super) fn pull_up_sources<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a Stmt<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Stmt<'a>, SqlError> {
+    let (from, where_clause) = match statement {
+        Stmt::Update(update) => (update.from, update.where_clause),
+        Stmt::Delete(delete) => (delete.using, delete.where_clause),
+        _ => return Ok(statement),
+    };
+    let Some(from) = from else {
+        return Ok(statement);
+    };
+    if core::iter::once(&from.base)
+        .chain(from.joins.iter().map(|join| &join.table))
+        .all(|table| table.subquery.is_none())
+    {
+        return Ok(statement);
+    }
+    let probe = alloc(arena, query::rule_select(&[], Some(*from), where_clause))?;
+    let pulled = query::pull_up_subqueries(probe, storage, txid, arena, None)?;
+    let Some(pulled_from) = pulled.from else {
+        return Ok(statement);
+    };
+    let pulled_from = alloc(arena, pulled_from)?;
+    alloc(
+        arena,
+        match statement {
+            Stmt::Update(update) => Stmt::Update(Update {
+                from: Some(pulled_from),
+                where_clause: pulled.where_clause,
+                ..*update
+            }),
+            Stmt::Delete(delete) => Stmt::Delete(Delete {
+                using: Some(pulled_from),
+                where_clause: pulled.where_clause,
+                ..*delete
+            }),
+            _ => unreachable!("matched above"),
+        },
+    )
 }

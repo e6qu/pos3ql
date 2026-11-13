@@ -246,6 +246,17 @@ fn constant_value_in(
     })
 }
 
+/// Whether PostgreSQL's planner folds `expression`, which names no column
+/// or parameter, to a constant: every operator, cast and call in it is an
+/// immutable built-in.
+pub(crate) fn folds_builtin_constant(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> Result<bool, SqlError> {
+    builtin_constant(expression, &crate::sql::exec::NoCols, storage, txid)
+}
+
 fn builtin_constant(
     expression: &Expr<'_>,
     columns: &dyn ColTypeResolver,
@@ -1704,9 +1715,17 @@ fn inlined_body_properties(
         return Ok(None);
     }
     let facts = argument_facts(arguments, columns, storage, txid, arena)?;
-    let body = arena
-        .alloc_str(routine.body.as_str())
-        .map_err(|_| crate::sql::eval::arena_full())?;
+    // A `RETURN` body is the expression of one `SELECT`, as it runs.
+    let body = if routine.body_kind == crate::storage::RoutineBodyKind::Return {
+        let mut text = crate::mem::arena::ArenaString::new(arena);
+        core::fmt::Write::write_fmt(&mut text, format_args!("SELECT {}", routine.body.as_str()))
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        text.as_str()
+    } else {
+        arena
+            .alloc_str(routine.body.as_str())
+            .map_err(|_| crate::sql::eval::arena_full())?
+    };
     let name = arena
         .alloc_str(routine.name.as_str())
         .map_err(|_| crate::sql::eval::arena_full())?;

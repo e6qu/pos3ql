@@ -213,6 +213,8 @@ fn note(error: SqlError, note: AnalysisNote) -> SqlError {
 }
 
 const FUNCTION_HINT: &str = "No function matches the given name and argument types. You might need to add explicit type casts.";
+const AMBIGUOUS_FUNCTION_HINT: &str =
+    "Could not choose a best candidate function. You might need to add explicit type casts.";
 const BINARY_OPERATOR_HINT: &str = "No operator matches the given name and argument types. You might need to add explicit type casts.";
 const AMBIGUOUS_OPERATOR_HINT: &str =
     "Could not choose a best candidate operator. You might need to add explicit type casts.";
@@ -600,6 +602,15 @@ pub(crate) fn with_hint(error: SqlError, hint: &'static str) -> SqlError {
     error
 }
 
+/// The one-based character position of `subject`, a slice of the client's
+/// statement, for a notice that points at it; `None` inside a routine's
+/// stored text.
+pub(crate) fn client_position(subject: &str) -> Option<usize> {
+    locate(subject)
+        .filter(|(_, source)| !source.internal)
+        .map(|(at, source)| character_position(source, at))
+}
+
 /// Positions `error` where the parser recorded `position`.
 pub(crate) fn at_source_position(
     error: SqlError,
@@ -660,7 +671,12 @@ pub(crate) fn expression_error(
             } else if state == sqlstate::CANNOT_COERCE && message.starts_with("cannot cast type ") {
                 at_parsed_offset(error, source_position.get())
             } else if let Expr::Str(literal) = operand
-                && state.starts_with("22")
+                && (state.starts_with("22")
+                    // An object-identifier type's input looks the name up:
+                    // any failure of it is the literal's.
+                    || crate::sql::types::ColType::from_sql_name(type_name)
+                        .is_some_and(crate::sql::types::ColType::is_reg_object)
+                        && error.sqlstate.internal_control().is_none())
                 && !is_type_modifier_failure(message)
             {
                 at_subject(error, literal)
@@ -697,6 +713,22 @@ pub(crate) fn expression_error(
                 }
             }
         }
+        Expr::Call {
+            name,
+            source_position,
+            ..
+        } if state == sqlstate::AMBIGUOUS_FUNCTION
+            && message.starts_with("function ")
+            && message.ends_with(") is not unique") =>
+        {
+            match source_position.get() {
+                Some(at) => annotated(error, Some(at), AMBIGUOUS_FUNCTION_HINT),
+                None => {
+                    let error = at_subject(error, name);
+                    annotated(error, None, AMBIGUOUS_FUNCTION_HINT)
+                }
+            }
+        }
         Expr::Binary {
             source_position, ..
         } if state == sqlstate::UNDEFINED_FUNCTION && message.starts_with("operator ") => {
@@ -713,6 +745,48 @@ pub(crate) fn expression_error(
             source_position, ..
         } if state == sqlstate::UNDEFINED_FUNCTION && message.starts_with("operator ") => {
             annotated(error, source_position.get(), UNARY_OPERATOR_HINT)
+        }
+        Expr::Param(_) if state == sqlstate::UNDEFINED_PARAMETER => {
+            at_expression(error, expression)
+        }
+        // A named row type without the field is reported where the row got
+        // its type: a cast's `::`, or its literal; a cast to `record`
+        // changes nothing.
+        Expr::Field { base, .. }
+            if state == sqlstate::UNDEFINED_COLUMN
+                && message.contains("\" not found in data type ") =>
+        {
+            let mut typed = *base;
+            while let Expr::Cast {
+                operand, type_name, ..
+            } = typed
+                && type_name.eq_ignore_ascii_case("record")
+            {
+                typed = operand;
+            }
+            match typed {
+                Expr::Cast {
+                    operand: Expr::Str(literal),
+                    ..
+                } => at_subject(error, literal),
+                Expr::Cast {
+                    source_position, ..
+                } => at_parsed_offset(error, source_position.get()),
+                _ => at_expression(error, typed),
+            }
+        }
+        // A field selection PostgreSQL cannot resolve is reported at its
+        // base expression.
+        Expr::Field { base, field }
+            if (state == sqlstate::WRONG_OBJECT_TYPE
+                && message.starts_with("column notation ."))
+                || (state == sqlstate::UNDEFINED_COLUMN
+                    && (message.starts_with("could not identify column ")
+                        || message.ends_with(
+                            crate::stack_format!(80, ".{} does not exist", field).as_str(),
+                        ))) =>
+        {
+            at_expression(error, base)
         }
         _ => error,
     }
@@ -906,9 +980,7 @@ pub(crate) fn take_annotation(sqlstate: &str, message: &dyn core::fmt::Display) 
 /// column and a missing or invalid FROM-clause entry.
 pub(crate) fn column_reference(error: SqlError, qualifier: Option<&str>, name: &str) -> SqlError {
     use crate::sql::eval::sqlstate;
-    // PL/pgSQL reports a record variable's missing field without a position.
-    let message = error.message.as_str();
-    if message.starts_with("record \"") && message.contains("\" has no field \"") {
+    if is_record_field_failure(&error) {
         return error;
     }
     if matches!(
@@ -932,6 +1004,15 @@ pub(crate) fn column_reference(error: SqlError, qualifier: Option<&str>, name: &
     } else {
         error
     }
+}
+
+/// A procedural record's missing field: PostgreSQL resolves the field while
+/// planning the expression that names it and reports it without a position.
+pub(crate) fn is_record_field_failure(error: &SqlError) -> bool {
+    let message = error.message.as_str();
+    error.sqlstate == crate::sql::eval::sqlstate::UNDEFINED_COLUMN
+        && message.starts_with("record \"")
+        && message.contains("\" has no field \"")
 }
 
 /// A cast's type modifier is applied after the constant's input, when the

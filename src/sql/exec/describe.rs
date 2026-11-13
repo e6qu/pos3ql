@@ -360,31 +360,38 @@ pub(crate) fn describe_data_modification_columns<'a>(
     if returning.is_empty() {
         return Ok(0);
     }
-    let (target, returning, target_alias, from) =
-        match crate::sql::query::resolve_view_for_dml(storage, target, txid, arena) {
-            Ok(Some(view)) => {
-                let rewritten = crate::sql::query::rewrite_view_dml(
-                    statement,
-                    target.name,
-                    view.base.name,
-                    view.base.schema.expect("view base is qualified"),
-                    view.columns,
-                    view.base_columns,
-                    storage,
-                    txid,
-                    arena,
-                )?;
-                let (returning, target_alias, from) = match rewritten {
-                    Stmt::Insert(insert) => (insert.returning, insert.alias, None),
-                    Stmt::Update(update) => (update.returning, update.alias, update.from),
-                    Stmt::Delete(delete) => (delete.returning, delete.alias, delete.using),
-                    _ => unreachable!("view rewrite keeps its statement kind"),
-                };
-                (view.base, returning, target_alias, from)
-            }
-            Ok(None) => (target, returning, target_alias, from),
-            Err(error) => return Err(error),
-        };
+    let (target, returning, target_alias, from) = match crate::sql::query::resolve_view_for_dml(
+        storage,
+        target,
+        txid,
+        arena,
+        match statement {
+            Stmt::Insert(_) => crate::sql::query::ViewWrite::Insert,
+            Stmt::Update(_) => crate::sql::query::ViewWrite::Update,
+            _ => crate::sql::query::ViewWrite::Delete,
+        },
+    ) {
+        Ok(Some(view)) => {
+            let rewritten = crate::sql::query::rewrite_view_dml(
+                statement,
+                target.name,
+                &view,
+                storage,
+                txid,
+                arena,
+            )?
+            .statement;
+            let (returning, target_alias, from) = match rewritten {
+                Stmt::Insert(insert) => (insert.returning, insert.alias, None),
+                Stmt::Update(update) => (update.returning, update.alias, update.from),
+                Stmt::Delete(delete) => (delete.returning, delete.alias, delete.using),
+                _ => unreachable!("view rewrite keeps its statement kind"),
+            };
+            (view.base, returning, target_alias, from)
+        }
+        Ok(None) => (target, returning, target_alias, from),
+        Err(error) => return Err(error),
+    };
     if let Some(from) = from {
         return crate::sql::exec::describe_dml_from_returning(
             storage,
@@ -745,6 +752,10 @@ impl ColTypeResolver for CatalogCols<'_> {
 
     fn domain_base_type(&self, type_oid: i32) -> Option<ColType> {
         self.storage.domain_base_type_for_oid(type_oid, self.txid)
+    }
+
+    fn select_common_type(&self, inputs: &[i32]) -> Result<i32, crate::storage::CommonTypeFailure> {
+        self.storage.select_common_type(inputs, self.txid)
     }
 
     fn named_type_oid(&self, type_name: &str) -> Option<i32> {
@@ -1520,9 +1531,16 @@ fn agg_undefined(name: &str, arg_oid: i32) -> SqlError {
 fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
     match expression {
         Expr::OuterAggregate { call, .. } => name_of(call),
+        // A PL/pgSQL `$n` is a parameter reference, which has no name.
+        Expr::Column { name, .. } | Expr::RoutineParam { name, .. }
+            if crate::sql::parser::is_positional_reference(name) =>
+        {
+            None
+        }
         Expr::Column { name, .. }
         | Expr::RoutineParam { name, .. }
         | Expr::SchemaColumn { name, .. } => Some(name),
+        Expr::WholeRow(table) => Some(table),
         // The desugarings of syntax-only constructs must not be labelled with
         // the internal name they carry: `SIMILAR TO` is an operator, so its
         // column is anonymous, while PostgreSQL does label OVERLAPS.
@@ -1664,7 +1682,8 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         Expr::Case {
             origin:
                 crate::sql::ast::CaseOrigin::BooleanTest { .. }
-                | crate::sql::ast::CaseOrigin::DistinctFrom { .. },
+                | crate::sql::ast::CaseOrigin::DistinctFrom { .. }
+                | crate::sql::ast::CaseOrigin::UnknownTest { .. },
             ..
         } => None,
         Expr::Case {
@@ -2081,6 +2100,11 @@ pub trait ColTypeResolver {
 
     fn domain_base_type(&self, _type_oid: i32) -> Option<ColType> {
         None
+    }
+
+    /// PostgreSQL's `select_common_type` over input type OIDs.
+    fn select_common_type(&self, inputs: &[i32]) -> Result<i32, crate::storage::CommonTypeFailure> {
+        crate::storage::builtin_select_common_type(inputs)
     }
 
     fn subquery_type(&self, _expression: &Expr<'_>) -> Result<Option<(i32, i16)>, SqlError> {
@@ -3183,6 +3207,15 @@ fn builtin_record_srf_field(name: &str, index: usize) -> Option<(&'static str, C
             _ => None,
         };
     }
+    if name.eq_ignore_ascii_case("pg_available_extensions")
+        || name.eq_ignore_ascii_case("pg_available_extension_versions")
+    {
+        return crate::sql::catalog::available_extension_function_columns(
+            name.eq_ignore_ascii_case("pg_available_extension_versions"),
+        )
+        .get(index)
+        .copied();
+    }
     if name.eq_ignore_ascii_case("pg_options_to_table") {
         return match index {
             0 => Some(("option_name", ColType::Text)),
@@ -3741,6 +3774,16 @@ fn record_shape_metadata_dyn(
             record_shape_metadata_dyn(argument, columns, visit)
         }
         Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name,
+            args,
+            ..
+        } if row_preserving_syntax(name)
+            && let Some(typed) = first_typed_argument(args) =>
+        {
+            record_shape_metadata_dyn(typed, columns, visit)
+        }
+        Expr::Call {
             kind,
             name,
             bound_oid,
@@ -3887,6 +3930,15 @@ pub fn record_field_metadata(
             "row expansion via \"*\" is not supported here"
         ));
     }
+    // A cast to `record` keeps the row's type, whose fields it selects.
+    if let Expr::Cast {
+        operand, type_name, ..
+    } = base
+        && ColType::from_sql_name(type_name) == Some(ColType::Record)
+        && infer_type_res(operand, columns).is_ok_and(|(type_oid, _)| type_oid != oid::RECORD)
+    {
+        return record_field_metadata(operand, field, columns);
+    }
     // Outside a routine, the parameters are the ones bound to the statement;
     // a simple query has none (`SELECT ($1).a`).
     if let Expr::Param(index) = base
@@ -3983,6 +4035,37 @@ pub fn record_field_metadata(
                 field,
                 columns,
             );
+        }
+        Expr::Call {
+            kind: crate::sql::ast::CallKind::SqlSyntax,
+            name,
+            args,
+            ..
+        } if row_preserving_syntax(name)
+            && let Some(typed) = first_typed_argument(args) =>
+        {
+            return record_field_metadata(typed, field, columns).map_err(|error| {
+                if error.sqlstate != sqlstate::UNDEFINED_COLUMN {
+                    return error;
+                }
+                // PostgreSQL names the common row type, not the argument.
+                match infer_type_res(typed, columns).and_then(|(type_oid, _)| {
+                    if type_oid == oid::RECORD {
+                        Ok(None)
+                    } else {
+                        columns.type_name_fixed(type_oid)
+                    }
+                }) {
+                    Ok(Some(type_name)) => sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" not found in data type {}",
+                        field,
+                        type_name.as_str()
+                    ),
+                    Ok(None) => error,
+                    Err(error) => error,
+                }
+            });
         }
         Expr::Call {
             kind,
@@ -4140,6 +4223,22 @@ pub fn record_field_metadata(
         }
         _ => could_not_identify(field),
     })
+}
+
+/// `COALESCE`, `NULLIF`, `GREATEST` and `LEAST` return their arguments'
+/// common type, so a row result keeps the first argument's fields and their
+/// declared types: `(coalesce(NEW, OLD)).label` has the column's domain.
+fn row_preserving_syntax(name: &str) -> bool {
+    matches!(name, "coalesce" | "nullif" | "greatest" | "least")
+}
+
+/// The first argument that is not an untyped `NULL`, which decides the
+/// common type when the others are.
+fn first_typed_argument<'e, 'a>(arguments: &'e [&'e Expr<'a>]) -> Option<&'e Expr<'a>> {
+    arguments
+        .iter()
+        .copied()
+        .find(|argument| !matches!(argument, Expr::Null))
 }
 
 pub fn record_field_type(
@@ -4359,10 +4458,12 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
                 qualifier,
             ));
         }
-        self.definition
-            .column_index(name)
-            .map(|index| self.definition.columns()[index].ctype)
-            .ok_or_else(|| {
+        match self.definition.column_index(name) {
+            Some(index) => Ok(self.definition.columns()[index].ctype),
+            // The written row's `tableoid` system column, also of its `old`
+            // and `new` images.
+            None if name == "tableoid" => Ok(ColType::Oid),
+            None => {
                 let error = match qualifier {
                     Some(qualifier) => sql_err!(
                         sqlstate::UNDEFINED_COLUMN,
@@ -4376,14 +4477,15 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
                         name
                     ),
                 };
-                crate::sql::column_suggestion::from_relation(
+                Err(crate::sql::column_suggestion::from_relation(
                     error,
                     qualifier,
                     name,
                     self.alias.unwrap_or(self.definition.name.as_str()),
                     &self.definition.columns()[..self.definition.n_columns],
-                )
-            })
+                ))
+            }
+        }
     }
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
         self.resolve(qualifier, name).ok()?;
@@ -4864,6 +4966,29 @@ pub(crate) fn user_routine_call_result(
     routine
         .and_then(|routine| routine.function_result_contract())
         .or_else(|| {
+            // PostgreSQL resolves a call to a trigger function, typed
+            // `trigger` or `event_trigger`; running it fails.
+            if bound_oid.is_none() && arguments.is_empty() && argument_names.is_empty() {
+                for (kind, pseudo) in [
+                    (
+                        crate::storage::RoutineCallKind::Trigger,
+                        crate::sql::types::PseudoType::Trigger,
+                    ),
+                    (
+                        crate::storage::RoutineCallKind::EventTrigger,
+                        crate::sql::types::PseudoType::EventTrigger,
+                    ),
+                ] {
+                    if let crate::storage::RoutineCallSelection::Stored(_) =
+                        storage.select_routine_call(name, &[], &[], false, txid, kind)
+                    {
+                        return Some(crate::storage::RoutineResult {
+                            ctype: ColType::Pseudo(pseudo),
+                            user_type: None,
+                        });
+                    }
+                }
+            }
             // A stored query binds an aggregate call to its OID.
             if let Some(oid) = bound_oid {
                 // Its declared result is exact unless polymorphic.
@@ -5444,6 +5569,77 @@ fn sliced_container_type(
     }
 }
 
+/// The result type of `COALESCE`, `GREATEST` or `LEAST`: PostgreSQL's
+/// common type of all arguments, an error positioned at the argument that
+/// has none.
+fn common_argument_result(
+    name: &str,
+    args: &[&Expr],
+    columns: &dyn ColTypeResolver,
+) -> Result<(i32, i16), SqlError> {
+    const MAX_ARGUMENTS: usize = 1024;
+    let context = match name {
+        "coalesce" => "COALESCE",
+        "greatest" => "GREATEST",
+        _ => "LEAST",
+    };
+    if args.len() > MAX_ARGUMENTS {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "{} has more than {} arguments",
+            context,
+            MAX_ARGUMENTS
+        ));
+    }
+    let mut inputs = [oid::UNKNOWN; MAX_ARGUMENTS];
+    for (input, argument) in inputs.iter_mut().zip(args) {
+        *input = infer_routine_argument_oid(argument, columns)?;
+    }
+    let type_name = |type_oid| {
+        columns
+            .type_name_fixed(type_oid)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| crate::util::StackStr::from_str("???"))
+    };
+    match columns.select_common_type(&inputs[..args.len()]) {
+        Ok(common) => {
+            let typlen = coltype_of_oid(common)
+                .or_else(|| columns.domain_base_type(common))
+                .map_or(-1, ColType::typlen);
+            Ok((common, typlen))
+        }
+        Err(crate::storage::CommonTypeFailure::Category {
+            selected,
+            input,
+            index,
+        }) => Err(crate::sql::error_position::at_expression(
+            sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "{} types {} and {} cannot be matched",
+                context,
+                type_name(selected).as_str(),
+                type_name(input).as_str()
+            ),
+            args[index],
+        )),
+        Err(crate::storage::CommonTypeFailure::Conversion {
+            input,
+            selected,
+            index,
+        }) => Err(crate::sql::error_position::at_expression(
+            sql_err!(
+                sqlstate::CANNOT_COERCE,
+                "{} could not convert type {} to {}",
+                context,
+                type_name(input).as_str(),
+                type_name(selected).as_str()
+            ),
+            args[index],
+        )),
+    }
+}
+
 pub fn infer_type_res(
     expression: &Expr,
     columns: &dyn ColTypeResolver,
@@ -5923,7 +6119,22 @@ fn infer_type_unpositioned(
                     }
                 }
             }
-            if operand.is_none() {
+            if let Some((tested, test)) = expression.boolean_test_argument() {
+                let tested_oid = infer_type_res(tested, columns)?.0;
+                if !matches!(tested_oid, oid::BOOL | oid::UNKNOWN) {
+                    let type_name =
+                        ColType::from_oid(tested_oid).map_or("unknown", |ctype| ctype.name());
+                    return Err(crate::sql::error_position::at_expression(
+                        sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "argument of {} must be type boolean, not type {}",
+                            test,
+                            type_name
+                        ),
+                        tested,
+                    ));
+                }
+            } else if operand.is_none() {
                 for (condition, _) in *whens {
                     let condition_oid = infer_type_res(condition, columns)?.0;
                     if !matches!(condition_oid, oid::BOOL | oid::UNKNOWN) {
@@ -5967,7 +6178,10 @@ fn infer_type_unpositioned(
                         Some(prev) => {
                             let next = crate::sql::types::common_builtin_candidate(prev, t)
                                 .map_err(|error| {
-                                    super::super::eval::common_type_error(error, "CASE")
+                                    crate::sql::error_position::at_expression(
+                                        super::super::eval::common_type_error(error, "CASE"),
+                                        e,
+                                    )
                                 })?;
                             needs_validation |=
                                 !crate::sql::types::builtin_implicit_cast(prev, next)
@@ -6001,9 +6215,15 @@ fn infer_type_unpositioned(
                             })
                             .expect("validated CASE declaration");
                         if !crate::sql::types::builtin_implicit_cast(from, ctype) {
-                            return Err(super::super::eval::common_type_error(
-                                crate::sql::types::CommonTypeError::Conversion { from, to: ctype },
-                                "CASE",
+                            return Err(crate::sql::error_position::at_expression(
+                                super::super::eval::common_type_error(
+                                    crate::sql::types::CommonTypeError::Conversion {
+                                        from,
+                                        to: ctype,
+                                    },
+                                    "CASE",
+                                ),
+                                result,
                             ));
                         }
                     }
@@ -6457,7 +6677,12 @@ fn infer_type_unpositioned(
             "json_strip_nulls" => of(ColType::Json),
             "jsonb_pretty" => of(ColType::Text),
             "pg_char_to_encoding" => of(ColType::Int4),
-            "pg_table_size" | "pg_database_size" | "pg_tablespace_size" => of(ColType::Int8),
+            "pg_table_size"
+            | "pg_relation_size"
+            | "pg_total_relation_size"
+            | "pg_indexes_size"
+            | "pg_database_size"
+            | "pg_tablespace_size" => of(ColType::Int8),
             // Array-manipulation functions keep the array argument's type, but
             // promote its element type to hold a wider new/replacement element
             // (PostgreSQL's polymorphic anyarray/anyelement resolution).
@@ -6627,42 +6852,7 @@ fn infer_type_unpositioned(
             "bttidcmp" | "hashtid" | "hashcid" => of(ColType::Int4),
             "hashtidextended" | "hashcidextended" => of(ColType::Int8),
             "cidin" | "cidrecv" => of(ColType::Cid),
-            // Functions returning the common type of their arguments (numeric
-            // tower: float8 > numeric > int8 > int4), so a NULL of a wider type
-            // still widens the result — matching PostgreSQL and the runtime
-            // promotion in `greatest`/`least`.
-            "greatest" | "least" => {
-                let rank = |o: i32| {
-                    if o == oid::FLOAT8 {
-                        5
-                    } else if o == oid::FLOAT4 {
-                        4
-                    } else if o == oid::NUMERIC {
-                        3
-                    } else if o == oid::INT8 {
-                        2
-                    } else if o == oid::INT2 || o == oid::INT4 {
-                        1
-                    } else {
-                        0
-                    }
-                };
-                let mut best: Option<(i32, i16)> = None;
-                for a in args.iter() {
-                    let t = infer_type_res(a, columns)?;
-                    best = Some(match best {
-                        None => t,
-                        Some(p) => {
-                            if rank(t.0) > rank(p.0) {
-                                t
-                            } else {
-                                p
-                            }
-                        }
-                    });
-                }
-                best.unwrap_or(of(ColType::Int8))
-            }
+            "greatest" | "least" => common_argument_result(name, args, columns)?,
             "nullif" => {
                 if args.len() != 2 {
                     return Err(super::super::eval::arity_err(name, args.len()));
@@ -6679,30 +6869,11 @@ fn infer_type_unpositioned(
                     (input, coltype_of_oid(input).map_or(-1, ColType::typlen))
                 }
             }
-            // `abs` takes its first argument's type. `coalesce`
-            // unifies across all of them, so an untyped NULL in front must not
-            // decide the result: `coalesce(NULL, 1)` is integer, not text.
-            "coalesce" | "abs" => {
-                let mut chosen = None;
-                for a in args.iter() {
-                    let t = infer_type_res(a, columns)?;
-                    if t.0 != oid::UNKNOWN {
-                        chosen = Some(t);
-                        break;
-                    }
-                    if !name.eq_ignore_ascii_case("coalesce") {
-                        break;
-                    }
-                }
-                match chosen {
-                    Some(t) => t,
-                    None if args.is_empty() => of(ColType::Int8),
-                    // All arguments untyped: PostgreSQL resolves the unknown
-                    // to text, exactly as it does for a bare literal.
-                    None if name.eq_ignore_ascii_case("coalesce") => of(ColType::Text),
-                    None => infer_type_res(args[0], columns)?,
-                }
-            }
+            "coalesce" => common_argument_result(name, args, columns)?,
+            "abs" => match args.first() {
+                Some(argument) => infer_type_res(argument, columns)?,
+                None => of(ColType::Int8),
+            },
             "char_length" | "character_length" | "octet_length" | "strpos" | "position"
             | "ascii" => of(ColType::Int4),
             // Math: sqrt/exp/ln/power stay numeric for a numeric argument (and
@@ -7067,6 +7238,8 @@ fn infer_type_unpositioned(
             | "pg_get_sequence_data"
             | "pg_get_publication_tables"
             | "pg_input_error_info"
+            | "pg_available_extensions"
+            | "pg_available_extension_versions"
             | "_pg_expandarray" => (oid::RECORD, -1),
             "grouping" => of(ColType::Int4),
             "make_date" => of(ColType::Date),

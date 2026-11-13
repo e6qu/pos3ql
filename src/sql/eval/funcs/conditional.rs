@@ -31,6 +31,42 @@ pub(crate) fn literal_argument_type<'e, 'a: 'e>(
     crate::storage::builtin_compatible_element_oid(inputs).and_then(ColType::from_oid)
 }
 
+/// The error PostgreSQL reports when `context`'s arguments have no common
+/// type.
+fn common_type_failure(
+    context: &str,
+    failure: crate::storage::CommonTypeFailure,
+    hooks: &EvalHooks<'_, '_>,
+) -> SqlError {
+    let name = |type_oid: i32| {
+        hooks
+            .catalog
+            .and_then(|catalog| catalog.type_name_fixed(type_oid).ok().flatten())
+            .or_else(|| crate::sql::exec::builtin_type_name_fixed(type_oid))
+            .unwrap_or_else(|| crate::util::StackStr::from_str("???"))
+    };
+    match failure {
+        crate::storage::CommonTypeFailure::Category {
+            selected, input, ..
+        } => sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "{} types {} and {} cannot be matched",
+            context,
+            name(selected).as_str(),
+            name(input).as_str()
+        ),
+        crate::storage::CommonTypeFailure::Conversion {
+            input, selected, ..
+        } => sql_err!(
+            sqlstate::CANNOT_COERCE,
+            "{} could not convert type {} to {}",
+            context,
+            name(input).as_str(),
+            name(selected).as_str()
+        ),
+    }
+}
+
 /// Handles the conditional/null-handling family. Returns `None` if `name` is not
 /// one of these functions, leaving the router to keep matching.
 #[allow(clippy::too_many_arguments)]
@@ -83,15 +119,21 @@ pub(crate) fn dispatch<'a>(
                 }
             }
             "coalesce" => {
-                let (common, declared) =
-                    super::array::common_argument_type(args, arena, row, hooks)?;
+                // The result has the arguments' common type: an argument of
+                // another type is converted to it.
+                let declared = super::array::declared_argument_oids(args, arena, row, hooks)?;
+                let common = match hooks.catalog {
+                    Some(catalog) => catalog.select_common_type(declared),
+                    None => crate::storage::builtin_select_common_type(declared),
+                }
+                .map_err(|failure| common_type_failure("COALESCE", failure, hooks))?;
+                let target = ColType::from_oid(common)
+                    .filter(|_| crate::storage::NamedTypeKind::from_oid(common).is_none());
                 for (arg, declared) in args.iter().zip(declared) {
                     let v = eval_full(arg, arena, params, row, hooks)?;
                     if !v.is_null() {
-                        return match common {
-                            Some(common) if *declared == crate::sql::types::oid::UNKNOWN => {
-                                cast_to(v, common, arena)
-                            }
+                        return match target {
+                            Some(target) if *declared != common => cast_to(v, target, arena),
                             _ => Ok(v),
                         };
                     }

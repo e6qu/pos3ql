@@ -101,6 +101,10 @@ if ! [[ "$POSTGRES_REGRESS_SHARD" =~ ^[0-9]+$ \
 fi
 EXTENSION_CONTROL_ROOT=${POS3QL_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
 REFERENCE_EXTENSION_CONTROL_ROOT=${POS3QL_REFERENCE_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
+# Both servers search PostgreSQL's built-in packages first (`$system`, where
+# contrib's postgres_fdw is installed), then the test packages.
+EXTENSION_CONTROL_PATH="\$system:$EXTENSION_CONTROL_ROOT"
+REFERENCE_EXTENSION_CONTROL_PATH="\$system:$REFERENCE_EXTENSION_CONTROL_ROOT"
 
 PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); echo "PASS: $1"; }
@@ -260,7 +264,7 @@ max_value_indexes = 64
 max_prepared_transactions = 8
 ${DIFFERENTIAL_TRANSACTION_CONFIG}
 memtable_bytes = 256MiB
-extension_control_path = ${EXTENSION_CONTROL_ROOT}
+extension_control_path = ${EXTENSION_CONTROL_PATH}
 EOF
 printf '%s\n' 'Starting pos3ql'
 : > "$WORK/p3.log"
@@ -374,7 +378,7 @@ CREATE FUNCTION transformed(integer) RETURNS integer LANGUAGE sql
   TRANSFORM FOR TYPE integer RETURN $1;
 CREATE FUNCTION supported(integer) RETURNS integer LANGUAGE sql
   SUPPORT pg_catalog.array_unnest_support RETURN $1;
-CREATE FUNCTION linked(integer) RETURNS integer LANGUAGE plpgsql
+CREATE FUNCTION linked(integer) RETURNS integer LANGUAGE c
   AS 'untrusted-library', 'entrypoint';
 CREATE TRUSTED PROCEDURAL LANGUAGE native_language
   HANDLER pg_catalog.plpgsql_call_handler;
@@ -407,6 +411,7 @@ psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
   > "$WORK/foreign_extension.out" 2>&1
 cat > "$WORK/foreign_catalog.sql" <<'SQL'
 SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
 CREATE FOREIGN DATA WRAPPER pos3ql_catalog_fdw
   HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator;
 CREATE SERVER pos3ql_catalog_a TYPE 'postgresql' VERSION '18'
@@ -478,8 +483,7 @@ foreign_reference_status=$?
 psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 > "$WORK/foreign_pos3ql.out" 2>&1 <<SQL
 CREATE TYPE public.pos3ql_fdw_pair AS (code integer, label text);
-CREATE FOREIGN DATA WRAPPER postgres_fdw
-  HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator;
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
 CREATE SERVER reference_server FOREIGN DATA WRAPPER postgres_fdw
   OPTIONS (host '$PGHOST', port '$PGPORT', dbname 'postgres', sslmode 'disable');
 CREATE USER MAPPING FOR CURRENT_USER SERVER reference_server OPTIONS (user '$PGUSER');
@@ -601,6 +605,44 @@ if [[ $foreign_subtransaction_reference_status -eq 0 && $foreign_subtransaction_
 else
   bad "foreign procedural subtransaction cleanup"
   cat "$WORK/foreign_subtransaction_reference.out" "$WORK/foreign_subtransaction_pos3ql.out"
+fi
+# The same remote table is a plain partition in PostgreSQL and a foreign
+# partition in pos3ql.
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -q -v ON_ERROR_STOP=1 \
+  -c 'DROP TABLE IF EXISTS public.pos3ql_fdw_mixed' \
+  -c 'CREATE TABLE public.pos3ql_fdw_mixed (id integer, note text)' \
+  > "$WORK/foreign_mixed_setup.out" 2>&1
+psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -q -v ON_ERROR_STOP=1 \
+  -c 'IMPORT FOREIGN SCHEMA public LIMIT TO (pos3ql_fdw_mixed) FROM SERVER reference_server INTO public' \
+  >> "$WORK/foreign_mixed_setup.out" 2>&1
+for side in reference pos3ql; do
+  if [[ $side == reference ]]; then host=$PGHOST port=$PGPORT; else host=127.0.0.1 port=$P3_PORT; fi
+  psql -h "$host" -p "$port" -U "$PGUSER" -d postgres -X -Atq -F '|' \
+    -v ON_ERROR_STOP=1 -f "$EXT/foreign-row-progress.sql" \
+    > "$WORK/foreign_row_progress_$side.out" 2>&1 || echo "status $?" >> "$WORK/foreign_row_progress_$side.out"
+done
+# The reference must run the whole script: no error and no failed status.
+if diff -u "$WORK/foreign_row_progress_reference.out" "$WORK/foreign_row_progress_pos3ql.out" \
+  && ! grep -Eq '^(status |psql:.*ERROR)' "$WORK/foreign_row_progress_reference.out"; then
+  ok "foreign writes keep changed rows across routine calls"
+else
+  bad "foreign write row progress"
+fi
+# PostgreSQL refuses MERGE when a result relation is a foreign partition.
+foreign_mixed_merge=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -q 2>&1 <<'SQL'
+BEGIN;
+CREATE TABLE fdw_merge_parent (id integer, note text) PARTITION BY RANGE (id);
+ALTER TABLE fdw_merge_parent ATTACH PARTITION pos3ql_fdw_mixed FOR VALUES FROM (0) TO (2000);
+MERGE INTO fdw_merge_parent USING (VALUES (1)) v(x) ON id = x
+  WHEN MATCHED THEN UPDATE SET note = 'm';
+ROLLBACK;
+SQL
+)
+if [[ "$foreign_mixed_merge" == *'ERROR:  cannot execute MERGE on relation "pos3ql_fdw_mixed"'*'DETAIL:  This operation is not supported for foreign tables.'* ]]; then
+  ok "MERGE over a foreign partition fails as in PostgreSQL"
+else
+  bad "MERGE over a foreign partition"
+  printf '%s\n' "$foreign_mixed_merge"
 fi
 cat > "$WORK/foreign_merge.sql" <<'SQL'
 BEGIN;
@@ -881,7 +923,7 @@ psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 \
   -c 'DROP EXTENSION IF EXISTS pos3ql_ext CASCADE; DROP EXTENSION IF EXISTS pos3ql_base CASCADE; DROP SCHEMA IF EXISTS extension_dump CASCADE' \
   > "$WORK/extension_reference_clean.out" 2>&1
-PGOPTIONS="-c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
+PGOPTIONS="-c extension_control_path=$REFERENCE_EXTENSION_CONTROL_PATH" \
   psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
     -v ON_ERROR_STOP=1 -f "$WORK/extension.sql" \
     > "$WORK/extension_restore.out" 2>&1
@@ -1507,7 +1549,7 @@ run_corpus() { # host port outfile file diagnostics
     *) printf 'FAIL: unknown corpus diagnostics %s\n' "$diagnostics" >&2; return 1 ;;
   esac
   if [[ "$1" == "$PGHOST" && "$2" == "$PGPORT" ]]; then
-    PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
+    PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_PATH" \
       psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -e -P pager=off \
         -v VERBOSITY=verbose -f "$4" > "$3.stdout" 2> "$3.stderr" || status=$?
   else
@@ -1529,7 +1571,7 @@ run_corpus() { # host port outfile file diagnostics
 }
 reset_user_extensions() { # host port
   psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
-    -c "SELECT extname FROM pg_extension WHERE extname LIKE 'pos3ql_%' ORDER BY extname DESC" |
+    -c "SELECT extname FROM pg_extension WHERE extname <> 'plpgsql' ORDER BY extname DESC" |
   while IFS= read -r extension; do
     [[ -z "$extension" ]] && continue
     extension=${extension//\"/\"\"}
@@ -1555,7 +1597,7 @@ reset_user_routines() { # host port
 reset_user_relations() { # host port
   psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
     -F $'\t' \
-    -c "SELECT n.nspname, c.relname, c.relkind FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p', 'm', 'v', 'S')" |
+    -c "SELECT n.nspname, c.relname, c.relkind FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p', 'm', 'v', 'S', 'f')" |
   while IFS=$'\t' read -r schema relation relkind; do
     [[ -z "$relation" ]] && continue
     schema=${schema//\"/\"\"}
@@ -1565,6 +1607,7 @@ reset_user_relations() { # host port
     r | p) drop='DROP TABLE' ;;
     v) drop='DROP VIEW' ;;
     S) drop='DROP SEQUENCE' ;;
+    f) drop='DROP FOREIGN TABLE' ;;
     *)
       printf 'FAIL: unexpected reset relation kind %q\n' "$relkind"
       return 1
@@ -1574,13 +1617,33 @@ reset_user_relations() { # host port
       -c "$drop \"$schema\".\"$relation\" CASCADE" >/dev/null 2>&1
   done
 }
+# Schemas, standalone types, foreign-data wrappers and roles a fixture leaves
+# behind would otherwise collide with a later fixture's (or a later run's on a
+# reused reference cluster) objects of the same name. Only roles created after
+# the run's first reset (OIDs above its baseline) are dropped, so roles that
+# predate the run on a shared reference server survive; pos3ql servers are
+# disposable, so every role it did not bootstrap is dropped.
+reset_user_objects() { # host port role-baseline
+  psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
+    -c "SELECT 'DROP FOREIGN DATA WRAPPER ' || quote_ident(fdwname) || ' CASCADE' FROM pg_foreign_data_wrapper UNION ALL SELECT 'DROP SCHEMA ' || quote_ident(nspname) || ' CASCADE' FROM pg_namespace WHERE nspname NOT IN ('public', 'information_schema') AND nspname NOT LIKE 'pg\\_%' UNION ALL SELECT 'DROP TYPE ' || quote_ident(n.nspname) || '.' || quote_ident(t.typname) || ' CASCADE' FROM pg_type AS t JOIN pg_namespace AS n ON n.oid = t.typnamespace WHERE n.nspname = 'public' AND t.typtype IN ('c', 'd', 'e', 'r') AND (t.typrelid = 0 OR (SELECT c.relkind FROM pg_class AS c WHERE c.oid = t.typrelid) = 'c') UNION ALL SELECT 'DROP OWNED BY ' || quote_ident(rolname) || ' CASCADE; DROP ROLE ' || quote_ident(rolname) FROM pg_roles WHERE oid > $3 AND rolname <> current_user" |
+  while IFS= read -r statement; do
+    [[ -z "$statement" ]] && continue
+    psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -q -c "$statement" >/dev/null 2>&1
+  done
+}
+role_baseline() { # host port
+  psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q -c "SELECT max(oid) FROM pg_roles"
+}
 reset_corpus_pair() {
+  [[ -n "${PG_ROLE_BASELINE:-}" ]] || PG_ROLE_BASELINE=$(role_baseline "$PGHOST" "$PGPORT")
   reset_user_extensions "$PGHOST" "$PGPORT"
   reset_user_extensions 127.0.0.1 "$P3_PORT"
   reset_user_relations "$PGHOST" "$PGPORT"
   reset_user_relations 127.0.0.1 "$P3_PORT"
   reset_user_routines "$PGHOST" "$PGPORT"
   reset_user_routines 127.0.0.1 "$P3_PORT"
+  reset_user_objects "$PGHOST" "$PGPORT" "$PG_ROLE_BASELINE"
+  reset_user_objects 127.0.0.1 "$P3_PORT" 16383
 }
 
 if [[ "$RUN_CORPUS" == 1 ]]; then

@@ -398,8 +398,8 @@ fn explain_analyze_runs_a_rewritten_statement_once_and_plans_each_query() {
 }
 
 #[test]
-fn explain_refuses_rewritten_queries_it_cannot_plan() {
-    with_engine("explain-rewritten-refusals", |engine, budget| {
+fn explain_rewrites_each_rule_action_again() {
+    with_engine("explain-rewritten-again", |engine, budget| {
         for sql in [
             "CREATE TABLE rr_t (a int, b int)",
             "CREATE TABLE rr_log (a int)",
@@ -411,39 +411,60 @@ fn explain_refuses_rewritten_queries_it_cannot_plan() {
         ] {
             run_with(engine, budget, sql);
         }
-        let refused =
-            "ERROR 0A000 EXPLAIN of a statement a rewrite rule changes is not supported for";
-        for (sql, what) in [
-            (
-                "EXPLAIN (COSTS OFF) INSERT INTO rr_v VALUES (1, 2)",
-                "a statement on a view",
-            ),
-            (
-                "EXPLAIN (COSTS OFF) INSERT INTO rr_t SELECT max(a), 1 FROM rr_log",
-                "an INSERT of an aggregated or ordered query",
-            ),
-        ] {
-            assert_eq!(
-                diagnostics(&run_with(engine, budget, sql)),
-                [format!("{refused} {what}")],
-                "{sql}"
-            );
-        }
+        // The view's INSTEAD action on rr_t runs rr_t's own rule.
+        assert_eq!(
+            data_rows(&run_with(
+                engine,
+                budget,
+                "EXPLAIN (COSTS OFF) INSERT INTO rr_v VALUES (1, 2)"
+            )),
+            [
+                "Insert on rr_t",
+                "  ->  Result",
+                "",
+                "Insert on rr_log",
+                "  ->  Result"
+            ]
+        );
+        // An aggregated query is read as the `*SELECT*` subquery.
+        assert_eq!(
+            data_rows(&run_with(
+                engine,
+                budget,
+                "EXPLAIN (COSTS OFF) INSERT INTO rr_t SELECT max(a), 1 FROM rr_log"
+            )),
+            [
+                "Insert on rr_t",
+                "  ->  Subquery Scan on \"*SELECT*\"",
+                "        ->  Aggregate",
+                "              ->  Seq Scan on rr_log",
+                "",
+                "Insert on rr_log",
+                "  ->  Subquery Scan on \"*SELECT*\"",
+                "        ->  Aggregate",
+                "              ->  Seq Scan on rr_log",
+            ]
+        );
         run_with(
             engine,
             budget,
             "CREATE RULE rr_log_insert AS ON INSERT TO rr_log DO ALSO \
              INSERT INTO rr_v VALUES (new.a, 0)",
         );
+        // rr_log, rr_v, rr_t and rr_log again: found before anything runs.
+        for sql in [
+            "EXPLAIN (COSTS OFF) INSERT INTO rr_log VALUES (1)",
+            "INSERT INTO rr_log VALUES (1)",
+        ] {
+            assert_eq!(
+                diagnostics(&run_with(engine, budget, sql)),
+                ["ERROR 42P17 infinite recursion detected in rules for relation \"rr_log\""],
+                "{sql}"
+            );
+        }
         assert_eq!(
-            diagnostics(&run_with(
-                engine,
-                budget,
-                "EXPLAIN (COSTS OFF) INSERT INTO rr_log VALUES (1)"
-            )),
-            [format!(
-                "{refused} an action on a view or on a relation with rules"
-            )]
+            data_rows(&run_with(engine, budget, "SELECT count(*) FROM rr_log")),
+            ["0"]
         );
     });
 }
@@ -491,5 +512,34 @@ fn joined_dml_hashes_the_first_of_several_from_items() {
                 "              ->  Seq Scan on um",
             ]
         );
+    });
+}
+
+#[test]
+fn update_from_returning_routine_call_resumes_with_the_joined_row() {
+    with_engine("update-from-returning-call", |engine, budget| {
+        setup(engine, budget);
+        run_with(
+            engine,
+            budget,
+            "CREATE FUNCTION note(v text) RETURNS text LANGUAGE plpgsql \
+             AS $$BEGIN RETURN v || '!'; END$$",
+        );
+        // Each RETURNING call stops the write after its row changed; the
+        // next attempt keeps the row and the FROM row it joined.
+        let output = run_with(
+            engine,
+            budget,
+            "UPDATE t SET b = note(s.c) FROM s WHERE t.a = s.a \
+             RETURNING t.a, t.b, note(s.c || t.b), s.d",
+        );
+        assert_eq!(sorted_rows(&output), ["1|p!|pp!!|10.00", "2|q!|qq!!|20.00"]);
+        let output = run_with(
+            engine,
+            budget,
+            "DELETE FROM t USING s WHERE t.a = s.a RETURNING t.a, note(s.c), s.d",
+        );
+        assert_eq!(sorted_rows(&output), ["1|p!|10.00", "2|q!|20.00"]);
+        assert!(data_rows(&run_with(engine, budget, "SELECT * FROM t")).is_empty());
     });
 }

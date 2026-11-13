@@ -488,8 +488,12 @@ fn cursor_between_retains_input_operators_and_deferred_errors() {
     session.success(
         &mut engine,
         "CREATE TABLE between_rows(id integer,lo integer,hi integer); \
-        INSERT INTO between_rows VALUES(1,0,2),(3,0,4),(9,5,6); \
-        BEGIN; DECLARE between_later NO SCROLL CURSOR FOR \
+        INSERT INTO between_rows VALUES(1,0,2),(3,0,4),(9,5,6)",
+        true,
+    );
+    session.success(
+        &mut engine,
+        "BEGIN; DECLARE between_later NO SCROLL CURSOR FOR \
         SELECT id,id BETWEEN lo AND 100/(id-9) FROM between_rows",
         true,
     );
@@ -955,8 +959,12 @@ fn cursor_retained_arrays_keep_captured_inputs_and_defer_index_errors() {
     session.success(
         &mut engine,
         "CREATE TABLE array_input(id integer, vals integer[]); \
-        INSERT INTO array_input VALUES(1,ARRAY[10,20,30]),(2,ARRAY[40,50,60]),(3,NULL); \
-        BEGIN; DECLARE arrays NO SCROLL CURSOR FOR SELECT vals[id],(ARRAY[id,id+1])[2],vals[2:3] \
+        INSERT INTO array_input VALUES(1,ARRAY[10,20,30]),(2,ARRAY[40,50,60]),(3,NULL)",
+        true,
+    );
+    session.success(
+        &mut engine,
+        "BEGIN; DECLARE arrays NO SCROLL CURSOR FOR SELECT vals[id],(ARRAY[id,id+1])[2],vals[2:3] \
         FROM array_input WHERE (ARRAY[id,0])[1]>0",
         true,
     );
@@ -1298,9 +1306,10 @@ fn cursor_retained_input_capacity_names_its_budget_and_releases_failed_open() {
     session.success(
         &mut engine,
         "CREATE TABLE many_inputs(id integer); \
-        INSERT INTO many_inputs SELECT g FROM generate_series(1,512) AS g; BEGIN",
+        INSERT INTO many_inputs SELECT g FROM generate_series(1,512) AS g",
         true,
     );
+    session.success(&mut engine, "BEGIN", true);
     let output = session.execute(
         &mut engine,
         "DECLARE too_many NO SCROLL CURSOR FOR SELECT id FROM many_inputs",
@@ -1309,10 +1318,10 @@ fn cursor_retained_input_capacity_names_its_budget_and_releases_failed_open() {
     assert_eq!(error_sqlstates(&output), ["54000"]);
     assert!(String::from_utf8_lossy(&output).contains("cursor_query_bytes"));
     assert!(!session.cursors.exists("too_many"));
+    session.success(&mut engine, "ROLLBACK; TRUNCATE many_inputs", true);
     session.success(
         &mut engine,
-        "ROLLBACK; TRUNCATE many_inputs; BEGIN; \
-        DECLARE fits NO SCROLL CURSOR FOR SELECT id FROM many_inputs; FETCH ALL FROM fits; COMMIT",
+        "BEGIN; DECLARE fits NO SCROLL CURSOR FOR SELECT id FROM many_inputs; FETCH ALL FROM fits; COMMIT",
         true,
     );
 }
@@ -1624,7 +1633,8 @@ fn cursor_retained_type_analysis_precedes_execution_permissions() {
     let mut budget = test_engine_budget(&config, 1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
-    session.success(&mut engine, "CREATE TABLE permission_input(id integer); CREATE ROLE cursor_denied; SET ROLE cursor_denied; BEGIN", true);
+    session.success(&mut engine, "CREATE TABLE permission_input(id integer); CREATE ROLE cursor_denied; SET ROLE cursor_denied", true);
+    session.success(&mut engine, "BEGIN", true);
     assert_eq!(
         error_sqlstates(&session.execute(
             &mut engine,
@@ -1923,8 +1933,12 @@ fn cursor_retained_hold_commit_errors_close_new_cursors_and_rollback() {
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     session.success(
         &mut engine,
-        "CREATE TABLE hold_error(id integer); INSERT INTO hold_error VALUES (1),(0); \
-        BEGIN; DECLARE held NO SCROLL CURSOR WITH HOLD FOR SELECT 100/id FROM hold_error",
+        "CREATE TABLE hold_error(id integer); INSERT INTO hold_error VALUES (1),(0)",
+        true,
+    );
+    session.success(
+        &mut engine,
+        "BEGIN; DECLARE held NO SCROLL CURSOR WITH HOLD FOR SELECT 100/id FROM hold_error",
         true,
     );
     assert_eq!(
@@ -1937,8 +1951,12 @@ fn cursor_retained_hold_commit_errors_close_new_cursors_and_rollback() {
     );
     assert!(!session.transaction.is_active());
     assert!(!session.cursors.exists("held"));
-    session.success(&mut engine, "TRUNCATE hold_error; INSERT INTO hold_error SELECT g FROM generate_series(1,8) AS g; \
-        BEGIN; INSERT INTO hold_error VALUES (9); \
+    session.success(
+        &mut engine,
+        "TRUNCATE hold_error; INSERT INTO hold_error SELECT g FROM generate_series(1,8) AS g",
+        true,
+    );
+    session.success(&mut engine, "BEGIN; INSERT INTO hold_error VALUES (9); \
         DECLARE held NO SCROLL CURSOR WITH HOLD FOR SELECT id FROM hold_error; FETCH NEXT FROM held", true);
     assert_eq!(
         error_sqlstates(&session.execute(&mut engine, "COMMIT", true)),
@@ -1962,9 +1980,13 @@ fn cursor_retained_hold_runs_deferred_triggers_before_saving_unread_results() {
         CREATE TABLE hold_trigger_gate(id integer); \
         CREATE FUNCTION hold_trigger_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'deferred gate'; END $$; \
         CREATE CONSTRAINT TRIGGER hold_gate AFTER INSERT ON hold_trigger_gate DEFERRABLE INITIALLY DEFERRED \
-        FOR EACH ROW EXECUTE FUNCTION hold_trigger_failure(); \
-        BEGIN; DECLARE held NO SCROLL CURSOR WITH HOLD FOR SELECT 100/id FROM hold_trigger_input; \
-        INSERT INTO hold_trigger_gate VALUES (1)", true);
+        FOR EACH ROW EXECUTE FUNCTION hold_trigger_failure()", true);
+    session.success(
+        &mut engine,
+        "BEGIN; DECLARE held NO SCROLL CURSOR WITH HOLD FOR SELECT 100/id FROM hold_trigger_input; \
+        INSERT INTO hold_trigger_gate VALUES (1)",
+        true,
+    );
     let failed = session.execute(&mut engine, "COMMIT", true);
     assert_eq!(error_sqlstates(&failed), ["P0001"]);
     assert!(String::from_utf8_lossy(&failed).contains("deferred gate"));
@@ -2228,8 +2250,12 @@ fn cursor_retained_errors_occur_when_the_requested_row_is_evaluated() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
     session.success(&mut engine,
-        "CREATE TABLE expression_input(id integer); INSERT INTO expression_input VALUES (1),(2),(0); \
-         BEGIN; DECLARE calculated NO SCROLL CURSOR FOR SELECT 100/id FROM expression_input", true);
+        "CREATE TABLE expression_input(id integer); INSERT INTO expression_input VALUES (1),(2),(0)", true);
+    session.success(
+        &mut engine,
+        "BEGIN; DECLARE calculated NO SCROLL CURSOR FOR SELECT 100/id FROM expression_input",
+        true,
+    );
     assert_eq!(
         data_rows(&session.success(&mut engine, "FETCH NEXT FROM calculated", true)),
         ["100"]
@@ -3038,8 +3064,12 @@ fn locking_cursors_reject_repeatable_read_changes_and_bound_sorted_rows() {
     // row returns; exhaustion names the setting.
     owner.success(
         &mut engine,
-        "INSERT INTO lt SELECT g, g FROM generate_series(10, 200) g; \
-         BEGIN; DECLARE big CURSOR FOR SELECT id FROM lt ORDER BY v FOR UPDATE",
+        "INSERT INTO lt SELECT g, g FROM generate_series(10, 200) g",
+        true,
+    );
+    owner.success(
+        &mut engine,
+        "BEGIN; DECLARE big CURSOR FOR SELECT id FROM lt ORDER BY v FOR UPDATE",
         true,
     );
     let response = owner.execute(&mut engine, "FETCH 1 FROM big", true);

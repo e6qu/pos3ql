@@ -86,6 +86,7 @@ pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 mod cte;
 mod view_write;
 pub(crate) use cte::captured_type_oid;
+pub(crate) use cte::select_reads_repeatably;
 pub(crate) use cte::{CteReader, dml_cte_runs_after, select_relations, set_query_relations};
 pub use view_write::{
     UpdatableView, ViewRewrite, ViewWrite, and_where, function_view_write_error,
@@ -1661,6 +1662,15 @@ pub(crate) fn with_routine_invocation_scope<R>(
     };
     let prior = ACTIVE_ROUTINE_INVOCATIONS.with(|active| active.replace(current));
     // Keep the guard private: a caller cannot forget it and leave dangling TLS.
+    let _scope = RoutineInvocationScope(prior);
+    execute()
+}
+
+/// Runs `execute` with no active invocation log. A streamed write source
+/// calls no routine, so it keeps no receipts: reading its rows again in a
+/// later attempt cannot shift the write's own log.
+pub(crate) fn without_routine_invocations<R>(execute: impl FnOnce() -> R) -> R {
+    let prior = ACTIVE_ROUTINE_INVOCATIONS.with(|active| active.replace(None));
     let _scope = RoutineInvocationScope(prior);
     execute()
 }

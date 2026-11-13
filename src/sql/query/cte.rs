@@ -4859,6 +4859,17 @@ fn frame_bound_mentions_column(
     }
 }
 
+/// Whether running `select` again under the same snapshot reads the same
+/// rows with the same values and has no effect: it calls no volatile
+/// built-in and no user routine.
+pub(crate) fn select_reads_repeatably(select: &Select<'_>, storage: &Storage, txid: u32) -> bool {
+    !select_contains_function(select, &|name, arity| {
+        super::super::ast::is_volatile_function(name)
+            || storage.has_non_aggregate_routine_candidate(name, arity, txid)
+            || storage.has_aggregate_routine_candidate(name, arity, txid)
+    })
+}
+
 pub(super) fn select_contains_volatile(select: &Select<'_>, storage: &Storage, txid: u32) -> bool {
     select_contains_function(select, &|name, arguments| {
         super::super::ast::is_volatile_function(name)

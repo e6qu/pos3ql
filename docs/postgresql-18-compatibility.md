@@ -790,6 +790,15 @@ callbacks are not available. MVCC visibility and SQL rechecks decide every
 result. [Immutable index navigation](index-navigation.md) specifies pruning,
 covering, and nearest-neighbor eligibility.
 
+An exclusion constraint (`EXCLUDE USING gist (during WITH &&)`) may use the
+B-tree (the default), hash, GiST or SP-GiST method with any commutative
+operator of the column type's default operator class for that method, as
+PostgreSQL checks it: `EXCLUDE (code WITH =)` on `text`, `EXCLUDE USING gist
+(area WITH &&)` on `box`. Each element must be a column; an expression element
+such as `int4range(lo, hi)` returns `0A000`. `CLUSTER` and `REPLICA IDENTITY
+USING INDEX` accept a primary key or unique constraint's index as well as an
+ordinary index.
+
 `REINDEX (TABLESPACE ...)` without `CONCURRENTLY` returns `0A000` for
 constraint-generated indexes such as `orders_pkey`, or for a table, schema, or
 database target that contains one, before changing anything. `CONCURRENTLY` can

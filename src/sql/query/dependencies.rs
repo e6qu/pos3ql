@@ -749,8 +749,9 @@ fn select_output_width(
             }
         }
     }
-    // The query's own WITH list names some of its FROM items.
-    let select = if select.with.is_empty() {
+    // The query's own WITH list and the views it reads name some of its
+    // FROM items.
+    let select = if select.with.is_empty() && !storage.has_any_view() {
         select
     } else {
         super::expand_ctes(select, storage, txid, arena)?

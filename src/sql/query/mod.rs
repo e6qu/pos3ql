@@ -8612,8 +8612,33 @@ pub(crate) fn analyse_rule_action<'a>(
         Stmt::SetQuery(query) => {
             analyse_set_tree(query.body, storage, txid, arena, Some(transition))
         }
+        Stmt::Insert(insert) if insert.select.is_some_and(|select| select.set_body.is_none()) => {
+            // The inserted query is analysed as a SELECT action is, with
+            // OLD and NEW as its outer row.
+            let select = insert.select.expect("checked above");
+            let mark = arena.mark();
+            let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+            let analysed = expand_ctes(select, storage, txid, arena).and_then(|select| {
+                describe_select(
+                    select,
+                    storage,
+                    txid,
+                    arena,
+                    &mut columns,
+                    crate::sql::exec::DescriptionTarget::Sql,
+                    Some(transition),
+                )?;
+                analyse_select(select, storage, txid, arena, Some(transition))
+            });
+            unsafe { arena.rewind_to(mark) };
+            analysed?;
+            validate_dml_assignment_casts(statement, storage, txid, arena, Some(transition))
+        }
         Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
-            analyse_dml_condition(statement, storage, txid, arena, Some(transition))?;
+            // Views the action reads are analysed through their queries.
+            let expanded =
+                cte::expand_dml_ctes_schema(statement, &[], storage, txid, None, None, arena)?;
+            analyse_dml_condition(expanded, storage, txid, arena, Some(transition))?;
             validate_dml_assignment_casts(statement, storage, txid, arena, Some(transition))
         }
         _ => Ok(()),

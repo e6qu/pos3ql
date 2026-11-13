@@ -486,7 +486,7 @@ non-volatile SQL functions, are built when the statement starts. `pg_get_viewdef
 PostgreSQL deparses it, in its indented layout and wrap column, from the
 stored query, never its stored text: subqueries, functions (including ones
 returning composite rows, `OUT` parameters or a `json_to_record` column
-definition list), catalog and `information_schema` relations, joins, set
+definition list), `JSON_TABLE` items, catalog and `information_schema` relations, joins, set
 operations, windows, grouping sets, `WITH` queries with `SEARCH` and `CYCLE`,
 constant and repeated sort keys, and the analyzed form of each expression
 (operator coercions, SQL-syntax functions, `IN` lists, row comparisons,

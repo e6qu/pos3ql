@@ -7156,8 +7156,11 @@ fn json_table_column_value<'a, C: ColumnLookup<'a>>(
                 hooks,
             );
         }
+        // `transformJsonTableColumn`: a written FORMAT, WRAPPER or QUOTES
+        // clause, or a non-scalar type, reads the value as `JSON_QUERY`.
         let query_semantics = *format == "json"
-            || *wrapper != "without"
+            || *wrapper != "unspecified"
+            || *quotes != "unspecified"
             || ColType::from_sql_name(type_name).is_some_and(|ctype| {
                 matches!(ctype, ColType::Json | ColType::Jsonb | ColType::Array(_))
             })

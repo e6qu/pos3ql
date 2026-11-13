@@ -8803,10 +8803,12 @@ fn scan_source_mode<'a>(
             && 1u64
                 .checked_shl(order[depth] as u32)
                 .is_some_and(|bit| nullable_tables & bit == 0);
+        // Keys read the folded predicate, whose catalog-reference literals
+        // are already converted, so a constant key is not converted again.
         if let Some(plan) = derived_key_plan(
             scope,
             from,
-            planning_where_clause.filter(|_| where_filters),
+            where_clause.filter(|_| where_filters),
             pushdown[depth],
             order,
             depth,

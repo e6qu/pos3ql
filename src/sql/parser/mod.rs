@@ -4520,7 +4520,9 @@ impl<'a> Parser<'a> {
             self.expect_ident("wrapper")?;
             kind
         } else {
-            "without"
+            // Unwritten: PostgreSQL then reads a scalar type's value as
+            // `JSON_VALUE` does rather than as `JSON_QUERY`.
+            "unspecified"
         };
         let quotes = if self.eat_ident("omit")? {
             self.expect_ident("quotes")?;
@@ -4537,7 +4539,7 @@ impl<'a> Parser<'a> {
             }
             "keep"
         } else {
-            "keep"
+            "unspecified"
         };
         let mut empty_code = "null";
         let mut error_code = "null";

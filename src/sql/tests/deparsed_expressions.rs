@@ -288,3 +288,50 @@ fn sql_standard_bodies_print_one_analyzed_statement_per_line() {
         ]
     );
 }
+
+/// `JSON_TABLE` FROM items print as PostgreSQL 18.6's `get_json_table`
+/// prints them (outputs captured from PostgreSQL 18.6).
+#[test]
+fn json_table_views_print_postgresql_layout() {
+    let (mut engine, mut budget) = test_engine();
+    rows(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE json_rows (id integer PRIMARY KEY, document jsonb NOT NULL); \
+         CREATE VIEW json_projection AS \
+           SELECT source.id, item.ordinality, item.item_id, item.price \
+             FROM json_rows AS source \
+             CROSS JOIN LATERAL JSON_TABLE(source.document, '$.items[*] ? (@.active == true)' \
+               COLUMNS (ordinality FOR ORDINALITY, item_id integer PATH '$.id', \
+                 price numeric(10,2) PATH '$.price')) AS item; \
+         CREATE VIEW j2 AS SELECT * FROM JSON_TABLE('{\"a\":1}'::jsonb, '$' PASSING 1 AS x \
+           COLUMNS (a int PATH '$.a' DEFAULT 0 ON EMPTY ERROR ON ERROR, \
+             b text FORMAT JSON PATH '$' WITH WRAPPER, c bool EXISTS PATH '$.a', \
+             NESTED PATH '$.n[*]' COLUMNS (d int PATH '$')) ERROR ON ERROR) jt",
+    );
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_viewdef('json_projection'), pg_get_viewdef('j2')"
+        ),
+        [concat!(
+            " SELECT source.id,\n    item.ordinality,\n    item.item_id,\n    item.price\n",
+            "   FROM (json_rows source\n     CROSS JOIN LATERAL JSON_TABLE(\n",
+            "            source.document, '$.\"items\"[*]?(@.\"active\" == true)' AS json_table_path_0\n",
+            "            COLUMNS (\n                ordinality FOR ORDINALITY,\n",
+            "                item_id integer PATH '$.\"id\"',\n",
+            "                price numeric(10,2) PATH '$.\"price\"'\n",
+            "            )\n        ) item);|",
+            " SELECT a,\n    b,\n    c,\n    d\n   FROM JSON_TABLE(\n",
+            "            '{\"a\": 1}'::jsonb, '$' AS json_table_path_0\n",
+            "            PASSING\n                1 AS x\n            COLUMNS (\n",
+            "                a integer PATH '$.\"a\"' DEFAULT 0 ON EMPTY ERROR ON ERROR,\n",
+            "                b text FORMAT JSON PATH '$' WITH UNCONDITIONAL WRAPPER KEEP QUOTES,\n",
+            "                c boolean EXISTS PATH '$.\"a\"',\n",
+            "                NESTED PATH '$.\"n\"[*]' AS json_table_path_1\n",
+            "                COLUMNS (\n                    d integer PATH '$'\n",
+            "                )\n            ) ERROR ON ERROR\n        ) jt;"
+        )]
+    );
+}

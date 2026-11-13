@@ -19,7 +19,7 @@ use crate::sql::ast::{
     LockStrength, LockWait, OrderBy, RelationInheritance, Select, SelectItem, SetOp, SetTree,
     TableRef, TableSampleMethod, WindowSpec,
 };
-use crate::sql::types::oid;
+use crate::sql::types::{ColType, oid};
 use crate::sql::{Arena, SqlError, Storage};
 
 const STD: i32 = 8;
@@ -1747,6 +1747,18 @@ impl<'r: 'x, 'x> Builder<'r, 'x> {
             None => core::slice::from_ref(item),
         };
         for function in functions {
+            if item.rows_from.is_none() && unqualified_name(function.table) == "json_table" {
+                if let Some(Expr::Call {
+                    name: "__json_table_columns",
+                    args,
+                    ..
+                }) = function.func_args.and_then(|args| args.get(4))
+                    && json_table_output_columns(&context, args, &mut columns)?
+                {
+                    continue;
+                }
+                return Ok(None);
+            }
             // A record function's column definition list.
             if let Some(definitions) = column_definitions(function) {
                 for definition in definitions {
@@ -1828,6 +1840,56 @@ impl<'r: 'x, 'x> Builder<'r, 'x> {
         };
         self.derived(item.alias, name, columns)
     }
+}
+
+/// A `JSON_TABLE`'s output columns in written order, nested ones in place;
+/// false when one cannot be typed.
+fn json_table_output_columns<'x>(
+    context: &Context<'_>,
+    columns: &'x [&'x Expr<'x>],
+    output: &mut ArenaList<'x, Column<'x>>,
+) -> Result<bool, SqlError> {
+    for column in columns {
+        let (name, type_oid) = match column {
+            Expr::Call {
+                name: "__json_table_ordinality",
+                args: [Expr::Str(name)],
+                ..
+            } => (*name, oid::INT4),
+            Expr::Call {
+                name: "__json_table_value" | "__json_table_exists",
+                args,
+                ..
+            } => match args {
+                [Expr::Str(name), Expr::Str(type_name), ..] => {
+                    let Some(type_oid) = context.named_type(type_name) else {
+                        return Ok(false);
+                    };
+                    (*name, type_oid)
+                }
+                _ => return Ok(false),
+            },
+            Expr::Call {
+                name: "__json_table_nested",
+                args: [_, _, Expr::Call { args: nested, .. }],
+                ..
+            } => {
+                if !json_table_output_columns(context, nested, output)? {
+                    return Ok(false);
+                }
+                continue;
+            }
+            _ => return Ok(false),
+        };
+        output
+            .push(Column {
+                name,
+                type_oid: Some(type_oid),
+                merged: None,
+            })
+            .map_err(full)?;
+    }
+    Ok(true)
 }
 
 /// The column definition list the parser keeps as a record function's
@@ -2122,6 +2184,11 @@ impl<'r: 'x, 'c, 'x> Printer<'r, 'c, 'x> {
             return Ok(());
         }
         if item.is_function_source() {
+            if item.rows_from.is_none() && unqualified_name(item.table) == "json_table" {
+                self.json_table(item.func_args.unwrap_or(&[]), output)?;
+                output.push(" ")?;
+                return push_name(output, entry.printed);
+            }
             match item.rows_from {
                 Some(functions) => {
                     output.push("ROWS FROM(")?;
@@ -2534,4 +2601,270 @@ pub(super) fn sublink<'x>(
         arena,
         output,
     )
+}
+
+/// `get_json_table`: a `JSON_TABLE` FROM item in PostgreSQL's layout, its
+/// paths canonical and named (`json_table_path_N` in written order when
+/// unnamed), its regular columns before its nested ones, and only the
+/// clauses that differ from each column's defaults.
+impl<'r: 'x, 'c, 'x> Printer<'r, 'c, 'x> {
+    fn json_table(
+        &self,
+        args: &'x [&'x Expr<'x>],
+        output: &mut Output<'_>,
+    ) -> Result<(), SqlError> {
+        let [
+            document,
+            Expr::Str(path),
+            path_name,
+            Expr::Call {
+                name: "__json_table_passing",
+                args: passing,
+                ..
+            },
+            Expr::Call {
+                name: "__json_table_columns",
+                args: columns,
+                ..
+            },
+            Expr::Str(behavior),
+        ] = args
+        else {
+            return output.unsupported();
+        };
+        let mut names = 0u32;
+        output.push("JSON_TABLE(")?;
+        output.indent += VAR;
+        output.keyword("", 0, 0, 0)?;
+        let document = self.writer.bind(document, self.arena)?;
+        self.context.write(document, Some(oid::JSONB), output)?;
+        output.push(", ")?;
+        self.json_path(path, path_name, &mut names, output)?;
+        if !passing.is_empty() {
+            output.push(" ")?;
+            output.keyword("PASSING ", 0, 0, 0)?;
+            output.indent += VAR;
+            for (index, pair) in passing.chunks(2).enumerate() {
+                let [value, Expr::Str(name)] = pair else {
+                    return output.unsupported();
+                };
+                if index != 0 {
+                    output.push(", ")?;
+                }
+                output.keyword("", 0, 0, 0)?;
+                let value = self.writer.bind(value, self.arena)?;
+                self.context.write(value, None, output)?;
+                output.push(" AS ")?;
+                push_name(output, name)?;
+            }
+            output.indent -= VAR;
+        }
+        self.json_table_columns(columns, &mut names, output)?;
+        if *behavior == "error" {
+            output.push(" ERROR ON ERROR")?;
+        }
+        output.indent -= VAR;
+        output.keyword(")", 0, 0, 0)
+    }
+
+    /// A path literal and its name.
+    fn json_path(
+        &self,
+        path: &str,
+        name: &Expr<'_>,
+        names: &mut u32,
+        output: &mut Output<'_>,
+    ) -> Result<(), SqlError> {
+        super::quote_literal(
+            output,
+            crate::sql::jsonpath::canonicalize(path, self.arena)?,
+        )?;
+        output.push(" AS ")?;
+        match name {
+            Expr::Str(name) => push_name(output, name)?,
+            _ => output.push(crate::stack_format!(32, "json_table_path_{}", *names).as_str())?,
+        }
+        if !matches!(name, Expr::Str(_)) {
+            *names += 1;
+        }
+        Ok(())
+    }
+
+    /// `get_json_table_columns`.
+    fn json_table_columns(
+        &self,
+        columns: &'x [&'x Expr<'x>],
+        names: &mut u32,
+        output: &mut Output<'_>,
+    ) -> Result<(), SqlError> {
+        output.push(" ")?;
+        output.keyword("COLUMNS (", 0, 0, 0)?;
+        output.indent += VAR;
+        let mut regular = false;
+        for column in columns {
+            let Expr::Call { name, args, .. } = column else {
+                return output.unsupported();
+            };
+            if *name == "__json_table_nested" {
+                continue;
+            }
+            if regular {
+                output.push(", ")?;
+            }
+            regular = true;
+            output.keyword("", 0, 0, 0)?;
+            self.json_table_column(name, args, output)?;
+        }
+        let mut comma = regular;
+        for column in columns {
+            let Expr::Call {
+                name: "__json_table_nested",
+                args: [Expr::Str(path), path_name, Expr::Call { args: nested, .. }],
+                ..
+            } = column
+            else {
+                continue;
+            };
+            if comma {
+                output.push(",")?;
+            }
+            comma = true;
+            output.push(" ")?;
+            output.keyword("NESTED PATH ", 0, 0, 0)?;
+            self.json_path(path, path_name, names, output)?;
+            self.json_table_columns(nested, names, output)?;
+        }
+        output.indent -= VAR;
+        output.keyword(")", 0, 0, 0)
+    }
+
+    fn json_table_column(
+        &self,
+        kind: &str,
+        args: &'x [&'x Expr<'x>],
+        output: &mut Output<'_>,
+    ) -> Result<(), SqlError> {
+        match (kind, args) {
+            ("__json_table_ordinality", [Expr::Str(name)]) => {
+                push_name(output, name)?;
+                output.push(" FOR ORDINALITY")
+            }
+            (
+                "__json_table_exists",
+                [
+                    Expr::Str(name),
+                    Expr::Str(type_name),
+                    Expr::Int(type_mod),
+                    Expr::Str(path),
+                    Expr::Str(behavior),
+                ],
+            ) => {
+                let Some(type_oid) = self.context.named_type(type_name) else {
+                    return output.unsupported();
+                };
+                push_name(output, name)?;
+                output.push(" ")?;
+                self.context.type_name_mod(
+                    type_oid,
+                    i32::try_from(*type_mod).unwrap_or(-1),
+                    output,
+                )?;
+                output.push(" EXISTS PATH ")?;
+                super::quote_literal(
+                    output,
+                    crate::sql::jsonpath::canonicalize(path, self.arena)?,
+                )?;
+                match *behavior {
+                    "false" => Ok(()),
+                    "true" => output.push(" TRUE ON ERROR"),
+                    "unknown" => output.push(" UNKNOWN ON ERROR"),
+                    "error" => output.push(" ERROR ON ERROR"),
+                    _ => output.unsupported(),
+                }
+            }
+            (
+                "__json_table_value",
+                [
+                    Expr::Str(name),
+                    Expr::Str(type_name),
+                    Expr::Int(type_mod),
+                    Expr::Str(path),
+                    Expr::Str(format),
+                    Expr::Str(wrapper),
+                    Expr::Str(quotes),
+                    empty_default,
+                    error_default,
+                    Expr::Str(empty_code),
+                    Expr::Str(error_code),
+                ],
+            ) => {
+                let Some(type_oid) = self.context.named_type(type_name) else {
+                    return output.unsupported();
+                };
+                push_name(output, name)?;
+                output.push(" ")?;
+                self.context.type_name_mod(
+                    type_oid,
+                    i32::try_from(*type_mod).unwrap_or(-1),
+                    output,
+                )?;
+                // `transformJsonTableColumn`'s `JSON_QUERY` columns.
+                let query = *format == "json"
+                    || *wrapper != "unspecified"
+                    || *quotes != "unspecified"
+                    || ColType::from_sql_name(type_name).is_some_and(|ctype| {
+                        matches!(
+                            ctype,
+                            ColType::Json | ColType::Jsonb | ColType::Array(_) | ColType::Record
+                        )
+                    })
+                    || crate::storage::NamedTypeKind::from_oid(type_oid).is_some_and(
+                        |(kind, _, array)| {
+                            array || kind == crate::storage::NamedTypeKind::Composite
+                        },
+                    );
+                // A string-category type's query column names its format.
+                if query && matches!(type_oid, oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME) {
+                    output.push(" FORMAT JSON")?;
+                }
+                output.push(" PATH ")?;
+                super::quote_literal(
+                    output,
+                    crate::sql::jsonpath::canonicalize(path, self.arena)?,
+                )?;
+                if query {
+                    output.push(match *wrapper {
+                        "conditional" => " WITH CONDITIONAL WRAPPER",
+                        "unconditional" => " WITH UNCONDITIONAL WRAPPER",
+                        _ => " WITHOUT WRAPPER",
+                    })?;
+                    output.push(if *quotes == "omit" {
+                        " OMIT QUOTES"
+                    } else {
+                        " KEEP QUOTES"
+                    })?;
+                }
+                for (code, default, on) in [
+                    (empty_code, empty_default, " ON EMPTY"),
+                    (error_code, error_default, " ON ERROR"),
+                ] {
+                    match *code {
+                        "null" => continue,
+                        "error" => output.push(" ERROR")?,
+                        "array" => output.push(" EMPTY ARRAY")?,
+                        "object" => output.push(" EMPTY OBJECT")?,
+                        "default" => {
+                            output.push(" DEFAULT ")?;
+                            let default = self.writer.bind(default, self.arena)?;
+                            self.context.write(default, Some(type_oid), output)?;
+                        }
+                        _ => return output.unsupported(),
+                    }
+                    output.push(on)?;
+                }
+                Ok(())
+            }
+            _ => output.unsupported(),
+        }
+    }
 }

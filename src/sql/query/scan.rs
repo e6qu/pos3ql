@@ -7787,10 +7787,7 @@ fn scan_source_mode<'a>(
             if source_ref(from, order[depth]).inheritance == RelationInheritance::Descendants
                 && storage.relation_has_descendants(slot, txid)
             {
-                let leaves = arena
-                    .alloc_slice_with(storage.table_count(), |_| usize::MAX)
-                    .map_err(|_| arena_full())?;
-                let n_leaves = if let Some(leaf) = exact_partition_leaf(
+                let leaves = if let Some(leaf) = exact_partition_leaf(
                     storage,
                     scope,
                     order[depth],
@@ -7800,10 +7797,9 @@ fn scan_source_mode<'a>(
                     hooks,
                     txid,
                 )? {
-                    leaves[0] = leaf;
-                    1
+                    &*arena.alloc_slice_copy(&[leaf]).map_err(|_| arena_full())?
                 } else {
-                    storage.relation_leaf_slots(slot, txid, leaves)?
+                    crate::sql::exec::relation_leaves_in_order(storage, slot, txid, arena)?
                 };
                 let mut index = 0usize;
                 let mut aborted = false;
@@ -7812,7 +7808,7 @@ fn scan_source_mode<'a>(
                     .defs
                     .stored(order[depth])
                     .expect("resolved logical relation");
-                for &leaf in &leaves[..n_leaves] {
+                for &leaf in leaves {
                     let physical = definitions.definition(storage, leaf, txid)?;
                     let foreign = physical.kind == crate::storage::TableKind::Foreign;
                     // PostgreSQL keeps no scan statistics for foreign tables.

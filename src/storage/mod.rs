@@ -37448,58 +37448,8 @@ impl Storage {
         Ok(true)
     }
 
-    /// Expands a logical relation through both ordinary inheritance and
-    /// partition attachment without allocating. A non-partitioned relation
-    /// contributes its own rows before its descendants; partitioned relations
-    /// contribute only their leaves. The caller supplies bounded storage sized
-    /// from the configured table catalog.
-    pub fn relation_leaf_slots(
-        &self,
-        root: usize,
-        txid: u32,
-        out: &mut [usize],
-    ) -> Result<usize, SqlError> {
-        fn visit(
-            storage: &Storage,
-            root: usize,
-            txid: u32,
-            out: &mut [usize],
-            n: &mut usize,
-        ) -> Result<(), SqlError> {
-            if out[..*n].contains(&root) {
-                return Ok(());
-            }
-            if !storage.table_def(root, txid).partition.is_partitioned() {
-                if *n == out.len() {
-                    return Err(sql_err!(
-                        crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "relation scan exceeds configured table capacity"
-                    ));
-                }
-                out[*n] = root;
-                *n += 1;
-            }
-            for child in 0..storage.table_count() {
-                if !storage.relation_visible_to_current_session(child, txid) {
-                    continue;
-                }
-                let child_def = storage.table_def(child, txid);
-                let partition_child = child_def.partition.attachment.is_some_and(|attachment| {
-                    usize::from(attachment.parent) == root && attachment.state.routable()
-                });
-                if !partition_child && !child_def.inheritance.contains(root) {
-                    continue;
-                }
-                visit(storage, child, txid, out, n)?;
-            }
-            Ok(())
-        }
-        let mut n = 0;
-        visit(self, root, txid, out, &mut n)?;
-        Ok(n)
-    }
-
-    /// Routes writes by partition bounds; scans use `relation_leaf_slots`.
+    /// Routes writes by partition bounds; scans and writes of a relation's
+    /// rows read its leaves through `sql::exec::relation_leaves_in_order`.
     pub fn partition_leaf_slots(
         &self,
         root: usize,

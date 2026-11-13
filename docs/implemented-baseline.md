@@ -140,7 +140,11 @@ rows with its local ones, and `UPDATE` and `DELETE` change them there too: in
 `orders` partitioned with a foreign partition `orders_archive`, `SELECT *
 FROM orders` returns both partitions' rows. `MERGE` into such a table fails
 with PostgreSQL's `0A000` (`cannot execute MERGE on relation
-"orders_archive"`).
+"orders_archive"`). Without `ORDER BY`, such a read and a write's
+`RETURNING` rows follow PostgreSQL's order: partitions in bound order (the
+default partition last, a list partition holding only `NULL` after the other
+list partitions, hash partitions by modulus and remainder), and an inherited
+table's children level by level in creation order.
 
 Under `READ COMMITTED`, `SELECT ... FOR UPDATE` returns the locked row's latest
 version: the join conditions, `WHERE` and output list run again over it, while

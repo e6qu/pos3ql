@@ -4799,7 +4799,13 @@ fn partition_bounds_overlap(
         ) => {
             for left in &lv[..usize::from(ln)] {
                 for right in &rv[..usize::from(rn)] {
-                    if compare_datums(&left.as_datum(), &right.as_datum())?.is_eq() {
+                    // A NULL bound value matches only the other NULL.
+                    let same = match (left.as_datum(), right.as_datum()) {
+                        (Datum::Null, Datum::Null) => true,
+                        (Datum::Null, _) | (_, Datum::Null) => false,
+                        (left, right) => compare_datums(&left, &right)?.is_eq(),
+                    };
+                    if same {
                         return Ok(true);
                     }
                 }
@@ -4850,6 +4856,195 @@ fn compare_partition_bound_tuples(
         }
     }
     Ok(Ordering::Equal)
+}
+
+/// The leaf tables a scan or write of `root` and its descendants reads, in
+/// PostgreSQL's order, which a result without `ORDER BY` and `RETURNING`
+/// follow: a partitioned table's partitions in bound order, a partitioned
+/// partition's own leaves in its place, and an inheritance tree level by
+/// level with each level's children in OID order, as `find_all_inheritors`
+/// lists them.
+pub(crate) fn relation_leaves_in_order<'a>(
+    storage: &Storage,
+    root: usize,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [usize], SqlError> {
+    let full = || {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "partition target list exceeds the statement arena"
+        )
+    };
+    let out = arena
+        .alloc_slice_with(storage.table_count(), |_| usize::MAX)
+        .map_err(|_| full())?;
+    let children = arena
+        .alloc_slice_with(storage.table_count(), |_| usize::MAX)
+        .map_err(|_| full())?;
+    let mut n = 0usize;
+    if storage.table_def(root, txid).partition.is_partitioned() {
+        partition_leaves_in_order(storage, root, txid, out, &mut n, children)?;
+        return Ok(&out[..n]);
+    }
+    out[0] = root;
+    n = 1;
+    let mut next = 0usize;
+    while next < n {
+        let parent = out[next];
+        next += 1;
+        let mut found = 0usize;
+        for child in 0..storage.table_count() {
+            if storage.relation_visible_to_current_session(child, txid)
+                && !out[..n].contains(&child)
+                && storage.table_def(child, txid).inheritance.contains(parent)
+            {
+                children[found] = child;
+                found += 1;
+            }
+        }
+        let level = &mut children[..found];
+        level.sort_unstable_by_key(|&child| {
+            crate::sql::catalog::user_table_oid(storage, child) as u32
+        });
+        for &child in level.iter() {
+            out[n] = child;
+            n += 1;
+        }
+    }
+    Ok(&out[..n])
+}
+
+fn partition_leaves_in_order(
+    storage: &Storage,
+    parent: usize,
+    txid: u32,
+    out: &mut [usize],
+    n: &mut usize,
+    scratch: &mut [usize],
+) -> Result<(), SqlError> {
+    let mut found = 0usize;
+    for child in 0..storage.table_count() {
+        if !storage.relation_visible_to_current_session(child, txid) {
+            continue;
+        }
+        if storage
+            .table_def(child, txid)
+            .partition
+            .attachment
+            .is_some_and(|attachment| {
+                usize::from(attachment.parent) == parent && attachment.state.routable()
+            })
+        {
+            scratch[found] = child;
+            found += 1;
+        }
+    }
+    let (level, rest) = scratch.split_at_mut(found);
+    let mut failed = None;
+    level.sort_unstable_by(|&left, &right| {
+        match partition_bound_order(storage, left, right, txid) {
+            Ok(ordering) => ordering,
+            Err(error) => {
+                failed.get_or_insert(error);
+                core::cmp::Ordering::Equal
+            }
+        }
+    });
+    if let Some(error) = failed {
+        return Err(error);
+    }
+    for &child in level.iter() {
+        if storage.table_def(child, txid).partition.is_partitioned() {
+            partition_leaves_in_order(storage, child, txid, out, n, rest)?;
+        } else {
+            out[*n] = child;
+            *n += 1;
+        }
+    }
+    Ok(())
+}
+
+/// PostgreSQL's partition descriptor order of two sibling partitions: range
+/// partitions by lower bound, list partitions by their least value with a
+/// partition of only `NULL` after them, hash partitions by modulus and
+/// remainder, and the default partition last.
+fn partition_bound_order(
+    storage: &Storage,
+    left: usize,
+    right: usize,
+    txid: u32,
+) -> Result<core::cmp::Ordering, SqlError> {
+    use crate::storage::PartitionBound;
+    use core::cmp::Ordering;
+    let bound = |slot: usize| {
+        storage
+            .table_def(slot, txid)
+            .partition
+            .attachment
+            .map(|attachment| attachment.bound)
+    };
+    let least = |values: &[crate::storage::OwnedDatum]| -> Result<Option<usize>, SqlError> {
+        let mut least: Option<usize> = None;
+        for (index, value) in values.iter().enumerate() {
+            if matches!(value.as_datum(), Datum::Null) {
+                continue;
+            }
+            let lower = match least {
+                None => true,
+                Some(current) => {
+                    compare_datums(&value.as_datum(), &values[current].as_datum())?.is_lt()
+                }
+            };
+            if lower {
+                least = Some(index);
+            }
+        }
+        Ok(least)
+    };
+    Ok(match (bound(left), bound(right)) {
+        (Some(PartitionBound::Default), Some(PartitionBound::Default)) => Ordering::Equal,
+        (Some(PartitionBound::Default), _) => Ordering::Greater,
+        (_, Some(PartitionBound::Default)) => Ordering::Less,
+        (
+            Some(PartitionBound::Range {
+                lower: left,
+                n_keys,
+                ..
+            }),
+            Some(PartitionBound::Range { lower: right, .. }),
+        ) => compare_partition_bound_tuples(&left, &right, n_keys)?,
+        (
+            Some(PartitionBound::List {
+                values: left,
+                n_values: left_count,
+            }),
+            Some(PartitionBound::List {
+                values: right,
+                n_values: right_count,
+            }),
+        ) => {
+            let left = &left[..usize::from(left_count)];
+            let right = &right[..usize::from(right_count)];
+            match (least(left)?, least(right)?) {
+                (Some(l), Some(r)) => compare_datums(&left[l].as_datum(), &right[r].as_datum())?,
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            }
+        }
+        (
+            Some(PartitionBound::Hash {
+                modulus: left_modulus,
+                remainder: left_remainder,
+            }),
+            Some(PartitionBound::Hash {
+                modulus: right_modulus,
+                remainder: right_remainder,
+            }),
+        ) => (left_modulus, left_remainder).cmp(&(right_modulus, right_remainder)),
+        _ => left.cmp(&right),
+    })
 }
 
 fn row_trigger_when_passes<'a>(
@@ -92372,16 +92567,7 @@ fn dml_leaf_slots_for<'a>(
                 )
             });
     }
-    let slots = arena
-        .alloc_slice_with(storage.table_count(), |_| 0usize)
-        .map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "partition target list exceeds the statement arena"
-            )
-        })?;
-    let n = storage.relation_leaf_slots(table_index, txid, slots)?;
-    Ok(&slots[..n])
+    relation_leaves_in_order(storage, table_index, txid, arena)
 }
 
 /// The rows a resumed write over a foreign table, or over a hierarchy with
@@ -92538,6 +92724,8 @@ pub(super) fn collect_matches<'a>(
         None
     };
     for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
+        // Each leaf's rows follow its physical order; leaves keep theirs.
+        let leaf_start = scratch.len();
         let physical = (*storage.table_def(leaf, txid)).clone();
         if physical.kind == crate::storage::TableKind::Foreign {
             let layout =
@@ -92569,6 +92757,7 @@ pub(super) fn collect_matches<'a>(
                     Ok(())
                 },
             )?;
+            scratch[leaf_start..].sort_unstable_by_key(|row| row.sort_key());
             continue;
         }
         storage.record_serializable_read(txid, leaf);
@@ -92639,11 +92828,12 @@ pub(super) fn collect_matches<'a>(
                 Ok(core::ops::ControlFlow::Continue(()))
             })?;
         }
+        // DML RETURNING follows each leaf's physical row order. The row map
+        // is hash-addressed, so restore the monotonic row identity assigned
+        // when the heap image was first appended before locks and writes
+        // begin.
+        scratch[leaf_start..].sort_unstable_by_key(|row| row.sort_key());
     }
-    // DML RETURNING follows the target table's physical row order. The row
-    // map is hash-addressed, so restore the monotonic row identity assigned
-    // when the heap image was first appended before locks and writes begin.
-    scratch.sort_unstable_by_key(|row| row.sort_key());
     images.finish()
 }
 

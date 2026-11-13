@@ -4363,9 +4363,10 @@ fn shared_transaction_identity_sql_and_maintenance_reservations_are_unique() {
         }
         crate::mem::guard::forbid_alloc(|| {
             ids.sort_unstable();
-            assert_eq!(ids, std::array::from_fn(|index| index as u32 + 1));
+            // Identities 1 and 2 are PostgreSQL's bootstrap and frozen ones.
+            assert_eq!(ids, std::array::from_fn(|index| index as u32 + 3));
             assert!(storage.transaction_identity_state().active.is_empty());
-            assert_eq!(storage.latest_transaction_identity(), 192);
+            assert_eq!(storage.latest_transaction_identity(), 194);
         });
     });
 }

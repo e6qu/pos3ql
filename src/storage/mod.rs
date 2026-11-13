@@ -24051,7 +24051,7 @@ impl Storage {
                     let mut rest = line;
                     let mut appended = !commented || self.extension_script_source.append(b"-- ");
                     while appended && let Some(at) = rest.find("MODULE_PATHNAME") {
-                        appended = self.extension_script_source.append(rest[..at].as_bytes())
+                        appended = self.extension_script_source.append(&rest.as_bytes()[..at])
                             && self
                                 .extension_script_source
                                 .append(system.module.path().as_bytes());

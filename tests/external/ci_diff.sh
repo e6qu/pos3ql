@@ -378,7 +378,7 @@ CREATE FUNCTION transformed(integer) RETURNS integer LANGUAGE sql
   TRANSFORM FOR TYPE integer RETURN $1;
 CREATE FUNCTION supported(integer) RETURNS integer LANGUAGE sql
   SUPPORT pg_catalog.array_unnest_support RETURN $1;
-CREATE FUNCTION linked(integer) RETURNS integer LANGUAGE plpgsql
+CREATE FUNCTION linked(integer) RETURNS integer LANGUAGE c
   AS 'untrusted-library', 'entrypoint';
 CREATE TRUSTED PROCEDURAL LANGUAGE native_language
   HANDLER pg_catalog.plpgsql_call_handler;

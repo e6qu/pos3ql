@@ -508,8 +508,8 @@ mod callable_contract_tests {
             assert_eq!(builtin_planner_procedure(oid).unwrap().volatility, 1);
         }
         assert_eq!(planner_properties::PROCEDURES.len(), 3397);
-        // Every PostgreSQL 18.6 pg_proc row, plus the two local FDW callbacks.
-        assert_eq!(callable_signatures::CALLABLES.len(), 3415);
+        // Every PostgreSQL 18.6 pg_proc row.
+        assert_eq!(callable_signatures::CALLABLES.len(), 3413);
         assert!(
             planner_properties::PROCEDURES
                 .iter()

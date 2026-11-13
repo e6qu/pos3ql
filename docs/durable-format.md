@@ -160,7 +160,7 @@ inserts a missing writer.
 | Record | Contents and rules |
 |---|---|
 | `table2` | Slot, creation stamp, hexadecimal checked-input image, name. Internal large-object page table keeps its reserved slot and stamp zero. |
-| `sq7`, `rtn2` | Sequence / routine slot and creation stamp. A routine's language code is 0 (SQL), 1 (PL/pgSQL), 2 (internal aggregate) or 16 plus a native routine code for a `LANGUAGE C` routine bound to built-in postgres_fdw code (0 handler, 1 validator, 2 and 3 `get_connections` 1.1 and 1.2, 4 `disconnect`, 5 `disconnect_all`). |
+| `sq7`, `rtn2` | Sequence / routine slot and creation stamp. A routine's language code is 0 (SQL), 1 (PL/pgSQL), 2 (internal aggregate) or 16 plus a native routine code for a `LANGUAGE C` routine bound to built-in postgres_fdw code (0 handler, 1 validator, 2 and 3 `get_connections` 1.1 and 1.2, 4 `disconnect`, 5 `disconnect_all`). Such a handler's `fdw_handler` result persists as type code 250. |
 | `fdw2` | Foreign-data wrapper slot, creation stamp, owner, handler and validator `pg_proc` OIDs (0 for none), name and options. The earlier `fdw` record, with 0/1 flags, is rejected. |
 | `xpk`, `xsc` | Available extension packages and their version scripts, numbered after the packages built into the binary (`$system`'s postgres_fdw), which are never persisted. |
 | `mv6` | Materialized-view catalog position and backing-table position. |

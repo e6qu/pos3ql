@@ -10316,7 +10316,8 @@ fn foreign_data_alter_drop_and_dependency_lifecycles_are_atomic() {
            JOIN pg_foreign_server s ON s.oid = f.ftserver; \
          SELECT umoptions::text FROM pg_user_mapping u JOIN pg_foreign_server s \
            ON s.oid = u.umserver WHERE s.srvname = 'lifecycle_a'; \
-         SELECT fdwhandler::regproc FROM pg_foreign_data_wrapper",
+         SELECT fdwhandler::regproc FROM pg_foreign_data_wrapper \
+           WHERE fdwname <> 'postgres_fdw'",
     );
     assert_eq!(
         data_rows(&savepoint),
@@ -10357,7 +10358,8 @@ fn foreign_data_alter_drop_and_dependency_lifecycles_are_atomic() {
          SELECT count(*) FROM pg_foreign_server; \
          SELECT count(*) FROM pg_foreign_data_wrapper",
     );
-    assert_eq!(data_rows(&cascade), ["0", "1", "0", "0"]);
+    // The extension's own postgres_fdw wrapper remains.
+    assert_eq!(data_rows(&cascade), ["0", "1", "0", "1"]);
 }
 
 #[test]
@@ -15679,7 +15681,7 @@ fn native_hook_ddl_rejects_before_catalog_publication() {
         "CREATE FUNCTION native_window(integer) RETURNS integer LANGUAGE sql WINDOW RETURN $1",
         "CREATE FUNCTION transformed(integer) RETURNS integer LANGUAGE sql TRANSFORM FOR TYPE integer RETURN $1",
         "CREATE FUNCTION supported(integer) RETURNS integer LANGUAGE sql SUPPORT pg_catalog.array_unnest_support RETURN $1",
-        "CREATE FUNCTION linked(integer) RETURNS integer LANGUAGE plpgsql AS 'untrusted-library', 'entrypoint'",
+        "CREATE FUNCTION linked(integer) RETURNS integer LANGUAGE c AS 'untrusted-library', 'entrypoint'",
         "CREATE TRUSTED PROCEDURAL LANGUAGE native_language HANDLER pg_catalog.plpgsql_call_handler",
         "CREATE LANGUAGE handlerless_language",
         "ALTER LANGUAGE plpgsql RENAME TO mutated_language",
@@ -16423,7 +16425,7 @@ fn user_cast_operator_catalog_survives_wal_checkpoint_and_cold_recovery() {
 }
 
 #[test]
-fn system_extension_packages_list_plpgsql_only_under_system() {
+fn system_extension_packages_list_plpgsql_and_postgres_fdw_only_under_system() {
     let rows = "SELECT name, default_version, installed_version, comment \
                   FROM pg_available_extensions ORDER BY name; \
                 SELECT name, version, installed, superuser, trusted, relocatable, schema, \
@@ -16431,7 +16433,11 @@ fn system_extension_packages_list_plpgsql_only_under_system() {
                   FROM pg_available_extension_versions ORDER BY name, version";
     let plpgsql = [
         "plpgsql|1.0|1.0|PL/pgSQL procedural language",
+        "postgres_fdw|1.2|NULL|foreign-data wrapper for remote PostgreSQL servers",
         "plpgsql|1.0|t|t|t|f|pg_catalog|t",
+        "postgres_fdw|1.0|f|t|f|t|NULL|t",
+        "postgres_fdw|1.1|f|t|f|t|NULL|t",
+        "postgres_fdw|1.2|f|t|f|t|NULL|t",
     ];
     // An empty control path is PostgreSQL's default `$system`.
     let config = test_config("system-extension-default");
@@ -16711,7 +16717,8 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         "DROP EXTENSION base_ext",
     );
     assert!(
-        String::from_utf8_lossy(&restricted).contains("other extensions depend on it"),
+        String::from_utf8_lossy(&restricted)
+            .contains("extension typed_ext depends on extension base_ext"),
         "{}",
         String::from_utf8_lossy(&restricted)
     );

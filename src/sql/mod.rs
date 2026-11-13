@@ -25382,13 +25382,6 @@ impl Engine {
                     dependent_count += 1;
                 }
             }
-            if dependent_count != 0 && !cascade {
-                return Ok(Err(sql_err!(
-                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
-                    "cannot drop extension \"{}\" because other extensions depend on it",
-                    name
-                )));
-            }
             for dependent in &dependent_extensions[..dependent_count] {
                 let targets = [dependent.as_str()];
                 let result = responder.without_command_complete(|responder| {

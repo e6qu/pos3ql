@@ -72063,9 +72063,6 @@ fn copy_match_header_in_frame(
     Ok(())
 }
 
-/// `ON_ERROR ignore` only discards data-conversion failures. Constraint,
-/// transaction, storage, and protocol errors remain statement failures.
-
 /// One COPY FROM data line: text fields decode, coerce through each column's
 /// input semantics, and store through the same row core INSERT uses —
 /// defaults, sequences, NOT NULL, uniqueness, CHECK and foreign keys all
@@ -72392,10 +72389,6 @@ fn copy_row_binary_in_frame<'a>(
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "COPY shares the bounded INSERT trigger and constraint context"
-)]
 /// Whether PostgreSQL's COPY FROM buffers rows for `table` (`CIM_MULTI`):
 /// no BEFORE or INSTEAD OF row INSERT trigger on it or a partition ancestor.
 fn copy_buffers_rows(storage: &Storage, table: usize, txid: u32) -> bool {
@@ -72418,6 +72411,10 @@ fn copy_buffers_rows(storage: &Storage, table: usize, txid: u32) -> bool {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "COPY shares the bounded INSERT trigger and constraint context"
+)]
 fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
     frame: &crate::sql::error_context::CopyFrame<'_>,
     storage: &mut Storage,

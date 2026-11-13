@@ -1153,7 +1153,6 @@ fn next_fragment(words: &[Word], start: &mut isize, end: &mut isize, max_words: 
     }
     if *end > i {
         *end = i;
-        i = *end;
         while i >= *start {
             *end = i;
             if interesting(&words[i as usize]) {

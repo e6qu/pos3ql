@@ -90435,10 +90435,17 @@ fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
     ));
     assert_eq!(rows, ["5|10|1|20|{1,2}|10|ready"]);
 
-    let rejected = run_with(&mut engine, &mut budget, "COPY copy_defaults FROM STDIN");
+    // `CopyGetAttnums`: a generated column takes no COPY data, so naming one
+    // fails at setup.
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY copy_defaults (input, doubled) FROM STDIN",
+    );
+    let rejected = String::from_utf8_lossy(&rejected);
     assert!(
-        String::from_utf8_lossy(&rejected).contains("428C9"),
-        "COPY targeting a generated column must fail at setup"
+        rejected.contains("42P10") && rejected.contains("is a generated column"),
+        "COPY naming a generated column must fail at setup: {rejected}"
     );
 }
 

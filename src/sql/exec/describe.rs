@@ -5031,8 +5031,11 @@ pub(crate) fn user_routine_call_result(
                         crate::sql::types::PseudoType::EventTrigger,
                     ),
                 ] {
-                    if let crate::storage::RoutineCallSelection::Stored(_) =
+                    // Selection ranks every non-procedure routine; only a
+                    // routine of the probed kind has this pseudo-type result.
+                    if let crate::storage::RoutineCallSelection::Stored(slot) =
                         storage.select_routine_call(name, &[], &[], false, txid, kind)
+                        && kind.accepts(storage.routine_for(slot, txid).kind)
                     {
                         return Some(crate::storage::RoutineResult {
                             ctype: ColType::Pseudo(pseudo),

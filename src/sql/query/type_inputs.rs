@@ -692,6 +692,45 @@ enum PlannerPass<'v, 'callback> {
     Capture(&'v mut PlannerVisit<'callback>),
 }
 
+/// The output list PostgreSQL's planner gives an `EXISTS` query it
+/// simplifies.
+const EXISTS_OUTPUT: [ast::SelectItem<'static>; 1] = [ast::SelectItem::Expr {
+    expression: &Expr::Int(1),
+    alias: None,
+}];
+
+/// Whether PostgreSQL's `simplify_EXISTS_query` replaces this `EXISTS`
+/// query's output list: a plain query without grouping, aggregates, window
+/// functions, set-returning output, set operations, `LIMIT` or `OFFSET`.
+fn exists_discards_output(select: &ast::Select<'_>, storage: &Storage, txid: u32) -> bool {
+    select.set_body.is_none()
+        && select.group_by.is_empty()
+        && select.having.is_none()
+        && select.limit.is_none()
+        && select.offset.is_none()
+        && select.locking.is_empty()
+        && select.items.iter().all(|item| match item {
+            ast::SelectItem::Expr { expression, .. } | ast::SelectItem::RecordStar(expression) => {
+                !super::expr_has_window(expression) && !contains_aggregate_call(expression)
+            }
+            ast::SelectItem::Wildcard(_) | ast::SelectItem::TableWildcard(_) => true,
+        })
+        && !super::srf::has_project_set(select.items, storage, txid)
+}
+
+/// Whether an expression calls an aggregate, outside its own subqueries.
+fn contains_aggregate_call(expression: &Expr<'_>) -> bool {
+    if expression.is_aggregate_use() {
+        return true;
+    }
+    let mut found = false;
+    let _ = super::walk_children(expression, &mut |child| {
+        found |= contains_aggregate_call(child);
+        Ok(())
+    });
+    found
+}
+
 struct Walker<'a, 'v, 'callback> {
     storage: &'a Storage,
     txid: u32,
@@ -1007,6 +1046,21 @@ impl<'storage, 'v, 'callback> Walker<'storage, 'v, 'callback> {
             }
         }
         match expression {
+            // PostgreSQL's planner discards a simple `EXISTS` query's output
+            // list before planning it, so its constants are never folded.
+            Expr::Exists(select)
+                if matches!(self.planner, PlannerPass::Capture(_))
+                    && exists_discards_output(select, self.storage, self.txid) =>
+            {
+                let simplified = self
+                    .arena
+                    .alloc(ast::Select {
+                        items: &EXISTS_OUTPUT,
+                        ..**select
+                    })
+                    .map_err(|_| super::arena_full())?;
+                return self.select(simplified, Some(row), None);
+            }
             Expr::Subquery(select)
             | Expr::Exists(select)
             | Expr::ArraySubquery(select)

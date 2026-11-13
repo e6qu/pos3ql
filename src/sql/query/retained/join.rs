@@ -429,6 +429,7 @@ pub(super) fn join_shape<'a>(
                     storage,
                     txid,
                     crate::sql::query::predicate_safety::AnalysisStage::RuntimeProjection,
+                    arena,
                 )?
                 .volatile
             {

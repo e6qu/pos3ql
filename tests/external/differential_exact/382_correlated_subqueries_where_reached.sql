@@ -1,0 +1,15 @@
+CREATE TABLE cwr_t(id int, k int);
+CREATE TABLE cwr_z(x int, y int);
+INSERT INTO cwr_t VALUES (1, 10), (2, 20), (3, 30);
+INSERT INTO cwr_z VALUES (1, 5), (2, 6), (3, 7);
+SELECT id, CASE WHEN id > 10 THEN (SELECT 1/(x - t.id) FROM cwr_z WHERE x = t.id) END FROM cwr_t t ORDER BY id;
+SELECT id, COALESCE(t.k, (SELECT 1/(x - t.id) FROM cwr_z WHERE x = t.id)) FROM cwr_t t ORDER BY id;
+SELECT id FROM cwr_t t WHERE id > 10 AND (SELECT 1/(x - t.id) FROM cwr_z WHERE x = t.id) > 0;
+SELECT id FROM cwr_t t WHERE id < 10 OR EXISTS (SELECT 1/(x - t.id) FROM cwr_z WHERE x = t.id);
+SELECT id, CASE WHEN id = 2 THEN (SELECT y FROM cwr_z WHERE x = t.id) ELSE -1 END FROM cwr_t t ORDER BY id DESC;
+SELECT k % 20, max(CASE WHEN id > 5 THEN (SELECT 1/(x - t.id) FROM cwr_z WHERE x = t.id) END) FROM cwr_t t GROUP BY 1 ORDER BY 1;
+SELECT id, sum(id) OVER (), CASE WHEN id > 5 THEN (SELECT 1/(x - t.id) FROM cwr_z WHERE x = t.id) END FROM cwr_t t ORDER BY id;
+SELECT id, (SELECT y FROM cwr_z WHERE x = t.id) FROM cwr_t t ORDER BY (SELECT y FROM cwr_z WHERE x = t.id) DESC;
+SELECT id, CASE WHEN id = 1 THEN (SELECT 1/(x - t.id) FROM cwr_z WHERE x = t.id) END FROM cwr_t t ORDER BY id;
+SELECT id, (SELECT CASE WHEN t.id > 9 THEN (SELECT 1/(z2.x - t.id) FROM cwr_z z2 WHERE z2.x = z.x) END FROM cwr_z z WHERE z.x = t.id) FROM cwr_t t ORDER BY id;
+SELECT k, (SELECT count(*) FROM cwr_z WHERE x <= max(t.id)) FROM cwr_t t GROUP BY k HAVING k < 15 OR (SELECT 1/(min(x) - 1) FROM cwr_z WHERE x = min(t.id)) > 0 ORDER BY k;

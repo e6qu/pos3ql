@@ -2227,10 +2227,11 @@ fn suspended_portals_hold_their_table_and_share_the_stream_slots() {
 fn buffered_paged_portals_name_portal_result_bytes_when_full() {
     let (mut fixture, mut conn, mut client, _, _) =
         stream_fixture(crate::config::TransactionMode::Mvcc, "paged-full");
-    // A subquery is not a retained shape: the paged portal buffers its result.
+    // A correlated subquery is not a retained shape: the paged portal
+    // buffers its result.
     let mut input = parse(
         "",
-        "SELECT id, payload FROM big WHERE id > (SELECT 0) ORDER BY id",
+        "SELECT id, payload FROM big WHERE EXISTS (SELECT 1 WHERE big.id > 0) ORDER BY id",
     );
     input.extend_from_slice(&bind("", ""));
     input.extend_from_slice(&execute("", 10));
@@ -2487,8 +2488,8 @@ fn streamed_copy_fails_after_delivered_rows_and_matches_unstreamed_output() {
         &mut conn,
         &mut fixture.engine,
         &mut client,
-        "COPY (SELECT payload, id FROM big WHERE id > (SELECT 0) ORDER BY id) \
-         TO STDOUT (FORMAT binary)",
+        "COPY (SELECT payload, id FROM big WHERE EXISTS (SELECT 1 WHERE big.id > 0) \
+         ORDER BY id) TO STDOUT (FORMAT binary)",
     );
     assert_eq!(
         fixture.engine.result_stream_metrics().spooled_shape,

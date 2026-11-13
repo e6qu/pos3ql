@@ -99,14 +99,25 @@ pub(crate) fn fold_aggregates<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     outer_arg: Option<&dyn ColumnLookup<'a>>,
+    // States initialized once per statement for these nodes, copied here.
+    prototypes: Option<&[AggState<'a>]>,
 ) -> Result<&'a mut [Datum<'a>], SqlError> {
     let states: &mut [AggState] = arena
         .alloc_slice_with(agg_nodes.len(), |_| AggState::default())
         .map_err(|_| arena_full())?;
-    for (i, (_, node)) in agg_nodes.iter().enumerate() {
-        let columns =
-            super::subquery::SubqueryColumns::of_scope(scope, outer_arg, storage, txid, arena);
-        states[i].init(node, storage, txid, &columns, arena)?;
+    match prototypes {
+        Some(prototypes) => {
+            for (state, prototype) in states.iter_mut().zip(prototypes) {
+                *state = prototype.fresh_copy(arena)?;
+            }
+        }
+        None => {
+            let columns =
+                super::subquery::SubqueryColumns::of_scope(scope, outer_arg, storage, txid, arena);
+            for (i, (_, node)) in agg_nodes.iter().enumerate() {
+                states[i].init(node, storage, txid, &columns, arena)?;
+            }
+        }
     }
     let recycling_safe = states[..agg_nodes.len()]
         .iter()
@@ -183,6 +194,10 @@ pub(crate) fn fold_aggregates<'a>(
 
 #[derive(Clone, Copy)]
 pub(crate) struct AggState<'a> {
+    /// When set, the buffers below and the values they hold live in this
+    /// arena's persistent tail, so a scan may reclaim each input row's
+    /// allocations once the row is folded in.
+    keep: Option<&'a Arena>,
     kind: AggKind,
     custom: Option<(i32, &'a crate::storage::AggregateRoutine)>,
     custom_moving: bool,
@@ -647,9 +662,79 @@ impl FixedWriter<'_> {
     }
 }
 
+/// The running values of an aggregate whose state [`AggState::holds_values_only`]:
+/// its best value and numeric sums, each encoded as a one-column projected
+/// row in a slot that is reused while the value fits and doubles otherwise.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct HeldValues([HeldValue; 3]);
+
+#[derive(Clone, Copy)]
+struct HeldValue {
+    bytes: *mut u8,
+    /// Encoded length, or `None` for no value.
+    len: Option<usize>,
+    capacity: usize,
+}
+
+impl Default for HeldValue {
+    fn default() -> Self {
+        Self {
+            bytes: core::ptr::null_mut(),
+            len: None,
+            capacity: 0,
+        }
+    }
+}
+
+impl HeldValue {
+    fn store(
+        &mut self,
+        value: Option<Datum<'_>>,
+        scratch: &Arena,
+        keep: &Arena,
+    ) -> Result<(), SqlError> {
+        let Some(value) = value else {
+            self.len = None;
+            return Ok(());
+        };
+        // Encode in scratch first: the value may have been decoded from
+        // this slot's own bytes.
+        let encoded = crate::sql::exec::encode_projected_pub(&[value], scratch)?;
+        if encoded.len() > self.capacity {
+            let capacity = encoded.len().max(self.capacity.saturating_mul(2));
+            let slot = keep
+                .alloc_persistent_slice_with(capacity, |_| 0u8)
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "an aggregate's running value exceeds the statement's memory"
+                    )
+                })?;
+            self.bytes = slot.as_mut_ptr();
+            self.capacity = capacity;
+        }
+        // SAFETY: the slot has `capacity` bytes in `keep`'s persistent tail,
+        // which outlives the scan; `encoded` is a distinct scratch extent.
+        unsafe { core::ptr::copy_nonoverlapping(encoded.as_ptr(), self.bytes, encoded.len()) };
+        self.len = Some(encoded.len());
+        Ok(())
+    }
+
+    fn load<'a>(&self, arena: &'a Arena) -> Result<Option<Datum<'a>>, SqlError> {
+        let Some(len) = self.len else {
+            return Ok(None);
+        };
+        // SAFETY: `store` wrote `len` encoded bytes to this persistent slot,
+        // and its arena outlives every evaluation that reads the value.
+        let encoded: &'a [u8] = unsafe { core::slice::from_raw_parts(self.bytes, len) };
+        crate::sql::exec::decode_projected_col_record(encoded, 0, arena).map(Some)
+    }
+}
+
 impl Default for AggState<'_> {
     fn default() -> Self {
         Self {
+            keep: None,
             kind: AggKind::Count,
             custom: None,
             custom_moving: false,
@@ -1027,6 +1112,132 @@ impl<'a> AggState<'a> {
         );
         self.custom_state_initialized = true;
         Ok(())
+    }
+
+    /// Keeps this state's buffers and buffered values in `keep`'s persistent
+    /// tail from now on (see [`Self::holds_values_only`]).
+    pub(crate) fn keep_buffers_in(&mut self, keep: &'a Arena) {
+        self.keep = Some(keep);
+    }
+
+    /// A buffer of `len` items: in the persistent tail when the state keeps
+    /// its buffers there, otherwise in `arena`.
+    fn alloc_buffer<T: Copy>(
+        &self,
+        arena: &'a Arena,
+        len: usize,
+        fill: impl FnMut(usize) -> T,
+    ) -> Result<&'a mut [T], SqlError> {
+        match self.keep {
+            Some(keep) => keep.alloc_persistent_slice_with(len, fill),
+            None => arena.alloc_slice_with(len, fill),
+        }
+        .map_err(|_| arena_full())
+    }
+
+    /// `bytes`, copied to the persistent tail when the state keeps its
+    /// buffers there.
+    fn kept_bytes(&self, bytes: &'a [u8]) -> Result<&'a [u8], SqlError> {
+        match self.keep {
+            Some(keep) => Ok(&*keep
+                .alloc_persistent_slice_with(bytes.len(), |index| bytes[index])
+                .map_err(|_| arena_full())?),
+            None => Ok(bytes),
+        }
+    }
+
+    /// Whether this state's running values are plain data plus at most the
+    /// values [`HeldValues`] keeps, once buffering states (`DISTINCT`, an
+    /// aggregate `ORDER BY`, collecting and ordered-set aggregates) keep their
+    /// buffers in the persistent tail ([`Self::keep_buffers_in`]). A
+    /// recycling scan may then reclaim each input row's allocations once
+    /// [`Self::hold`] has copied the running values out.
+    pub(crate) fn holds_values_only(&self, node: &Expr<'_>) -> bool {
+        if !matches!(node, Expr::Call { .. }) {
+            return false;
+        }
+        self.custom.is_none()
+            && (matches!(
+                self.kind,
+                AggKind::RangeAgg
+                    | AggKind::RangeIntersectAgg
+                    | AggKind::StringAgg
+                    | AggKind::ArrayAgg
+                    | AggKind::XmlAgg
+                    | AggKind::JsonAgg { .. }
+                    | AggKind::JsonObjectAgg { .. }
+                    | AggKind::PercentileCont
+                    | AggKind::PercentileDisc
+                    | AggKind::Mode
+                    | AggKind::Count
+                    | AggKind::Sum
+                    | AggKind::Avg
+                    | AggKind::Min
+                    | AggKind::Max
+                    | AggKind::BoolAnd
+                    | AggKind::BoolOr
+                    | AggKind::BitAnd
+                    | AggKind::BitOr
+                    | AggKind::BitXor
+                    | AggKind::VarPop
+                    | AggKind::VarSamp
+                    | AggKind::StddevPop
+                    | AggKind::StddevSamp
+            ) || self.kind.is_two_arg_stat())
+    }
+
+    /// Copies this state's arena-backed running values into `held`, whose
+    /// slots in `keep`'s persistent tail are reused while a value fits.
+    pub(crate) fn hold(
+        &self,
+        held: &mut HeldValues,
+        scratch: &Arena,
+        keep: &Arena,
+    ) -> Result<(), SqlError> {
+        let values = [
+            self.best,
+            self.sum_numeric.map(Datum::Numeric),
+            self.sum_sq_numeric.map(Datum::Numeric),
+        ];
+        for (slot, value) in held.0.iter_mut().zip(values) {
+            slot.store(value, scratch, keep)?;
+        }
+        Ok(())
+    }
+
+    /// Reads the running values [`Self::hold`] kept back into this state,
+    /// decoded in `arena`.
+    pub(crate) fn restore_held(
+        &mut self,
+        held: &HeldValues,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        let numeric = |value: Option<Datum<'a>>| match value {
+            None => Ok(None),
+            Some(Datum::Numeric(value)) => Ok(Some(value)),
+            Some(_) => Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a held numeric aggregate value changed type"
+            )),
+        };
+        self.best = held.0[0].load(arena)?;
+        self.sum_numeric = numeric(held.0[1].load(arena)?)?;
+        self.sum_sq_numeric = numeric(held.0[2].load(arena)?)?;
+        Ok(())
+    }
+
+    /// Whether a recycling scan may reclaim each input row's allocations
+    /// after this aggregate folds it: its running values are plain data, as
+    /// any layout [`Self::fixed_state`] saves other than a reference.
+    pub(crate) fn recycling_safe_for(
+        &self,
+        node: &Expr<'_>,
+        columns: &dyn crate::sql::exec::ColTypeResolver,
+    ) -> bool {
+        self.recycling_safe()
+            || self
+                .fixed_state(node, columns)
+                .is_some_and(|layout| layout != FixedState::Reference)
     }
 
     pub(crate) fn recycling_safe(&self) -> bool {
@@ -2585,7 +2796,7 @@ impl<'a> AggState<'a> {
         };
         // Stash the first delimiter so the DISTINCT/ORDER BY fold can reuse it.
         if self.sep.is_none() {
-            self.sep = Some(sep_bytes);
+            self.sep = Some(self.kept_bytes(sep_bytes)?);
         }
         if self.ordered {
             // Keep each row's delimiter with its value: PostgreSQL applies the
@@ -2641,9 +2852,7 @@ impl<'a> AggState<'a> {
                 self.ord_cap * 2
             };
             let empty: &[u8] = &[];
-            let fresh = arena
-                .alloc_slice_with(new_cap, |_| empty)
-                .map_err(|_| arena_full())?;
+            let fresh = self.alloc_buffer(arena, new_cap, |_| empty)?;
             if self.ord_len > 0 {
                 let old = unsafe { core::slice::from_raw_parts(self.ord, self.ord_len) };
                 fresh[..self.ord_len].copy_from_slice(old);
@@ -2651,6 +2860,7 @@ impl<'a> AggState<'a> {
             self.ord = fresh.as_mut_ptr();
             self.ord_cap = new_cap;
         }
+        let enc = self.kept_bytes(enc)?;
         unsafe { self.ord.add(self.ord_len).write(enc) };
         self.ord_len += 1;
         Ok(())
@@ -2684,9 +2894,7 @@ impl<'a> AggState<'a> {
             while new_cap < need {
                 new_cap *= 2;
             }
-            let fresh = arena
-                .alloc_slice_with(new_cap, |_| 0u8)
-                .map_err(|_| arena_full())?;
+            let fresh = self.alloc_buffer(arena, new_cap, |_| 0u8)?;
             if self.str_len > 0 {
                 let old = unsafe { core::slice::from_raw_parts(self.str_buf, self.str_len) };
                 fresh[..self.str_len].copy_from_slice(old);
@@ -2845,9 +3053,7 @@ impl<'a> AggState<'a> {
             } else {
                 self.vals_cap * 2
             };
-            let fresh = arena
-                .alloc_slice_with(new_cap, |_| Datum::Null)
-                .map_err(|_| arena_full())?;
+            let fresh = self.alloc_buffer(arena, new_cap, |_| Datum::Null)?;
             if self.vals_len > 0 {
                 let old = unsafe { core::slice::from_raw_parts(self.vals, self.vals_len) };
                 fresh[..self.vals_len].copy_from_slice(old);
@@ -2855,6 +3061,14 @@ impl<'a> AggState<'a> {
             self.vals = fresh.as_mut_ptr();
             self.vals_cap = new_cap;
         }
+        // A kept value is re-read from its own encoded copy, which borrows
+        // nothing from the row being folded.
+        let v = if self.keep.is_some() {
+            let encoded = self.kept_bytes(crate::sql::exec::encode_projected_pub(&[v], arena)?)?;
+            crate::sql::exec::decode_projected_pub(encoded, 0)
+        } else {
+            v
+        };
         unsafe { self.vals.add(self.vals_len).write(v) };
         self.vals_len += 1;
         Ok(())
@@ -2873,13 +3087,13 @@ impl<'a> AggState<'a> {
         }
         let vals = unsafe { core::slice::from_raw_parts_mut(self.vals, self.vals_len) };
         crate::util::try_sort_unstable_by(vals, |a, b| {
-            compare_datums_with_catalog(self.collation, catalog, a, b)
+            compare_distinct(self.collation, catalog, a, b)
         })?;
         let mut prev: Option<Datum<'a>> = None;
         for &v in vals.iter() {
             let fresh = match prev {
                 None => true,
-                Some(p) => !compare_datums_with_catalog(self.collation, catalog, &p, &v)?.is_eq(),
+                Some(p) => !compare_distinct(self.collation, catalog, &p, &v)?.is_eq(),
             };
             if fresh {
                 self.count += 1;
@@ -3459,6 +3673,16 @@ impl<'a> AggState<'a> {
         let text = arena
             .alloc_str_display(JsonObjectAggregateDisplay { pairs, jsonb })
             .map_err(|_| arena_full())?;
+        // A jsonb object sorts its keys and keeps the last value of a
+        // repeated key, as jsonb input does.
+        let text = if jsonb {
+            let tree = crate::sql::json::parse(text, arena)?;
+            arena
+                .alloc_str_display(crate::sql::json::JsonWrite(&tree))
+                .map_err(|_| arena_full())?
+        } else {
+            text
+        };
         Ok(Datum::Json { text, jsonb })
     }
 
@@ -3507,19 +3731,13 @@ impl<'a> AggState<'a> {
             crate::mem::arena::try_stable_sort_via(
                 arena,
                 vals,
-                |a, b| compare_datums_with_catalog(self.collation, catalog, a, b),
+                |a, b| compare_distinct(self.collation, catalog, a, b),
                 |_| arena_full(),
             )?;
             let mut unique = 0usize;
             for i in 0..vals.len() {
                 let same = i > 0
-                    && compare_datums_with_catalog(
-                        self.collation,
-                        catalog,
-                        &vals[i],
-                        &vals[i - 1],
-                    )?
-                    .is_eq();
+                    && compare_distinct(self.collation, catalog, &vals[i], &vals[i - 1])?.is_eq();
                 if !same {
                     vals[unique] = vals[i];
                     unique += 1;
@@ -3545,5 +3763,22 @@ impl core::fmt::Display for XmlAggregateDisplay<'_> {
             }
         }
         Ok(())
+    }
+}
+
+/// Orders an aggregate's `DISTINCT` values. NULLs, which `array_agg` and
+/// `json_agg` keep, are one value that sorts last, as PostgreSQL's sort
+/// places them.
+fn compare_distinct(
+    collation: Collation,
+    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    a: &Datum<'_>,
+    b: &Datum<'_>,
+) -> Result<core::cmp::Ordering, SqlError> {
+    match (a.is_null(), b.is_null()) {
+        (true, true) => Ok(core::cmp::Ordering::Equal),
+        (true, false) => Ok(core::cmp::Ordering::Greater),
+        (false, true) => Ok(core::cmp::Ordering::Less),
+        (false, false) => compare_datums_with_catalog(collation, catalog, a, b),
     }
 }

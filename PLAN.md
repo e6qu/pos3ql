@@ -109,7 +109,7 @@ is owned.
   restarts the statement. PL/pgSQL cursor reads (`OPEN`, `FETCH` and cursor
   `FOR` loops) read storage synchronously; their lock waits already park. A top-level `SELECT` that the retained reader cannot hold
   (`DISTINCT` over routine output, grouping sets, groupings whose keys or aggregate inputs call
-  routines, subqueries, sorts in object-store mode or over non-volatile
+  routines, correlated subqueries, sorts in object-store mode or over non-volatile
   routine output, joins it would probe through an index) restarts once for
   each first call of a SQL-language routine, so its work grows with the square
   of those calls; single-table, `VALUES` and `generate_series` sources,
@@ -206,28 +206,13 @@ is owned.
     index-probed joins, `RIGHT` and `FULL` joins of more than two items or
     over generator calls, grouping sets,
     subqueries other than the simple FROM subqueries merged into their query
-    and uncorrelated scalar, `EXISTS`, `ARRAY` and row subqueries of unsorted,
-    ungrouped streams (correlated ones, `IN`/`ANY`/`ALL` lists, subqueries
-    under a sort or grouping, grouped or bounded derived tables, and scans of
-    CTEs that run once). A correlated subquery is analysed again for each
-    outer row: the general executor resolves its FROM scope, aggregate calls
-    and output type, and evaluates its operators without binding them first
-    (about 1 ms per outer row for a 50-row inner scan in a debug build).
-    Binding the subquery once per statement and rewinding a retained child
-    tree per row removes that. These subquery behaviours were built on
-    per-statement initPlans and must be rebuilt on the deferred subqueries
-    that run where evaluation first reaches them: uncorrelated `IN`/`ANY`/
-    `ALL` lists that run at their first read (`WHERE id IN (SELECT 1/x
-    FROM z) AND false` returns no rows in PostgreSQL), also inside sorted
-    streams; `UPDATE`/`DELETE`/`INSERT ... SELECT` subqueries read as of
-    the statement and only when a row reaches them; a nested uncorrelated
-    subquery that runs once per statement and shares its slot across outer
-    rows (`(SELECT x + (SELECT nextval('s')) ...)` per row); correlated
-    scalar subqueries bound once per statement; aggregates of a scalar
-    subquery (`sum((SELECT v FROM u LIMIT 1))`, which fails with `42725`) and
-    held running aggregate values that do not keep each row's scratch; and
-    outer references through a subquery's `LIMIT` or `OFFSET` (`ARRAY(SELECT
-    w ... LIMIT t.id)`, `(SELECT array_agg(w) ... OFFSET t.id - 1)`),
+    and uncorrelated scalar, `EXISTS`, `ARRAY`, row and `IN`/`ANY`/`ALL`
+    subqueries of unsorted, sorted or grouped streams (correlated ones,
+    grouped or bounded derived tables, and scans of CTEs that run once). A
+    correlated subquery binds its result type, executor, aggregate calls,
+    row type or list collations once per statement, but still resolves its
+    FROM scope and evaluates its operators unbound each time a row reaches
+    it; rewinding a retained child tree per outer row removes that analysis,
     set operations other than `UNION ALL` (and `UNION ALL` under
     `ORDER BY`, in a declared cursor, or with volatile or routine-calling
     expressions), sorts in object-store mode (external runs
@@ -444,20 +429,7 @@ PostgreSQL's left-to-right analysis, so a parameter typed by one use and passed
 untyped to an `"any"` argument by another can be accepted where PostgreSQL
 reports `42P18`, and a user-defined polymorphic argument left untyped becomes
 `text` where PostgreSQL reports `42804`. 
-An aggregate in a subquery that reads only an outer query's columns
-belongs to that query, as in PostgreSQL, except through a subquery in `FROM`
-or a set operation, whose outer references fail as missing FROM-clause
-entries; a `UNION` subquery reading an outer column fails the same way, and a
-correlated `LIMIT` or `JOIN ... ON` inside a subquery cannot read an outer
-column. A subquery reading an aggregate of a query that also has window
-functions fails with `0A000`. An aggregate whose argument is a scalar subquery
-(`SELECT sum((SELECT v FROM u LIMIT 1)) FROM t`) fails with `42725`
-(`function sum is not unique`), and `CREATE VIEW` over a query with a
-correlated scalar subquery fails with `XX000` (`column dependency has no
-owning relation dependency`). An aggregate of an `UPDATE` or `DELETE`
-target in a subquery of its `WHERE` (`UPDATE t SET v = 2 WHERE (SELECT
-max(t.v) FROM u) > 0`) is not rejected with PostgreSQL's `aggregate functions
-are not allowed in WHERE`. A SQL function whose earlier
+A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final

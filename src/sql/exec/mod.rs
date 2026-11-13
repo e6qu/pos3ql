@@ -167,6 +167,17 @@ impl<'arena> DmlRowImages<'arena> {
         Ok(())
     }
 
+    /// The stored image kept for a local `row`, when its write needs one.
+    fn image(&self, row: PhysicalRow) -> Option<&'arena [u8]> {
+        let PhysicalRow::Local {
+            table_index, rowid, ..
+        } = row
+        else {
+            return None;
+        };
+        self.bytes(table_index, rowid).ok()
+    }
+
     /// The joined row kept for `row`, when the selection joined one.
     fn joined_bytes(&self, row: PhysicalRow) -> Option<&'arena [u8]> {
         let rows = self.joined.as_slice();
@@ -76643,6 +76654,22 @@ fn merge_target<'a>(
         Ok(leaves) => leaves,
         Err(error) => return sql_fail(error),
     };
+    // PostgreSQL's planner refuses a MERGE whose result relations include a
+    // foreign partition or child.
+    if !foreign_target
+        && let Some(&leaf) = leaves.iter().find(|&&leaf| {
+            storage.table_def(leaf, txn.txid).kind == crate::storage::TableKind::Foreign
+        })
+    {
+        return sql_fail(crate::sql::eval::with_detail(
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot execute MERGE on relation \"{}\"",
+                storage.table_def(leaf, txn.txid).name.as_str()
+            ),
+            format_args!("This operation is not supported for foreign tables."),
+        ));
+    }
     let mut n_target = 0usize;
     let mut foreign_rows: *mut Option<(crate::sql::foreign::RemoteTupleId, &'a [Datum<'a>])> =
         core::ptr::null_mut();
@@ -82703,7 +82730,6 @@ pub(crate) fn update<'a>(
                 statement.inheritance,
                 def,
                 statement.alias,
-                schema,
                 from,
                 statement.where_clause,
                 arena,
@@ -82724,7 +82750,6 @@ pub(crate) fn update<'a>(
                 statement.inheritance,
                 def,
                 statement.alias,
-                schema,
                 from,
                 statement.where_clause,
                 arena,
@@ -83756,7 +83781,7 @@ pub(crate) fn update<'a>(
             {
                 if let Err(error) = progress.interrupt_rows(
                     scratch,
-                    &|row| retained_rows.joined_bytes(row),
+                    &retained_rows,
                     [transition_capture.as_ref(), None, None],
                     &storage.row_work,
                 ) {
@@ -84094,7 +84119,6 @@ pub(crate) fn delete<'a>(
                 statement.inheritance,
                 def,
                 statement.alias,
-                schema,
                 using,
                 statement.where_clause,
                 arena,
@@ -84116,7 +84140,6 @@ pub(crate) fn delete<'a>(
                 statement.inheritance,
                 def,
                 statement.alias,
-                schema,
                 using,
                 statement.where_clause,
                 arena,
@@ -84644,7 +84667,7 @@ pub(crate) fn delete<'a>(
             {
                 if let Err(error) = progress.interrupt_rows(
                     scratch,
-                    &|row| retained_rows.joined_bytes(row),
+                    &retained_rows,
                     [transition_capture.as_ref(), None, None],
                     &storage.row_work,
                 ) {
@@ -92361,10 +92384,11 @@ fn dml_leaf_slots_for<'a>(
     Ok(&slots[..n])
 }
 
-/// The rows a resumed write over a foreign table continues with: the
-/// selection its interrupted attempt kept, with the joined `FROM` or `USING`
-/// rows. The remote session keeps the earlier rows' changes, so selecting
-/// again would find their new versions or miss them.
+/// The rows a resumed write over a foreign table, or over a hierarchy with
+/// foreign children, continues with: the selection its interrupted attempt
+/// kept, with the joined `FROM` or `USING` rows and the local rows' stored
+/// images. The remote session and the local rows keep the earlier rows'
+/// changes, so selecting again would find their new versions or miss them.
 fn resumed_foreign_matches<'a>(
     storage: &Storage,
     table_index: usize,
@@ -92375,12 +92399,35 @@ fn resumed_foreign_matches<'a>(
     scratch: &mut DmlScratch,
 ) -> Result<DmlRowImages<'a>, SqlError> {
     let def = (*storage.table_def(table_index, txid)).clone();
-    // Local rows of a mixed hierarchy would need their stored images.
-    if def.kind != crate::storage::TableKind::Foreign {
-        return Err(retained_progress_required());
-    }
     let mut images = DmlRowImages::new(arena);
-    images.capture_layout(table_index, &def, &def, capture, arena, storage, txid)?;
+    let mut stored = selection.images(arena)?.iter();
+    for row in selection.rows {
+        let (leaf, rowid) = match *row {
+            PhysicalRow::Local {
+                table_index, rowid, ..
+            } => (table_index, Some(rowid)),
+            PhysicalRow::Foreign { table_index, .. } => (table_index, None),
+        };
+        let physical = (*storage.table_def(leaf, txid)).clone();
+        images.capture_layout(leaf, &def, &physical, capture, arena, storage, txid)?;
+        if let Some(rowid) = rowid
+            && capture.needs_bytes(storage, table_index, leaf, txid)
+        {
+            let bytes = stored.next().ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "resumed DML row has no retained bytes"
+                )
+            })?;
+            images.push(leaf, rowid, retain_dml_bytes(arena, bytes)?)?;
+        }
+    }
+    if stored.next().is_some() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "resumed DML selection kept more row images than rows"
+        ));
+    }
     scratch.clear();
     scratch.extend_from_slice(selection.rows).map_err(|error| {
         sql_err!(
@@ -92398,6 +92445,57 @@ fn resumed_foreign_matches<'a>(
         }
     }
     images.finish()
+}
+
+/// Visits the remote rows of a foreign table that a write selects, alone or
+/// as a child of the target, with their values in the target's columns.
+#[expect(clippy::too_many_arguments, reason = "row pipeline plumbing")]
+fn visit_foreign_rows<'a>(
+    storage: &Storage,
+    table: usize,
+    layout: DmlTableLayout<'a>,
+    columns: usize,
+    txid: u32,
+    arena: &'a Arena,
+    sequences: Option<&dyn crate::sql::eval::SequenceAccess>,
+    visit: &mut impl FnMut(PhysicalRow, &[Datum<'a>]) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    crate::sql::foreign::visit_mutable_rows(
+        storage,
+        table,
+        txid,
+        arena,
+        &mut |tuple_id, row| {
+            let row = arena.alloc_slice_copy(row).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "foreign mutable-row scan exceeds the statement arena"
+                )
+            })?;
+            let mut physical = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(row, layout.schema, &mut physical)?;
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            layout.project(&physical, &mut values);
+            visit(
+                PhysicalRow::Foreign {
+                    table_index: table,
+                    tuple_id,
+                },
+                &values[..columns],
+            )
+        },
+        sequences,
+    )
+}
+
+fn push_selected(scratch: &mut DmlScratch, row: PhysicalRow) -> Result<(), SqlError> {
+    scratch.push(row).map_err(|error| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "statement row selection: {}",
+            error
+        )
+    })
 }
 
 #[expect(clippy::too_many_arguments, reason = "row pipeline plumbing")]
@@ -92421,56 +92519,10 @@ pub(super) fn collect_matches<'a>(
     scratch.clear();
     let mut images = DmlRowImages::new(arena);
     let def = (*storage.table_def(table_index, txid)).clone();
-    if def.kind == crate::storage::TableKind::Foreign {
-        images.capture_layout(table_index, &def, &def, capture, arena, storage, txid)?;
-        crate::sql::foreign::visit_mutable_rows(
-            storage,
-            table_index,
-            txid,
-            arena,
-            &mut |tuple_id, row| {
-                let row = arena.alloc_slice_copy(row).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "foreign mutable-row scan exceeds the statement arena"
-                    )
-                })?;
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(row, schema, &mut values)?;
-                if row_matches_values(
-                    storage,
-                    txid,
-                    &def,
-                    alias,
-                    &values,
-                    where_clause,
-                    arena,
-                    params,
-                    hooks,
-                    row_security,
-                    transition,
-                )? {
-                    scratch
-                        .push(PhysicalRow::Foreign {
-                            table_index,
-                            tuple_id,
-                        })
-                        .map_err(|error| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "statement row selection: {}",
-                                error
-                            )
-                        })?;
-                }
-                Ok(())
-            },
-            hooks.sequences,
-        )?;
-        scratch.sort_unstable_by_key(|row| row.sort_key());
-        return images.finish();
-    }
-    let indexed = if transition.is_none() && !storage.relation_has_descendants(table_index, txid) {
+    let indexed = if transition.is_none()
+        && def.kind != crate::storage::TableKind::Foreign
+        && !storage.relation_has_descendants(table_index, txid)
+    {
         super::query::dml_indexed_candidates(
             storage,
             table_index,
@@ -92486,6 +92538,39 @@ pub(super) fn collect_matches<'a>(
         None
     };
     for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
+        let physical = (*storage.table_def(leaf, txid)).clone();
+        if physical.kind == crate::storage::TableKind::Foreign {
+            let layout =
+                images.capture_layout(leaf, &def, &physical, capture, arena, storage, txid)?;
+            visit_foreign_rows(
+                storage,
+                leaf,
+                layout,
+                def.n_columns,
+                txid,
+                arena,
+                hooks.sequences,
+                &mut |row, values| {
+                    if row_matches_values(
+                        storage,
+                        txid,
+                        &def,
+                        alias,
+                        values,
+                        where_clause,
+                        arena,
+                        params,
+                        hooks,
+                        row_security,
+                        transition,
+                    )? {
+                        push_selected(scratch, row)?;
+                    }
+                    Ok(())
+                },
+            )?;
+            continue;
+        }
         storage.record_serializable_read(txid, leaf);
         let access = indexed.as_ref().filter(|_| leaf == table_index);
         if access.is_none_or(|access| access.scan_executed()) {
@@ -92497,7 +92582,6 @@ pub(super) fn collect_matches<'a>(
                 crate::sql::datetime::now_micros(),
             )?;
         }
-        let physical = (*storage.table_def(leaf, txid)).clone();
         let layout = images.capture_layout(leaf, &def, &physical, capture, arena, storage, txid)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
         let mut visit = |rowid, state: crate::storage::RowRead<'_>| {
@@ -92573,7 +92657,6 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
     inheritance: crate::sql::ast::RelationInheritance,
     def: &crate::storage::TableDefinition<Definition0>,
     alias: Option<&str>,
-    schema: &[ColType],
     from: &super::ast::FromClause<'a>,
     where_clause: Option<&Expr<'a>>,
     arena: &'a Arena,
@@ -92587,91 +92670,81 @@ fn collect_join_matches<'a, Definition0: crate::storage::DefinitionBacking>(
     let _snapshot = storage.dml_expression_snapshot(capture.command());
     scratch.clear();
     let mut images = DmlRowImages::new(arena);
-    if def.kind == crate::storage::TableKind::Foreign {
-        images.capture_layout(table_index, def, def, capture, arena, storage, txid)?;
-        crate::sql::foreign::visit_mutable_rows(
-            storage,
-            table_index,
-            txid,
-            arena,
-            &mut |tuple_id, row| {
-                let row = arena.alloc_slice_copy(row).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "foreign mutable-row scan exceeds the statement arena"
-                    )
-                })?;
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(row, schema, &mut values)?;
-                let context = RowCtx {
-                    def: crate::storage::RelationDefinition::from_definition(def),
-                    values: &values[..def.n_columns],
-                    alias,
-                };
-                if let Some(plan) = row_security
-                    && !super::query::row_security_passes(
-                        plan, &context, storage, txid, arena, params, hooks,
-                    )?
-                {
-                    return Ok(());
-                }
-                let row = PhysicalRow::Foreign {
-                    table_index,
-                    tuple_id,
-                };
-                let matched = if capture.retains_joined() {
-                    match super::query::joined_from_match(
-                        storage,
-                        from,
-                        txid,
-                        where_clause,
-                        arena,
-                        params,
-                        &context,
-                        None,
-                        arena,
-                    )? {
-                        Some(joined) => {
-                            images.push_joined(row, joined)?;
-                            true
-                        }
-                        None => false,
-                    }
-                } else {
-                    super::query::first_from_match(
-                        storage,
-                        from,
-                        txid,
-                        where_clause,
-                        &[],
-                        arena,
-                        params,
-                        &context,
-                        &mut |_| Ok(()),
-                        None,
-                        None,
-                    )?
-                };
-                if matched {
-                    scratch.push(row).map_err(|error| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "statement row selection: {}",
-                            error
-                        )
-                    })?;
-                }
-                Ok(())
-            },
-            hooks.sequences,
-        )?;
-        scratch.sort_unstable_by_key(|row| row.sort_key());
-        return images.finish();
-    }
     for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
+        let physical = (*storage.table_def(leaf, txid)).clone();
+        if physical.kind == crate::storage::TableKind::Foreign {
+            let layout =
+                images.capture_layout(leaf, def, &physical, capture, arena, storage, txid)?;
+            visit_foreign_rows(
+                storage,
+                leaf,
+                layout,
+                def.n_columns,
+                txid,
+                arena,
+                hooks.sequences,
+                &mut |row, values| {
+                    let context = RowCtx {
+                        def: crate::storage::RelationDefinition::from_definition(def),
+                        values,
+                        alias,
+                    };
+                    if let Some(plan) = row_security
+                        && !super::query::row_security_passes(
+                            plan, &context, storage, txid, arena, params, hooks,
+                        )?
+                    {
+                        return Ok(());
+                    }
+                    let matched = if capture.retains_joined() {
+                        match super::query::joined_from_match(
+                            storage,
+                            from,
+                            txid,
+                            where_clause,
+                            arena,
+                            params,
+                            &context,
+                            None,
+                            arena,
+                        )? {
+                            Some(joined) => {
+                                images.push_joined(row, joined)?;
+                                true
+                            }
+                            None => false,
+                        }
+                    } else {
+                        super::query::first_from_match(
+                            storage,
+                            from,
+                            txid,
+                            where_clause,
+                            &[],
+                            arena,
+                            params,
+                            &context,
+                            &mut |_| Ok(()),
+                            None,
+                            None,
+                        )?
+                    };
+                    if matched {
+                        scratch.push(row).map_err(|error| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "statement row selection: {}",
+                                error
+                            )
+                        })?;
+                    }
+                    Ok(())
+                },
+            )?;
+            continue;
+        }
         storage.record_serializable_read(txid, leaf);
         storage.record_relation_scan(txid, leaf, None, 0, crate::sql::datetime::now_micros())?;
-        let physical = (*storage.table_def(leaf, txid)).clone();
         let layout = images.capture_layout(leaf, def, &physical, capture, arena, storage, txid)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
         storage.for_each_row_state(
@@ -92778,7 +92851,6 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
     inheritance: crate::sql::ast::RelationInheritance,
     def: &crate::storage::TableDefinition<Definition0>,
     alias: Option<&str>,
-    schema: &[ColType],
     from: &super::ast::FromClause<'a>,
     where_clause: Option<&Expr<'a>>,
     arena: &'a Arena,
@@ -92793,95 +92865,85 @@ fn collect_join_matches_with_transition<'a, Definition0: crate::storage::Definit
     let _snapshot = storage.dml_expression_snapshot(capture.command());
     scratch.clear();
     let mut images = DmlRowImages::new(arena);
-    if def.kind == crate::storage::TableKind::Foreign {
-        images.capture_layout(table_index, def, def, capture, arena, storage, txid)?;
-        crate::sql::foreign::visit_mutable_rows(
-            storage,
-            table_index,
-            txid,
-            arena,
-            &mut |tuple_id, row| {
-                let row = arena.alloc_slice_copy(row).map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "foreign mutable-row scan exceeds the statement arena"
-                    )
-                })?;
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(row, schema, &mut values)?;
-                let context = RowCtx {
-                    def: crate::storage::RelationDefinition::from_definition(def),
-                    values: &values[..def.n_columns],
-                    alias,
-                };
-                if let Some(plan) = row_security
-                    && !super::query::row_security_passes(
-                        plan, &context, storage, txid, arena, params, hooks,
-                    )?
-                {
-                    return Ok(());
-                }
-                let scope = JoinedTriggerDmlScope {
-                    row: &context,
-                    outer,
-                };
-                let row = PhysicalRow::Foreign {
-                    table_index,
-                    tuple_id,
-                };
-                let matched = if capture.retains_joined() {
-                    match super::query::joined_from_match(
-                        storage,
-                        from,
-                        txid,
-                        where_clause,
-                        arena,
-                        params,
-                        &scope,
-                        None,
-                        arena,
-                    )? {
-                        Some(joined) => {
-                            images.push_joined(row, joined)?;
-                            true
-                        }
-                        None => false,
-                    }
-                } else {
-                    super::query::first_from_match(
-                        storage,
-                        from,
-                        txid,
-                        where_clause,
-                        &[],
-                        arena,
-                        params,
-                        &scope,
-                        &mut |_| Ok(()),
-                        None,
-                        None,
-                    )?
-                };
-                if matched {
-                    scratch.push(row).map_err(|error| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "statement row selection: {}",
-                            error
-                        )
-                    })?;
-                }
-                Ok(())
-            },
-            hooks.sequences,
-        )?;
-        scratch.sort_unstable_by_key(|row| row.sort_key());
-        return images.finish();
-    }
     for &leaf in dml_leaf_slots_for(storage, table_index, inheritance, txid, arena)? {
+        let physical = (*storage.table_def(leaf, txid)).clone();
+        if physical.kind == crate::storage::TableKind::Foreign {
+            let layout =
+                images.capture_layout(leaf, def, &physical, capture, arena, storage, txid)?;
+            visit_foreign_rows(
+                storage,
+                leaf,
+                layout,
+                def.n_columns,
+                txid,
+                arena,
+                hooks.sequences,
+                &mut |row, values| {
+                    let context = RowCtx {
+                        def: crate::storage::RelationDefinition::from_definition(def),
+                        values,
+                        alias,
+                    };
+                    if let Some(plan) = row_security
+                        && !super::query::row_security_passes(
+                            plan, &context, storage, txid, arena, params, hooks,
+                        )?
+                    {
+                        return Ok(());
+                    }
+                    let scope = JoinedTriggerDmlScope {
+                        row: &context,
+                        outer,
+                    };
+                    let matched = if capture.retains_joined() {
+                        match super::query::joined_from_match(
+                            storage,
+                            from,
+                            txid,
+                            where_clause,
+                            arena,
+                            params,
+                            &scope,
+                            None,
+                            arena,
+                        )? {
+                            Some(joined) => {
+                                images.push_joined(row, joined)?;
+                                true
+                            }
+                            None => false,
+                        }
+                    } else {
+                        super::query::first_from_match(
+                            storage,
+                            from,
+                            txid,
+                            where_clause,
+                            &[],
+                            arena,
+                            params,
+                            &scope,
+                            &mut |_| Ok(()),
+                            None,
+                            None,
+                        )?
+                    };
+                    if matched {
+                        scratch.push(row).map_err(|error| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "statement row selection: {}",
+                                error
+                            )
+                        })?;
+                    }
+                    Ok(())
+                },
+            )?;
+            continue;
+        }
         storage.record_serializable_read(txid, leaf);
         storage.record_relation_scan(txid, leaf, None, 0, crate::sql::datetime::now_micros())?;
-        let physical = (*storage.table_def(leaf, txid)).clone();
         let layout = images.capture_layout(leaf, def, &physical, capture, arena, storage, txid)?;
         let capture_bytes = capture.needs_bytes(storage, table_index, leaf, txid);
         storage.for_each_row_state(

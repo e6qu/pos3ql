@@ -7813,39 +7813,69 @@ fn scan_source_mode<'a>(
                     .stored(order[depth])
                     .expect("resolved logical relation");
                 for &leaf in &leaves[..n_leaves] {
-                    storage.record_relation_scan(
-                        txid,
-                        leaf,
-                        None,
-                        0,
-                        crate::sql::datetime::now_micros(),
-                    )?;
                     let physical = definitions.definition(storage, leaf, txid)?;
+                    let foreign = physical.kind == crate::storage::TableKind::Foreign;
+                    // PostgreSQL keeps no scan statistics for foreign tables.
+                    if !foreign {
+                        storage.record_relation_scan(
+                            txid,
+                            leaf,
+                            None,
+                            0,
+                            crate::sql::datetime::now_micros(),
+                        )?;
+                    }
                     let mapping = crate::storage::RelationColumnMap::new(logical, physical, arena)?;
                     let mut schema = [ColType::Bool; MAX_COLUMNS];
                     physical.schema(&mut schema);
                     let schema = &schema[..physical.n_columns];
-                    let scan = storage.captured_row_scan_in(leaf, txid, arena)?;
-                    let mut visit =
-                        |rowid, physical_values: &[Datum<'a>]| -> Result<bool, SqlError> {
-                            check_timeout()?;
+                    let mut visit = |rowid: Option<u64>,
+                                     physical_values: &[Datum<'a>]|
+                     -> Result<bool, SqlError> {
+                        check_timeout()?;
+                        if !foreign {
                             storage.record_relation_tuple_read(txid, leaf, None)?;
-                            let this = index;
-                            index += 1;
-                            recycled(arena, recycle_rows, retain_match, || {
-                                let values = arena
-                                    .alloc_slice_with(logical.n_columns, |_| Datum::Null)
-                                    .map_err(|_| arena_full())?;
-                                mapping.project(physical_values, values);
-                                refresh_catalog_object_names(storage, txid, values, arena)?;
-                                visit_candidate!(this, BoundRow::Values(values), Some(rowid))
-                            })
-                        };
+                        }
+                        let this = index;
+                        index += 1;
+                        recycled(arena, recycle_rows, retain_match, || {
+                            let values = arena
+                                .alloc_slice_with(logical.n_columns, |_| Datum::Null)
+                                .map_err(|_| arena_full())?;
+                            mapping.project(physical_values, values);
+                            refresh_catalog_object_names(storage, txid, values, arena)?;
+                            visit_candidate!(this, BoundRow::Values(values), rowid)
+                        })
+                    };
+                    // A foreign child's rows come from its server, as a
+                    // foreign table read on its own does.
+                    if foreign {
+                        let rows = crate::sql::foreign::materialize(
+                            storage,
+                            leaf,
+                            txid,
+                            arena,
+                            hooks.sequences,
+                        )?;
+                        for bytes in rows {
+                            let mut values = [Datum::Null; MAX_COLUMNS];
+                            let width = crate::sql::exec::decode_projected_row_into(
+                                bytes,
+                                arena,
+                                &mut values,
+                            )?;
+                            if !visit(None, &values[..width])? {
+                                return Ok(false);
+                            }
+                        }
+                        continue;
+                    }
+                    let scan = storage.captured_row_scan_in(leaf, txid, arena)?;
                     let flow = scan.for_each_overlay(&mut |rowid, home| {
                         let bytes = storage.row_bytes(leaf, rowid, home, arena)?;
                         let mut values = [Datum::Null; MAX_COLUMNS];
                         rowenc::decode(bytes, schema, &mut values)?;
-                        if !visit(rowid, &values[..physical.n_columns])? {
+                        if !visit(Some(rowid), &values[..physical.n_columns])? {
                             return Ok(core::ops::ControlFlow::Break(()));
                         }
                         Ok(core::ops::ControlFlow::Continue(()))
@@ -7863,7 +7893,7 @@ fn scan_source_mode<'a>(
                                 }
                                 crate::storage::SpilledRowRepresentation::Values(values) => values,
                             };
-                            if !visit(row.rowid, values)? {
+                            if !visit(Some(row.rowid), values)? {
                                 aborted = true;
                                 return Ok(core::ops::ControlFlow::Break(()));
                             }

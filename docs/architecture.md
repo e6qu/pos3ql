@@ -194,12 +194,12 @@ A multi-step statement inside another's step (a rule action whose target
 has rules of its own) keeps its steps one level deeper, up to
 `write_step_levels` levels (4 by default);
 a step that is resumed keeps the effects of the calls that ran before it
-resumed. A write to a foreign table keeps its selected remote rows (and
-their joined `FROM` or `USING` rows) instead of selecting them again, since
-the remote session keeps the earlier rows' changes. Where a write cannot
-keep its rows (a partitioned or inherited table mixing local and foreign
-children, or a step that changed rows without row progress), a call after
-its first change
+resumed. A write to a foreign table, or to a partitioned or inherited table
+with foreign children, keeps its selected rows (with the local rows' stored
+images and the joined `FROM` or `USING` rows) instead of selecting them
+again, since the remote session keeps the earlier rows' changes. Where a
+write cannot keep its rows (a step that changed rows without row progress),
+a call after its first change
 fails with `0A000` instead of running after a rollback that would hide
 those changes; one level deeper than `write_step_levels` it fails with
 `54000`, naming the setting. Writes that rules rewrite into
@@ -745,8 +745,7 @@ Further rules that apply to every saved owner:
 - **Unsupported restarts fail loudly.** A path that cannot save its progress
   returns `0A000` and rolls back rather than repeat a write — for example
   `SQL row expression requires retained write progress` for a routine call
-  after a SQL-language function's `MERGE` or data-modifying `WITH`, or an
-  `UPDATE` or `DELETE` of a table mixing local and foreign children, changed
+  after a SQL-language function's `MERGE` or data-modifying `WITH` changed
   rows; or an unsaved volatile
   value such as `random()`. Contexts with no resumable executor reject advisory
   unlocks with `0A000`.

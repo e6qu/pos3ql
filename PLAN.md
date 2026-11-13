@@ -157,11 +157,10 @@ is owned.
   triggers read synchronously. A routine call inside the rows
   keeps the changed rows (row progress), also for views and rules written
   from PL/pgSQL and SQL-language bodies, and for foreign tables, which keep
-  their selected remote rows. Extend row progress to `UPDATE` and `DELETE`
-  of a table mixing local and foreign children (the local rows' images
-  would have to be kept with the remote selection) and to data-modifying
-  `WITH` inside routine bodies: a routine call after their first row change
-  fails with `0A000`
+  their selected remote rows, also beside the local rows' stored images of
+  a table mixing local and foreign children. Extend row progress to
+  data-modifying `WITH` inside routine bodies: a routine call after their
+  first row change fails with `0A000`
   (`SQL row expression requires retained write progress`), because
   restarting would hide the earlier rows from the call. Multi-step
   statements nested deeper than `write_step_levels` fail the same way with

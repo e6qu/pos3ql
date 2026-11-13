@@ -95,6 +95,10 @@ struct SavedSelection {
     rows: crate::mem::lease_pool::MutableSlice<PhysicalRow>,
     /// Each row's joined `FROM` or `USING` row, in selection order.
     joined: Option<transition_rows::SavedTransitionRows>,
+    /// The stored images of the local rows of a hierarchy that mixes local
+    /// and foreign children, in selection order: selecting them again would
+    /// find the earlier rows' new versions.
+    images: Option<transition_rows::SavedTransitionRows>,
 }
 
 /// A selection an interrupted attempt kept for the next one.
@@ -102,6 +106,7 @@ struct SavedSelection {
 pub(super) struct KeptSelection<'p> {
     pub(super) rows: &'p [PhysicalRow],
     joined: Option<&'p transition_rows::SavedTransitionRows>,
+    images: Option<&'p transition_rows::SavedTransitionRows>,
 }
 
 impl<'p> KeptSelection<'p> {
@@ -116,6 +121,17 @@ impl<'p> KeptSelection<'p> {
         self.joined
             .map(|joined| joined.restore(arena).map(|rows| rows.old))
             .transpose()
+    }
+
+    /// The local rows' stored images, in selection order, decoded in `arena`.
+    pub(super) fn images<'out>(self, arena: &'out Arena) -> Result<&'out [&'out [u8]], SqlError>
+    where
+        'p: 'out,
+    {
+        Ok(match self.images {
+            Some(images) => images.restore(arena)?.old,
+            None => &[],
+        })
     }
 }
 
@@ -978,11 +994,12 @@ impl RowProgress {
     }
 
     /// [`Self::interrupt`] for a write over stored rows: a selection of
-    /// foreign rows is kept for the next attempt.
-    pub(super) fn interrupt_rows<'r>(
+    /// foreign rows is kept for the next attempt, with the stored images of
+    /// any local rows beside them.
+    pub(super) fn interrupt_rows(
         &mut self,
         selection: &[PhysicalRow],
-        joined: &dyn Fn(PhysicalRow) -> Option<&'r [u8]>,
+        selected: &DmlRowImages<'_>,
         captures: [Option<&TransitionCapture<'_>>; CAPTURES],
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<(), SqlError> {
@@ -1002,6 +1019,7 @@ impl RowProgress {
             };
             let mut rows = pool.lease::<PhysicalRow>(selection.len()).map_err(full)?;
             rows.extend_from_slice(selection).map_err(full)?;
+            let joined = |row| selected.joined_bytes(row);
             let joined = if selection.first().is_some_and(|row| joined(*row).is_some()) {
                 let mut kept = pool.lease::<&[u8]>(selection.len()).map_err(full)?;
                 for row in selection {
@@ -1023,7 +1041,29 @@ impl RowProgress {
             } else {
                 None
             };
-            Some(SavedSelection { rows, joined })
+            let mut local = selection.iter().filter_map(|row| selected.image(*row));
+            let images = match local.next() {
+                Some(first) => {
+                    let mut kept = pool.lease::<&[u8]>(selection.len()).map_err(full)?;
+                    kept.push(first).map_err(full)?;
+                    for image in local {
+                        kept.push(image).map_err(full)?;
+                    }
+                    Some(transition_rows::SavedTransitionRows::capture(
+                        TransitionRows {
+                            old: &kept,
+                            new: &[],
+                        },
+                        pool,
+                    )?)
+                }
+                None => None,
+            };
+            Some(SavedSelection {
+                rows,
+                joined,
+                images,
+            })
         } else {
             None
         };
@@ -1078,6 +1118,7 @@ impl RowProgress {
             .map(|selection| KeptSelection {
                 rows: &selection.rows,
                 joined: selection.joined.as_ref(),
+                images: selection.images.as_ref(),
             })
     }
 

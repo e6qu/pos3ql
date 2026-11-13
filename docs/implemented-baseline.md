@@ -135,6 +135,13 @@ key check that waited for its parent row fails the same way under `READ
 COMMITTED`. The move is recorded in the journal, so a prepared transaction's
 move still fails waiting statements after a restart.
 
+A partitioned or inherited table with foreign children reads their remote
+rows with its local ones, and `UPDATE` and `DELETE` change them there too: in
+`orders` partitioned with a foreign partition `orders_archive`, `SELECT *
+FROM orders` returns both partitions' rows. `MERGE` into such a table fails
+with PostgreSQL's `0A000` (`cannot execute MERGE on relation
+"orders_archive"`).
+
 Under `READ COMMITTED`, `SELECT ... FOR UPDATE` returns the locked row's latest
 version: the join conditions, `WHERE` and output list run again over it, while
 the other tables in the join keep the rows first read. For example, a job

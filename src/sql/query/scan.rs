@@ -5831,6 +5831,9 @@ enum KeyProbe<'a> {
         qualifier: Option<&'a str>,
         name: &'a str,
     },
+    /// A literal or a cast of one (`'t'::regclass`), evaluated once for the
+    /// scan instead of for each row the conjunct would otherwise filter.
+    Constant(&'a Expr<'a>),
 }
 
 /// Chooses a [`DerivedKeyPlan`] for execution position `depth`: the first
@@ -5899,6 +5902,19 @@ pub(crate) fn derived_key_plan<'a>(
                 column_def.collation,
             ));
         }
+        if let Expr::Cast { operand, .. } = expression
+            && matches!(operand, Expr::Str(_) | Expr::Int(_))
+        {
+            // Only a non-collatable type probes: the row filter still decides
+            // each candidate, and the key compares in the column's type.
+            let (oid, _) =
+                crate::sql::exec::infer_type_res(expression, &crate::sql::exec::NoCols).ok()?;
+            return Some((
+                KeyProbe::Constant(expression),
+                ColType::from_oid(oid)?,
+                Collation::None,
+            ));
+        }
         // An outer reference of a correlated subquery is a bare or
         // table-qualified column this scope cannot see.
         let Expr::Column { qualifier, name } = *expression else {
@@ -5934,7 +5950,7 @@ pub(crate) fn derived_key_plan<'a>(
                 (None, Some(column)) => (column, probe_key(left)?),
                 (None, None) => return None,
             };
-        if outer_only && !matches!(probe, KeyProbe::Outer { .. }) {
+        if outer_only && matches!(probe, KeyProbe::Source { .. }) {
             return None;
         }
         let build = &scope.defs.get(build_table)?.columns[build_column];
@@ -7958,6 +7974,22 @@ fn scan_source_mode<'a>(
                     KeyProbe::Outer { qualifier, name } => outer
                         .expect("outer probes are planned with an outer row")
                         .lookup(qualifier, name)?,
+                    KeyProbe::Constant(expression) => {
+                        let value = crate::sql::eval::eval_full(
+                            expression,
+                            arena,
+                            params,
+                            &NoColumns,
+                            hooks,
+                        )?;
+                        let ctype = scope
+                            .defs
+                            .get(order[depth])
+                            .expect("keyed source has a definition")
+                            .columns[plan.build_column]
+                            .ctype;
+                        crate::sql::eval::cast_to(value, ctype, arena)?
+                    }
                 };
                 DerivedKeyLookup::hash(plan, value, storage, txid)
             })?;

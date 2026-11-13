@@ -960,6 +960,35 @@ pub(crate) fn rewind_replay_cursor(start: Option<StatementReplayStart>) -> Resul
     })
 }
 
+/// Moves replay past the journal region a data-modifying `WITH` query's
+/// step consumed between `start` and `end`, when replay stands exactly at
+/// its start: a reader running again reads the step's row there, and the
+/// step's own values belong to the step, not to the reader.
+pub(crate) fn skip_replay_region(
+    start: Option<StatementReplayStart>,
+    end: StatementReplayCursor,
+) -> Result<(), SqlError> {
+    let at_start = with_statement_context(|context| {
+        let (Some(start), Some((arena, session))) = (start, context) else {
+            return if start.is_none() && context.is_none() {
+                Ok(false)
+            } else {
+                Err(replay_changed())
+            };
+        };
+        let replay = session.statement_replay.get();
+        validate_cursor(arena, replay, start)?;
+        Ok(
+            sequence_position(arena, replay, start.sequences)? == replay.next
+                && effect_position(arena, replay, start.effects)? == replay.effects_next,
+        )
+    })?;
+    if at_start {
+        restore_replay_cursor(end, ReplayInputPosition::KeepConsumed)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum ReplayInputPosition {
     RecordedEnd,

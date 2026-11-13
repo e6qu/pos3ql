@@ -235,11 +235,25 @@ source reading its own target sees none of the new rows, as in PostgreSQL.
 Its reads keep no invocation-log receipts. A restarted attempt reads the
 source again and skips, by count, the rows earlier attempts wrote; the
 source reads the same rows each time, so the count finds the unfinished
-row. Any other source materializes first, in the work arena, where a
-source larger than the arena fails with `54000`; an output item there that
-calls a volatile user routine is split so that the source reads only its
-other parts, and the row phase runs the calls as each row is inserted, as
-PostgreSQL computes its output list.
+row. A source whose volatile built-in calls are all in its output list,
+without ordering, grouping, `DISTINCT`, windows, set operations or row
+locking, is read by the engine one row at a time (`src/sql/driven_insert.rs`):
+each row's output is evaluated as the row is read, then the row is written,
+as PostgreSQL's ModifyTable pulls it. The same reader runs an
+`INSERT ... SELECT` reading a data-modifying `WITH` query, also when its
+output calls user routines: the row's predicate and output share one
+invocation log, and when a call waits inside its body (a lock or a cold
+read) the write keeps that log in its progress (leased from
+`execution_control_bytes` only while the call waits) together with every
+effect before the wait; reading the row again replays the calls before it
+and continues that call where it waited, so each call runs once. A plain
+source that calls a user routine is not read this way, because the calls'
+results stay in the statement arena's retained tail until the statement
+ends. Any other source materializes first, in the work
+arena, where a source larger than the arena fails with `54000`; an output
+item there that calls a volatile user routine is split so that the source
+reads only its other parts, and the row phase runs the calls as each row is
+inserted, as PostgreSQL computes its output list.
 
 **Example:** `UPDATE items SET total = running_total()`, where
 `running_total()` sums `items`, gives each row the sum including the rows
@@ -392,7 +406,8 @@ BY id` sorts first, so its output queues in the spool instead.
 | A write's row after an effect a rerun would not repeat, or every row when such an effect ran in its scan | Blocks until the next step's rows or the statement's end |
 | A top-level write's `AFTER ROW` events, immediate constraint checks and `AFTER STATEMENT` triggers | Yields; finished events are kept (see above). An event's reads after its first effect block until that event ends |
 | A rule action's row selection after the rule's earlier steps, when their rows could resume | Yields; the step rolls back to its start and the finished steps are kept |
-| A data-modifying `WITH` main statement's row selection; `AFTER` triggers between the steps of a rule-rewritten write, and `AFTER` work of writes inside routine bodies | Blocks until the next step's rows or that work ends |
+| `AFTER` work of a top-level rule-rewritten write's steps | Yields; the step is kept finished, its finished events are kept, and the statement continues with the steps after it once that work ends |
+| A data-modifying `WITH` main statement's row selection; `AFTER` work of writes inside routine bodies | Blocks until the next step's rows or that work ends |
 | Routine calls inside a write's rows (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, rule actions, `INSTEAD OF` view triggers): row expressions, row triggers, `RETURNING`; `BEFORE` and `INSTEAD OF` trigger bodies that need the engine | Run on the engine between attempts; the write keeps its changed rows and finished steps and continues at the unfinished row (see above). A storage or lock wait inside the call restarts the whole statement |
 | DDL and `COPY FROM` | Blocks for the whole statement |
 | Top-level `CALL` and `DO` bodies: queries and write scans before the statement's first effect | Yields; the body resumes at its waiting statement |
@@ -735,62 +750,68 @@ outputs, as scrollable cursors over such shapes do now.
 
 ### Write sub-statements that run as their rows are read
 
-*Design; not yet implemented (see PLAN.md, write phases).* PostgreSQL runs a
-data-modifying `WITH` query, a rule's action and an `INSERT ... SELECT`
-source as plan nodes the consuming statement pulls rows from. pos3ql runs
-the first two to completion first, which orders their `AFTER` events before
-the consumer's; a repeatable `INSERT ... SELECT` source already streams (see
-[execution model](#execution-model)), and one with volatile or routine calls
-still materializes.
+PostgreSQL runs a data-modifying `WITH` query, a rule's action and an
+`INSERT ... SELECT` source as plan nodes the consuming statement pulls rows
+from, so their row triggers, calls and sequence values interleave with the
+consumer's and their `AFTER` events queue in that order. For example,
+`WITH w AS (INSERT INTO a ... RETURNING x) INSERT INTO b SELECT x FROM w`
+queues `a`'s row 1, `b`'s row 1, `a`'s row 2 and so on, and `a`'s statement
+event once `b` reads past `w`'s last row.
 
-Every `AFTER` event of the statement, its sub-statements' included, already
-fires at the statement's end in the order the events were queued, as
-PostgreSQL's `AfterTriggerEndQuery` fires them. What differs is the queue
-order and the order of volatile calls. For example, `WITH w AS (INSERT INTO
-a ... RETURNING x) INSERT INTO b SELECT x FROM w` queues `a`'s row 1, `b`'s
-row 1, `a`'s row 2 and so on in PostgreSQL, and `a`'s statement event before
-`b`'s; pos3ql queues all of `a`'s events first. A data-modifying query that
-nothing reads already runs after the main statement, last one first, and
-its events already follow the main statement's.
+**Built: `WITH` inserts read row by row.** A data-modifying `WITH` query is
+bound as a relation whose rows live with the statement's invocation log
+(`WriteProducer` in `src/sql/query/mod.rs`). A reader that pulls rows one at
+a time reads it through a retained scan node (`RetainedSource::Produced`):
+a row past those the query returned makes the query's next step the
+attempt's pending call, which the engine runs between the reader's rows, and
+the same read runs again. A step of an `INSERT ... SELECT` reads its source
+through a retained reader the engine drives (`src/sql/driven_insert.rs`): a
+call in the source hands off on its row, a `WITH` query the source reads
+runs its own step in place, and each row is written by its own call of the
+insert (`InsertSource::Produced`), whose row progress keeps the write's
+counters, transition rows and `RETURNING` stage between rows. The step ends
+at the start of the row after one that returned a row, before that row
+reads its source, as ModifyTable returns each row first. An
+`INSERT ... VALUES` step evaluates each row as it writes it and skips
+earlier rows by index. The reader and the analysed statement live in a
+512 KiB block of the statement arena's persistent tail, so a step re-reads
+nothing; what a step analysed or read for an attempt is reclaimed, so the
+statement's memory does not grow with the rows. Each step's sequence and
+statement-effect journal region is kept with its row: a reader that reads
+the row again at the region's start replays past it.
 
-- **Producer nodes.** A data-modifying `WITH` query becomes a retained plan
-  node (see [retained plan tree](#retained-plan-tree)) whose step writes one
-  source row and yields its `RETURNING` row. The consumer pulls it like a
-  scan; an unreferenced query is drained after the main statement, last one
-  first, as PostgreSQL's `ExecPostprocessPlan` does. An `INSERT ... SELECT`
-  source with volatile or routine calls reads through the same node
-  interface instead of materializing, once it keeps its own invocation log
-  and sequence replay cursor. The
-  two go together: a write that consumes a producer only interleaves with
-  it once it pulls one source row per row it writes.
-- **Retained selections.** A producer's step cannot select its rows again
-  for every row it yields: under the restart model that costs one full
-  selection per produced row. Its scan is itself a retained node (the same
-  cursor-mode reader result streams use), and the write keeps the node's
-  position with its row progress, as a foreign table's write already keeps
-  its selected remote rows.
-- **Event order.** Each producer queues its `AFTER ROW` events in the
-  existing spilling event log as its rows are written, tagged with the
-  statement's depth and command, so they interleave with the consumer's in
-  PostgreSQL's order. Statement-level events stay queued at the producer's
-  end. No new memory class is needed: the log already spills to
-  `trigger_event_spill_bytes`.
-- **Separate logs per producer.** A wait or a routine call restarts the
-  statement at the unfinished row. Each producer keeps its own row progress
-  (changed rows, as for a top-level write) and its own routine invocation
-  log, so a restart replays neither another producer's calls nor its rows;
-  the consumer's progress records which producer row it last consumed.
-  Producers count against `write_step_levels`, and exhaustion stays the named
-  `54000`. The invocation log replays calls by position, so a source read
-  again after a restart replays its own log: sharing the write's log would
-  shift every later call once skipped rows stop evaluating theirs.
-- **Rule steps.** A rule action's AFTER work runs from the same completion
-  cursor as a top-level write's, so it yields instead of reading
-  synchronously. The suspended completion returns to the statement's
-  attempt loop, which records the step finished with its outputs (the step
-  progress a routine call already keeps) and starts another attempt; that
-  attempt skips the finished steps and runs the next one. (Foreign-table writes already keep their selected remote
-  rows across routine calls; see [execution model](#execution-model).)
+The readers that pull row by row are a `SELECT` whose single `FROM` item is
+such a query (or a `UNION ALL` of such `SELECT`s, read one after another),
+run by retained readers whose calls hand off on their row; an
+`INSERT ... SELECT` step reading another; and a top-level `INSERT ... SELECT`
+reading one, which the engine drives the same way. After the main query,
+every data-modifying query runs to its end, last one first, as PostgreSQL's
+`ExecPostprocessPlan` does. A `SELECT` reader without calls reads row by
+row too when that is visible (a `LIMIT` or `OFFSET`, or a `UNION ALL` of
+several readers), so a query read only partly finishes after the queries
+nothing read; otherwise it reads the queries whole, which needs less
+memory and leaves the same effects in the same order. An `UPDATE`, `DELETE` or `MERGE` query's step ends at the start
+of the row after one that returned a row, as an `INSERT ... VALUES` step
+does; its row progress keeps the selected rows, so the next step continues
+at that row. A sort, aggregate or window reader reads its whole input first,
+as PostgreSQL's does. A join reader reads the query whole at its first read,
+which matches PostgreSQL only when its plan hashes the query. A wait inside a step
+runs the statement again from its first start: the main write's row
+progress would otherwise roll back over the step's rows.
+
+**Built: rule steps.** A step of a top-level rule-rewritten write (the
+original statement or an action) runs under a completion boundary of its own
+command, so its `AFTER` work runs from the same completion cursor as a
+top-level write's and yields instead of reading synchronously. The
+completion records that it belongs to a step: the innermost rule loop marks
+the step finished with the write's row count, the completion replies with
+that count only, and the statement's attempt loop runs the `AFTER` work
+(retaining the write across a wait in it), then starts another attempt that
+skips the finished steps and replays from that point on. That point covers
+both invocation logs (routine results and the saved inputs of calls, which
+carry the result position after them) and the sequence replay; a level's
+last finished step records it, so skipping that step, also inside an outer
+step that resumes from its own start, continues past its calls.
 
 ### How saved state is owned
 

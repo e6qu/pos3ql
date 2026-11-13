@@ -194,7 +194,13 @@ is owned.
   read row by row re-reads nothing between steps: its reader and analysed
   statement stay in a 512 KiB block of the statement arena's persistent
   tail. A PL/pgSQL `WITH ... INSERT/UPDATE/DELETE` statement fails with
-  `0A000`.
+  `0A000`. The check that a data-modifying `WITH` query's rules leave
+  exactly one statement (its `RETURNING` check first, then the first
+  offending rule in name order) counts each rule action as one statement;
+  PostgreSQL rewrites the actions with their own targets' rules first, so an
+  action into a table with `DO INSTEAD NOTHING` leaves none there. Matching
+  it needs each stored action parsed under its rule's creation path to find
+  its target and event.
 - **Routine variables in `WITH`:** the `WITH` queries of a PL/pgSQL
   `RETURN QUERY`, `SELECT ... INTO`, `PERFORM` or `FOR` query read the
   routine's variables, materialized or not, but three other `WITH` positions

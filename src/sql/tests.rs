@@ -6517,6 +6517,7 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
     assert_eq!(
         Engine::extra_budget_bytes(&config) - Engine::extra_budget_bytes(&one),
         2 * (config.work_arena_bytes
+            + config.catalog_image_bytes
             + crate::storage::RowCursorBuffers::allocation_bytes(&config)
             + core::mem::size_of::<QueryWorkspace>()
             + dml_workspace_bytes)
@@ -6527,6 +6528,7 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
     );
     let bytes = config.query_workspace_slots
         * (config.work_arena_bytes
+            + config.catalog_image_bytes
             + crate::storage::RowCursorBuffers::allocation_bytes(&config)
             + core::mem::size_of::<QueryWorkspace>());
     let mut budget = Budget::new(bytes);

@@ -353,6 +353,9 @@ struct QueryWorkspaces {
 
 struct QueryWorkspace {
     arena: Arena,
+    /// Images of the catalog relations a statement reads under its catalog
+    /// snapshot; reset when a top-level statement starts.
+    catalog_images: Arena,
     row_cursor_buffers: crate::storage::RowCursorBuffers,
     connection_id: i32,
     database_oid: crate::storage::DatabaseOid,
@@ -433,6 +436,11 @@ impl QueryWorkspaces {
             slots
                 .push(QueryWorkspace {
                     arena: Arena::new(budget, "query_workspace_arena", config.work_arena_bytes)?,
+                    catalog_images: Arena::new(
+                        budget,
+                        "catalog_image_arena",
+                        config.catalog_image_bytes,
+                    )?,
                     row_cursor_buffers: crate::storage::RowCursorBuffers::new(config, budget)?,
                     connection_id: 0,
                     database_oid: crate::storage::DatabaseOid::POSTGRES,
@@ -471,6 +479,17 @@ impl QueryWorkspaces {
     fn database_oid(&self) -> crate::storage::DatabaseOid {
         self.slots[execution_query_workspace().index()].database_oid
     }
+    /// The selected workspace's statement catalog image arena.
+    fn catalog_images(&self) -> &Arena {
+        &self.slots[execution_query_workspace().index()].catalog_images
+    }
+
+    fn reset_catalog_images(&mut self) {
+        self.slots[execution_query_workspace().index()]
+            .catalog_images
+            .reset();
+    }
+
     fn cursor_parts(&mut self) -> (&Arena, &mut crate::storage::RowCursorBuffers) {
         let workspace = &mut self.slots[execution_query_workspace().index()];
         (&workspace.arena, &mut workspace.row_cursor_buffers)
@@ -4726,6 +4745,7 @@ impl Engine {
             config.query_workspace_slots.saturating_mul(
                 config
                     .work_arena_bytes
+                    .saturating_add(config.catalog_image_bytes)
                     .saturating_add(crate::storage::RowCursorBuffers::allocation_bytes(config))
                     .saturating_add(size_of::<QueryWorkspace>()),
             ),
@@ -17454,6 +17474,15 @@ impl Engine {
             &mut cursor::CursorPool,
         ) -> Result<T, SqlError>,
     ) -> Result<Result<T, SqlError>, WireFull> {
+        // A volatile routine's statement reads the catalog as it is now.
+        let _fresh_catalog_reads = if source_snapshot == crate::storage::SNAPSHOT_ALL {
+            match query::enter_fresh_catalog_reads() {
+                Ok(scope) => Some(scope),
+                Err(error) => return Ok(Err(error)),
+            }
+        } else {
+            None
+        };
         let saved = continuation.as_deref_mut().and_then(Option::take);
         let resumed = saved.is_some();
         let owner = if resumed {
@@ -21069,6 +21098,11 @@ impl Engine {
         let _active_cursors = cursor::enter_active(cursors as *mut _ as *const _);
         let _active_prepared = prep::enter_active(sqlprep as *mut _ as *const _);
         let index_statement = concurrent_index::Kind::for_statement(statement).is_some();
+        // The statement's own catalog scans read the catalog as it begins.
+        let _catalog_snapshot = match query::enter_catalog_snapshot(self.work.catalog_images()) {
+            Ok(scope) => scope,
+            Err(error) => return Ok(Err(error)),
+        };
         let mut result = loop {
             if let Some(command) = &txn.concurrent_index
                 && let Some(cursor) = command.replay
@@ -21466,6 +21500,7 @@ impl Engine {
         // materialized state alive until evaluation returns.
         if reset_workspace {
             self.work.reset();
+            self.work.reset_catalog_images();
         }
         if let Err(error) = self.refresh_prepared_transaction_catalog() {
             return Ok(Err(error));
@@ -21588,20 +21623,32 @@ impl Engine {
             Ok(lease) => lease,
             Err(error) => return Ok(Err(error)),
         };
-        let result = self.execute_stmt_with_snapshot(
+        // Built under the statement's session context and snapshot, before
+        // it runs; the execution arena is only their scratch space.
+        let prebuilt = query::prebuild_statement_catalog_images(
             statement,
-            arena,
-            params,
-            txn,
-            sqlprep,
-            cursors,
-            guc,
-            routine_transaction_context,
-            responder,
-            reset_workspace,
-            capture,
-            &mut snapshot.lease,
+            &self.storage,
+            txn.txid,
+            &self.work,
         );
+        let result = if let Err(error) = prebuilt {
+            Ok(Err(error))
+        } else {
+            self.execute_stmt_with_snapshot(
+                statement,
+                arena,
+                params,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                routine_transaction_context,
+                responder,
+                reset_workspace,
+                capture,
+                &mut snapshot.lease,
+            )
+        };
         if reset_workspace
             && matches!(&result, Ok(Err(error)) if
                 error.sqlstate == sqlstate::INTERNAL_IO_WAIT

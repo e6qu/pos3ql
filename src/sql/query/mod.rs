@@ -85,6 +85,10 @@ pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 mod catalog_images;
 #[cfg(test)]
 pub(crate) use catalog_images::IMAGE_BUILDS;
+pub(crate) use catalog_images::{
+    enter_fresh as enter_fresh_catalog_reads, enter_statement as enter_catalog_snapshot,
+};
+pub(crate) use scope::prebuild_statement_catalog_images;
 mod cte;
 pub(crate) use cte::captured_type_oid;
 pub(crate) use cte::{CteReader, dml_cte_runs_after, select_relations, set_query_relations};
@@ -10407,12 +10411,18 @@ fn collect_grouped_aggs<'a>(
     }
     if is_sublink(e) {
         // The window layer evaluates subqueries above the grouped derived
-        // table, where an aggregate this query owns has no group to read.
-        aggregate_levels::visit_owned_outer_aggregates(e, &mut |_| {
-            Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "a subquery reading an aggregate of a query with window functions is not supported"
-            ))
+        // table: an aggregate this query owns is folded there, and the
+        // subquery reads it as that table's column.
+        aggregate_levels::visit_owned_outer_aggregates(e, &mut |call| {
+            if !out
+                .as_slice()
+                .iter()
+                .any(|(node, _)| core::ptr::eq(*node, call))
+            {
+                out.push((call as *const _, call))
+                    .map_err(|_| arena_full())?;
+            }
+            Ok(())
         })?;
     }
     walk_children(e, &mut |child| {
@@ -10430,6 +10440,41 @@ struct GroupedRewrite<'a, 's> {
     /// The source scope, to distinguish an unknown column (42703) from a
     /// known-but-ungrouped one (42803), as PostgreSQL.
     scope: Option<&'s QueryScope<'a>>,
+}
+
+/// The alias of a grouped window query's grouped derived table.
+pub(super) const GROUPED_WINDOW_SOURCE: &str = "?grouped";
+
+/// A subquery of a grouped window query reads the aggregates the query owns
+/// as columns of its grouped derived table.
+fn rewrite_owned_sublink_aggregates<'a>(
+    e: &'a Expr<'a>,
+    context: &GroupedRewrite<'a, '_>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    let replace = |call: &'a Expr<'a>| -> Option<&'a Expr<'a>> {
+        let index = context
+            .aggs
+            .iter()
+            .position(|(node, _)| core::ptr::eq(*node, call))?;
+        arena
+            .alloc(Expr::Column {
+                qualifier: Some(GROUPED_WINDOW_SOURCE),
+                name: context.agg_names[index],
+            })
+            .ok()
+            .map(|column| &*column)
+    };
+    let rewritten = aggregate_levels::replace_owned_outer_aggregates(e, arena, &replace)?;
+    let mut remaining = false;
+    aggregate_levels::visit_owned_outer_aggregates(rewritten, &mut |_| {
+        remaining = true;
+        Ok(())
+    })?;
+    if remaining {
+        return Err(arena_full());
+    }
+    Ok(rewritten)
 }
 
 /// Rewrites an outer-select expression of a grouped window query: aggregate
@@ -10488,7 +10533,7 @@ fn rewrite_grouped_expr<'a>(
         | Expr::Subquery(_)
         | Expr::RowSubquery { .. }
         | Expr::Exists(_)
-        | Expr::ArraySubquery(_) => Ok(e),
+        | Expr::ArraySubquery(_) => rewrite_owned_sublink_aggregates(e, context, arena),
         Expr::RoutineParam {
             qualifier, name, ..
         } => {
@@ -10669,22 +10714,30 @@ fn rewrite_grouped_expr<'a>(
                 filter,
             })
         }
-        Expr::InSubquery { operand, select, negated } => alloc(Expr::InSubquery {
-            operand: rewrite(operand)?,
-            select,
-            negated: *negated,
-        }),
+        Expr::InSubquery { operand, select, negated } => rewrite_owned_sublink_aggregates(
+            alloc(Expr::InSubquery {
+                operand: rewrite(operand)?,
+                select,
+                negated: *negated,
+            })?,
+            context,
+            arena,
+        ),
         Expr::QuantifiedSubquery {
             operand,
             operator,
             select,
             all,
-        } => alloc(Expr::QuantifiedSubquery {
-            operand: rewrite(operand)?,
-            operator: *operator,
-            select,
-            all: *all,
-        }),
+        } => rewrite_owned_sublink_aggregates(
+            alloc(Expr::QuantifiedSubquery {
+                operand: rewrite(operand)?,
+                operator: *operator,
+                select,
+                all: *all,
+            })?,
+            context,
+            arena,
+        ),
         Expr::Array(items) => {
             let mut rewritten = ArenaList::new(arena);
             for x in items.iter() {

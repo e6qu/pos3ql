@@ -459,8 +459,7 @@ belongs to that query, as in PostgreSQL, except through a subquery in `FROM`
 or a set operation, whose outer references fail as missing FROM-clause
 entries; a `UNION` subquery reading an outer column fails the same way, and a
 correlated `LIMIT` or `JOIN ... ON` inside a subquery cannot read an outer
-column. A subquery reading an aggregate of a query that also has window
-functions fails with `0A000`. A SQL function whose earlier
+column. A SQL function whose earlier
 statements are not queries or data changes (`CREATE TEMP TABLE t(a int);
 SELECT a FROM t`) has its result converted value by value at the call instead
 of being type-checked like PostgreSQL's analysis just before the final
@@ -498,12 +497,14 @@ separate copy where PostgreSQL reuses the constraint's index; constraint
 indexes need a durable link to a parent index first.
 An exclusion constraint element must be a column: an expression
 (`EXCLUDE USING gist (int4range(a, b) WITH &&)`) fails with `0A000`, since
-the stored constraint keeps no element expressions. A
-statement's scans read catalog changes that routines it called made earlier in
-the same statement: `SELECT mk(g), (SELECT count(*) FROM pg_class WHERE
-relname LIKE 'made_%') FROM generate_series(1, 3) g`, where `mk` creates a
-table, counts the new tables, while PostgreSQL's statement snapshot counts
-none. `pg_get_viewdef` uses PostgreSQL's
+the stored constraint keeps no element expressions. A statement's own catalog scans, including those through views, read the
+catalog as the statement began (images built at its start), so `SELECT mk(g),
+(SELECT count(*) FROM pg_class WHERE relname LIKE 'made_%') FROM
+generate_series(1, 3) g`, where `mk` creates a table, counts none, as
+PostgreSQL's statement snapshot does; a volatile routine's queries see the
+change. A STABLE or IMMUTABLE SQL function's catalog query still reads the
+catalog as it is when it runs, where PostgreSQL reads it under the calling
+statement's snapshot. `pg_get_viewdef` uses PostgreSQL's
 layout, including its wrap column, only for a view
 over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
 comma or `USING` joins, subqueries or set operations; other views return their

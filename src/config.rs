@@ -71,6 +71,9 @@ pub struct Config {
     /// PostgreSQL's `work_mem`: a sort or hash aggregate that exceeds its
     /// selected workspace errors (54000) rather than growing at runtime.
     pub work_arena_bytes: usize,
+    /// Per query workspace: images of the catalog relations a statement
+    /// reads under its catalog snapshot.
+    pub catalog_image_bytes: usize,
     /// Prepared-statement slots in each connection's wire and SQL pools.
     pub max_prepared: usize,
     /// Stored query text and metadata per wire or SQL prepared statement.
@@ -471,6 +474,7 @@ impl Config {
             conn_send_buffer_bytes: 64 * KIB,
             sql_arena_bytes: 32 * MIB,
             work_arena_bytes: 64 * MIB,
+            catalog_image_bytes: 8 * MIB,
             max_prepared: 64,
             prepared_bytes: 8 * KIB,
             routine_input_slots: 128,
@@ -827,6 +831,10 @@ impl Config {
                 }
                 "work_arena_bytes" => {
                     config.work_arena_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "catalog_image_bytes" => {
+                    config.catalog_image_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
                 }
                 "max_prepared" => {

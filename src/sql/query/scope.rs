@@ -88,6 +88,164 @@ fn catalog_scan(
     }
 }
 
+/// Synthesized catalog rows in the tagged row encoding scans read.
+fn encode_catalog_rows<'a>(
+    synth: &crate::sql::catalog::SynthTable<'a>,
+    arena: &'a Arena,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    const EMPTY: &[u8] = &[];
+    let encoded = arena
+        .alloc_slice_with(synth.rows.len(), |_| EMPTY)
+        .map_err(|_| arena_full())?;
+    for (i, r) in synth.rows.iter().enumerate() {
+        if r.len() > MAX_COLUMNS {
+            return Err(arena_full());
+        }
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        for (column, value) in r.iter().copied().enumerate() {
+            // Catalog builders may compute identifiers as signed integers,
+            // but tagged rows must carry the advertised oid representation
+            // before joins and expression evaluation.
+            values[column] = if synth.def.columns[column].ctype == ColType::Oid {
+                super::super::eval::cast_to(value, ColType::Oid, arena)?
+            } else {
+                value
+            };
+        }
+        encoded[i] = crate::sql::exec::encode_projected_pub(&values[..r.len()], arena)?;
+    }
+    Ok(encoded)
+}
+
+/// Builds, at the start of a query that calls a user routine, the image of
+/// every `pg_catalog` relation it reads, directly or through views, under the
+/// statement's catalog snapshot: a routine the query calls that changes the
+/// catalog leaves the query's own scans reading the catalog as it began, as
+/// PostgreSQL's statement snapshot does. Other statements' scans build the
+/// same images when they first read a relation, which nothing they run can
+/// have changed.
+pub(crate) fn prebuild_statement_catalog_images(
+    statement: &crate::sql::ast::Stmt<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    // Only a query that can run a user routine can change the catalog
+    // before its own scans read it.
+    let crate::sql::ast::Stmt::Select(select) = statement else {
+        return Ok(());
+    };
+    if !super::cte::select_contains_function(select, &|name, arguments| {
+        storage.has_callable_candidate(name, arguments, txid)
+    }) {
+        return Ok(());
+    }
+    super::catalog_images::pin_statement_images();
+    let path = storage.path();
+    let mut failure = None;
+    super::cte::statement_relations_of(statement, &mut |table| {
+        if failure.is_none()
+            && let Err(error) = prebuild_relation(table, &path, storage, txid, 0, arena)
+        {
+            failure = Some(error);
+        }
+        0
+    });
+    failure.map_or(Ok(()), Err)
+}
+
+const MAX_PREBUILD_VIEW_DEPTH: usize = 16;
+
+fn prebuild_relation(
+    table: &TableRef<'_>,
+    path: &crate::storage::PathContext,
+    storage: &Storage,
+    txid: u32,
+    depth: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    if table.cte.is_some() || table.subquery.is_some() || table.is_function_source() {
+        return Ok(());
+    }
+    match storage.resolve_relation_under(path, table.schema, table.table, txid) {
+        Some(crate::storage::ResolvedRelation::Catalog) => {
+            let Some(namespace) = path.catalog_namespace(table.schema, table.table) else {
+                return Ok(());
+            };
+            use crate::sql::catalog_snapshot::CatalogScan;
+            let mut sequential_rows = None;
+            for scan in [CatalogScan::Sequential, CatalogScan::Index] {
+                let Some(key) = super::catalog_images::ImageKey::new(
+                    storage,
+                    namespace,
+                    table.table,
+                    scan,
+                    txid,
+                ) else {
+                    return Ok(());
+                };
+                if let Some(rows) = super::catalog_images::cached(arena, key) {
+                    sequential_rows = Some(rows);
+                    continue;
+                }
+                // Without committed history to restore, both scans read the
+                // same rows.
+                if scan == CatalogScan::Index
+                    && storage.commit_snapshot() == u64::MAX
+                    && let Some(rows) = sequential_rows
+                {
+                    super::catalog_images::share(arena, key, rows)?;
+                    continue;
+                }
+                let mark = arena.mark();
+                let retained = crate::sql::catalog::synthesize(
+                    storage,
+                    Some(namespace),
+                    table.table,
+                    txid,
+                    scan,
+                    arena,
+                )
+                .and_then(|synth| encode_catalog_rows(&synth, arena))
+                .and_then(|encoded| super::catalog_images::retain(arena, key, encoded));
+                // SAFETY: the image was copied into the catalog image arena;
+                // nothing allocated since `mark` is referenced.
+                unsafe { arena.rewind_to(mark) };
+                sequential_rows = Some(retained?);
+            }
+            Ok(())
+        }
+        Some(crate::storage::ResolvedRelation::View(slot)) if depth < MAX_PREBUILD_VIEW_DEPTH => {
+            let query = storage.snapshot_view_query(slot, txid, arena)?;
+            let sql = arena
+                .alloc_str(query.sql.as_str())
+                .map_err(|_| arena_full())?;
+            let user = crate::sql::eval::funcs::system::session_user_owned();
+            let view_path = storage.compute_path(query.creation_path.as_str(), user.as_str(), txid);
+            let body = super::parse_stored_query(
+                sql,
+                query.input_source.unwrap_or(sql),
+                storage,
+                txid,
+                query.dependencies.view(),
+                arena,
+            )?;
+            let mut failure = None;
+            super::cte::select_relations(body, &mut |inner| {
+                if failure.is_none()
+                    && let Err(error) =
+                        prebuild_relation(inner, &view_path, storage, txid, depth + 1, arena)
+                {
+                    failure = Some(error);
+                }
+                0
+            });
+            failure.map_or(Ok(()), Err)
+        }
+        _ => Ok(()),
+    }
+}
+
 /// 42P10 for a column alias list longer than its table's columns. The
 /// query an `INSERT` with subscripted targets reads instead reports
 /// PostgreSQL's `INSERT has more target columns than expressions` at the
@@ -2474,27 +2632,7 @@ impl<'d> QueryScope<'d> {
         let rows: &'a [&'a [u8]] = if let Some(rows) = retained_rows {
             rows
         } else if materialize {
-            const EMPTY: &[u8] = &[];
-            let encoded = arena
-                .alloc_slice_with(synth.rows.len(), |_| EMPTY)
-                .map_err(|_| arena_full())?;
-            for (i, r) in synth.rows.iter().enumerate() {
-                if r.len() > MAX_COLUMNS {
-                    return Err(arena_full());
-                }
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                for (column, value) in r.iter().copied().enumerate() {
-                    // Catalog builders may compute identifiers as signed
-                    // integers, but tagged rows must carry the advertised oid
-                    // representation before joins and expression evaluation.
-                    values[column] = if synth.def.columns[column].ctype == ColType::Oid {
-                        super::super::eval::cast_to(value, ColType::Oid, arena)?
-                    } else {
-                        value
-                    };
-                }
-                encoded[i] = crate::sql::exec::encode_projected_pub(&values[..r.len()], arena)?;
-            }
+            let encoded = encode_catalog_rows(&synth, arena)?;
             match image_key {
                 Some(key) => super::catalog_images::retain(arena, key, encoded)?,
                 None => encoded,

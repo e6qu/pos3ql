@@ -878,6 +878,7 @@ Exhaustion returns `54000` naming the pool, before any partial effect.
 | Setting(s) | Bounds |
 |---|---|
 | `sql_arena_bytes` (per-connection statement memory), `work_arena_bytes` (per query workspace; see [`work_mem`](#work_mem)) | Row images, joins, lists, programs, JSON/XML work, table-function rows, sorts and aggregates, retained scan/COPY/validation records (32 bytes per resident row) |
+| `catalog_image_bytes` (per query workspace, default 8 MiB) | Catalog relation images a query that calls a user routine builds when it starts, so its own catalog scans read the catalog as it began |
 | `max_tables`, `max_extended_statistics`, other catalog `max_*` | One capacity per catalog family; omitting `max_extended_statistics` derives it from `max_tables`, so set it explicitly |
 | `max_connections`, `max_prepared_transactions`, `max_subscriptions` | Transaction identity registry has `max_connections + max_prepared_transactions` entries |
 | `max_catalog_versions_per_object`, `max_ddl_per_transaction` | Retained definition/undo versions. Enum label images use `max_enums + P` slots, `P = min(max_enums * max_catalog_versions_per_object, (max_connections + max_prepared_transactions + max_subscriptions) * max_ddl_per_transaction)`, each holding `max_enum_labels_per_type` labels |

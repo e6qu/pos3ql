@@ -745,6 +745,21 @@ expressions, trigger conditions and domain constraints still store plain text;
 renaming or moving a routine or type such an expression names is refused with
 `0A000`, as is renaming an enum label any stored expression spells.
 
+### Catalog reads within a statement
+
+PostgreSQL reads every catalog relation a statement scans under the
+statement's snapshot, so `SELECT mk(g), (SELECT count(*) FROM pg_class) FROM
+generate_series(1, 3) g`, where `mk` creates a table, counts the tables that
+existed when the statement began. Before a query that calls a user routine
+runs, pos3ql builds an image of every `pg_catalog` relation the query names,
+directly or through views, in the query workspace's `catalog_image_bytes`
+arena, and the query's scans read those images until it ends. A query that
+calls no user routine cannot change the catalog while it runs, and builds its
+images as it first reads each relation. A volatile routine's statements read
+the catalog as it is when they run. A statement pins at most 256 images,
+nested routine statements included; that limit or a full arena returns
+`54000`.
+
 ### Statement preparation
 
 Function calls bind their selected function, argument mapping and declared

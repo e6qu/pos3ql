@@ -738,6 +738,7 @@ mod tests {
                     name: SqlName::parse("positive").unwrap(),
                     expression: crate::util::StackStr::from_str("VALUE > 0"),
                     validation: ConstraintValidation::EnforcedValidated,
+                    no_inherit: false,
                 };
                 storage.create_domain(
                     schema,

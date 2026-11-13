@@ -71,8 +71,12 @@ fn row_history_reservation_survives_prepared_recovery_and_releases_on_resolution
                 &mut engine,
                 "CREATE SEQUENCE history_reclaim_calls START 2; \
                 CREATE TABLE prepared_history(id integer PRIMARY KEY,value integer); \
-                INSERT INTO prepared_history VALUES(1,0),(2,0),(3,0); \
-                BEGIN; UPDATE prepared_history SET value=1 WHERE id=1; \
+                INSERT INTO prepared_history VALUES(1,0),(2,0),(3,0)",
+                true,
+            );
+            writer.success(
+                &mut engine,
+                "BEGIN; UPDATE prepared_history SET value=1 WHERE id=1; \
                 DELETE FROM prepared_history WHERE id=2; PREPARE TRANSACTION 'history-slot'",
                 true,
             );

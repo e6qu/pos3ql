@@ -57,7 +57,7 @@ type Step<T> = Result<T, Stop>;
 
 /// Returns `select` with every pullable FROM subquery merged into it, or
 /// `select` itself when none is.
-pub(super) fn pull_up_subqueries<'a>(
+pub(crate) fn pull_up_subqueries<'a>(
     select: &'a Select<'a>,
     storage: &'a Storage,
     txid: u32,
@@ -96,6 +96,7 @@ pub(super) fn pull_up_subqueries<'a>(
             Err(Stop::Full) => return Err(arena_full()),
         }
     }
+    current = super::outer_joins::reduce_outer_joins(current, storage, txid, arena, outer)?;
     for step in [push_down_restrictions, move_having_to_where] {
         let mark = arena.mark();
         match step(current, storage, txid, arena, outer) {
@@ -1139,6 +1140,12 @@ fn inner_column<'a>(
             .alloc(Expr::Column {
                 qualifier: Some(renamed[table]),
                 name: scope.defs.column_name(table, column),
+            })
+            .map_err(|_| Stop::full())?),
+        ResolvedColumn::TableOid(table) => Ok(&*arena
+            .alloc(Expr::Column {
+                qualifier: Some(renamed[table]),
+                name: "tableoid",
             })
             .map_err(|_| Stop::full())?),
         ResolvedColumn::Merged(_) => Err(Stop::Keep),

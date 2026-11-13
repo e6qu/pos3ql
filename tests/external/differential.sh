@@ -12,6 +12,18 @@ DIFFERENTIAL_TRANSACTION_CONFIG=$(< "$EXT/differential-capacities.conf") || exit
 ROOT_VENV=${POS3QL_VENV:-target/external-venv}
 EXTENSION_CONTROL_ROOT=${POS3QL_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
 REFERENCE_EXTENSION_CONTROL_ROOT=${POS3QL_REFERENCE_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
+# Both servers search PostgreSQL's built-in packages first (`$system`, where
+# contrib's postgres_fdw is installed), then the test packages.
+EXTENSION_CONTROL_PATH="\$system:$EXTENSION_CONTROL_ROOT"
+REFERENCE_EXTENSION_CONTROL_PATH="\$system:$REFERENCE_EXTENSION_CONTROL_ROOT"
+# The server splits PGOPTIONS on whitespace and honours only backslash
+# escapes, so quotes would become part of a value.
+pgoptions_value() {
+  local value=${1//\\/\\\\}
+  value=${value// /\\ }
+  printf '%s' "${value//$'\t'/\\$'\t'}"
+}
+REFERENCE_PGOPTIONS="-c timezone=UTC -c extension_control_path=$(pgoptions_value "$REFERENCE_EXTENSION_CONTROL_PATH")"
 KEEP=${1:-}
 
 PGBIN=${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}
@@ -194,7 +206,7 @@ if [[ "$REFERENCE_MODE" == local ]]; then
     exit 1
   fi
   SOCKDIR=$(mktemp -d /tmp/pos3ql-pgsock.XXXX)
-  "$PGBIN/pg_ctl" -D "$WORK/pgdata" -o "-p $PG_PORT -k $SOCKDIR -c listen_addresses=127.0.0.1 -c timezone=UTC -c max_prepared_transactions=8 -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
+  "$PGBIN/pg_ctl" -D "$WORK/pgdata" -o "-p $PG_PORT -k $SOCKDIR -c listen_addresses=127.0.0.1 -c timezone=UTC -c max_prepared_transactions=8 -c extension_control_path='$REFERENCE_EXTENSION_CONTROL_PATH'" \
     -l "$WORK/pg.log" start >/dev/null || { bad "pg start"; exit 1; }
 fi
 
@@ -224,7 +236,7 @@ max_value_indexes = 64
 max_prepared_transactions = 8
 ${DIFFERENTIAL_TRANSACTION_CONFIG}
 memtable_bytes = ${POS3QL_DIFF_MEMTABLE:-256MiB}
-extension_control_path = ${EXTENSION_CONTROL_ROOT}
+extension_control_path = ${EXTENSION_CONTROL_PATH}
 ${POS3QL_EXTRA_CONF:-}
 EOF
 if [[ -n "$DIFF_OBJECT_PREFIX" ]]; then
@@ -268,7 +280,7 @@ run_corpus() { # port name file diagnostics
   esac
   printf 'RUN: differential: %s\n' "$2"
   if [[ "$1" == "$PG_PORT" ]]; then
-    PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
+    PGOPTIONS="$REFERENCE_PGOPTIONS" \
       "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$REFERENCE_DATABASE" -X -e -P pager=off \
         -v VERBOSITY=verbose -f "$3" > "$WORK/$2.stdout" 2> "$WORK/$2.stderr" || status=$?
   else
@@ -315,7 +327,7 @@ reset_user_relations() { # port
   [[ "$1" == "$PG_PORT" ]] && database=$REFERENCE_DATABASE
   "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$database" -X -A -t -q \
     -F $'\t' \
-    -c "SELECT n.nspname, c.relname, c.relkind FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p', 'm', 'v', 'S')" |
+    -c "SELECT n.nspname, c.relname, c.relkind FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p', 'm', 'v', 'S', 'f')" |
   while IFS=$'\t' read -r schema relation relkind; do
     [[ -z "$relation" ]] && continue
     schema=${schema//\"/\"\"}
@@ -325,6 +337,7 @@ reset_user_relations() { # port
     r | p) drop='DROP TABLE' ;;
     v) drop='DROP VIEW' ;;
     S) drop='DROP SEQUENCE' ;;
+    f) drop='DROP FOREIGN TABLE' ;;
     *)
       printf 'FAIL: unexpected reset relation kind %q\n' "$relkind"
       return 1
@@ -353,13 +366,37 @@ reset_user_routines() { # port
   done
 }
 
+# Schemas, standalone types, foreign-data wrappers and roles a fixture leaves
+# behind would otherwise collide with a later fixture's (or a later run's on a
+# reused reference cluster) objects of the same name. Only roles created after
+# the run's first reset (OIDs above its baseline) are dropped, so roles that
+# predate the run on a shared reference server survive; pos3ql servers are
+# disposable, so every role it did not bootstrap is dropped.
+reset_user_objects() { # port role-baseline
+  local database=postgres
+  [[ "$1" == "$PG_PORT" ]] && database=$REFERENCE_DATABASE
+  "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$database" -X -A -t -q \
+    -c "SELECT 'DROP FOREIGN DATA WRAPPER ' || quote_ident(fdwname) || ' CASCADE' FROM pg_foreign_data_wrapper UNION ALL SELECT 'DROP SCHEMA ' || quote_ident(nspname) || ' CASCADE' FROM pg_namespace WHERE nspname NOT IN ('public', 'information_schema') AND nspname NOT LIKE 'pg\\_%' UNION ALL SELECT 'DROP TYPE ' || quote_ident(n.nspname) || '.' || quote_ident(t.typname) || ' CASCADE' FROM pg_type AS t JOIN pg_namespace AS n ON n.oid = t.typnamespace WHERE n.nspname = 'public' AND t.typtype IN ('c', 'd', 'e', 'r') AND (t.typrelid = 0 OR (SELECT c.relkind FROM pg_class AS c WHERE c.oid = t.typrelid) = 'c') UNION ALL SELECT 'DROP OWNED BY ' || quote_ident(rolname) || ' CASCADE; DROP ROLE ' || quote_ident(rolname) FROM pg_roles WHERE oid > $2 AND rolname <> current_user" |
+  while IFS= read -r statement; do
+    [[ -z "$statement" ]] && continue
+    "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$database" -X -q -c "$statement" >/dev/null 2>&1
+  done
+}
+role_baseline() { # port
+  local database=postgres
+  [[ "$1" == "$PG_PORT" ]] && database=$REFERENCE_DATABASE
+  "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$database" -X -A -t -q -c "SELECT max(oid) FROM pg_roles"
+}
 reset_pair() {
+  [[ -n "${PG_ROLE_BASELINE:-}" ]] || PG_ROLE_BASELINE=$(role_baseline "$PG_PORT")
   reset_user_extensions "$PG_PORT"
   reset_user_extensions "$P3_PORT"
   reset_user_relations "$PG_PORT"
   reset_user_relations "$P3_PORT"
   reset_user_routines "$PG_PORT"
   reset_user_routines "$P3_PORT"
+  reset_user_objects "$PG_PORT" "$PG_ROLE_BASELINE"
+  reset_user_objects "$P3_PORT" 16383
 }
 
 restart_pos3ql_clean() {

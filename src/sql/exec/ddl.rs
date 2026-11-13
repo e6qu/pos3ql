@@ -44,21 +44,33 @@ pub(super) fn build_def(
                 c.name
             ));
         }
-        def.columns[i] = build_column(c, storage, txid, arena)?;
+        // CREATE TABLE positions its columns' default errors; ALTER TABLE
+        // ADD COLUMN does not.
+        def.columns[i] =
+            crate::sql::error_position::with_analysis(|| build_column(c, storage, txid, arena))?;
         if let Some(name) = c.not_null_name {
             def.set_not_null_constraint_name(i, SqlName::parse(name)?);
         }
     }
-    // A generation expression may not reference another generated column (42P17);
-    // needs the full column set, so check once the table is assembled.
-    validate_generated_refs(&def, arena)?;
+    // A generation expression reads the other columns, so it is analysed
+    // once the table is assembled, positioned in the statement's text.
+    crate::sql::error_position::with_analysis(|| {
+        validate_generated_refs(&def, Some(columns), storage, txid, arena)
+    })?;
     Ok(def)
 }
 
-/// Enforces that no `GENERATED` column's expression references another generated
-/// column (or itself) — PostgreSQL's `check_nested_generated` rule (42P17).
+/// PostgreSQL's `cookDefault` for each `GENERATED` column: the expression's
+/// columns, operators and constants resolve against the table, it may not
+/// reference another generated column (or itself, 42P17), and its type must
+/// convert to the column's by assignment. `sources` are the columns as
+/// written, whose generation text is positioned in the statement; without
+/// them the stored text is analysed.
 pub(super) fn validate_generated_refs<Definition0: crate::storage::DefinitionBacking>(
     def: &crate::storage::TableDefinition<Definition0>,
+    sources: Option<&[ColumnDef]>,
+    storage: &Storage,
+    txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     for c in def.columns() {
@@ -66,8 +78,95 @@ pub(super) fn validate_generated_refs<Definition0: crate::storage::DefinitionBac
             continue;
         }
         let default = c.default.expression();
-        let text = default.as_ref().expect("generated column has expr text");
-        let expression = crate::sql::parser::parse_expr(text.as_str(), arena)?;
+        let stored = default.as_ref().expect("generated column has expr text");
+        let text = sources
+            .and_then(|columns| {
+                columns
+                    .iter()
+                    .find(|column| column.name == c.name.as_str())?
+                    .generated_text
+            })
+            .unwrap_or(stored.as_str());
+        let expression = crate::sql::parser::parse_expr(text, arena)?;
+        let column_oid = storage
+            .routine_type_oid(c.ctype, c.user_type, txid)
+            .unwrap_or_else(|| c.ctype.oid());
+        let user_type = |type_oid: i32| crate::storage::NamedTypeKind::from_oid(type_oid);
+        if c.default.is_virtual() && (c.primary || c.unique) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "{} on virtual generated columns are not supported",
+                if c.primary {
+                    "primary keys"
+                } else {
+                    "unique constraints"
+                }
+            ));
+        }
+        if c.default.is_virtual() {
+            // PostgreSQL 18 limits what a virtual column may compute with.
+            match user_type(column_oid) {
+                Some((crate::storage::NamedTypeKind::Domain, _, false)) => {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "virtual generated column \"{}\" cannot have a domain type",
+                        c.name.as_str()
+                    ));
+                }
+                Some(_) => {
+                    return Err(crate::sql::error_position::with_detail(
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "virtual generated column \"{}\" cannot have a user-defined type",
+                            c.name.as_str()
+                        ),
+                        format_args!(
+                            "Virtual generated columns that make use of user-defined types are not yet supported."
+                        ),
+                    ));
+                }
+                None => {}
+            }
+            if let Some(function) = expression.find_function(&|name| {
+                let name = name.rsplit('.').next().unwrap_or(name);
+                crate::sql::catalog::builtin_callable_signatures(name)
+                    .next()
+                    .is_none()
+            }) {
+                return Err(crate::sql::error_position::with_detail(
+                    crate::sql::error_position::at_reference(
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "generation expression uses user-defined function"
+                        ),
+                        function,
+                    ),
+                    format_args!(
+                        "Virtual generated columns that make use of user-defined functions are not yet supported."
+                    ),
+                ));
+            }
+        }
+        let columns = super::CatalogCols {
+            definition: Some(crate::storage::RelationDefinition::from_definition(def)),
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        };
+        let (source_oid, _) = super::infer_type_res(expression, &columns)?;
+        crate::sql::query::check_literal_operands_typed(
+            expression,
+            &|other| {
+                super::infer_type_res(other, &columns)
+                    .ok()
+                    .and_then(|(oid, _)| ColType::from_oid(oid))
+            },
+            storage,
+            txid,
+            arena,
+        )?;
         let mut offending: Option<SqlError> = None;
         expression.for_each_column(&mut |name| {
             if offending.is_some() {
@@ -85,6 +184,43 @@ pub(super) fn validate_generated_refs<Definition0: crate::storage::DefinitionBac
         });
         if let Some(e) = offending {
             return Err(e);
+        }
+        if c.default.is_virtual() && user_type(source_oid).is_some() {
+            return Err(crate::sql::error_position::with_detail(
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "generation expression uses user-defined type"
+                ),
+                format_args!(
+                    "Virtual generated columns that make use of user-defined types are not yet supported."
+                ),
+            ));
+        }
+        let target_oid = column_oid;
+        if !crate::sql::catalog::can_coerce_assignment(storage, txid, source_oid, target_oid) {
+            return Err(crate::sql::error_position::with_hint(
+                sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "column \"{}\" is of type {} but default expression is of type {}",
+                    c.name.as_str(),
+                    crate::sql::catalog::format_type_name(storage, txid, target_oid)?.as_str(),
+                    crate::sql::catalog::format_type_name(storage, txid, source_oid)?.as_str()
+                ),
+                "You will need to rewrite or cast the expression.",
+            ));
+        }
+        // A cast or operator PostgreSQL marks stable (`a::text::regclass`)
+        // makes the expression depend on more than the row; PostgreSQL checks
+        // this after the expression's type.
+        if crate::sql::planner_inputs::inline::index_expression_is_mutable(
+            expression, &columns, storage, txid, arena,
+        )?
+        .unwrap_or(false)
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "generation expression is not immutable"
+            ));
         }
     }
     Ok(())
@@ -300,9 +436,13 @@ pub(super) fn build_column(
                 c.name
             ));
         }
-        ColumnDefault::Generated(resolve_generated(gtext, storage, txid, arena)?)
+        ColumnDefault::Generated {
+            expression: resolve_generated(gtext, storage, txid, arena)?,
+            kind: c.generated_kind,
+        }
     } else {
         let column_default = resolve_default(
+            c.name,
             c.default,
             c.default_text,
             ctype,
@@ -479,7 +619,9 @@ pub(super) fn resolve_generated(
 }
 
 /// Resolves a column DEFAULT into one complete catalog state.
+#[expect(clippy::too_many_arguments, reason = "DDL column context")]
 pub(super) fn resolve_default(
+    column: &str,
     default: Option<&Expr>,
     default_text: Option<&str>,
     ctype: ColType,
@@ -497,13 +639,20 @@ pub(super) fn resolve_default(
             "cannot use subquery in DEFAULT expression"
         ));
     }
-    let mut has_reference = false;
-    expression.for_each_column_reference(&mut |_, _| has_reference = true);
-    if has_reference {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "cannot use column reference in DEFAULT expression"
-        ));
+    let mut reference = None;
+    expression.for_each_column_reference(&mut |qualifier, name| {
+        if reference.is_none() {
+            reference = Some(crate::sql::error_position::at_reference(
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot use column reference in DEFAULT expression"
+                ),
+                qualifier.unwrap_or(name),
+            ));
+        }
+    });
+    if let Some(error) = reference {
+        return Err(error);
     }
     // A literal-only default folds to a constant now; anything volatile or
     // stable (any function call) is kept as text and evaluated at insert time.
@@ -521,6 +670,24 @@ pub(super) fn resolve_default(
             sequences: None,
             merge_action: None,
         };
+        let source_oid =
+            crate::sql::eval::expression_type_identity(expression, &NoColumns, &hooks)?
+                .routine_argument_oid();
+        let target_oid = ctype.oid();
+        if source_oid != crate::sql::types::oid::UNKNOWN
+            && !crate::sql::catalog::can_coerce_assignment(storage, txid, source_oid, target_oid)
+        {
+            return Err(crate::sql::error_position::with_hint(
+                sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "column \"{}\" is of type {} but default expression is of type {}",
+                    column,
+                    crate::sql::catalog::format_type_name(storage, txid, target_oid)?.as_str(),
+                    crate::sql::catalog::format_type_name(storage, txid, source_oid)?.as_str()
+                ),
+                "You will need to rewrite or cast the expression.",
+            ));
+        }
         let v = eval_full(
             expression,
             arena,
@@ -528,9 +695,10 @@ pub(super) fn resolve_default(
             &NoColumns,
             &hooks,
         )?;
-        let source_oid =
-            crate::sql::eval::expression_type_identity(expression, &NoColumns, &hooks)?
-                .routine_argument_oid();
+        let literal_input = |error: SqlError| match expression {
+            Expr::Str(text) => crate::sql::error_position::at_reference(error, text),
+            _ => error,
+        };
         let v = match ctype {
             ColType::Array(crate::sql::types::ArrElem::Domain { .. })
                 if source_oid == ctype.oid() =>
@@ -550,14 +718,34 @@ pub(super) fn resolve_default(
                 let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
                 crate::sql::eval::regobject_cast(v, target, Some(&catalog), arena)?
             }
-            _ => cast_to(v, ctype, arena)?,
+            _ => cast_to(v, ctype, arena).map_err(literal_input)?,
         };
-        let v = apply_typmod(v, ctype, type_mod, arena)?;
-        return Ok(ColumnDefault::Constant {
-            value: OwnedDatum::from_datum(&v)?,
-            expression: store_default_text(default_text)?,
-        });
+        // A value its type modifier rejects fails at each insert, as
+        // PostgreSQL applies the modifier when the default is used.
+        if let Ok(v) = apply_typmod(v, ctype, type_mod, arena) {
+            return Ok(ColumnDefault::Constant {
+                value: OwnedDatum::from_datum(&v)?,
+                expression: store_default_text(default_text)?,
+            });
+        }
     }
+    // The expression is analysed when the column is defined: its functions
+    // resolve and its literals run their inputs.
+    let mark = arena.mark();
+    let analysed = super::infer_type_res(
+        expression,
+        &super::CatalogCols {
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        },
+    );
+    // Only the verdict leaves; analysis scratch is discarded.
+    unsafe { arena.rewind_to(mark) };
+    analysed?;
     let source = store_default_text(default_text)?;
     Ok(ColumnDefault::Expression(
         crate::sql::enum_values::checks::bind_default::<{ crate::storage::DEFAULT_EXPR_MAX }>(
@@ -626,6 +814,22 @@ pub(super) fn resolve_cols<Definition0: crate::storage::DefinitionBacking>(
         out[i] = index as u16;
     }
     Ok((out, names.len()))
+}
+
+/// [`resolve_cols`] for the column lists of a foreign key, with
+/// PostgreSQL's `transformColumnNameList` error.
+fn resolve_foreign_key_cols<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
+    names: &[&str],
+) -> Result<([u16; MAX_INDEX_COLS], usize), SqlError> {
+    if let Some(missing) = names.iter().find(|name| def.column_index(name).is_none()) {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_COLUMN,
+            "column \"{}\" referenced in foreign key constraint does not exist",
+            missing
+        ));
+    }
+    resolve_cols(def, names)
 }
 
 /// The distinct variables of an expression over one relation. A whole-row
@@ -1138,18 +1342,11 @@ fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
                     variables.add_whole_row()
                 }
                 None => {
-                    if let Some(qualifier) = qualifier {
-                        return Err(sql_err!(
-                            sqlstate::UNDEFINED_COLUMN,
-                            "column {}.{} does not exist",
-                            qualifier,
-                            name
-                        ));
-                    }
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" does not exist",
-                        name
+                    return Err(crate::sql::column_suggestion::missing_relation_column(
+                        *qualifier,
+                        name,
+                        def.name.as_str(),
+                        &def.columns.as_ref()[..def.n_columns],
                     ));
                 }
             }
@@ -1286,6 +1483,136 @@ fn validate_check_refs<Definition0: crate::storage::DefinitionBacking>(
     Ok(())
 }
 
+/// The operator an exclusion constraint element compares `column` with, as
+/// PostgreSQL's `ComputeIndexAttrs` checks it: the column type's default
+/// operator class for `method`, then a commutative operator `written` of the
+/// class's operator family.
+fn exclusion_operator(
+    storage: &Storage,
+    element: crate::storage::RoutineResult,
+    type_oid: i32,
+    key: Option<&crate::sql::ast::IndexColumn<'_>>,
+    method: crate::sql::ast::IndexAccessMethod,
+    written: &str,
+    txid: u32,
+) -> Result<crate::storage::ExclusionOperator, SqlError> {
+    let collation = key.and_then(|key| key.collation);
+    let written_class = key.and_then(|key| key.operator_class);
+    let ordering_specified = key.is_some_and(|key| key.ordering_specified);
+    let nulls_order_specified = key.is_some_and(|key| key.nulls_order_specified);
+    let type_name = |oid: i32| crate::sql::catalog::format_type_oid(storage, txid, oid, -1);
+    if collation.is_some() && !element.ctype.is_collatable() {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "collations are not supported by type {}",
+            type_name(type_oid).as_str()
+        ));
+    }
+    let class = storage.resolve_index_operator_class(None, element, method, txid)?;
+    let Some((family, input)) = crate::sql::catalog::builtin_operator_class_family(class.oid())
+    else {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "exclusion constraints over user-defined operator classes are not supported"
+        ));
+    };
+    if collation.is_some() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "COLLATE in exclusion constraint elements is not supported"
+        ));
+    }
+    // Only the element type's default class is kept; naming it changes
+    // nothing PostgreSQL prints.
+    if let Some(written_class) = written_class {
+        let default_name = match class {
+            crate::storage::IndexOperatorClass::Gist(class) => Some(class.name()),
+            _ => None,
+        };
+        let schema_ok = written_class
+            .schema
+            .is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"));
+        if !schema_ok || default_name != Some(written_class.name) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "exclusion constraint operator class \"{}\" is not supported; only the element type's default class is",
+                written_class.name
+            ));
+        }
+    }
+    if ordering_specified || nulls_order_specified {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "access method \"{}\" does not support {} options",
+            method.name(),
+            if ordering_specified {
+                "ASC/DESC"
+            } else {
+                "NULLS FIRST/LAST"
+            }
+        ));
+    }
+    let operator = crate::sql::catalog::builtin_binary_operator(written, type_oid, type_oid)
+        .or_else(|| crate::sql::catalog::builtin_binary_operator(written, input, input))
+        .ok_or_else(|| {
+            crate::sql::error_position::with_hint(
+                sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "operator does not exist: {} {} {}",
+                    type_name(type_oid).as_str(),
+                    written,
+                    type_name(type_oid).as_str()
+                ),
+                "No operator matches the given name and argument types. You might need to add explicit type casts.",
+            )
+        })?;
+    let (_, left, right, commutator) = crate::sql::catalog::builtin_binary_operator_row(operator)
+        .expect("a found built-in operator has a row");
+    let signature = crate::stack_format!(
+        600,
+        "{}({},{})",
+        written,
+        type_name(left).as_str(),
+        type_name(right).as_str()
+    );
+    if commutator != operator {
+        crate::sql::eval::stash_diagnostic(
+            Some(crate::util::StackStr::from_str(
+                "Only commutative operators can be used in exclusion constraints.",
+            )),
+            None,
+        );
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "operator {} is not commutative",
+            signature.as_str()
+        ));
+    }
+    if !crate::sql::catalog::builtin_family_has_operator(family, method.oid(), operator) {
+        let family_name =
+            crate::sql::catalog::builtin_operator_family(family).map_or("", |(_, name)| name);
+        crate::sql::eval::stash_diagnostic(
+            Some(crate::util::StackStr::from_str(
+                "The exclusion operator must be related to the index operator class for the constraint.",
+            )),
+            None,
+        );
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "operator {} is not a member of operator family \"{}\"",
+            signature.as_str(),
+            family_name
+        ));
+    }
+    crate::storage::ExclusionOperator::from_oid(operator).ok_or_else(|| {
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "exclusion operator {} is not supported",
+            signature.as_str()
+        )
+    })
+}
+
 /// Applies each parsed table constraint to `def`: single-column PK/UNIQUE set
 /// column flags; multi-column PK/UNIQUE become entries in `def.uniques`; CHECK
 /// predicates and FOREIGN KEYs are validated and recorded.
@@ -1347,6 +1674,7 @@ pub(super) fn attach_constraints(
                 }
                 has_primary = true;
                 let (indices, n) = resolve_cols(def, columns)?;
+                reject_virtual_columns(def, &indices[..n], "primary keys")?;
                 for &column_index in &indices[..n] {
                     def.columns[column_index as usize].not_null =
                         def.columns[column_index as usize].not_null.add_local();
@@ -1400,6 +1728,7 @@ pub(super) fn attach_constraints(
                 nulls_not_distinct,
             } => {
                 let (indices, n) = resolve_cols(def, columns)?;
+                reject_virtual_columns(def, &indices[..n], "unique constraints")?;
                 let stored_timing = storage_timing(*timing);
                 let equivalent_flag = n == 1
                     && !*nulls_not_distinct
@@ -1459,8 +1788,26 @@ pub(super) fn attach_constraints(
                 expression,
                 text,
                 validation,
+                no_inherit,
             } => {
-                let single_column = expression_variables(expression, def)?.single_column();
+                if *no_inherit && def.partition.is_partitioned() {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_TABLE_DEFINITION,
+                        "cannot add NO INHERIT constraint to partitioned table \"{}\"",
+                        def.name.as_str()
+                    ));
+                }
+                // CREATE TABLE (the only caller merging equivalent
+                // constraints) positions a CHECK's unknown column as
+                // PostgreSQL does; ALTER TABLE reports it without one.
+                let single_column = if merge_equivalent {
+                    crate::sql::error_position::with_analysis(|| {
+                        expression_variables(expression, def)
+                    })?
+                } else {
+                    expression_variables(expression, def)?
+                }
+                .single_column();
                 if text.len() > crate::storage::CHECK_SQL_MAX {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -1492,6 +1839,7 @@ pub(super) fn attach_constraints(
                     name: constraint_name,
                     expression: crate::util::StackStr::new(),
                     validation: storage_validation(*validation),
+                    no_inherit: *no_inherit,
                 };
                 let stored = stored_relation_expression(text, def, arena)?;
                 let _ = core::fmt::Write::write_str(&mut c.expression, stored);
@@ -1503,6 +1851,14 @@ pub(super) fn attach_constraints(
                 }
                 def.checks[def.n_checks] = c;
                 def.n_checks += 1;
+                super::expression_bindings::capture_expression_dependencies(
+                    storage,
+                    def,
+                    crate::storage::ExpressionOwner::Check(c.name),
+                    c.expression.as_str(),
+                    txid,
+                    arena,
+                )?;
             }
             TableConstraint::ForeignKey {
                 source_position: _,
@@ -1511,6 +1867,7 @@ pub(super) fn attach_constraints(
                 parent,
                 parent_cols,
                 on_delete,
+                delete_set_columns,
                 on_update,
                 timing,
                 validation,
@@ -1533,7 +1890,7 @@ pub(super) fn attach_constraints(
                     columns,
                     parent,
                     parent_cols,
-                    *on_delete,
+                    (*on_delete, delete_set_columns),
                     *on_update,
                     *timing,
                     *validation,
@@ -1541,31 +1898,42 @@ pub(super) fn attach_constraints(
                     exclude,
                     arena,
                 )?;
+                // The referenced key is checked first, as PostgreSQL does.
+                let (indices, n) = resolve_cols(def, columns)?;
+                reject_virtual_columns(def, &indices[..n], "foreign key constraints")?;
             }
             TableConstraint::Exclusion {
                 source_position: _,
                 name,
-                columns,
-                operators,
+                method,
+                elements,
                 predicate,
                 predicate_text,
                 timing,
             } => {
-                let (indices, count) = resolve_cols(def, columns)?;
-                for &column in &indices[..count] {
-                    if !matches!(
-                        def.columns[column as usize].ctype,
-                        crate::sql::types::ColType::Range(_)
-                    ) {
-                        return Err(crate::sql::error_position::with_hint(
-                            sql_err!(
-                                sqlstate::UNDEFINED_OBJECT,
-                                "data type {} has no default operator class for access method \"gist\"",
-                                def.columns[column as usize].ctype.name()
-                            ),
-                            crate::sql::error_position::DEFAULT_OPERATOR_CLASS_HINT,
-                        ));
-                    }
+                if elements.len() > MAX_INDEX_COLS {
+                    return Err(sql_err!(
+                        sqlstate::TOO_MANY_COLUMNS,
+                        "cannot use more than {} columns in an index",
+                        MAX_INDEX_COLS
+                    ));
+                }
+                if matches!(
+                    method,
+                    crate::sql::ast::IndexAccessMethod::Brin
+                        | crate::sql::ast::IndexAccessMethod::Gin
+                ) {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "access method \"{}\" does not support exclusion constraints",
+                        method.name()
+                    ));
+                }
+                let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
+                for element in *elements {
+                    let (key, operator) =
+                        resolve_exclusion_element(storage, def, *method, element, txid, arena)?;
+                    exclusion.push(key, operator)?;
                 }
                 if def.n_exclusions == crate::storage::MAX_EXCLUSIONS {
                     return Err(sql_err!(
@@ -1577,18 +1945,16 @@ pub(super) fn attach_constraints(
                 if let Some(expression) = predicate {
                     let _ = check_referenced_columns(expression, def)?;
                 }
-                let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
+                if let Some(text) = predicate_text {
+                    super::expression_bindings::reject_unbound_exclusion_names(
+                        storage, def, text, txid, arena,
+                    )?;
+                }
+                exclusion.method = *method;
+                exclusion.timing = storage_timing(*timing);
                 exclusion.name = match name {
                     Some(name) => SqlName::parse(name)?,
-                    None => auto_key_name(
-                        storage,
-                        def,
-                        &indices[..count],
-                        "excl",
-                        txid,
-                        exclude,
-                        crate::storage::GeneratedNameClass::IndexConstraint,
-                    )?,
+                    None => auto_exclusion_name(storage, def, &exclusion, txid, exclude, arena)?,
                 };
                 if !merge_equivalent && constraint_name_taken(def, exclusion.name.as_str()) {
                     return Err(sql_err!(
@@ -1598,22 +1964,6 @@ pub(super) fn attach_constraints(
                         def.name.as_str()
                     ));
                 }
-                exclusion.columns[..count].copy_from_slice(&indices[..count]);
-                for (index, operator) in operators.iter().copied().enumerate() {
-                    exclusion.operators[index] = match operator {
-                        crate::sql::ast::ExclusionOperator::Equal => {
-                            crate::storage::ExclusionOperator::Equal
-                        }
-                        crate::sql::ast::ExclusionOperator::Overlaps => {
-                            crate::storage::ExclusionOperator::Overlaps
-                        }
-                        crate::sql::ast::ExclusionOperator::Adjacent => {
-                            crate::storage::ExclusionOperator::Adjacent
-                        }
-                    };
-                }
-                exclusion.n_cols = count;
-                exclusion.timing = storage_timing(*timing);
                 exclusion.predicate = match predicate_text {
                     Some(text) => {
                         let mut stored = crate::util::StackStr::new();
@@ -1635,6 +1985,167 @@ pub(super) fn attach_constraints(
     }
     def.attributes.initialize(def.n_columns)?;
     crate::storage::constraint_names::table(def)
+}
+
+/// One `EXCLUDE` element resolved as PostgreSQL's `ComputeIndexAttrs` does:
+/// a plain column reference is the column, any other expression is kept as
+/// its canonical text after its names, type and immutability are checked.
+fn resolve_exclusion_element<'a>(
+    storage: &Storage,
+    def: &TableDefBuilder,
+    method: crate::sql::ast::IndexAccessMethod,
+    element: &crate::sql::ast::ExclusionElementSpec<'a>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<
+    (
+        crate::storage::ExclusionElement<'a>,
+        crate::storage::ExclusionOperator,
+    ),
+    SqlError,
+> {
+    let key = &element.key;
+    let column = match key.column {
+        Some(name) => Some(def.column_index(name).ok_or_else(|| {
+            if key.expression_text.starts_with('(') || key.expression_text != name {
+                crate::sql::error_position::at_expression(
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        name
+                    ),
+                    key.expression,
+                )
+            } else {
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" named in key does not exist",
+                    name
+                )
+            }
+        })?),
+        None => plain_column_reference(key.expression, def)?,
+    };
+    let (stored, input, type_oid) = if let Some(column) = column {
+        let meta = def.columns()[column];
+        let type_oid = crate::sql::catalog::catalog_column_type_oid(storage, &meta, txid)?;
+        (
+            crate::storage::ExclusionElement::Column(column as u16),
+            crate::storage::RoutineResult {
+                ctype: meta.ctype,
+                user_type: meta.user_type,
+            },
+            type_oid,
+        )
+    } else {
+        check_referenced_columns(key.expression, def)?;
+        let (input, type_oid) =
+            exclusion_expression_type(storage, def, key.expression, method, txid, arena)?;
+        let text = stored_relation_expression(key.expression_text, def, arena)?;
+        super::expression_bindings::reject_unbound_exclusion_names(
+            storage, def, text, txid, arena,
+        )?;
+        (
+            crate::storage::ExclusionElement::Expression(text),
+            input,
+            type_oid,
+        )
+    };
+    let operator = exclusion_operator(
+        storage,
+        input,
+        type_oid,
+        Some(key),
+        method,
+        element.operator,
+        txid,
+    )?;
+    Ok((stored, operator))
+}
+
+/// The type of an exclusion element expression over `def`, which must be
+/// immutable, as `ComputeIndexAttrs` checks it.
+fn exclusion_expression_type(
+    storage: &Storage,
+    def: &TableDefBuilder,
+    expression: &Expr<'_>,
+    method: crate::sql::ast::IndexAccessMethod,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(crate::storage::RoutineResult, i32), SqlError> {
+    let (type_oid, _) = super::infer_type_res(
+        expression,
+        &super::CatalogCols {
+            definition: Some(crate::storage::RelationDefinition::from_definition(def)),
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        },
+    )?;
+    require_immutable_index_expression(expression, def, storage, txid, "expression", arena)?;
+    let (ctype, user_type) =
+        super::catalog_column_type(storage, txid, type_oid).ok_or_else(|| {
+            crate::sql::error_position::with_hint(
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "data type unknown has no default operator class for access method \"{}\"",
+                    method.name()
+                ),
+                crate::sql::error_position::DEFAULT_OPERATOR_CLASS_HINT,
+            )
+        })?;
+    Ok((crate::storage::RoutineResult { ctype, user_type }, type_oid))
+}
+
+/// Re-analyzes `exclusion` over `def` after its columns changed type, as
+/// PostgreSQL rebuilds the constraint from its definition: each expression
+/// is resolved again and each operator looked up for the new element type.
+pub(crate) fn revalidate_exclusion(
+    storage: &Storage,
+    def: &TableDefBuilder,
+    exclusion: &crate::storage::ExclusionConstraint,
+    txid: u32,
+    arena: &Arena,
+) -> Result<crate::storage::ExclusionConstraint, SqlError> {
+    let mut rebuilt = exclusion.without_elements();
+    for (element, operator) in exclusion.elements().zip(exclusion.operators()) {
+        let (input, type_oid) = match element {
+            crate::storage::ExclusionElement::Column(column) => {
+                let meta = def.columns()[usize::from(column)];
+                (
+                    crate::storage::RoutineResult {
+                        ctype: meta.ctype,
+                        user_type: meta.user_type,
+                    },
+                    crate::sql::catalog::catalog_column_type_oid(storage, &meta, txid)?,
+                )
+            }
+            crate::storage::ExclusionElement::Expression(text) => {
+                let source = arena
+                    .alloc_str(text)
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                let expression = crate::sql::parser::parse_expr(source, arena)?;
+                // The stored definition, not the statement, is analyzed.
+                exclusion_expression_type(storage, def, expression, exclusion.method, txid, arena)
+                    .inspect_err(|error| {
+                    let _ = crate::sql::error_position::take_position(error);
+                })?
+            }
+        };
+        let operator = exclusion_operator(
+            storage,
+            input,
+            type_oid,
+            None,
+            exclusion.method,
+            operator.sql(),
+            txid,
+        )?;
+        rebuilt.push(element, operator)?;
+    }
+    Ok(rebuilt)
 }
 
 /// PostgreSQL's auto-generated constraint name: `<table>_pkey` for a primary
@@ -1667,6 +2178,64 @@ pub(super) fn auto_key_name<Definition0: crate::storage::DefinitionBacking>(
             "index name columns exceed their fixed reservation"
         ));
     }
+    generated_key_name(
+        storage,
+        def,
+        addition.as_str(),
+        suffix,
+        transaction,
+        exclude,
+        class,
+    )
+}
+
+/// The name PostgreSQL's `ChooseIndexName` gives an exclusion constraint:
+/// its elements' index column names, an expression named as
+/// `FigureIndexColname` names it.
+pub(super) fn auto_exclusion_name<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    def: &crate::storage::TableDefinition<Definition0>,
+    exclusion: &crate::storage::ExclusionConstraint,
+    transaction: u32,
+    exclude: Option<usize>,
+    arena: &Arena,
+) -> Result<SqlName, SqlError> {
+    let mut names = super::IndexColumnNames::new();
+    for element in exclusion.elements() {
+        match element {
+            crate::storage::ExclusionElement::Column(column) => {
+                names.push(def.columns()[usize::from(column)].name.as_str())?;
+            }
+            crate::storage::ExclusionElement::Expression(text) => {
+                let source = arena
+                    .alloc_str(text)
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                let expression = crate::sql::parser::parse_expr(source, arena)?;
+                names.push(super::index_expression_column_name(expression))?;
+            }
+        }
+    }
+    generated_key_name(
+        storage,
+        def,
+        names.addition().as_str(),
+        "excl",
+        transaction,
+        exclude,
+        crate::storage::GeneratedNameClass::IndexConstraint,
+    )
+}
+
+fn generated_key_name<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    def: &crate::storage::TableDefinition<Definition0>,
+    addition: &str,
+    suffix: &str,
+    transaction: u32,
+    exclude: Option<usize>,
+    class: crate::storage::GeneratedNameClass,
+) -> Result<SqlName, SqlError> {
+    use core::fmt::Write as _;
     let mut number = 0u32;
     loop {
         let mut label = StackStr::<32>::from_str(suffix);
@@ -1675,7 +2244,7 @@ pub(super) fn auto_key_name<Definition0: crate::storage::DefinitionBacking>(
         }
         let name = crate::storage::constraint_names::generated(
             def.name.as_str(),
-            (!addition.is_empty()).then_some(addition.as_str()),
+            (!addition.is_empty()).then_some(addition),
             label.as_str(),
         )?;
         if !storage.generated_name_taken(def, name, transaction, exclude, class) {
@@ -1782,7 +2351,7 @@ fn attach_fkey(
     child_cols: &[&str],
     parent: &QualName,
     parent_cols: &[&str],
-    on_delete: FkAction,
+    (on_delete, delete_set_names): (FkAction, &[&str]),
     on_update: FkAction,
     timing: AstConstraintTiming,
     validation: AstConstraintValidation,
@@ -1797,7 +2366,7 @@ fn attach_fkey(
             crate::storage::MAX_FKEYS
         ));
     }
-    let (child_idxs, n_child) = resolve_cols(def, child_cols)?;
+    let (child_idxs, n_child) = resolve_foreign_key_cols(def, child_cols)?;
 
     // The parent may be this very table (self-reference), not yet in
     // storage: PostgreSQL resolves the reference with the new table already
@@ -1871,6 +2440,24 @@ fn attach_fkey(
             }
         ));
     }
+    // `ON DELETE SET NULL (...)` names key columns, each once
+    // (`validateFkOnDeleteSetColumns`).
+    let (named_set_cols, n_named_set) = resolve_foreign_key_cols(def, delete_set_names)?;
+    let mut delete_set_cols = [0u16; MAX_INDEX_COLS];
+    let mut n_delete_set = 0;
+    for (&column, name) in named_set_cols[..n_named_set].iter().zip(delete_set_names) {
+        if !child_idxs[..n_child].contains(&column) {
+            return Err(sql_err!(
+                sqlstate::INVALID_COLUMN_REFERENCE,
+                "column \"{}\" referenced in ON DELETE SET action must be part of foreign key",
+                name
+            ));
+        }
+        if !delete_set_cols[..n_delete_set].contains(&column) {
+            delete_set_cols[n_delete_set] = column;
+            n_delete_set += 1;
+        }
+    }
     // Referenced columns default to the parent's primary key.
     let mut pcol_names: [&str; MAX_INDEX_COLS] = [""; MAX_INDEX_COLS];
     let n_parent;
@@ -1880,6 +2467,13 @@ fn attach_fkey(
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::INVALID_FOREIGN_KEY,
                 "there is no primary key for referenced table \"{}\"",
+                parent.name
+            ));
+        }
+        if primary_key_is_deferrable(&parent_def) {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "cannot use a deferrable primary key for referenced table \"{}\"",
                 parent.name
             ));
         }
@@ -1897,7 +2491,7 @@ fn attach_fkey(
             "number of referencing and referenced columns for foreign key disagree"
         ));
     }
-    let (parent_idxs, _) = resolve_cols(&parent_def, &pcol_names[..n_parent])?;
+    let (parent_idxs, _) = resolve_foreign_key_cols(&parent_def, &pcol_names[..n_parent])?;
     if !self_ref {
         let parent_slot = resolved.expect("non-self foreign key resolved above");
         storage.require_schema_usage(parent_def.schema.as_str(), txid)?;
@@ -1932,13 +2526,24 @@ fn attach_fkey(
         }
     }
 
-    // The referenced columns must be a unique key of the parent (PG 42830).
-    if !is_unique_key(&parent_def, &parent_idxs[..n_parent]) {
-        return Err(sql_err!(
-            crate::sql::eval::sqlstate::INVALID_FOREIGN_KEY,
-            "there is no unique constraint matching given keys for referenced table \"{}\"",
-            parent.name
-        ));
+    // The referenced columns must be a unique key of the parent (PG 42830)
+    // that is checked immediately.
+    match referenced_key(&parent_def, &parent_idxs[..n_parent]) {
+        ReferencedKey::Usable => {}
+        ReferencedKey::Deferrable => {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "cannot use a deferrable unique constraint for referenced table \"{}\"",
+                parent.name
+            ));
+        }
+        ReferencedKey::Missing => {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::INVALID_FOREIGN_KEY,
+                "there is no unique constraint matching given keys for referenced table \"{}\"",
+                parent.name
+            ));
+        }
     }
     let fname = match name {
         Some(n) => SqlName::parse(n)?,
@@ -1973,6 +2578,8 @@ fn attach_fkey(
     fk.parent_cols[..n_parent].copy_from_slice(&parent_idxs[..n_parent]);
     fk.n_parent_cols = n_parent;
     fk.on_delete = fk_action_of(on_delete);
+    fk.delete_set_cols = delete_set_cols;
+    fk.n_delete_set_cols = n_delete_set;
     fk.on_update = fk_action_of(on_update);
     fk.timing = storage_timing(timing);
     fk.validation = storage_validation(validation);
@@ -2053,13 +2660,6 @@ fn check_foreign_key_column_types(
     (referencing_name, referencing): (&str, &crate::storage::ColumnMeta),
     (referenced_name, referenced): (&str, &crate::storage::ColumnMeta),
 ) -> Result<(), SqlError> {
-    if super::foreign_key_equality::dissimilar_composites(referencing.ctype, referenced.ctype) {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "foreign key constraint \"{}\" between different composite types is not supported",
-            constraint
-        ));
-    }
     if super::foreign_key_equality::key_equality(referencing.ctype, referenced.ctype).is_none() {
         let type_oid = |column: &crate::storage::ColumnMeta| {
             storage
@@ -2162,22 +2762,46 @@ pub(super) fn references_named_key<Definition0: crate::storage::DefinitionBackin
         .is_some_and(|key| key.name.as_str() == name)
 }
 
-fn is_unique_key<Definition0: crate::storage::DefinitionBacking>(
+/// Whether a set of columns is a unique key a foreign key can reference.
+enum ReferencedKey {
+    Usable,
+    /// Only a deferrable unique key matches; PostgreSQL rejects it.
+    Deferrable,
+    Missing,
+}
+
+fn referenced_key<Definition0: crate::storage::DefinitionBacking>(
     def: &crate::storage::TableDefinition<Definition0>,
     columns: &[u16],
-) -> bool {
+) -> ReferencedKey {
     if columns.len() == 1 {
         let c = &def.columns()[columns[0] as usize];
         if c.unique || c.primary {
-            return true;
+            return ReferencedKey::Usable;
         }
     }
-    def.uniques().iter().any(|uk| {
-        !uk.timing.is_deferrable() && uk.n_cols == columns.len() && {
-            let a = uk.columns();
-            columns.iter().all(|c| a.contains(c)) && a.iter().all(|c| columns.contains(c))
+    let mut found = ReferencedKey::Missing;
+    for key in def.uniques() {
+        let keyed = key.columns();
+        if key.n_cols == columns.len()
+            && columns.iter().all(|c| keyed.contains(c))
+            && keyed.iter().all(|c| columns.contains(c))
+        {
+            if !key.timing.is_deferrable() {
+                return ReferencedKey::Usable;
+            }
+            found = ReferencedKey::Deferrable;
         }
-    })
+    }
+    found
+}
+
+fn primary_key_is_deferrable<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
+) -> bool {
+    def.uniques()
+        .iter()
+        .any(|key| key.kind.is_primary() && key.timing.is_deferrable())
 }
 
 fn storage_timing(timing: AstConstraintTiming) -> crate::storage::ConstraintTiming {
@@ -2202,4 +2826,24 @@ fn storage_validation(validation: AstConstraintValidation) -> crate::storage::Co
         }
         AstConstraintValidation::NotEnforced => crate::storage::ConstraintValidation::NotEnforced,
     }
+}
+
+/// PostgreSQL 18's refusal of a key, index or statistics over a virtual
+/// generated column, whose values the row does not hold.
+pub(crate) fn reject_virtual_columns<Definition0: crate::storage::DefinitionBacking>(
+    def: &crate::storage::TableDefinition<Definition0>,
+    columns: &[u16],
+    what: &str,
+) -> Result<(), SqlError> {
+    if columns
+        .iter()
+        .any(|&column| def.columns()[usize::from(column)].default.is_virtual())
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "{} on virtual generated columns are not supported",
+            what
+        ));
+    }
+    Ok(())
 }

@@ -125,10 +125,27 @@ impl ViewSecurityBarrier {
 /// PostgreSQL's three view options.  Parsing them as a closed state keeps a
 /// later executor from treating a misspelled option as inert catalog text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ViewOption {
+pub enum ViewOptionValue {
     CheckOption(ViewCheckOption),
     SecurityBarrier(bool),
     SecurityInvoker(bool),
+}
+
+/// A view option with its value as written, which `reloptions` lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewOption {
+    pub value: ViewOptionValue,
+    pub spelling: crate::storage::ReloptionSpelling,
+}
+
+impl ViewOption {
+    pub const fn name(self) -> ViewOptionName {
+        match self.value {
+            ViewOptionValue::CheckOption(_) => ViewOptionName::CheckOption,
+            ViewOptionValue::SecurityBarrier(_) => ViewOptionName::SecurityBarrier,
+            ViewOptionValue::SecurityInvoker(_) => ViewOptionName::SecurityInvoker,
+        }
+    }
 }
 
 /// One option name accepted by `ALTER VIEW ... RESET (...)`.
@@ -409,6 +426,9 @@ pub enum CreateSchemaElement<'a> {
         security: ViewSecurity,
         security_barrier: ViewSecurityBarrier,
         check_option: Option<ViewCheckOption>,
+        /// The written options in `reloptions` order, with a trailing
+        /// `WITH CHECK OPTION` clause last.
+        option_order: crate::storage::ViewOptionOrder,
         sql: &'a str,
     },
     Index {
@@ -549,6 +569,9 @@ pub enum TransactionTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingSyntax {
     DecodedValue,
+    /// Several comma-separated items, joined with `", "`, for a parameter
+    /// that accepts a list only once PL/pgSQL has loaded.
+    DecodedList,
     Default,
     FromCurrent,
     TimeZone,
@@ -663,6 +686,9 @@ pub enum Stmt<'a> {
         security: ViewSecurity,
         security_barrier: ViewSecurityBarrier,
         check_option: Option<ViewCheckOption>,
+        /// The written options in `reloptions` order, with a trailing
+        /// `WITH CHECK OPTION` clause last.
+        option_order: crate::storage::ViewOptionOrder,
         sql: &'a str,
     },
     /// `ALTER VIEW` retains a closed action rather than sharing the broader
@@ -874,7 +900,7 @@ pub enum Stmt<'a> {
     },
     DropTextSearch {
         kind: TextSearchObjectKind,
-        name: QualName<'a>,
+        names: &'a [QualName<'a>],
         if_exists: bool,
         cascade: bool,
     },
@@ -2744,6 +2770,18 @@ impl IndexAccessMethod {
         }
     }
 
+    /// `pg_am.oid`.
+    pub const fn oid(self) -> i32 {
+        match self {
+            Self::Btree => 403,
+            Self::Hash => 405,
+            Self::Brin => 3580,
+            Self::Gist => 783,
+            Self::Gin => 2742,
+            Self::SpGist => 4000,
+        }
+    }
+
     pub const fn name(self) -> &'static str {
         match self {
             Self::Btree => "btree",
@@ -2930,6 +2968,14 @@ pub struct IndexColumn<'a> {
     pub ordering_specified: bool,
     pub nulls_first: bool,
     pub nulls_order_specified: bool,
+}
+
+/// One `EXCLUDE` element as written: an index element (a column, a function
+/// call or a parenthesized expression) and the operator after `WITH`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExclusionElementSpec<'a> {
+    pub key: IndexColumn<'a>,
+    pub operator: &'a str,
 }
 
 /// The relation class selected by REINDEX. Other PostgreSQL forms require
@@ -3213,6 +3259,41 @@ pub struct Select<'a> {
     /// `FOR UPDATE`/`FOR SHARE`/… row-locking clauses, in written order. Empty
     /// when the query carries none.
     pub locking: &'a [LockClause<'a>],
+    /// How the query was written where execution no longer needs it.
+    pub written: WrittenQuery<'a>,
+}
+
+/// The written form of a query level that its executable fields expand,
+/// kept so that `pg_get_viewdef` and `pg_get_ruledef` print it as written.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WrittenQuery<'a> {
+    /// The level is one row of a `VALUES` list.
+    pub values: bool,
+    /// `LIMIT ALL`, which executes as no limit.
+    pub limit_all: bool,
+    /// The `GROUP BY` elements, by position in `group_by`, when the clause
+    /// holds grouping sets.
+    pub grouping: &'a [GroupingElement<'a>],
+}
+
+impl WrittenQuery<'_> {
+    pub const PLAIN: Self = Self {
+        values: false,
+        limit_all: false,
+        grouping: &[],
+    };
+}
+
+/// One written `GROUP BY` element.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GroupingElement<'a> {
+    /// One expression, by its position in `group_by`.
+    Expression(u16),
+    /// A parenthesized list, `(a, b)` or `()`.
+    List(&'a [u16]),
+    Rollup(&'a [GroupingElement<'a>]),
+    Cube(&'a [GroupingElement<'a>]),
+    Sets(&'a [GroupingElement<'a>]),
 }
 
 impl Select<'_> {
@@ -3235,6 +3316,7 @@ impl Select<'_> {
         with: &[],
         set_body: None,
         locking: &[],
+        written: WrittenQuery::PLAIN,
     };
 }
 
@@ -3476,6 +3558,13 @@ impl PartialEq for MaterializedCteSource<'_> {
     }
 }
 
+/// Which calls [`Expr::contains_call`] looks for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallScope {
+    Any,
+    Routines,
+}
+
 impl Expr<'_> {
     /// A `ROW(...)` or `(a, b, ...)` constructor. PostgreSQL compares two of
     /// these field by field with SQL-standard NULL semantics, while every
@@ -3509,6 +3598,18 @@ impl Expr<'_> {
             | Expr::Collate { operand, .. } => operand.folds_to_constant(),
             Expr::Binary { left, right, .. } => {
                 left.folds_to_constant() && right.folds_to_constant()
+            }
+            // `textlike` and its kin are immutable, so a pattern match of
+            // constants folds too.
+            Expr::Like {
+                operand,
+                pattern,
+                escape,
+                ..
+            } => {
+                operand.folds_to_constant()
+                    && pattern.folds_to_constant()
+                    && escape.is_none_or(|escape| escape.folds_to_constant())
             }
             _ => false,
         }
@@ -3610,15 +3711,34 @@ pub struct TableSample<'a> {
 /// Source provenance does not participate in SQL expression equality. Runtime
 /// plan keys must extract the actual offset, never compare this annotation.
 #[derive(Debug, Clone, Copy)]
-pub struct SourcePosition(Option<usize>);
+pub struct SourcePosition {
+    offset: Option<usize>,
+    /// The node is one part of a single grammar construct the parser
+    /// expanded (`BETWEEN`'s connective), which PostgreSQL's grammar does not
+    /// merge into a surrounding `AND`/`OR` list.
+    expanded: bool,
+}
 
 impl SourcePosition {
-    pub const UNKNOWN: Self = Self(None);
+    pub const UNKNOWN: Self = Self::new(None);
     pub const fn new(offset: Option<usize>) -> Self {
-        Self(offset)
+        Self {
+            offset,
+            expanded: false,
+        }
     }
     pub const fn get(self) -> Option<usize> {
-        self.0
+        self.offset
+    }
+    /// This position, marking its node as an expanded grammar construct.
+    pub const fn expanded(self) -> Self {
+        Self {
+            expanded: true,
+            ..self
+        }
+    }
+    pub const fn is_expanded(self) -> bool {
+        self.expanded
     }
 }
 
@@ -3772,8 +3892,15 @@ pub enum SelectItem<'a> {
 }
 
 /// A window function's resolved `OVER` clause.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct WindowSpec<'a> {
+    /// The `WINDOW` clause name this specification was defined under, which
+    /// `OVER name` keeps for deparsing.
+    pub name: Option<&'a str>,
+    /// The window an `OVER (base ...)` or `AS (base ...)` copy extends.
+    pub base: Option<&'a str>,
+    /// A copy took its `ORDER BY` from `base`.
+    pub copied_order: bool,
     pub partition_by: &'a [&'a Expr<'a>],
     pub order_by: &'a [OrderBy<'a>],
     /// Explicit `ROWS`/`RANGE`/`GROUPS` frame; None = the default frame
@@ -3781,10 +3908,23 @@ pub struct WindowSpec<'a> {
     pub frame: Option<WindowFrame<'a>>,
 }
 
+/// Names only record how the specification was written; two specifications
+/// that partition, order and frame rows alike evaluate alike.
+impl PartialEq for WindowSpec<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.partition_by == other.partition_by
+            && self.order_by == other.order_by
+            && self.frame == other.frame
+    }
+}
+
 /// An explicit window frame clause.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WindowFrame<'a> {
     pub units: FrameUnits,
+    /// Written as `BETWEEN start AND end`; otherwise `end` is the implied
+    /// `CURRENT ROW`.
+    pub between: bool,
     pub start: FrameBound<'a>,
     pub end: FrameBound<'a>,
     pub exclusion: FrameExclusion,
@@ -3903,6 +4043,9 @@ impl RelationStorageOptionNames {
 /// durable relation definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableAccessMethod<'a> {
+    /// No `USING` clause: a partitioned table records none, and any other
+    /// table takes its partition parent's or `default_table_access_method`.
+    Unspecified,
     Heap,
     /// A syntactically valid access-method name whose catalog resolution is
     /// deferred to execution. It cannot reach storage unless it resolves to
@@ -4235,6 +4378,8 @@ pub enum TableConstraint<'a> {
         /// enforcement time.
         text: &'a str,
         validation: ConstraintValidation,
+        /// `NO INHERIT`: the constraint stays local to its table.
+        no_inherit: bool,
     },
     ForeignKey {
         source_position: SourcePosition,
@@ -4244,6 +4389,9 @@ pub enum TableConstraint<'a> {
         /// Referenced columns; empty means "the parent's primary key".
         parent_cols: &'a [&'a str],
         on_delete: FkAction,
+        /// The referencing columns `ON DELETE SET NULL (...)` or `SET
+        /// DEFAULT (...)` changes; empty means all of them.
+        delete_set_columns: &'a [&'a str],
         on_update: FkAction,
         timing: ConstraintTiming,
         validation: ConstraintValidation,
@@ -4251,8 +4399,10 @@ pub enum TableConstraint<'a> {
     Exclusion {
         source_position: SourcePosition,
         name: Option<&'a str>,
-        columns: &'a [&'a str],
-        operators: &'a [ExclusionOperator],
+        /// The access method enforcing the constraint (`USING`, B-tree by
+        /// default).
+        method: IndexAccessMethod,
+        elements: &'a [ExclusionElementSpec<'a>],
         predicate: Option<&'a Expr<'a>>,
         predicate_text: Option<&'a str>,
         timing: ConstraintTiming,
@@ -4279,13 +4429,6 @@ impl TableConstraint<'_> {
             } => *source_position,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExclusionOperator {
-    Equal,
-    Overlaps,
-    Adjacent,
 }
 
 /// The transaction-local check mode selected by a constraint definition or
@@ -4602,6 +4745,23 @@ pub enum RoutineBody<'a> {
     String(&'a str),
     Return(&'a str),
     Atomic(&'a str),
+    /// `AS 'file' [, 'link symbol']` of a `LANGUAGE C` routine; without a
+    /// symbol the routine's name is its symbol.
+    Library {
+        file: &'a str,
+        symbol: Option<&'a str>,
+    },
+}
+
+impl<'a> RoutineBody<'a> {
+    /// The text `pg_proc.prosrc` keeps: a C routine's link symbol, which
+    /// defaults to the routine's `name`.
+    pub fn stored_text(self, name: &'a str) -> &'a str {
+        match self {
+            Self::String(body) | Self::Return(body) | Self::Atomic(body) => body,
+            Self::Library { symbol, .. } => symbol.unwrap_or(name),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4655,6 +4815,8 @@ pub enum RoutineVolatility {
 pub enum RoutineLanguage {
     Sql,
     PlPgSql,
+    /// Binds to a native routine pos3ql implements for a built-in module.
+    C,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4877,6 +5039,9 @@ pub struct DropTable<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColumnDef<'a> {
+    /// Where the definition starts, which orders it among the table's
+    /// constraints as PostgreSQL numbers them.
+    pub source_position: SourcePosition,
     pub name: &'a str,
     pub type_name: &'a str,
     /// PostgreSQL atttypmod for the declared type: -1 when no `(...)` modifier.
@@ -4907,9 +5072,11 @@ pub struct ColumnDef<'a> {
     /// The raw source text of the DEFAULT expression, for storing non-constant
     /// defaults and for `pg_get_expr` / `\d` reconstruction.
     pub default_text: Option<&'a str>,
-    /// `GENERATED ALWAYS AS (expr) STORED`: the raw source text of the generation
-    /// expression, computed from the row's other columns at insert/update.
+    /// `GENERATED ALWAYS AS (expr) [STORED | VIRTUAL]`: the raw source text of
+    /// the generation expression, computed from the row's other columns.
     pub generated_text: Option<&'a str>,
+    /// The generation kind; `VIRTUAL` when neither keyword is written.
+    pub generated_kind: crate::storage::Generation,
     /// `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [(options)]`.
     pub identity: Option<IdentitySpec<'a>>,
 }
@@ -4927,8 +5094,8 @@ pub struct IdentitySpec<'a> {
 
 /// The result of parsing a `GENERATED` column clause.
 pub enum ColGen<'a> {
-    /// `ALWAYS AS (expr) STORED`.
-    Generated(&'a str),
+    /// `ALWAYS AS (expr) [STORED | VIRTUAL]`.
+    Generated(&'a str, crate::storage::Generation),
     /// `{ ALWAYS | BY DEFAULT } AS IDENTITY [(options)]`.
     Identity(IdentitySpec<'a>),
 }
@@ -5189,6 +5356,8 @@ pub struct OnConflictTarget<'a> {
 pub struct Update<'a> {
     pub source_position: SourcePosition,
     pub table: QualName<'a>,
+    /// `UPDATE ONLY` leaves inheritance children out.
+    pub inheritance: RelationInheritance,
     pub alias: Option<&'a str>,
     pub assignments: &'a [(&'a str, &'a Expr<'a>)],
     /// Extra tables joined for the assignment/WHERE (`UPDATE t SET ... FROM e`).
@@ -5200,6 +5369,8 @@ pub struct Update<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Delete<'a> {
     pub table: QualName<'a>,
+    /// `DELETE FROM ONLY` leaves inheritance children out.
+    pub inheritance: RelationInheritance,
     pub alias: Option<&'a str>,
     /// Extra tables joined for the WHERE (`DELETE FROM t USING e`).
     pub using: Option<&'a FromClause<'a>>,
@@ -5933,8 +6104,8 @@ pub enum Expr<'a> {
     /// time. PostgreSQL types these as numeric, not float8.
     NumericLit(&'a str),
     Str(&'a str),
-    /// Bit-string literal (`B'1010'` / `X'1F'`): the canonical `'0'`/`'1'`
-    /// characters, typed `bit(len)`.
+    /// Bit-string literal (`B'1010'` / `X'1F'`): `B` or `X`, then the written
+    /// digits, typed `bit(len)`.
     BitLit(&'a str),
     Column {
         /// Optional table/alias qualifier.
@@ -6164,6 +6335,9 @@ pub enum CaseOrigin {
     /// (negated for `IS DISTINCT FROM`), as PostgreSQL's `DistinctExpr` calls
     /// the equality operator's function.
     DistinctFrom { negated: bool },
+    /// `x IS [NOT] UNKNOWN`: one `WHEN` whose condition is `x IS [NOT] NULL`,
+    /// for a boolean `x`.
+    UnknownTest { negated: bool },
 }
 
 pub(crate) fn is_volatile_function(name: &str) -> bool {
@@ -6348,6 +6522,45 @@ impl<'a> Expr<'a> {
         Some((operand, *value, *negated))
     }
 
+    /// The operand of `x IS [NOT] UNKNOWN` and whether the test is negated.
+    pub(crate) fn unknown_test_operand(&self) -> Option<(&'a Expr<'a>, bool)> {
+        let Expr::Case {
+            origin: CaseOrigin::UnknownTest { negated },
+            whens: [(Expr::IsNull { operand, .. }, _)],
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some((operand, *negated))
+    }
+
+    /// The boolean operand of a desugared `IS [NOT] TRUE/FALSE/UNKNOWN` and
+    /// the test's spelling, for its type check.
+    pub(crate) fn boolean_test_argument(&self) -> Option<(&'a Expr<'a>, &'static str)> {
+        if let Some((operand, value, negated)) = self.boolean_test_operand() {
+            return Some((
+                operand,
+                match (value, negated) {
+                    (true, false) => "IS TRUE",
+                    (true, true) => "IS NOT TRUE",
+                    (false, false) => "IS FALSE",
+                    (false, true) => "IS NOT FALSE",
+                },
+            ));
+        }
+        self.unknown_test_operand().map(|(operand, negated)| {
+            (
+                operand,
+                if negated {
+                    "IS NOT UNKNOWN"
+                } else {
+                    "IS UNKNOWN"
+                },
+            )
+        })
+    }
+
     pub(crate) const fn source_position(&self) -> SourcePosition {
         match self {
             Self::Call {
@@ -6499,7 +6712,23 @@ impl<'a> Expr<'a> {
     /// non-constant DEFAULT (`now()`, `nextval(...)`, `random()`, …) that must be
     /// evaluated per inserted row rather than folded once.
     pub fn contains_call(&self) -> bool {
+        self.contains_call_in(CallScope::Any)
+    }
+
+    /// Whether evaluating the expression can run a routine: a `ROW(...)`
+    /// constructor only assembles its fields, so the planner can treat
+    /// `ROW(1, 'a')::t` as the constant PostgreSQL folds it to.
+    pub fn calls_routine(&self) -> bool {
+        self.contains_call_in(CallScope::Routines)
+    }
+
+    fn contains_call_in(&self, scope: CallScope) -> bool {
         match self {
+            Expr::Call { args, .. }
+                if scope == CallScope::Routines && self.is_row_constructor() =>
+            {
+                args.iter().any(|argument| argument.contains_call_in(scope))
+            }
             Expr::Call { .. } | Expr::OuterAggregate { .. } => true,
             Expr::Null
             | Expr::Bool(_)
@@ -6525,11 +6754,11 @@ impl<'a> Expr<'a> {
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
             | Expr::Field { base: operand, .. }
-            | Expr::RecordFieldIndex { base: operand, .. } => operand.contains_call(),
+            | Expr::RecordFieldIndex { base: operand, .. } => operand.contains_call_in(scope),
             Expr::Slice { base, lower, upper } => {
-                base.contains_call()
-                    || lower.is_some_and(|e| e.contains_call())
-                    || upper.is_some_and(|e| e.contains_call())
+                base.contains_call_in(scope)
+                    || lower.is_some_and(|e| e.contains_call_in(scope))
+                    || upper.is_some_and(|e| e.contains_call_in(scope))
             }
             Expr::Binary { left, right, .. }
             | Expr::Subscript {
@@ -6540,9 +6769,9 @@ impl<'a> Expr<'a> {
                 operand: left,
                 array: right,
                 ..
-            } => left.contains_call() || right.contains_call(),
+            } => left.contains_call_in(scope) || right.contains_call_in(scope),
             Expr::InList { operand, list, .. } => {
-                operand.contains_call() || list.iter().any(|e| e.contains_call())
+                operand.contains_call_in(scope) || list.iter().any(|e| e.contains_call_in(scope))
             }
             Expr::Like {
                 operand,
@@ -6550,26 +6779,28 @@ impl<'a> Expr<'a> {
                 escape,
                 ..
             } => {
-                operand.contains_call()
-                    || pattern.contains_call()
-                    || escape.is_some_and(|expression| expression.contains_call())
+                operand.contains_call_in(scope)
+                    || pattern.contains_call_in(scope)
+                    || escape.is_some_and(|expression| expression.contains_call_in(scope))
             }
             Expr::Match {
                 operand, pattern, ..
-            } => operand.contains_call() || pattern.contains_call(),
+            } => operand.contains_call_in(scope) || pattern.contains_call_in(scope),
             Expr::Case {
                 operand,
                 whens,
                 otherwise,
                 ..
             } => {
-                operand.map(|o| o.contains_call()).unwrap_or(false)
+                operand.map(|o| o.contains_call_in(scope)).unwrap_or(false)
                     || whens
                         .iter()
-                        .any(|(c, r)| c.contains_call() || r.contains_call())
-                    || otherwise.map(|o| o.contains_call()).unwrap_or(false)
+                        .any(|(c, r)| c.contains_call_in(scope) || r.contains_call_in(scope))
+                    || otherwise
+                        .map(|o| o.contains_call_in(scope))
+                        .unwrap_or(false)
             }
-            Expr::Array(items) => items.iter().any(|e| e.contains_call()),
+            Expr::Array(items) => items.iter().any(|e| e.contains_call_in(scope)),
             // A subquery-bearing default is rejected elsewhere; treat it as
             // non-foldable to be safe.
             Expr::Subquery(_)
@@ -6719,7 +6950,7 @@ impl<'a> Expr<'a> {
         self.find_function(&is_volatile_function)
     }
 
-    fn find_function(&self, matches: &dyn Fn(&str) -> bool) -> Option<&str> {
+    pub(crate) fn find_function(&self, matches: &dyn Fn(&str) -> bool) -> Option<&str> {
         match self {
             Expr::Call { name, args, .. } => {
                 if matches(name) {

@@ -807,7 +807,17 @@ pub(super) fn dependencies<'a>(
 ) -> Result<&'a [&'a [Datum<'a>]], SqlError> {
     let constraints = super::pg_constraint_values(storage, transaction, arena)?;
     let definition = super::schema::require("pg_constraint", false);
-    let [kind, oid, domain, table, key, index, parent, referenced] = [
+    let [
+        kind,
+        oid,
+        domain,
+        table,
+        key,
+        index,
+        parent,
+        referenced,
+        parent_constraint,
+    ] = [
         "contype",
         "oid",
         "contypid",
@@ -816,6 +826,7 @@ pub(super) fn dependencies<'a>(
         "conindid",
         "confrelid",
         "confkey",
+        "conparentid",
     ]
     .map(|name| {
         definition
@@ -901,6 +912,27 @@ pub(super) fn dependencies<'a>(
                 0,
                 b'i',
             )?;
+            // PostgreSQL's `ConstraintSetParentConstraint`: a partition's
+            // constraint goes with its parent's or with the partition.
+            let parent = integer(values[parent_constraint])?;
+            if parent != 0 {
+                push(
+                    super::PG_CONSTRAINT_OID,
+                    oid,
+                    super::PG_CONSTRAINT_OID,
+                    parent,
+                    0,
+                    b'P',
+                )?;
+                push(
+                    super::PG_CONSTRAINT_OID,
+                    oid,
+                    super::PG_CLASS_OID,
+                    table,
+                    0,
+                    b'S',
+                )?;
+            }
         } else if constraint_kind == b'f' {
             push(
                 super::PG_CONSTRAINT_OID,
@@ -923,7 +955,63 @@ pub(super) fn dependencies<'a>(
         }
     }
     for index in indexes {
+        // PostgreSQL's `IndexSetParentIndex`: a partition's index goes with
+        // its parent index or with the partition.
+        let partition_edges = index
+            .index_parent_oid
+            .map(|parent| [(parent, b'P'), (index.table_oid, b'S')]);
         if index.constraint_identity.is_some() {
+            // A constraint index depends on its constraint instead of its
+            // simple key columns; `index_create` still records the columns
+            // its expressions, then its predicate, use.
+            if index.is_exclusion {
+                let table = storage.table_def(index.table_slot, transaction);
+                let mut expressions = crate::storage::ColumnSet::EMPTY;
+                for position in 0..index.n_cols {
+                    if let Some(source) =
+                        super::index_expression_source(storage, index, position, transaction)
+                    {
+                        let source = arena
+                            .alloc_str(source.as_str())
+                            .map_err(|_| crate::sql::eval::arena_full())?;
+                        let expression = crate::sql::parser::parse_expr(source, arena)?;
+                        expressions |=
+                            super::super::exec::check_referenced_columns(expression, &table)?;
+                    }
+                }
+                let mut predicate = crate::storage::ColumnSet::EMPTY;
+                if let Some(source) = index.predicate {
+                    let source = arena
+                        .alloc_str(source.as_str())
+                        .map_err(|_| crate::sql::eval::arena_full())?;
+                    let expression = crate::sql::parser::parse_expr(source, arena)?;
+                    predicate = super::super::exec::check_referenced_columns(expression, &table)?;
+                }
+                for referenced in [expressions, predicate] {
+                    for column in 0..table.n_columns {
+                        if referenced.contains(column) {
+                            push(
+                                super::PG_CLASS_OID,
+                                index.oid,
+                                super::PG_CLASS_OID,
+                                index.table_oid,
+                                i32::from(table.attribute_number(column)),
+                                b'a',
+                            )?;
+                        }
+                    }
+                }
+            }
+            for (referenced, kind) in partition_edges.into_iter().flatten() {
+                push(
+                    super::PG_CLASS_OID,
+                    index.oid,
+                    super::PG_CLASS_OID,
+                    referenced,
+                    0,
+                    kind,
+                )?;
+            }
             continue;
         }
         let table = storage.table_def(index.table_slot, transaction);
@@ -981,6 +1069,44 @@ pub(super) fn dependencies<'a>(
                         i32::from(table.attribute_number(column)),
                         b'a',
                     )?;
+                }
+            }
+        }
+        for (referenced, kind) in partition_edges.into_iter().flatten() {
+            push(
+                super::PG_CLASS_OID,
+                index.oid,
+                super::PG_CLASS_OID,
+                referenced,
+                0,
+                kind,
+            )?;
+        }
+        // The objects the key expressions name, then those the predicate
+        // names, normally: two separately deduplicated sets.
+        if let Some(definition) = super::info_index(storage, index, transaction) {
+            for predicate in [false, true] {
+                let mut references = [(0, 0); crate::storage::MAX_INDEX_EXPRESSION_DEPENDENCIES];
+                let mut count = 0;
+                for entry in definition.expression_dependencies().iter().filter(|entry| {
+                    predicate == (entry.owner == crate::storage::ExpressionOwner::IndexPredicate)
+                }) {
+                    let Ok(bound) =
+                        storage.rebound_stored_query_dependency(entry.dependency(), transaction)
+                    else {
+                        continue;
+                    };
+                    if let Some(reference) =
+                        super::dependencies::stored_reference(storage, transaction, &bound)
+                            .filter(|(_, object)| *object >= crate::storage::FIRST_NORMAL_OBJECT_ID)
+                        && !references[..count].contains(&reference)
+                    {
+                        references[count] = reference;
+                        count += 1;
+                    }
+                }
+                for (class, object) in &references[..count] {
+                    push(super::PG_CLASS_OID, index.oid, *class, *object, 0, b'n')?;
                 }
             }
         }

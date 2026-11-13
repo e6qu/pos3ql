@@ -578,6 +578,7 @@ impl SavedBinding {
             input_owner: input.input_owner,
             input_collation: input.input_collation,
             input_sites: &[],
+            positionals: input.positionals,
             variable_conflict: input.variable_conflict,
             print_strict_params: input.print_strict_params,
             fresh_snapshots: input.fresh_snapshots,

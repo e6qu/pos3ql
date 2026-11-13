@@ -4,15 +4,19 @@ CREATE TABLE t (d int, e int, f int, g int);
 CREATE RULE r1 AS ON INSERT TO a DO ALSO INSERT INTO t (e) VALUES (new.x);
 CREATE RULE r2 AS ON UPDATE TO a DO ALSO UPDATE t SET f = new.y WHERE g = 1;
 CREATE RULE r3 AS ON DELETE TO a DO ALSO DELETE FROM t WHERE d = old.x;
+-- Each column change below has one kind of dependent: which of several
+-- PostgreSQL names first follows pg_depend's physical row order.
+ALTER TABLE t ALTER COLUMN e TYPE bigint;
+ALTER TABLE t ALTER COLUMN f TYPE bigint;
 CREATE FUNCTION fa() RETURNS void LANGUAGE sql BEGIN ATOMIC INSERT INTO t (e, f) VALUES (1, 2); UPDATE t SET g = 3 WHERE d = 1; END;
 CREATE FUNCTION fb() RETURNS void LANGUAGE sql BEGIN ATOMIC INSERT INTO t VALUES (1); END;
 CREATE FUNCTION fc() RETURNS void LANGUAGE sql BEGIN ATOMIC DELETE FROM t; END;
 CREATE FUNCTION fd() RETURNS void LANGUAGE sql BEGIN ATOMIC INSERT INTO t SELECT 1, 2; END;
 SELECT pg_describe_object(classid, objid, objsubid) AS dependent, pg_describe_object(refclassid, refobjid, refobjsubid) AS referenced, deptype FROM pg_depend WHERE refobjid = 't'::regclass ORDER BY 1, 2;
-ALTER TABLE t ALTER COLUMN e TYPE bigint;
-ALTER TABLE t ALTER COLUMN f TYPE bigint;
 DROP RULE r1 ON a;
 DROP RULE r2 ON a;
+ALTER TABLE t ALTER COLUMN e TYPE bigint;
+ALTER TABLE t ALTER COLUMN f TYPE bigint;
 DROP FUNCTION fa();
 ALTER TABLE t ALTER COLUMN e TYPE bigint;
 ALTER TABLE t ALTER COLUMN f TYPE bigint;

@@ -178,6 +178,7 @@ fn pending_calls_own_nested_arguments_and_types_after_scratch_release_and_arena_
                     .alloc_slice_copy(&[super::super::types::RecordField {
                         name,
                         type_oid: super::super::types::oid::TEXT,
+                        type_mod: -1,
                         value: Datum::Text(text),
                     }])
                     .unwrap();
@@ -318,6 +319,7 @@ fn completed_invocations_keep_values_after_the_body_source_is_released() {
                 .alloc_slice_copy(&[super::super::types::RecordField {
                     name,
                     type_oid: super::super::types::oid::TEXT,
+                    type_mod: -1,
                     value: Datum::Text(text),
                 }])
                 .unwrap();

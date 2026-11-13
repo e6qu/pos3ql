@@ -457,6 +457,8 @@ struct SubscriptionBootstrapWork {
     line: crate::mem::buffer::FixedBuf,
     binary_header_pending: bool,
     binary_end_seen: bool,
+    /// Input rows of the table copy so far, for COPY error context.
+    copied_rows: u64,
 }
 
 fn subscription_name_array(
@@ -1020,6 +1022,7 @@ impl Server {
                         )?,
                         binary_header_pending: false,
                         binary_end_seen: false,
+                        copied_rows: 0,
                     },
                     name: None,
                     definition: None,
@@ -2400,6 +2403,7 @@ impl Server {
         worker.bootstrap.copy_setup = Some(setup);
         worker.bootstrap.binary_header_pending = binary;
         worker.bootstrap.binary_end_seen = false;
+        worker.bootstrap.copied_rows = 0;
         worker.bootstrap.stage = SubscriptionBootstrapStage::Copying;
         Ok(true)
     }
@@ -2500,6 +2504,12 @@ impl Server {
             return self.advance_subscription_sql(slot, readable, writable);
         }
         let worker = &mut self.subscriptions[slot];
+        // Readiness reported in the same poll batch that unbound the worker
+        // (its subscription was disabled or dropped) belongs to the closed
+        // connection.
+        if !worker.client.is_bound() {
+            return Ok(());
+        }
         let mut failed = false;
         let mut cleanup_slot_absent = false;
         let mut publisher_failure = None;
@@ -2754,10 +2764,12 @@ impl Server {
                                             .copy_setup
                                             .as_ref()
                                             .expect("copying stage owns setup");
+                                        worker.bootstrap.copied_rows += 1;
                                         if let Err(error) = worker.apply.copy_binary_row(
                                             &mut self.engine,
                                             setup,
                                             &worker.bootstrap.line.readable()[..length],
+                                            worker.bootstrap.copied_rows,
                                         ) {
                                             local_failure = Some(error);
                                             return Err(crate::pg::replication_client::ClientError::PublisherError);
@@ -2774,10 +2786,12 @@ impl Server {
                                         .copy_setup
                                         .as_ref()
                                         .expect("copying stage owns setup");
+                                    worker.bootstrap.copied_rows += 1;
                                     if let Err(error) = worker.apply.copy_line(
                                         &mut self.engine,
                                         setup,
                                         worker.bootstrap.line.readable(),
+                                        worker.bootstrap.copied_rows,
                                     ) {
                                         local_failure = Some(error);
                                         return Err(crate::pg::replication_client::ClientError::PublisherError);
@@ -4511,6 +4525,7 @@ mod tests {
             line: crate::mem::buffer::FixedBuf::new(budget, "test_subscription_copy", 256).unwrap(),
             binary_header_pending: false,
             binary_end_seen: false,
+            copied_rows: 0,
         }
     }
 

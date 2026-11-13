@@ -37,10 +37,14 @@ oids = sorted({int(oid) for oid in re.findall(r"\((\d+), \d+\)", index)})
 if not oids:
     sys.exit("no callable OIDs found")
 
-sql = ("SELECT coalesce(jsonb_agg(jsonb_build_array(objoid::integer, description) "
+# CALLABLE_OIDS number the routines initdb creates after the platform's
+# collations as the pinned CI image does, where dsnowball_init is 13232.
+pinned_oid = ("objoid::integer - CASE WHEN objoid >= 'dsnowball_init'::regproc "
+              "THEN 'dsnowball_init'::regproc::integer - 13232 ELSE 0 END")
+sql = ("SELECT coalesce(jsonb_agg(jsonb_build_array(" + pinned_oid + ", description) "
        "ORDER BY objoid), '[]') FROM pg_description "
        "WHERE classoid = 'pg_catalog.pg_proc'::regclass AND objsubid = 0 "
-       "AND objoid IN (" + ",".join(map(str, oids)) + ")")
+       "AND " + pinned_oid + " IN (" + ",".join(map(str, oids)) + ")")
 output = psql(sql)
 rows = json.loads(output)
 

@@ -274,6 +274,7 @@ mod ownership_tests {
                         .alloc_slice_copy(&[super::super::super::types::RecordField {
                             name: field,
                             type_oid: super::super::super::types::oid::TEXT,
+                            type_mod: -1,
                             value: Datum::Text(text),
                         }])
                         .unwrap();

@@ -914,9 +914,12 @@ fn procedural_variable_column_conflicts_follow_postgresql() {
                 "CREATE FUNCTION vc_bad() RETURNS int LANGUAGE plpgsql AS $$ #nonsense BEGIN RETURN 1; END $$",
                 &["ERROR 42601 syntax error at or near \"nonsense\" @62"],
             ),
+            // Until PL/pgSQL loads, the parameter is a placeholder.
+            ("SET plpgsql.variable_conflict = bogus", &["SET"]),
             (
-                "SET plpgsql.variable_conflict = bogus",
+                "DO $$ BEGIN NULL; END $$; SET plpgsql.variable_conflict = bogus",
                 &[
+                    "DO",
                     "ERROR 22023 invalid value for parameter \"plpgsql.variable_conflict\": \"bogus\" hint: Available values: error, use_variable, use_column.",
                 ],
             ),
@@ -926,9 +929,10 @@ fn procedural_variable_column_conflicts_follow_postgresql() {
                 &["SET", "data|use_column", "SHOW", "data|1", "SELECT 1"],
             ),
             (
-                "SELECT enumvals, context, category FROM pg_settings \
+                "DO $$ BEGIN NULL; END $$; SELECT enumvals, context, category FROM pg_settings \
                  WHERE name = 'plpgsql.variable_conflict'",
                 &[
+                    "DO",
                     "data|{error,use_variable,use_column}|superuser|Customized Options",
                     "SELECT 1",
                 ],
@@ -1064,6 +1068,53 @@ fn insert_target_counts_are_positioned() {
             let output = run_with(engine, budget, sql);
             assert_eq!(transcript(&output), *expected, "{sql}");
         }
+    });
+}
+
+#[test]
+fn record_fields_and_referential_actions_report_postgresql_context() {
+    with_engine("record-field-context", |engine, budget| {
+        for statement in [
+            "CREATE TABLE parent (id int PRIMARY KEY)",
+            "CREATE TABLE child (id int, parent_id int REFERENCES parent ON DELETE CASCADE)",
+            "CREATE FUNCTION refuse() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN RAISE EXCEPTION 'refused %', OLD.id; END $$",
+            "CREATE TRIGGER refuse BEFORE DELETE ON child FOR EACH ROW EXECUTE FUNCTION refuse()",
+            "INSERT INTO parent VALUES (1)",
+            "INSERT INTO child VALUES (7, 1)",
+        ] {
+            let output = run_with(engine, budget, statement);
+            assert_eq!(reports(&output), Vec::<String>::new(), "{statement}");
+        }
+        assert_reports(
+            engine,
+            budget,
+            &[
+                (
+                    "DO $$ DECLARE r record; BEGIN SELECT 1 AS a INTO r; \
+                     RAISE NOTICE '%', r.b; END $$",
+                    &[
+                        "E|C=42703|M=record \"r\" has no field \"b\"|W=PL/pgSQL expression \"r.b\"\n\
+                         PL/pgSQL function inline_code_block line 1 at RAISE",
+                    ],
+                ),
+                (
+                    "DO $$ DECLARE x int := 0; BEGIN RAISE NOTICE '%', (SELECT 1 / x); END $$",
+                    &[
+                        "E|C=22012|M=division by zero|W=PL/pgSQL expression \"(SELECT 1 / x)\"\n\
+                         PL/pgSQL function inline_code_block line 1 at RAISE",
+                    ],
+                ),
+                (
+                    "DELETE FROM parent",
+                    &[
+                        "E|C=P0001|M=refused 7|W=PL/pgSQL function refuse() line 1 at RAISE\n\
+                         SQL statement \"DELETE FROM ONLY \"public\".\"child\" WHERE $1 \
+                         OPERATOR(pg_catalog.=) \"parent_id\"\"",
+                    ],
+                ),
+            ],
+        );
     });
 }
 

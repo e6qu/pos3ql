@@ -302,7 +302,7 @@ pub fn projected_value_len(v: &Datum) -> Result<usize, SqlError> {
                 n += 4;
             }
             for f in *fields {
-                n += length_bytes + f.name.len() + 4 + projected_value_len(&f.value)?;
+                n += length_bytes + f.name.len() + 8 + projected_value_len(&f.value)?;
             }
             n
         }
@@ -722,7 +722,7 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             let text_len = w.at - 5;
             out[1..5].copy_from_slice(&(text_len as u32).to_le_bytes());
             // Structural tail: field count, then per field its name, type
-            // OID, and nested tagged value.
+            // OID and modifier, and nested tagged value.
             let mut at = 5 + text_len;
             lengths.write(fields.len(), &mut out[at..]);
             at += length_bytes;
@@ -732,7 +732,8 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
                 out[at..at + f.name.len()].copy_from_slice(f.name.as_bytes());
                 at += f.name.len();
                 out[at..at + 4].copy_from_slice(&f.type_oid.to_le_bytes());
-                at += 4;
+                out[at + 4..at + 8].copy_from_slice(&f.type_mod.to_le_bytes());
+                at += 8;
                 at += write_projected_value(&f.value, &mut out[at..]);
             }
             at
@@ -768,7 +769,8 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
                 out[at..at + f.name.len()].copy_from_slice(f.name.as_bytes());
                 at += f.name.len();
                 out[at..at + 4].copy_from_slice(&f.type_oid.to_le_bytes());
-                at += 4;
+                out[at + 4..at + 8].copy_from_slice(&f.type_mod.to_le_bytes());
+                at += 8;
                 at += write_projected_value(&f.value, &mut out[at..]);
             }
             at
@@ -1397,7 +1399,7 @@ impl<'a> Iterator for ProjectedFields<'a> {
         let type_oid = i32::from_le_bytes(self.bytes[type_at..type_at + 4].try_into().unwrap());
         let value = ProjectedValue {
             bytes: self.bytes,
-            tag_at: type_at + 4,
+            tag_at: type_at + 8,
         };
         let tag = self.bytes[value.tag_at];
         self.at = value.tag_at + 1 + decode_projected_value(self.bytes, tag, value.tag_at + 1).1;
@@ -1500,7 +1502,7 @@ fn record_tail_len(bytes: &[u8], at: usize, lengths: RecordLengths) -> usize {
     cursor += length_bytes;
     for _ in 0..n_fields {
         let name_len = lengths.read(bytes, cursor);
-        cursor += length_bytes + name_len + 4;
+        cursor += length_bytes + name_len + 8;
         let tag = bytes[cursor];
         cursor += 1;
         cursor += decode_projected_value(bytes, tag, cursor).1;
@@ -1614,6 +1616,7 @@ fn decode_record_tail<'a>(
         .alloc_slice_with(n_fields, |_| RecordField {
             name: "",
             type_oid: 0,
+            type_mod: -1,
             value: Datum::Null,
         })
         .map_err(|_| {
@@ -1629,7 +1632,8 @@ fn decode_record_tail<'a>(
             .expect("projected record name was encoded from valid UTF-8");
         cursor += name_len;
         f.type_oid = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-        cursor += 4;
+        f.type_mod = i32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap());
+        cursor += 8;
         let tag = bytes[cursor];
         cursor += 1;
         let (value, size) = decode_projected_value(bytes, tag, cursor);
@@ -1719,6 +1723,7 @@ mod tests {
                 RecordField {
                     name: "field",
                     type_oid: oid::INT4,
+                    type_mod: -1,
                     value: Datum::Int4(42)
                 };
                 count
@@ -1730,6 +1735,7 @@ mod tests {
             let nested = [RecordField {
                 name: "nested",
                 type_oid: oid::RECORD,
+                type_mod: -1,
                 value: composite,
             }];
             let values = [
@@ -1775,6 +1781,7 @@ mod tests {
         let fields = [RecordField {
             name: &name,
             type_oid: oid::TEXT,
+            type_mod: -1,
             value: Datum::Text("value"),
         }];
         crate::mem::guard::forbid_alloc(|| {
@@ -1804,6 +1811,7 @@ mod tests {
             RecordField {
                 name: "x",
                 type_oid: oid::INT4,
+                type_mod: -1,
                 value: Datum::Int4(1)
             };
             u16::MAX as usize + 1
@@ -1919,11 +1927,13 @@ mod tests {
             RecordField {
                 name: "f1",
                 type_oid: oid::INT4,
+                type_mod: -1,
                 value: Datum::Int4(42),
             },
             RecordField {
                 name: "f2",
                 type_oid: oid::TEXT,
+                type_mod: -1,
                 value: Datum::Null,
             },
         ];

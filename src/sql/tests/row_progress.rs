@@ -589,3 +589,33 @@ fn row_lock_waits_release_kept_rows_on_timeout_and_rollback() {
         }
     }
 }
+
+/// `INSERT ... SELECT` reading its own target selects its source again in
+/// each attempt after a routine call: the rows earlier attempts inserted stay
+/// invisible to it, as to PostgreSQL's single scan.
+#[test]
+fn self_reading_insert_select_resumes_with_its_first_source() {
+    let config = test_config("row-progress-self-insert");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    writer.success(
+        &mut engine,
+        "CREATE TABLE grow (a int); INSERT INTO grow VALUES (1), (2); \
+         CREATE FUNCTION same(v int) RETURNS int LANGUAGE plpgsql \
+         AS $$BEGIN RETURN v; END$$",
+        true,
+    );
+    let output = writer.success(
+        &mut engine,
+        "INSERT INTO grow SELECT a + 10 FROM grow WHERE same(a) > 0 RETURNING a, same(a)",
+        true,
+    );
+    assert_eq!(data_rows(&output), ["11|11", "12|12"]);
+    assert_eq!(
+        data_rows(&writer.success(&mut engine, "SELECT a FROM grow ORDER BY a", true)),
+        ["1", "2", "11", "12"]
+    );
+    drop((writer, engine));
+    std::fs::remove_dir_all(config.data_dir).unwrap();
+}

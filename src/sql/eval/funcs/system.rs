@@ -249,7 +249,7 @@ pub(crate) fn session_schemas() -> SessionSchemas {
 
 /// Maximum number of readable settings published per statement for
 /// `current_setting`. Comfortably covers the `SHOW ALL` set plus a margin.
-pub const MAX_SESSION_SETTINGS: usize = 64;
+pub const MAX_SESSION_SETTINGS: usize = crate::sql::SETTING_NAMES.len();
 
 /// A per-statement snapshot of the session's readable settings (name → value),
 /// published like the session user so `current_setting` reads exactly what
@@ -563,16 +563,19 @@ fn object_address_record<'a>(
             crate::sql::types::RecordField {
                 name: "classid",
                 type_oid: crate::sql::types::oid::OID,
+                type_mod: -1,
                 value: Datum::Oid(class_id as u32),
             },
             crate::sql::types::RecordField {
                 name: "objid",
                 type_oid: crate::sql::types::oid::OID,
+                type_mod: -1,
                 value: Datum::Oid(object_id as u32),
             },
             crate::sql::types::RecordField {
                 name: "objsubid",
                 type_oid: crate::sql::types::oid::INT4,
+                type_mod: -1,
                 value: Datum::Int4(sub_id),
             },
         ])
@@ -602,11 +605,13 @@ fn identify_object_record<'a>(
                 crate::sql::types::RecordField {
                     name: "type",
                     type_oid: crate::sql::types::oid::TEXT,
+                    type_mod: -1,
                     value: Datum::Text(object_type),
                 },
                 crate::sql::types::RecordField {
                     name: "object_names",
                     type_oid: crate::sql::types::oid::TEXT_ARRAY,
+                    type_mod: -1,
                     value: if object.identity.is_empty() {
                         Datum::Null
                     } else {
@@ -619,6 +624,7 @@ fn identify_object_record<'a>(
                 crate::sql::types::RecordField {
                     name: "object_args",
                     type_oid: crate::sql::types::oid::TEXT_ARRAY,
+                    type_mod: -1,
                     value: if object.identity.is_empty() {
                         Datum::Null
                     } else {
@@ -636,11 +642,13 @@ fn identify_object_record<'a>(
                 crate::sql::types::RecordField {
                     name: "type",
                     type_oid: crate::sql::types::oid::TEXT,
+                    type_mod: -1,
                     value: Datum::Text(object_type),
                 },
                 crate::sql::types::RecordField {
                     name: "schema",
                     type_oid: crate::sql::types::oid::TEXT,
+                    type_mod: -1,
                     value: match object.schema_name.as_ref() {
                         Some(value) => {
                             Datum::Text(arena.alloc_str(value.as_str()).map_err(|_| arena_full())?)
@@ -651,6 +659,7 @@ fn identify_object_record<'a>(
                 crate::sql::types::RecordField {
                     name: "name",
                     type_oid: crate::sql::types::oid::TEXT,
+                    type_mod: -1,
                     value: match object_name {
                         Some(value) => {
                             Datum::Text(arena.alloc_str(value).map_err(|_| arena_full())?)
@@ -661,6 +670,7 @@ fn identify_object_record<'a>(
                 crate::sql::types::RecordField {
                     name: "identity",
                     type_oid: crate::sql::types::oid::TEXT,
+                    type_mod: -1,
                     value: if object.identity.is_empty() {
                         Datum::Null
                     } else {
@@ -1175,6 +1185,8 @@ pub(crate) fn dispatch<'a>(
                 | "pg_terminate_backend"
                 | "pg_log_backend_memory_contexts"
                 | "pg_listening_channels"
+                | "pg_available_extensions"
+                | "pg_available_extension_versions"
                 | "pg_notification_queue_usage"
                 | "pg_advisory_lock"
                 | "pg_advisory_lock_shared"
@@ -1229,6 +1241,9 @@ pub(crate) fn dispatch<'a>(
                 | "pg_get_viewdef"
                 | "pg_get_ruledef"
                 | "pg_table_size"
+                | "pg_relation_size"
+                | "pg_total_relation_size"
+                | "pg_indexes_size"
                 | "pg_database_size"
                 | "pg_tablespace_location"
                 | "pg_tablespace_size"
@@ -1480,6 +1495,33 @@ pub(crate) fn dispatch<'a>(
                     )),
                     None => Ok(Datum::Null),
                 }
+            }
+            "pg_available_extensions" | "pg_available_extension_versions" => {
+                arity(0)?;
+                let versions = name == "pg_available_extension_versions";
+                let Some(index) = hooks.srf_index.and_then(|index| index.checked_sub(1)) else {
+                    return Ok(Datum::Null);
+                };
+                let Some(catalog) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let Some(values) = catalog
+                    .available_extension_rows(versions, arena)?
+                    .get(index)
+                    .copied()
+                else {
+                    return Ok(Datum::Null);
+                };
+                let columns = crate::sql::catalog::available_extension_function_columns(versions);
+                let fields = arena
+                    .alloc_slice_with(columns.len(), |field| crate::sql::types::RecordField {
+                        name: columns[field].0,
+                        type_oid: columns[field].1.oid(),
+                        value: values[field],
+                        type_mod: -1,
+                    })
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                Ok(Datum::Record(fields))
             }
             "pg_notification_queue_usage" => {
                 arity(0)?;
@@ -1979,7 +2021,9 @@ pub(crate) fn dispatch<'a>(
                         eval_full(args[1], arena, params, row, hooks)?,
                         Datum::Bool(true)
                     );
-                match session_setting(name_value) {
+                match session_setting(name_value)
+                    .or_else(|| crate::sql::guc::active_custom_setting(name_value))
+                {
                     Some(v) => Ok(Datum::Text(
                         arena.alloc_str(v.as_str()).map_err(|_| arena_full())?,
                     )),
@@ -2034,6 +2078,18 @@ pub(crate) fn dispatch<'a>(
                         ));
                     }
                 };
+                if crate::sql::guc::active_requires_set_privilege(name)? {
+                    hooks
+                        .catalog
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "set_config of \"{}\" has no session catalog",
+                                name
+                            )
+                        })?
+                        .authorize_parameter_set(name)?;
+                }
                 let configured = crate::sql::guc::set_active_config(name, value, local)?;
                 Ok(Datum::Text(
                     arena
@@ -2703,6 +2759,7 @@ pub(crate) fn dispatch<'a>(
                     None => return Ok(Datum::Null),
                 };
                 let col = match eval_full(args[1], arena, params, row, hooks)? {
+                    Datum::Int2(v) => i32::from(v),
                     Datum::Int4(v) => v,
                     Datum::Int8(v) => v as i32,
                     _ => return Ok(Datum::Null),
@@ -2898,17 +2955,64 @@ pub(crate) fn dispatch<'a>(
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
-            "pg_table_size" => {
-                arity(1)?;
+            "pg_table_size" | "pg_relation_size" | "pg_total_relation_size" | "pg_indexes_size" => {
+                if name == "pg_relation_size" {
+                    if !(1..=2).contains(&args.len()) {
+                        arity(1)?;
+                    }
+                } else {
+                    arity(1)?;
+                }
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                // The `regclass` argument: an untyped literal names the relation.
+                let relation = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Text(name) => super::super::regobject_cast(
+                        Datum::Text(name),
+                        ColType::Regclass,
+                        hooks.catalog,
+                        arena,
+                    )?,
+                    value => value,
+                };
+                let oid = match CatalogOid::parse(relation)? {
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };
+                // Only the main fork holds rows; pos3ql keeps no free-space,
+                // visibility or init forks.
+                let main_fork = match args.get(1) {
+                    None => true,
+                    Some(fork) => match eval_full(fork, arena, params, row, hooks)? {
+                        Datum::Null => return Ok(Datum::Null),
+                        Datum::Text("main") => true,
+                        Datum::Text("fsm" | "vm" | "init") => false,
+                        Datum::Text(_) => {
+                            crate::sql::eval::stash_diagnostic(
+                                None,
+                                Some(crate::util::StackStr::from_str(
+                                    "Valid fork names are \"main\", \"fsm\", \"vm\", and \"init\".",
+                                )),
+                            );
+                            return Err(sql_err!(
+                                sqlstate::INVALID_PARAMETER_VALUE,
+                                "invalid fork name"
+                            ));
+                        }
+                        other => {
+                            return Err(crate::sql::eval::function_argument_mismatch(name, &other));
+                        }
+                    },
+                };
+                // Indexes have no physical store, so their sizes are zero.
                 Ok(cat
                     .relation_size(oid)?
+                    .map(|size| match name {
+                        "pg_indexes_size" => 0,
+                        _ if !main_fork => 0,
+                        _ => size,
+                    })
                     .map(Datum::Int8)
                     .unwrap_or(Datum::Null))
             }
@@ -3223,12 +3327,31 @@ pub(crate) fn dispatch<'a>(
 /// `None` for an OID that is not a built-in column type.
 /// `modifier_given` distinguishes an explicit `-1` from no modifier, which
 /// makes PostgreSQL spell unconstrained `character` as `bpchar`.
+/// `format_type` of a built-in type without an executable representation
+/// (pseudo-types, catalog row types and their arrays): its `pg_type` name,
+/// or its element's followed by `[]` for a true array type, which excludes
+/// the plain-storage `int2vector` and `oidvector`.
+fn catalog_row_type_name(oid: i32) -> Option<crate::util::StackStr<80>> {
+    const ARRAY_SUBSCRIPT_HANDLER: i32 = 6179;
+    let rows = crate::sql::catalog::builtin_type_rows();
+    let row = &rows[rows.binary_search_by_key(&oid, |row| row.oid).ok()?];
+    if row.element != 0 && row.subscript == ARRAY_SUBSCRIPT_HANDLER && row.storage != b'p' {
+        let element = format_builtin_type(row.element, -1, false)?;
+        return Some(stack_format!(80, "{}[]", element.as_str()));
+    }
+    let mut text = crate::util::StackStr::<80>::new();
+    crate::sql::catalog::write_identifier(&mut text, row.name);
+    Some(text)
+}
+
 pub(crate) fn format_builtin_type(
     o: i32,
     type_mod: i32,
     modifier_given: bool,
 ) -> Option<crate::util::StackStr<80>> {
-    let coltype = exec::coltype_of_oid(o)?;
+    let Some(coltype) = exec::coltype_of_oid(o) else {
+        return catalog_row_type_name(o);
+    };
     let (base, array) = match coltype {
         ColType::Array(element) => (element.to_coltype(), true),
         scalar => (scalar, false),

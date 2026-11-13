@@ -127,7 +127,7 @@ fn published_transition_rows_own_payloads_after_collection_memory_is_recycled() 
     let saved = crate::mem::guard::forbid_alloc(|| {
         let text = inputs.alloc_slice_with(8192, |_| b'x').unwrap();
         let text = core::str::from_utf8(text).unwrap();
-        let mut capture = TransitionCapture::new(&collection, 2, 1).unwrap();
+        let mut capture = TransitionCapture::new(&collection);
         capture
             .push_old(&[Datum::Text(text), Datum::Null], &collection)
             .unwrap();
@@ -135,10 +135,6 @@ fn published_transition_rows_own_payloads_after_collection_memory_is_recycled() 
         capture
             .push_new(&[Datum::Bytea(&[1, 2, 3]), Datum::Int4(73)], &collection)
             .unwrap();
-        let error = capture.push_new(&[], &collection).unwrap_err();
-        assert!(error.message.as_str().contains("NEW TABLE"));
-        let error = capture.push_old(&[], &collection).unwrap_err();
-        assert!(error.message.as_str().contains("OLD TABLE"));
         SavedTransitionRows::capture(capture.into_rows(), &pool).unwrap()
     });
     inputs.reset();

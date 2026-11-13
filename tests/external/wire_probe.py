@@ -108,6 +108,9 @@ def standby_status(end_lsn, reply_requested=False):
 
 
 def simple_query(s, text):
+    # A BEGIN joins the statements before it in the same Query message to its
+    # transaction, as PostgreSQL's implicit block does; probes that roll back
+    # send their setup in an earlier message.
     s.sendall(frontend_message(b"Q", text.encode() + b"\x00"))
     out = []
     while True:
@@ -119,6 +122,20 @@ def simple_query(s, text):
         out.append(item)
         if item[0] == b"Z":
             return out
+
+
+def simple_query_blocks(s, text):
+    """Sends `text` as one Query message per transaction block: a BEGIN in a
+    Query makes everything before it in that Query part of the block, so
+    setup that must commit on its own goes in its own message, as psql
+    sends each statement."""
+    out = []
+    parts = text.split("BEGIN; ")
+    for index, part in enumerate(parts):
+        query = part if index == 0 else "BEGIN; " + part
+        if query.strip():
+            out.extend(simple_query(s, query))
+    return out
 
 
 def read_until_ready(s):
@@ -6221,7 +6238,7 @@ def test_sequence_rename_lifecycle_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))
     drain_startup(s)
-    result = simple_query(
+    result = simple_query_blocks(
         s,
         "CREATE SCHEMA wire_sequence_rename_schema; "
         "CREATE SEQUENCE wire_sequence_rename_source START WITH 10 INCREMENT BY 2; "
@@ -6233,7 +6250,9 @@ def test_sequence_rename_lifecycle_over_raw_wire():
         "SELECT nextval('wire_sequence_rename_target'); "
         "INSERT INTO wire_sequence_rename_default DEFAULT VALUES RETURNING id; "
         "SELECT id FROM wire_sequence_rename_view; "
-        "SELECT nextval('wire_sequence_rename_target'); "
+        "SELECT nextval('wire_sequence_rename_target')",
+    ) + simple_query(
+        s,
         "BEGIN; "
         "ALTER SEQUENCE wire_sequence_rename_target RENAME TO wire_sequence_rename_rollback; "
         "SELECT nextval('wire_sequence_rename_rollback'); "
@@ -6269,7 +6288,7 @@ def test_schema_rename_lifecycle_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))
     drain_startup(s)
-    result = simple_query(
+    result = simple_query_blocks(
         s,
         "CREATE SCHEMA wire_schema_rename_source; "
         "CREATE TYPE wire_schema_rename_source.mood AS ENUM ('calm', 'storm'); "
@@ -6285,7 +6304,9 @@ def test_schema_rename_lifecycle_over_raw_wire():
         "INSERT INTO wire_schema_rename_target.items(state) VALUES ('calm') RETURNING id; "
         "SELECT id, state FROM wire_schema_rename_target.item_view; "
         "SELECT 'storm'::wire_schema_rename_target.mood; "
-        "SELECT obj_description('wire_schema_rename_target.ticket'::regclass); "
+        "SELECT obj_description('wire_schema_rename_target.ticket'::regclass)",
+    ) + simple_query(
+        s,
         "BEGIN; "
         "ALTER SCHEMA wire_schema_rename_target RENAME TO wire_schema_rename_rollback; "
         "INSERT INTO wire_schema_rename_rollback.items(state) VALUES ('storm'); "
@@ -6307,7 +6328,7 @@ def test_materialized_view_metadata_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))
     drain_startup(s)
-    result = simple_query(
+    result = simple_query_blocks(
         s,
         "CREATE TABLE wire_matview_metadata_source (value integer); "
         "INSERT INTO wire_matview_metadata_source VALUES (7), (9); "
@@ -6322,7 +6343,9 @@ def test_materialized_view_metadata_over_raw_wire():
         "SELECT attname, attstattarget FROM pg_attribute "
         "WHERE attrelid = 'wire_matview_metadata'::regclass AND attnum > 0; "
         "SELECT reloptions::text FROM pg_class "
-        "WHERE oid = 'wire_matview_metadata'::regclass; "
+        "WHERE oid = 'wire_matview_metadata'::regclass",
+    ) + simple_query(
+        s,
         "BEGIN; ALTER MATERIALIZED VIEW wire_matview_metadata "
         "SET (fillfactor = 90); ROLLBACK; "
         "SELECT reloptions::text FROM pg_class "

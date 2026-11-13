@@ -40,6 +40,7 @@ impl CopyTransitionRows {
         self.bytes.clear();
     }
 
+    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.rows.len()
     }

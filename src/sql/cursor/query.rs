@@ -870,6 +870,7 @@ mod tests {
         let fields = [crate::sql::types::RecordField {
             name: "label",
             type_oid: crate::sql::types::oid::TEXT,
+            type_mod: -1,
             value: Datum::Text(&text),
         }];
         crate::mem::guard::forbid_alloc(|| {
@@ -990,6 +991,7 @@ mod tests {
         let fields = [RecordField {
             name: "label",
             type_oid: oid::TEXT,
+            type_mod: -1,
             value: Datum::Text(&text),
         }];
         let locals = [
@@ -1065,6 +1067,7 @@ mod tests {
             .map(|name| RecordField {
                 name,
                 type_oid: oid::TEXT,
+                type_mod: -1,
                 value: Datum::Text(&text),
             })
             .collect();

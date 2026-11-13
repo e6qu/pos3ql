@@ -129,6 +129,21 @@ fn visit_order(
         .then((left.sub as u32).cmp(&(right.sub as u32)))
 }
 
+/// PostgreSQL's `IsPinnedObject`: initdb's objects below
+/// `FirstUnpinnedObjectId` (12000), except large objects, databases and the
+/// `public` schema.
+fn pinned(object: ObjectAddress) -> bool {
+    const FIRST_UNPINNED_OBJECT_ID: i32 = 12_000;
+    const LARGE_OBJECT_RELATION_ID: i32 = 2613;
+    const DATABASE_RELATION_ID: i32 = 1262;
+    const NAMESPACE_RELATION_ID: i32 = 2615;
+    const PUBLIC_NAMESPACE: i32 = 2200;
+    (0..FIRST_UNPINNED_OBJECT_ID).contains(&object.object)
+        && object.class != DATABASE_RELATION_ID
+        && object.class != LARGE_OBJECT_RELATION_ID
+        && !(object.class == NAMESPACE_RELATION_ID && object.object == PUBLIC_NAMESPACE)
+}
+
 fn same_object(left: ObjectAddress, right: ObjectAddress) -> bool {
     left.class == right.class && left.object == right.object
 }
@@ -313,6 +328,14 @@ impl Walker<'_> {
     ) -> Result<Entry, SqlError> {
         if self.on_stack(object, flags) || self.in_targets(object, flags) {
             return Ok(Entry::Done);
+        }
+        if pinned(object) {
+            let description = describe(self.storage, self.txid, object, arena)?;
+            return Err(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop {} because it is required by the database system",
+                description
+            ));
         }
         let mut owner = None;
         let mut partition_owner = None;

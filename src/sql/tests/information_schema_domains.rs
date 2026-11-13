@@ -25,9 +25,9 @@ fn information_schema_domains_resolve_check_and_describe_like_postgresql() {
             vec!["YES|information_schema.yes_or_no"],
         ),
         (
-            "SELECT 13713::regtype, format_type(13724, NULL), \
+            "SELECT 13307::regtype, format_type(13318, NULL), \
                     'information_schema.sql_identifier'::regtype::oid",
-            vec!["information_schema.cardinal_number|information_schema.time_stamp|13718"],
+            vec!["information_schema.cardinal_number|information_schema.time_stamp|13312"],
         ),
         (
             "SELECT pg_typeof(table_name), pg_typeof(ordinal_position), pg_typeof(is_nullable) \
@@ -39,16 +39,16 @@ fn information_schema_domains_resolve_check_and_describe_like_postgresql() {
         ),
         (
             "SELECT typname, typtype, typbasetype, typtypmod, typarray FROM pg_type \
-             WHERE oid IN (13713, 13726, 13725) ORDER BY oid",
+             WHERE oid IN (13307, 13320, 13319) ORDER BY oid",
             vec![
-                "cardinal_number|d|23|-1|13712",
+                "cardinal_number|d|23|-1|13306",
                 "_yes_or_no|b|0|-1|0",
-                "yes_or_no|d|1043|7|13725",
+                "yes_or_no|d|1043|7|13319",
             ],
         ),
         (
             "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint \
-             WHERE oid IN (13714, 13727) ORDER BY oid",
+             WHERE oid IN (13308, 13321) ORDER BY oid",
             vec![
                 "cardinal_number_domain_check|CHECK ((VALUE >= 0))",
                 "yes_or_no_check|CHECK (((VALUE)::text = ANY ((ARRAY['YES'::character varying, \
@@ -110,7 +110,7 @@ fn information_schema_domains_resolve_check_and_describe_like_postgresql() {
             &mut engine,
             &mut budget,
             "SET search_path = information_schema, public; \
-             SELECT 1::cardinal_number, 13713::regtype"
+             SELECT 1::cardinal_number, 13307::regtype"
         ),
         ["1|cardinal_number"]
     );

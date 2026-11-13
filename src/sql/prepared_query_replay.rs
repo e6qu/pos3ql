@@ -23,9 +23,7 @@ pub(super) fn stage_query_record(
             columns,
             sql,
             path,
-            security_invoker,
-            security_barrier,
-            check_option,
+            options,
             dependencies,
         } => {
             let (columns, default_inputs) = columns.materialize(storage, txid)?;
@@ -50,7 +48,7 @@ pub(super) fn stage_query_record(
                         creation_path,
                         dependencies,
                     },
-                    options: view_options(*security_invoker, *security_barrier, *check_option)?,
+                    options: *options,
                 },
                 txid,
             )?;
@@ -121,16 +119,14 @@ pub(super) fn stage_query_record(
         WalOp::SetViewOptions {
             schema,
             name,
-            security_invoker,
-            security_barrier,
-            check_option,
+            options,
         } => {
             let slot = storage
                 .view_slot(schema, name, txid)
                 .ok_or_else(|| invalid("view source"))?;
             let prior = storage.stage_view_options(
                 storage.prepare_view_edit(slot, txid)?,
-                view_options(*security_invoker, *security_barrier, *check_option)?,
+                *options,
                 txid,
             )?;
             transaction.record_catalog_change(
@@ -247,11 +243,8 @@ pub(super) fn stage_query_record(
         } => {
             let target = trigger_target(storage, *target, table_schema, table, txid)?;
             let function = storage
-                .routine_slot_by_signature(function_schema, function, &[], txid)
-                .ok_or_else(|| invalid("trigger function"))?;
-            if !matches!(storage.routine(function).kind, RoutineKind::Trigger) {
-                return Err(invalid("trigger function result"));
-            }
+                .trigger_function_named(function_schema, function, txid)
+                .map_err(invalid)?;
             let kind = if *constraint {
                 let referenced_table = match (referenced_schema, referenced_table) {
                     (Some(schema), Some(table)) => Some(
@@ -634,23 +627,6 @@ fn text<const N: usize>(value: &str) -> Result<StackStr<N>, SqlError> {
         ));
     }
     Ok(result)
-}
-
-fn view_options(invoker: bool, barrier: u8, check: u8) -> Result<ViewOptions, SqlError> {
-    Ok(ViewOptions {
-        security: if invoker {
-            ViewSecurity::Invoker
-        } else {
-            ViewSecurity::Definer
-        },
-        security_barrier: ViewSecurityBarrier::from_code(barrier)
-            .ok_or_else(|| invalid("view security barrier"))?,
-        check_option: if check == 0 {
-            None
-        } else {
-            Some(ViewCheckOption::from_code(check).ok_or_else(|| invalid("view check option"))?)
-        },
-    })
 }
 
 fn rule_target(

@@ -6,7 +6,7 @@ use super::*;
 use crate::pg::conn::{After, AuthContext, Conn};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const KEY: &[u8; 16] = b"result-stream-ky";
 
@@ -123,8 +123,12 @@ enum ColdRequest {
     JoinQuery,
     /// A paged portal of a RIGHT join of the cold table with itself.
     RightJoin,
-    /// A simple Query of the same RIGHT join.
+    /// A simple Query of the same RIGHT join: a hash join probing its
+    /// preserved side.
     RightJoinQuery,
+    /// A simple Query of a FULL hash join of the cold table with itself,
+    /// whose hashed rows carry match flags.
+    FullJoinQuery,
     /// A simple Query of a grouping, which reads its whole input first.
     GroupedQuery,
     /// A join with a bounded derived table, which the general executor
@@ -214,6 +218,14 @@ fn right_joins_stream_cold_tables() {
     cold_result_stream(
         "result-stream-cold-right-join-query",
         ColdRequest::RightJoinQuery,
+    );
+}
+
+#[test]
+fn full_joins_stream_cold_tables() {
+    cold_result_stream(
+        "result-stream-cold-full-join-query",
+        ColdRequest::FullJoinQuery,
     );
 }
 
@@ -352,6 +364,9 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
             ColdRequest::RightJoinQuery => query(
                 "SELECT b.id, b.code FROM cold_orders a RIGHT JOIN cold_orders b ON a.id = b.id",
             ),
+            ColdRequest::FullJoinQuery => query(
+                "SELECT a.id, a.code FROM cold_orders a FULL JOIN cold_orders b ON a.id = b.id",
+            ),
             ColdRequest::SpooledJoin => query(
                 "SELECT a.id, a.code FROM cold_orders a \
                  JOIN (SELECT id FROM cold_orders OFFSET 0) b ON a.id = b.id",
@@ -407,7 +422,7 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
     // The second query of a UNION ALL starts its own cold scan.
     let mut second_query_yielded = false;
     let mut gets = 0usize;
-    let mut deadline = Instant::now() + Duration::from_secs(10);
+    let mut deadline = crate::test_wait::deadline();
     loop {
         read_available(&mut client, &mut received);
         let delivered = messages(&received)
@@ -452,7 +467,7 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
         let served = objects.requests.load(std::sync::atomic::Ordering::Relaxed);
         if served != gets {
             gets = served;
-            deadline = Instant::now() + Duration::from_secs(10);
+            deadline = crate::test_wait::deadline();
         }
         advance(&mut engine);
         assert_eq!(
@@ -502,6 +517,7 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
         | ColdRequest::View
         | ColdRequest::JoinQuery
         | ColdRequest::RightJoinQuery
+        | ColdRequest::FullJoinQuery
         | ColdRequest::GroupedQuery
         | ColdRequest::SpooledJoin
         | ColdRequest::CteTwice

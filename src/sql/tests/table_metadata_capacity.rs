@@ -217,8 +217,12 @@ fn rewritten_rows_keep_complete_index_caches_after_later_updates_and_prepared_re
             session.success(
                 &mut engine,
                 "CREATE TABLE rewritten_cache(id integer PRIMARY KEY,amount integer); \
-                 INSERT INTO rewritten_cache VALUES(1,10),(2,20); \
-                 BEGIN; ALTER TABLE rewritten_cache ALTER COLUMN amount TYPE bigint; \
+                 INSERT INTO rewritten_cache VALUES(1,10),(2,20)",
+                !cold,
+            );
+            session.success(
+                &mut engine,
+                "BEGIN; ALTER TABLE rewritten_cache ALTER COLUMN amount TYPE bigint; \
                  UPDATE rewritten_cache SET id=11 WHERE id=1",
                 !cold,
             );
@@ -615,8 +619,12 @@ fn prepared_resolution_installs_admitted_metadata_with_no_free_lease() {
         session.success(
             &mut engine,
             "CREATE TABLE prepared_metadata(id integer PRIMARY KEY,amount integer); \
-             INSERT INTO prepared_metadata VALUES(1,10); \
-             BEGIN; ALTER TABLE prepared_metadata ALTER COLUMN amount TYPE bigint; \
+             INSERT INTO prepared_metadata VALUES(1,10)",
+            false,
+        );
+        session.success(
+            &mut engine,
+            "BEGIN; ALTER TABLE prepared_metadata ALTER COLUMN amount TYPE bigint; \
              UPDATE prepared_metadata SET id=11 WHERE id=1; \
              CREATE INDEX prepared_metadata_amount ON prepared_metadata(amount); \
              PREPARE TRANSACTION 'metadata-admitted'",

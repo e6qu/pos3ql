@@ -18,6 +18,8 @@ use super::wire::{self, MsgOut, WireFull};
 /// Maximum result columns whose per-column format we track (matches the
 /// projection limit).
 pub const MAX_RESULT_COLS: usize = crate::sql::exec::MAX_PROJ;
+/// The longest command tag: `INSERT 0 ` and a 20-digit row count fit.
+pub(crate) const COMMAND_TAG_MAX: usize = 64;
 
 /// An ErrorResponse cursor: the 1-based character position in the client's
 /// query string that PostgreSQL sends as the `P` field and psql shows as a
@@ -307,6 +309,12 @@ pub struct Responder<'b> {
     /// Composite utility commands execute ordinary DROP helpers but publish
     /// one command tag of their own.
     suppress_command_complete: bool,
+    /// A simple Query's statement tag waits here until its statement ends:
+    /// PostgreSQL reports CommandComplete only after the statement's end
+    /// checks and, for the last statement of an implicit transaction, after
+    /// the commit, so a failure there reports no tag.
+    hold_command_complete: bool,
+    held_command_complete: Option<crate::util::StackStr<COMMAND_TAG_MAX>>,
     /// Last complete frame produced by the typed command writer. DDL keeps
     /// its tag in statement memory while end triggers run, preserving notices.
     last_command_completion: Option<(OutputMark, usize)>,
@@ -818,10 +826,10 @@ fn serialized_row_len(
 }
 
 impl<'b> Responder<'b> {
-    pub fn new(buffer: &'b mut FixedBuf) -> Self {
+    fn with_rows(buffer: &'b mut FixedBuf, cursor_rows: CursorRowOutput<'b>) -> Self {
         Self {
             buffer,
-            cursor_rows: CursorRowOutput::Wire,
+            cursor_rows,
             suppress_row_description: false,
             formats: ResultFmt::ALL_TEXT,
             result_type_oids: [0; MAX_RESULT_COLS],
@@ -830,6 +838,8 @@ impl<'b> Responder<'b> {
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
             suppress_command_complete: false,
+            hold_command_complete: false,
+            held_command_complete: None,
             last_command_completion: None,
             affected_rows: None,
             discarded_rows: 0,
@@ -845,58 +855,23 @@ impl<'b> Responder<'b> {
         }
     }
 
+    pub fn new(buffer: &'b mut FixedBuf) -> Self {
+        Self::with_rows(buffer, CursorRowOutput::Wire)
+    }
+
     pub fn for_execute(buffer: &'b mut FixedBuf, formats: ResultFmt) -> Self {
         Self {
-            buffer,
-            cursor_rows: CursorRowOutput::Wire,
             suppress_row_description: true,
             formats,
-            result_type_oids: [0; MAX_RESULT_COLS],
-            result_columns: 0,
-            output: None,
-            render: crate::sql::guc::RenderContext::default(),
-            discard_query_output: false,
-            suppress_command_complete: false,
-            last_command_completion: None,
-            affected_rows: None,
-            discarded_rows: 0,
-            discard_serialize: ExplainSerialize::None,
-            serialized_bytes: 0,
-            serialization_micros: 0,
-            promotion: Promotion::Disabled,
-            promotion_trigger: PromotionTrigger::Overflow,
-            spooled: None,
-            respool: false,
-            buffer_setting: "conn_send_buffer_bytes",
-            dependency_report: None,
+            ..Self::new(buffer)
         }
     }
 
     /// Saves cursor values or discards them without rendering.
     pub(crate) fn for_cursor(description: &'b mut FixedBuf, rows: CursorRowOutput<'b>) -> Self {
         Self {
-            buffer: description,
-            cursor_rows: rows,
-            suppress_row_description: false,
-            formats: ResultFmt::ALL_TEXT,
-            result_type_oids: [0; MAX_RESULT_COLS],
-            result_columns: 0,
-            output: None,
-            render: crate::sql::guc::RenderContext::default(),
-            discard_query_output: false,
             suppress_command_complete: true,
-            last_command_completion: None,
-            affected_rows: None,
-            discarded_rows: 0,
-            discard_serialize: ExplainSerialize::None,
-            serialized_bytes: 0,
-            serialization_micros: 0,
-            promotion: Promotion::Disabled,
-            promotion_trigger: PromotionTrigger::Overflow,
-            spooled: None,
-            respool: false,
-            buffer_setting: "conn_send_buffer_bytes",
-            dependency_report: None,
+            ..Self::with_rows(description, rows)
         }
     }
 
@@ -910,28 +885,8 @@ impl<'b> Responder<'b> {
     /// result-format codes so the client decodes DataRows correctly.
     pub fn for_describe(buffer: &'b mut FixedBuf, formats: ResultFmt) -> Self {
         Self {
-            buffer,
-            cursor_rows: CursorRowOutput::Wire,
-            suppress_row_description: false,
             formats,
-            result_type_oids: [0; MAX_RESULT_COLS],
-            result_columns: 0,
-            output: None,
-            render: crate::sql::guc::RenderContext::default(),
-            discard_query_output: false,
-            suppress_command_complete: false,
-            last_command_completion: None,
-            affected_rows: None,
-            discarded_rows: 0,
-            discard_serialize: ExplainSerialize::None,
-            serialized_bytes: 0,
-            serialization_micros: 0,
-            promotion: Promotion::Disabled,
-            promotion_trigger: PromotionTrigger::Overflow,
-            spooled: None,
-            respool: false,
-            buffer_setting: "conn_send_buffer_bytes",
-            dependency_report: None,
+            ..Self::new(buffer)
         }
     }
 
@@ -2306,6 +2261,12 @@ impl<'b> Responder<'b> {
         if self.discard_query_output || self.suppress_command_complete {
             return Ok(());
         }
+        if self.hold_command_complete {
+            let held = crate::util::StackStr::from_str(tag);
+            assert!(!held.is_truncated(), "command tags fit COMMAND_TAG_MAX");
+            self.held_command_complete = Some(held);
+            return Ok(());
+        }
         let start = self.mark();
         self.control(|buffer| {
             let mut m = MsgOut::begin(buffer, wire::MSG_COMMAND_COMPLETE);
@@ -2316,8 +2277,24 @@ impl<'b> Responder<'b> {
         Ok(())
     }
 
+    /// Holds the next statement's CommandComplete instead of sending it; see
+    /// [`Self::take_held_command_complete`].
+    pub(crate) fn hold_command_complete(&mut self) {
+        self.hold_command_complete = true;
+        self.held_command_complete = None;
+    }
+
+    /// Stops holding and returns the held tag, which the caller sends once
+    /// the statement's transaction boundary has passed.
+    pub(crate) fn take_held_command_complete(
+        &mut self,
+    ) -> Option<crate::util::StackStr<COMMAND_TAG_MAX>> {
+        self.hold_command_complete = false;
+        self.held_command_complete.take()
+    }
+
     /// The tag of the last CommandComplete, while it still ends the output.
-    pub(crate) fn completion_tag(&self) -> Option<crate::util::StackStr<64>> {
+    pub(crate) fn completion_tag(&self) -> Option<crate::util::StackStr<COMMAND_TAG_MAX>> {
         let (start, length) = self.last_command_completion?;
         if self.excess_since(start) != Some(length) {
             return None;
@@ -2699,9 +2676,11 @@ impl<'b> Responder<'b> {
                             m.u8(b'D');
                             m.cstr(detail.as_str());
                         }
-                        Some(crate::sql::error_position::AnalysisNote::Hint(hint))
-                            if analysis_hint.is_none()
-                                && diagnostic.as_ref().is_none_or(|d| d.hint.is_none()) =>
+                        Some(
+                            crate::sql::error_position::AnalysisNote::Hint(hint)
+                            | crate::sql::error_position::AnalysisNote::Suggestion(hint),
+                        ) if analysis_hint.is_none()
+                            && diagnostic.as_ref().is_none_or(|d| d.hint.is_none()) =>
                         {
                             m.u8(b'H');
                             m.cstr(hint.as_str());
@@ -3206,11 +3185,13 @@ mod tests {
             RecordField {
                 name: "id",
                 type_oid: oid::INT4,
+                type_mod: -1,
                 value: Datum::Int4(42),
             },
             RecordField {
                 name: "note",
                 type_oid: oid::TEXT,
+                type_mod: -1,
                 value: Datum::Null,
             },
         ];
@@ -3371,6 +3352,7 @@ mod tests {
         let fields = [RecordField {
             name: "kind",
             type_oid: oid::CHAR,
+            type_mod: -1,
             value: Datum::Char(0xff),
         }];
         let value = Datum::Record(&fields);
@@ -3391,6 +3373,7 @@ mod tests {
         let fields = [RecordField {
             name: "value",
             type_oid: oid::TEXT,
+            type_mod: -1,
             value: Datum::Text("quote\"and\\slash"),
         }];
         let value = Datum::Record(&fields);

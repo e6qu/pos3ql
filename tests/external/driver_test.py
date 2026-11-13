@@ -3,6 +3,8 @@
 # for parameterized queries.
 import datetime
 import faulthandler
+import json
+import re
 import sys
 import threading
 import time
@@ -265,11 +267,12 @@ print("plpgsql dynamic analyze extended protocol ok")
 # GENERIC_PLAN accepts a bound placeholder without using its value to plan.
 cur.execute("SET search_path = public")
 cur.execute("EXPLAIN (SETTINGS, FORMAT JSON) SELECT 1")
-assert '"Settings":{"search_path":"public"}' in cur.fetchone()[0]
+assert json.loads(cur.fetchone()[0])[0]["Settings"] == {"search_path": "public"}
 cur.execute("EXPLAIN (GENERIC_PLAN, FORMAT JSON) SELECT %s::integer", (41,))
 assert '"Node Type"' in cur.fetchone()[0]
 cur.execute("EXPLAIN (FORMAT XML, SUMMARY OFF) SELECT 1 UNION ALL SELECT 2")
-xml_plan = cur.fetchone()[0]
+# PostgreSQL indents the document; compare its element nesting only.
+xml_plan = re.sub(r">\s+<", "><", cur.fetchone()[0])
 assert "<Plans><Plan>" in xml_plan and "<Node><Node-Type>" not in xml_plan
 cur.execute(
     "EXPLAIN (ANALYZE, BUFFERS, WAL, TIMING OFF, FORMAT YAML) SELECT %s::integer",

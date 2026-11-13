@@ -19819,7 +19819,15 @@ fn describe_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Ve
         let mut responder =
             Responder::for_describe(&mut buffer, crate::pg::respond::ResultFmt::ALL_TEXT);
         engine
-            .describe(sql_text, &arena, &transaction, None, &mut responder, &[])
+            .describe(
+                sql_text,
+                &arena,
+                &transaction,
+                None,
+                &GucState::new(),
+                &mut responder,
+                &[],
+            )
             .unwrap()
     };
     assert!(described, "{}", String::from_utf8_lossy(buffer.readable()));
@@ -93198,6 +93206,7 @@ fn view_metadata_never_reserves_execution_locks_for_idle_or_active_transactions(
                     &session.arena,
                     &session.transaction,
                     Some(&session.cursors),
+                    &session.guc,
                     &mut responder,
                     &[],
                 ))

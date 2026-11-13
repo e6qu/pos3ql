@@ -26186,6 +26186,7 @@ fn compile_plpgsql_execution<'a>(
     arena: &'a Arena,
     has_parameter: &ParameterType<'_>,
 ) -> Result<(TriggerProgram<'a>, CompiledProgram<'a>), SqlError> {
+    crate::sql::guc::note_plpgsql_use();
     let written = source;
     let source = ProgramSource::capture(source, kind, &storage.execution_control)?;
     let (parsed, code) = source.parse(arena, Some(written))?;
@@ -37097,6 +37098,10 @@ fn execute_trigger_step_in<'a>(
                 Ok(None)
             }),
             TriggerStatement::Assert(assertion) => execute_trigger_statement(|| {
+                // `plpgsql.check_asserts = off` skips the statement entirely.
+                if !crate::sql::guc::active_check_asserts()? {
+                    return Ok(None);
+                }
                 let transition = records.transition(definition);
                 let scope = TriggerLocalScope {
                     locals,

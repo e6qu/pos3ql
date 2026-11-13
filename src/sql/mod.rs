@@ -14970,12 +14970,14 @@ impl Engine {
 
     /// Describe (statement or portal): RowDescription for SELECT/SHOW,
     /// NoData otherwise. Returns whether it succeeded.
+    #[allow(clippy::too_many_arguments)]
     pub fn describe(
         &mut self,
         text: &str,
         arena: &Arena,
         txn: &TxnState,
         cursors: Option<&cursor::CursorPool>,
+        guc: &GucState,
         responder: &mut Responder,
         bound_inputs: &[u8],
     ) -> Result<bool, WireFull> {
@@ -15146,7 +15148,8 @@ impl Engine {
                 Ok(true)
             }
             Stmt::Show(name) => {
-                let title = match guc::canonical_setting_name(name) {
+                // A custom parameter keeps the spelling that defined it.
+                let title = match guc.show_title(name) {
                     Ok(title) => title,
                     Err(error) => {
                         responder.error(error.sqlstate, error.message.as_str())?;
@@ -21079,6 +21082,48 @@ impl Engine {
     /// Outer Result: wire-level trouble. Inner Result: SQL-level error.
     #[allow(clippy::too_many_arguments)]
     fn execute_stmt(
+        &mut self,
+        statement: &Stmt,
+        arena: &Arena,
+        params: &[Datum],
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        routine_transaction_context: exec::PlpgsqlTransactionContext,
+        responder: &mut Responder,
+        timeout_entry: StatementTimeoutEntry,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        // PL/pgSQL loads before a DO block or a PL/pgSQL routine's validator
+        // runs, and after any other statement that first ran PL/pgSQL.
+        guc::take_plpgsql_use();
+        if match statement {
+            Stmt::Do { .. } => true,
+            Stmt::CreateRoutine(routine) => routine.language == ast::RoutineLanguage::PlPgSql,
+            _ => false,
+        } {
+            guc.load_plpgsql(responder)?;
+        }
+        let result = self.execute_stmt_loaded(
+            statement,
+            arena,
+            params,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            routine_transaction_context,
+            responder,
+            timeout_entry,
+        );
+        if guc::take_plpgsql_use() {
+            guc.load_plpgsql(responder)?;
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_stmt_loaded(
         &mut self,
         statement: &Stmt,
         arena: &Arena,
@@ -27263,6 +27308,9 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "max_locks_per_transaction",
     "max_prepared_transactions",
     "password_encryption",
+    "plpgsql.check_asserts",
+    "plpgsql.extra_errors",
+    "plpgsql.extra_warnings",
     "plpgsql.print_strict_params",
     "plpgsql.variable_conflict",
     "row_security",

@@ -572,6 +572,12 @@ SQL/JSON result types) are reported when the statement would run. In a
 `SELECT`, an unknown relation, a modifier's unknown type and an output column
 written before the failing modifier are reported first, as PostgreSQL's
 analysis order finds them; in other statements the modifier error comes first.
+Before a session first runs PL/pgSQL, PostgreSQL does not know the
+`plpgsql.*` parameters (`SHOW plpgsql.variable_conflict` fails with `42704`,
+`SET` stores a placeholder that loading converts and `pg_settings` lists only
+placeholders); pos3ql knows them from startup. PL/pgSQL's extra checks
+(`shadowed_variables`, `too_many_rows`, `strict_multi_assignment` in
+`plpgsql.extra_warnings` and `plpgsql.extra_errors`) fail with `0A000`.
 Writes to catalog views other than `pg_settings`, and to system catalogs,
 fail with `42P01`. A write through a view on another view that writes the
 lower view with its own `INSTEAD OF` trigger or rewrite rule fails with

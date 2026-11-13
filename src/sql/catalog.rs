@@ -32295,6 +32295,8 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "plpgsql.variable_conflict" => "error",
             "session_replication_role" => "origin",
             "plpgsql.print_strict_params" => "off",
+            "plpgsql.check_asserts" => "on",
+            "plpgsql.extra_warnings" | "plpgsql.extra_errors" => "none",
             "TimeZone" => "UTC",
             "work_mem" => "4096",
             "transaction_isolation" => "read committed",
@@ -32308,6 +32310,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 | "event_triggers"
                 | "integer_datetimes"
                 | "plpgsql.print_strict_params"
+                | "plpgsql.check_asserts"
                 | "is_superuser"
                 | "row_security"
                 | "standard_conforming_strings"
@@ -32461,9 +32464,11 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 text(
                     match name {
                         "track_functions" => "Statistics / Monitoring",
-                        "plpgsql.variable_conflict" | "plpgsql.print_strict_params" => {
-                            "Customized Options"
-                        }
+                        "plpgsql.variable_conflict"
+                        | "plpgsql.print_strict_params"
+                        | "plpgsql.check_asserts"
+                        | "plpgsql.extra_warnings"
+                        | "plpgsql.extra_errors" => "Customized Options",
                         "work_mem" => "Resource Usage / Memory",
                         "session_replication_role" => {
                             "Client Connection Defaults / Statement Behavior"
@@ -32482,6 +32487,13 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                         }
                         "plpgsql.print_strict_params" => {
                             "Print information about parameters in the DETAIL part of the error messages generated on INTO ... STRICT failures."
+                        }
+                        "plpgsql.check_asserts" => "Perform checks given in ASSERT statements.",
+                        "plpgsql.extra_warnings" => {
+                            "List of programming constructs that should produce a warning."
+                        }
+                        "plpgsql.extra_errors" => {
+                            "List of programming constructs that should produce an error."
                         }
                         _ => "",
                     },

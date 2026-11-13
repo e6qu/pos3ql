@@ -3808,6 +3808,7 @@ impl Conn {
                         &self.arena,
                         &self.txn,
                         Some(&self.cursors),
+                        &self.guc,
                         &mut responder,
                         self.prepared[stmt_slot].type_inputs(),
                     )
@@ -4119,6 +4120,7 @@ impl Conn {
                 &self.arena,
                 &self.txn,
                 Some(&self.cursors),
+                &self.guc,
                 &mut responder,
                 self.prepared[slot].type_inputs(),
             ) {

@@ -1928,6 +1928,7 @@ fn procedural_declared_records_keep_domain_types_in_stars_fields_and_calls() {
                     &arena,
                     &session.transaction,
                     None,
+                    &session.guc,
                     &mut Responder::for_describe(
                         &mut described,
                         crate::pg::respond::ResultFmt::ALL_TEXT,

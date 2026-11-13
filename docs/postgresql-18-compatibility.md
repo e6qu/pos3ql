@@ -329,8 +329,19 @@ Syntax and errors:
   `#variable_conflict use_column` at the start of the body, or the superuser
   setting `plpgsql.variable_conflict = use_column`, reads the column instead;
   `use_variable` reads the variable everywhere, so with variable `a = 2`,
-  `SELECT sum(a) FROM t` adds 2 per row and `GROUP BY a` makes one group. The
-  setting exists from startup, as if PL/pgSQL were preloaded.
+  `SELECT sum(a) FROM t` adds 2 per row and `GROUP BY a` makes one group.
+  PL/pgSQL's settings (`plpgsql.variable_conflict`,
+  `plpgsql.print_strict_params`, `plpgsql.check_asserts`,
+  `plpgsql.extra_warnings`, `plpgsql.extra_errors`) exist from startup.
+- PL/pgSQL "loads" in a session the first time the session runs or creates
+  PL/pgSQL code, as PostgreSQL loads its library: placeholders named
+  `plpgsql.anything` (for example from `SET plpgsql.foo = 'x'`) are then
+  removed with `WARNING: invalid configuration parameter name "plpgsql.foo",
+  removing it`, and a later `SET plpgsql.bar = 'y'` fails with `42602`
+  (`"plpgsql" is a reserved prefix.`). `plpgsql.check_asserts = off` skips
+  `ASSERT` statements. PL/pgSQL's extra checks are not implemented:
+  `plpgsql.extra_warnings` and `plpgsql.extra_errors` accept only `none`, and
+  any other valid value fails with `0A000`.
 - A PL/pgSQL function keeps the `plpgsql.variable_conflict` and
   `plpgsql.print_strict_params` values it was compiled under, as PostgreSQL's
   per-session function cache does: the creating session compiles it at

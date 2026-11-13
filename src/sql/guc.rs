@@ -289,6 +289,81 @@ pub(crate) struct PlpgsqlSettings {
     pub(crate) print_strict_params: bool,
 }
 
+/// `plpgsql.check_asserts` of the running statement's session: whether
+/// PL/pgSQL `ASSERT` statements are evaluated, read when one runs.
+pub(crate) fn active_check_asserts() -> Result<bool, SqlError> {
+    with_active_state(|guc| Ok(guc.store.borrow().current.plpgsql_check_asserts))
+}
+
+/// `plpgsql.extra_warnings` and `plpgsql.extra_errors`, kept as written.
+/// pos3ql runs none of PL/pgSQL's extra checks, so only `none` is accepted;
+/// any other valid setting fails loudly instead of being ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlpgsqlExtraChecks(StackStr<16>);
+
+impl PlpgsqlExtraChecks {
+    fn none() -> Self {
+        Self(StackStr::from_str("none"))
+    }
+
+    /// PostgreSQL's `plpgsql_extra_checks_check_hook`.
+    fn parse(name: &str, value: &str) -> Result<Self, SqlError> {
+        if value.eq_ignore_ascii_case("none") {
+            return Ok(Self(StackStr::from_str(value)));
+        }
+        let invalid = |detail: StackStr<160>| {
+            crate::sql::eval::stash_diagnostic(Some(StackStr::from_str(detail.as_str())), None);
+            sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "invalid value for parameter \"{}\": \"{}\"",
+                name,
+                value
+            )
+        };
+        if !value.eq_ignore_ascii_case("all") {
+            let mut items = 0usize;
+            for item in value.split(',') {
+                let item = item.trim_matches(|c: char| c.is_ascii_whitespace());
+                if item.is_empty() {
+                    return Err(invalid(StackStr::from_str("List syntax is invalid.")));
+                }
+                items += 1;
+                if [
+                    "shadowed_variables",
+                    "too_many_rows",
+                    "strict_multi_assignment",
+                ]
+                .iter()
+                .any(|known| item.eq_ignore_ascii_case(known))
+                {
+                    continue;
+                }
+                return Err(invalid(
+                    if item.eq_ignore_ascii_case("all") || item.eq_ignore_ascii_case("none") {
+                        crate::stack_format!(
+                            160,
+                            "Key word \"{}\" cannot be combined with other key words.",
+                            item
+                        )
+                    } else {
+                        crate::stack_format!(160, "Unrecognized key word: \"{}\".", item)
+                    },
+                ));
+            }
+            debug_assert!(items > 0);
+        }
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "PL/pgSQL extra checks are not supported: parameter \"{}\" accepts only \"none\"",
+            name
+        ))
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
 /// The session's PL/pgSQL settings, for a trigger function compiled while a
 /// statement runs.
 pub(crate) fn active_plpgsql_settings() -> Result<PlpgsqlSettings, SqlError> {
@@ -376,6 +451,21 @@ pub fn set_active_config(
         publish_active_setting(guc, name);
         Ok(result)
     })
+}
+
+thread_local! {
+    static PLPGSQL_USED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Records that the running statement compiled PL/pgSQL, which loads it as
+/// PostgreSQL loads its library on first use.
+pub(crate) fn note_plpgsql_use() {
+    PLPGSQL_USED.with(|used| used.set(true));
+}
+
+/// Takes the [`note_plpgsql_use`] record of the running statement.
+pub(crate) fn take_plpgsql_use() -> bool {
+    PLPGSQL_USED.with(|used| used.replace(false))
 }
 
 /// The value of a custom parameter the running statement's session defined,
@@ -820,6 +910,9 @@ struct GucValues {
     plpgsql_variable_conflict: VariableConflict,
     session_replication_role: SessionReplicationRole,
     plpgsql_print_strict_params: bool,
+    plpgsql_check_asserts: bool,
+    plpgsql_extra_warnings: PlpgsqlExtraChecks,
+    plpgsql_extra_errors: PlpgsqlExtraChecks,
     /// Values of the session's custom parameters, by [`CustomNames`] slot.
     custom: [StackStr<CUSTOM_PARAMETER_VALUE_BYTES>; CUSTOM_PARAMETER_SLOTS],
 }
@@ -984,6 +1077,9 @@ impl GucValues {
             track_functions,
             plpgsql_variable_conflict,
             plpgsql_print_strict_params,
+            plpgsql_check_asserts,
+            plpgsql_extra_warnings,
+            plpgsql_extra_errors,
             session_replication_role,
             custom
         )
@@ -1021,6 +1117,9 @@ impl GucValues {
             plpgsql_variable_conflict: VariableConflict::Error,
             session_replication_role: SessionReplicationRole::Origin,
             plpgsql_print_strict_params: false,
+            plpgsql_check_asserts: true,
+            plpgsql_extra_warnings: PlpgsqlExtraChecks::none(),
+            plpgsql_extra_errors: PlpgsqlExtraChecks::none(),
             custom: [StackStr::new(); CUSTOM_PARAMETER_SLOTS],
         };
         let _ = write!(values.datestyle, "ISO, MDY");
@@ -1068,7 +1167,10 @@ const GUC_PLPGSQL_VARIABLE_CONFLICT: GucMask = 1 << 28;
 const GUC_WORK_MEM: GucMask = 1 << 29;
 const GUC_PLPGSQL_PRINT_STRICT_PARAMS: GucMask = 1 << 30;
 const GUC_SESSION_REPLICATION_ROLE: GucMask = 1 << 31;
-const GUC_BUILTIN_SETTING_COUNT: usize = 32;
+const GUC_PLPGSQL_CHECK_ASSERTS: GucMask = 1 << 32;
+const GUC_PLPGSQL_EXTRA_WARNINGS: GucMask = 1 << 33;
+const GUC_PLPGSQL_EXTRA_ERRORS: GucMask = 1 << 34;
+const GUC_BUILTIN_SETTING_COUNT: usize = 35;
 #[cfg(test)]
 const GUC_BUILTIN_ALL: GucMask =
     GucMask::MAX >> (GucMask::BITS as usize - GUC_BUILTIN_SETTING_COUNT);
@@ -1092,6 +1194,21 @@ const fn custom_bit(slot: usize) -> GucMask {
 struct CustomNames {
     names: RefCell<[StackStr<CUSTOM_PARAMETER_NAME_BYTES>; CUSTOM_PARAMETER_SLOTS]>,
     count: Cell<usize>,
+    /// Slots whose placeholder loading PL/pgSQL removed; they stay used.
+    removed: Cell<u8>,
+    /// PL/pgSQL has loaded in this session, reserving the `plpgsql` prefix.
+    plpgsql_loaded: Cell<bool>,
+}
+
+const _: () = assert!(CUSTOM_PARAMETER_SLOTS <= u8::BITS as usize);
+
+/// The prefix PL/pgSQL reserves when it loads, as PostgreSQL's
+/// `MarkGUCPrefixReserved("plpgsql")` does.
+const PLPGSQL_PREFIX: &str = "plpgsql";
+
+fn has_plpgsql_prefix(name: &str) -> bool {
+    name.split_once('.')
+        .is_some_and(|(prefix, _)| prefix.eq_ignore_ascii_case(PLPGSQL_PREFIX))
 }
 
 impl CustomNames {
@@ -1099,14 +1216,20 @@ impl CustomNames {
         Self {
             names: RefCell::new([StackStr::new(); CUSTOM_PARAMETER_SLOTS]),
             count: Cell::new(0),
+            removed: Cell::new(0),
+            plpgsql_loaded: Cell::new(false),
         }
     }
 
     fn find(&self, name: &str) -> Option<usize> {
         let names = self.names.borrow();
+        let removed = self.removed.get();
         names[..self.count.get()]
             .iter()
-            .position(|defined| defined.as_str().eq_ignore_ascii_case(name))
+            .enumerate()
+            .position(|(slot, defined)| {
+                removed & (1 << slot) == 0 && defined.as_str().eq_ignore_ascii_case(name)
+            })
     }
 
     /// The slot of a custom parameter, defining it as PostgreSQL's
@@ -1116,6 +1239,17 @@ impl CustomNames {
             return Ok(slot);
         }
         validate_custom_name(name)?;
+        if self.plpgsql_loaded.get() && has_plpgsql_prefix(name) {
+            crate::sql::eval::stash_diagnostic(
+                Some(StackStr::from_str("\"plpgsql\" is a reserved prefix.")),
+                None,
+            );
+            return Err(sql_err!(
+                sqlstate::INVALID_NAME,
+                "invalid configuration parameter name \"{}\"",
+                name
+            ));
+        }
         let count = self.count.get();
         if count == CUSTOM_PARAMETER_SLOTS {
             return Err(sql_err!(
@@ -1288,6 +1422,12 @@ fn guc_bit(name: &str) -> GucMask {
         GUC_WORK_MEM
     } else if name.eq_ignore_ascii_case("plpgsql.print_strict_params") {
         GUC_PLPGSQL_PRINT_STRICT_PARAMS
+    } else if name.eq_ignore_ascii_case("plpgsql.check_asserts") {
+        GUC_PLPGSQL_CHECK_ASSERTS
+    } else if name.eq_ignore_ascii_case("plpgsql.extra_warnings") {
+        GUC_PLPGSQL_EXTRA_WARNINGS
+    } else if name.eq_ignore_ascii_case("plpgsql.extra_errors") {
+        GUC_PLPGSQL_EXTRA_ERRORS
     } else if name.eq_ignore_ascii_case("session_replication_role") {
         GUC_SESSION_REPLICATION_ROLE
     } else {
@@ -1426,6 +1566,9 @@ fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: GucMask) {
     copy!(GUC_SESSION_REPLICATION_ROLE, session_replication_role);
     copy!(GUC_PLPGSQL_VARIABLE_CONFLICT, plpgsql_variable_conflict);
     copy!(GUC_PLPGSQL_PRINT_STRICT_PARAMS, plpgsql_print_strict_params);
+    copy!(GUC_PLPGSQL_CHECK_ASSERTS, plpgsql_check_asserts);
+    copy!(GUC_PLPGSQL_EXTRA_WARNINGS, plpgsql_extra_warnings);
+    copy!(GUC_PLPGSQL_EXTRA_ERRORS, plpgsql_extra_errors);
     for slot in 0..CUSTOM_PARAMETER_SLOTS {
         if mask & custom_bit(slot) != 0 {
             target.custom[slot] = source.custom[slot];
@@ -1818,6 +1961,40 @@ impl GucState {
             return crate::storage::SqlName::parse(self.custom.names.borrow()[slot].as_str());
         }
         canonical_setting_name(name)
+    }
+
+    /// Loads PL/pgSQL into the session once: its prefix becomes reserved and
+    /// each placeholder under it is removed with PostgreSQL's warning.
+    pub(crate) fn load_plpgsql(
+        &self,
+        responder: &mut crate::pg::respond::Responder,
+    ) -> Result<(), crate::pg::wire::WireFull> {
+        if self.custom.plpgsql_loaded.replace(true) {
+            return Ok(());
+        }
+        for slot in 0..self.custom.count.get() {
+            let name = self.custom.names.borrow()[slot];
+            if self.custom.removed.get() & (1 << slot) != 0 || !has_plpgsql_prefix(name.as_str()) {
+                continue;
+            }
+            self.custom
+                .removed
+                .set(self.custom.removed.get() | (1 << slot));
+            crate::sql::eval::stash_diagnostic(
+                Some(StackStr::from_str("\"plpgsql\" is now a reserved prefix.")),
+                None,
+            );
+            responder.warning(
+                sqlstate::INVALID_NAME,
+                crate::stack_format!(
+                    160,
+                    "invalid configuration parameter name \"{}\", removing it",
+                    name.as_str()
+                )
+                .as_str(),
+            )?;
+        }
+        Ok(())
     }
 
     pub(crate) fn source(&self, name: &str) -> &'static str {
@@ -2792,6 +2969,12 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
         values.plpgsql_variable_conflict = defaults.plpgsql_variable_conflict;
     } else if name.eq_ignore_ascii_case("plpgsql.print_strict_params") {
         values.plpgsql_print_strict_params = defaults.plpgsql_print_strict_params;
+    } else if name.eq_ignore_ascii_case("plpgsql.check_asserts") {
+        values.plpgsql_check_asserts = defaults.plpgsql_check_asserts;
+    } else if name.eq_ignore_ascii_case("plpgsql.extra_warnings") {
+        values.plpgsql_extra_warnings = defaults.plpgsql_extra_warnings;
+    } else if name.eq_ignore_ascii_case("plpgsql.extra_errors") {
+        values.plpgsql_extra_errors = defaults.plpgsql_extra_errors;
     } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
         // Storage scans are deterministic and never synchronize their starts.
     } else if name.eq_ignore_ascii_case("standard_conforming_strings")
@@ -3071,6 +3254,18 @@ fn apply_setting(
             parse_boolean_setting("plpgsql.print_strict_params", v)?;
         return Ok(());
     }
+    if name.eq_ignore_ascii_case("plpgsql.check_asserts") {
+        values.plpgsql_check_asserts = parse_boolean_setting("plpgsql.check_asserts", v)?;
+        return Ok(());
+    }
+    if name.eq_ignore_ascii_case("plpgsql.extra_warnings") {
+        values.plpgsql_extra_warnings = PlpgsqlExtraChecks::parse("plpgsql.extra_warnings", v)?;
+        return Ok(());
+    }
+    if name.eq_ignore_ascii_case("plpgsql.extra_errors") {
+        values.plpgsql_extra_errors = PlpgsqlExtraChecks::parse("plpgsql.extra_errors", v)?;
+        return Ok(());
+    }
     if name.eq_ignore_ascii_case("plpgsql.variable_conflict") {
         values.plpgsql_variable_conflict = VariableConflict::parse(v).ok_or_else(|| {
             invalid_enum_value(
@@ -3250,6 +3445,16 @@ fn owned_setting(values: &GucValues, custom: &CustomNames, name: &str) -> Option
         } else {
             "off"
         }))
+    } else if name.eq_ignore_ascii_case("plpgsql.check_asserts") {
+        Some(StackStr::from_str(if values.plpgsql_check_asserts {
+            "on"
+        } else {
+            "off"
+        }))
+    } else if name.eq_ignore_ascii_case("plpgsql.extra_warnings") {
+        Some(StackStr::from_str(values.plpgsql_extra_warnings.as_str()))
+    } else if name.eq_ignore_ascii_case("plpgsql.extra_errors") {
+        Some(StackStr::from_str(values.plpgsql_extra_errors.as_str()))
     } else if name.eq_ignore_ascii_case("seed") {
         Some(StackStr::from_str("unavailable"))
     } else {

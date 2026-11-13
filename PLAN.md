@@ -443,10 +443,13 @@ other shipped descriptions are listed); `pg_type`, `pg_operator` and
 `pg_opfamily` return built-in rows in OID order rather than a fresh cluster's
 physical order (`pg_opclass`, `pg_amop` and `pg_amproc` match it). psql's
 describe commands match PostgreSQL 18.6 except: `\dF`, `\dFd` and `\dFt`
-list only the `simple` and `english` text search objects; and `\dfS+` takes
-about ten seconds in a debug build over 3,400 routines because each row's
-calls repeat overload resolution and expression typing that PostgreSQL does
-once while planning. Parameter inference walks a statement in its own order rather than
+list only the `simple` and `english` text search objects; `\dfS+` lists
+`postgres_fdw_handler` and `postgres_fdw_validator` in `pg_catalog`, where
+PostgreSQL has them only in the schema of an installed `postgres_fdw`
+extension; and `\dfS+` over 3,400 routines takes about twice as long as
+PostgreSQL (0.5 s against 0.24 s in release builds on one host, 2026-11-13)
+because each row's calls repeat overload resolution and expression typing
+that PostgreSQL does once while planning. Parameter inference walks a statement in its own order rather than
 PostgreSQL's left-to-right analysis, so a parameter typed by one use and passed
 untyped to an `"any"` argument by another can be accepted where PostgreSQL
 reports `42P18`, and a user-defined polymorphic argument left untyped becomes

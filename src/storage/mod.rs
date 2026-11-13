@@ -57390,6 +57390,11 @@ impl Storage {
         right_oid: Option<i32>,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
+        // Most applied operators are built in; skip copying every
+        // user-defined operator when none has this name.
+        if !self.has_visible_operator_named(name, txid) {
+            return Ok(None);
+        }
         let path_position = |schema: SqlName| {
             self.path().entries().iter().position(|entry| match entry {
                 PathEntry::Schema(slot) => self.schema_def_for(*slot as usize, txid).name == schema,

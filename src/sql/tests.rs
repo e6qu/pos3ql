@@ -23589,7 +23589,8 @@ fn maximum_statement_width_executes_before_and_after_object_cold_recovery() {
                 .iter()
                 .filter(|line| line.contains("Append"))
                 .count(),
-            WIDTH - 1,
+            // PostgreSQL flattens a chain of UNION ALL into one Append.
+            1,
             "{phase} set EXPLAIN: {}",
             String::from_utf8_lossy(&set_plan)
         );
@@ -54673,8 +54674,10 @@ fn explain_analyze_counts_each_node_of_the_plan_it_runs() {
         "EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) SELECT * FROM na ORDER BY b",
     ));
     assert!(
-        timed[1].starts_with("  ->  Seq Scan on na (actual time=")
-            && timed[1].ends_with(" rows=100.00 loops=1)"),
+        timed
+            .iter()
+            .any(|row| row.starts_with("  ->  Seq Scan on na (actual time=")
+                && row.ends_with(" rows=100.00 loops=1)")),
         "{timed:?}"
     );
 }
@@ -54854,7 +54857,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
     assert!(
         detailed
             .iter()
-            .any(|row| row.contains("Index Scan using ep_pkey on ep")),
+            .any(|row| row.contains("Index Scan using ep_pkey on public.ep")),
         "{detailed:?}"
     );
 

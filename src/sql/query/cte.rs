@@ -3415,6 +3415,10 @@ fn with_exec_context<'a, 's, 'e, R>(
                 if execution.refuses_evaluate_once() {
                     return Err(execution.refuse());
                 }
+                // PostgreSQL plans a referenced CTE it runs once before the
+                // query reading it, folding the CTE's constants then, even
+                // when no row of the query ever reads the CTE.
+                super::check_select_constants(query, arena, storage, txid)?;
                 let relation = materialize_query_cte(
                     cte.name,
                     cte.columns,

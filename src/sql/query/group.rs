@@ -538,12 +538,9 @@ pub(super) fn groups_for_mask<'a>(
     let output_correlated = output_correlated.as_slice();
 
     let n_aggs = agg_nodes.len();
-    let scope_columns = super::ScopeCols(scope);
-    let outer_columns = super::aggregate_outer_columns(Some(scope), outer, storage, txid, arena);
-    let aggregate_columns: &dyn crate::sql::exec::ColTypeResolver = match &outer_columns {
-        Some(columns) => columns,
-        None => &scope_columns,
-    };
+    let argument_columns =
+        super::aggregate_argument_columns(Some(scope), outer, storage, txid, arena);
+    let aggregate_columns: &dyn crate::sql::exec::ColTypeResolver = &argument_columns;
     let states: &mut [AggState] = arena
         .alloc_slice_with(n_groups * n_aggs.max(1), |_| AggState::default())
         .map_err(|_| arena_full())?;

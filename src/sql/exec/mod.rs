@@ -81015,9 +81015,11 @@ struct StreamedSource<'a> {
     next: Option<Option<&'a [Datum<'a>]>>,
 }
 
-/// A streamed source's reader holds this share of the arena's remaining
-/// bytes; the writes recycle the rest row by row.
-const STREAMED_SOURCE_SHARE: usize = 2;
+/// The fixed block a streamed source's reader holds (a table scan's cursor
+/// buffers take about 128 KiB); the writes recycle the rest of the arena row
+/// by row. A source in an arena with less than twice this free
+/// materializes instead.
+const STREAMED_SOURCE_BLOCK: usize = 512 << 10;
 
 /// Opens a streamed source and reads its first row before the first row
 /// change, so a wait there restarts the statement and a sort or hash table
@@ -81038,7 +81040,7 @@ fn open_streamed_source<'a>(
     responder: &mut Responder<'_>,
 ) -> Result<Option<StreamedSource<'a>>, SqlError> {
     let block = arena
-        .alloc_front_block(arena.remaining() / STREAMED_SOURCE_SHARE)
+        .alloc_front_block(STREAMED_SOURCE_BLOCK)
         .map_err(|_| super::eval::arena_full())?;
     let reader = super::query::without_routine_invocations(|| {
         let _snapshot = storage.dml_expression_snapshot(command);
@@ -81550,6 +81552,7 @@ where
         if matches!(source, InsertSource::Statement)
             && transition_relations.is_none()
             && !capturing
+            && arena.remaining() >= 2 * STREAMED_SOURCE_BLOCK
             && super::query::select_reads_repeatably(sel, storage, txn.txid)
         {
             let opened = open_streamed_source(
@@ -81736,7 +81739,8 @@ where
                              services: &mut TriggerServices<'_>,
                              responder: &mut Responder<'_>,
                              index: usize,
-                             bytes: &'a [u8]|
+                             bytes: &'a [u8],
+                             streamed: Option<&'a [Datum<'a>]>|
          -> Outcome {
             {
                 match row_progress::start_row(
@@ -81789,41 +81793,49 @@ where
                     }
                     Err(error) => return sql_fail(error),
                 }
-                let converted = match &deferred {
-                    Some(deferred) => {
-                        let source = match deferred_source_row(
-                            deferred,
-                            bytes,
-                            storage,
-                            txn.txid,
-                            seq_session,
-                            arena,
-                            params,
-                        )
-                        .and_then(|row| {
-                            coerce_insert_projection(
-                                row,
-                                !statement.values_defaults.is_empty(),
-                                def,
-                                &targets[..n_targets],
-                                source_assignment_casts.expect("SELECT has a cast plan"),
-                                statement.overriding,
-                                storage,
-                                txn.txid,
-                                arena,
-                                Some(&crate::sql::sequence::SeqEval::new(
-                                    storage,
-                                    seq_session,
-                                    coercion_txid,
-                                )),
+                // A streamed row converts here, inside its row: an
+                // assignment cast that calls a routine resumes at the row.
+                let converted = match (streamed, &deferred) {
+                    (Some(_), _) | (None, Some(_)) => {
+                        let source = match streamed
+                            .map_or_else(
+                                || {
+                                    deferred_source_row(
+                                        deferred.as_ref().expect("a deferred source"),
+                                        bytes,
+                                        storage,
+                                        txn.txid,
+                                        seq_session,
+                                        arena,
+                                        params,
+                                    )
+                                },
+                                Ok,
                             )
-                        }) {
+                            .and_then(|row| {
+                                coerce_insert_projection(
+                                    row,
+                                    !statement.values_defaults.is_empty(),
+                                    def,
+                                    &targets[..n_targets],
+                                    source_assignment_casts.expect("SELECT has a cast plan"),
+                                    statement.overriding,
+                                    storage,
+                                    txn.txid,
+                                    arena,
+                                    Some(&crate::sql::sequence::SeqEval::new(
+                                        storage,
+                                        seq_session,
+                                        coercion_txid,
+                                    )),
+                                )
+                            }) {
                             Ok(row) => row,
                             Err(error) => return sql_fail(error),
                         };
                         Some(source)
                     }
-                    None => None,
+                    (None, None) => None,
                 };
                 // A deferred source row holds hidden call columns past its
                 // written ones; its converted row has the written shape.
@@ -81943,7 +81955,7 @@ where
         let rows_outcome = match stream.as_mut() {
             None => (|| -> Outcome {
                 for (index, bytes) in rows_bytes.iter().enumerate().skip(first_row) {
-                    match write_row(storage, txn, services, responder, index, bytes)? {
+                    match write_row(storage, txn, services, responder, index, bytes, None)? {
                         Ok(()) => {}
                         Err(error) => return sql_fail(error),
                     }
@@ -81961,28 +81973,15 @@ where
                                 "streamed INSERT source row was not evaluated"
                             ));
                         };
-                        let converted = coerce_insert_projection(
-                            values,
-                            !statement.values_defaults.is_empty(),
-                            def,
-                            &targets[..n_targets],
-                            source_assignment_casts.expect("SELECT has a cast plan"),
-                            statement.overriding,
+                        match write_row(
                             storage,
-                            txn.txid,
-                            arena,
-                            Some(&crate::sql::sequence::SeqEval::new(
-                                storage,
-                                seq_session,
-                                coercion_txid,
-                            )),
-                        )
-                        .and_then(|row| encode_projected_pub(row, arena));
-                        let bytes = match converted {
-                            Ok(bytes) => bytes,
-                            Err(error) => return sql_fail(error),
-                        };
-                        match write_row(storage, txn, services, responder, index, bytes)? {
+                            txn,
+                            services,
+                            responder,
+                            index,
+                            &[],
+                            Some(values),
+                        )? {
                             Ok(()) => {}
                             Err(error) => return sql_fail(error),
                         }

@@ -4,13 +4,14 @@
 
 use super::*;
 
-/// An engine whose work arena, where a top-level write runs, is 512 KiB.
+/// An engine whose work arena, where a top-level write runs, is 2 MiB.
 fn streamed_engine(label: &str) -> (Engine, Budget, TxnState) {
     let mut config = test_config(label);
     config.txn_rows = 32_768;
-    config.work_arena_bytes = 512 << 10;
+    config.work_arena_bytes = 2 << 20;
     config.wal_bytes = 32 << 20;
     config.memtable_bytes = 16 << 20;
+    config.wal_buffer_bytes = 32 << 20;
     config.row_overlay_slots = 32_768;
     let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 27));
     let engine = Engine::new(&config, &mut budget).unwrap();
@@ -50,13 +51,13 @@ fn insert_select_streams_its_source_in_fixed_memory() {
         "CREATE TABLE stream_src(id integer, label text); \
          CREATE TABLE stream_dst(id integer, label text)",
     );
-    // About 620 KB of encoded source rows: more than the whole work arena.
+    // About 2.3 MB of encoded source rows: more than the whole work arena.
     let text = success(
         &mut engine,
         &mut budget,
         &mut txn,
         "INSERT INTO stream_src \
-         SELECT g, repeat('x', 120) || g FROM generate_series(1, 4000) g",
+         SELECT g, repeat('x', 560) || g FROM generate_series(1, 4000) g",
     );
     assert!(text.contains("INSERT 0 4000"), "{text}");
     checkpoint(&mut engine);
@@ -94,8 +95,8 @@ fn insert_select_streams_its_source_in_fixed_memory() {
         rows(&output),
         [format!(
             "2000|4002000|{}10|{}998",
-            "x".repeat(120),
-            "x".repeat(120)
+            "x".repeat(560),
+            "x".repeat(560)
         )]
     );
     // A source calling a volatile built-in reads differently each time it

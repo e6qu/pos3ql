@@ -227,7 +227,8 @@ no volatile built-in (`random()`, `nextval`, ...) and no user routine, and
 that the retained reader runs (see [retained plan tree](#retained-plan-tree);
 a single table the general executor would read through an index keeps that
 path), streams: it reads as of the statement's start, holds one source row
-at a time in a fixed block (half of the arena's free bytes), and
+at a time in a fixed 512 KiB block of the arena (an arena with less
+than 1 MiB free materializes the source instead), and
 each row is written before the next is read, so `INSERT INTO archive
 SELECT * FROM orders` copies any number of rows in fixed memory and a
 source reading its own target sees none of the new rows, as in PostgreSQL.

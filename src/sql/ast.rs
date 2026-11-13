@@ -3552,6 +3552,18 @@ impl Expr<'_> {
             Expr::Binary { left, right, .. } => {
                 left.folds_to_constant() && right.folds_to_constant()
             }
+            // `textlike` and its kin are immutable, so a pattern match of
+            // constants folds too.
+            Expr::Like {
+                operand,
+                pattern,
+                escape,
+                ..
+            } => {
+                operand.folds_to_constant()
+                    && pattern.folds_to_constant()
+                    && escape.is_none_or(|escape| escape.folds_to_constant())
+            }
             _ => false,
         }
     }

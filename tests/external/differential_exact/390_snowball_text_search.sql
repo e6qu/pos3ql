@@ -52,13 +52,29 @@ select to_tsvector('danish', 'Børnene legede på gaderne') @@ to_tsquery('danis
 select alias, token, dictionaries, dictionary, lexemes from ts_debug('russian', 'Running красивые дома 42');
 select alias, token, dictionaries, dictionary, lexemes from ts_debug('hindi', 'word शब्दों');
 -- Catalog rows initdb creates.
--- initdb numbers the Snowball objects after the platform's collations; these
--- OIDs must match the pinned reference image.
-select 'dsnowball_init'::regproc::oid as init, 'dsnowball_lexize'::regproc::oid as lexize,
-       (select tmplinit::oid from pg_ts_template where tmplname = 'snowball') as template_init,
-       'snowball'::text as template, (select oid from pg_ts_template where tmplname = 'snowball') as template_oid,
-       'english_stem'::regdictionary::oid as english_stem, 'english'::regconfig::oid as english,
-       'yiddish'::regconfig::oid as yiddish;
+-- initdb numbers the Snowball objects, information_schema and plpgsql after
+-- the platform's collations, so only offsets from dsnowball_init are portable
+-- (ci_diff.sh pins the absolute numbering against the reference image).
+select 'dsnowball_init'::regproc::oid::int8 - b as init, 'dsnowball_lexize'::regproc::oid::int8 - b as lexize,
+       (select tmplinit::oid::int8 from pg_ts_template where tmplname = 'snowball') - b as template_init,
+       (select oid::int8 from pg_ts_template where tmplname = 'snowball') - b as template,
+       'english_stem'::regdictionary::oid::int8 - b as english_stem, 'english'::regconfig::oid::int8 - b as english,
+       'yiddish'::regconfig::oid::int8 - b as yiddish
+  from (select 'dsnowball_init'::regproc::oid::int8 as b) base;
+select c, name, o - b as offset_from_dsnowball_init
+  from (select 'pg_proc' as c, proname::text as name, oid::int8 as o from pg_proc
+        union all select 'pg_ts_template', tmplname::text, oid::int8 from pg_ts_template
+        union all select 'pg_ts_dict', dictname::text, oid::int8 from pg_ts_dict
+        union all select 'pg_ts_config', cfgname::text, oid::int8 from pg_ts_config
+        union all select 'pg_namespace', nspname::text, oid::int8 from pg_namespace
+        union all select 'pg_extension', extname::text, oid::int8 from pg_extension
+        union all select 'pg_language', lanname::text, oid::int8 from pg_language
+        union all select 'pg_constraint', conname::text, oid::int8 from pg_constraint
+        union all select 'pg_type', typname::text, oid::int8 from pg_type where typtype = 'd'
+          or typelem in (select oid from pg_type where typtype = 'd')) objects,
+       (select 'dsnowball_init'::regproc::oid::int8 as b) base
+ where o >= b and o < 16384
+ order by o;
 select cfgname, cfgnamespace::regnamespace, cfgowner::regrole, cfgparser::regproc, obj_description(oid, 'pg_ts_config') from pg_ts_config order by cfgname;
 select dictname, dictnamespace::regnamespace, dictowner::regrole, t.tmplname, dictinitoption, obj_description(d.oid, 'pg_ts_dict') from pg_ts_dict d join pg_ts_template t on t.oid = d.dicttemplate order by dictname;
 select tmplname, tmplinit, tmpllexize, obj_description(oid, 'pg_ts_template') from pg_ts_template order by tmplname;

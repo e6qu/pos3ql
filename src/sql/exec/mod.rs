@@ -55448,6 +55448,21 @@ impl ColTypeResolver for RuleConditionColumns<'_> {
         self.catalog.validate_enum_input_literal(text, target_oid)
     }
 
+    fn validate_literal_input(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
+        self.catalog.validate_literal_input(text, target_oid)
+    }
+
+    fn validate_call_literal_inputs(
+        &self,
+        selection: crate::sql::eval::RoutineCallSelection,
+        args: &[&crate::sql::ast::Expr<'_>],
+        argument_names: &[Option<&str>],
+        variadic: bool,
+    ) -> Result<(), SqlError> {
+        self.catalog
+            .validate_call_literal_inputs(selection, args, argument_names, variadic)
+    }
+
     fn type_name_fixed(&self, oid: i32) -> Result<Option<StackStr<260>>, SqlError> {
         self.catalog.type_name_fixed(oid)
     }
@@ -74223,6 +74238,9 @@ impl CopyFilter {
     fn resolve<Definition0: crate::storage::DefinitionBacking>(
         statement: &crate::sql::ast::CopyStmt,
         def: &crate::storage::TableDefinition<Definition0>,
+        storage: &Storage,
+        txid: u32,
+        arena: &Arena,
     ) -> Result<Self, SqlError> {
         let Some(predicate) = statement.where_clause else {
             return Ok(Self {
@@ -74238,6 +74256,33 @@ impl CopyFilter {
         }
         // PostgreSQL analyses the condition in the statement's text.
         crate::sql::error_position::with_analysis(|| validate_copy_predicate(predicate, def))?;
+        // The predicate is analysed with the statement, before any data is
+        // read: its functions resolve and its literals run their inputs.
+        let mark = arena.mark();
+        let columns = CatalogCols {
+            definition: Some(crate::storage::RelationDefinition::from_definition(def)),
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        };
+        let analysed = infer_type_res(predicate, &columns).and_then(|_| {
+            super::query::check_literal_operands_typed(
+                predicate,
+                &|other| {
+                    infer_type_res(other, &columns)
+                        .ok()
+                        .and_then(|(oid, _)| ColType::from_oid(oid))
+                },
+                storage,
+                txid,
+                arena,
+            )
+        });
+        // Only the verdict leaves; analysis scratch is discarded.
+        unsafe { arena.rewind_to(mark) };
+        analysed?;
         let row = RowCtx {
             table_oid: None,
             def: crate::storage::RelationDefinition::from_definition(def),
@@ -74600,6 +74645,7 @@ pub fn copy_begin(
     storage: &Storage,
     statement: &crate::sql::ast::CopyStmt,
     txid: u32,
+    arena: &Arena,
 ) -> Result<CopySetup, SqlError> {
     let security_role = storage.current_role_slot(txid).ok_or_else(|| {
         sql_err!(
@@ -74702,43 +74748,45 @@ pub fn copy_begin(
             "COPY FROM not supported with row-level security"
         ));
     }
-    if !statement.to && storage.matview_slot_for_table(table_index, txid).is_some() {
-        return Err(sql_err!(
-            sqlstate::WRONG_OBJECT_TYPE,
-            "cannot copy to materialized view \"{}\"",
-            def.name.as_str()
-        ));
-    }
     if statement.to {
         if !storage.row_security_applies(table_index, security_role, txid) {
             if def.partition.is_partitioned() {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "cannot copy from partitioned table \"{}\"",
-                    def.name.as_str()
+                return Err(crate::sql::error_position::with_hint(
+                    sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "cannot copy from partitioned table \"{}\"",
+                        def.name.as_str()
+                    ),
+                    COPY_QUERY_HINT,
                 ));
             }
             if def.kind == crate::storage::TableKind::Foreign {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "cannot copy from foreign table \"{}\"",
-                    def.name.as_str()
+                return Err(crate::sql::error_position::with_hint(
+                    sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "cannot copy from foreign table \"{}\"",
+                        def.name.as_str()
+                    ),
+                    COPY_QUERY_HINT,
                 ));
             }
         }
         if storage.matviews_visible_to(txid).any(|(_, view)| {
             usize::from(view.backing_table) == table_index && !view.populated_for(txid)
         }) {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "cannot copy from unpopulated materialized view \"{}\"",
-                def.name.as_str()
+            return Err(crate::sql::error_position::with_hint(
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot copy from unpopulated materialized view \"{}\"",
+                    def.name.as_str()
+                ),
+                "Use the REFRESH MATERIALIZED VIEW command.",
             ));
         }
     }
     let opts = &statement.options;
     let fmt = CopyFmt::resolve(def, statement.table.name, opts)?;
-    let filter = CopyFilter::resolve(statement, def)?;
+    let filter = CopyFilter::resolve(statement, def, storage, txid, arena)?;
     Ok(CopySetup {
         clock: super::datetime::statement_clock(),
         snapshot_lease: Mutex::new(None),
@@ -74784,7 +74832,7 @@ fn copy_export_table(
         }
         StoredRelKind::View => (AccessClass::View, "view"),
         StoredRelKind::Sequence => (AccessClass::Sequence, "sequence"),
-        StoredRelKind::Index => (AccessClass::Index, "non-table relation"),
+        StoredRelKind::Index => return Err(copy_index_error(name.name)),
     };
     let object = storage
         .resolve_access_object(class, schema.as_str(), name.name, txid)
@@ -74830,16 +74878,203 @@ fn copy_export_table(
     if !permitted {
         return Err(sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
-            "permission denied for table {}",
+            "permission denied for {} {}",
+            description,
             name.name
         ));
     }
-    Err(sql_err!(
+    let error = sql_err!(
         sqlstate::WRONG_OBJECT_TYPE,
         "cannot copy from {} \"{}\"",
         description,
         name.name
-    ))
+    );
+    Err(if kind == StoredRelKind::View {
+        crate::sql::error_position::with_hint(error, COPY_QUERY_HINT)
+    } else {
+        error
+    })
+}
+
+/// PostgreSQL's hint for COPY TO of a relation that only a query can read.
+const COPY_QUERY_HINT: &str = "Try the COPY (SELECT ...) TO variant.";
+
+/// COPY opens its relation as a table, which an index is not.
+fn copy_index_error(name: &str) -> SqlError {
+    crate::sql::eval::with_detail(
+        sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "cannot open relation \"{}\"",
+            name
+        ),
+        format_args!("This operation is not supported for indexes."),
+    )
+}
+
+/// A COPY FROM target PostgreSQL accepts only after it has entered copy-in
+/// mode: `CopyFrom` refuses these relations once the client is sending data.
+#[derive(Clone, Copy, Debug)]
+pub enum CopyRefusal {
+    View(SqlName),
+    MaterializedView(SqlName),
+    Sequence(SqlName),
+}
+
+impl CopyRefusal {
+    /// The error, with its hint stashed for the report.
+    pub fn error(self) -> SqlError {
+        match self {
+            Self::View(name) => crate::sql::error_position::with_hint(
+                sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "cannot copy to view \"{}\"",
+                    name.as_str()
+                ),
+                "To enable copying to a view, provide an INSTEAD OF INSERT trigger.",
+            ),
+            Self::MaterializedView(name) => sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "cannot copy to materialized view \"{}\"",
+                name.as_str()
+            ),
+            Self::Sequence(name) => sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "cannot copy to sequence \"{}\"",
+                name.as_str()
+            ),
+        }
+    }
+}
+
+/// A refused COPY FROM, after the checks PostgreSQL makes before copy-in:
+/// the relation opens, the role may insert, and the column list resolves.
+pub struct RefusedCopyIn {
+    pub refusal: CopyRefusal,
+    pub n_targets: usize,
+    pub binary: bool,
+}
+
+/// COPY FROM into a view or sequence. `None` leaves every other relation to
+/// [`copy_begin`]; an index fails here as PostgreSQL's open does.
+pub fn copy_from_refusal(
+    storage: &Storage,
+    statement: &crate::sql::ast::CopyStmt,
+    txid: u32,
+) -> Result<Option<RefusedCopyIn>, SqlError> {
+    use crate::storage::StoredRelKind;
+    if statement.to {
+        return Ok(None);
+    }
+    let name = &statement.table;
+    let Some((schema, kind)) = storage.classify_relation(name.schema, name.name, txid) else {
+        return Ok(None);
+    };
+    let role = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        )
+    })?;
+    let (refusal, columns): (CopyRefusal, &[&str]) = match kind {
+        StoredRelKind::Index => return Err(copy_index_error(name.name)),
+        StoredRelKind::View => {
+            let object = storage
+                .resolve_access_object(
+                    crate::storage::AccessClass::View,
+                    schema.as_str(),
+                    name.name,
+                    txid,
+                )
+                .ok_or_else(|| undefined_qual(name))?;
+            let slot = usize::from(object.slot);
+            require_view_privilege_as(
+                storage,
+                slot,
+                crate::storage::PrivilegeSet::INSERT,
+                role,
+                txid,
+            )?;
+            let target = crate::storage::TriggerTarget::View(object.slot);
+            if storage
+                .triggers_for_target(target, txid)
+                .any(|(_, trigger)| {
+                    matches!(trigger.timing, crate::sql::ast::TriggerTiming::InsteadOf)
+                        && trigger
+                            .events
+                            .contains(crate::sql::ast::TriggerEvents::INSERT)
+                })
+            {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "COPY FROM through a view's INSTEAD OF INSERT trigger is not supported"
+                ));
+            }
+            let view = storage.view(slot);
+            let names = view.columns_for(txid).names();
+            let n_targets = copy_refused_targets(
+                statement.columns,
+                name.name,
+                |column| names.iter().any(|candidate| candidate.as_str() == column),
+                names.len(),
+            )?;
+            return Ok(Some(RefusedCopyIn {
+                refusal: CopyRefusal::View(view.name),
+                n_targets,
+                binary: statement.options.format == crate::sql::ast::CopyFormat::Binary,
+            }));
+        }
+        StoredRelKind::Sequence => {
+            // A sequence's privileges do not include INSERT.
+            if !storage.role(role).attributes_to(txid).superuser {
+                return Err(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied for sequence {}",
+                    name.name
+                ));
+            }
+            (
+                CopyRefusal::Sequence(SqlName::parse(name.name)?),
+                &["last_value", "log_cnt", "is_called"],
+            )
+        }
+        StoredRelKind::Table | StoredRelKind::ForeignTable | StoredRelKind::Matview => {
+            return Ok(None);
+        }
+    };
+    let n_targets = copy_refused_targets(
+        statement.columns,
+        name.name,
+        |column| columns.contains(&column),
+        columns.len(),
+    )?;
+    Ok(Some(RefusedCopyIn {
+        refusal,
+        n_targets,
+        binary: statement.options.format == crate::sql::ast::CopyFormat::Binary,
+    }))
+}
+
+fn copy_refused_targets(
+    written: &[&str],
+    relation: &str,
+    exists: impl Fn(&str) -> bool,
+    all: usize,
+) -> Result<usize, SqlError> {
+    for column in written {
+        if !exists(column) {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" of relation \"{}\" does not exist",
+                column,
+                relation
+            ));
+        }
+    }
+    Ok(if written.is_empty() {
+        all
+    } else {
+        written.len()
+    })
 }
 
 pub(crate) fn subscription_copy_setup(

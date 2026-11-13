@@ -340,11 +340,22 @@ fn whole_row_constraints_and_indexes_name_depend_and_print_like_postgresql() {
         ("CREATE TABLE wc () INHERITS (wr)", "0A000"),
         ("CREATE STATISTICS ws ON (wr IS NULL), a FROM wr", "0A000"),
         ("CREATE TABLE wbad(a int, CHECK (zz.a > 0))", "42P01"),
-        // A row-typed key has no stored encoding.
-        ("CREATE INDEX wr_row ON wr ((wr))", "0A000"),
+        // An anonymous record key has no ordering.
+        ("CREATE INDEX wr_record ON wr ((ROW(a, b)))", "42P16"),
     ] {
         assert_eq!(sqlstate(&mut engine, &mut budget, sql), state, "{sql}");
     }
+    // A whole-row key has the table's row type.
+    assert_eq!(
+        rows(
+            &mut engine,
+            &mut budget,
+            "CREATE INDEX wr_row ON wr ((wr)); \
+             SELECT pg_get_indexdef('wr_row'::regclass); \
+             DROP INDEX wr_row",
+        ),
+        vec!["CREATE INDEX wr_row ON public.wr USING btree ((wr.*))"]
+    );
     rows(&mut engine, &mut budget, "ALTER TABLE wr RENAME TO wr2");
     assert_eq!(
         rows(

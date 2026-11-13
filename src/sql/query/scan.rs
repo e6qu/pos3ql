@@ -5954,6 +5954,12 @@ pub(crate) fn derived_key_plan<'a>(
             return None;
         }
         let build = &scope.defs.get(build_table)?.columns[build_column];
+        // A constant is converted to the column's type before hashing; only
+        // plain `oid` keys hash that conversion like the stored values (a
+        // `regproc` column keeps its own representation).
+        if matches!(probe, KeyProbe::Constant(_)) && build.ctype != ColType::Oid {
+            return None;
+        }
         (join_key_types_compatible(build.ctype, probe_type) && build.collation == probe_collation)
             .then_some(DerivedKeyPlan {
                 probe,

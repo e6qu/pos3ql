@@ -29179,6 +29179,11 @@ fn execute_procedural_query<T>(
                     arena,
                     continuation,
                     snapshot,
+                    if fresh_snapshot {
+                        crate::sql::query::CatalogReads::Fresh
+                    } else {
+                        crate::sql::query::CatalogReads::Statement
+                    },
                     context.txn,
                     sqlprep,
                     cursors,
@@ -29655,6 +29660,11 @@ fn eval_procedural_expression_in<'a>(
                 arena,
                 continuation.as_deref_mut(),
                 snapshot,
+                if row.invocation.fresh_snapshots {
+                    crate::sql::query::CatalogReads::Fresh
+                } else {
+                    crate::sql::query::CatalogReads::Statement
+                },
                 context.txn,
                 sqlprep,
                 cursors,

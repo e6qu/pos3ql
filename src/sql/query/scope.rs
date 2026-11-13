@@ -149,17 +149,80 @@ pub(crate) fn prebuild_statement_catalog_images(
         _ => return Ok(()),
     }
     super::catalog_images::pin_statement_images();
+    prebuild_statement_relations(statement, storage, txid, 0, arena)
+}
+
+/// Builds the images `statement` reads and those read by the non-volatile
+/// SQL functions it calls, which run under the statement's snapshot.
+fn prebuild_statement_relations(
+    statement: &crate::sql::ast::Stmt<'_>,
+    storage: &Storage,
+    txid: u32,
+    depth: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
     let path = storage.path();
     let mut failure = None;
     super::cte::statement_relations_of(statement, &mut |table| {
         if failure.is_none()
-            && let Err(error) = prebuild_relation(table, &path, storage, txid, 0, arena)
+            && let Err(error) = prebuild_relation(table, &path, storage, txid, depth, arena)
         {
             failure = Some(error);
         }
         0
     });
-    failure.map_or(Ok(()), Err)
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if depth >= MAX_PREBUILD_VIEW_DEPTH {
+        return Ok(());
+    }
+    let failure = core::cell::RefCell::new(None);
+    let call = |name: &str, arity: usize| {
+        if failure.borrow().is_none()
+            && let Err(error) = prebuild_function_bodies(name, arity, storage, txid, depth, arena)
+        {
+            *failure.borrow_mut() = Some(error);
+        }
+        // Visit every call.
+        false
+    };
+    super::cte::statement_contains_function(statement, &call);
+    failure.into_inner().map_or(Ok(()), Err)
+}
+
+/// Builds the images read by the bodies of the non-volatile SQL functions
+/// that a call of `name` with `arity` arguments could select.
+fn prebuild_function_bodies(
+    name: &str,
+    arity: usize,
+    storage: &Storage,
+    txid: u32,
+    depth: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let mut bodies = crate::mem::arena::ArenaList::new(arena);
+    storage.visit_stable_sql_function_bodies(name, arity, txid, &mut |kind, body| {
+        let text = match kind {
+            crate::storage::RoutineBodyKind::Return => arena
+                .alloc_str_display(format_args!("SELECT {body}"))
+                .map_err(|_| arena_full())?,
+            crate::storage::RoutineBodyKind::String | crate::storage::RoutineBodyKind::Atomic => {
+                &*arena.alloc_str(body).map_err(|_| arena_full())?
+            }
+        };
+        bodies.push(text).map_err(|_| arena_full())
+    })?;
+    for &body in bodies.as_slice() {
+        // A body that does not parse fails when the function is called.
+        let Ok(mut parser) = crate::sql::parser::Parser::new(body, arena) else {
+            continue;
+        };
+        while let Ok(Some(statement)) = parser.next_stmt() {
+            prebuild_statement_relations(&statement, storage, txid, depth + 1, arena)?;
+        }
+    }
+    Ok(())
 }
 
 const MAX_PREBUILD_VIEW_DEPTH: usize = 16;

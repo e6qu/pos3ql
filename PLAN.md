@@ -472,11 +472,7 @@ record, and only named composite types have a stored value form (a table's
 row type needs its own durable value form and key ordering first). A rule action that names its table's renamed column without
 `NEW.` or `OLD.` fails the rename with `0A000`. After a table, routine or type rename,
 `pg_get_viewdef` of a view it cannot deparse (see below) still prints the old
-names from the stored query text. A unique
-violation is reported for the table's single-column keys first, then its
-unique indexes, then its multi-column keys, where PostgreSQL checks every
-index in creation (OID) order, so a row that breaks both a key and a later
-index can name a different constraint.
+names from the stored query text.
 An exclusion constraint element must be a column: an expression
 (`EXCLUDE USING gist (int4range(a, b) WITH &&)`) fails with `0A000`, since
 the stored constraint keeps no element expressions. A statement's own catalog scans, including those through views, read the
@@ -485,11 +481,9 @@ catalog as the statement began (images built at its start), so `SELECT mk(g),
 generate_series(1, 3) g`, where `mk` creates a table, counts none, as
 PostgreSQL's statement snapshot does, and so does a data change whose
 trigger creates tables; a volatile routine's queries see the change. A
-STABLE or IMMUTABLE SQL function's catalog query still reads the catalog as
-it is when it runs, where PostgreSQL reads it under the calling statement's
-snapshot: prebuilding the images its body reads is not enough, because the
-call runs after the statement pauses for an earlier routine and its reads
-do not reach the statement's pinned images. `pg_get_viewdef` uses PostgreSQL's
+STABLE or IMMUTABLE SQL function reads the catalog under its calling
+statement's snapshot too: the images its body reads, through nested
+non-volatile SQL functions, are built when the statement starts. `pg_get_viewdef` uses PostgreSQL's
 layout, including its wrap column, only for a view
 over plain tables joined with `ON` conditions, without `DISTINCT`, `HAVING`,
 comma or `USING` joins, subqueries or set operations; other views return their

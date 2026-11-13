@@ -14841,6 +14841,7 @@ impl Engine {
                         scratch,
                         None,
                         source_snapshot,
+                        query::CatalogReads::Statement,
                         txn,
                         sqlprep,
                         cursors,
@@ -17461,6 +17462,7 @@ impl Engine {
         frame: &Arena,
         mut continuation: Option<&mut Option<query::RoutineInvocationState>>,
         source_snapshot: u32,
+        catalog_reads: query::CatalogReads,
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
@@ -17474,8 +17476,7 @@ impl Engine {
             &mut cursor::CursorPool,
         ) -> Result<T, SqlError>,
     ) -> Result<Result<T, SqlError>, WireFull> {
-        // A volatile routine's statement reads the catalog as it is now.
-        let _fresh_catalog_reads = if source_snapshot == crate::storage::SNAPSHOT_ALL {
+        let _fresh_catalog_reads = if catalog_reads == query::CatalogReads::Fresh {
             match query::enter_fresh_catalog_reads() {
                 Ok(scope) => Some(scope),
                 Err(error) => return Ok(Err(error)),
@@ -17675,6 +17676,7 @@ impl Engine {
                     frame,
                     None,
                     source_snapshot,
+                    query::CatalogReads::Statement,
                     txn,
                     sqlprep,
                     cursors,
@@ -17706,6 +17708,7 @@ impl Engine {
                         frame,
                         None,
                         source_snapshot,
+                        query::CatalogReads::Statement,
                         txn,
                         sqlprep,
                         cursors,
@@ -25960,6 +25963,7 @@ impl Engine {
                 frame,
                 None,
                 command,
+                query::CatalogReads::Statement,
                 txn,
                 sqlprep,
                 cursors,
@@ -26277,6 +26281,7 @@ impl Engine {
                         frame,
                         None,
                         source_snapshot,
+                        query::CatalogReads::Statement,
                         txn,
                         sqlprep,
                         cursors,
@@ -26313,6 +26318,7 @@ impl Engine {
                         frame,
                         None,
                         source_snapshot,
+                        query::CatalogReads::Statement,
                         txn,
                         sqlprep,
                         cursors,

@@ -429,6 +429,16 @@ pub(crate) fn enter_statement(images: &Arena) -> Result<CatalogSnapshotScope, Sq
     })
 }
 
+/// Which catalog snapshot a routine statement's scans read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CatalogReads {
+    /// The calling statement's: a non-volatile routine, or an expression of
+    /// the statement itself.
+    Statement,
+    /// The catalog as it is now: a volatile routine's statement.
+    Fresh,
+}
+
 /// A volatile routine's statements read the catalog as it is now.
 pub(crate) fn enter_fresh() -> Result<CatalogSnapshotScope, SqlError> {
     push(|_| None)

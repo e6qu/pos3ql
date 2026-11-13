@@ -47985,6 +47985,51 @@ impl Storage {
         })
     }
 
+    /// Visits the body of each visible non-volatile SQL function that could
+    /// answer `name` with `arity` arguments. The routine catalog stays locked
+    /// while `visit` runs, so it must not reenter the catalog.
+    pub(crate) fn visit_stable_sql_function_bodies(
+        &self,
+        name: &str,
+        arity: usize,
+        txid: u32,
+        visit: &mut dyn FnMut(RoutineBodyKind, &str) -> Result<(), SqlError>,
+    ) -> Result<(), SqlError> {
+        let mut visit_schema = |schema: &str, routine_name: &str| -> Result<(), SqlError> {
+            let catalog = self.routines.lock().expect("routine catalog lock poisoned");
+            for routine in catalog.iter() {
+                if routine.database != current_database()
+                    || !routine.visible_to(txid)
+                    || !routine.accepts_input_arity_for(arity, txid)
+                    || routine.schema_for(txid).as_str() != schema
+                    || routine.name_for(txid).as_str() != routine_name
+                {
+                    continue;
+                }
+                let definition = routine.definition_for(txid);
+                if definition.language == RoutineLanguage::Sql
+                    && definition.attributes.volatility != RoutineVolatility::Volatile
+                    && definition.kind.function_result().is_some()
+                {
+                    visit(definition.body_kind, definition.body.as_str())?;
+                }
+            }
+            Ok(())
+        };
+        if let Some((schema, routine_name)) = name.split_once('.') {
+            return visit_schema(schema, routine_name);
+        }
+        for entry in self.path().entries() {
+            if let PathEntry::Schema(slot) = entry {
+                visit_schema(
+                    self.schema_def_for(*slot as usize, txid).name.as_str(),
+                    name,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn has_routine_candidate(
         &self,
         name: &str,

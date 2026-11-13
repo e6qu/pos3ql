@@ -87,7 +87,8 @@ mod catalog_images;
 #[cfg(test)]
 pub(crate) use catalog_images::IMAGE_BUILDS;
 pub(crate) use catalog_images::{
-    enter_fresh as enter_fresh_catalog_reads, enter_statement as enter_catalog_snapshot,
+    CatalogReads, enter_fresh as enter_fresh_catalog_reads,
+    enter_statement as enter_catalog_snapshot,
 };
 pub(crate) use scope::prebuild_statement_catalog_images;
 mod cte;

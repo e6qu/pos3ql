@@ -46,6 +46,9 @@ pub(crate) struct Context<'s> {
     /// Qualify every column, as PostgreSQL does when the query's range table
     /// holds more than the FROM items (a rule's `OLD` and `NEW`).
     pub qualify: bool,
+    /// The base type OID of the domain whose constraint is printed, which
+    /// `VALUE` has.
+    pub domain_value: Option<i32>,
 }
 
 /// A FROM item: the name stored references qualify columns with, the name
@@ -280,6 +283,12 @@ fn operator_type(type_oid: i32) -> i32 {
 impl Context<'_> {
     fn column_type(&self, qualifier: Option<&str>, name: &str) -> Result<Option<i32>, SqlError> {
         if qualifier.is_none()
+            && name == "value"
+            && let Some(type_oid) = self.domain_value
+        {
+            return Ok(Some(type_oid));
+        }
+        if qualifier.is_none()
             && let Some(parameter) = self
                 .parameters
                 .iter()
@@ -322,10 +331,11 @@ impl Context<'_> {
     /// a column of the context's table.
     fn column_known(&self, qualifier: Option<&str>, name: &str) -> bool {
         (qualifier.is_none()
-            && self
-                .parameters
-                .iter()
-                .any(|parameter| parameter.name.as_str() == name))
+            && ((name == "value" && self.domain_value.is_some())
+                || self
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.name.as_str() == name)))
             || self.joined_source(qualifier, name).is_some()
             || self.table.is_some_and(|table| {
                 qualifier.is_none_or(|qualifier| qualifier == table.name.as_str())
@@ -650,7 +660,16 @@ impl Context<'_> {
         right: &Expr<'_>,
     ) -> Result<(Option<i32>, Option<i32>), SqlError> {
         let (left, right) = (self.type_of(left)?, self.type_of(right)?);
-        Ok(match (left.map(operator_type), right.map(operator_type)) {
+        // A domain operand is coerced to its base type, as a relabeling the
+        // deparser prints as a cast.
+        let seen = |type_oid: i32| {
+            operator_type(super::domain_root_type_oid(
+                self.storage,
+                self.txid,
+                type_oid,
+            ))
+        };
+        Ok(match (left.map(seen), right.map(seen)) {
             (Some(left), None) => (Some(left), Some(left)),
             (None, Some(right)) => (Some(right), Some(right)),
             (None, None) => (Some(oid::TEXT), Some(oid::TEXT)),
@@ -976,6 +995,9 @@ impl Context<'_> {
                 if !self.column_known(*qualifier, name) {
                     return output.unsupported();
                 }
+                if qualifier.is_none() && *name == "value" && self.domain_value.is_some() {
+                    return output.push("VALUE");
+                }
                 let mut identifier = crate::util::StackStr::<260>::new();
                 let source = self.joined_source(*qualifier, name);
                 match source.and_then(|(source, column)| source.columns.merged(column)) {
@@ -1190,11 +1212,37 @@ impl Context<'_> {
                 self.operator_pair(operand, pattern, symbol, output)
             }
             Expr::Cast {
-                operand, type_name, ..
+                operand,
+                type_name,
+                type_mod,
+                ..
             } => {
                 let Some(target) = self.named_type(type_name) else {
                     return output.unsupported();
                 };
+                // `transformArrayExpr`: a cast of an ARRAY constructor
+                // coerces each element to the element type instead.
+                if let Expr::Array(items) = operand
+                    && *type_mod < 0
+                    && let Some(element) = crate::sql::assignment_path::element_type_oid(target)
+                    && !items.iter().any(|item| matches!(item, Expr::Array(_)))
+                {
+                    output.push("ARRAY[")?;
+                    for (index, item) in items.iter().enumerate() {
+                        if index != 0 {
+                            output.push(", ")?;
+                        }
+                        match self.type_of(item)? {
+                            Some(natural) if natural != element => {
+                                self.wrapped(item, None, Parent::Cast, true, output)?;
+                                output.push("::")?;
+                                self.type_name(element, output)?;
+                            }
+                            _ => self.write(item, Some(element), output)?,
+                        }
+                    }
+                    return output.push("]");
+                }
                 match operand {
                     // A cast literal is converted while parsing.
                     Expr::Str(_) | Expr::Null => self.literal(operand, target, output),
@@ -1906,6 +1954,7 @@ pub(crate) fn rule_action_definition<'a>(
         joined,
         pretty,
         qualify: true,
+        domain_value: None,
     };
     // The target's relation, then its alias after `separator`.
     let relation = |separator: &str| {

@@ -375,7 +375,7 @@ mod tests {
         config.max_triggers = 1;
         config.max_policies = 1;
         config.max_publications = 1;
-        config.max_text_search_objects = 21;
+        config.max_text_search_objects = crate::storage::BUILTIN_TEXT_SEARCH_SLOTS;
         config.max_large_objects = 1;
         config.large_object_pages = 1;
         config.max_extended_statistics = 1;

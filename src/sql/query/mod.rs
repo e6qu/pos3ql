@@ -58,9 +58,9 @@ use materialize::{external_materialized_into, materialized_rows, materialized_se
 
 mod scan;
 pub(crate) use plan::plan_time_bool;
-pub use scan::JoinRow;
 #[cfg(test)]
-pub(crate) use scan::derived_candidates_visited;
+pub(crate) use scan::JOIN_CANDIDATES;
+pub use scan::JoinRow;
 pub(crate) use scan::select_hash_join_plan;
 use scan::{
     Chained, PaxReadDemand, pax_column_demand,
@@ -75,7 +75,7 @@ pub(crate) use scan::{
 };
 pub(crate) use scan::{
     RowSecurityExpression, RowSecurityPlan, conjoin_row_security, plan_row_security,
-    row_security_passes,
+    row_security_off_error, row_security_passes,
 };
 
 mod scope;
@@ -86,6 +86,13 @@ pub(crate) use cte::{
 pub(crate) use scope::unreachable_entry;
 pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 
+mod catalog_images;
+#[cfg(test)]
+pub(crate) use catalog_images::IMAGE_BUILDS;
+pub(crate) use catalog_images::{
+    enter_fresh as enter_fresh_catalog_reads, enter_statement as enter_catalog_snapshot,
+};
+pub(crate) use scope::prebuild_statement_catalog_images;
 mod cte;
 pub(crate) use cte::captured_type_oid;
 pub(crate) use cte::{CteReader, dml_cte_runs_after, select_relations, set_query_relations};
@@ -120,6 +127,24 @@ pub use cte::{
     describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under, expand_dml_ctes,
     rewrite_view_dml,
 };
+
+/// Whether `expression` calls a volatile function. With `except_nextval`,
+/// `nextval` does not count (`contain_volatile_functions_not_nextval`).
+pub(crate) fn expression_contains_volatile(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+    except_nextval: bool,
+) -> bool {
+    cte::expression_contains_function(expression, &|name, arguments| {
+        let builtin = name.strip_prefix("pg_catalog.").unwrap_or(name);
+        if except_nextval && builtin == "nextval" {
+            return false;
+        }
+        crate::sql::ast::is_volatile_function(name)
+            || storage.has_volatile_function_routine_candidate(name, arguments, txid)
+    })
+}
 
 pub(crate) fn stored_query_dependencies(
     sql: &str,
@@ -4683,6 +4708,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .listening_channel_count(self.storage.current_connection_id())
     }
 
+    fn available_extension_rows<'a>(
+        &self,
+        versions: bool,
+        arena: &'a Arena,
+    ) -> Result<&'a [&'a [Datum<'a>]], SqlError> {
+        super::catalog::available_extension_function_rows(self.storage, self.txid, versions, arena)
+    }
+
     fn listening_channel_at(&self, index: usize) -> Option<crate::sql::notify::Channel> {
         self.storage
             .listening_channel_at(self.storage.current_connection_id(), index)
@@ -4949,31 +4982,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 "invalid text-search dictionary catalog entry"
             ));
         };
-        match behavior {
-            super::super::storage::TextSearchDictionaryBehavior::Simple { accept: false } => {
-                Ok(super::full_text::TextSearchLexeme::Unmapped)
-            }
-            super::super::storage::TextSearchDictionaryBehavior::Simple { accept: true } => Ok(
-                match super::full_text::normalize_token(
-                    token,
-                    super::full_text::TextSearchConfig::Simple,
-                    arena,
-                )? {
-                    Some(lexeme) => super::full_text::TextSearchLexeme::Lexeme(lexeme),
-                    None => super::full_text::TextSearchLexeme::StopWord,
-                },
-            ),
-            super::super::storage::TextSearchDictionaryBehavior::EnglishStem => Ok(
-                match super::full_text::normalize_token(
-                    token,
-                    super::full_text::TextSearchConfig::English,
-                    arena,
-                )? {
-                    Some(lexeme) => super::full_text::TextSearchLexeme::Lexeme(lexeme),
-                    None => super::full_text::TextSearchLexeme::StopWord,
-                },
-            ),
-        }
+        super::full_text::lexize_dictionary(behavior, token, arena)
     }
 
     fn normalize_text_search_token<'a>(
@@ -5007,27 +5016,12 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 "invalid text-search configuration catalog entry"
             ));
         };
-        let token_index = usize::from(token_type.checked_sub(1).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "invalid text-search parser token type"
-            )
-        })?);
-        if token_index >= super::super::storage::TEXT_SEARCH_TOKEN_TYPES {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "invalid text-search parser token type"
-            ));
-        }
-        for dictionary_oid in mappings.dictionaries[token_index]
-            .iter()
-            .take(usize::from(mappings.counts[token_index]))
-        {
+        super::full_text::lexize_mapped(&mappings, token_type, token, arena, |dictionary_oid| {
             let dictionary_slot = self
                 .storage
                 .text_search_slot_by_oid(
                     super::ast::TextSearchObjectKind::Dictionary,
-                    *dictionary_oid,
+                    dictionary_oid,
                     self.txid,
                 )
                 .ok_or_else(|| {
@@ -5036,45 +5030,20 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                         "text-search configuration references a missing dictionary"
                     )
                 })?;
-            let super::super::storage::TextSearchDefinition::Dictionary { behavior, .. } = self
+            match self
                 .storage
                 .text_search_object(dictionary_slot)
                 .definition_for(self.txid)
-            else {
-                return Err(sql_err!(
+            {
+                super::super::storage::TextSearchDefinition::Dictionary { behavior, .. } => {
+                    Ok(behavior)
+                }
+                _ => Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "invalid text-search dictionary catalog entry"
-                ));
-            };
-            match behavior {
-                super::super::storage::TextSearchDictionaryBehavior::Simple { accept: false } => {}
-                super::super::storage::TextSearchDictionaryBehavior::Simple { accept: true } => {
-                    return Ok(
-                        match super::full_text::normalize_token(
-                            token,
-                            super::full_text::TextSearchConfig::Simple,
-                            arena,
-                        )? {
-                            Some(lexeme) => super::full_text::TextSearchLexeme::Lexeme(lexeme),
-                            None => super::full_text::TextSearchLexeme::StopWord,
-                        },
-                    );
-                }
-                super::super::storage::TextSearchDictionaryBehavior::EnglishStem => {
-                    return Ok(
-                        match super::full_text::normalize_token(
-                            token,
-                            super::full_text::TextSearchConfig::English,
-                            arena,
-                        )? {
-                            Some(lexeme) => super::full_text::TextSearchLexeme::Lexeme(lexeme),
-                            None => super::full_text::TextSearchLexeme::StopWord,
-                        },
-                    );
-                }
+                )),
             }
-        }
-        Ok(super::full_text::TextSearchLexeme::Unmapped)
+        })
     }
 
     fn has_operator_candidate(&self, name: &str) -> bool {
@@ -5571,8 +5540,11 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         let routine = self.storage.routine_for(slot, self.txid);
         Ok(Some(input_progress::evaluation(
             oid,
+            // An aggregate's recorded immutability says nothing about its
+            // transition functions, so its calls are evaluated at run time.
             if routine.attributes.volatility == crate::storage::RoutineVolatility::Immutable
                 && !routine.kind.is_set_returning()
+                && !matches!(routine.kind, crate::storage::RoutineKind::Aggregate(_))
             {
                 super::eval::ExpressionEvaluation::Immutable
             } else {
@@ -10686,6 +10658,41 @@ struct GroupedRewrite<'a, 's> {
     scope: Option<&'s QueryScope<'a>>,
 }
 
+/// The alias of a grouped window query's grouped derived table.
+pub(super) const GROUPED_WINDOW_SOURCE: &str = "?grouped";
+
+/// A subquery of a grouped window query reads the aggregates the query owns
+/// as columns of its grouped derived table.
+fn rewrite_owned_sublink_aggregates<'a>(
+    e: &'a Expr<'a>,
+    context: &GroupedRewrite<'a, '_>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    let replace = |call: &'a Expr<'a>| -> Option<&'a Expr<'a>> {
+        let index = context
+            .aggs
+            .iter()
+            .position(|(node, _)| core::ptr::eq(*node, call))?;
+        arena
+            .alloc(Expr::Column {
+                qualifier: Some(GROUPED_WINDOW_SOURCE),
+                name: context.agg_names[index],
+            })
+            .ok()
+            .map(|column| &*column)
+    };
+    let rewritten = aggregate_levels::replace_owned_outer_aggregates(e, arena, &replace)?;
+    let mut remaining = false;
+    aggregate_levels::visit_owned_outer_aggregates(rewritten, &mut |_| {
+        remaining = true;
+        Ok(())
+    })?;
+    if remaining {
+        return Err(arena_full());
+    }
+    Ok(rewritten)
+}
+
 /// Rewrites an outer-select expression of a grouped window query: aggregate
 /// nodes and grouping-key expressions become references to the inner derived
 /// table's columns; window calls keep their shape with rewritten insides. A
@@ -10742,7 +10749,7 @@ fn rewrite_grouped_expr<'a>(
         | Expr::Subquery(_)
         | Expr::RowSubquery { .. }
         | Expr::Exists(_)
-        | Expr::ArraySubquery(_) => Ok(e),
+        | Expr::ArraySubquery(_) => rewrite_owned_sublink_aggregates(e, context, arena),
         Expr::RoutineParam {
             qualifier, name, ..
         } => {
@@ -10928,22 +10935,30 @@ fn rewrite_grouped_expr<'a>(
                 filter,
             })
         }
-        Expr::InSubquery { operand, select, negated } => alloc(Expr::InSubquery {
-            operand: rewrite(operand)?,
-            select,
-            negated: *negated,
-        }),
+        Expr::InSubquery { operand, select, negated } => rewrite_owned_sublink_aggregates(
+            alloc(Expr::InSubquery {
+                operand: rewrite(operand)?,
+                select,
+                negated: *negated,
+            })?,
+            context,
+            arena,
+        ),
         Expr::QuantifiedSubquery {
             operand,
             operator,
             select,
             all,
-        } => alloc(Expr::QuantifiedSubquery {
-            operand: rewrite(operand)?,
-            operator: *operator,
-            select,
-            all: *all,
-        }),
+        } => rewrite_owned_sublink_aggregates(
+            alloc(Expr::QuantifiedSubquery {
+                operand: rewrite(operand)?,
+                operator: *operator,
+                select,
+                all: *all,
+            })?,
+            context,
+            arena,
+        ),
         Expr::Array(items) => {
             let mut rewritten = ArenaList::new(arena);
             for x in items.iter() {
@@ -16479,6 +16494,94 @@ fn detached_join_values<'a, 'r>(
 }
 
 /// The FROM item for a DML target, which includes inheritance descendants.
+/// PostgreSQL's analysis errors for aggregates in an `INSERT`, `UPDATE` or
+/// `DELETE`: none of the statement's own level may appear in its `VALUES`,
+/// `WHERE`, `RETURNING` or `SET` clauses, checked in PostgreSQL's order.
+pub(crate) fn check_data_modification_aggregates<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    statement: &Stmt<'a>,
+) -> Result<(), SqlError> {
+    let mut values: &[&[&Expr<'a>]] = &[];
+    let (table, alias, extra, where_clause, returning, assignments) = match statement {
+        Stmt::Insert(insert) => {
+            values = insert.rows;
+            (
+                insert.table,
+                insert.alias,
+                None,
+                None,
+                insert.returning,
+                &[][..],
+            )
+        }
+        Stmt::Update(update) => (
+            update.table,
+            update.alias,
+            update.from,
+            update.where_clause,
+            update.returning,
+            update.assignments,
+        ),
+        Stmt::Delete(delete) => (
+            delete.table,
+            delete.alias,
+            delete.using,
+            delete.where_clause,
+            delete.returning,
+            &[][..],
+        ),
+        _ => return Ok(()),
+    };
+    let mut clauses = ArenaList::new(arena);
+    let mut push =
+        |clause, expression| clauses.push((clause, expression)).map_err(|_| arena_full());
+    for &expression in values.iter().flat_map(|row| row.iter()) {
+        push(Some("VALUES"), expression)?;
+    }
+    if let Some(expression) = where_clause {
+        push(None, expression)?;
+    }
+    for item in returning.items {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
+            push(Some("RETURNING"), expression)?;
+        }
+    }
+    for (_, expression) in assignments {
+        push(Some("UPDATE"), expression)?;
+    }
+    if clauses.is_empty() {
+        return Ok(());
+    }
+    let base = dml_target_ref(table, alias);
+    let joins = match extra {
+        None => &[][..],
+        Some(extra) => &*arena
+            .alloc_slice_with(extra.joins.len() + 1, |index| match index {
+                0 => crate::sql::ast::Join {
+                    table: extra.base,
+                    kind: crate::sql::ast::JoinKind::Comma,
+                    on: None,
+                    using: None,
+                    natural: false,
+                },
+                _ => extra.joins[index - 1],
+            })
+            .map_err(|_| arena_full())?,
+    };
+    let from = arena
+        .alloc(FromClause { base, joins })
+        .map_err(|_| arena_full())?;
+    aggregate_levels::check_data_modification_aggregates(
+        storage,
+        txid,
+        arena,
+        from,
+        clauses.as_slice(),
+    )
+}
+
 pub(crate) fn dml_target_ref<'a>(target: QualName<'a>, alias: Option<&'a str>) -> TableRef<'a> {
     TableRef {
         schema: target.schema,

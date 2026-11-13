@@ -79,14 +79,19 @@ pub(crate) use catalog_sources::{
     SessionIdentity, SessionRole,
 };
 mod constraint_identities;
+mod expression_dependencies;
+pub(crate) use expression_dependencies::{
+    ExpressionDependency, ExpressionOwner, MAX_INDEX_EXPRESSION_DEPENDENCIES,
+    MAX_TABLE_EXPRESSION_DEPENDENCIES, too_many_expression_dependencies,
+};
 mod inline_key_names;
 mod key_name_admission;
 mod restored_key_names;
 #[cfg(test)]
 pub(crate) use constraint_identities::MAX_CONSTRAINT_CREATION;
 pub(crate) use constraint_identities::{
-    AttributeIdentities, ConstraintIdentity, ForeignKeyTrigger, validate_constraint_identities,
-    validate_constraint_lifetimes,
+    AttributeIdentities, ConstraintDeclarationOrder, ConstraintIdentity, DeclaredKey,
+    ForeignKeyTrigger, validate_constraint_identities, validate_constraint_lifetimes,
 };
 pub(crate) use key_name_admission::{GeneratedNameClass, RelationNameSources};
 mod column_maps;
@@ -1932,38 +1937,43 @@ impl UniqueKey {
     }
 }
 
+/// The built-in commutative binary operator, by `pg_operator` OID, that an
+/// exclusion constraint compares one element with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExclusionOperator {
-    Equal,
-    Overlaps,
-    Adjacent,
+pub struct ExclusionOperator {
+    oid: i32,
+    binary: crate::sql::ast::BinaryOp,
 }
 
 impl ExclusionOperator {
-    pub const fn code(self) -> u8 {
-        match self {
-            Self::Equal => 0,
-            Self::Overlaps => 1,
-            Self::Adjacent => 2,
-        }
+    /// `None` unless `oid` is a built-in binary operator the evaluator runs.
+    pub(crate) fn from_oid(oid: i32) -> Option<Self> {
+        let (name, ..) = crate::sql::catalog::builtin_binary_operator_row(oid)?;
+        Some(Self {
+            oid,
+            binary: crate::sql::ast::BinaryOp::from_operator_name(name)?,
+        })
     }
 
-    pub const fn from_code(code: u8) -> Option<Self> {
-        match code {
-            0 => Some(Self::Equal),
-            1 => Some(Self::Overlaps),
-            2 => Some(Self::Adjacent),
-            _ => None,
-        }
+    pub(crate) const fn oid(self) -> i32 {
+        self.oid
     }
 
-    pub const fn sql(self) -> &'static str {
-        match self {
-            Self::Equal => "=",
-            Self::Overlaps => "&&",
-            Self::Adjacent => "-|-",
-        }
+    pub(crate) const fn binary(self) -> crate::sql::ast::BinaryOp {
+        self.binary
     }
+
+    pub(crate) fn sql(self) -> &'static str {
+        crate::sql::catalog::builtin_binary_operator_row(self.oid)
+            .expect("an exclusion operator is a built-in binary operator")
+            .0
+    }
+
+    /// Range equality, the operator of `EMPTY`'s unused positions.
+    const RANGE_EQUAL: Self = Self {
+        oid: 3882,
+        binary: crate::sql::ast::BinaryOp::Eq,
+    };
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1971,6 +1981,8 @@ pub struct ExclusionConstraint {
     pub(crate) identity: Option<ConstraintIdentity>,
     pub(crate) index_identity: Option<RelationIdentity>,
     pub name: SqlName,
+    /// The index access method that enforces the constraint.
+    pub method: crate::sql::ast::IndexAccessMethod,
     pub columns: [u16; MAX_INDEX_COLS],
     pub operators: [ExclusionOperator; MAX_INDEX_COLS],
     pub n_cols: usize,
@@ -1983,8 +1995,9 @@ impl ExclusionConstraint {
         identity: None,
         index_identity: None,
         name: SqlName::EMPTY,
+        method: crate::sql::ast::IndexAccessMethod::Gist,
         columns: [0; MAX_INDEX_COLS],
-        operators: [ExclusionOperator::Equal; MAX_INDEX_COLS],
+        operators: [ExclusionOperator::RANGE_EQUAL; MAX_INDEX_COLS],
         n_cols: 0,
         predicate: None,
         timing: ConstraintTiming::NotDeferrable,
@@ -2003,6 +2016,8 @@ pub struct CheckConstraint {
     pub name: SqlName,
     pub expression: StackStr<CHECK_SQL_MAX>,
     pub validation: ConstraintValidation,
+    /// `NO INHERIT`: the table's children neither receive nor need it.
+    pub no_inherit: bool,
 }
 
 impl CheckConstraint {
@@ -2011,6 +2026,7 @@ impl CheckConstraint {
         name: SqlName::EMPTY,
         expression: StackStr::new(),
         validation: ConstraintValidation::EnforcedValidated,
+        no_inherit: false,
     };
 }
 
@@ -2129,6 +2145,10 @@ pub struct TableDefinition<B: DefinitionBacking> {
     pub n_fkeys: usize,
     pub exclusions: B::Slice<ExclusionConstraint, MAX_EXCLUSIONS>,
     pub n_exclusions: usize,
+    /// What the CHECK constraints and column expressions were bound to.
+    pub(crate) expression_dependencies:
+        B::Slice<ExpressionDependency, MAX_TABLE_EXPRESSION_DEPENDENCIES>,
+    pub(crate) n_expression_dependencies: usize,
     /// PostgreSQL retains a table's TOAST relation after the last toastable
     /// column is dropped. This catalog bit records that irreversible creation.
     pub has_toast: bool,
@@ -2140,6 +2160,10 @@ pub struct TableDefinition<B: DefinitionBacking> {
     /// selected index definition, but PostgreSQL retains this mode when a
     /// dependent index disappears with a dropped column.
     pub replica_identity: ReplicaIdentityMode,
+    /// The primary key or unique constraint index, by its identity, that
+    /// `CLUSTER ON` and `REPLICA IDENTITY USING INDEX` selected. Other
+    /// indexes carry these marks on their own definitions.
+    pub(crate) key_index_marks: KeyIndexMarks,
     /// Direct PostgreSQL table-inheritance parents. Slots are durable catalog
     /// identities; a parent cannot be dropped or reused while this edge exists.
     pub inheritance: TableInheritance,
@@ -2150,6 +2174,90 @@ pub struct TableDefinition<B: DefinitionBacking> {
 }
 
 impl Copy for TableDefinition<BorrowedDefinition<'_>> {}
+
+/// The key indexes a table's `CLUSTER ON` and `REPLICA IDENTITY USING INDEX`
+/// select, by index identity. A key index has no index slot of its own to
+/// carry `pg_index.indisclustered` and `indisreplident`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeyIndexMarks {
+    pub clustered: Option<RelationIdentity>,
+    pub replica_identity: Option<RelationIdentity>,
+}
+
+impl KeyIndexMarks {
+    pub(crate) const NONE: Self = Self {
+        clustered: None,
+        replica_identity: None,
+    };
+
+    /// Each mark as its creation stamp, zero when unset.
+    pub(crate) fn encode(self) -> [u64; 2] {
+        [self.clustered, self.replica_identity]
+            .map(|mark| mark.map_or(0, RelationIdentity::created_at))
+    }
+
+    pub(crate) fn decode(stamps: [u64; 2]) -> Option<Self> {
+        let mark = |stamp: u64| match stamp {
+            0 => Some(None),
+            stamp => RelationIdentity::parse(stamp).map(Some),
+        };
+        Some(Self {
+            clustered: mark(stamps[0])?,
+            replica_identity: mark(stamps[1])?,
+        })
+    }
+}
+
+impl<B: DefinitionBacking> TableDefinition<B> {
+    /// The key index identities of the table's primary key and unique
+    /// constraints.
+    pub(crate) fn key_index_identities(&self) -> impl Iterator<Item = RelationIdentity> + '_ {
+        (0..usize::from(self.attributes.count))
+            .filter(
+                |&attribute| match self.attributes.slots.as_ref()[attribute] {
+                    column_attributes::AttributeSlot::Live(column) => {
+                        let column = &self.columns.as_ref()[usize::from(column)];
+                        column.primary || column.unique
+                    }
+                    _ => false,
+                },
+            )
+            .filter_map(|attribute| self.inline_index_identities.as_ref()[attribute])
+            .chain(self.uniques().iter().filter_map(|key| key.index_identity))
+    }
+
+    /// The columns of the key whose index is `identity`.
+    pub(crate) fn key_index_columns(&self, identity: RelationIdentity) -> Option<ColumnSet> {
+        let mut columns = ColumnSet::EMPTY;
+        if let Some(column) = (0..self.n_columns).find(|&column| {
+            let metadata = &self.columns.as_ref()[column];
+            (metadata.primary || metadata.unique)
+                && self.column_index_identity(column) == Some(identity)
+        }) {
+            columns.insert(column);
+            return Some(columns);
+        }
+        let key = self
+            .uniques()
+            .iter()
+            .find(|key| key.index_identity == Some(identity))?;
+        for &column in key.columns() {
+            columns.insert(usize::from(column));
+        }
+        Some(columns)
+    }
+
+    /// Whether every mark names one of the table's key indexes.
+    pub(crate) fn key_index_marks_valid(&self) -> bool {
+        [
+            self.key_index_marks.clustered,
+            self.key_index_marks.replica_identity,
+        ]
+        .into_iter()
+        .flatten()
+        .all(|mark| self.key_index_identities().any(|identity| identity == mark))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableStorageOptions {
@@ -2277,6 +2385,10 @@ impl From<crate::sql::ast::OnCommitAction> for OnCommitAction {
 /// becoming behaviorless metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableAccessMethod {
+    /// A partitioned table created without `USING` or reset to `DEFAULT`:
+    /// `pg_class.relam` is zero, and each new partition takes
+    /// `default_table_access_method`.
+    Unspecified,
     Heap,
     /// A database-local table access method. The OID, not its mutable name or
     /// storage slot, crosses table definitions, WAL, and checkpoints.
@@ -2287,7 +2399,16 @@ impl TableAccessMethod {
     pub const fn builtin_code(self) -> Option<u8> {
         match self {
             Self::Heap => Some(0),
-            Self::Catalog(_) => None,
+            Self::Unspecified | Self::Catalog(_) => None,
+        }
+    }
+
+    /// `pg_class.relam`.
+    pub fn relam(self) -> i32 {
+        match self {
+            Self::Unspecified => 0,
+            Self::Heap => 2,
+            Self::Catalog(oid) => oid.get(),
         }
     }
 }
@@ -2536,11 +2657,13 @@ impl<B: DefinitionBacking> TableDefinition<B> {
             n_checks: self.n_checks,
             n_fkeys: self.n_fkeys,
             n_exclusions: self.n_exclusions,
+            n_expression_dependencies: self.n_expression_dependencies,
             has_toast: self.has_toast,
             toast_index_identity: self.toast_index_identity,
             has_rules: self.has_rules,
             row_level_security: self.row_level_security,
             replica_identity: self.replica_identity,
+            key_index_marks: self.key_index_marks,
             inheritance: self.inheritance,
             type_membership: self.type_membership,
             partition: self.partition,
@@ -2557,6 +2680,8 @@ impl<B: DefinitionBacking> TableDefinition<B> {
             checks: &self.checks.as_ref()[..self.n_checks],
             fkeys: &self.fkeys.as_ref()[..self.n_fkeys],
             exclusions: &self.exclusions.as_ref()[..self.n_exclusions],
+            expression_dependencies: &self.expression_dependencies.as_ref()
+                [..self.n_expression_dependencies],
             attributes: column_attributes::ColumnAttributes {
                 count: self.attributes.count,
                 slots: &self.attributes.slots.as_ref()[..usize::from(self.attributes.count)],
@@ -2739,6 +2864,7 @@ impl TableDefBuilder {
         result.has_rules = source.has_rules;
         result.row_level_security = source.row_level_security;
         result.replica_identity = source.replica_identity;
+        result.key_index_marks = source.key_index_marks;
         result.inheritance = source.inheritance;
         result.type_membership = source.type_membership;
         result.partition = source.partition;
@@ -2761,6 +2887,9 @@ impl TableDefBuilder {
         result.fkeys[..source.n_fkeys].copy_from_slice(&source.fkeys.as_ref()[..source.n_fkeys]);
         result.exclusions[..source.n_exclusions]
             .copy_from_slice(&source.exclusions.as_ref()[..source.n_exclusions]);
+        result.n_expression_dependencies = source.n_expression_dependencies;
+        result.expression_dependencies[..source.n_expression_dependencies]
+            .copy_from_slice(source.expression_dependencies());
         result.attributes =
             column_attributes::ColumnAttributes::from_attributes(&source.attributes);
         result
@@ -2779,6 +2908,7 @@ impl TableDefBuilder {
             || self.n_checks > MAX_CHECKS
             || self.n_fkeys > MAX_FKEYS
             || self.n_exclusions > MAX_EXCLUSIONS
+            || self.n_expression_dependencies > MAX_TABLE_EXPRESSION_DEPENDENCIES
         {
             return Err(sql_err!(
                 sqlstate::DATA_EXCEPTION,
@@ -2805,11 +2935,13 @@ impl TableDefBuilder {
             n_checks: self.n_checks,
             n_fkeys: self.n_fkeys,
             n_exclusions: self.n_exclusions,
+            n_expression_dependencies: self.n_expression_dependencies,
             has_toast: self.has_toast,
             toast_index_identity: self.toast_index_identity,
             has_rules: self.has_rules,
             row_level_security: self.row_level_security,
             replica_identity: self.replica_identity,
+            key_index_marks: self.key_index_marks,
             inheritance: self.inheritance,
             type_membership: self.type_membership,
             partition: self.partition,
@@ -2842,6 +2974,9 @@ impl TableDefBuilder {
                 .map_err(exhausted)?,
             exclusions: pool
                 .copy_slice(&self.exclusions[..self.n_exclusions])
+                .map_err(exhausted)?,
+            expression_dependencies: pool
+                .copy_slice(&self.expression_dependencies[..self.n_expression_dependencies])
                 .map_err(exhausted)?,
             attributes: column_attributes::ColumnAttributes {
                 count: self.attributes.count,
@@ -2883,11 +3018,15 @@ impl TableDefBuilder {
             n_fkeys: 0,
             exclusions: [ExclusionConstraint::EMPTY; MAX_EXCLUSIONS],
             n_exclusions: 0,
+            expression_dependencies: [ExpressionDependency::EMPTY;
+                MAX_TABLE_EXPRESSION_DEPENDENCIES],
+            n_expression_dependencies: 0,
             has_toast: false,
             toast_index_identity: None,
             has_rules: false,
             row_level_security: RowLevelSecurityState::DISABLED,
             replica_identity: ReplicaIdentityMode::DEFAULT,
+            key_index_marks: KeyIndexMarks::NONE,
             inheritance: TableInheritance::NONE,
             type_membership: TableTypeMembership::NONE,
             partition: PartitionDef::NONE,
@@ -2926,11 +3065,14 @@ impl TableDef {
             n_fkeys: 0,
             exclusions: crate::mem::lease_pool::SharedSlice::EMPTY,
             n_exclusions: 0,
+            expression_dependencies: crate::mem::lease_pool::SharedSlice::EMPTY,
+            n_expression_dependencies: 0,
             has_toast: false,
             toast_index_identity: None,
             has_rules: false,
             row_level_security: RowLevelSecurityState::DISABLED,
             replica_identity: ReplicaIdentityMode::DEFAULT,
+            key_index_marks: KeyIndexMarks::NONE,
             inheritance: TableInheritance::NONE,
             type_membership: TableTypeMembership::NONE,
             partition: PartitionDef::NONE,
@@ -2968,11 +3110,14 @@ impl TableDefView<'_> {
             n_fkeys: 0,
             exclusions: &[],
             n_exclusions: 0,
+            expression_dependencies: &[],
+            n_expression_dependencies: 0,
             has_toast: false,
             toast_index_identity: None,
             has_rules: false,
             row_level_security: RowLevelSecurityState::DISABLED,
             replica_identity: ReplicaIdentityMode::DEFAULT,
+            key_index_marks: KeyIndexMarks::NONE,
             inheritance: TableInheritance::NONE,
             type_membership: TableTypeMembership::NONE,
             partition: PartitionDef::NONE,
@@ -3768,6 +3913,151 @@ impl CollationDef {
 
 pub(crate) const MAX_CATALOG_CREATION: u64 = 9_999_999;
 
+/// Text search objects initdb creates in every database: the default parser,
+/// five templates, the `simple` dictionary and configuration, then a Snowball
+/// dictionary and configuration for each of PostgreSQL's 29 languages
+/// (`snowball_create.sql`). The Snowball OIDs follow the PostgreSQL 18.6
+/// reference image, where initdb numbers them after the platform collations.
+pub(crate) const BUILTIN_TEXT_SEARCH_OBJECTS: usize = 8 + 2 * SNOWBALL_CONFIGURATIONS;
+// Database identity checks track the built-in objects in a `u128` bitmap.
+const _: () = assert!(BUILTIN_TEXT_SEARCH_OBJECTS <= 128);
+/// Slots the built-in objects of `postgres`, `template1` and `template0` take.
+pub(crate) const BUILTIN_TEXT_SEARCH_SLOTS: usize = 3 * BUILTIN_TEXT_SEARCH_OBJECTS;
+const SNOWBALL_CONFIGURATIONS: usize = 29;
+use crate::sql::catalog::{
+    DSNOWBALL_INIT_OID, DSNOWBALL_LEXIZE_OID, FIRST_SNOWBALL_DICTIONARY_OID, SNOWBALL_TEMPLATE_OID,
+};
+
+/// The languages with a built-in Snowball configuration, in initdb's order.
+pub(crate) fn builtin_snowball_languages()
+-> impl Iterator<Item = crate::sql::snowball::SnowballLanguage> {
+    crate::sql::snowball::SnowballLanguage::ALL
+        .iter()
+        .copied()
+        .filter(|language| *language != crate::sql::snowball::SnowballLanguage::Porter)
+}
+
+pub(crate) fn builtin_text_search_definition(ordinal: usize) -> Option<TextSearchDefinition> {
+    use crate::sql::snowball::{SnowballLanguage, StopwordList};
+    use core::fmt::Write as _;
+    let pg_catalog = SqlName::parse("pg_catalog").expect("builtin schema fits");
+    let name = |value: &str| SqlName::parse(value).expect("builtin name fits");
+    let template = |value, oid, kind| {
+        let (_, init, lexize) = TextSearchTemplateKind::ALL
+            .into_iter()
+            .find(|(candidate, ..)| *candidate == kind)
+            .expect("listed template kind");
+        TextSearchDefinition::Template {
+            schema: pg_catalog,
+            name: name(value),
+            oid,
+            init,
+            lexize,
+            kind,
+        }
+    };
+    let mut simple_mappings = TextSearchMappings::EMPTY;
+    for token in [
+        1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22,
+    ] {
+        simple_mappings.dictionaries[token - 1][0] = 3765;
+        simple_mappings.counts[token - 1] = 1;
+    }
+    Some(match ordinal {
+        0 => TextSearchDefinition::Parser {
+            schema: pg_catalog,
+            name: name("default"),
+            oid: 3722,
+            start: 3717,
+            gettoken: 3718,
+            end: 3719,
+            headline: 3720,
+            lextypes: 3721,
+        },
+        1 => template("simple", 3727, TextSearchTemplateKind::Simple),
+        2 => template("synonym", 3730, TextSearchTemplateKind::Synonym),
+        3 => template("ispell", 3733, TextSearchTemplateKind::Ispell),
+        4 => template("thesaurus", 3742, TextSearchTemplateKind::Thesaurus),
+        5 => template(
+            "snowball",
+            SNOWBALL_TEMPLATE_OID,
+            TextSearchTemplateKind::Snowball,
+        ),
+        6 => TextSearchDefinition::Dictionary {
+            schema: pg_catalog,
+            name: name("simple"),
+            oid: 3765,
+            owner: 10,
+            template: 3727,
+            options: StackStr::new(),
+            behavior: TextSearchDictionaryBehavior::SIMPLE,
+        },
+        7 => TextSearchDefinition::Configuration {
+            schema: pg_catalog,
+            name: name("simple"),
+            oid: 3748,
+            owner: 10,
+            parser: 3722,
+            mappings: simple_mappings,
+        },
+        _ => {
+            let index = (ordinal - 8) / 2;
+            let language = builtin_snowball_languages().nth(index)?;
+            let dictionary_oid = |language: SnowballLanguage| {
+                let index = builtin_snowball_languages()
+                    .position(|candidate| candidate == language)
+                    .expect("built-in language");
+                FIRST_SNOWBALL_DICTIONARY_OID + 2 * index as i32
+            };
+            let mut text = StackStr::<64>::new();
+            if (ordinal - 8).is_multiple_of(2) {
+                let stopwords = StopwordList::parse(language.name());
+                let mut options = StackStr::<512>::new();
+                let _ = write!(options, "language = '{}'", language.name());
+                if let Some(list) = stopwords {
+                    let _ = write!(options, ", stopwords = '{}'", list.name());
+                }
+                let _ = write!(text, "{}_stem", language.name());
+                TextSearchDefinition::Dictionary {
+                    schema: pg_catalog,
+                    name: name(text.as_str()),
+                    oid: dictionary_oid(language),
+                    owner: 10,
+                    template: SNOWBALL_TEMPLATE_OID,
+                    options,
+                    behavior: TextSearchDictionaryBehavior::Snowball {
+                        language,
+                        stopwords,
+                    },
+                }
+            } else {
+                // Hindi and Russian stem all-ASCII words as English.
+                let ascii = match language {
+                    SnowballLanguage::Hindi | SnowballLanguage::Russian => {
+                        SnowballLanguage::English
+                    }
+                    other => other,
+                };
+                let mut mappings = simple_mappings;
+                for token in [1usize, 11, 16] {
+                    mappings.dictionaries[token - 1][0] = dictionary_oid(ascii);
+                }
+                for token in [2usize, 10, 17] {
+                    mappings.dictionaries[token - 1][0] = dictionary_oid(language);
+                }
+                TextSearchDefinition::Configuration {
+                    schema: pg_catalog,
+                    name: name(language.name()),
+                    oid: dictionary_oid(language) + 1,
+                    owner: 10,
+                    parser: 3722,
+                    mappings,
+                }
+            }
+        }
+    })
+}
+
 #[derive(Clone, Copy)]
 enum TextSearchIdentity {
     Builtin { oid: i32, ordinal: u8 },
@@ -3786,22 +4076,18 @@ impl TextSearchIdentity {
             }
             return Ok(Self::Created(created));
         }
-        use crate::sql::ast::TextSearchObjectKind as Kind;
-        let ordinal = match (definition.kind(), definition.oid()) {
-            (Kind::Parser, 3722) => 0,
-            (Kind::Template, 3727) => 1,
-            (Kind::Template, 13_234) => 2,
-            (Kind::Dictionary, 3765) => 3,
-            (Kind::Dictionary, 13_247) => 4,
-            (Kind::Configuration, 3748) => 5,
-            (Kind::Configuration, 13_248) => 6,
-            _ => {
-                return Err(sql_err!(
+        let ordinal = (0..BUILTIN_TEXT_SEARCH_OBJECTS)
+            .find(|ordinal| {
+                builtin_text_search_definition(*ordinal).is_some_and(|builtin| {
+                    builtin.kind() == definition.kind() && builtin.oid() == definition.oid()
+                })
+            })
+            .ok_or_else(|| {
+                sql_err!(
                     sqlstate::DATA_EXCEPTION,
                     "stored text search object has no valid builtin or creation identity"
-                ));
-            }
-        };
+                )
+            })? as u8;
         Ok(Self::Builtin {
             oid: definition.oid(),
             ordinal,
@@ -3832,10 +4118,114 @@ fn text_search_lifetime_oid(
 pub(crate) const TEXT_SEARCH_TOKEN_TYPES: usize = 23;
 pub(crate) const TEXT_SEARCH_DICTIONARIES_PER_TOKEN: usize = 4;
 
+/// The dictionary kind a text search template's support routines implement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextSearchTemplateKind {
+    Simple,
+    Synonym,
+    Ispell,
+    Thesaurus,
+    Snowball,
+}
+
+impl TextSearchTemplateKind {
+    const ALL: [(Self, i32, i32); 5] = [
+        (Self::Simple, 3725, 3726),
+        (Self::Synonym, 3728, 3729),
+        (Self::Ispell, 3731, 3732),
+        (Self::Thesaurus, 3740, 3741),
+        (Self::Snowball, DSNOWBALL_INIT_OID, DSNOWBALL_LEXIZE_OID),
+    ];
+
+    /// The kind whose `init` and `lexize` routines these are; `init` is
+    /// optional for the simple template, as in PostgreSQL's catalog.
+    pub(crate) fn from_routines(init: i32, lexize: i32) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .find(|(kind, kind_init, kind_lexize)| {
+                lexize == *kind_lexize
+                    && (init == *kind_init || (init == 0 && *kind == Self::Simple))
+            })
+            .map(|(kind, ..)| *kind)
+    }
+
+    pub(crate) fn code(self) -> u8 {
+        Self::ALL
+            .iter()
+            .position(|(kind, ..)| *kind == self)
+            .expect("listed template kind") as u8
+    }
+
+    pub(crate) fn from_code(code: u8) -> Option<Self> {
+        Self::ALL.get(usize::from(code)).map(|(kind, ..)| *kind)
+    }
+}
+
+/// How a text search dictionary turns a token into lexemes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TextSearchDictionaryBehavior {
-    Simple { accept: bool },
-    EnglishStem,
+    Simple {
+        accept: bool,
+        stopwords: Option<crate::sql::snowball::StopwordList>,
+    },
+    Snowball {
+        language: crate::sql::snowball::SnowballLanguage,
+        stopwords: Option<crate::sql::snowball::StopwordList>,
+    },
+}
+
+impl TextSearchDictionaryBehavior {
+    pub(crate) const SIMPLE: Self = Self::Simple {
+        accept: true,
+        stopwords: None,
+    };
+
+    /// Stable encoding: kind, then accept or language, then stopword list.
+    pub(crate) fn code(self) -> [u8; 3] {
+        let stopwords = |list: Option<crate::sql::snowball::StopwordList>| {
+            list.map_or(0, |list| {
+                1 + crate::sql::snowball::StopwordList::ALL
+                    .iter()
+                    .position(|candidate| *candidate == list)
+                    .expect("listed stopword file") as u8
+            })
+        };
+        match self {
+            Self::Simple {
+                accept,
+                stopwords: list,
+            } => [0, u8::from(accept), stopwords(list)],
+            Self::Snowball {
+                language,
+                stopwords: list,
+            } => [
+                1,
+                crate::sql::snowball::SnowballLanguage::ALL
+                    .iter()
+                    .position(|candidate| *candidate == language)
+                    .expect("listed Snowball language") as u8,
+                stopwords(list),
+            ],
+        }
+    }
+
+    pub(crate) fn from_code(code: [u8; 3]) -> Option<Self> {
+        let stopwords = match code[2] {
+            0 => None,
+            list => Some(*crate::sql::snowball::StopwordList::ALL.get(usize::from(list) - 1)?),
+        };
+        match code[0] {
+            0 if code[1] <= 1 => Some(Self::Simple {
+                accept: code[1] == 1,
+                stopwords,
+            }),
+            1 => Some(Self::Snowball {
+                language: *crate::sql::snowball::SnowballLanguage::ALL.get(usize::from(code[1]))?,
+                stopwords,
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3869,7 +4259,7 @@ pub(crate) enum TextSearchDefinition {
         oid: i32,
         init: i32,
         lexize: i32,
-        behavior: TextSearchDictionaryBehavior,
+        kind: TextSearchTemplateKind,
     },
     Dictionary {
         schema: SqlName,
@@ -3925,18 +4315,8 @@ impl TextSearchDefinition {
                     && matches!(headline, 0 | 3720)
             }
             Self::Template {
-                init,
-                lexize,
-                behavior,
-                ..
-            } => matches!(
-                (init, lexize, behavior),
-                (
-                    0 | 3725,
-                    3726,
-                    TextSearchDictionaryBehavior::Simple { accept: true }
-                ) | (13_232, 13_233, TextSearchDictionaryBehavior::EnglishStem)
-            ),
+                init, lexize, kind, ..
+            } => TextSearchTemplateKind::from_routines(init, lexize) == Some(kind),
             Self::Dictionary { .. } => true,
             Self::Configuration { mappings, .. } => (0..TEXT_SEARCH_TOKEN_TYPES).all(|token| {
                 usize::from(mappings.counts[token]) <= TEXT_SEARCH_DICTIONARIES_PER_TOKEN
@@ -5053,7 +5433,12 @@ impl StoredDependencyIdentity {
             Self::Collation(_) => class == DependencyClass::Collation,
             Self::TextSearchConfigurationOid(oid) => {
                 class == DependencyClass::TextSearchConfiguration
-                    && (matches!(oid, 3748 | 13_248) || (700_000_001..=709_999_999).contains(&oid))
+                    && ((0..BUILTIN_TEXT_SEARCH_OBJECTS).any(|ordinal| {
+                        builtin_text_search_definition(ordinal).is_some_and(|builtin| {
+                            builtin.kind() == crate::sql::ast::TextSearchObjectKind::Configuration
+                                && builtin.oid() == oid
+                        })
+                    }) || (700_000_001..=709_999_999).contains(&oid))
             }
             Self::RoutineOid(oid) => {
                 class == DependencyClass::Routine
@@ -6188,7 +6573,11 @@ pub struct ViewOptions {
     pub security: ViewSecurity,
     pub security_barrier: ViewSecurityBarrier,
     pub check_option: Option<ViewCheckOption>,
+    /// Which statement wrote the query; not a reloption.
     pub query_origin: ViewQueryOrigin,
+    /// The options `pg_class.reloptions` lists; an explicit
+    /// `security_invoker=false` is listed although it selects the default.
+    pub order: ViewOptionOrder,
 }
 
 impl ViewOptions {
@@ -6197,7 +6586,251 @@ impl ViewOptions {
         security_barrier: ViewSecurityBarrier::Default,
         check_option: None,
         query_origin: ViewQueryOrigin::View,
+        order: ViewOptionOrder::EMPTY,
     };
+
+    pub const ENCODED_BYTES: usize = 4 + ViewOptionOrder::ENCODED_BYTES;
+
+    /// The journal and checkpoint image: security, barrier, check option and
+    /// query-origin codes, then the listed options.
+    pub fn encode(self) -> [u8; Self::ENCODED_BYTES] {
+        let mut bytes = [0; Self::ENCODED_BYTES];
+        bytes[0] = u8::from(self.security == ViewSecurity::Invoker);
+        bytes[1] = self.security_barrier.code();
+        bytes[2] = self.check_option.map_or(0, ViewCheckOption::code);
+        bytes[3] = self.query_origin.code();
+        bytes[4..].copy_from_slice(&self.order.encode());
+        bytes
+    }
+
+    pub fn decode(bytes: [u8; Self::ENCODED_BYTES]) -> Option<Self> {
+        let options = Self {
+            security: match bytes[0] {
+                0 => ViewSecurity::Definer,
+                1 => ViewSecurity::Invoker,
+                _ => return None,
+            },
+            security_barrier: ViewSecurityBarrier::from_code(bytes[1])?,
+            check_option: match bytes[2] {
+                0 => None,
+                code => Some(ViewCheckOption::from_code(code)?),
+            },
+            query_origin: ViewQueryOrigin::from_code(bytes[3])?,
+            order: ViewOptionOrder::decode(bytes[4..].try_into().ok()?)?,
+        };
+        options.is_consistent().then_some(options)
+    }
+
+    /// Whether `order` lists exactly the options that are set, each spelled
+    /// as a value that selects its setting.
+    pub(crate) fn is_consistent(self) -> bool {
+        use crate::sql::ast::ViewOptionName;
+        let boolean =
+            |kind: ViewOptionName| crate::sql::eval::parse_bool(self.order.spelling(kind)).ok();
+        let barrier = match self.security_barrier {
+            ViewSecurityBarrier::Default => !self.order.contains(ViewOptionName::SecurityBarrier),
+            ViewSecurityBarrier::Enabled => boolean(ViewOptionName::SecurityBarrier) == Some(true),
+            ViewSecurityBarrier::Disabled => {
+                boolean(ViewOptionName::SecurityBarrier) == Some(false)
+            }
+        };
+        let check = match self.check_option {
+            None => !self.order.contains(ViewOptionName::CheckOption),
+            Some(option) => self
+                .order
+                .spelling(ViewOptionName::CheckOption)
+                .eq_ignore_ascii_case(match option {
+                    ViewCheckOption::Local => "local",
+                    ViewCheckOption::Cascaded => "cascaded",
+                }),
+        };
+        let invoker = if self.order.contains(ViewOptionName::SecurityInvoker) {
+            boolean(ViewOptionName::SecurityInvoker) == Some(self.security == ViewSecurity::Invoker)
+        } else {
+            self.security == ViewSecurity::Definer
+        };
+        barrier && check && invoker
+    }
+}
+
+/// One listed view option's value as written (`on`, `1`, `LOCAL`), which
+/// `pg_class.reloptions` repeats. Every accepted value fits: the longest are
+/// `cascaded` and `false`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReloptionSpelling {
+    bytes: [u8; Self::MAX_BYTES],
+    len: u8,
+}
+
+impl ReloptionSpelling {
+    pub const MAX_BYTES: usize = 8;
+    pub const EMPTY: Self = Self {
+        bytes: [0; Self::MAX_BYTES],
+        len: 0,
+    };
+
+    /// `None` when `text` is empty, longer than any accepted value or not
+    /// printable ASCII without spaces, as every accepted value is.
+    pub fn new(text: &str) -> Option<Self> {
+        if text.is_empty()
+            || text.len() > Self::MAX_BYTES
+            || !text.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return None;
+        }
+        let mut bytes = [0; Self::MAX_BYTES];
+        bytes[..text.len()].copy_from_slice(text.as_bytes());
+        Some(Self {
+            bytes,
+            len: text.len() as u8,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..usize::from(self.len)])
+            .expect("reloption spellings are ASCII")
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// The options a view's `pg_class.reloptions` lists, in PostgreSQL's order
+/// and with their values as written: in the order written when the view was
+/// created or replaced, with each later `ALTER VIEW ... SET` moving the
+/// options it sets to the end. The order takes two bits per option, first
+/// option lowest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewOptionOrder {
+    order: u8,
+    /// Indexed by [`Self::kind_code`] minus one; empty when not listed.
+    spellings: [ReloptionSpelling; 3],
+}
+
+impl ViewOptionOrder {
+    pub const EMPTY: Self = Self {
+        order: 0,
+        spellings: [ReloptionSpelling::EMPTY; 3],
+    };
+
+    /// The order code, then each spelling's length and padded bytes.
+    pub const ENCODED_BYTES: usize = 1 + 3 * (1 + ReloptionSpelling::MAX_BYTES);
+
+    const fn kind_code(kind: crate::sql::ast::ViewOptionName) -> u8 {
+        match kind {
+            crate::sql::ast::ViewOptionName::CheckOption => 1,
+            crate::sql::ast::ViewOptionName::SecurityBarrier => 2,
+            crate::sql::ast::ViewOptionName::SecurityInvoker => 3,
+        }
+    }
+
+    const fn kind(code: u8) -> Option<crate::sql::ast::ViewOptionName> {
+        match code {
+            1 => Some(crate::sql::ast::ViewOptionName::CheckOption),
+            2 => Some(crate::sql::ast::ViewOptionName::SecurityBarrier),
+            3 => Some(crate::sql::ast::ViewOptionName::SecurityInvoker),
+            _ => None,
+        }
+    }
+
+    pub fn encode(self) -> [u8; Self::ENCODED_BYTES] {
+        let mut bytes = [0; Self::ENCODED_BYTES];
+        bytes[0] = self.order;
+        for (chunk, spelling) in bytes[1..]
+            .as_chunks_mut::<{ 1 + ReloptionSpelling::MAX_BYTES }>()
+            .0
+            .iter_mut()
+            .zip(self.spellings)
+        {
+            chunk[0] = spelling.len;
+            chunk[1..].copy_from_slice(&spelling.bytes);
+        }
+        bytes
+    }
+
+    /// Accepts only distinct options without gaps, each listed option with
+    /// a spelling and every other without one. Whether a spelling denotes
+    /// its option's value is [`ViewOptions::decode`]'s check.
+    pub fn decode(bytes: [u8; Self::ENCODED_BYTES]) -> Option<Self> {
+        let code = bytes[0];
+        let mut seen = 0u8;
+        let mut ended = false;
+        for position in 0..4 {
+            let kind = (code >> (2 * position)) & 3;
+            if kind == 0 {
+                ended = true;
+            } else if ended || position == 3 || seen & (1 << kind) != 0 {
+                return None;
+            } else {
+                seen |= 1 << kind;
+            }
+        }
+        let mut spellings = [ReloptionSpelling::EMPTY; 3];
+        for (index, (spelling, chunk)) in spellings
+            .iter_mut()
+            .zip(
+                bytes[1..]
+                    .as_chunks::<{ 1 + ReloptionSpelling::MAX_BYTES }>()
+                    .0,
+            )
+            .enumerate()
+        {
+            let len = usize::from(chunk[0]);
+            if len > ReloptionSpelling::MAX_BYTES || chunk[1 + len..].iter().any(|&b| b != 0) {
+                return None;
+            }
+            if len != 0 {
+                *spelling = ReloptionSpelling::new(core::str::from_utf8(&chunk[1..1 + len]).ok()?)?;
+            }
+            if (seen & (1 << (index + 1)) != 0) == spelling.is_empty() {
+                return None;
+            }
+        }
+        Some(Self {
+            order: code,
+            spellings,
+        })
+    }
+
+    pub fn names(self) -> impl Iterator<Item = crate::sql::ast::ViewOptionName> {
+        (0..3).map_while(move |position| Self::kind((self.order >> (2 * position)) & 3))
+    }
+
+    pub fn contains(self, kind: crate::sql::ast::ViewOptionName) -> bool {
+        self.names().any(|listed| listed == kind)
+    }
+
+    /// The written value of a listed option; empty when it is not listed.
+    pub fn spelling(&self, kind: crate::sql::ast::ViewOptionName) -> &str {
+        self.spellings[usize::from(Self::kind_code(kind)) - 1].as_str()
+    }
+
+    /// The list without `kind`.
+    #[must_use]
+    pub fn without(self, kind: crate::sql::ast::ViewOptionName) -> Self {
+        let mut order = 0;
+        for (position, listed) in self.names().filter(|listed| *listed != kind).enumerate() {
+            order |= Self::kind_code(listed) << (2 * position);
+        }
+        let mut spellings = self.spellings;
+        spellings[usize::from(Self::kind_code(kind)) - 1] = ReloptionSpelling::EMPTY;
+        Self { order, spellings }
+    }
+
+    /// The list with `kind`, written as `spelling`, moved to or added at the
+    /// end.
+    #[must_use]
+    pub fn with_last(
+        self,
+        kind: crate::sql::ast::ViewOptionName,
+        spelling: ReloptionSpelling,
+    ) -> Self {
+        let mut rest = self.without(kind);
+        rest.order |= Self::kind_code(kind) << (2 * rest.names().count());
+        rest.spellings[usize::from(Self::kind_code(kind)) - 1] = spelling;
+        rest
+    }
 }
 
 /// Which statement wrote a view's query. PostgreSQL's `CREATE OR REPLACE
@@ -9591,7 +10224,11 @@ impl RoutineAttributes {
         rows_bits: None,
     };
 
-    pub(crate) const AGGREGATE: Self = Self::DEFAULT;
+    /// PostgreSQL's AggregateCreate records every aggregate as immutable.
+    pub(crate) const AGGREGATE: Self = Self {
+        volatility: RoutineVolatility::Immutable,
+        ..Self::DEFAULT
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12727,6 +13364,9 @@ pub struct IndexDef {
     pub(crate) pending_definition: Option<PendingIndexDefinition>,
     pub ddl_state: CatalogDdlState,
     pub(crate) pending_parent_drop_txid: Option<u32>,
+    /// What the key expressions and predicate were bound to when written.
+    pub(crate) expression_dependencies: [ExpressionDependency; MAX_INDEX_EXPRESSION_DEPENDENCIES],
+    pub(crate) n_expression_dependencies: u8,
 }
 
 impl IndexDef {
@@ -12761,6 +13401,8 @@ impl IndexDef {
         pending_definition: None,
         ddl_state: CatalogDdlState::Absent,
         pending_parent_drop_txid: None,
+        expression_dependencies: [ExpressionDependency::EMPTY; MAX_INDEX_EXPRESSION_DEPENDENCIES],
+        n_expression_dependencies: 0,
     };
 
     /// Whether `txid` sees this index exist.
@@ -21349,7 +21991,7 @@ impl Storage {
         Ok(rebound)
     }
 
-    fn rebound_stored_query_dependency(
+    pub(crate) fn rebound_stored_query_dependency(
         &self,
         mut dependency: StoredQueryDependency,
         txid: u32,
@@ -22212,93 +22854,24 @@ impl Storage {
                 .push(TextSearchDef::EMPTY)
                 .expect("sized to text search capacity");
         }
-        let pg_catalog = SqlName::parse("pg_catalog").expect("builtin schema fits");
-        let present = |definition| TextSearchDef {
-            database: DatabaseOid::POSTGRES,
-            created_at: 0,
-            definition,
-            pending: None,
-            ddl_state: CatalogDdlState::Present,
-        };
-        text_search_objects[0] = present(TextSearchDefinition::Parser {
-            schema: pg_catalog,
-            name: SqlName::parse("default").expect("builtin name fits"),
-            oid: 3722,
-            start: 3717,
-            gettoken: 3718,
-            end: 3719,
-            headline: 3720,
-            lextypes: 3721,
-        });
-        text_search_objects[1] = present(TextSearchDefinition::Template {
-            schema: pg_catalog,
-            name: SqlName::parse("simple").expect("builtin name fits"),
-            oid: 3727,
-            init: 3725,
-            lexize: 3726,
-            behavior: TextSearchDictionaryBehavior::Simple { accept: true },
-        });
-        text_search_objects[2] = present(TextSearchDefinition::Template {
-            schema: pg_catalog,
-            name: SqlName::parse("snowball").expect("builtin name fits"),
-            oid: 13_234,
-            init: 13_232,
-            lexize: 13_233,
-            behavior: TextSearchDictionaryBehavior::EnglishStem,
-        });
-        text_search_objects[3] = present(TextSearchDefinition::Dictionary {
-            schema: pg_catalog,
-            name: SqlName::parse("simple").expect("builtin name fits"),
-            oid: 3765,
-            owner: 10,
-            template: 3727,
-            options: StackStr::new(),
-            behavior: TextSearchDictionaryBehavior::Simple { accept: true },
-        });
-        text_search_objects[4] = present(TextSearchDefinition::Dictionary {
-            schema: pg_catalog,
-            name: SqlName::parse("english_stem").expect("builtin name fits"),
-            oid: 13_247,
-            owner: 10,
-            template: 13_234,
-            options: StackStr::from_str("language = 'english', stopwords = 'english'"),
-            behavior: TextSearchDictionaryBehavior::EnglishStem,
-        });
-        let mut simple_mappings = TextSearchMappings::EMPTY;
-        for token in [
-            1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22,
-        ] {
-            simple_mappings.dictionaries[token - 1][0] = 3765;
-            simple_mappings.counts[token - 1] = 1;
-        }
-        text_search_objects[5] = present(TextSearchDefinition::Configuration {
-            schema: pg_catalog,
-            name: SqlName::parse("simple").expect("builtin name fits"),
-            oid: 3748,
-            owner: 10,
-            parser: 3722,
-            mappings: simple_mappings,
-        });
-        let mut english_mappings = simple_mappings;
-        for token in [1usize, 2, 10, 11, 16, 17] {
-            english_mappings.dictionaries[token - 1][0] = 13_247;
-        }
-        text_search_objects[6] = present(TextSearchDefinition::Configuration {
-            schema: pg_catalog,
-            name: SqlName::parse("english").expect("builtin name fits"),
-            oid: 13_248,
-            owner: 10,
-            parser: 3722,
-            mappings: english_mappings,
-        });
-        for (database, offset) in [
-            (DatabaseOid::TEMPLATE1, 7usize),
-            (DatabaseOid::TEMPLATE0, 14usize),
-        ] {
-            for builtin in 0..7 {
-                let mut definition = text_search_objects[builtin];
-                definition.database = database;
-                text_search_objects[offset + builtin] = definition;
+        for (offset, database) in [
+            DatabaseOid::POSTGRES,
+            DatabaseOid::TEMPLATE1,
+            DatabaseOid::TEMPLATE0,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for ordinal in 0..BUILTIN_TEXT_SEARCH_OBJECTS {
+                text_search_objects[offset * BUILTIN_TEXT_SEARCH_OBJECTS + ordinal] =
+                    TextSearchDef {
+                        database,
+                        created_at: 0,
+                        definition: builtin_text_search_definition(ordinal)
+                            .expect("ordinal below the builtin count"),
+                        pending: None,
+                        ddl_state: CatalogDdlState::Present,
+                    };
             }
         }
         let mut event_triggers =
@@ -24140,6 +24713,11 @@ impl Storage {
         current_database()
     }
 
+    /// Advances with every catalog edit, including uncommitted ones.
+    pub(crate) fn catalog_edit_sequence(&self) -> u64 {
+        self.catalog_sequence.current()
+    }
+
     pub(crate) fn current_database_name(&self, txid: u32) -> SqlName {
         self.database_catalog()
             .definitions
@@ -24592,6 +25170,7 @@ impl Storage {
                     definition,
                     CatalogAllocation::Restore(CatalogPosition::new(target_slot, created_at)?),
                     TableCreation::Pending(txid),
+                    None,
                 )?;
                 {
                     let target_table = &mut self.tables[target_slot];
@@ -25100,6 +25679,7 @@ impl Storage {
                     )?);
                 }
                 definition.table_binding = Some(self.capture_index_binding(copied_table, txid));
+                self.rebind_template_index_types(&mut definition, source, txid)?;
                 for collation in definition.collations.iter_mut().take(definition.n_cols) {
                     if let Collation::Catalog(selected) = *collation {
                         self.collation_definition(selected, txid)?;
@@ -30101,8 +30681,12 @@ impl Storage {
 
     /// PUBLIC's privileges on `object` before any explicit grant. A few
     /// built-in routines (such as `pg_read_file`) start without PUBLIC
-    /// `EXECUTE`.
+    /// `EXECUTE`, and initdb revokes `CREATE` and `TEMPORARY` on the template
+    /// databases from PUBLIC, leaving `CONNECT`.
     pub(crate) fn object_default_public_privileges(&self, object: AccessObject) -> PrivilegeSet {
+        if self.is_initdb_template_database(object) {
+            return PrivilegeSet::CONNECT;
+        }
         if object.class == AccessClass::BuiltinRoutine {
             let public = self
                 .builtin_routine_entry(usize::from(object.slot))
@@ -30118,6 +30702,16 @@ impl Storage {
             };
         }
         default_public_object_privileges(object.class)
+    }
+
+    /// Whether `object` is `template0` or `template1`, whose initial ACL
+    /// initdb sets explicitly (`{=c/postgres,postgres=CTc/postgres}`).
+    pub(crate) fn is_initdb_template_database(&self, object: AccessObject) -> bool {
+        object.class == AccessClass::Database
+            && matches!(
+                self.database(usize::from(object.slot)).oid,
+                DatabaseOid::TEMPLATE0 | DatabaseOid::TEMPLATE1
+            )
     }
 
     /// Privileges initdb grants predefined role `role` on `object` before any
@@ -32484,6 +33078,7 @@ impl Storage {
             definition,
             CatalogAllocation::Restore(position),
             creation,
+            None,
         )
     }
 
@@ -38299,7 +38894,14 @@ impl Storage {
         let key = if let Some(created_at) = enforcer.index_created_at {
             index = selection.index(self, created_at)?;
             if let Some(source) = index.predicate {
-                let predicate = crate::sql::parser::parse_expr(source.as_str(), arena)?;
+                let predicate = crate::sql::exec::expression_bindings::bound_index_expression(
+                    source.as_str(),
+                    self,
+                    &index,
+                    ExpressionOwner::IndexPredicate,
+                    evaluation_txid,
+                    arena,
+                )?;
                 if !crate::sql::exec::constraints::index_predicate_matches(
                     self,
                     evaluation_txid,
@@ -38314,8 +38916,16 @@ impl Storage {
             let mut expressions = [None; MAX_INDEX_COLS];
             for (position, source) in index.expressions.iter().enumerate().take(index.n_cols) {
                 if let Some(source) = source {
-                    expressions[position] =
-                        Some(crate::sql::parser::parse_expr(source.as_str(), arena)?);
+                    expressions[position] = Some(
+                        crate::sql::exec::expression_bindings::bound_index_expression(
+                            source.as_str(),
+                            self,
+                            &index,
+                            ExpressionOwner::IndexKey(position as u8),
+                            evaluation_txid,
+                            arena,
+                        )?,
+                    );
                 }
             }
             crate::sql::exec::constraints::index_key_values(
@@ -40721,7 +41331,14 @@ impl Storage {
                         None => table_definition.columns[columns[position] as usize].ctype,
                         Some(source) => {
                             let expression =
-                                crate::sql::parser::parse_expr(source.as_str(), &arena)?;
+                                crate::sql::exec::expression_bindings::bound_index_expression(
+                                    source.as_str(),
+                                    self,
+                                    &index,
+                                    ExpressionOwner::IndexKey(position as u8),
+                                    txid.unwrap_or(0),
+                                    &arena,
+                                )?;
                             want[n_want].dependency_mask |=
                                 crate::sql::exec::check_referenced_columns(
                                     expression,
@@ -41355,8 +41972,13 @@ impl Storage {
             .columns()
             .iter()
             .any(|column| column.ctype.typlen() == -1);
-        let slot =
-            table_creation::allocate(self, def, CatalogAllocation::New, TableCreation::Committed)?;
+        let slot = table_creation::allocate(
+            self,
+            def,
+            CatalogAllocation::New,
+            TableCreation::Committed,
+            None,
+        )?;
         Ok(slot)
     }
 
@@ -41467,7 +42089,17 @@ impl Storage {
     /// Transactional create: the table exists only for `txid` until commit.
     /// A name already visible to `txid` is a duplicate (42P07); a name held by
     /// another transaction's uncommitted DDL joins the shared wait graph.
-    pub fn create_table_in(&self, mut def: TableDefBuilder, txid: u32) -> Result<usize, SqlError> {
+    pub fn create_table_in(&self, def: TableDefBuilder, txid: u32) -> Result<usize, SqlError> {
+        self.create_declared_table_in(def, txid, None)
+    }
+
+    /// Creates a table whose constraints are numbered in `declared` order.
+    pub(crate) fn create_declared_table_in(
+        &self,
+        mut def: TableDefBuilder,
+        txid: u32,
+        declared: Option<&ConstraintDeclarationOrder>,
+    ) -> Result<usize, SqlError> {
         for column in def.columns() {
             reject_system_column_name(column.name.as_str())?;
         }
@@ -41482,6 +42114,7 @@ impl Storage {
             def,
             CatalogAllocation::New,
             TableCreation::Pending(txid),
+            declared,
         )?;
         if temporary {
             self.mark_temporary_transaction(txid);
@@ -51871,22 +52504,24 @@ impl Storage {
         })
     }
 
-    pub(crate) fn table_access_method_name(
+    /// Whether a restored table's access method exists, and is unspecified
+    /// only on a partitioned table.
+    pub(crate) fn table_access_method_valid<B: DefinitionBacking>(
         &self,
-        method: TableAccessMethod,
+        definition: &TableDefinition<B>,
         txid: u32,
-    ) -> Option<SqlName> {
-        match method {
-            TableAccessMethod::Heap => SqlName::parse("heap").ok(),
+    ) -> bool {
+        match definition.access_method {
+            TableAccessMethod::Unspecified => definition.partition.is_partitioned(),
+            TableAccessMethod::Heap => true,
             TableAccessMethod::Catalog(oid) => AccessMethodIter {
                 catalog: &self.operator_catalog,
                 next_slot: 0,
             }
-            .find_map(|(_, candidate)| {
-                (candidate.database == current_database()
+            .any(|(_, candidate)| {
+                candidate.database == current_database()
                     && candidate.visible_to(txid)
-                    && candidate.oid() == oid)
-                    .then_some(candidate.definition.name)
+                    && candidate.oid() == oid
             }),
         }
     }
@@ -54612,6 +55247,24 @@ impl Storage {
         .map(move |(slot, operator)| (slot, operator.definition_for(txid)))
     }
 
+    /// Whether any operator visible to `txid` is named `name`, read under one
+    /// catalog lock. Expression evaluation asks this for every operator it
+    /// applies, so the common answer (no user-defined operator of that name)
+    /// must not copy each slot.
+    pub(crate) fn has_visible_operator_named(&self, name: &str, txid: u32) -> bool {
+        let database = current_database();
+        self.operator_catalog
+            .lock()
+            .expect("operator catalog lock poisoned")
+            .operators
+            .iter()
+            .any(|operator| {
+                operator.database == database
+                    && operator.visible_to(txid)
+                    && operator.definition_for(txid).name.as_str() == name
+            })
+    }
+
     /// Whether a visible operator of this database named `name` lives in a
     /// schema on the search path. Builtin operator evaluation asks this per
     /// row, so it scans under one lock and copies only matching names.
@@ -57058,6 +57711,11 @@ impl Storage {
         right_oid: Option<i32>,
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
+        // Most applied operators are built in; skip copying every
+        // user-defined operator when none has this name.
+        if !self.has_visible_operator_named(name, txid) {
+            return Ok(None);
+        }
         let path_position = |schema: SqlName| {
             self.path().entries().iter().position(|entry| match entry {
                 PathEntry::Schema(slot) => self.schema_def_for(*slot as usize, txid).name == schema,

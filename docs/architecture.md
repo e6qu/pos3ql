@@ -765,6 +765,55 @@ entries on the SQL execution thread. A paused call releases its entry and
 re-admits it on resume, so another client's calls are not counted as its
 children. Exhaustion returns `54000` naming the function timing stack.
 
+### Stored expressions
+
+PostgreSQL stores a CHECK constraint, a column default or generation
+expression, and an index key expression or predicate as an analyzed tree that
+names functions, operators, types and collations by OID. pos3ql stores the
+SQL text and, beside it, the dependency list captured when the expression was
+written: each entry pairs the spelling used with the object it resolved to
+under the creator's `search_path`. Before an expression runs, is printed
+(`pg_get_constraintdef`, `pg_get_expr`, `pg_get_indexdef`, `\d`) or describes
+a key, its text is bound to those objects under their current names. So with
+`search_path = app` at creation, `CHECK (score(a) > 0)` keeps calling
+`app.score` after the path changes, after `ALTER FUNCTION app.score RENAME TO
+rank` (printed as `app.rank(a)`), and after `ALTER SCHEMA app RENAME TO core`.
+
+| Owner | Where the list lives | Limit |
+|---|---|---|
+| CHECK constraints, defaults, generated columns | The table definition, frozen into `table_metadata_bytes` | 64 entries per table |
+| Index keys and predicate | The index definition | 16 entries per index |
+
+Each single expression also respects `max_stored_query_dependencies_per_object`.
+Exceeding a limit returns `54000`. Sequence references are not in the list:
+`nextval('s')` keeps its regclass literal, which sequence renames already
+maintain.
+
+The lists produce `pg_depend` rows as PostgreSQL's do: a constraint, default
+or index depends normally on what it names, and a generation expression
+internally on its column. `DROP ... RESTRICT` of a named object therefore
+fails listing them, and `CASCADE` drops the CHECK constraints, clears the
+defaults, drops the generated columns and drops the indexes (after the drop
+that removed the object, in one statement). Exclusion predicates, statistics
+expressions, trigger conditions and domain constraints still store plain text;
+renaming or moving a routine or type such an expression names is refused with
+`0A000`, as is renaming an enum label any stored expression spells.
+
+### Catalog reads within a statement
+
+PostgreSQL reads every catalog relation a statement scans under the
+statement's snapshot, so `SELECT mk(g), (SELECT count(*) FROM pg_class) FROM
+generate_series(1, 3) g`, where `mk` creates a table, counts the tables that
+existed when the statement began. Before a query that calls a user routine
+runs, pos3ql builds an image of every `pg_catalog` relation the query names,
+directly or through views, in the query workspace's `catalog_image_bytes`
+arena, and the query's scans read those images until it ends. A query that
+calls no user routine cannot change the catalog while it runs, and builds its
+images as it first reads each relation. A volatile routine's statements read
+the catalog as it is when they run. A statement pins at most 256 images,
+nested routine statements included; that limit or a full arena returns
+`54000`.
+
 ### Statement preparation
 
 Function calls bind their selected function, argument mapping and declared
@@ -868,6 +917,19 @@ NULL keys, duplicate matches, extra `ON` conditions and `LEFT JOIN` share that
 path. A build estimated beyond its fixed 32,768-entry ceiling, a lateral or
 partitioned source, or incompatible key types selects a nested-loop plan before
 execution; `EXPLAIN` reports the same choice.
+
+Other joins run as a nested loop. A `WHERE` condition is checked at the first
+join level where all its sources are bound, including above a `LEFT JOIN` when
+it names only the preserved side. A materialized source (a catalog relation,
+CTE or subquery result) has no index, so a level that compares one of its
+columns with an earlier source's column, or with an outer reference of a
+correlated subquery, hashes that column once and visits only the rows with a
+matching hash; the full `ON` and `WHERE` conditions still decide every row.
+`EXPLAIN` reports these plans as `Nested Loop`. Within one statement, a
+`pg_catalog` base relation is built once and reused by every scan, including
+each run of a correlated subquery, until the statement writes or changes the
+catalog, so psql's `\d`, `\dT` and `\dC` queries do work proportional to
+their results rather than to the product of the catalog sizes.
 
 See [index navigation](index-navigation.md) for searchable summaries and exact
 checks, and [durable formats](durable-format.md) for encodings and accepted

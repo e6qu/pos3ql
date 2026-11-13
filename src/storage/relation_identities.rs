@@ -134,8 +134,19 @@ impl Storage {
         &self,
         definition: &mut super::TableDefBuilder,
     ) -> Result<(), SqlError> {
+        self.reserve_declared_table_catalog_identities(definition, None)
+    }
+
+    /// Reserves a new table's identities, numbering its NOT NULL, key and
+    /// exclusion constraints and key indexes as `declared` when given.
+    pub(crate) fn reserve_declared_table_catalog_identities(
+        &self,
+        definition: &mut super::TableDefBuilder,
+        declared: Option<&super::ConstraintDeclarationOrder>,
+    ) -> Result<(), SqlError> {
         Self::validate_inline_key_names(definition)?;
-        self.reserve_constraint_identities(definition)?;
+        definition.prune_expression_dependencies();
+        self.reserve_constraint_identities(definition, declared)?;
         definition.has_toast |= definition
             .columns()
             .iter()
@@ -159,6 +170,30 @@ impl Storage {
                 *identity = None;
             }
         }
+        // PostgreSQL creates the primary key's index first, then the other
+        // key and exclusion indexes.
+        let next = || {
+            RelationIdentity::parse(
+                self.catalog_sequence
+                    .next_bounded(MAX_RELATION_GENERATION, "relation")?,
+            )
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "bounded creation stamp is not a relation identity"
+                )
+            })
+        };
+        super::constraint_identities::for_each_key_in_creation_order(
+            definition,
+            declared,
+            |_, identity| {
+                if identity.is_none() {
+                    *identity = Some(next()?);
+                }
+                Ok(())
+            },
+        )?;
         for identity in definition.table_index_identities_mut() {
             if identity.is_none() {
                 *identity = Some(
@@ -170,6 +205,19 @@ impl Storage {
                 );
             }
         }
+        // A dropped or recreated key takes its CLUSTER and replica identity
+        // marks with it, as dropping an index clears them in PostgreSQL.
+        let mut marks = definition.key_index_marks;
+        for mark in [&mut marks.clustered, &mut marks.replica_identity] {
+            if mark.is_some_and(|mark| {
+                !definition
+                    .key_index_identities()
+                    .any(|identity| identity == mark)
+            }) {
+                *mark = None;
+            }
+        }
+        definition.key_index_marks = marks;
         Ok(())
     }
 
@@ -180,6 +228,12 @@ impl Storage {
     ) -> Result<(), SqlError> {
         Self::validate_inline_key_names(definition)?;
         super::validate_constraint_lifetimes(definition.constraint_identities(), owner_birth)?;
+        if !definition.key_index_marks_valid() {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "saved CLUSTER or replica identity mark names no key index"
+            ));
+        }
         for (position, identity) in definition.table_index_identities().enumerate() {
             let identity = identity.ok_or_else(|| {
                 sql_err!(

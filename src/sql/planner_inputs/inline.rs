@@ -1704,9 +1704,17 @@ fn inlined_body_properties(
         return Ok(None);
     }
     let facts = argument_facts(arguments, columns, storage, txid, arena)?;
-    let body = arena
-        .alloc_str(routine.body.as_str())
-        .map_err(|_| crate::sql::eval::arena_full())?;
+    // A `RETURN` body is the expression of one `SELECT`, as it runs.
+    let body = if routine.body_kind == crate::storage::RoutineBodyKind::Return {
+        let mut text = crate::mem::arena::ArenaString::new(arena);
+        core::fmt::Write::write_fmt(&mut text, format_args!("SELECT {}", routine.body.as_str()))
+            .map_err(|_| crate::sql::eval::arena_full())?;
+        text.as_str()
+    } else {
+        arena
+            .alloc_str(routine.body.as_str())
+            .map_err(|_| crate::sql::eval::arena_full())?
+    };
     let name = arena
         .alloc_str(routine.name.as_str())
         .map_err(|_| crate::sql::eval::arena_full())?;

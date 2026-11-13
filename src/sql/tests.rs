@@ -19,6 +19,8 @@ mod canonical_sequences;
 mod cast_and_operator_class_descriptions;
 mod catalog_identity_lookup;
 mod catalog_join_probes;
+mod catalog_join_work;
+mod check_no_inherit;
 mod client_catalog;
 mod compatibility_diagnostics;
 mod composite_parameter_fields;
@@ -40,6 +42,7 @@ mod indirect_execute_privileges;
 mod information_schema_domains;
 mod initplans;
 mod joined_dml_returning;
+mod key_index_marks;
 mod key_preparation;
 mod nested_planner_inputs;
 pub(super) mod object_reads;
@@ -88,6 +91,7 @@ mod type_catalog_rows;
 mod type_dependent_routines;
 mod type_input_binding;
 mod type_input_positions;
+mod view_reloptions;
 mod virtual_search_path;
 mod write_progress;
 
@@ -6515,6 +6519,7 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
     assert_eq!(
         Engine::extra_budget_bytes(&config) - Engine::extra_budget_bytes(&one),
         2 * (config.work_arena_bytes
+            + config.catalog_image_bytes
             + crate::storage::RowCursorBuffers::allocation_bytes(&config)
             + core::mem::size_of::<QueryWorkspace>()
             + dml_workspace_bytes)
@@ -6525,6 +6530,7 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
     );
     let bytes = config.query_workspace_slots
         * (config.work_arena_bytes
+            + config.catalog_image_bytes
             + crate::storage::RowCursorBuffers::allocation_bytes(&config)
             + core::mem::size_of::<QueryWorkspace>());
     let mut budget = Budget::new(bytes);
@@ -16477,7 +16483,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         [
             "base_ext|1.0|NULL",
             "typed_ext|1.0|NULL",
-            "base_ext|1.0|f|t|{}|NULL",
+            "base_ext|1.0|f|t|NULL|NULL",
             "typed_ext|1.0|f|t|{base_ext}|typed extension fixture",
             "typed_ext|2.0|f|t|{base_ext}|typed extension v2",
             "typed_ext|3.0|f|t|{base_ext}|typed extension v3",
@@ -16520,8 +16526,9 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         data_rows(&output),
         [
             "base_ext|1.0|extensions|t",
+            "plpgsql|1.0|pg_catalog|f",
             "typed_ext|1.0|extensions|t",
-            "15",
+            "19",
             "t|{\"WHERE NOT built_in\",\"\"}",
             "5",
             "kept|t",
@@ -16558,6 +16565,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         )),
         [
             "base_ext|1.0",
+            "plpgsql|1.0",
             "typed_ext|2.0",
             "5",
             "kept|t",
@@ -16601,6 +16609,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         )),
         [
             "base_ext|1.0",
+            "plpgsql|1.0",
             "typed_ext|2.0",
             "5",
             "kept|t",
@@ -16651,7 +16660,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         &mut recovered,
         &mut recovered_budget,
         "DROP EXTENSION base_ext CASCADE; \
-         SELECT count(*) FROM pg_extension; \
+         SELECT count(*) FROM pg_extension WHERE extname <> 'plpgsql'; \
          SELECT count(*) FROM pg_class WHERE relname='typed_values'; \
          SELECT count(*) FROM pg_proc WHERE proname='typed_identity'; \
          SELECT count(*) FROM pg_proc WHERE proname='aggregate_dependency_total'; \
@@ -16673,12 +16682,13 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         data_rows(&run_with(
             &mut replayed,
             &mut replay_budget,
-            "SELECT count(*) FROM pg_extension; \
+            "SELECT count(*) FROM pg_extension WHERE extname <> 'plpgsql'; \
              SELECT count(*) FROM pg_class WHERE relname='typed_values'; \
              SELECT count(*) FROM pg_depend \
              WHERE classid = 'pg_extension'::regclass OR refclassid = 'pg_extension'::regclass",
         )),
-        ["0", "0", "0"]
+        // Only initdb's plpgsql extension and its four members remain.
+        ["0", "0", "4"]
     );
     drop(replayed);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -16812,7 +16822,7 @@ fn extension_lifecycle_rejects_invalid_states_and_obeys_dependency_classes() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT count(*) FROM pg_extension",
+            "SELECT count(*) FROM pg_extension WHERE extname <> 'plpgsql'",
         )),
         ["0"]
     );
@@ -16822,7 +16832,7 @@ fn extension_lifecycle_rejects_invalid_states_and_obeys_dependency_classes() {
             &mut engine,
             &mut budget,
             "BEGIN; CREATE EXTENSION empty_ext; ROLLBACK; \
-             SELECT count(*) FROM pg_extension",
+             SELECT count(*) FROM pg_extension WHERE extname <> 'plpgsql'",
         )),
         ["0"]
     );
@@ -18359,6 +18369,7 @@ fn copy_line(
     engine.copy_row_line(
         setup,
         line,
+        &crate::sql::error_context::CopyFrame::new(1, false),
         super::CopyRowContext::new(
             txn,
             guc,
@@ -18389,6 +18400,7 @@ fn copy_binary_row(
     engine.copy_row_binary(
         setup,
         row,
+        &crate::sql::error_context::CopyFrame::new(1, true),
         super::CopyRowContext::new(
             txn,
             guc,
@@ -23931,62 +23943,27 @@ fn row_level_security_covers_views_merge_copy_partitions_and_saved_queries() {
     );
     assert_eq!(copy_data_rows(&copied), ["1\trls_client", "3\trls_client"]);
 
-    let mut copy_transition = copy_transition_scratch(&mut budget);
-    let mut send = crate::mem::FixedBuf::new(&mut budget, "rls copy send", 1 << 18).unwrap();
-    let mut arena = Arena::new(&mut budget, "rls copy sql", 1 << 18).unwrap();
-    let mut transaction = TxnState::new(&mut budget, 1024).unwrap();
-    let mut pool = test_pool(&mut budget);
-    let mut cursors = test_cursors(&mut budget);
-    let guc = GucState::new();
-    {
-        let mut responder = Responder::new(&mut send);
-        engine
-            .execute_simple(
-                "SET ROLE rls_client; COPY rls_target FROM STDIN",
-                &arena,
-                &mut transaction,
-                &mut pool,
-                &mut cursors,
-                &guc,
-                &mut responder,
-                1,
-            )
-            .unwrap();
-    }
-    let (copy, _deadline) = engine
-        .take_pending_copy()
-        .expect("COPY enters streaming mode");
-    arena.reset();
-    assert_eq!(
-        copy_line(
-            &mut engine,
-            &mut budget,
-            &copy,
-            &mut transaction,
-            &guc,
-            &arena,
-            b"4\trls_client\tcopy",
-            &mut copy_transition,
-        )
-        .unwrap(),
-        crate::sql::exec::CopyRowOutcome::Stored
-    );
-    finish_copy(
+    // PostgreSQL's DoCopy refuses COPY FROM when policies apply.
+    let copy_from = run_with(
         &mut engine,
         &mut budget,
-        &copy,
-        &mut transaction,
-        &guc,
-        &mut copy_transition,
-    )
-    .unwrap();
+        "SET ROLE rls_client; COPY rls_target FROM STDIN",
+    );
+    let copy_from = String::from_utf8_lossy(&copy_from);
+    assert!(
+        copy_from.contains("0A000")
+            && copy_from.contains("COPY FROM not supported with row-level security")
+            && copy_from.contains("Use INSERT statements instead."),
+        "{copy_from}"
+    );
+    assert!(engine.take_pending_copy().is_none());
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
             &mut budget,
             "SET ROLE rls_client; SELECT id FROM rls_target ORDER BY id"
         )),
-        ["1", "3", "4"]
+        ["1", "3"]
     );
 
     let row_security_off = run_with(
@@ -61098,17 +61075,33 @@ fn enums_order_and_enforce() {
     );
     // DROP RESTRICT fails while a column depends on the enum.
     assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "DROP TYPE mood")).contains("2BP01"));
-    // A column default's cast names the type and its labels as text, so
-    // label and type renames are refused until that table is gone.
-    for refused in [
-        "ALTER TYPE mood RENAME VALUE 'sad' TO 'blue'",
-        "ALTER TYPE mood RENAME TO feeling",
-    ] {
-        assert!(
-            String::from_utf8_lossy(&run_with(&mut e, &mut b, refused)).contains("0A000"),
-            "{refused}"
-        );
-    }
+    // A column default's cast spells its labels as text, so a label rename
+    // is refused until that table is gone; the default is bound to the type
+    // itself, so a type rename follows.
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "ALTER TYPE mood RENAME VALUE 'sad' TO 'blue'"
+        ))
+        .contains("0A000")
+    );
+    run_with(&mut e, &mut b, "ALTER TYPE mood RENAME TO mood_renamed");
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "INSERT INTO enum_defaults DEFAULT VALUES RETURNING m, moods; \
+             SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef \
+             WHERE adrelid = 'enum_defaults'::regclass ORDER BY adnum"
+        )),
+        [
+            "ok|{sad,happy}",
+            "'ok'::mood_renamed",
+            "ARRAY['sad'::mood_renamed, 'happy'::mood_renamed]"
+        ]
+    );
+    run_with(&mut e, &mut b, "ALTER TYPE mood_renamed RENAME TO mood");
     run_with(&mut e, &mut b, "DROP TABLE enum_defaults");
     // Renames rewrite inline scalar/array labels while preserving sort order,
     // then move the type identity (including its generated array type).
@@ -62914,6 +62907,39 @@ fn correlated_scalar_subquery_in_projection() {
         "SELECT a, (SELECT count(*) FROM t AS x WHERE x.b < t.b) AS rnk FROM t ORDER BY a",
     );
     assert_eq!(data_rows(&bytes), ["1|0", "2|1", "3|2"]);
+}
+
+#[test]
+fn nested_subquery_reads_enclosing_subquery_row() {
+    let (mut e, mut b) = test_engine();
+    for (sql, expected) in [
+        (
+            "SELECT (SELECT (SELECT p.x) FROM (VALUES (1)) p(x))",
+            ["1"].as_slice(),
+        ),
+        (
+            "SELECT (SELECT array(SELECT p.x + o.y) FROM (VALUES (1), (3)) p(x) \
+             ORDER BY 1 DESC LIMIT 1) FROM (VALUES (2)) o(y)",
+            &["{5}"],
+        ),
+        (
+            "SELECT EXISTS (SELECT 1 FROM (VALUES (1)) p(x) WHERE (SELECT p.x) = 1)",
+            &["t"],
+        ),
+        (
+            "SELECT (SELECT (SELECT o.y) FROM (VALUES (1)) p(x) GROUP BY p.x) \
+             FROM (VALUES (2)) o(y)",
+            &["2"],
+        ),
+        (
+            "SELECT (SELECT array_agg(p.x) FROM (VALUES (1), (5)) p(x) \
+             WHERE (SELECT o.y + p.x) > 4) FROM (VALUES (2)) o(y)",
+            &["{5}"],
+        ),
+    ] {
+        let bytes = run_with(&mut e, &mut b, sql);
+        assert_eq!(data_rows(&bytes), expected, "{sql}");
+    }
 }
 
 #[test]
@@ -69491,7 +69517,8 @@ fn configured_database_and_schema_capacities_survive_publication_and_object_cold
     let mut config = test_config("database-schema-capacities");
     config.max_databases = 3 + USER_DATABASES;
     config.max_schemas = 3 + USER_DATABASES + USER_SCHEMAS;
-    config.max_text_search_objects = 21 + 7 * USER_DATABASES;
+    config.max_text_search_objects = crate::storage::BUILTIN_TEXT_SEARCH_SLOTS
+        + crate::storage::BUILTIN_TEXT_SEARCH_OBJECTS * USER_DATABASES;
     config.wal_buffer_bytes = 4 << 20;
     config.checkpoint_manifest_bytes = 4 << 20;
     config.object_store_on = true;
@@ -69889,7 +69916,7 @@ fn startup_sized_metadata_catalogs_exhaust_and_survive_object_cold_recovery() {
     config.max_tables = 4;
     config.max_collations = COLLATIONS;
     config.max_conversions = CONVERSIONS;
-    config.max_text_search_objects = 21 + TEXT_DICTIONARIES;
+    config.max_text_search_objects = crate::storage::BUILTIN_TEXT_SEARCH_SLOTS + TEXT_DICTIONARIES;
     config.max_event_triggers = EVENT_TRIGGERS;
     config.max_tablespaces = 2 + TABLESPACES;
     config.max_comments = TABLESPACES;
@@ -71859,6 +71886,112 @@ fn reindex_preserves_indexed_access_after_checkpoint_and_cold_restart() {
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
+/// CHECK constraints, defaults, generation expressions and index keys and
+/// predicates stay bound to the routine they named when written, across WAL
+/// replay and a checkpoint, under a later search path and rename.
+#[test]
+fn bound_table_expressions_survive_replay_and_checkpoint() {
+    let mut config = test_config("bound-expression-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("bound-expression-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let no_error = |output: &[u8]| {
+        let text = String::from_utf8_lossy(output);
+        assert!(!text.contains("ERROR"), "{text}");
+    };
+    let expected = |engine: &mut Engine, budget: &mut Budget| {
+        assert_eq!(
+            data_rows(&run_with(
+                engine,
+                budget,
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+                 WHERE conrelid = 'bound_rows'::regclass AND contype = 'c'; \
+                 SELECT pg_get_indexdef('bound_rows_key'::regclass); \
+                 SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef \
+                 WHERE adrelid = 'bound_rows'::regclass ORDER BY adnum",
+            )),
+            [
+                "CHECK ((bound_moved.renamed(a) > 0))",
+                "CREATE INDEX bound_rows_key ON public.bound_rows USING btree \
+                 (bound_moved.renamed(a)) WHERE (bound_moved.renamed(b) > 0)",
+                "bound_moved.renamed(5)",
+                "bound_moved.renamed(a)",
+            ]
+        );
+    };
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    no_error(&run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA bound_schema; \
+         CREATE FUNCTION bound_schema.f(int) RETURNS int LANGUAGE sql IMMUTABLE RETURN $1 + 1; \
+         SET search_path = bound_schema, public; \
+         CREATE TABLE public.bound_rows (a int CHECK (f(a) > 0), b int DEFAULT f(5), \
+         g int GENERATED ALWAYS AS (f(a)) STORED); \
+         CREATE INDEX bound_rows_key ON public.bound_rows (f(a)) WHERE f(b) > 0; \
+         RESET search_path; \
+         ALTER FUNCTION bound_schema.f(int) RENAME TO renamed; \
+         ALTER SCHEMA bound_schema RENAME TO bound_moved",
+    ));
+    engine.commit_wal().unwrap();
+    drop(engine);
+
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    expected(&mut engine, &mut budget);
+    no_error(&run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO bound_rows (a) VALUES (3)",
+    ));
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "INSERT INTO bound_rows (a) VALUES (-3)"
+        ))
+        .contains("23514")
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    expected(&mut engine, &mut budget);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT a, b, g FROM bound_rows"
+        )),
+        ["3|6|4"]
+    );
+    no_error(&run_with(
+        &mut engine,
+        &mut budget,
+        "DROP FUNCTION bound_moved.renamed(int) CASCADE",
+    ));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_constraint WHERE conrelid = 'bound_rows'::regclass; \
+             SELECT count(*) FROM pg_index WHERE indrelid = 'bound_rows'::regclass; \
+             SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_attribute \
+             WHERE attrelid = 'bound_rows'::regclass AND attnum > 0 AND NOT attisdropped",
+        )),
+        ["0", "0", "a,b"]
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
 #[test]
 fn cluster_selection_survives_checkpoint_and_cold_restart() {
     let mut config = test_config("cluster-recovery");
@@ -73725,7 +73858,7 @@ fn temporary_views_are_inferred_shadowed_mutable_and_session_scoped() {
             "2",
             "1",
             "2",
-            "t|{security_invoker=true,check_option=cascaded}",
+            "t|{check_option=cascaded,security_invoker=true}",
         ]
     );
 
@@ -80688,7 +80821,8 @@ fn pg_dump_bootstrap_surface() {
             "SELECT count(*) FROM pg_extension x \
              JOIN pg_namespace n ON n.oid=x.extnamespace"
         )),
-        ["0"]
+        // initdb's plpgsql, which pg_dump skips as a built-in object.
+        ["1"]
     );
     run_with(
         &mut engine,
@@ -90291,16 +90425,17 @@ fn copy_from_applies_expression_defaults_sequences_and_generated_columns() {
     ));
     assert_eq!(rows, ["5|10|1|20|{1,2}|10|ready"]);
 
-    // COPY reads no generated column: the default list leaves it out, and
-    // naming one fails at setup, as in PostgreSQL.
+    // `CopyGetAttnums`: a generated column takes no COPY data, so naming one
+    // fails at setup.
     let rejected = run_with(
         &mut engine,
         &mut budget,
         "COPY copy_defaults (input, doubled) FROM STDIN",
     );
+    let rejected = String::from_utf8_lossy(&rejected);
     assert!(
-        String::from_utf8_lossy(&rejected).contains("column \"doubled\" is a generated column"),
-        "COPY naming a generated column must fail at setup"
+        rejected.contains("42P10") && rejected.contains("is a generated column"),
+        "COPY naming a generated column must fail at setup: {rejected}"
     );
 }
 
@@ -90351,13 +90486,27 @@ fn copy_from_postgresql18_controls_preserve_typed_input_boundaries() {
     ));
     arena.reset();
     engine
-        .copy_match_header(&setup, b"id,note", &arena)
+        .copy_match_header(
+            &setup,
+            b"id,note",
+            &crate::sql::error_context::CopyFrame::new(1, false),
+            &arena,
+        )
         .expect("matching header");
     arena.reset();
     let bad_header = engine
-        .copy_match_header(&setup, b"note,id", &arena)
+        .copy_match_header(
+            &setup,
+            b"note,id",
+            &crate::sql::error_context::CopyFrame::new(1, false),
+            &arena,
+        )
         .expect_err("reordered header must fail");
     assert_eq!(bad_header.sqlstate, sqlstate::BAD_COPY_FILE_FORMAT);
+    assert_eq!(
+        bad_header.message.as_str(),
+        "column name mismatch in header line field 1: got \"note\", expected \"id\""
+    );
     arena.reset();
     copy_line(
         &mut engine,
@@ -90382,8 +90531,10 @@ fn copy_from_postgresql18_controls_preserve_typed_input_boundaries() {
         &mut copy_transition,
     )
     .expect_err("bad integer must remain a typed conversion error");
-    assert!(crate::sql::exec::copy_ignorable_error(&conversion));
-    assert!(conversion.message.as_str().contains("COPY column \"id\""));
+    assert_eq!(
+        conversion.message.as_str(),
+        "invalid input syntax for type integer: \"not-an-integer\""
+    );
     finish_copy(
         &mut engine,
         &mut budget,
@@ -93805,12 +93956,12 @@ fn subscription_copy_transition_values_survive_worker_rewinds_and_abort() {
         let setup = apply
             .start_copy_table(&mut engine, schema, table, &columns)
             .unwrap();
-        apply.copy_line(&mut engine, &setup, b"1\tone").unwrap();
+        apply.copy_line(&mut engine, &setup, b"1\tone", 1).unwrap();
         let oversized = [b'x'; 80];
         let mut line = [b'0'; 82];
         line[..2].copy_from_slice(b"2\t");
         line[2..].copy_from_slice(&oversized);
-        let error = apply.copy_line(&mut engine, &setup, &line).unwrap_err();
+        let error = apply.copy_line(&mut engine, &setup, &line, 1).unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert!(error.message.as_str().contains("copy_transition_bytes"));
         apply.stop(&mut engine);
@@ -93826,8 +93977,8 @@ fn subscription_copy_transition_values_survive_worker_rewinds_and_abort() {
         let setup = apply
             .start_copy_table(&mut engine, schema, table, &columns)
             .unwrap();
-        apply.copy_line(&mut engine, &setup, b"1\tone").unwrap();
-        apply.copy_line(&mut engine, &setup, b"2\ttwo").unwrap();
+        apply.copy_line(&mut engine, &setup, b"1\tone", 1).unwrap();
+        apply.copy_line(&mut engine, &setup, b"2\ttwo", 1).unwrap();
         apply.finish_copy_table(&mut engine, &setup).unwrap();
         apply.finish_bootstrap(&mut engine, 41).unwrap();
     });
@@ -93852,7 +94003,7 @@ fn subscription_copy_transition_values_survive_worker_rewinds_and_abort() {
         let setup = apply
             .start_copy_table(&mut engine, schema, table, &columns)
             .unwrap();
-        apply.copy_line(&mut engine, &setup, b"3\tnew").unwrap();
+        apply.copy_line(&mut engine, &setup, b"3\tnew", 1).unwrap();
         apply.finish_copy_table(&mut engine, &setup).unwrap();
         apply.stop(&mut engine);
         apply.unbind();
@@ -97046,11 +97197,21 @@ fn statement_files_streamed_copy_keeps_trigger_sources_between_data_messages() {
                 );
                 if binary {
                     engine
-                        .copy_row_binary(&setup, &[0, 1, 0, 0, 0, 4, 0, 0, 0, id], context)
+                        .copy_row_binary(
+                            &setup,
+                            &[0, 1, 0, 0, 0, 4, 0, 0, 0, id],
+                            &crate::sql::error_context::CopyFrame::new(1, true),
+                            context,
+                        )
                         .unwrap();
                 } else {
                     engine
-                        .copy_row_line(&setup, if id == 7 { b"7" } else { b"8" }, context)
+                        .copy_row_line(
+                            &setup,
+                            if id == 7 { b"7" } else { b"8" },
+                            &crate::sql::error_context::CopyFrame::new(1, false),
+                            context,
+                        )
                         .unwrap();
                 }
             });

@@ -35,6 +35,8 @@ use super::wire::{self, MsgIn, WireFull};
 /// Eight maximum-size frames; a listener that falls further behind is closed
 /// rather than sent a truncated stream.
 pub const HELD_NOTIFICATION_BYTES: usize = 8 * 8192;
+/// Per-connection space for a failed COPY FROM's error context.
+pub const COPY_ERROR_CONTEXT_BYTES: usize = crate::sql::error_context::CONTEXT_BYTES;
 
 /// A responder whose output queues after the connection's overflow, so a
 /// message never overtakes earlier queued output.
@@ -471,6 +473,9 @@ pub struct Conn {
     copy: Option<CopyInProgress>,
     /// Staging for one COPY data row (rows split across CopyData messages).
     copy_buf: FixedBuf,
+    /// The `CONTEXT` of the error that failed the current COPY FROM, kept
+    /// until the error is reported at the end of the copy.
+    copy_error_context: FixedBuf,
     /// Rows inserted by this connection's active COPY statement. Statement
     /// transition tables retain this state across interleaved reactor turns.
     copy_transition_scratch: crate::sql::exec::CopyTransitionRows,
@@ -663,6 +668,11 @@ impl Conn {
             )?,
             copy: None,
             copy_buf: FixedBuf::new(budget, "copy_line", config.copy_line_bytes)?,
+            copy_error_context: FixedBuf::new(
+                budget,
+                "copy_error_context",
+                COPY_ERROR_CONTEXT_BYTES,
+            )?,
             copy_transition_scratch: crate::sql::exec::CopyTransitionRows::new(
                 budget,
                 config.txn_rows,
@@ -3041,10 +3051,12 @@ impl Conn {
                 let line = &self.copy_buf.readable()[..line_end];
                 if copy.header_pending {
                     copy.line = copy.line.saturating_add(1);
+                    let frame = crate::sql::error_context::CopyFrame::new(copy.line, false);
                     if matches!(copy.setup.fmt.header, crate::sql::ast::CopyHeader::Match)
-                        && let Err(error) = engine.copy_match_header(&copy.setup, line, &self.arena)
+                        && let Err(error) =
+                            engine.copy_match_header(&copy.setup, line, &frame, &self.arena)
                     {
-                        copy.failed = Some(error);
+                        fail_copy(copy, &mut self.copy_error_context, error);
                     }
                     copy.header_pending = false;
                 } else if copy.end_seen || copy.failed.is_some() {
@@ -3053,12 +3065,18 @@ impl Conn {
                 } else if crate::sql::copy::is_end_marker(line) {
                     copy.end_seen = true;
                 } else {
-                    copy.line = copy.line.saturating_add(1);
-                    let outcome = {
+                    copy.line = copy.line.saturating_add(1).saturating_add(if csv {
+                        crate::sql::copy::csv_quoted_newlines(line, quote, escape)
+                    } else {
+                        0
+                    });
+                    let frame = crate::sql::error_context::CopyFrame::new(copy.line, false);
+                    let (outcome, conversion) = {
                         let mut responder = output(&mut self.send, &mut self.overflow);
-                        engine.copy_row_line(
+                        let outcome = engine.copy_row_line(
                             &copy.setup,
                             line,
+                            &frame,
                             crate::sql::CopyRowContext::new(
                                 &mut self.txn,
                                 &self.guc,
@@ -3067,12 +3085,19 @@ impl Conn {
                                 &mut responder,
                                 &mut self.copy_transition_scratch,
                             ),
-                        )
+                        );
+                        (outcome, frame.conversion())
                     };
                     match outcome {
                         Ok(crate::sql::exec::CopyRowOutcome::Stored) => copy.count += 1,
                         Ok(crate::sql::exec::CopyRowOutcome::Filtered) => {}
-                        Err(error) => record_copy_input_error(&mut self.send, copy, error),
+                        Err(error) => record_copy_input_error(
+                            &mut self.send,
+                            copy,
+                            &mut self.copy_error_context,
+                            error,
+                            conversion,
+                        ),
                     }
                 }
             }
@@ -3143,12 +3168,15 @@ impl Conn {
                 BinaryFrame::Row(len) => {
                     self.arena.reset();
                     if !copy.end_seen && copy.failed.is_none() {
+                        copy.line = copy.line.saturating_add(1);
                         let row = &self.copy_buf.readable()[..len];
+                        let frame = crate::sql::error_context::CopyFrame::new(copy.line, true);
                         let outcome = {
                             let mut responder = output(&mut self.send, &mut self.overflow);
                             engine.copy_row_binary(
                                 &copy.setup,
                                 row,
+                                &frame,
                                 crate::sql::CopyRowContext::new(
                                     &mut self.txn,
                                     &self.guc,
@@ -3162,7 +3190,7 @@ impl Conn {
                         match outcome {
                             Ok(crate::sql::exec::CopyRowOutcome::Stored) => copy.count += 1,
                             Ok(crate::sql::exec::CopyRowOutcome::Filtered) => {}
-                            Err(e) => copy.failed = Some(e),
+                            Err(e) => fail_copy(copy, &mut self.copy_error_context, e),
                         }
                     }
                     self.copy_buf.consume(len);
@@ -3195,10 +3223,12 @@ impl Conn {
             let line = self.copy_buf.readable();
             if copy.header_pending {
                 copy.line = copy.line.saturating_add(1);
+                let frame = crate::sql::error_context::CopyFrame::new(copy.line, false);
                 if matches!(copy.setup.fmt.header, crate::sql::ast::CopyHeader::Match)
-                    && let Err(error) = engine.copy_match_header(&copy.setup, line, &self.arena)
+                    && let Err(error) =
+                        engine.copy_match_header(&copy.setup, line, &frame, &self.arena)
                 {
-                    copy.failed = Some(error);
+                    fail_copy(copy, &mut self.copy_error_context, error);
                 }
                 copy.header_pending = false;
             } else if !copy.end_seen
@@ -3206,11 +3236,13 @@ impl Conn {
                 && !crate::sql::copy::is_end_marker(line)
             {
                 copy.line = copy.line.saturating_add(1);
-                let outcome = {
+                let frame = crate::sql::error_context::CopyFrame::new(copy.line, false);
+                let (outcome, conversion) = {
                     let mut responder = output(&mut self.send, &mut self.overflow);
-                    engine.copy_row_line(
+                    let outcome = engine.copy_row_line(
                         &copy.setup,
                         line,
+                        &frame,
                         crate::sql::CopyRowContext::new(
                             &mut self.txn,
                             &self.guc,
@@ -3219,12 +3251,19 @@ impl Conn {
                             &mut responder,
                             &mut self.copy_transition_scratch,
                         ),
-                    )
+                    );
+                    (outcome, frame.conversion())
                 };
                 match outcome {
                     Ok(crate::sql::exec::CopyRowOutcome::Stored) => copy.count += 1,
                     Ok(crate::sql::exec::CopyRowOutcome::Filtered) => {}
-                    Err(error) => record_copy_input_error(&mut self.send, copy, error),
+                    Err(error) => record_copy_input_error(
+                        &mut self.send,
+                        copy,
+                        &mut self.copy_error_context,
+                        error,
+                        conversion,
+                    ),
                 }
             }
             self.copy_buf.clear();
@@ -3295,7 +3334,20 @@ impl Conn {
                     responder
                         .notice(
                             sqlstate::SUCCESSFUL_COMPLETION,
-                            crate::stack_format!(96, "COPY ignored {} rows", copy.ignored).as_str(),
+                            if copy.ignored == 1 {
+                                crate::stack_format!(
+                                    96,
+                                    "{} row was skipped due to data type incompatibility",
+                                    copy.ignored
+                                )
+                            } else {
+                                crate::stack_format!(
+                                    96,
+                                    "{} rows were skipped due to data type incompatibility",
+                                    copy.ignored
+                                )
+                            }
+                            .as_str(),
                         )
                         .and_then(|()| {
                             responder
@@ -3305,7 +3357,18 @@ impl Conn {
                     responder.command_complete(crate::stack_format!(32, "COPY {count}").as_str())
                 }
             }
-            Err(e) => responder.error(e.sqlstate, e.message.as_str()),
+            Err(e) => {
+                if let Ok(context) = core::str::from_utf8(self.copy_error_context.readable())
+                    && !context.is_empty()
+                {
+                    crate::sql::error_context::restore(&e, context, None);
+                }
+                self.copy_error_context.clear();
+                if let Some(diagnostic) = copy.failed_diagnostic.take() {
+                    crate::sql::eval::stash_full_diagnostic(diagnostic);
+                }
+                responder.error(e.sqlstate, e.message.as_str())
+            }
         };
         if extended && failed {
             self.phase = Phase::SkipToSync;
@@ -4463,6 +4526,7 @@ impl Conn {
                 let header_pending = !matches!(setup.fmt.header, crate::sql::ast::CopyHeader::None);
                 let binary_header_pending = setup.fmt.binary;
                 self.copy_transition_scratch.clear();
+                self.copy_error_context.clear();
                 self.copy = Some(CopyInProgress {
                     setup,
                     deadline,
@@ -4470,6 +4534,7 @@ impl Conn {
                     ignored: 0,
                     line: 0,
                     failed: None,
+                    failed_diagnostic: None,
                     end_seen: false,
                     header_pending,
                     binary_header_pending,
@@ -4716,6 +4781,7 @@ impl Conn {
                         !matches!(setup.fmt.header, crate::sql::ast::CopyHeader::None);
                     let binary_header_pending = setup.fmt.binary;
                     self.copy_transition_scratch.clear();
+                    self.copy_error_context.clear();
                     self.copy = Some(CopyInProgress {
                         setup,
                         deadline,
@@ -4723,6 +4789,7 @@ impl Conn {
                         ignored: 0,
                         line: 0,
                         failed: None,
+                        failed_diagnostic: None,
                         end_seen: false,
                         header_pending,
                         binary_header_pending,
@@ -6437,6 +6504,8 @@ struct CopyInProgress {
     ignored: u64,
     line: u64,
     failed: Option<crate::sql::eval::SqlError>,
+    /// `failed`'s DETAIL and HINT, kept until it is reported.
+    failed_diagnostic: Option<crate::sql::eval::Diagnostic>,
     end_seen: bool,
     /// CSV/text HEADER: the first data line is column names to skip, not a row.
     header_pending: bool,
@@ -6447,47 +6516,70 @@ struct CopyInProgress {
     extended: bool,
 }
 
-fn record_copy_input_error(send: &mut FixedBuf, copy: &mut CopyInProgress, error: SqlError) {
-    if !matches!(
-        copy.setup.on_error,
-        crate::sql::ast::CopyErrorAction::Ignore
-    ) || !crate::sql::exec::copy_ignorable_error(&error)
-    {
-        copy.failed = Some(error);
+/// Fails the COPY with `error`, keeping its context for the report at the
+/// end of the copy: the worker-local context snapshot does not outlive the
+/// input message that raised it.
+fn fail_copy(copy: &mut CopyInProgress, context: &mut FixedBuf, error: SqlError) {
+    context.clear();
+    crate::sql::error_context::take(&error, |reported| {
+        if let Some(reported) = reported {
+            // The capture bounds a context to the buffer's size.
+            let _ = context.append(reported.context.as_bytes());
+        }
+    });
+    copy.failed_diagnostic = crate::sql::eval::take_diagnostic();
+    copy.failed = Some(error);
+}
+
+/// A row error. With `ON_ERROR ignore`, an input conversion error skips the
+/// row, as `NextCopyFrom`'s soft errors do; every other error fails the copy.
+fn record_copy_input_error(
+    send: &mut FixedBuf,
+    copy: &mut CopyInProgress,
+    context: &mut FixedBuf,
+    error: SqlError,
+    conversion: Option<crate::sql::error_context::CopyConversion>,
+) {
+    let (true, Some(conversion)) = (
+        matches!(
+            copy.setup.on_error,
+            crate::sql::ast::CopyErrorAction::Ignore
+        ),
+        conversion,
+    ) else {
+        fail_copy(copy, context, error);
         return;
-    }
+    };
+    // The skipped error is not reported.
+    crate::sql::error_context::take(&error, |_| ());
+    let _ = crate::sql::eval::take_diagnostic();
     copy.ignored = copy.ignored.saturating_add(1);
     if matches!(
         copy.setup.log_verbosity,
         crate::sql::ast::CopyLogVerbosity::Verbose
-    ) {
-        let mut responder = Responder::new(send);
-        if responder
-            .notice(
-                error.sqlstate,
-                crate::stack_format!(
-                    192,
-                    "COPY ignored row {}: {}",
-                    copy.line,
-                    error.message.as_str()
-                )
-                .as_str(),
-            )
-            .is_err()
-        {
-            copy.failed = Some(crate::sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "COPY verbose diagnostics exceed the send buffer"
-            ));
-            return;
-        }
+    ) && Responder::new(send)
+        .notice(
+            sqlstate::SUCCESSFUL_COMPLETION,
+            conversion.skipped_notice().as_str(),
+        )
+        .is_err()
+    {
+        copy.failed = Some(crate::sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "COPY verbose diagnostics exceed the send buffer"
+        ));
+        return;
     }
     if let Some(limit) = copy.setup.reject_limit
         && copy.ignored > limit
     {
+        // Raised while the skipped row's column is still current.
+        context.clear();
+        let _ = context.append(conversion.context().as_str().as_bytes());
+        copy.failed_diagnostic = None;
         copy.failed = Some(crate::sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "COPY rejected more than {} rows",
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            "skipped more than REJECT_LIMIT ({}) rows due to data type incompatibility",
             limit
         ));
     }

@@ -213,6 +213,8 @@ fn note(error: SqlError, note: AnalysisNote) -> SqlError {
 }
 
 const FUNCTION_HINT: &str = "No function matches the given name and argument types. You might need to add explicit type casts.";
+const AMBIGUOUS_FUNCTION_HINT: &str =
+    "Could not choose a best candidate function. You might need to add explicit type casts.";
 const BINARY_OPERATOR_HINT: &str = "No operator matches the given name and argument types. You might need to add explicit type casts.";
 const AMBIGUOUS_OPERATOR_HINT: &str =
     "Could not choose a best candidate operator. You might need to add explicit type casts.";
@@ -694,6 +696,22 @@ pub(crate) fn expression_error(
                 None => {
                     let error = at_subject(error, name);
                     annotated(error, None, FUNCTION_HINT)
+                }
+            }
+        }
+        Expr::Call {
+            name,
+            source_position,
+            ..
+        } if state == sqlstate::AMBIGUOUS_FUNCTION
+            && message.starts_with("function ")
+            && message.ends_with(") is not unique") =>
+        {
+            match source_position.get() {
+                Some(at) => annotated(error, Some(at), AMBIGUOUS_FUNCTION_HINT),
+                None => {
+                    let error = at_subject(error, name);
+                    annotated(error, None, AMBIGUOUS_FUNCTION_HINT)
                 }
             }
         }

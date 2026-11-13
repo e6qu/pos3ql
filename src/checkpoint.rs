@@ -4351,7 +4351,9 @@ impl Checkpointer {
                     };
                     let tablespace: u16 = parse_field(words.next(), "table tablespace")?;
                     let access_method: i32 = parse_field(words.next(), "table access method")?;
-                    let access_method = if access_method == 2 {
+                    let access_method = if access_method == 0 {
+                        crate::storage::TableAccessMethod::Unspecified
+                    } else if access_method == 2 {
                         crate::storage::TableAccessMethod::Heap
                     } else {
                         crate::storage::TableAccessMethod::Catalog(
@@ -4360,11 +4362,6 @@ impl Checkpointer {
                             )?,
                         )
                     };
-                    if storage.table_access_method_name(access_method, 0).is_none() {
-                        return Err(CheckpointSetupError::Corrupt(
-                            "table references an unknown access method",
-                        ));
-                    }
                     let inheritance_count: usize =
                         parse_field(words.next(), "table inheritance count")?;
                     if inheritance_count > crate::storage::MAX_TABLE_INHERITANCE_PARENTS {
@@ -5054,7 +5051,7 @@ impl Checkpointer {
                     };
                     def.partition = parse_partition_manifest(&mut words)?;
                 }
-                Some("rls") => {
+                Some("rls2") => {
                     let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("rls outside table"));
                     };
@@ -5074,6 +5071,11 @@ impl Checkpointer {
                         parse_field(words.next(), "replica identity mode")?,
                     )
                     .ok_or(CheckpointSetupError::Corrupt("replica identity mode"))?;
+                    def.key_index_marks = crate::storage::KeyIndexMarks::decode([
+                        parse_field(words.next(), "clustered key index")?,
+                        parse_field(words.next(), "replica identity key index")?,
+                    ])
+                    .ok_or(CheckpointSetupError::Corrupt("key index marks"))?;
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("trailing rls fields"));
                     }
@@ -5998,7 +6000,28 @@ impl Checkpointer {
                     def.uniques[i] = uk;
                     def.n_uniques += 1;
                 }
-                Some("chk") => {
+                Some("xdep") => {
+                    let Some((_, _, def, _)) = pending_def.as_mut() else {
+                        return Err(CheckpointSetupError::Corrupt("xdep outside table"));
+                    };
+                    if def.n_expression_dependencies
+                        >= crate::storage::MAX_TABLE_EXPRESSION_DEPENDENCIES
+                    {
+                        return Err(CheckpointSetupError::Corrupt("too many xdep lines"));
+                    }
+                    let bytes = decode_manifest_hex_bytes(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("xdep bytes missing"))?,
+                    )?;
+                    let mut at = 0;
+                    let entry = crate::wal::decode_expression_dependency(&bytes, &mut at)
+                        .filter(|entry| at == bytes.len() && entry.owner.belongs_to_table())
+                        .ok_or(CheckpointSetupError::Corrupt("bad xdep"))?;
+                    def.expression_dependencies[def.n_expression_dependencies] = entry;
+                    def.n_expression_dependencies += 1;
+                }
+                Some("chk2") => {
                     let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("chk outside table"));
                     };
@@ -6006,6 +6029,11 @@ impl Checkpointer {
                         return Err(CheckpointSetupError::Corrupt("too many chk lines"));
                     }
                     let validation: u8 = parse_field(words.next(), "chk validation")?;
+                    let no_inherit = match parse_field::<u8>(words.next(), "chk inheritance")? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(CheckpointSetupError::Corrupt("bad chk inheritance")),
+                    };
                     let hex_name = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("chk name missing"))?;
@@ -6016,6 +6044,7 @@ impl Checkpointer {
                     check.validation = crate::storage::ConstraintValidation::from_code(validation)
                         .ok_or(CheckpointSetupError::Corrupt("bad chk validation"))?;
                     check.name = sql_name(&decode_hex_name(hex_name)?)?;
+                    check.no_inherit = no_inherit;
                     let expression = decode_hex_name(hexpr)?;
                     use core::fmt::Write;
                     let _ = write!(check.expression, "{expression}");
@@ -6078,7 +6107,7 @@ impl Checkpointer {
                     def.fkeys[i] = fk;
                     def.n_fkeys += 1;
                 }
-                Some("excl") => {
+                Some("excl2") => {
                     let Some((_, _, def, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("excl outside table"));
                     };
@@ -6086,6 +6115,7 @@ impl Checkpointer {
                         return Err(CheckpointSetupError::Corrupt("too many excl lines"));
                     }
                     let timing: u8 = parse_field(words.next(), "excl timing")?;
+                    let method: u8 = parse_field(words.next(), "excl method")?;
                     let n_cols: usize = parse_field(words.next(), "excl ncols")?;
                     if n_cols == 0 || n_cols > crate::storage::MAX_INDEX_COLS {
                         return Err(CheckpointSetupError::Corrupt("bad excl ncols"));
@@ -6093,12 +6123,14 @@ impl Checkpointer {
                     let mut exclusion = crate::storage::ExclusionConstraint::EMPTY;
                     exclusion.timing = crate::storage::ConstraintTiming::from_code(timing)
                         .ok_or(CheckpointSetupError::Corrupt("bad excl timing"))?;
+                    exclusion.method = crate::sql::ast::IndexAccessMethod::from_code(method)
+                        .ok_or(CheckpointSetupError::Corrupt("bad excl method"))?;
                     exclusion.n_cols = n_cols;
                     for position in 0..n_cols {
                         exclusion.columns[position] = parse_field(words.next(), "excl col")?;
-                        let operator: u8 = parse_field(words.next(), "excl operator")?;
+                        let operator: i32 = parse_field(words.next(), "excl operator")?;
                         exclusion.operators[position] =
-                            crate::storage::ExclusionOperator::from_code(operator)
+                            crate::storage::ExclusionOperator::from_oid(operator)
                                 .ok_or(CheckpointSetupError::Corrupt("bad excl operator"))?;
                     }
                     exclusion.name = sql_name(&decode_hex_name(
@@ -6523,7 +6555,7 @@ impl Checkpointer {
                         )
                         .map_err(|_| CheckpointSetupError::Corrupt("invalid foreign table"))?;
                 }
-                Some("vw15") => {
+                Some("vw16") => {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     load_view(storage, line, metadata.catalog_sequence)?;
                 }
@@ -7228,22 +7260,19 @@ impl Checkpointer {
                         crate::storage::TextSearchDictionaryBehavior,
                         CheckpointSetupError,
                     > {
-                        Ok(
-                            match parse_field::<u8>(word, "text-search dictionary behavior")? {
-                                0 => crate::storage::TextSearchDictionaryBehavior::Simple {
-                                    accept: true,
-                                },
-                                1 => crate::storage::TextSearchDictionaryBehavior::Simple {
-                                    accept: false,
-                                },
-                                2 => crate::storage::TextSearchDictionaryBehavior::EnglishStem,
-                                _ => {
-                                    return Err(CheckpointSetupError::Corrupt(
-                                        "invalid text-search dictionary behavior",
-                                    ));
-                                }
-                            },
-                        )
+                        let code: u32 = parse_field(word, "text-search dictionary behavior")?;
+                        let [kind, value, stopwords, unused] = code.to_le_bytes();
+                        if unused != 0 {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid text-search dictionary behavior",
+                            ));
+                        }
+                        crate::storage::TextSearchDictionaryBehavior::from_code([
+                            kind, value, stopwords,
+                        ])
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "invalid text-search dictionary behavior",
+                        ))
                     };
                     let definition = match kind {
                         "p" => crate::storage::TextSearchDefinition::Parser {
@@ -7262,7 +7291,13 @@ impl Checkpointer {
                             oid,
                             init: parse_field(words.next(), "text-search template init")?,
                             lexize: parse_field(words.next(), "text-search template lexize")?,
-                            behavior: behavior(words.next())?,
+                            kind: crate::storage::TextSearchTemplateKind::from_code(parse_field(
+                                words.next(),
+                                "text-search template kind",
+                            )?)
+                            .ok_or(CheckpointSetupError::Corrupt(
+                                "invalid text-search template kind",
+                            ))?,
                         },
                         "d" => {
                             let owner = parse_field(words.next(), "text-search dictionary owner")?;
@@ -8171,6 +8206,8 @@ impl Checkpointer {
                             name: sql_name(&cname)?,
                             expression: crate::util::StackStr::from_str(&cexpr),
                             validation,
+                            // Domain constraints are never inherited.
+                            no_inherit: false,
                         };
                     }
                     let base_domain = match (base_domain.is_empty(), base_domain_schema.is_empty())
@@ -9450,6 +9487,34 @@ impl Checkpointer {
                             *range = parse_field(words.next(), "idx unsummarized range")?;
                         }
                     }
+                    let mut expression_dependencies = [crate::storage::ExpressionDependency::EMPTY;
+                        crate::storage::MAX_INDEX_EXPRESSION_DEPENDENCIES];
+                    let mut n_expression_dependencies = 0usize;
+                    if words.clone().next() == Some("xd") {
+                        let _ = words.next();
+                        n_expression_dependencies =
+                            parse_field(words.next(), "idx expression dependency count")?;
+                        if n_expression_dependencies == 0
+                            || n_expression_dependencies > expression_dependencies.len()
+                        {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "bad idx expression dependency count",
+                            ));
+                        }
+                        for entry in &mut expression_dependencies[..n_expression_dependencies] {
+                            let bytes = decode_manifest_hex_bytes(words.next().ok_or(
+                                CheckpointSetupError::Corrupt("idx expression dependency missing"),
+                            )?)?;
+                            let mut at = 0;
+                            *entry = crate::wal::decode_expression_dependency(&bytes, &mut at)
+                                .filter(|entry| {
+                                    at == bytes.len() && !entry.owner.belongs_to_table()
+                                })
+                                .ok_or(CheckpointSetupError::Corrupt(
+                                    "bad idx expression dependency",
+                                ))?;
+                        }
+                    }
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("trailing idx fields"));
                     }
@@ -9547,6 +9612,8 @@ impl Checkpointer {
                                 pending_definition: None,
                                 ddl_state: crate::storage::CatalogDdlState::Present,
                                 pending_parent_drop_txid: None,
+                                expression_dependencies,
+                                n_expression_dependencies: n_expression_dependencies as u8,
                             },
                             0,
                         )
@@ -10825,10 +10892,7 @@ impl Checkpointer {
                     crate::storage::TableKind::Foreign => 1,
                 },
                 definition.tablespace,
-                match definition.access_method {
-                    crate::storage::TableAccessMethod::Heap => 2,
-                    crate::storage::TableAccessMethod::Catalog(oid) => oid.get(),
-                },
+                definition.access_method.relam(),
                 definition.inheritance.parents_ref().len(),
             )
             .map_err(|_| {
@@ -10921,10 +10985,12 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "rls {} {} {}",
+                    "rls2 {} {} {} {} {}",
                     u8::from(definition.row_level_security.enabled),
                     u8::from(definition.row_level_security.forced),
                     definition.replica_identity.code(),
+                    definition.key_index_marks.encode()[0],
+                    definition.key_index_marks.encode()[1],
                 ),
             )?;
             for (column, c) in definition.columns().iter().enumerate() {
@@ -11073,7 +11139,7 @@ impl Checkpointer {
                     ),
                 )?;
             }
-            // `chk <validation> <hex-name> <hex-predicate>`
+            // `chk2 <validation> <no-inherit> <hex-name> <hex-predicate>`
             for check in definition.checks() {
                 use core::fmt::Write;
                 let mut hex_name = StackStr::<130>::new();
@@ -11087,11 +11153,27 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "chk {} {} {}",
+                        "chk2 {} {} {} {}",
                         check.validation.code(),
+                        u8::from(check.no_inherit),
                         hex_name.as_str(),
                         hexpr.as_str()
                     ),
+                )?;
+            }
+            // `xdep <hex>`: one expression dependency in its journal encoding.
+            for entry in definition.expression_dependencies() {
+                let mut bytes = [0u8; crate::wal::EXPRESSION_DEPENDENCY_BYTES];
+                let length = crate::wal::expression_dependency_bytes(entry, &mut bytes)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "expression dependency exceeds its manifest line"
+                        )
+                    })?;
+                write_manifest(
+                    &mut self.manifest_output,
+                    format_args!("xdep {}", ManifestInputBytes(&bytes[..length])),
                 )?;
             }
             // `fkey <ncols> <c..> <nparent> <p..> <actions> <timing> <validation> <names>`
@@ -11137,13 +11219,13 @@ impl Checkpointer {
             }
             for exclusion in definition.exclusions() {
                 use core::fmt::Write;
-                let mut elements = StackStr::<128>::new();
+                let mut elements = StackStr::<{ 24 * crate::storage::MAX_INDEX_COLS }>::new();
                 for position in 0..exclusion.n_cols {
                     let _ = write!(
                         elements,
                         "{} {} ",
                         exclusion.columns[position],
-                        exclusion.operators[position].code()
+                        exclusion.operators[position].oid()
                     );
                 }
                 let mut hex_name = StackStr::<130>::new();
@@ -11168,8 +11250,9 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_output,
                     format_args!(
-                        "excl {} {} {}{} {}",
+                        "excl2 {} {} {} {}{} {}",
                         exclusion.timing.code(),
+                        exclusion.method.code(),
                         exclusion.n_cols,
                         elements.as_str(),
                         hex_name.as_str(),
@@ -11633,7 +11716,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "vw15 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "vw16 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     view_slot,
                     view.created_at,
                     view.return_rule,
@@ -11642,15 +11725,11 @@ impl Checkpointer {
                     hschema.as_str(),
                     hpath.as_str(),
                     hname.as_str(),
-                    u8::from(matches!(
-                        view.options.security,
-                        crate::storage::ViewSecurity::Invoker
-                    )),
-                    view.options.security_barrier.code(),
-                    view.options
-                        .check_option
-                        .map_or(0, crate::storage::ViewCheckOption::code),
-                    view.options.query_origin.code(),
+                    view.options.encode()[0],
+                    view.options.encode()[1],
+                    view.options.encode()[2],
+                    view.options.encode()[3],
+                    ManifestInputBytes(&view.options.order.encode()),
                     ManifestViewColumns(view.columns),
                     ManifestInputBytes(view.default_inputs.bytes()),
                     ManifestDependencies(storage.view_dependencies(view_slot, 0).view())
@@ -12307,7 +12386,7 @@ impl Checkpointer {
                     oid,
                     init,
                     lexize,
-                    behavior,
+                    kind,
                 } => write_manifest(
                     &mut self.manifest_output,
                     format_args!(
@@ -12319,7 +12398,7 @@ impl Checkpointer {
                         oid,
                         init,
                         lexize,
-                        text_search_behavior_code(behavior),
+                        kind.code(),
                     ),
                 )?,
                 crate::storage::TextSearchDefinition::Dictionary {
@@ -13142,7 +13221,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_output,
                 format_args!(
-                    "idx {} {} {} {} {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {} {} {} gb{} bo{} gi{},{}{}",
+                    "idx {} {} {} {} {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {} {} {} gb{} bo{} gi{},{}{}{}",
                     index.created_at,
                     match index.relation {
                         crate::storage::IndexRelationSource::Table => 0,
@@ -13191,6 +13270,7 @@ impl Checkpointer {
                     fastupdate,
                     gin_pending_list_limit.as_str(),
                     maintenance_suffix.as_str(),
+                    ManifestIndexDependencies(index.expression_dependencies()),
                 ),
             )?;
         }
@@ -18141,6 +18221,11 @@ fn finish_pending(
                 "manifest column count mismatch",
             ));
         }
+        if !storage.table_access_method_valid(&definition, 0) {
+            return Err(CheckpointSetupError::Corrupt(
+                "table references an unknown access method",
+            ));
+        }
         let slot = if storage
             .is_large_object_page_relation(definition.schema.as_str(), definition.name.as_str())
         {
@@ -19067,7 +19152,7 @@ fn load_view(
     catalog_sequence: u64,
 ) -> Result<(), CheckpointSetupError> {
     let mut words = line.split(' ');
-    if words.next() != Some("vw15") {
+    if words.next() != Some("vw16") {
         return Err(CheckpointSetupError::Corrupt("unsupported view record"));
     }
     let identity = crate::storage::ViewCatalogIdentity::new(
@@ -19095,29 +19180,26 @@ fn load_view(
     let path = read_hex(words.next(), "view path missing")?;
     let path_buffer = parse_creation_path(&path, "invalid view creation search path")?;
     let name = read_hex(words.next(), "view name missing")?;
-    let security = match parse_field::<u8>(words.next(), "view security missing")? {
-        0 => crate::storage::ViewSecurity::Definer,
-        1 => crate::storage::ViewSecurity::Invoker,
-        _ => return Err(CheckpointSetupError::Corrupt("invalid view security")),
-    };
-    let security_barrier = crate::storage::ViewSecurityBarrier::from_code(parse_field(
-        words.next(),
+    let mut option_codes = [0u8; crate::storage::ViewOptions::ENCODED_BYTES];
+    for (code, what) in option_codes.iter_mut().zip([
+        "view security missing",
         "view security barrier missing",
-    )?)
-    .ok_or(CheckpointSetupError::Corrupt(
-        "invalid view security barrier",
-    ))?;
-    let check_option = match parse_field::<u8>(words.next(), "view check option missing")? {
-        0 => None,
-        code => crate::storage::ViewCheckOption::from_code(code)
-            .ok_or(CheckpointSetupError::Corrupt("invalid view check option"))
-            .map(Some)?,
-    };
-    let query_origin = crate::storage::ViewQueryOrigin::from_code(parse_field(
-        words.next(),
+        "view check option missing",
         "view query origin missing",
-    )?)
-    .ok_or(CheckpointSetupError::Corrupt("invalid view query origin"))?;
+    ]) {
+        *code = parse_field::<u8>(words.next(), what)?;
+    }
+    let listed = decode_manifest_hex_bytes(
+        words
+            .next()
+            .ok_or(CheckpointSetupError::Corrupt("view option list missing"))?,
+    )?;
+    if listed.len() != crate::storage::ViewOptionOrder::ENCODED_BYTES {
+        return Err(CheckpointSetupError::Corrupt("invalid view option list"));
+    }
+    option_codes[4..].copy_from_slice(&listed);
+    let options = crate::storage::ViewOptions::decode(option_codes)
+        .ok_or(CheckpointSetupError::Corrupt("invalid view options"))?;
     let encoded_columns = words
         .next()
         .ok_or(CheckpointSetupError::Corrupt("view columns missing"))?;
@@ -19275,12 +19357,7 @@ fn load_view(
             creation_path: path_buffer,
             dependencies,
         },
-        options: crate::storage::ViewOptions {
-            security,
-            security_barrier,
-            check_option,
-            query_origin,
-        },
+        options,
     };
     storage
         .replay_view(identity, sql_name(&schema)?, sql_name(&name)?, definition)
@@ -19510,12 +19587,9 @@ impl core::fmt::Display for ManifestRoutineColumns<'_> {
     }
 }
 
-fn text_search_behavior_code(behavior: crate::storage::TextSearchDictionaryBehavior) -> u8 {
-    match behavior {
-        crate::storage::TextSearchDictionaryBehavior::Simple { accept: true } => 0,
-        crate::storage::TextSearchDictionaryBehavior::Simple { accept: false } => 1,
-        crate::storage::TextSearchDictionaryBehavior::EnglishStem => 2,
-    }
+fn text_search_behavior_code(behavior: crate::storage::TextSearchDictionaryBehavior) -> u32 {
+    let [kind, value, stopwords] = behavior.code();
+    u32::from_le_bytes([kind, value, stopwords, 0])
 }
 
 struct ManifestTextSearchMappings<'a>(&'a crate::storage::TextSearchMappings);
@@ -19675,6 +19749,26 @@ impl core::fmt::Display for ManifestDependencies<'_> {
 }
 
 struct ManifestInputBytes<'a>(&'a [u8]);
+
+/// ` xd <count> <hex>...`: an index's expression dependencies in their
+/// journal encoding, or nothing when it has none.
+struct ManifestIndexDependencies<'a>(&'a [crate::storage::ExpressionDependency]);
+
+impl core::fmt::Display for ManifestIndexDependencies<'_> {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0.is_empty() {
+            return Ok(());
+        }
+        write!(output, " xd {}", self.0.len())?;
+        for entry in self.0 {
+            let mut bytes = [0u8; crate::wal::EXPRESSION_DEPENDENCY_BYTES];
+            let length = crate::wal::expression_dependency_bytes(entry, &mut bytes)
+                .ok_or(core::fmt::Error)?;
+            write!(output, " {}", ManifestInputBytes(&bytes[..length]))?;
+        }
+        Ok(())
+    }
+}
 
 impl core::fmt::Display for ManifestInputBytes<'_> {
     fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -20188,7 +20282,7 @@ mod stored_dependency_tests {
             oversized_utf8.as_str(),
         ] {
             let view = format!(
-                "vw15 0 1 0 2 {} {} {} {} 0 0 0 0 0:0: - i2 0 -",
+                "vw16 0 1 0 2 {} {} {} {} 0 0 0 0 0 0:0: - i2 0 -",
                 ManifestName("SELECT 1"),
                 ManifestName("public"),
                 ManifestName(path),

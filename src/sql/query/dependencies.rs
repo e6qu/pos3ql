@@ -3753,6 +3753,13 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
                     .relation_row_type_creation(crate::storage::RowTypeRelation::Table(slot)),
             )));
         }
+        // A trigger's OLD/NEW rows, or a table expression's own row.
+        if let Some(composite) = self
+            .transition
+            .and_then(|transition| transition.whole_row_composite_type(name))
+        {
+            return Some(composite);
+        }
         self.scope?
             .whole_row_type(name)
             .filter(|ctype| matches!(ctype, ColType::Composite(_)))

@@ -30,7 +30,7 @@ fn foreign_key_reflection_probes_descriptions_by_key() {
     ))[0]
         .parse::<u64>()
         .unwrap();
-    let before = crate::sql::query::derived_candidates_visited();
+    let before = crate::sql::query::JOIN_CANDIDATES.with(core::cell::Cell::get);
     // SQLAlchemy's get_multi_foreign_keys query; results from PostgreSQL 18.6.
     let rows = data_rows(&run_with(
         &mut engine,
@@ -54,7 +54,7 @@ fn foreign_key_reflection_probes_descriptions_by_key() {
          WHERE pg_catalog.pg_class.relkind = ANY (ARRAY['r', 'p', 'f']) \
            AND pg_catalog.pg_namespace.nspname = 'cjp' ORDER BY 1, 2",
     ));
-    let visited = crate::sql::query::derived_candidates_visited() - before;
+    let visited = crate::sql::query::JOIN_CANDIDATES.with(core::cell::Cell::get) - before;
     assert_eq!(
         rows,
         [
@@ -64,8 +64,7 @@ fn foreign_key_reflection_probes_descriptions_by_key() {
         ]
     );
     // A scan per outer row would visit every description for each class
-    // row; probing visits only rows sharing a key, and sources smaller than
-    // the probe threshold.
+    // row; probing visits only rows sharing a key.
     assert!(
         visited < classes * 32 && visited < classes * descriptions / 64,
         "visited {visited} rows for {classes} classes and {descriptions} descriptions"

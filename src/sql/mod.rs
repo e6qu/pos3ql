@@ -4,11 +4,11 @@
 pub mod acl;
 pub mod array;
 pub mod ast;
-mod brin_catalog;
 pub mod catalog;
 mod catalog_image;
 mod catalog_metadata;
 pub mod catalog_node;
+mod catalog_operator_rows;
 mod catalog_snapshot;
 mod catalog_snapshot_keys;
 pub(crate) mod commit;
@@ -76,8 +76,10 @@ pub mod ryu;
 pub mod sequence;
 pub mod sha512;
 pub mod snapshot;
+pub(crate) mod snowball;
 mod spgist_catalog;
 pub(crate) mod statistics;
+pub(crate) mod text_parser;
 pub mod timezone;
 mod timezone_abbreviation_data;
 pub mod to_char;
@@ -354,6 +356,9 @@ struct QueryWorkspaces {
 
 struct QueryWorkspace {
     arena: Arena,
+    /// Images of the catalog relations a statement reads under its catalog
+    /// snapshot; reset when a top-level statement starts.
+    catalog_images: Arena,
     row_cursor_buffers: crate::storage::RowCursorBuffers,
     connection_id: i32,
     database_oid: crate::storage::DatabaseOid,
@@ -434,6 +439,11 @@ impl QueryWorkspaces {
             slots
                 .push(QueryWorkspace {
                     arena: Arena::new(budget, "query_workspace_arena", config.work_arena_bytes)?,
+                    catalog_images: Arena::new(
+                        budget,
+                        "catalog_image_arena",
+                        config.catalog_image_bytes,
+                    )?,
                     row_cursor_buffers: crate::storage::RowCursorBuffers::new(config, budget)?,
                     connection_id: 0,
                     database_oid: crate::storage::DatabaseOid::POSTGRES,
@@ -472,6 +482,17 @@ impl QueryWorkspaces {
     fn database_oid(&self) -> crate::storage::DatabaseOid {
         self.slots[execution_query_workspace().index()].database_oid
     }
+    /// The selected workspace's statement catalog image arena.
+    fn catalog_images(&self) -> &Arena {
+        &self.slots[execution_query_workspace().index()].catalog_images
+    }
+
+    fn reset_catalog_images(&mut self) {
+        self.slots[execution_query_workspace().index()]
+            .catalog_images
+            .reset();
+    }
+
     fn cursor_parts(&mut self) -> (&Arena, &mut crate::storage::RowCursorBuffers) {
         let workspace = &mut self.slots[execution_query_workspace().index()];
         (&workspace.arena, &mut workspace.row_cursor_buffers)
@@ -2242,6 +2263,14 @@ fn logical_replica_identity(
             })
         }
         crate::storage::ReplicaIdentityMode::Index => {
+            if let Some(key) = definition.key_index_marks.replica_identity {
+                return Ok(LogicalReplicaIdentity {
+                    wire: pgoutput::ReplicaIdentity::Index,
+                    key_mask: definition
+                        .key_index_columns(key)
+                        .unwrap_or(ColumnSet::EMPTY),
+                });
+            }
             let mut selected = None;
             for slot in 0..storage.index_count() {
                 let Some(index) = storage.index_visible_to(slot, 0) else {
@@ -4813,6 +4842,7 @@ impl Engine {
             config.query_workspace_slots.saturating_mul(
                 config
                     .work_arena_bytes
+                    .saturating_add(config.catalog_image_bytes)
                     .saturating_add(crate::storage::RowCursorBuffers::allocation_bytes(config))
                     .saturating_add(size_of::<QueryWorkspace>()),
             ),
@@ -10614,6 +10644,22 @@ impl Engine {
             responder.command_complete("SET")?;
             return Ok(Ok(()));
         }
+        // PostgreSQL resolves the configuration when it is set and keeps its
+        // schema-qualified name.
+        let canonical_config;
+        let value = if syntax == ast::SettingSyntax::DecodedValue
+            && name.eq_ignore_ascii_case("default_text_search_config")
+        {
+            match canonical_text_search_config(&self.storage, txn.txid, value) {
+                Ok(canonical) => {
+                    canonical_config = canonical;
+                    canonical_config.as_str()
+                }
+                Err(error) => return Ok(Err(error)),
+            }
+        } else {
+            value
+        };
         let changed = match syntax {
             ast::SettingSyntax::DecodedValue => {
                 guc.set_config(name, Some(value), local).map(|_| ())
@@ -11908,11 +11954,12 @@ impl Engine {
     }
 
     /// One complete COPY data line (no trailing newline).
-    pub fn copy_row_line(
+    pub(crate) fn copy_row_line<'a>(
         &mut self,
         setup: &exec::CopySetup,
-        line: &[u8],
-        context: CopyRowContext<'_, '_>,
+        line: &'a [u8],
+        frame: &error_context::CopyFrame<'a>,
+        context: CopyRowContext<'a, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
         let _settings =
             self.enter_copy_session(setup, context.txn, context.guc, context.responder)?;
@@ -11929,6 +11976,7 @@ impl Engine {
             ),
             setup,
             line,
+            frame,
             context.arena,
             context.responder,
             context.transition_rows,
@@ -11937,21 +11985,23 @@ impl Engine {
 
     /// Checks a `COPY ... HEADER MATCH` line through the same decoded field
     /// grammar as the following data rows.
-    pub fn copy_match_header(
+    pub(crate) fn copy_match_header<'a>(
         &self,
         setup: &exec::CopySetup,
-        line: &[u8],
+        line: &'a [u8],
+        frame: &error_context::CopyFrame<'a>,
         arena: &Arena,
     ) -> Result<(), SqlError> {
-        exec::copy_match_header(&self.storage, setup, line, arena)
+        exec::copy_match_header(&self.storage, setup, line, frame, arena)
     }
 
     /// One complete COPY FROM binary row (int16 field count + fields).
-    pub fn copy_row_binary(
+    pub(crate) fn copy_row_binary<'a>(
         &mut self,
         setup: &exec::CopySetup,
-        row: &[u8],
-        context: CopyRowContext<'_, '_>,
+        row: &'a [u8],
+        frame: &error_context::CopyFrame<'a>,
+        context: CopyRowContext<'a, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
         let _settings =
             self.enter_copy_session(setup, context.txn, context.guc, context.responder)?;
@@ -11968,6 +12018,7 @@ impl Engine {
             ),
             setup,
             row,
+            frame,
             context.arena,
             context.responder,
             context.transition_rows,
@@ -17586,6 +17637,15 @@ impl Engine {
             &mut cursor::CursorPool,
         ) -> Result<T, SqlError>,
     ) -> Result<Result<T, SqlError>, WireFull> {
+        // A volatile routine's statement reads the catalog as it is now.
+        let _fresh_catalog_reads = if source_snapshot == crate::storage::SNAPSHOT_ALL {
+            match query::enter_fresh_catalog_reads() {
+                Ok(scope) => Some(scope),
+                Err(error) => return Ok(Err(error)),
+            }
+        } else {
+            None
+        };
         let saved = continuation.as_deref_mut().and_then(Option::take);
         let resumed = saved.is_some();
         let owner = if resumed {
@@ -21201,6 +21261,11 @@ impl Engine {
         let _active_cursors = cursor::enter_active(cursors as *mut _ as *const _);
         let _active_prepared = prep::enter_active(sqlprep as *mut _ as *const _);
         let index_statement = concurrent_index::Kind::for_statement(statement).is_some();
+        // The statement's own catalog scans read the catalog as it begins.
+        let _catalog_snapshot = match query::enter_catalog_snapshot(self.work.catalog_images()) {
+            Ok(scope) => scope,
+            Err(error) => return Ok(Err(error)),
+        };
         let mut result = loop {
             if let Some(command) = &txn.concurrent_index
                 && let Some(cursor) = command.replay
@@ -21598,6 +21663,7 @@ impl Engine {
         // materialized state alive until evaluation returns.
         if reset_workspace {
             self.work.reset();
+            self.work.reset_catalog_images();
         }
         if let Err(error) = self.refresh_prepared_transaction_catalog() {
             return Ok(Err(error));
@@ -21720,20 +21786,32 @@ impl Engine {
             Ok(lease) => lease,
             Err(error) => return Ok(Err(error)),
         };
-        let result = self.execute_stmt_with_snapshot(
+        // Built under the statement's session context and snapshot, before
+        // it runs; the execution arena is only their scratch space.
+        let prebuilt = query::prebuild_statement_catalog_images(
             statement,
-            arena,
-            params,
-            txn,
-            sqlprep,
-            cursors,
-            guc,
-            routine_transaction_context,
-            responder,
-            reset_workspace,
-            capture,
-            &mut snapshot.lease,
+            &self.storage,
+            txn.txid,
+            &self.work,
         );
+        let result = if let Err(error) = prebuilt {
+            Ok(Err(error))
+        } else {
+            self.execute_stmt_with_snapshot(
+                statement,
+                arena,
+                params,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                routine_transaction_context,
+                responder,
+                reset_workspace,
+                capture,
+                &mut snapshot.lease,
+            )
+        };
         if reset_workspace
             && matches!(&result, Ok(Err(error)) if
                 error.sqlstate == sqlstate::INTERNAL_IO_WAIT
@@ -22064,6 +22142,7 @@ impl Engine {
                 security,
                 security_barrier,
                 check_option,
+                option_order,
                 sql,
             } => exec::create_view(
                 &mut self.storage,
@@ -22077,6 +22156,7 @@ impl Engine {
                     security: *security,
                     security_barrier: *security_barrier,
                     check_option: *check_option,
+                    option_order: *option_order,
                     sql,
                     raw_path: guc.search_path().as_str(),
                     kept_column_types: &[],
@@ -22257,6 +22337,32 @@ impl Engine {
                 *cascade,
                 responder,
             ),
+            Stmt::CreateExtension {
+                name,
+                if_not_exists,
+                ..
+            } if *name == BUILTIN_EXTENSION => {
+                if !*if_not_exists {
+                    return Ok(Err(sql_err!(
+                        sqlstate::DUPLICATE_OBJECT,
+                        "extension \"{}\" already exists",
+                        name
+                    )));
+                }
+                responder.notice(
+                    sqlstate::DUPLICATE_OBJECT,
+                    stack_format!(128, "extension \"{}\" already exists, skipping", name).as_str(),
+                )?;
+                responder.command_complete("CREATE EXTENSION")?;
+                Ok(Ok(()))
+            }
+            Stmt::AlterExtension { name, .. }
+            | Stmt::AlterMaterializedViewExtensionDependency {
+                extension: name, ..
+            } if *name == BUILTIN_EXTENSION => Ok(Err(builtin_extension_change())),
+            Stmt::DropExtension { names, .. } if names.contains(&BUILTIN_EXTENSION) => {
+                Ok(Err(builtin_extension_change()))
+            }
             Stmt::CreateExtension {
                 name,
                 if_not_exists,
@@ -22739,7 +22845,7 @@ impl Engine {
             ),
             Stmt::DropTextSearch {
                 kind,
-                name,
+                names,
                 if_exists,
                 cascade,
             } => exec::drop_text_search(
@@ -22749,7 +22855,7 @@ impl Engine {
                 &mut self.dml_scratch,
                 guc.seq_session(),
                 *kind,
-                name,
+                names,
                 *if_exists,
                 *cascade,
                 arena,
@@ -23520,6 +23626,7 @@ impl Engine {
                                 security,
                                 security_barrier,
                                 check_option,
+                                option_order,
                                 sql,
                             } = requalified
                             {
@@ -23547,6 +23654,7 @@ impl Engine {
                                         security: *security,
                                         security_barrier: *security_barrier,
                                         check_option: *check_option,
+                                        option_order: *option_order,
                                         sql,
                                         raw_path: schema_path,
                                         kept_column_types: &[],
@@ -25521,6 +25629,17 @@ impl Engine {
                 return Ok(Err(error));
             }
         }
+        if let Err(error) = exec::drop_dangling_table_expressions(
+            &mut self.storage,
+            &mut self.wal,
+            txn,
+            &mut self.dml_scratch,
+            guc.seq_session(),
+            arena,
+            responder,
+        ) {
+            return Ok(Err(error));
+        }
         responder.command_complete("DROP EXTENSION")?;
         Ok(Ok(()))
     }
@@ -25601,7 +25720,7 @@ impl Engine {
         if self.storage.extension_slot(name, txn.txid).is_some() {
             if if_not_exists {
                 responder.notice(
-                    sqlstate::SUCCESSFUL_COMPLETION,
+                    sqlstate::DUPLICATE_OBJECT,
                     stack_format!(128, "extension \"{}\" already exists, skipping", name).as_str(),
                 )?;
                 responder.command_complete("CREATE EXTENSION")?;
@@ -25712,7 +25831,7 @@ impl Engine {
             Ok(Some(plan)) => plan,
             Ok(None) => {
                 responder.notice(
-                    sqlstate::SUCCESSFUL_COMPLETION,
+                    sqlstate::DUPLICATE_OBJECT,
                     stack_format!(128, "extension \"{}\" already exists, skipping", name).as_str(),
                 )?;
                 responder.command_complete("CREATE EXTENSION")?;
@@ -27439,6 +27558,7 @@ pub(crate) fn requalify_schema_element<'a>(
             security,
             security_barrier,
             check_option,
+            option_order,
             sql,
         } => Stmt::CreateView {
             name: requalify(*name)?,
@@ -27448,6 +27568,7 @@ pub(crate) fn requalify_schema_element<'a>(
             security: *security,
             security_barrier: *security_barrier,
             check_option: *check_option,
+            option_order: *option_order,
             sql,
         },
         ast::CreateSchemaElement::Index {
@@ -28086,10 +28207,7 @@ fn apply_prepared_table_wal_payload(
             )
         })?;
     storage.restore_table_type_inputs(&mut definition, inputs, transaction_id)?;
-    if storage
-        .table_access_method_name(definition.access_method, transaction_id)
-        .is_none()
-    {
+    if !storage.table_access_method_valid(&definition, transaction_id) {
         return Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
             "prepared transaction references an unknown table access method"
@@ -29188,10 +29306,7 @@ fn apply_table_wal_payload(storage: &mut Storage, payload: &[u8]) -> Result<(), 
             )
         })?;
     storage.restore_table_type_inputs(&mut definition, inputs, 0)?;
-    if storage
-        .table_access_method_name(definition.access_method, 0)
-        .is_none()
-    {
+    if !storage.table_access_method_valid(&definition, 0) {
         return Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
             "journal table references an unknown access method"
@@ -30062,10 +30177,7 @@ fn apply_wal_op(
             columns,
             sql,
             path,
-            security_invoker,
-            security_barrier,
-            check_option,
-            query_origin,
+            options,
             dependencies,
         } => {
             let (columns, default_inputs) = columns.materialize(storage, 0)?;
@@ -30094,42 +30206,7 @@ fn apply_wal_op(
                         creation_path,
                         dependencies,
                     },
-                    options: crate::storage::ViewOptions {
-                        security: if security_invoker {
-                            crate::storage::ViewSecurity::Invoker
-                        } else {
-                            crate::storage::ViewSecurity::Definer
-                        },
-                        security_barrier: crate::storage::ViewSecurityBarrier::from_code(
-                            security_barrier,
-                        )
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::DATA_EXCEPTION,
-                                "journal has invalid view security barrier"
-                            )
-                        })?,
-                        check_option: match check_option {
-                            0 => None,
-                            code => {
-                                Some(crate::storage::ViewCheckOption::from_code(code).ok_or_else(
-                                    || {
-                                        sql_err!(
-                                            sqlstate::DATA_EXCEPTION,
-                                            "journal has invalid view check option"
-                                        )
-                                    },
-                                )?)
-                            }
-                        },
-                        query_origin: crate::storage::ViewQueryOrigin::from_code(query_origin)
-                            .ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::DATA_EXCEPTION,
-                                    "journal has invalid view query origin"
-                                )
-                            })?,
-                    },
+                    options,
                 },
             )?;
         }
@@ -30141,10 +30218,7 @@ fn apply_wal_op(
         WalOp::SetViewOptions {
             schema,
             name,
-            security_invoker,
-            security_barrier,
-            check_option,
-            query_origin,
+            options,
         } => {
             let slot = storage
                 .resolve_access_object(crate::storage::AccessClass::View, schema, name, 0)
@@ -30156,45 +30230,8 @@ fn apply_wal_op(
                         name
                     )
                 })?;
-            let check_option = match check_option {
-                0 => None,
-                code => Some(crate::storage::ViewCheckOption::from_code(code).ok_or_else(
-                    || {
-                        sql_err!(
-                            sqlstate::DATA_EXCEPTION,
-                            "journal has invalid view check option"
-                        )
-                    },
-                )?),
-            };
-            let undo = storage.stage_view_options(
-                storage.prepare_view_edit(slot, 0)?,
-                crate::storage::ViewOptions {
-                    security: if security_invoker {
-                        crate::storage::ViewSecurity::Invoker
-                    } else {
-                        crate::storage::ViewSecurity::Definer
-                    },
-                    security_barrier: crate::storage::ViewSecurityBarrier::from_code(
-                        security_barrier,
-                    )
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::DATA_EXCEPTION,
-                            "journal has invalid view security barrier"
-                        )
-                    })?,
-                    check_option,
-                    query_origin: crate::storage::ViewQueryOrigin::from_code(query_origin)
-                        .ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::DATA_EXCEPTION,
-                                "journal has invalid view query origin"
-                            )
-                        })?,
-                },
-                0,
-            )?;
+            let undo =
+                storage.stage_view_options(storage.prepare_view_edit(slot, 0)?, options, 0)?;
             storage.commit_view_alter(undo);
         }
         WalOp::SetViewColumns {
@@ -31183,6 +31220,7 @@ fn apply_wal_op(
             expressions,
             unique,
             definition,
+            expression_dependencies,
         } => {
             let mut stored_expressions = [None; crate::storage::MAX_INDEX_COLS];
             for (index, expression) in expressions.into_iter().enumerate() {
@@ -31190,43 +31228,43 @@ fn apply_wal_op(
                     .map(crate::storage::index_expression_stackstr)
                     .transpose()?;
             }
-            let slot = storage.create_index(
-                crate::storage::IndexDef {
-                    database: storage.current_database_oid(),
-                    created_at,
-                    schema: crate::storage::SqlName::parse(schema)?,
-                    name: crate::storage::SqlName::parse(name)?,
-                    pending_name: None,
-                    table: crate::storage::SqlName::parse(table)?,
-                    relation,
-                    table_binding: None,
-                    pending_table: None,
-                    method,
-                    ownership: crate::storage::Ownership::BOOTSTRAP,
-                    columns,
-                    expressions: stored_expressions,
-                    include_columns,
-                    collations,
-                    explicit_collations,
-                    operator_classes,
-                    resolved_operator_classes,
-                    operator_class_options,
-                    descending,
-                    nulls_first,
-                    n_cols,
-                    n_include_cols,
-                    nulls_not_distinct,
-                    predicate: predicate
-                        .map(crate::storage::index_predicate_stackstr)
-                        .transpose()?,
-                    unique,
-                    mutable: definition,
-                    pending_definition: None,
-                    ddl_state: crate::storage::CatalogDdlState::Present,
-                    pending_parent_drop_txid: None,
-                },
-                0,
-            )?;
+            let mut index = crate::storage::IndexDef {
+                database: storage.current_database_oid(),
+                created_at,
+                schema: crate::storage::SqlName::parse(schema)?,
+                name: crate::storage::SqlName::parse(name)?,
+                pending_name: None,
+                table: crate::storage::SqlName::parse(table)?,
+                relation,
+                table_binding: None,
+                pending_table: None,
+                method,
+                ownership: crate::storage::Ownership::BOOTSTRAP,
+                columns,
+                expressions: stored_expressions,
+                include_columns,
+                collations,
+                explicit_collations,
+                operator_classes,
+                resolved_operator_classes,
+                operator_class_options,
+                descending,
+                nulls_first,
+                n_cols,
+                n_include_cols,
+                nulls_not_distinct,
+                predicate: predicate
+                    .map(crate::storage::index_predicate_stackstr)
+                    .transpose()?,
+                unique,
+                mutable: definition,
+                pending_definition: None,
+                ddl_state: crate::storage::CatalogDdlState::Present,
+                pending_parent_drop_txid: None,
+                ..crate::storage::IndexDef::EMPTY
+            };
+            index.restore_expression_dependencies(expression_dependencies.entries())?;
+            let slot = storage.create_index(index, 0)?;
             storage.commit_index_create(slot)?;
         }
         WalOp::BrinMaintenance {
@@ -32135,6 +32173,17 @@ mod tests;
 #[cfg(all(test, not(miri)))]
 pub(crate) use tests::object_reads::HttpObjectServer;
 
+/// The extension initdb installs; its members are built in, so it cannot be
+/// altered, dropped or commented on.
+pub(crate) const BUILTIN_EXTENSION: &str = "plpgsql";
+
+pub(crate) fn builtin_extension_change() -> SqlError {
+    sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "changing built-in extension \"{}\" is not supported",
+        BUILTIN_EXTENSION
+    )
+}
 fn prepared_statement_missing(name: &str) -> SqlError {
     sql_err!(
         sqlstate::INVALID_SQL_STATEMENT_NAME,
@@ -32530,4 +32579,66 @@ fn rule_insert_target<'a>(
         type_oids,
         type_names,
     })
+}
+
+/// `check_default_text_search_config`: the configuration named by `value` on
+/// the search path, as `schema.name`.
+fn canonical_text_search_config(
+    storage: &crate::storage::Storage,
+    txid: u32,
+    value: &str,
+) -> Result<crate::util::StackStr<128>, SqlError> {
+    use core::fmt::Write as _;
+    let invalid = || {
+        sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "invalid value for parameter \"default_text_search_config\": \"{}\"",
+            value
+        )
+    };
+    let identifier = |part: &str| -> Option<crate::util::StackStr<64>> {
+        let mut out = crate::util::StackStr::<64>::new();
+        if let Some(quoted) = part
+            .strip_prefix('"')
+            .and_then(|part| part.strip_suffix('"'))
+        {
+            let mut previous_quote = false;
+            for character in quoted.chars() {
+                if character == '"' && previous_quote {
+                    previous_quote = false;
+                    continue;
+                }
+                previous_quote = character == '"';
+                let _ = out.write_char(character);
+            }
+        } else {
+            for character in part.chars() {
+                let _ = out.write_char(character.to_ascii_lowercase());
+            }
+        }
+        (!out.is_empty() && !out.is_truncated()).then_some(out)
+    };
+    let (schema, name) = catalog::split_qualified_name(value).ok_or_else(invalid)?;
+    let schema = schema
+        .map(identifier)
+        .map(|part| part.ok_or_else(invalid))
+        .transpose()?;
+    let name = identifier(name).ok_or_else(invalid)?;
+    let slot = storage
+        .text_search_slot_on_path(
+            ast::TextSearchObjectKind::Configuration,
+            schema.as_ref().map(crate::util::StackStr::as_str),
+            name.as_str(),
+            txid,
+        )
+        .ok_or_else(invalid)?;
+    let definition = storage.text_search_object(slot).definition_for(txid);
+    let mut canonical = crate::util::StackStr::<128>::new();
+    let _ = write!(
+        canonical,
+        "{}.{}",
+        crate::sql::eval::args::quote_identifier(definition.schema().as_str()).as_str(),
+        crate::sql::eval::args::quote_identifier(definition.name().as_str()).as_str()
+    );
+    Ok(canonical)
 }

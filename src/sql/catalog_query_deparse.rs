@@ -226,6 +226,7 @@ impl<'r> Writer<'r> {
             joined: scope,
             pretty: self.pretty,
             qualify: self.qualify || nested || own != 1,
+            domain_value: None,
         }
     }
 

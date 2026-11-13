@@ -422,9 +422,18 @@ function fails with `0A000` when called; `DROP ROLE`'s `DETAIL` lists
 owners by OID and privileges by grant order, where PostgreSQL lists
 `pg_shdepend` rows in their physical order (insertion order in a fresh
 catalog), which needs a durable stamp for each owner change;
-built-in operators, types and other
-catalog objects have no shipped `pg_description` text (built-in routines
-do). Parameter inference walks a statement in its own order rather than
+built-in conversions and collations have no
+shipped `pg_description` text and `pg_conversion` lists no built-in rows (the
+other shipped descriptions are listed); `pg_type`, `pg_operator` and
+`pg_opfamily` return built-in rows in OID order rather than a fresh cluster's
+physical order (`pg_opclass`, `pg_amop` and `pg_amproc` match it). psql's
+describe commands match PostgreSQL 18.6 except: `\dfS+` lists
+`postgres_fdw_handler` and `postgres_fdw_validator` in `pg_catalog`, where
+PostgreSQL has them only in the schema of an installed `postgres_fdw`
+extension; and `\dfS+` over 3,400 routines takes about twice as long as
+PostgreSQL (0.5 s against 0.24 s in release builds on one host, 2026-11-13)
+because each row's calls repeat overload resolution and expression typing
+that PostgreSQL does once while planning. Parameter inference walks a statement in its own order rather than
 PostgreSQL's left-to-right analysis, so a parameter typed by one use and passed
 untyped to an `"any"` argument by another can be accepted where PostgreSQL
 reports `42P18`, and a user-defined polymorphic argument left untyped becomes
@@ -442,45 +451,39 @@ TRUE/FALSE`, `CASE`, casts, SQL value functions, positional calls of
 built-in and user-defined functions, `ROW(...)` and whole-row references;
 other expressions (subqueries, named-argument calls, `$n` parameters and
 array constructors outside a quantified comparison) are still printed as
-stored. Column defaults, CHECK and exclusion predicates, index keys and
-predicates, statistics expressions, trigger `WHEN` conditions, domain
-constraints keep routine and type names as SQL text, so renaming or moving a
-routine or type one of them names, or renaming an enum value it casts to,
-fails with `0A000` (PostgreSQL stores them bound by OID and follows the
-rename); views, rules, policies and SQL-standard routine bodies are bound and
-follow it. Those expressions also resolve unqualified names under the
-session's search path when they run, so `CHECK (f(v) > 0)` created with
-`search_path = s` fails with `42883` once the path lacks `s`. Binding them
-means storing, with each expression, the dependency list captured under the
-creator's path (as `stored_query_dependencies` does for views and policies),
-binding it with `bind_stored_expression` wherever it is evaluated or printed,
-journaling and checkpointing that list with its owner, and then dropping the
-rename refusals. Renaming an enum value that a cast literal in a SQL-standard routine
+stored. CHECK constraints, column defaults and generation expressions, and
+index keys and predicates are bound to the routines, operators, types and
+collations they named when written (see
+[stored expressions](docs/architecture.md#stored-expressions)): a later
+search path, rename or schema move changes nothing, and dropping a named
+object reports and cascades to them. Exclusion predicates, statistics
+expressions, trigger `WHEN` conditions and domain constraints still keep
+routine and type names as SQL text, so renaming or moving a routine or type
+one of them names fails with `0A000`, as does renaming an enum value any
+stored expression casts to; binding them follows the same dependency-list
+pattern. Renaming an enum value that a cast literal in a SQL-standard routine
 body spells (`RETURN 'a'::e`) leaves the body spelling the old label, so the
-call fails with `22P02`. An index key whose value is a row
-(`CREATE INDEX ON t ((t))`) fails with `0A000`, since row values have no stored
-key encoding. A rule action that names its table's renamed column without
+call fails with `22P02`. An index key whose value is a whole row
+(`CREATE INDEX ON t ((t))`) fails with `0A000`: evaluation yields an anonymous
+record, and only named composite types have a stored value form (a table's
+row type needs its own durable value form and key ordering first). A rule action that names its table's renamed column without
 `NEW.` or `OLD.` fails the rename with `0A000`. After a table, routine or type rename,
 `pg_get_viewdef` of a view it cannot deparse (see below) still prints the old
 names from the stored query text. A
 partition's `UNIQUE` or `PRIMARY KEY` constraint cannot be attached to
 its parent's plain unique index, so attaching such a partition builds a
 separate copy where PostgreSQL reuses the constraint's index; constraint
-indexes need a durable link to a parent index first. A partitioned table's
-multi-column `UNIQUE` constraint has its index but no `pg_constraint` row, and
-a child's inherited `NOT NULL` constraint is named after the child
-(`c_k_not_null`) where PostgreSQL keeps the parent's name. `CHECK ... NO
-INHERIT` fails with `42601`; an exclusion constraint over a B-tree index fails
-with `42601`, and `box` has no default GiST operator class. `ALTER TABLE ...
-CLUSTER ON` and `REPLICA IDENTITY USING INDEX` reject an index that backs a
-`PRIMARY KEY` or `UNIQUE` constraint (`42704`), since those indexes have no
-separate index slot to mark. A view's `reloptions` list `security_barrier`
-before `check_option` and omit `security_invoker=false`, where PostgreSQL keeps
-the options as written; keeping them needs the written order in the view's
-journal records and checkpoint image. `pg_operator` lists 27 `=` operators
-where PostgreSQL lists 63, so a foreign key's `conpfeqop`, `conppeqop` and
-`conffeqop` are NULL where PostgreSQL lists each key column's equality
-operator (`{96}`); they need the complete built-in operator rows first. `pg_get_viewdef`, `pg_views`,
+indexes need a durable link to a parent index first.
+An exclusion constraint element must be a column: an expression
+(`EXCLUDE USING gist (int4range(a, b) WITH &&)`) fails with `0A000`, since
+the stored constraint keeps no element expressions. A statement's own catalog scans, including those through views, read the
+catalog as the statement began (images built at its start), so `SELECT mk(g),
+(SELECT count(*) FROM pg_class WHERE relname LIKE 'made_%') FROM
+generate_series(1, 3) g`, where `mk` creates a table, counts none, as
+PostgreSQL's statement snapshot does; a volatile routine's queries see the
+change. A STABLE or IMMUTABLE SQL function's catalog query still reads the
+catalog as it is when it runs, where PostgreSQL reads it under the calling
+statement's snapshot. `pg_get_viewdef`, `pg_views`,
 `pg_get_ruledef` and `pg_rules` print a view's or rule action's query as
 PostgreSQL deparses it, in its indented layout and wrap column, including
 subqueries, functions, explicit, `USING` and `NATURAL` joins, set operations,
@@ -551,9 +554,7 @@ columns its query never reads, so `SELECT * FROM t WHERE EXISTS (SELECT 1
 FROM (SELECT 10 / t.x) s)` fails with division by zero on a zero `x` where
 PostgreSQL, which drops unread subquery outputs, returns the row. A
 whole-row reference to a table (`SELECT t FROM t`) is typed `record`, where
-PostgreSQL types it as the table's row type `t`. An index key that is a whole row (`CREATE INDEX ON t ((t))`) fails with
-`0A000`, where PostgreSQL indexes the row: evaluation yields an anonymous
-record, which the row encoding cannot store as a key. A row constructor casts to a table's row type
+PostgreSQL types it as the table's row type `t`. A row constructor casts to a table's row type
 (`ROW(1, 'a')::t`) but not to a view's, and an array of a table's row type
 (`ARRAY[ROW(1, 'a')::t]`) fails with `0A000`, where PostgreSQL accepts both.
 A PL/pgSQL variable declared with a view's row type (`r v;` or
@@ -592,6 +593,10 @@ A user table's `tableoid` system column fails with `0A000`
 expose it. COPY to or from a server file or program,
 `COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
 RETURNING` a non-JSON, non-string type are rejected with `0A000`.
+A string literal passed to a `regclass` parameter (`nextval('missing')`) is
+resolved when a row evaluates it, so a missing relation is not reported for a
+query or `COPY ... WHERE` that evaluates no row; PostgreSQL resolves it while
+analyzing the statement.
 A view
 dropped by the cascade of a function, sequence, collation, operator, text
 search object or type (`DROP FUNCTION f CASCADE` where view `v` calls `f`)

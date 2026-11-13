@@ -337,10 +337,11 @@ impl<'a> Numeric<'a> {
             }
             while i < bytes.len() {
                 if bytes[i].is_ascii_digit() {
-                    exp = exp
-                        .checked_mul(10)
-                        .and_then(|v| v.checked_add((bytes[i] - b'0') as i64))
-                        .ok_or_else(overflow)?;
+                    exp = exp * 10 + i64::from(bytes[i] - b'0');
+                    // PostgreSQL's set_var_from_str bound.
+                    if exp > i64::from(i32::MAX / 2) {
+                        return Err(bad());
+                    }
                     i += 1;
                 } else if bytes[i] == b'_' && digit_at(i + 1) {
                     i += 1;
@@ -361,6 +362,10 @@ impl<'a> Numeric<'a> {
         let frac_digits = ndec - point; // decimal places present
         // dscale before applying exponent.
         let dscale_dec = frac_digits as i64 - exp;
+        // `make_result`: the display scale must fit NUMERIC_DSCALE_MAX.
+        if dscale_dec > NUMERIC_DSCALE_MAX {
+            return Err(overflow());
+        }
         let dscale = dscale_dec.max(0) as u16;
 
         Self::from_decimal_digits(&dec_digits[..ndec], point as i64 + exp, dscale, neg, arena)
@@ -456,7 +461,8 @@ impl<'a> Numeric<'a> {
                 digits: &[],
             });
         }
-        let weight = (base_weight - lead as i64) as i16;
+        // `make_result`: the weight must fit its int16 field.
+        let weight = i16::try_from(base_weight - lead as i64).map_err(|_| overflow())?;
         Ok(Numeric {
             sign: if neg { Sign::Neg } else { Sign::Pos },
             weight,
@@ -616,6 +622,9 @@ impl<'a> Numeric<'a> {
         Ok(acc)
     }
 }
+
+/// PostgreSQL's `NUMERIC_DSCALE_MAX`.
+const NUMERIC_DSCALE_MAX: i64 = 0x3FFF;
 
 fn overflow() -> SqlError {
     sql_err!(

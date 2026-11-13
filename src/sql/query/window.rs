@@ -238,7 +238,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         base: TableRef {
             schema: None,
             table: "",
-            alias: Some("?grouped"),
+            alias: Some(super::GROUPED_WINDOW_SOURCE),
             subquery: Some(inner),
             func_args: None,
             func_argument_names: &[],

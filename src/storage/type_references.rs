@@ -894,6 +894,22 @@ impl TypeCatalog {
         self.bind_query_type_dependency(dependency, transaction)
     }
 
+    /// Moves copied expression dependencies' types from the template
+    /// `source` database to their copies in the current one.
+    pub(super) fn rebind_template_expression_dependencies(
+        &self,
+        entries: &mut [super::ExpressionDependency],
+        source: DatabaseOid,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        for entry in entries {
+            let mut dependency = entry.dependency();
+            self.clone_query_type_dependency(&mut dependency, source, transaction)?;
+            *entry = super::ExpressionDependency::new(entry.owner, &dependency);
+        }
+        Ok(())
+    }
+
     pub(super) fn bind_domain_spec(
         &self,
         storage: &super::Storage,
@@ -1502,7 +1518,31 @@ impl super::Storage {
             definition.type_membership =
                 super::TableTypeMembership::Composite(TypeReference::from_bound_name(copied.name)?);
         }
+        let count = definition.n_expression_dependencies;
+        catalog.rebind_template_expression_dependencies(
+            &mut definition.expression_dependencies[..count],
+            source,
+            transaction,
+        )?;
         catalog.bind_table_definition(definition, transaction)
+    }
+
+    /// Rebinds a copied index's expression dependencies to the copy's types.
+    pub(super) fn rebind_template_index_types(
+        &self,
+        definition: &mut super::IndexDef,
+        source: DatabaseOid,
+        transaction: u32,
+    ) -> Result<(), SqlError> {
+        let count = usize::from(definition.n_expression_dependencies);
+        self.type_catalog
+            .lock()
+            .expect("type catalog lock poisoned")
+            .rebind_template_expression_dependencies(
+                &mut definition.expression_dependencies[..count],
+                source,
+                transaction,
+            )
     }
 
     pub(super) fn redeclare_template_contract_types(

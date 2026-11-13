@@ -22,20 +22,20 @@ use crate::sql::ast::{
     CreateOperator, CreateOperatorClass, CreateRoutine, CreateRule, CreateSchemaElement,
     CreateStatistics, CreateTextSearchConfiguration, CreateTextSearchDictionary,
     CreateTextSearchParser, CreateTextSearchTemplate, CreateTransform, CreateTrigger, DomainCheck,
-    EventTriggerEvent, ExclusionOperator, Expr, ExtensionMemberIdentity, ExtensionRelationKind,
-    ForeignDataHandler, ForeignDataValidator, ForeignOption, ForeignOptionAction,
-    ForeignSchemaSelection, ForeignUser, ImportForeignSchema, IndexAccessMethod, IndexBuildMode,
-    IndexStorageOptionNames, IndexStorageOptions, IndexTargetScope, OperatorClassMember,
-    OperatorFamilyMember, OperatorFamilyMemberIdentity, OperatorIdentity, OperatorOperands,
-    PartitionBound, PartitionClause, PartitionStrategy, PolicyCommand, PolicyExpression,
-    PolicyIdentity, PolicyPermissiveness, PolicyRole, PublicationDescendants,
-    PublicationOperations, PublicationTarget, RelationPersistence, RelationStorageOptionNames,
-    RelationStorageOptions, RoleOptions, RoutineArgument, RoutineArgumentMode, RoutineArgumentType,
-    RoutineCreateKind, RoutineIdentity, RoutineParallel, RoutineResultColumn, RoutineTargetKind,
-    RuleAction, RuleEvent, RuleMode, SchemaAuthorization, SchemaName, SourcePosition,
-    StatisticsExpression, StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName,
-    StatisticsTarget, SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions,
-    SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
+    EventTriggerEvent, Expr, ExtensionMemberIdentity, ExtensionRelationKind, ForeignDataHandler,
+    ForeignDataValidator, ForeignOption, ForeignOptionAction, ForeignSchemaSelection, ForeignUser,
+    ImportForeignSchema, IndexAccessMethod, IndexBuildMode, IndexStorageOptionNames,
+    IndexStorageOptions, IndexTargetScope, OperatorClassMember, OperatorFamilyMember,
+    OperatorFamilyMemberIdentity, OperatorIdentity, OperatorOperands, PartitionBound,
+    PartitionClause, PartitionStrategy, PolicyCommand, PolicyExpression, PolicyIdentity,
+    PolicyPermissiveness, PolicyRole, PublicationDescendants, PublicationOperations,
+    PublicationTarget, RelationPersistence, RelationStorageOptionNames, RelationStorageOptions,
+    RoleOptions, RoutineArgument, RoutineArgumentMode, RoutineArgumentType, RoutineCreateKind,
+    RoutineIdentity, RoutineParallel, RoutineResultColumn, RoutineTargetKind, RuleAction,
+    RuleEvent, RuleMode, SchemaAuthorization, SchemaName, SourcePosition, StatisticsExpression,
+    StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName, StatisticsTarget,
+    SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions, SubscriptionOrigin,
+    SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
     SubscriptionSynchronousCommit, TableAccessMethod, TableMembership, TablespaceOptionNames,
     TablespaceOptions, TextSearchConfigurationSource, TextSearchObjectKind, TextSearchOption,
     TransformFunction, TriggerEvent, TriggerIdentity, TriggerKind, TriggerTiming,
@@ -98,8 +98,6 @@ pub(super) struct ConstraintAttributes {
     pub(super) timing: ConstraintTiming,
     pub(super) validation: ConstraintValidation,
     pub(super) no_inherit: bool,
-    /// Where the attribute list starts.
-    pub(super) at: usize,
 }
 
 /// Where a constraint is written, which decides what its attributes mean.
@@ -148,14 +146,6 @@ fn deferred_not_deferrable(at: usize) -> ParseError {
         at,
         "constraint declared INITIALLY DEFERRED must be DEFERRABLE",
     )
-}
-
-/// A CHECK constraint's `NO INHERIT` is not represented in the catalog yet.
-fn check_no_inherit_unsupported(at: usize) -> ParseError {
-    let mut error =
-        positioned_syntax_error(at, "CHECK constraints marked NO INHERIT are not supported");
-    error.sqlstate = sqlstate::FEATURE_NOT_SUPPORTED;
-    error
 }
 
 fn positioned_syntax_error(at: usize, message: &str) -> ParseError {
@@ -1094,13 +1084,9 @@ impl<'a> Parser<'a> {
             }
             let name = self.col_ident("text search option name")?;
             self.expect_op("=")?;
+            // Repeated options reach the template's init routine, which
+            // reports them as PostgreSQL's do.
             let value = self.database_option_value("text search option value is required")?;
-            if options[..count]
-                .iter()
-                .any(|option| option.name.eq_ignore_ascii_case(name))
-            {
-                return Err(self.err_here("duplicate text search option"));
-            }
             options[count] = TextSearchOption { name, value };
             count += 1;
             if !self.eat_op(",")? {
@@ -1112,7 +1098,7 @@ impl<'a> Parser<'a> {
 
     fn create_text_search(&mut self) -> Result<Stmt<'a>, ParseError> {
         if self.eat_ident("parser")? {
-            let name = self.any_qual_name("text search parser name")?;
+            let name = self.any_name("text search parser name")?;
             self.expect_op("(")?;
             let mut start = None;
             let mut gettoken = None;
@@ -1154,7 +1140,7 @@ impl<'a> Parser<'a> {
             }));
         }
         if self.eat_ident("template")? {
-            let name = self.any_qual_name("text search template name")?;
+            let name = self.any_name("text search template name")?;
             self.expect_op("(")?;
             let mut init = None;
             let mut lexize = None;
@@ -1185,7 +1171,7 @@ impl<'a> Parser<'a> {
             }));
         }
         if self.eat_ident("dictionary")? {
-            let name = self.any_qual_name("text search dictionary name")?;
+            let name = self.any_name("text search dictionary name")?;
             self.expect_op("(")?;
             self.expect_ident("template")?;
             self.expect_op("=")?;
@@ -1205,7 +1191,7 @@ impl<'a> Parser<'a> {
             ));
         }
         if self.eat_ident("configuration")? {
-            let name = self.any_qual_name("text search configuration name")?;
+            let name = self.any_name("text search configuration name")?;
             self.expect_op("(")?;
             let source = if self.eat_ident("parser")? {
                 self.expect_op("=")?;
@@ -4828,7 +4814,7 @@ impl<'a> Parser<'a> {
     /// MATERIALIZED VIEW before their AS query. The closed output is consumed
     /// directly by the durable backing relation definition.
     fn table_as_options(&mut self) -> Result<crate::sql::ast::TableAsOptions<'a>, ParseError> {
-        let mut access_method = TableAccessMethod::Heap;
+        let mut access_method = TableAccessMethod::Unspecified;
         let mut tablespace = None;
         let mut storage_options = RelationStorageOptions::DEFAULT;
         let mut on_commit = crate::sql::ast::OnCommitAction::PreserveRows;
@@ -5710,7 +5696,7 @@ impl<'a> Parser<'a> {
                 membership: TableMembership::None,
                 persistence: RelationPersistence::Permanent,
                 on_commit: crate::sql::ast::OnCommitAction::PreserveRows,
-                access_method: TableAccessMethod::Heap,
+                access_method: TableAccessMethod::Unspecified,
                 tablespace: None,
                 storage_options: RelationStorageOptions::DEFAULT,
                 if_not_exists: false,
@@ -5752,6 +5738,7 @@ impl<'a> Parser<'a> {
                         security,
                         security_barrier,
                         check_option,
+                        option_order,
                         sql,
                     } => CreateSchemaElement::View {
                         name,
@@ -5761,6 +5748,7 @@ impl<'a> Parser<'a> {
                         security,
                         security_barrier,
                         check_option,
+                        option_order,
                         sql,
                     },
                     Stmt::CreateIndex {
@@ -5884,34 +5872,7 @@ impl<'a> Parser<'a> {
         };
         let table = self.qual_name("table name")?;
         let method = if self.eat_ident("using")? {
-            let method = self.any_ident("index access method")?;
-            if method.eq_ignore_ascii_case("btree") {
-                IndexAccessMethod::Btree
-            } else if method.eq_ignore_ascii_case("hash") {
-                IndexAccessMethod::Hash
-            } else if method.eq_ignore_ascii_case("brin") {
-                IndexAccessMethod::Brin
-            } else if method.eq_ignore_ascii_case("gist") {
-                IndexAccessMethod::Gist
-            } else if method.eq_ignore_ascii_case("gin") {
-                IndexAccessMethod::Gin
-            } else if method.eq_ignore_ascii_case("spgist") {
-                IndexAccessMethod::SpGist
-            } else {
-                return Err(ParseError {
-                    at: self.peek_at,
-                    message: stack_format!(
-                        super::PARSE_MESSAGE_BYTES,
-                        "index access method \"{}\" is not supported",
-                        method
-                    ),
-                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                    cursor: None,
-                    hint: None,
-                    near: None,
-                    detail: None,
-                });
-            }
+            self.index_access_method()?
         } else {
             IndexAccessMethod::Btree
         };
@@ -6527,22 +6488,24 @@ impl<'a> Parser<'a> {
         let mut security = ViewSecurity::Definer;
         let mut security_barrier = ViewSecurityBarrier::Default;
         let mut check_option = None;
+        let mut option_order = crate::storage::ViewOptionOrder::EMPTY;
         if self.eat_ident("with")? {
             self.expect_op("(")?;
             for option in self.view_options()? {
-                match option {
-                    crate::sql::ast::ViewOption::SecurityInvoker(enabled) => {
-                        security = if *enabled {
+                option_order = option_order.with_last(option.name(), option.spelling);
+                match option.value {
+                    crate::sql::ast::ViewOptionValue::SecurityInvoker(enabled) => {
+                        security = if enabled {
                             ViewSecurity::Invoker
                         } else {
                             ViewSecurity::Definer
                         };
                     }
-                    crate::sql::ast::ViewOption::CheckOption(option) => {
-                        check_option = Some(*option);
+                    crate::sql::ast::ViewOptionValue::CheckOption(option) => {
+                        check_option = Some(option);
                     }
-                    crate::sql::ast::ViewOption::SecurityBarrier(enabled) => {
-                        security_barrier = ViewSecurityBarrier::from_enabled(*enabled);
+                    crate::sql::ast::ViewOptionValue::SecurityBarrier(enabled) => {
+                        security_barrier = ViewSecurityBarrier::from_enabled(enabled);
                     }
                 }
             }
@@ -6555,15 +6518,27 @@ impl<'a> Parser<'a> {
         let end = self.peek_at;
         let sql = self.text[start..end].trim();
         if self.eat_ident("with")? {
+            let at = self.peek_at;
             let option = if self.eat_ident("local")? {
                 crate::sql::ast::ViewCheckOption::Local
             } else {
                 let _ = self.eat_ident("cascaded")?;
                 crate::sql::ast::ViewCheckOption::Cascaded
             };
+            // PostgreSQL lists the clause as `check_option=local` or
+            // `check_option=cascaded`.
+            let spelling = crate::storage::ReloptionSpelling::new(match option {
+                crate::sql::ast::ViewCheckOption::Local => "local",
+                crate::sql::ast::ViewCheckOption::Cascaded => "cascaded",
+            })
+            .expect("check option values are spellings");
             self.expect_ident("check")?;
             self.expect_ident("option")?;
-            check_option = Some(option);
+            if check_option.replace(option).is_some() {
+                return Err(Self::duplicate_reloption(at, "check_option"));
+            }
+            option_order =
+                option_order.with_last(crate::sql::ast::ViewOptionName::CheckOption, spelling);
         }
         Ok(Stmt::CreateView {
             name,
@@ -6573,6 +6548,7 @@ impl<'a> Parser<'a> {
             security,
             security_barrier,
             check_option,
+            option_order,
             sql,
         })
     }
@@ -7376,7 +7352,14 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
-            let name = self.any_qual_name(kind.noun())?;
+            let mut names = ArenaList::new(self.arena);
+            loop {
+                let name = self.any_name(kind.noun())?;
+                self.push(&mut names, name)?;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
             let cascade = if self.eat_ident("cascade")? {
                 true
             } else {
@@ -7385,7 +7368,7 @@ impl<'a> Parser<'a> {
             };
             return Ok(Stmt::DropTextSearch {
                 kind,
-                name,
+                names: names.as_slice(),
                 if_exists,
                 cascade,
             });
@@ -8370,7 +8353,7 @@ impl<'a> Parser<'a> {
                     TableAccessMethod::Named(method)
                 }
             } else {
-                TableAccessMethod::Heap
+                TableAccessMethod::Unspecified
             };
             let tablespace = if self.eat_ident("tablespace")? {
                 Some(self.col_ident("tablespace name")?)
@@ -8447,7 +8430,7 @@ impl<'a> Parser<'a> {
             if foreign {
                 return Err(self.err_here("CREATE FOREIGN TABLE OF is not supported by PostgreSQL"));
             }
-            let mut access_method = TableAccessMethod::Heap;
+            let mut access_method = TableAccessMethod::Unspecified;
             let mut tablespace = None;
             let mut storage_options = RelationStorageOptions::DEFAULT;
             loop {
@@ -8490,6 +8473,7 @@ impl<'a> Parser<'a> {
         // list has that identifier immediately followed by `,` or `)`; a column
         // definition has a type after it.
         let mut pending_first_col = None;
+        let first_at = self.peek_at;
         if matches!(self.peeked, Tok::Ident(w)
             if !matches!(w, "like" | "constraint" | "primary" | "unique" | "check" | "foreign"))
         {
@@ -8520,7 +8504,7 @@ impl<'a> Parser<'a> {
                 );
             }
             // Otherwise it is a column definition whose name we already read.
-            pending_first_col = Some(first_ident);
+            pending_first_col = Some((first_at, first_ident));
         }
         let mut columns = ArenaList::new(self.arena);
         let mut cons = ArenaList::new(self.arena);
@@ -8536,7 +8520,7 @@ impl<'a> Parser<'a> {
             // The first column's name was pre-read to tell a definition list
             // from a `CREATE TABLE ... AS` column-name list; use it, skipping the
             // LIKE / constraint forms it cannot be.
-            let col_name = if let Some(pre_read) = pending_first_col.take() {
+            let (column_at, col_name) = if let Some(pre_read) = pending_first_col.take() {
                 pre_read
             } else {
                 // `LIKE source [INCLUDING ...]` copies another table's columns in
@@ -8584,7 +8568,7 @@ impl<'a> Parser<'a> {
                 if cons_name.is_some() {
                     return Err(self.syntax_error_here());
                 }
-                self.col_ident("column name")?
+                (constraint_at, self.col_ident("column name")?)
             };
             let warnings_before = self.warnings.len();
             let (type_name, type_mod) = self.type_name_mod()?;
@@ -8625,6 +8609,7 @@ impl<'a> Parser<'a> {
             self.push(
                 &mut columns,
                 ColumnDef {
+                    source_position: SourcePosition::new(Some(column_at)),
                     name: col_name,
                     type_name,
                     type_mod,
@@ -8663,7 +8648,7 @@ impl<'a> Parser<'a> {
         } else {
             PartitionClause::None
         };
-        let mut access_method = TableAccessMethod::Heap;
+        let mut access_method = TableAccessMethod::Unspecified;
         let mut tablespace = None;
         let mut storage_options = RelationStorageOptions::DEFAULT;
         let mut on_commit = crate::sql::ast::OnCommitAction::PreserveRows;
@@ -9215,32 +9200,62 @@ impl<'a> Parser<'a> {
         Ok(not_distinct)
     }
 
+    /// An index access method name after `USING`.
+    fn index_access_method(&mut self) -> Result<IndexAccessMethod, ParseError> {
+        let method = self.any_ident("index access method")?;
+        Ok(if method.eq_ignore_ascii_case("btree") {
+            IndexAccessMethod::Btree
+        } else if method.eq_ignore_ascii_case("hash") {
+            IndexAccessMethod::Hash
+        } else if method.eq_ignore_ascii_case("brin") {
+            IndexAccessMethod::Brin
+        } else if method.eq_ignore_ascii_case("gist") {
+            IndexAccessMethod::Gist
+        } else if method.eq_ignore_ascii_case("gin") {
+            IndexAccessMethod::Gin
+        } else if method.eq_ignore_ascii_case("spgist") {
+            IndexAccessMethod::SpGist
+        } else {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(
+                    super::PARSE_MESSAGE_BYTES,
+                    "index access method \"{}\" is not supported",
+                    method
+                ),
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                cursor: None,
+                hint: None,
+                near: None,
+                detail: None,
+            });
+        })
+    }
+
     fn exclusion_constraint(
         &mut self,
         name: Option<&'a str>,
         source_position: SourcePosition,
     ) -> Result<TableConstraint<'a>, ParseError> {
-        if self.eat_ident("using")? {
-            let method = self.col_ident("exclusion index method")?;
-            if method != "gist" {
-                let mut error = self.err_here("only GiST exclusion constraints are supported");
-                error.sqlstate = sqlstate::FEATURE_NOT_SUPPORTED;
-                return Err(error);
-            }
-        }
+        let method = if self.eat_ident("using")? {
+            self.index_access_method()?
+        } else {
+            IndexAccessMethod::Btree
+        };
         self.expect_op("(")?;
         let mut columns = ArenaList::new(self.arena);
         let mut operators = ArenaList::new(self.arena);
         loop {
+            if self.peeked == Tok::Op("(") || self.lookahead(1)? == Tok::Op("(") {
+                let mut error =
+                    self.err_here("exclusion constraint elements must be columns, not expressions");
+                error.sqlstate = sqlstate::FEATURE_NOT_SUPPORTED;
+                return Err(error);
+            }
             let column = self.col_ident("exclusion column")?;
             self.push(&mut columns, column)?;
             self.expect_ident("with")?;
-            let operator = match self.any_op_token()? {
-                "=" => ExclusionOperator::Equal,
-                "&&" => ExclusionOperator::Overlaps,
-                "-|-" => ExclusionOperator::Adjacent,
-                _ => return Err(self.err_here("unsupported exclusion operator")),
-            };
+            let operator = self.any_op_token()?;
             self.push(&mut operators, operator)?;
             if !self.eat_op(",")? {
                 break;
@@ -9261,6 +9276,7 @@ impl<'a> Parser<'a> {
         Ok(TableConstraint::Exclusion {
             source_position,
             name,
+            method,
             columns: columns.as_slice(),
             operators: operators.as_slice(),
             predicate,
@@ -9283,20 +9299,20 @@ impl<'a> Parser<'a> {
         let text = self.text[start..self.peek_at].trim_end();
         let text = self.arena_str(text)?;
         self.expect_op(")")?;
-        let validation = if site == ConstraintSite::Column {
-            let no_inherit_at = self.peek_at;
-            if self.eat_ident("no")? {
-                self.expect_ident("inherit")?;
-                return Err(check_no_inherit_unsupported(no_inherit_at));
-            }
-            self.column_constraint_attributes(ColumnAttributeTarget::Check)?
-                .1
+        // A column CHECK takes NO INHERIT only right after its predicate; a
+        // table CHECK lists it among its other attributes.
+        let (validation, no_inherit) = if site == ConstraintSite::Column {
+            let no_inherit = self.check_no_inherit()?;
+            let validation = self
+                .column_constraint_attributes(ColumnAttributeTarget::Check)?
+                .1;
+            (validation, no_inherit)
         } else {
             let attributes = self.constraint_attributes(ConstraintAttributeRules::CHECK)?;
-            if attributes.no_inherit {
-                return Err(check_no_inherit_unsupported(attributes.at));
-            }
-            site.written_validation(attributes.validation)
+            (
+                site.written_validation(attributes.validation),
+                attributes.no_inherit,
+            )
         };
         Ok(TableConstraint::Check {
             source_position,
@@ -9304,7 +9320,17 @@ impl<'a> Parser<'a> {
             expression,
             text,
             validation,
+            no_inherit,
         })
+    }
+
+    /// A column CHECK's optional `NO INHERIT`.
+    fn check_no_inherit(&mut self) -> Result<bool, ParseError> {
+        if !self.eat_ident("no")? {
+            return Ok(false);
+        }
+        self.expect_ident("inherit")?;
+        Ok(true)
     }
 
     /// The part of a FOREIGN KEY after `REFERENCES`: parent table, optional
@@ -9479,7 +9505,6 @@ impl<'a> Parser<'a> {
                 ConstraintValidation::EnforcedValidated
             },
             no_inherit: has(CAS_NO_INHERIT),
-            at,
         })
     }
 

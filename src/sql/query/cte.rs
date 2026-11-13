@@ -4116,6 +4116,14 @@ fn returning_relations(
         .sum()
 }
 
+/// Visits every relation `statement` names as written, in subqueries too.
+pub(crate) fn statement_relations_of(
+    statement: &Stmt<'_>,
+    visit: &mut dyn FnMut(&TableRef<'_>) -> usize,
+) -> usize {
+    statement_relations(statement, visit)
+}
+
 fn statement_relations(
     statement: &Stmt<'_>,
     visit: &mut dyn FnMut(&TableRef<'_>) -> usize,

@@ -1611,6 +1611,17 @@ impl<'a> Parser<'a> {
         Ok((second, third))
     }
 
+    /// PostgreSQL's `any_name`: a `ColId` optionally followed by dotted
+    /// `ColLabel`s, so an unquoted reserved keyword cannot start it.
+    fn any_name(&mut self, what: &str) -> Result<QualName<'a>, ParseError> {
+        if let Tok::Ident(word) = self.peeked
+            && is_column_name_keyword(word)
+        {
+            return Err(self.syntax_error_here());
+        }
+        self.any_qual_name(what)
+    }
+
     fn any_qual_name(&mut self, what: &str) -> Result<QualName<'a>, ParseError> {
         let source = NamespaceSource {
             start: self.peek_at,
@@ -6711,28 +6722,40 @@ impl<'a> Parser<'a> {
         ),
         ParseError,
     > {
-        use crate::sql::ast::{RelationStorageOptions, ViewCheckOption, ViewOption};
+        use crate::sql::ast::{
+            RelationStorageOptions, ViewCheckOption, ViewOption, ViewOptionValue,
+        };
         let mut storage = RelationStorageOptions::DEFAULT;
-        let mut options = [ViewOption::SecurityInvoker(false); 3];
+        let mut options = [ViewOption {
+            value: ViewOptionValue::SecurityInvoker(false),
+            spelling: crate::storage::ReloptionSpelling::EMPTY,
+        }; 3];
         let mut count = 0usize;
         let mut seen = [false; 4];
         loop {
             let option = self.any_ident("relation option name")?;
             let index = if option.eq_ignore_ascii_case("security_invoker") {
-                options[count] =
-                    ViewOption::SecurityInvoker(self.subscription_bool_option(option)?);
+                let (enabled, spelling) = self.reloption_bool(option)?;
+                options[count] = ViewOption {
+                    value: ViewOptionValue::SecurityInvoker(enabled),
+                    spelling,
+                };
                 0
             } else if option.eq_ignore_ascii_case("security_barrier") {
-                options[count] =
-                    ViewOption::SecurityBarrier(self.subscription_bool_option(option)?);
+                let (enabled, spelling) = self.reloption_bool(option)?;
+                options[count] = ViewOption {
+                    value: ViewOptionValue::SecurityBarrier(enabled),
+                    spelling,
+                };
                 1
             } else if option.eq_ignore_ascii_case("check_option") {
                 self.expect_op("=")?;
                 let value = match self.peeked {
-                    Tok::Ident(value) | Tok::Str(value) => value,
+                    Tok::Ident(value) | Tok::QuotedIdent(value) | Tok::Str(value) => value,
                     _ => return Err(self.syntax_error_here()),
                 };
-                let value = if value.eq_ignore_ascii_case("local") {
+                let spelling = crate::storage::ReloptionSpelling::new(value);
+                let checked = if value.eq_ignore_ascii_case("local") {
                     ViewCheckOption::Local
                 } else if value.eq_ignore_ascii_case("cascaded") {
                     ViewCheckOption::Cascaded
@@ -6752,7 +6775,10 @@ impl<'a> Parser<'a> {
                     });
                 };
                 self.advance()?;
-                options[count] = ViewOption::CheckOption(value);
+                options[count] = ViewOption {
+                    value: ViewOptionValue::CheckOption(checked),
+                    spelling: spelling.expect("check option values are spellings"),
+                };
                 2
             } else if option.eq_ignore_ascii_case("fillfactor") {
                 self.expect_op("=")?;
@@ -6762,19 +6788,7 @@ impl<'a> Parser<'a> {
                 return Err(self.unrecognized_parameter(option));
             };
             if core::mem::replace(&mut seen[index], true) {
-                return Err(ParseError {
-                    at: self.peek_at,
-                    message: stack_format!(
-                        PARSE_MESSAGE_BYTES,
-                        "parameter \"{}\" specified more than once",
-                        option
-                    ),
-                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-                    cursor: None,
-                    hint: None,
-                    near: None,
-                    detail: None,
-                });
+                return Err(Self::duplicate_reloption(self.peek_at, option));
             }
             if index < 3 {
                 count += 1;
@@ -6785,6 +6799,72 @@ impl<'a> Parser<'a> {
         }
         self.expect_op(")")?;
         Ok((storage, self.arena_slice(&options[..count])?))
+    }
+
+    /// A boolean reloption and its spelling: absent means `true`; otherwise
+    /// any spelling PostgreSQL's `parse_bool` accepts (`on`, `yes`, `1`,
+    /// `t`, `of`, ...).
+    fn reloption_bool(
+        &mut self,
+        option: &str,
+    ) -> Result<(bool, crate::storage::ReloptionSpelling), ParseError> {
+        if !self.eat_op("=")? {
+            return Ok((
+                true,
+                crate::storage::ReloptionSpelling::new("true").expect("a spelling"),
+            ));
+        }
+        let at = self.peek_at;
+        let value = match self.peeked {
+            Tok::Ident(value) | Tok::QuotedIdent(value) | Tok::Str(value) | Tok::Num(value) => {
+                value
+            }
+            _ => return Err(self.err_here("syntax error")),
+        };
+        self.advance()?;
+        // Unlike boolean input, reloption parsing does not trim whitespace.
+        (value.trim() == value)
+            .then(|| crate::sql::eval::parse_bool(value).ok())
+            .flatten()
+            .zip(crate::storage::ReloptionSpelling::new(value))
+            .ok_or_else(|| {
+                Self::invalid_reloption(
+                    at,
+                    stack_format!(
+                        PARSE_MESSAGE_BYTES,
+                        "invalid value for boolean option \"{}\": {}",
+                        option,
+                        value
+                    ),
+                )
+            })
+    }
+
+    /// PostgreSQL validates reloptions after parsing, as `22023`.
+    fn invalid_reloption(
+        at: usize,
+        message: crate::util::StackStr<PARSE_MESSAGE_BYTES>,
+    ) -> ParseError {
+        ParseError {
+            at,
+            message,
+            sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            cursor: None,
+            hint: None,
+            near: None,
+            detail: None,
+        }
+    }
+
+    fn duplicate_reloption(at: usize, option: &str) -> ParseError {
+        Self::invalid_reloption(
+            at,
+            stack_format!(
+                PARSE_MESSAGE_BYTES,
+                "parameter \"{}\" specified more than once",
+                option
+            ),
+        )
     }
 
     /// One `ALTER TABLE ... SET` subcommand, after `SET`.
@@ -6992,7 +7072,7 @@ impl<'a> Parser<'a> {
             if count == values.len() {
                 return Err(self.err_here("too many text search dictionaries"));
             }
-            values[count] = self.any_qual_name("text search dictionary")?;
+            values[count] = self.any_name("text search dictionary")?;
             count += 1;
             if !self.eat_op(",")? {
                 break;
@@ -7013,7 +7093,7 @@ impl<'a> Parser<'a> {
         } else {
             return Err(self.syntax_error_here());
         };
-        let name = self.any_qual_name(kind.noun())?;
+        let name = self.any_name(kind.noun())?;
         let action = if self.eat_ident("rename")? {
             self.expect_ident("to")?;
             AlterTextSearchAction::Rename(self.any_ident("new text search object name")?)
@@ -7052,12 +7132,12 @@ impl<'a> Parser<'a> {
                     None
                 };
                 if self.eat_ident("replace")? {
-                    let old = self.any_qual_name("old text search dictionary")?;
+                    let old = self.any_name("old text search dictionary")?;
                     self.expect_ident("with")?;
                     TextSearchMappingAction::Replace {
                         token_types,
                         old,
-                        new: self.any_qual_name("new text search dictionary")?,
+                        new: self.any_name("new text search dictionary")?,
                     }
                 } else {
                     let Some(token_types) = token_types else {
@@ -7459,6 +7539,7 @@ impl<'a> Parser<'a> {
             let clauses = self.column_clauses(name, table, false, column_constraints)?;
             Ok(AlterAction::AddColumn {
                 definition: ColumnDef {
+                    source_position: constraint_at,
                     name,
                     type_name,
                     type_mod,
@@ -9140,7 +9221,7 @@ impl<'a> Parser<'a> {
             };
             CommentTarget::TextSearch {
                 kind,
-                name: self.any_qual_name("text search object name")?,
+                name: self.any_name("text search object name")?,
             }
         } else if self.eat_ident("event")? {
             self.expect_ident("trigger")?;

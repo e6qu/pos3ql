@@ -625,6 +625,7 @@ fn join_quals<'a>(
             joined: &joined,
             pretty: false,
             qualify: false,
+            domain_value: None,
         };
         quals.filters[index] = deparse_qual(&context, own, arena)?;
         if !own.is_empty() && quals.filters[index].is_none() {
@@ -644,6 +645,7 @@ fn join_quals<'a>(
         joined,
         pretty: false,
         qualify: true,
+        domain_value: None,
     };
     quals.hash_cond = deparse_qual(&context, &hash_conds[..hash_count], arena)?;
     if hash_count != 0 && quals.hash_cond.is_none() {
@@ -699,6 +701,7 @@ fn single_relation_filter<'a>(
         joined: &joined,
         pretty: false,
         qualify: false,
+        domain_value: None,
     };
     deparse_qual(&context, &conjuncts[..count], arena)
 }

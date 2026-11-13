@@ -217,11 +217,27 @@ pub fn parse_date(s: &str) -> Result<i32, SqlError> {
             .and_then(|p| p.parse::<u32>().ok())
             .ok_or_else(bad)?,
     );
-    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
+    // `ValidateDate`: a month or day no month has is `DTERR_MD_FIELD_OVERFLOW`,
+    // which suggests another DateStyle; a day past its month's end is not.
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(datestyle_hint(out_of_range()));
+    }
+    if day > days_in_month(year, month) {
         return Err(out_of_range());
     }
     let days = days_from_civil(year, month, day) - PG_EPOCH_DAYS;
     i32::try_from(days).map_err(|_| out_of_range())
+}
+
+/// `DateTimeParseError`'s hint for `DTERR_MD_FIELD_OVERFLOW`.
+fn datestyle_hint(error: SqlError) -> SqlError {
+    crate::sql::eval::stash_diagnostic(
+        None,
+        Some(StackStr::from_str(
+            "Perhaps you need a different \"DateStyle\" setting.",
+        )),
+    );
+    error
 }
 
 const MONTH_ABBR: [&str; 12] = [
@@ -1129,8 +1145,21 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
     // `date` error surfaced verbatim — so a 22007 from `parse_date` is remapped
     // to the timestamp type, while its 22008 out-of-range error is kept, since
     // an impossible date is an impossible timestamp too.
-    let mut date_days =
-        parse_date(date_part).map_err(|e| if e.sqlstate == "22007" { bad() } else { e })? as i64;
+    // The out-of-range error names the whole timestamp input, as PostgreSQL's
+    // `DateTimeParseError` does; its pending hint stays with it.
+    let mut date_days = parse_date(date_part).map_err(|e| {
+        if e.sqlstate == "22007" {
+            bad()
+        } else if e.sqlstate == sqlstate::DATETIME_FIELD_OVERFLOW {
+            sql_err!(
+                sqlstate::DATETIME_FIELD_OVERFLOW,
+                "date/time field value out of range: \"{}\"",
+                s
+            )
+        } else {
+            e
+        }
+    })? as i64;
     if bc {
         let (year, month, day) = civil_from_days(date_days + PG_EPOCH_DAYS);
         date_days = days_from_civil(1 - year, month, day) - PG_EPOCH_DAYS;

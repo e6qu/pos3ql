@@ -71,6 +71,9 @@ pub struct Config {
     /// PostgreSQL's `work_mem`: a sort or hash aggregate that exceeds its
     /// selected workspace errors (54000) rather than growing at runtime.
     pub work_arena_bytes: usize,
+    /// Per query workspace: images of the catalog relations a statement
+    /// reads under its catalog snapshot.
+    pub catalog_image_bytes: usize,
     /// Prepared-statement slots in each connection's wire and SQL pools.
     pub max_prepared: usize,
     /// Stored query text and metadata per wire or SQL prepared statement.
@@ -201,7 +204,8 @@ pub struct Config {
     /// Fixed number of user-defined conversion catalog slots.
     pub max_conversions: usize,
     /// Fixed number of text-search parser, template, dictionary, and
-    /// configuration catalog slots.
+    /// configuration catalog slots. Every database holds its own copy of the
+    /// 66 built-in objects; `postgres`, `template1` and `template0` take 198.
     pub max_text_search_objects: usize,
     /// Fixed number of event-trigger catalog slots.
     pub max_event_triggers: usize,
@@ -471,6 +475,7 @@ impl Config {
             conn_send_buffer_bytes: 64 * KIB,
             sql_arena_bytes: 32 * MIB,
             work_arena_bytes: 64 * MIB,
+            catalog_image_bytes: 8 * MIB,
             max_prepared: 64,
             prepared_bytes: 8 * KIB,
             routine_input_slots: 128,
@@ -526,7 +531,7 @@ impl Config {
             max_publications: 32,
             max_collations: 128,
             max_conversions: 128,
-            max_text_search_objects: 512,
+            max_text_search_objects: 2_560,
             max_event_triggers: 64,
             max_tablespaces: 64,
             max_comments: 64,
@@ -827,6 +832,10 @@ impl Config {
                 }
                 "work_arena_bytes" => {
                     config.work_arena_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "catalog_image_bytes" => {
+                    config.catalog_image_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
                 }
                 "max_prepared" => {
@@ -1757,10 +1766,13 @@ impl Config {
                 "max_tablespaces must reserve the two built-in tablespaces".to_string(),
             ));
         }
-        if config.max_text_search_objects < 21 {
+        if config.max_text_search_objects < crate::storage::BUILTIN_TEXT_SEARCH_SLOTS {
             return Err(ConfigError::at(
                 0,
-                "max_text_search_objects must reserve the 21 built-in objects".to_string(),
+                format!(
+                    "max_text_search_objects must reserve the {} built-in objects",
+                    crate::storage::BUILTIN_TEXT_SEARCH_SLOTS
+                ),
             ));
         }
         if config.max_locks_per_transaction == 0 {
@@ -2191,6 +2203,7 @@ impl Config {
             // Send buffer plus the equally sized private output reserve.
             self.conn_send_buffer_bytes.saturating_mul(2),
             crate::pg::conn::HELD_NOTIFICATION_BYTES,
+            crate::pg::conn::COPY_ERROR_CONTEXT_BYTES,
             crate::sql::cursor::ResultStreams::budget_bytes(self),
             self.sql_arena_bytes,
             crate::sql::exec::CopyTransitionRows::budget_bytes(self),
@@ -3286,7 +3299,7 @@ sql_arena_bytes = 4096
             .is_err()
         );
         assert!(
-            Config::parse("max_text_search_objects = 20\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nplan_build_bytes = 16MiB\nplan_build_leases = 64\nresult_stream_bytes = 256KiB\nresult_stream_slots = 2\nindex_statistics_slots = 4096\ntrigger_event_spill_bytes = 0\n").is_err()
+            Config::parse("max_text_search_objects = 197\n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nplan_build_bytes = 16MiB\nplan_build_leases = 64\nresult_stream_bytes = 256KiB\nresult_stream_slots = 2\nindex_statistics_slots = 4096\ntrigger_event_spill_bytes = 0\n").is_err()
         );
         assert!(
             Config::parse("database_collation_locale = \n\ntransaction_mode = mvcc\ncatalog_history_bytes = 16MiB\nrow_history_slots = 65536\nrow_overlay_slots = 8192\nrow_work_bytes = 8MiB\nrow_work_leases = 128\nexecution_control_bytes = 256KiB\nexecution_control_leases = 256\ndefinition_image_slots = 256\ntable_metadata_bytes = 64MiB\ntable_metadata_leases = 8192\nstatistics_bytes = 1MiB\nstatistics_leases = 1024\nresult_spool_bytes = 16MiB\nresult_spool_leases = 64\nplan_build_bytes = 16MiB\nplan_build_leases = 64\nresult_stream_bytes = 256KiB\nresult_stream_slots = 2\nindex_statistics_slots = 4096\ntrigger_event_spill_bytes = 0\n").is_err()
@@ -3679,6 +3692,7 @@ sql_arena_bytes = 4096
         // Includes the private output reserve sized like the send buffer.
         let per_connection = 1030
             + crate::pg::conn::HELD_NOTIFICATION_BYTES
+            + crate::pg::conn::COPY_ERROR_CONTEXT_BYTES
             + crate::sql::cursor::ResultStreams::budget_bytes(&c)
             + crate::sql::prep::SqlPreparedPool::budget_bytes(&c)
             + copy_transition

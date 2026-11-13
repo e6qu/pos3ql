@@ -125,10 +125,27 @@ impl ViewSecurityBarrier {
 /// PostgreSQL's three view options.  Parsing them as a closed state keeps a
 /// later executor from treating a misspelled option as inert catalog text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ViewOption {
+pub enum ViewOptionValue {
     CheckOption(ViewCheckOption),
     SecurityBarrier(bool),
     SecurityInvoker(bool),
+}
+
+/// A view option with its value as written, which `reloptions` lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewOption {
+    pub value: ViewOptionValue,
+    pub spelling: crate::storage::ReloptionSpelling,
+}
+
+impl ViewOption {
+    pub const fn name(self) -> ViewOptionName {
+        match self.value {
+            ViewOptionValue::CheckOption(_) => ViewOptionName::CheckOption,
+            ViewOptionValue::SecurityBarrier(_) => ViewOptionName::SecurityBarrier,
+            ViewOptionValue::SecurityInvoker(_) => ViewOptionName::SecurityInvoker,
+        }
+    }
 }
 
 /// One option name accepted by `ALTER VIEW ... RESET (...)`.
@@ -409,6 +426,9 @@ pub enum CreateSchemaElement<'a> {
         security: ViewSecurity,
         security_barrier: ViewSecurityBarrier,
         check_option: Option<ViewCheckOption>,
+        /// The written options in `reloptions` order, with a trailing
+        /// `WITH CHECK OPTION` clause last.
+        option_order: crate::storage::ViewOptionOrder,
         sql: &'a str,
     },
     Index {
@@ -663,6 +683,9 @@ pub enum Stmt<'a> {
         security: ViewSecurity,
         security_barrier: ViewSecurityBarrier,
         check_option: Option<ViewCheckOption>,
+        /// The written options in `reloptions` order, with a trailing
+        /// `WITH CHECK OPTION` clause last.
+        option_order: crate::storage::ViewOptionOrder,
         sql: &'a str,
     },
     /// `ALTER VIEW` retains a closed action rather than sharing the broader
@@ -874,7 +897,7 @@ pub enum Stmt<'a> {
     },
     DropTextSearch {
         kind: TextSearchObjectKind,
-        name: QualName<'a>,
+        names: &'a [QualName<'a>],
         if_exists: bool,
         cascade: bool,
     },
@@ -2744,6 +2767,18 @@ impl IndexAccessMethod {
         }
     }
 
+    /// `pg_am.oid`.
+    pub const fn oid(self) -> i32 {
+        match self {
+            Self::Btree => 403,
+            Self::Hash => 405,
+            Self::Brin => 3580,
+            Self::Gist => 783,
+            Self::Gin => 2742,
+            Self::SpGist => 4000,
+        }
+    }
+
     pub const fn name(self) -> &'static str {
         match self {
             Self::Btree => "btree",
@@ -3959,6 +3994,9 @@ impl RelationStorageOptionNames {
 /// durable relation definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableAccessMethod<'a> {
+    /// No `USING` clause: a partitioned table records none, and any other
+    /// table takes its partition parent's or `default_table_access_method`.
+    Unspecified,
     Heap,
     /// A syntactically valid access-method name whose catalog resolution is
     /// deferred to execution. It cannot reach storage unless it resolves to
@@ -4291,6 +4329,8 @@ pub enum TableConstraint<'a> {
         /// enforcement time.
         text: &'a str,
         validation: ConstraintValidation,
+        /// `NO INHERIT`: the constraint stays local to its table.
+        no_inherit: bool,
     },
     ForeignKey {
         source_position: SourcePosition,
@@ -4308,7 +4348,11 @@ pub enum TableConstraint<'a> {
         source_position: SourcePosition,
         name: Option<&'a str>,
         columns: &'a [&'a str],
-        operators: &'a [ExclusionOperator],
+        /// The access method enforcing the constraint (`USING`, B-tree by
+        /// default).
+        method: IndexAccessMethod,
+        /// Each element's operator as written.
+        operators: &'a [&'a str],
         predicate: Option<&'a Expr<'a>>,
         predicate_text: Option<&'a str>,
         timing: ConstraintTiming,
@@ -4335,13 +4379,6 @@ impl TableConstraint<'_> {
             } => *source_position,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExclusionOperator {
-    Equal,
-    Overlaps,
-    Adjacent,
 }
 
 /// The transaction-local check mode selected by a constraint definition or
@@ -4933,6 +4970,9 @@ pub struct DropTable<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColumnDef<'a> {
+    /// Where the definition starts, which orders it among the table's
+    /// constraints as PostgreSQL numbers them.
+    pub source_position: SourcePosition,
     pub name: &'a str,
     pub type_name: &'a str,
     /// PostgreSQL atttypmod for the declared type: -1 when no `(...)` modifier.

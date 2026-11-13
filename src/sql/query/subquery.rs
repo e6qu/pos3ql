@@ -2329,6 +2329,20 @@ fn select_correlated<'a>(
     select_has_outer_ref(select, &chain, storage, txid, arena)
 }
 
+/// Whether `select`'s FROM items resolve on their own as written: a view,
+/// which the general executor expands as it runs the query, does not.
+pub(crate) fn select_from_resolves<'a>(
+    select: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    match select.from.as_ref() {
+        Some(from) => Ok(correlation_schema(storage, txid, from, arena)?.is_some()),
+        None => Ok(true),
+    }
+}
+
 pub(crate) fn expression_has_correlated_subquery<'a>(
     expression: &'a Expr<'a>,
     storage: &'a Storage,
@@ -3768,11 +3782,11 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
     }
 }
 
-pub(crate) fn subquery_expression_type(
-    expression: &Expr<'_>,
+pub(crate) fn subquery_expression_type<'a>(
+    expression: &'a Expr<'a>,
     storage: &Storage,
     txid: u32,
-    arena: &Arena,
+    arena: &'a Arena,
     outer: &dyn ColumnLookup<'_>,
 ) -> Result<Option<i32>, SqlError> {
     let (select, array) = match expression {
@@ -3802,6 +3816,8 @@ pub(crate) fn subquery_expression_type(
                 )?;
                 return Ok(type_oid);
             }
+            // Views in the sub-SELECT's FROM read through their expansion.
+            let select = super::expand_ctes(select, storage, txid, arena)?;
             let Some(SelectItem::Expr { expression, .. }) = select.items.get(usize::from(*index))
             else {
                 return Ok(None);
@@ -3866,6 +3882,8 @@ pub(crate) fn subquery_expression_type(
         return super::subquery_result_type(expression, Some(&types), storage, txid, arena)
             .map(|result| result.map(|result| result.type_oid));
     }
+    // Views in the subquery's FROM read through their expansion.
+    let select = super::expand_ctes(select, storage, txid, arena)?;
     let scope = select
         .from
         .as_ref()

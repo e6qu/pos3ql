@@ -984,6 +984,34 @@ pub(super) fn dependencies<'a>(
                 }
             }
         }
+        // The objects the key expressions name, then those the predicate
+        // names, normally: two separately deduplicated sets.
+        if let Some(definition) = super::info_index(storage, index, transaction) {
+            for predicate in [false, true] {
+                let mut references = [(0, 0); crate::storage::MAX_INDEX_EXPRESSION_DEPENDENCIES];
+                let mut count = 0;
+                for entry in definition.expression_dependencies().iter().filter(|entry| {
+                    predicate == (entry.owner == crate::storage::ExpressionOwner::IndexPredicate)
+                }) {
+                    let Ok(bound) =
+                        storage.rebound_stored_query_dependency(entry.dependency(), transaction)
+                    else {
+                        continue;
+                    };
+                    if let Some(reference) =
+                        super::dependencies::stored_reference(storage, transaction, &bound)
+                            .filter(|(_, object)| *object >= crate::storage::FIRST_NORMAL_OBJECT_ID)
+                        && !references[..count].contains(&reference)
+                    {
+                        references[count] = reference;
+                        count += 1;
+                    }
+                }
+                for (class, object) in &references[..count] {
+                    push(super::PG_CLASS_OID, index.oid, *class, *object, 0, b'n')?;
+                }
+            }
+        }
     }
     for table in 0..storage.table_count() {
         if storage.table_slot_visible_to(table, transaction)

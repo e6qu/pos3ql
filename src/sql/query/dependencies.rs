@@ -1607,8 +1607,8 @@ pub(crate) fn validate_dml_assignment_casts(
                     &columns,
                     storage,
                     txid,
-                )?;
-                assigned_literal(expression, &target.columns()[index], arena)
+                    arena,
+                )
             };
         // An INSERT's VALUES rows read no relation, only the enclosing
         // routine's variables and trigger rows.
@@ -1641,8 +1641,8 @@ pub(crate) fn validate_dml_assignment_casts(
                         columns,
                         storage,
                         txid,
+                        arena,
                     )?;
-                    assigned_literal(expression, column, arena)?;
                 }
             }
             Ok(())
@@ -2130,12 +2130,11 @@ fn validate_insert_projection(
                     },
                 }
             })?;
-            // An unknown-type literal converts to its target as analysed.
             match expression {
-                Some(Expr::Str(literal)) => {
-                    super::convert_literal(literal, Some(column.ctype), arena)
+                Some(expression) => {
+                    validate_assigned_literal(expression, column, storage, txid, arena)
                 }
-                _ => Ok(()),
+                None => Ok(()),
             }
         },
     )
@@ -2635,22 +2634,14 @@ pub(crate) fn visit_projection_types(
 }
 
 /// PostgreSQL's assignment analysis (`transformAssignedExpr`) of one target:
-/// the value must coerce to the column's type in assignment context. A
+/// the value must coerce to the column's type in assignment context, and an
+/// unknown-type literal converts with the column type's input routine. A
 /// subscripted target checks each assigned value against the element type
 /// (or the container type for a slice or jsonb), positioned at the target.
-/// An unknown-type literal assigned to a column converts to the column's
-/// type while the statement is analysed.
-fn assigned_literal(
-    expression: &Expr<'_>,
-    column: &crate::storage::ColumnMeta,
-    arena: &Arena,
-) -> Result<(), SqlError> {
-    match expression {
-        Expr::Str(literal) => super::convert_literal(literal, Some(column.ctype), arena),
-        _ => Ok(()),
-    }
-}
-
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the target, its column and the catalog that resolves the value"
+)]
 fn validate_assignment_expression(
     expression: &Expr<'_>,
     target_name: Option<&str>,
@@ -2659,6 +2650,7 @@ fn validate_assignment_expression(
     columns: &dyn ColTypeResolver,
     storage: &Storage,
     txid: u32,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     if matches!(expression, Expr::DefaultMarker) {
         return Ok(());
@@ -2682,7 +2674,38 @@ fn validate_assignment_expression(
         storage,
         txid,
     )
-    .map_err(|error| crate::sql::error_position::at_expression(error, expression))
+    .map_err(|error| crate::sql::error_position::at_expression(error, expression))?;
+    validate_assigned_literal(expression, column, storage, txid, arena)
+}
+
+/// An UNKNOWN literal assigned to a column runs the column type's input
+/// routine while the statement is analysed, before any row is read.
+fn validate_assigned_literal(
+    expression: &Expr<'_>,
+    column: &crate::storage::ColumnMeta,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let Expr::Str(text) = expression else {
+        return Ok(());
+    };
+    let Some(target_oid) = storage.routine_type_oid(column.ctype, column.user_type, txid) else {
+        return Ok(());
+    };
+    let enumerated = match crate::sql::eval::constructor_type_from_oid(target_oid, &|oid| {
+        storage.domain_base_type_for_oid(oid, txid)
+    }) {
+        Some(ColType::Enum(_)) => true,
+        Some(ColType::Array(element)) => matches!(element.to_coltype(), ColType::Enum(_)),
+        _ => false,
+    };
+    if enumerated {
+        crate::sql::catalog::validate_enum_input_literal(storage, txid, text, target_oid, arena)
+    } else {
+        crate::sql::catalog::validate_literal_input(storage, txid, text, target_oid, arena)
+    }
+    .map_err(|error| crate::sql::error_position::at_subject(error, text))
 }
 
 /// Which statement assigns a column. PostgreSQL positions an error about the
@@ -3446,6 +3469,34 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
             self.txid,
             text,
             target_oid,
+            self.arena,
+        )
+    }
+
+    fn validate_literal_input(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
+        crate::sql::catalog::validate_literal_input(
+            self.storage,
+            self.txid,
+            text,
+            target_oid,
+            self.arena,
+        )
+    }
+
+    fn validate_call_literal_inputs(
+        &self,
+        selection: crate::sql::eval::RoutineCallSelection,
+        args: &[&crate::sql::ast::Expr<'_>],
+        argument_names: &[Option<&str>],
+        variadic: bool,
+    ) -> Result<(), SqlError> {
+        crate::sql::catalog::validate_call_literal_inputs(
+            self.storage,
+            self.txid,
+            selection,
+            args,
+            argument_names,
+            variadic,
             self.arena,
         )
     }

@@ -199,6 +199,21 @@ Syntax and errors:
   omitted column's default calls a volatile function other than `nextval`, or
   `WHERE` is volatile. `COPY FROM` into a table whose row-level security
   policies apply to the user fails with `0A000`, as in PostgreSQL.
+- `COPY` into a view, materialized view or sequence is refused with `42809`
+  only after the server has started reading the client's data, as PostgreSQL
+  does, so `psql` reports it at the end of the data. Privileges and the column
+  list are checked first. `COPY` of an index fails at once with `cannot open
+  relation`. `COPY ... TO` of a view, foreign or partitioned table hints at the
+  `COPY (SELECT ...) TO` form. Once a `COPY FROM` has failed, the client's
+  `CopyFail` ends it with that error rather than a second one.
+- An untyped string literal is converted with its target type's input routine
+  while the statement is analysed, as PostgreSQL does, so it fails even when no
+  row evaluates it: `SELECT nextval('missing') FROM empty_table`,
+  `CASE WHEN false THEN 'abc'::integer END`, `UPDATE t SET n = 'abc' WHERE
+  false`, a `COPY ... WHERE` predicate and a column default all report the bad
+  input. This covers built-in types (including `regclass` and the other
+  object-identifier types), arrays of them and enums; domain constraints and
+  length limits are still checked when the value is computed.
 - Checks PostgreSQL makes after parsing are reported when the statement would
   run, with PostgreSQL's code and message: type modifiers (`numeric(2000)` is
   `22023`, `NUMERIC precision 2000 must be between 1 and 1000`; `numeric(5,-2)`

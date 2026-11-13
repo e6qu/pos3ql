@@ -3555,6 +3555,21 @@ impl crate::sql::exec::ColTypeResolver for SubqueryColumns<'_, '_, '_, '_, '_> {
         self.catalog.validate_enum_input_literal(text, target_oid)
     }
 
+    fn validate_literal_input(&self, text: &str, target_oid: i32) -> Result<(), SqlError> {
+        self.catalog.validate_literal_input(text, target_oid)
+    }
+
+    fn validate_call_literal_inputs(
+        &self,
+        selection: crate::sql::eval::RoutineCallSelection,
+        args: &[&crate::sql::ast::Expr<'_>],
+        argument_names: &[Option<&str>],
+        variadic: bool,
+    ) -> Result<(), SqlError> {
+        self.catalog
+            .validate_call_literal_inputs(selection, args, argument_names, variadic)
+    }
+
     fn is_empty_scope(&self) -> bool {
         self.scope.is_none_or(|scope| scope.n == 0)
             && self.outer.is_none_or(|outer| outer.is_empty_scope())

@@ -729,6 +729,23 @@ pub(super) fn resolve_default(
             });
         }
     }
+    // The expression is analysed when the column is defined: its functions
+    // resolve and its literals run their inputs.
+    let mark = arena.mark();
+    let analysed = super::infer_type_res(
+        expression,
+        &super::CatalogCols {
+            definition: None,
+            alias: None,
+            output_aliases: &[],
+            storage,
+            txid,
+            arena,
+        },
+    );
+    // Only the verdict leaves; analysis scratch is discarded.
+    unsafe { arena.rewind_to(mark) };
+    analysed?;
     let source = store_default_text(default_text)?;
     Ok(ColumnDefault::Expression(
         crate::sql::enum_values::checks::bind_default::<{ crate::storage::DEFAULT_EXPR_MAX }>(

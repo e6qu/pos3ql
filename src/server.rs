@@ -2500,6 +2500,12 @@ impl Server {
             return self.advance_subscription_sql(slot, readable, writable);
         }
         let worker = &mut self.subscriptions[slot];
+        // Readiness reported in the same poll batch that unbound the worker
+        // (its subscription was disabled or dropped) belongs to the closed
+        // connection.
+        if !worker.client.is_bound() {
+            return Ok(());
+        }
         let mut failed = false;
         let mut cleanup_slot_absent = false;
         let mut publisher_failure = None;

@@ -4972,6 +4972,10 @@ pub fn subquery_hooks<'a>(
 /// runs for each row that reaches it through the evaluator's subquery
 /// executor ([`DmlSubqueries`]). Both read as of `command`, so a subquery
 /// first run after the statement wrote rows does not see them.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a data change's subqueries are prepared against its command and row"
+)]
 pub(crate) fn uncorrelated_subquery_hooks<'a>(
     exprs: &[Option<&'a Expr<'a>>],
     storage: &Storage,

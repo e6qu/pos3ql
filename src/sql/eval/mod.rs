@@ -3563,7 +3563,7 @@ impl<'h> DeferredSubquery<'h> {
             Sublink::of(unsafe { &*slot.node.cast::<Expr<'_>>() }) == Some(sublink)
         });
         let slot = same.next()?;
-        same.next().is_none().then(|| Self {
+        same.next().is_none().then_some(Self {
             node: address,
             ..*slot
         })

@@ -71,25 +71,34 @@ pub(super) fn row_passes_correlated_where<'a>(
         return Ok(true);
     };
     let base = hooks.subs.expect("outer subqueries prepared");
-    let row_subs = merge_correlated(
-        where_correlated,
-        base,
-        row,
-        outer,
-        storage,
-        txid,
-        arena,
-        params,
-        scalars,
-        lists,
-        hooks.sequences,
-    )?;
-    let h = EvalHooks {
-        subs: Some(&row_subs),
-        ..*hooks
-    };
-    let row = super::Chained { inner: row, outer };
-    where_passes(w, arena, params, &row, &h)
+    // Only the verdict escapes: the subqueries' values and the condition's
+    // scratch are reclaimed even when the scan keeps each row's allocations.
+    let mark = arena.mark();
+    let passes = (|| {
+        let row_subs = merge_correlated(
+            where_correlated,
+            base,
+            row,
+            outer,
+            storage,
+            txid,
+            arena,
+            params,
+            &mut *scalars,
+            &mut *lists,
+            hooks.sequences,
+        )?;
+        let h = EvalHooks {
+            subs: Some(&row_subs),
+            ..*hooks
+        };
+        let row = super::Chained { inner: row, outer };
+        where_passes(w, arena, params, &row, &h)
+    })();
+    // SAFETY: the merged values live only in `scalars` and `lists`, which
+    // the next merge overwrites before any read; nothing else escapes.
+    unsafe { arena.rewind_to(mark) };
+    passes
 }
 
 /// The outer-row lookup for a correlated subquery re-evaluated per GROUP:
@@ -208,6 +217,19 @@ pub(super) fn groups_for_mask<'a>(
     pax_demand: super::PaxReadDemand,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let n_keys = statement.group_by.len();
+    // The key passes read only the correlated subqueries in grouping keys;
+    // the aggregate pass runs those in aggregate arguments.
+    let mut key_correlated = ArenaList::new(arena);
+    for &node in row_correlated {
+        if statement
+            .group_by
+            .iter()
+            .any(|key| expr_contains_node(key, node as *const Expr))
+        {
+            key_correlated.push(node).map_err(|_| arena_full())?;
+        }
+    }
+    let key_correlated = key_correlated.as_slice();
 
     // Pass 2: encode group keys per row (columns outside this set → NULL),
     // sort them, and compute group assignments. When durable object storage
@@ -265,11 +287,11 @@ pub(super) fn groups_for_mask<'a>(
                 }
                 let row_subs;
                 let row_hooks_store;
-                let row_hooks: &EvalHooks = if row_correlated.is_empty() {
+                let row_hooks: &EvalHooks = if key_correlated.is_empty() {
                     hooks
                 } else {
                     row_subs = merge_correlated(
-                        row_correlated,
+                        key_correlated,
                         hooks.subs.expect("outer subqueries prepared"),
                         row,
                         outer,
@@ -400,11 +422,11 @@ pub(super) fn groups_for_mask<'a>(
                     }
                     let row_subs;
                     let row_hooks_store;
-                    let row_hooks: &EvalHooks = if row_correlated.is_empty() {
+                    let row_hooks: &EvalHooks = if key_correlated.is_empty() {
                         hooks
                     } else {
                         row_subs = merge_correlated(
-                            row_correlated,
+                            key_correlated,
                             hooks.subs.expect("outer subqueries prepared"),
                             row,
                             outer,
@@ -578,9 +600,32 @@ pub(super) fn groups_for_mask<'a>(
     if n_aggs > 0 {
         let mut at = 0usize;
         let mut partial_rows = 0usize;
-        let recycling_safe = states[..n_groups * n_aggs]
-            .iter()
-            .all(AggState::recycling_safe);
+        // Every group's states share the first group's kinds; without a
+        // group no row folds.
+        let recycling_safe = agg_nodes.iter().enumerate().all(|(i, (_, node))| {
+            states
+                .get(i)
+                .is_none_or(|state| state.recycling_safe_for(node, aggregate_columns))
+        });
+        // Otherwise, states whose running values `hold` copies out after each
+        // row, and whose buffers live in the persistent tail, let the scan
+        // reclaim that row's allocations too.
+        let hold_values = !recycling_safe
+            && !partial_execution
+            && agg_nodes.iter().enumerate().all(|(i, (_, node))| {
+                states
+                    .get(i)
+                    .is_none_or(|state| state.holds_values_only(node))
+            });
+        let held: &mut [super::aggregate::HeldValues] = arena
+            .alloc_slice_with(if hold_values { n_groups * n_aggs } else { 0 }, |_| {
+                super::aggregate::HeldValues::default()
+            })
+            .map_err(|_| arena_full())?;
+        for (state, held) in states.iter_mut().zip(held.iter_mut()) {
+            state.keep_buffers_in(arena);
+            state.hold(held, arena, arena)?;
+        }
         let mut visit = |row: &JoinRow<'_, 'a, '_>| {
             if !row_passes_correlated_where(
                 where_correlated,
@@ -638,6 +683,10 @@ pub(super) fn groups_for_mask<'a>(
                 let index = g * n_aggs + i;
                 if partial_execution && states[index].supports_partial() {
                     partial_states[index].update(node, arena, params, row, row_hooks)?;
+                } else if hold_values {
+                    states[index].restore_held(&held[index], arena)?;
+                    states[index].update(node, arena, params, row, row_hooks)?;
+                    states[index].hold(&mut held[index], arena, arena)?;
                 } else {
                     states[index].update(node, arena, params, row, row_hooks)?;
                 }
@@ -670,11 +719,14 @@ pub(super) fn groups_for_mask<'a>(
             }
             Ok(true)
         };
-        if recycling_safe {
+        if recycling_safe || hold_values {
             scan_source_recycling_with_pax_columns(
                 storage, scope, from, txid, scan_where, arena, params, hooks, outer, pax_demand,
                 &mut visit,
             )?;
+            for (state, held) in states.iter_mut().zip(held.iter()) {
+                state.restore_held(held, arena)?;
+            }
         } else {
             scan_source_with_pax_columns(
                 storage, scope, from, txid, scan_where, arena, params, hooks, outer, pax_demand,

@@ -1196,6 +1196,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                         .alloc_slice_with(names.len(), |index| crate::sql::types::RecordField {
                             name: names[index],
                             type_oid: types[index].oid(),
+                            type_mod: -1,
                             value: Datum::Null,
                         })
                         .map_err(|_| arena_full())?;
@@ -1225,6 +1226,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                         .alloc_slice_with(fields.len(), |index| crate::sql::types::RecordField {
                             name: fields[index].0,
                             type_oid: fields[index].1.oid(),
+                            type_mod: -1,
                             value: Datum::Null,
                         })
                         .map_err(|_| arena_full())?;
@@ -1255,6 +1257,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                     .alloc_slice_with(4, |index| crate::sql::types::RecordField {
                         name: ["message", "detail", "hint", "sql_error_code"][index],
                         type_oid: crate::sql::types::oid::TEXT,
+                        type_mod: -1,
                         value: Datum::Null,
                     })
                     .map_err(|_| arena_full())?;
@@ -1375,6 +1378,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                         .alloc_slice_with(4, |index| crate::sql::types::RecordField {
                             name: PARTITION_TREE_COLUMNS[index].0,
                             type_oid: PARTITION_TREE_COLUMNS[index].1.oid(),
+                            type_mod: -1,
                             value: row[index],
                         })
                         .map_err(|_| arena_full())?;
@@ -1445,6 +1449,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                                 crate::sql::types::ArrElem::Int2.array_oid(),
                                 crate::sql::types::ArrElem::Text.array_oid(),
                             ][field],
+                            type_mod: -1,
                             value: row[field],
                         })
                         .map_err(|_| arena_full())?;
@@ -1506,6 +1511,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                     .alloc_slice_with(columns.len(), |_| crate::sql::types::RecordField {
                         name: "",
                         type_oid: 0,
+                        type_mod: -1,
                         value: Datum::Null,
                     })
                     .map_err(|_| arena_full())?;
@@ -1522,6 +1528,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                                     "routine result type is absent from the catalog"
                                 )
                             })?,
+                        type_mod: -1,
                         value: crate::sql::exec::decode_projected_col_record(
                             encoded, index, arena,
                         )?,

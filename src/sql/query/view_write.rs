@@ -1006,7 +1006,7 @@ fn resolve_level<'a>(
             return ViewColumnSource::Computed;
         }
         match below_columns.iter().find(|candidate| **candidate == column) {
-            Some(found) => ViewColumnSource::Column(*found),
+            Some(found) => ViewColumnSource::Column(found),
             None if SYSTEM_COLUMNS.contains(&column) => ViewColumnSource::SystemColumn,
             None if column == below_alias && qualifier.is_none() => ViewColumnSource::WholeRow,
             None => ViewColumnSource::Computed,

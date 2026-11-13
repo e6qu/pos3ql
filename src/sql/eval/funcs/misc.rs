@@ -234,6 +234,7 @@ pub(crate) fn dispatch<'a>(
                                         .alloc_str(name.as_str())
                                         .map_err(|_| arena_full())?,
                                     type_oid: field.type_oid,
+                                    type_mod: field.type_mod,
                                     value: field.value,
                                 })
                                 .map_err(|_| arena_full())?;
@@ -247,6 +248,7 @@ pub(crate) fn dispatch<'a>(
                             .push(RecordField {
                                 name: arena.alloc_str(name.as_str()).map_err(|_| arena_full())?,
                                 type_oid,
+                                type_mod: super::super::expression_type_mod(arg, row),
                                 value,
                             })
                             .map_err(|_| arena_full())?;

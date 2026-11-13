@@ -902,6 +902,7 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
         let mut fields = [super::types::RecordField {
             name: "",
             type_oid: 0,
+            type_mod: -1,
             value: Datum::Null,
         }; MAX_COLUMNS];
         let too_large = || sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "record exceeds the arena");
@@ -997,6 +998,7 @@ impl<'v> ReturningLookup<'_, 'v> {
         let mut fields = [super::types::RecordField {
             name: "",
             type_oid: 0,
+            type_mod: -1,
             value: Datum::Null,
         }; MAX_COLUMNS];
         for (index, field) in fields
@@ -20858,6 +20860,7 @@ impl<'s, 'v> TriggerTransition<'_, 's, 'v> {
             .alloc_slice_with(columns.len(), |index| RecordField {
                 name: "",
                 type_oid: columns[index].ctype.oid(),
+                type_mod: columns[index].type_mod,
                 value: values.map_or(Datum::Null, |values| values[index]),
             })
             .map_err(|_| super::query::arena_full_pub())?;
@@ -32605,6 +32608,7 @@ fn static_write_locals<'a>(
             .alloc_slice_with(columns.len(), |_| RecordField {
                 name: "",
                 type_oid: 0,
+                type_mod: -1,
                 value: Datum::Null,
             })
             .map_err(|_| super::query::arena_full_pub())?;
@@ -33260,6 +33264,7 @@ fn fit_plpgsql_row<'a>(
         .alloc_slice_with(target_oids.len(), |index| RecordField {
             name: "",
             type_oid: target_oids[index],
+            type_mod: -1,
             value: Datum::Null,
         })
         .map_err(|_| super::query::arena_full_pub())?;
@@ -33274,6 +33279,7 @@ fn fit_plpgsql_row<'a>(
             } else {
                 source.type_oid
             },
+            type_mod: source.type_mod,
             value: converted,
         };
     }
@@ -33345,6 +33351,7 @@ fn coerce_plpgsql_table_rowtype<'a>(
     let mut coerced = [RecordField {
         name: "",
         type_oid: 0,
+        type_mod: -1,
         value: Datum::Null,
     }; MAX_COLUMNS];
     for (index, (source, column)) in fields.iter().zip(definition.columns()).enumerate() {
@@ -33354,6 +33361,7 @@ fn coerce_plpgsql_table_rowtype<'a>(
                 .alloc_str(column.name.as_str())
                 .map_err(|_| super::query::arena_full_pub())?,
             type_oid: column.ctype.oid(),
+            type_mod: column.type_mod,
             value: coerce_assignment(
                 source.value,
                 column,
@@ -33679,7 +33687,7 @@ fn assign_trigger_record_column<'a>(
     let input_collation =
         super::eval::coercion_input_collation(assignment.expression, &scope, hooks.catalog)?;
     let value = eval_procedural_expression(context, assignment.expression, &scope, continuation)?;
-    let value = coerce_assignment(
+    let coerced = coerce_assignment(
         value,
         &definition.columns()[column],
         PlannedAssignmentCast {
@@ -33695,7 +33703,44 @@ fn assign_trigger_record_column<'a>(
             context.seq_session(),
             context.txn.txid,
         )),
-    )?;
+    );
+    let value = match coerced {
+        Ok(value) => value,
+        // PostgreSQL plans the field's conversion into the assignment's
+        // expression, so a constant that fails the field's type modifier
+        // (and not its type's input) fails while the assignment is planned.
+        Err(error)
+            if folds_to_constant(assignment.expression) && {
+                let mut unconstrained = definition.columns()[column];
+                unconstrained.type_mod = -1;
+                coerce_assignment(
+                    value,
+                    &unconstrained,
+                    PlannedAssignmentCast {
+                        input_collation,
+                        defined: cast.as_ref(),
+                        site: None,
+                    },
+                    context.storage(),
+                    context.txn.txid,
+                    context.arena,
+                    None,
+                )
+                .is_ok()
+            } =>
+        {
+            return match crate::sql::error_context::innermost_assignment() {
+                Some(statement) => in_procedural_query(
+                    statement,
+                    crate::sql::error_context::QueryMode::Assignment,
+                    false,
+                    || Err(error),
+                ),
+                None => Err(error),
+            };
+        }
+        Err(error) => return Err(error),
+    };
     records.record_mut(record).set_field(column, value);
 
     Ok(())
@@ -33844,8 +33889,8 @@ pub(super) fn trigger_record_row<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
-    // A named composite's fields keep their declared type modifiers, which
-    // PostgreSQL compares too; a record's fields carry none here.
+    // A named composite's fields keep their declared type modifiers and a
+    // record's fields their own, which PostgreSQL compares too.
     let mut field_mods = [-1; crate::storage::MAX_COMPOSITE_FIELDS];
     let fields = match value {
         Datum::Null => return Ok(None),
@@ -33857,7 +33902,9 @@ pub(super) fn trigger_record_row<'a>(
             fields
         }
         Datum::Record(fields) => {
-            field_mods.fill(i32::MIN);
+            for (target, field) in field_mods.iter_mut().zip(fields.iter()) {
+                *target = field.type_mod;
+            }
             fields
         }
         _ if source == TriggerRowSource::Return => {
@@ -33906,17 +33953,11 @@ pub(super) fn trigger_record_row<'a>(
         let declared = storage
             .routine_type_oid(column.ctype, column.user_type, txid)
             .unwrap_or(column.ctype.oid());
-        let returned_mod = field_mods.get(index).copied().unwrap_or(i32::MIN);
-        // A record's field modifier is not tracked: a value that its
-        // column's modifier would change came from another modifier.
-        let unfitted = returned_mod == i32::MIN
-            && column.type_mod >= 0
-            && apply_typmod(field.value, column.ctype, column.type_mod, arena)
-                .and_then(|fitted| compare_datums(&fitted, &field.value))
-                .map_or(true, |ordering| !ordering.is_eq());
+        let returned_mod = field_mods.get(index).copied().unwrap_or(-1);
+        // PostgreSQL's `build_attrmap_by_position`: a constrained column
+        // requires the same modifier; an unconstrained one accepts any.
         if (field.type_oid != declared && field.type_oid != column.ctype.oid())
-            || (returned_mod != i32::MIN && returned_mod != column.type_mod)
-            || unfitted
+            || (column.type_mod >= 0 && returned_mod != column.type_mod)
         {
             let returned = if returned_mod >= 0 {
                 crate::sql::catalog::format_type_oid(storage, txid, field.type_oid, returned_mod)
@@ -33973,6 +34014,7 @@ fn assign_trigger_record_field<'a>(
         let mut fields = [RecordField {
             name: "",
             type_oid: 0,
+            type_mod: -1,
             value: Datum::Null,
         }; MAX_COLUMNS];
         let mut count = 0;
@@ -33982,6 +34024,7 @@ fn assign_trigger_record_field<'a>(
                     .alloc_str(name)
                     .map_err(|_| super::query::arena_full_pub())?,
                 type_oid,
+                type_mod: -1,
                 value: Datum::Null,
             };
             count += 1;
@@ -34329,7 +34372,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
 ) -> Result<TriggerForRows<'a>, SqlError> {
     let arena = context.arena;
     with_bound_parameter_types(query.parameter_types, || {
-        let mut fields = [("", 0); MAX_PROJ];
+        let mut fields = [("", 0, -1); MAX_PROJ];
         let width = {
             let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
             let width = match query.statement {
@@ -34358,6 +34401,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                         .alloc_str(column.name)
                         .map_err(|_| super::query::arena_full_pub())?,
                     column.type_oid,
+                    column.type_mod,
                 );
             }
             width
@@ -34380,12 +34424,14 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                 let mut row_fields = [RecordField {
                     name: "",
                     type_oid: 0,
+                    type_mod: -1,
                     value: Datum::Null,
                 }; MAX_PROJ];
                 for index in 0..width {
                     row_fields[index] = RecordField {
                         name: fields[index].0,
                         type_oid: fields[index].1,
+                        type_mod: fields[index].2,
                         value: detached_trigger_datum(values[index], arena)?,
                     };
                 }
@@ -34403,6 +34449,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
                 .alloc_slice_with(width, |index| RecordField {
                     name: fields[index].0,
                     type_oid: fields[index].1,
+                    type_mod: fields[index].2,
                     value: Datum::Null,
                 })
                 .map_err(|_| super::query::arena_full_pub())?;
@@ -34550,6 +34597,7 @@ fn for_dml_rows<'a>(
             .alloc_slice_with(width, |index| RecordField {
                 name: "",
                 type_oid: columns[index].type_oid,
+                type_mod: columns[index].type_mod,
                 value: Datum::Null,
             })
             .map_err(|_| super::query::arena_full_pub())?;
@@ -34677,6 +34725,7 @@ where
             let mut fields = [RecordField {
                 name: "",
                 type_oid: 0,
+                type_mod: -1,
                 value: Datum::Null,
             }; MAX_PROJ];
             for index in 0..width {
@@ -34685,6 +34734,7 @@ where
                         .alloc_str(columns[index].name)
                         .map_err(|_| super::query::arena_full_pub())?,
                     type_oid: columns[index].type_oid,
+                    type_mod: columns[index].type_mod,
                     value: detached_trigger_datum(values[index], result_arena)?,
                 };
             }
@@ -34700,6 +34750,7 @@ where
             .alloc_slice_with(width, |index| RecordField {
                 name: "",
                 type_oid: columns[index].type_oid,
+                type_mod: columns[index].type_mod,
                 value: Datum::Null,
             })
             .map_err(|_| super::query::arena_full_pub())?;
@@ -36131,6 +36182,7 @@ fn execute_trigger_step_in<'a>(
                             let record_target = targets.len() == 1 && targets[0].takes_row(locals);
                             let mut column_names = [None; MAX_COLUMNS];
                             let mut column_type_oids = [0; MAX_COLUMNS];
+                            let mut column_type_mods = [-1; MAX_COLUMNS];
                             let column_count = {
                                 let cursors = context.host.cursors();
                                 let mut borrowed_names = [None; MAX_COLUMNS];
@@ -36138,6 +36190,7 @@ fn execute_trigger_step_in<'a>(
                                     name,
                                     &mut borrowed_names,
                                     &mut column_type_oids,
+                                    &mut column_type_mods,
                                 )?;
                                 for (target, source) in column_names[..count]
                                     .iter_mut()
@@ -36177,6 +36230,7 @@ fn execute_trigger_step_in<'a>(
                                 let mut fields = [RecordField {
                                     name: "",
                                     type_oid: 0,
+                                    type_mod: -1,
                                     value: Datum::Null,
                                 }; MAX_COLUMNS];
                                 for index in 0..column_count {
@@ -36193,6 +36247,7 @@ fn execute_trigger_step_in<'a>(
                                         name: column_names[index]
                                             .expect("cursor description name initialized"),
                                         type_oid: column_type_oids[index],
+                                        type_mod: column_type_mods[index],
                                         value,
                                     };
                                 }
@@ -36319,7 +36374,7 @@ fn execute_trigger_step_in<'a>(
                 };
                 let record_target = statement.targets.len() == 1 && targets[0].takes_row(locals);
                 let arena = context.arena;
-                let mut fields = [("", 0); MAX_PROJ];
+                let mut fields = [("", 0, -1); MAX_PROJ];
                 let record_width = if record_target {
                     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
                     let width = super::query::describe_select(
@@ -36337,6 +36392,7 @@ fn execute_trigger_step_in<'a>(
                                 .alloc_str(column.name)
                                 .map_err(|_| super::query::arena_full_pub())?,
                             column.type_oid,
+                            column.type_mod,
                         );
                     }
                     width
@@ -36387,6 +36443,7 @@ fn execute_trigger_step_in<'a>(
                                         let mut row_fields = [RecordField {
                                             name: "",
                                             type_oid: 0,
+                                            type_mod: -1,
                                             value: Datum::Null,
                                         };
                                             MAX_PROJ];
@@ -36394,6 +36451,7 @@ fn execute_trigger_step_in<'a>(
                                             row_fields[index] = RecordField {
                                                 name: fields[index].0,
                                                 type_oid: fields[index].1,
+                                                type_mod: fields[index].2,
                                                 value: detached_trigger_datum(value, arena)?,
                                             };
                                         }
@@ -36422,6 +36480,7 @@ fn execute_trigger_step_in<'a>(
                                 .alloc_slice_with(record_width, |index| RecordField {
                                     name: fields[index].0,
                                     type_oid: fields[index].1,
+                                    type_mod: fields[index].2,
                                     value: Datum::Null,
                                 })
                                 .map_err(|_| super::query::arena_full_pub())?;
@@ -36502,9 +36561,10 @@ fn execute_trigger_step_in<'a>(
                 with_bound_parameter_types(query.parameter_types, || {
                     let record_target =
                         statement.targets.len() == 1 && targets[0].takes_row(locals);
-                    let (record_width, record_names, record_type_oids) = {
+                    let (record_width, record_names, record_type_oids, record_type_mods) = {
                         let mut names = [StackStr::<63>::new(); MAX_PROJ];
                         let mut type_oids = [0i32; MAX_PROJ];
+                        let mut type_mods = [-1i32; MAX_PROJ];
                         let width = if record_target
                             && let Stmt::FetchCursor {
                                 name,
@@ -36514,8 +36574,12 @@ fn execute_trigger_step_in<'a>(
                         {
                             let cursors = context.host.cursors();
                             let mut borrowed = [None; MAX_PROJ];
-                            let width =
-                                cursors.record_columns(name, &mut borrowed, &mut type_oids)?;
+                            let width = cursors.record_columns(
+                                name,
+                                &mut borrowed,
+                                &mut type_oids,
+                                &mut type_mods,
+                            )?;
                             for (name, source) in names[..width].iter_mut().zip(&borrowed[..width])
                             {
                                 *name = StackStr::from_str(
@@ -36585,10 +36649,11 @@ fn execute_trigger_step_in<'a>(
                             for (index, column) in columns[..width].iter().enumerate() {
                                 names[index] = StackStr::from_str(column.name);
                                 type_oids[index] = column.type_oid;
+                                type_mods[index] = column.type_mod;
                             }
                             width
                         };
-                        (width, names, type_oids)
+                        (width, names, type_oids, type_mods)
                     };
                     let arena = context.arena;
                     let prepare_empty_record =
@@ -36598,6 +36663,7 @@ fn execute_trigger_step_in<'a>(
                                     .alloc_slice_with(record_width, |index| RecordField {
                                         name: "",
                                         type_oid: record_type_oids[index],
+                                        type_mod: record_type_mods[index],
                                         value: Datum::Null,
                                     })
                                     .map_err(|_| super::query::arena_full_pub())?;
@@ -36624,6 +36690,7 @@ fn execute_trigger_step_in<'a>(
                                 let mut fields = [RecordField {
                                     name: "",
                                     type_oid: 0,
+                                    type_mod: -1,
                                     value: Datum::Null,
                                 }; MAX_PROJ];
                                 for (index, value) in values.iter().copied().enumerate() {
@@ -36632,6 +36699,7 @@ fn execute_trigger_step_in<'a>(
                                             .alloc_str(record_names[index].as_str())
                                             .map_err(|_| super::query::arena_full_pub())?,
                                         type_oid: record_type_oids[index],
+                                        type_mod: record_type_mods[index],
                                         value: detached_trigger_datum(value, arena)?,
                                     };
                                 }
@@ -39259,7 +39327,7 @@ struct NewRowTarget<'r, 'n, 'm, 'a> {
 struct StaticReturning<'a> {
     into: Option<PlpgsqlInto<'a>>,
     /// Field names and types when a single record variable receives the row.
-    record: Option<&'a [(&'a str, i32)]>,
+    record: Option<&'a [(&'a str, i32, i32)]>,
     selected: [Datum<'a>; MAX_COLUMNS],
     rows: u64,
 }
@@ -39292,7 +39360,9 @@ impl<'a> StaticReturning<'a> {
                 crate::sql::exec::DescriptionTarget::Sql,
             )?;
             let fields = arena
-                .alloc_slice_with(width, |index| ("", columns[index].type_oid))
+                .alloc_slice_with(width, |index| {
+                    ("", columns[index].type_oid, columns[index].type_mod)
+                })
                 .map_err(|_| super::query::arena_full_pub())?;
             for (field, column) in fields.iter_mut().zip(&columns[..width]) {
                 field.0 = arena
@@ -39317,6 +39387,7 @@ impl<'a> StaticReturning<'a> {
                         .alloc_slice_with(fields.len(), |index| RecordField {
                             name: fields[index].0,
                             type_oid: fields[index].1,
+                            type_mod: fields[index].2,
                             value: Datum::Null,
                         })
                         .map_err(|_| super::query::arena_full_pub())?;
@@ -39349,6 +39420,7 @@ impl<'a> StaticReturning<'a> {
                 .alloc_slice_with(fields.len(), |index| RecordField {
                     name: fields[index].0,
                     type_oid: fields[index].1,
+                    type_mod: fields[index].2,
                     value: Datum::Null,
                 })
                 .map_err(|_| super::query::arena_full_pub())?;
@@ -73629,6 +73701,7 @@ fn decode_binary_record<'a>(
         .alloc_slice_with(field_count as usize, |_| super::types::RecordField {
             name: "",
             type_oid: 0,
+            type_mod: -1,
             value: Datum::Null,
         })
         .map_err(|_| {
@@ -75243,6 +75316,7 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
             .alloc_slice_with(columns.len(), |index| RecordField {
                 name: "",
                 type_oid: self.source_def.columns()[first + index].ctype.oid(),
+                type_mod: self.source_def.columns()[first + index].type_mod,
                 value: source[first + index],
             })
             .map_err(|_| super::query::arena_full_pub())?;
@@ -94059,6 +94133,7 @@ fn composite_storage_text<'a>(
         .alloc_slice_with(definition.physical_field_count(), |_| RecordField {
             name: "",
             type_oid: 0,
+            type_mod: -1,
             value: Datum::Null,
         })
         .map_err(|_| {
@@ -94220,6 +94295,7 @@ fn coerce_composite_value_inner<'a>(
         .alloc_slice_with(input.len(), |_| RecordField {
             name: "",
             type_oid: 0,
+            type_mod: -1,
             value: Datum::Null,
         })
         .map_err(|_| {
@@ -94539,6 +94615,7 @@ fn decode_composite_text_inner<'a>(
         .alloc_slice_with(definition.active_field_count(), |_| RecordField {
             name: "",
             type_oid: 0,
+            type_mod: -1,
             value: Datum::Null,
         })
         .map_err(|_| {

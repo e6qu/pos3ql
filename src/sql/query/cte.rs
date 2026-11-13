@@ -5381,6 +5381,7 @@ fn recursive_key<'a>(
         .alloc_slice_with(keys.len(), |_| RecordField {
             name: "",
             type_oid: 0,
+            type_mod: -1,
             value: Datum::Null,
         })
         .map_err(|_| arena_full())?;
@@ -5501,12 +5502,14 @@ fn decorate_recursive_row<'a>(
                     .alloc_slice_with(key_fields.len() + 1, |_| RecordField {
                         name: "",
                         type_oid: 0,
+                        type_mod: -1,
                         value: Datum::Null,
                     })
                     .map_err(|_| arena_full())?;
                 fields[0] = RecordField {
                     name: "*DEPTH*",
                     type_oid: crate::sql::types::oid::INT8,
+                    type_mod: -1,
                     value: Datum::Int8(depth),
                 };
                 fields[1..].copy_from_slice(key_fields);

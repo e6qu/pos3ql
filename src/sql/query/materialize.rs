@@ -199,6 +199,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
             .alloc_slice_with(width, |_| crate::sql::types::RecordField {
                 name: "",
                 type_oid: 0,
+                type_mod: -1,
                 value: Datum::Null,
             })
             .map_err(|_| arena_full())?;

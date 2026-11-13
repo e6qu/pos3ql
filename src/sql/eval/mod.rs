@@ -2097,6 +2097,17 @@ pub(crate) fn is_sql_syntax_call(expression: &Expr<'_>) -> bool {
     )
 }
 
+/// The type modifier PostgreSQL's `exprTypmod` gives an expression: a
+/// column's declared modifier, a cast's target modifier, otherwise none.
+pub(crate) fn expression_type_mod<'v>(expression: &Expr<'_>, row: &dyn ColumnLookup<'v>) -> i32 {
+    match expression {
+        Expr::Column { qualifier, name } => row.column_type_mod(*qualifier, name),
+        Expr::Cast { type_mod, .. } | Expr::BoundLiteral { type_mod, .. } => *type_mod,
+        Expr::Collate { operand, .. } => expression_type_mod(operand, row),
+        _ => -1,
+    }
+}
+
 pub(crate) fn sql_syntax_call_name(name: &str) -> bool {
     matches!(
         name,
@@ -5433,6 +5444,7 @@ fn materialize_acl_value<'a>(
                 .alloc_slice_with(fields.len(), |_| RecordField {
                     name: "",
                     type_oid: 0,
+                    type_mod: -1,
                     value: Datum::Null,
                 })
                 .map_err(|_| arena_full())?;
@@ -5449,6 +5461,7 @@ fn materialize_acl_value<'a>(
                 .alloc_slice_with(fields.len(), |_| RecordField {
                     name: "",
                     type_oid: 0,
+                    type_mod: -1,
                     value: Datum::Null,
                 })
                 .map_err(|_| arena_full())?;
@@ -10214,11 +10227,13 @@ fn call<'a>(
                     super::types::RecordField {
                         name: "x",
                         type_oid,
+                        type_mod: -1,
                         value,
                     },
                     super::types::RecordField {
                         name: "n",
                         type_oid: super::types::oid::INT4,
+                        type_mod: -1,
                         value: Datum::Int4(ordinal),
                     },
                 ])
@@ -10529,11 +10544,13 @@ fn call<'a>(
                     super::types::RecordField {
                         name: "key",
                         type_oid: super::types::oid::TEXT,
+                        type_mod: -1,
                         value: Datum::Text(key),
                     },
                     super::types::RecordField {
                         name: "value",
                         type_oid: value_oid,
+                        type_mod: -1,
                         value: *value,
                     },
                 ])
@@ -10570,21 +10587,25 @@ fn call<'a>(
                     super::types::RecordField {
                         name: "grantor",
                         type_oid: super::types::oid::OID,
+                        type_mod: -1,
                         value: Datum::Oid(value.grantor),
                     },
                     super::types::RecordField {
                         name: "grantee",
                         type_oid: super::types::oid::OID,
+                        type_mod: -1,
                         value: Datum::Oid(value.grantee),
                     },
                     super::types::RecordField {
                         name: "privilege_type",
                         type_oid: super::types::oid::TEXT,
+                        type_mod: -1,
                         value: Datum::Text(value.privilege),
                     },
                     super::types::RecordField {
                         name: "is_grantable",
                         type_oid: super::types::oid::BOOL,
+                        type_mod: -1,
                         value: Datum::Bool(value.grantable),
                     },
                 ])
@@ -10629,11 +10650,13 @@ fn call<'a>(
                     super::types::RecordField {
                         name: "option_name",
                         type_oid: super::types::oid::TEXT,
+                        type_mod: -1,
                         value: option_name,
                     },
                     super::types::RecordField {
                         name: "option_value",
                         type_oid: super::types::oid::TEXT,
+                        type_mod: -1,
                         value: option_value,
                     },
                 ])
@@ -10664,11 +10687,13 @@ fn call<'a>(
                     super::types::RecordField {
                         name: "last_value",
                         type_oid: super::types::oid::INT8,
+                        type_mod: -1,
                         value: Datum::Int8(last_value),
                     },
                     super::types::RecordField {
                         name: "is_called",
                         type_oid: super::types::oid::BOOL,
+                        type_mod: -1,
                         value: Datum::Bool(is_called),
                     },
                 ])

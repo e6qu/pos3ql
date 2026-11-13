@@ -13,6 +13,7 @@ fn loop_values_keep_names_types_arrays_and_null_rows_after_source_reset() {
         .alloc_slice_copy(&[RecordField {
             name: source.alloc_str("amount").unwrap(),
             type_oid: crate::sql::types::oid::INT4,
+            type_mod: -1,
             value: Datum::Null,
         }])
         .unwrap();

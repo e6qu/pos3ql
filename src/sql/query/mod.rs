@@ -1464,6 +1464,7 @@ impl<'a> RoutineResultShape<'a> {
             .alloc_slice_with(columns.len(), |_| super::types::RecordField {
                 name: "",
                 type_oid: super::types::oid::UNKNOWN,
+                type_mod: -1,
                 value: Datum::Null,
             })
             .map_err(|_| arena_full())?;
@@ -1535,6 +1536,7 @@ impl<'a> RoutineResultShape<'a> {
                         } else {
                             values[index].type_oid()
                         },
+                        type_mod: -1,
                         value: Datum::Null,
                     })
                     .map_err(|_| arena_full())?;
@@ -3718,6 +3720,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     .push(super::types::RecordField {
                         name,
                         type_oid: field_oid,
+                        type_mod: -1,
                         value: Datum::Null,
                     })
                     .map_err(|_| arena_full())?;
@@ -3741,6 +3744,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 .push(super::types::RecordField {
                     name,
                     type_oid: column.type_oid,
+                    type_mod: column.type_mod,
                     value: Datum::Null,
                 })
                 .map_err(|_| arena_full())?;
@@ -5202,6 +5206,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 super::types::RecordField {
                     name: "",
                     type_oid: super::types::oid::UNKNOWN,
+                    type_mod: -1,
                     value: Datum::Null,
                 }
             })

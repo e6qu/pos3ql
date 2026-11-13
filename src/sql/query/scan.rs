@@ -4453,6 +4453,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
             let mut fields = [crate::sql::types::RecordField {
                 name: "",
                 type_oid: 0,
+                type_mod: -1,
                 value: Datum::Null,
             }; MAX_COLUMNS];
             for (index, field) in fields.iter_mut().enumerate().take(alias.n_columns) {
@@ -4480,6 +4481,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         let mut fields = [crate::sql::types::RecordField {
             name: "",
             type_oid: 0,
+            type_mod: -1,
             value: Datum::Null,
         }; MAX_COLUMNS];
         for (i, field) in fields.iter_mut().enumerate().take(source.n_columns) {
@@ -4510,6 +4512,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
             .alloc_slice_with(source.n_columns, |index| crate::sql::types::RecordField {
                 name: "",
                 type_oid: columns[index].ctype.oid(),
+                type_mod: columns[index].type_mod,
                 value: Datum::Null,
             })
             .map_err(|_| arena_full())?;

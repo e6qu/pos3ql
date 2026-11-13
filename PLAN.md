@@ -584,14 +584,12 @@ lower view with its own `INSTEAD OF` trigger or rewrite rule fails with
 `0A000` (`writing through view "v2" into view "v1", which has INSTEAD OF
 triggers or rewrite rules, is not supported`); PostgreSQL rewrites onto the
 lower view and fires its trigger or rule.
-A trigger's returned `record` (as opposed to a named row type) keeps no
-field type modifiers, so a returned `varchar(10)` field fails only when its
-value does not fit the `varchar(5)` column, and its `DETAIL` names the
-field's type without the modifier; PostgreSQL compares the modifiers. Record
-fields need a type modifier carried from every source that sets one (casts,
-query columns, row variables). A constant assigned to a `NEW` field that
-fails its column's modifier (`NEW.v := 'abcdefgh'`) lacks PostgreSQL's
-`PL/pgSQL assignment` context line. `ROW(...)::t` for a table's row type fails
+A constant assigned to a PL/pgSQL variable (`v := 'abcdefgh'` for
+`varchar(5)`) that fails the variable's modifier reports `LINE`/`QUERY`
+instead of PostgreSQL's `PL/pgSQL assignment` context; an immutable call
+(`upper('abcdefgh')`) misses that context for variables and `NEW` fields; and
+`NEW.n := 'zz'` for an `integer` field lacks PostgreSQL's `LINE`/`QUERY`.
+`ROW(...)::t` for a table's row type fails
 with `42846`, and `COALESCE` of two different tables' rows is accepted where
 PostgreSQL fails with `42846` (`COALESCE could not convert type b to a`).
 A field selection error (`(1).x`) has no cursor position.

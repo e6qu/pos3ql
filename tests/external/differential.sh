@@ -12,6 +12,10 @@ DIFFERENTIAL_TRANSACTION_CONFIG=$(< "$EXT/differential-capacities.conf") || exit
 ROOT_VENV=${POS3QL_VENV:-target/external-venv}
 EXTENSION_CONTROL_ROOT=${POS3QL_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
 REFERENCE_EXTENSION_CONTROL_ROOT=${POS3QL_REFERENCE_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
+# Both servers search PostgreSQL's built-in packages first (`$system`, where
+# contrib's postgres_fdw is installed), then the test packages.
+EXTENSION_CONTROL_PATH="\$system:$EXTENSION_CONTROL_ROOT"
+REFERENCE_EXTENSION_CONTROL_PATH="\$system:$REFERENCE_EXTENSION_CONTROL_ROOT"
 KEEP=${1:-}
 
 PGBIN=${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}
@@ -194,7 +198,7 @@ if [[ "$REFERENCE_MODE" == local ]]; then
     exit 1
   fi
   SOCKDIR=$(mktemp -d /tmp/pos3ql-pgsock.XXXX)
-  "$PGBIN/pg_ctl" -D "$WORK/pgdata" -o "-p $PG_PORT -k $SOCKDIR -c listen_addresses=127.0.0.1 -c timezone=UTC -c max_prepared_transactions=8 -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
+  "$PGBIN/pg_ctl" -D "$WORK/pgdata" -o "-p $PG_PORT -k $SOCKDIR -c listen_addresses=127.0.0.1 -c timezone=UTC -c max_prepared_transactions=8 -c extension_control_path='$REFERENCE_EXTENSION_CONTROL_PATH'" \
     -l "$WORK/pg.log" start >/dev/null || { bad "pg start"; exit 1; }
 fi
 
@@ -224,7 +228,7 @@ max_value_indexes = 64
 max_prepared_transactions = 8
 ${DIFFERENTIAL_TRANSACTION_CONFIG}
 memtable_bytes = ${POS3QL_DIFF_MEMTABLE:-256MiB}
-extension_control_path = ${EXTENSION_CONTROL_ROOT}
+extension_control_path = ${EXTENSION_CONTROL_PATH}
 ${POS3QL_EXTRA_CONF:-}
 EOF
 if [[ -n "$DIFF_OBJECT_PREFIX" ]]; then
@@ -268,7 +272,7 @@ run_corpus() { # port name file diagnostics
   esac
   printf 'RUN: differential: %s\n' "$2"
   if [[ "$1" == "$PG_PORT" ]]; then
-    PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
+    PGOPTIONS="-c timezone=UTC -c extension_control_path='$REFERENCE_EXTENSION_CONTROL_PATH'" \
       "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$REFERENCE_DATABASE" -X -e -P pager=off \
         -v VERBOSITY=verbose -f "$3" > "$WORK/$2.stdout" 2> "$WORK/$2.stderr" || status=$?
   else

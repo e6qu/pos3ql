@@ -5962,6 +5962,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 catalog: Some(&catalog),
                 ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
             };
+            crate::sql::exec::reject_native_routine_call(routine, txid)?;
             let mapping = routine
                 .call_input_mapping(tref.func_argument_names, args.len(), tref.func_variadic)
                 .expect("resolved table routine call has a valid argument mapping");

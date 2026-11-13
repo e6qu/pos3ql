@@ -6,6 +6,8 @@
 //! reclamation must preserve those owners. SQL currently uses one CPU worker.
 
 mod catalog_history;
+mod system_extensions;
+pub(crate) use system_extensions::{NativeModule, NativeRoutine};
 mod plan_invalidation_targets;
 mod plan_invalidations;
 pub(crate) use plan_invalidation_targets::{SelectedPlanTarget, TruncateTarget};
@@ -9723,23 +9725,33 @@ pub(crate) enum RoutineLanguage {
     Sql,
     PlPgSql,
     Internal,
+    /// `LANGUAGE C`, bound to a native routine of a built-in module.
+    Native(NativeRoutine),
 }
 
 impl RoutineLanguage {
+    /// Durable code: 0-2 for the interpreted languages and `Internal`,
+    /// `NATIVE_CODE_BASE` plus the native routine's code for `Native`.
     pub(crate) const fn code(self) -> u8 {
         match self {
             Self::Sql => 0,
             Self::PlPgSql => 1,
             Self::Internal => 2,
+            Self::Native(routine) => Self::NATIVE_CODE_BASE + routine.code(),
         }
     }
 
-    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+    const NATIVE_CODE_BASE: u8 = 16;
+
+    pub(crate) fn from_code(code: u8) -> Option<Self> {
         match code {
             0 => Some(Self::Sql),
             1 => Some(Self::PlPgSql),
             2 => Some(Self::Internal),
-            _ => None,
+            _ => code
+                .checked_sub(Self::NATIVE_CODE_BASE)
+                .and_then(NativeRoutine::from_code)
+                .map(Self::Native),
         }
     }
 }
@@ -13459,6 +13471,9 @@ impl Iterator for ExtensionConfigIter<'_> {
 pub(crate) enum ExtensionPackageCode {
     Sql,
     NativeLibrary,
+    /// A `$system` package whose `LANGUAGE C` routines bind to the native
+    /// routines pos3ql implements for this module.
+    Builtin(NativeModule),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -23772,14 +23787,24 @@ impl Storage {
                 .extension_control_path
                 .split(':')
                 .any(|root| root == "$system");
+        // Built-in packages take the first slots; checkpoints persist only
+        // the slots after them.
+        if self.system_extension_packages {
+            self.register_system_extension_packages()?;
+        }
         if self.extension_package_source == ExtensionPackageSource::Durable {
             return Ok(());
         }
+        let mut before_system = true;
         for root in config
             .extension_control_path
             .split(':')
-            .filter(|root| !root.is_empty() && *root != "$system")
+            .filter(|root| !root.is_empty())
         {
+            if root == "$system" {
+                before_system = false;
+                continue;
+            }
             let root = std::path::Path::new(root);
             let control_directory = root.join("extension");
             let entries = match std::fs::read_dir(&control_directory) {
@@ -23814,6 +23839,19 @@ impl Storage {
             }
             controls.sort_by(|left, right| left.0.cmp(&right.0));
             for (written_name, control_path) in controls {
+                let system = system_extensions::SYSTEM_PACKAGES
+                    .iter()
+                    .any(|package| package.name == written_name);
+                if system && before_system && self.system_extension_packages {
+                    // PostgreSQL would load this package instead of its own;
+                    // pos3ql cannot load a native library.
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "extension control file \"{}\" cannot replace the built-in package \"{}\"",
+                        control_path.display(),
+                        written_name
+                    ));
+                }
                 if self
                     .extension_packages
                     .iter()
@@ -23980,6 +24018,76 @@ impl Storage {
             }
         }
         Ok(())
+    }
+
+    /// Registers the packages built into pos3ql in `$system`, whose scripts
+    /// read `MODULE_PATHNAME` as their module's path.
+    fn register_system_extension_packages(&mut self) -> Result<(), SqlError> {
+        for system in system_extensions::SYSTEM_PACKAGES {
+            let mut package =
+                parse_extension_control(SqlName::parse(system.name)?, system.control)?.package;
+            package.code = ExtensionPackageCode::Builtin(system.module);
+            let package_slot = self.extension_packages.len();
+            self.extension_packages.push(package).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many available extension packages (limit {})",
+                    self.extension_packages.capacity()
+                )
+            })?;
+            for &(from, to, source) in system.scripts {
+                let offset = self.extension_script_source.len();
+                for line in source.lines() {
+                    // Like a configured script, `\\echo` lines become comments.
+                    let commented = line.trim_start().starts_with("\\echo");
+                    let mut rest = line;
+                    let mut appended = !commented || self.extension_script_source.append(b"-- ");
+                    while appended && let Some(at) = rest.find("MODULE_PATHNAME") {
+                        appended = self.extension_script_source.append(rest[..at].as_bytes())
+                            && self
+                                .extension_script_source
+                                .append(system.module.path().as_bytes());
+                        rest = &rest[at + "MODULE_PATHNAME".len()..];
+                    }
+                    appended = appended
+                        && self.extension_script_source.append(rest.as_bytes())
+                        && self.extension_script_source.append(b"\n");
+                    if !appended {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "extension scripts exceed extension_script_bytes ({})",
+                            self.extension_script_source.capacity()
+                        ));
+                    }
+                }
+                self.extension_scripts
+                    .push(ExtensionScript {
+                        package: package_slot as u16,
+                        from: from.map(ExtensionVersion::parse).transpose()?,
+                        to: ExtensionVersion::parse(to)?,
+                        offset: offset as u32,
+                        length: (self.extension_script_source.len() - offset) as u32,
+                        effective: package,
+                    })
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "too many extension scripts (limit {})",
+                            self.extension_scripts.capacity()
+                        )
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The packages built into pos3ql, which hold the first package slots.
+    pub(crate) fn system_extension_package_count(&self) -> usize {
+        if self.system_extension_packages {
+            system_extensions::SYSTEM_PACKAGES.len()
+        } else {
+            0
+        }
     }
 
     pub(crate) fn extension_package_source(&self) -> ExtensionPackageSource {
@@ -34181,12 +34289,31 @@ impl Storage {
         drop(catalog);
         let (_, name) = self.access_object_name_to(object, txid);
         // PostgreSQL's dependency walk names the member and its extension
-        // as `getObjectDescription` does, without quotes.
+        // as `getObjectDescription` does, without quotes; a routine with its
+        // argument types (`f(text[],oid)`).
+        let mut described = StackStr::<1024>::from_str(name.as_str());
+        if object.class == AccessClass::Routine {
+            use core::fmt::Write as _;
+            let routine = self.routine_for(object.slot as usize, txid);
+            let _ = described.write_char('(');
+            for (index, argument) in routine.arguments().iter().enumerate() {
+                if index != 0 {
+                    let _ = described.write_char(',');
+                }
+                let oid = self
+                    .routine_type_oid(argument.ctype, argument.user_type, txid)
+                    .unwrap_or(argument.ctype.oid());
+                let _ = described.write_str(
+                    crate::sql::catalog::format_type_oid(self, txid, oid, -1).as_str(),
+                );
+            }
+            let _ = described.write_char(')');
+        }
         let error = sql_err!(
             sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
             "cannot drop {} {} because extension {} requires it",
             kind,
-            name.as_str(),
+            described.as_str(),
             extension_name.as_str()
         );
         crate::sql::eval::stash_diagnostic(

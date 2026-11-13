@@ -127,6 +127,9 @@ wal_record_kinds! {
 /// column, table and schema renames rewrite. Kind 71, with only the mutable
 /// settings, is rejected.
     KIND_ALTER_INDEX_DEFINITION_V2 = 161;
+/// Foreign-data wrappers name their handler and validator by routine OID.
+/// Kind 115, with only a postgres_fdw flag, is rejected.
+    KIND_SET_FOREIGN_DATA_WRAPPER_V2 = 171;
 // Publication records carry the typed ordinary-descendant selection added
 // after the original record layout. New kinds make older bytes fail recovery
 // loudly instead of being reinterpreted as a different catalog contract.
@@ -3393,7 +3396,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DatabaseScope { .. } => KIND_DATABASE_SCOPE,
         WalOp::CreateLargeObject { .. } => KIND_CREATE_LARGE_OBJECT,
         WalOp::DropLargeObject { .. } => KIND_DROP_LARGE_OBJECT,
-        WalOp::SetForeignDataWrapper { .. } => KIND_SET_FOREIGN_DATA_WRAPPER,
+        WalOp::SetForeignDataWrapper { .. } => KIND_SET_FOREIGN_DATA_WRAPPER_V2,
         WalOp::SetForeignServer { .. } => KIND_SET_FOREIGN_SERVER,
         WalOp::SetUserMapping { .. } => KIND_SET_USER_MAPPING,
         WalOp::SetForeignTable { .. } | WalOp::RestoreForeignTable(_) => KIND_SET_FOREIGN_TABLE,
@@ -3694,7 +3697,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::DropLargeObject { .. } => 4,
         WalOp::SetForeignDataWrapper { definition, .. } => {
             13 + definition.map_or(0, |definition| {
-                1 + definition.name.as_str().len() + 2 + foreign_options_len(definition.options)
+                // Name, handler and validator routine OIDs, options.
+                1 + definition.name.as_str().len() + 8 + foreign_options_len(definition.options)
             })
         }
         WalOp::SetForeignServer { definition, .. } => {
@@ -5323,16 +5327,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&[u8::from(definition.is_some())]);
             if let Some(definition) = definition {
                 ok &= name_bytes(buffer, definition.name.as_str())
-                    && buffer.append(&[
-                        match definition.handler {
-                            crate::storage::foreign::ForeignDataHandler::None => 0,
-                            crate::storage::foreign::ForeignDataHandler::Postgres => 1,
-                        },
-                        match definition.validator {
-                            crate::storage::foreign::ForeignDataValidator::None => 0,
-                            crate::storage::foreign::ForeignDataValidator::Postgres => 1,
-                        },
-                    ])
+                    && buffer.append(&definition.handler.routine_oid().to_le_bytes())
+                    && buffer.append(&definition.validator.routine_oid().to_le_bytes())
                     && append_foreign_options(buffer, definition.options);
             }
             ok
@@ -8272,7 +8268,7 @@ fn decode_op_inner<'a>(
             at = 4;
             (oid != 0 && at == payload.len()).then_some(WalOp::DropLargeObject { oid })
         }),
-        KIND_SET_FOREIGN_DATA_WRAPPER => decode_large_op(|| {
+        KIND_SET_FOREIGN_DATA_WRAPPER_V2 => decode_large_op(|| {
             let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
@@ -8287,18 +8283,15 @@ fn decode_op_inner<'a>(
                 1 => {
                     at += 1;
                     let name = SqlName::parse(take_name(&mut at)?).ok()?;
-                    let handler = match *payload.get(at)? {
-                        0 => crate::storage::foreign::ForeignDataHandler::None,
-                        1 => crate::storage::foreign::ForeignDataHandler::Postgres,
-                        _ => return None,
-                    };
-                    at += 1;
-                    let validator = match *payload.get(at)? {
-                        0 => crate::storage::foreign::ForeignDataValidator::None,
-                        1 => crate::storage::foreign::ForeignDataValidator::Postgres,
-                        _ => return None,
-                    };
-                    at += 1;
+                    let handler = crate::storage::foreign::ForeignDataHandler::from_routine_oid(
+                        i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?),
+                    )?;
+                    at += 4;
+                    let validator =
+                        crate::storage::foreign::ForeignDataValidator::from_routine_oid(
+                            i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?),
+                        )?;
+                    at += 4;
                     Some(crate::storage::foreign::ForeignDataWrapperDefinition {
                         name,
                         handler,
@@ -9800,7 +9793,7 @@ fn decode_op_inner<'a>(
                 table,
             })
         }),
-        KIND_ALTER_TRIGGER => None,
+        KIND_ALTER_TRIGGER | KIND_SET_FOREIGN_DATA_WRAPPER => None,
         KIND_ALTER_TRIGGER_V2 => decode_large_op(|| {
             let identity = take_catalog_position(payload, &mut at)?;
             crate::storage::CatalogIdentity::parse(identity.created_at())?;

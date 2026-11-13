@@ -8474,8 +8474,7 @@ fn foreign_data_catalogs_are_typed_transactional_and_visible() {
     let created = run_with(
         &mut engine,
         &mut budget,
-        "CREATE FOREIGN DATA WRAPPER postgres_fdw \
-             HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator; \
+        "CREATE EXTENSION postgres_fdw; \
          CREATE SERVER upstream TYPE 'postgresql' VERSION '18' \
              FOREIGN DATA WRAPPER postgres_fdw \
              OPTIONS (host '127.0.0.1', port '5432', dbname 'postgres'); \
@@ -9564,6 +9563,7 @@ fn plpgsql_dynamic_administration_uses_static_catalog_boundaries() {
         &mut engine,
         &mut budget,
         "SELECT lo_create(90231::oid);
+         CREATE EXTENSION postgres_fdw;
          CREATE FUNCTION dynamic_catalog_administration() RETURNS void LANGUAGE plpgsql AS '
            BEGIN
              EXECUTE ''CREATE ROLE dynamic_catalog_owner'';
@@ -10061,8 +10061,7 @@ fn foreign_data_privileges_and_savepoints_share_typed_catalog_state() {
         &mut budget,
         "CREATE ROLE fdw_owner; CREATE ROLE fdw_user; \
          CREATE SCHEMA fdw_zone AUTHORIZATION fdw_user; \
-         CREATE FOREIGN DATA WRAPPER postgres_fdw \
-           HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator; \
+         CREATE EXTENSION postgres_fdw; \
          GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw TO fdw_owner; \
          SET ROLE fdw_owner; \
          CREATE SERVER privilege_server FOREIGN DATA WRAPPER postgres_fdw \
@@ -10122,8 +10121,7 @@ fn foreign_data_catalog_views_enforce_postgresql_credential_visibility() {
         &mut budget,
         "CREATE ROLE mapping_owner; CREATE ROLE mapped_user; CREATE ROLE mapping_observer; \
          CREATE SCHEMA mapping_zone AUTHORIZATION mapped_user; \
-         CREATE FOREIGN DATA WRAPPER postgres_fdw \
-           HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator; \
+         CREATE EXTENSION postgres_fdw; \
          GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw TO mapping_owner, mapping_observer; \
          SET ROLE mapping_owner; \
          CREATE SERVER catalog_server TYPE 'postgresql' VERSION '18' \
@@ -10196,8 +10194,7 @@ fn foreign_table_conflict_rejections_match_postgres_fdw_surface() {
     let setup = run_with(
         &mut engine,
         &mut budget,
-        "CREATE FOREIGN DATA WRAPPER postgres_fdw \
-           HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator; \
+        "CREATE EXTENSION postgres_fdw; \
          CREATE SERVER mutation_server FOREIGN DATA WRAPPER postgres_fdw \
            OPTIONS (host '127.0.0.1'); \
          CREATE USER MAPPING FOR CURRENT_USER SERVER mutation_server; \
@@ -10230,8 +10227,7 @@ fn postgresql_dump_foreign_data_ddl_restores_without_reinterpretation() {
     let output = run_with(
         &mut engine,
         &mut budget,
-        "CREATE FOREIGN DATA WRAPPER postgres_fdw \
-           HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator; \
+        "CREATE EXTENSION postgres_fdw; \
          CREATE SERVER dump_server TYPE 'postgresql' VERSION '18' \
            FOREIGN DATA WRAPPER postgres_fdw \
            OPTIONS (dbname 'postgres', host '127.0.0.1', port '5432'); \
@@ -10267,7 +10263,8 @@ fn foreign_data_alter_drop_and_dependency_lifecycles_are_atomic() {
     let setup = run_with(
         &mut engine,
         &mut budget,
-        "CREATE FOREIGN DATA WRAPPER lifecycle_fdw NO HANDLER NO VALIDATOR; \
+        "CREATE EXTENSION postgres_fdw; \
+         CREATE FOREIGN DATA WRAPPER lifecycle_fdw NO HANDLER NO VALIDATOR; \
          ALTER FOREIGN DATA WRAPPER lifecycle_fdw \
            HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator; \
          ALTER FOREIGN DATA WRAPPER lifecycle_fdw RENAME TO lifecycle_fdw_renamed; \
@@ -10354,8 +10351,7 @@ fn foreign_data_catalogs_survive_object_cold_checkpoint_recovery() {
     let created = run_with(
         &mut engine,
         &mut budget,
-        "CREATE FOREIGN DATA WRAPPER postgres_fdw \
-             HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator; \
+        "CREATE EXTENSION postgres_fdw; \
          CREATE ROLE foreign_reader; \
          GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw TO foreign_reader; \
          CREATE SERVER durable_server TYPE '' VERSION '' FOREIGN DATA WRAPPER postgres_fdw \
@@ -10417,8 +10413,7 @@ fn foreign_data_catalogs_survive_wal_replay_before_checkpoint() {
         let output = run_with(
             &mut engine,
             &mut budget,
-            "CREATE FOREIGN DATA WRAPPER postgres_fdw \
-                 HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator; \
+            "CREATE EXTENSION postgres_fdw; \
              CREATE SERVER wal_server TYPE '' FOREIGN DATA WRAPPER postgres_fdw \
                  OPTIONS (host '127.0.0.1', port '5432', dbname 'postgres'); \
              CREATE USER MAPPING FOR CURRENT_USER SERVER wal_server \
@@ -94264,7 +94259,7 @@ fn pgoutput_targets_reject_foreign_tables_views_and_other_relation_kinds() {
          CREATE VIEW subscription_view AS SELECT 1 AS id; \
          CREATE MATERIALIZED VIEW subscription_matview AS SELECT 1 AS id; \
          CREATE SEQUENCE subscription_sequence; \
-         CREATE FOREIGN DATA WRAPPER postgres_fdw HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator; \
+         CREATE EXTENSION postgres_fdw; \
          CREATE SERVER subscription_upstream FOREIGN DATA WRAPPER postgres_fdw OPTIONS (host '127.0.0.1', port '1', sslmode 'disable'); \
          CREATE FOREIGN TABLE subscription_foreign(id integer) SERVER subscription_upstream", true);
     let schema = crate::storage::SqlName::parse("public").unwrap();

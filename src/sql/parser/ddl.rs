@@ -4067,6 +4067,8 @@ impl<'a> Parser<'a> {
                     crate::sql::ast::RoutineLanguage::Sql
                 } else if self.eat_ident("plpgsql")? {
                     crate::sql::ast::RoutineLanguage::PlPgSql
+                } else if self.eat_ident("c")? {
+                    crate::sql::ast::RoutineLanguage::C
                 } else {
                     let unsupported = self.any_ident("routine language")?;
                     return Err(ParseError {
@@ -4088,22 +4090,14 @@ impl<'a> Parser<'a> {
                     return Err(self.err_here("conflicting or redundant options"));
                 }
                 let source = self.str_literal("function body")?;
-                if self.eat_op(",")? {
-                    let _symbol = self.str_literal("function link symbol")?;
-                    return Err(ParseError {
-                        at: self.peek_at,
-                        message: stack_format!(
-                            super::PARSE_MESSAGE_BYTES,
-                            "native-library routine bodies are not supported"
-                        ),
-                        sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                        cursor: None,
-                        hint: None,
-                        near: None,
-                        detail: None,
-                    });
-                }
-                body = Some(crate::sql::ast::RoutineBody::String(source));
+                body = Some(if self.eat_op(",")? {
+                    crate::sql::ast::RoutineBody::Library {
+                        file: source,
+                        symbol: Some(self.str_literal("function link symbol")?),
+                    }
+                } else {
+                    crate::sql::ast::RoutineBody::String(source)
+                });
             } else if self.eat_ident("return")? {
                 if body.is_some() {
                     return Err(self.err_here("conflicting or redundant options"));
@@ -4338,9 +4332,37 @@ impl<'a> Parser<'a> {
             }
             (None, _) => return Err(self.invalid_function_definition("no language specified")),
         };
+        // PostgreSQL's interpret_AS_clause: a C routine names its object
+        // file, and every other language takes one AS item.
+        let body = match (language, body) {
+            (
+                crate::sql::ast::RoutineLanguage::C,
+                Some(crate::sql::ast::RoutineBody::String(file)),
+            ) => Some(crate::sql::ast::RoutineBody::Library { file, symbol: None }),
+            (
+                crate::sql::ast::RoutineLanguage::Sql | crate::sql::ast::RoutineLanguage::PlPgSql,
+                Some(crate::sql::ast::RoutineBody::Library { .. }),
+            ) => {
+                return Err(self.invalid_function_definition(
+                    if language == crate::sql::ast::RoutineLanguage::Sql {
+                        "only one AS item needed for language \"sql\""
+                    } else {
+                        "only one AS item needed for language \"plpgsql\""
+                    },
+                ));
+            }
+            (_, body) => body,
+        };
+        if language == crate::sql::ast::RoutineLanguage::C
+            && !matches!(body, Some(crate::sql::ast::RoutineBody::Library { .. }))
+        {
+            return Err(self.invalid_function_definition("no function body specified"));
+        }
         if body.is_some_and(|body| {
-            !matches!(body, crate::sql::ast::RoutineBody::String(_))
-                && language != crate::sql::ast::RoutineLanguage::Sql
+            !matches!(
+                body,
+                crate::sql::ast::RoutineBody::String(_) | crate::sql::ast::RoutineBody::Library { .. }
+            ) && language != crate::sql::ast::RoutineLanguage::Sql
         }) {
             return Err(ParseError {
                 at: self.peek_at,

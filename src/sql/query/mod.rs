@@ -4151,6 +4151,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
         source_position: Option<InvocationSite>,
         arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
+        super::exec::reject_native_routine_call(routine, self.txid)?;
         if routine.attributes.strict && arguments.iter().any(Datum::is_null) {
             return Ok(Some(Datum::Null));
         }

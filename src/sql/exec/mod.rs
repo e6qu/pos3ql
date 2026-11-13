@@ -1489,7 +1489,7 @@ pub use projected::{
 };
 
 mod ddl;
-mod dependency_report;
+pub(crate) mod dependency_report;
 pub(crate) mod expression_bindings;
 use ddl::{add_unique_key, attach_constraints, auto_key_name, build_column, build_def};
 pub(crate) use ddl::{check_referenced_columns, visit_expression_variables};
@@ -2231,7 +2231,10 @@ pub fn create_foreign_table(
     };
     let wrapper = storage.foreign_wrapper_by_slot(server_definition.wrapper as usize, txn.txid);
     if wrapper.is_some_and(|wrapper| {
-        wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+        matches!(
+            wrapper.validator,
+            crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+        )
     }) && let Err(error) =
         validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Table)
     {
@@ -2248,7 +2251,10 @@ pub fn create_foreign_table(
             return sql_fail(error);
         }
         if wrapper.is_some_and(|wrapper| {
-            wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+            matches!(
+            wrapper.validator,
+            crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+        )
         }) && let Err(error) =
             validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Column)
         {
@@ -2454,44 +2460,136 @@ pub fn import_foreign_schema(
     sql_ok()
 }
 
+/// The routine a wrapper's `HANDLER name` names, found as PostgreSQL's
+/// `lookup_fdw_handler_func` does: `name()` returning `fdw_handler`. pos3ql
+/// runs only the handler bound to postgres_fdw's native code.
 fn resolve_foreign_handler(
+    storage: &Storage,
     handler: super::ast::ForeignDataHandler<'_>,
+    txid: u32,
 ) -> Result<crate::storage::foreign::ForeignDataHandler, SqlError> {
-    match handler {
-        super::ast::ForeignDataHandler::None => {
-            Ok(crate::storage::foreign::ForeignDataHandler::None)
+    let super::ast::ForeignDataHandler::Function(name) = handler else {
+        return Ok(crate::storage::foreign::ForeignDataHandler::None);
+    };
+    let written = foreign_routine_name(name)?;
+    let routine = foreign_routine(storage, written.as_str(), &[], txid)?;
+    let returns_handler = matches!(
+        routine.kind,
+        crate::storage::RoutineKind::Function { result }
+            if result.ctype == ColType::Pseudo(crate::sql::types::PseudoType::FdwHandler)
+    );
+    if !returns_handler {
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "function {} must return type fdw_handler",
+            written.as_str()
+        ));
+    }
+    match routine.language {
+        crate::storage::RoutineLanguage::Native(crate::storage::NativeRoutine::PostgresFdwHandler) => {
+            Ok(crate::storage::foreign::ForeignDataHandler::Postgres {
+                routine: crate::storage::routine_oid(&routine),
+            })
         }
-        super::ast::ForeignDataHandler::Function(name)
-            if name.name.eq_ignore_ascii_case("postgres_fdw_handler") =>
-        {
-            Ok(crate::storage::foreign::ForeignDataHandler::Postgres)
-        }
-        super::ast::ForeignDataHandler::Function(name) => Err(sql_err!(
+        _ => Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "native foreign-data handler {} is not supported",
-            name.name
+            "foreign-data handler {} is not supported",
+            written.as_str()
         )),
     }
 }
 
+/// The routine a wrapper's `VALIDATOR name` names: `name(text[], oid)`, as
+/// PostgreSQL's `lookup_fdw_validator_func` finds it.
 fn resolve_foreign_validator(
+    storage: &Storage,
     validator: super::ast::ForeignDataValidator<'_>,
+    txid: u32,
 ) -> Result<crate::storage::foreign::ForeignDataValidator, SqlError> {
-    match validator {
-        super::ast::ForeignDataValidator::None => {
-            Ok(crate::storage::foreign::ForeignDataValidator::None)
-        }
-        super::ast::ForeignDataValidator::Function(name)
-            if name.name.eq_ignore_ascii_case("postgres_fdw_validator") =>
-        {
-            Ok(crate::storage::foreign::ForeignDataValidator::Postgres)
-        }
-        super::ast::ForeignDataValidator::Function(name) => Err(sql_err!(
+    let super::ast::ForeignDataValidator::Function(name) = validator else {
+        return Ok(crate::storage::foreign::ForeignDataValidator::None);
+    };
+    let written = foreign_routine_name(name)?;
+    let routine = foreign_routine(
+        storage,
+        written.as_str(),
+        &[crate::sql::types::oid::TEXT_ARRAY, crate::sql::types::oid::OID],
+        txid,
+    )?;
+    match routine.language {
+        crate::storage::RoutineLanguage::Native(
+            crate::storage::NativeRoutine::PostgresFdwValidator,
+        ) => Ok(crate::storage::foreign::ForeignDataValidator::Postgres {
+            routine: crate::storage::routine_oid(&routine),
+        }),
+        _ => Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "native foreign-data validator {} is not supported",
-            name.name
+            "foreign-data validator {} is not supported",
+            written.as_str()
         )),
     }
+}
+
+fn foreign_routine_name(
+    name: super::ast::QualName<'_>,
+) -> Result<StackStr<256>, SqlError> {
+    use core::fmt::Write as _;
+    let mut written = StackStr::new();
+    if let Some(schema) = name.schema {
+        let _ = write!(written, "{schema}.");
+    }
+    let _ = written.write_str(name.name);
+    if written.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::NAME_TOO_LONG,
+            "foreign-data routine name is too long"
+        ));
+    }
+    Ok(written)
+}
+
+/// The stored routine `written(arguments)` with exactly these argument
+/// types, or PostgreSQL's `function ... does not exist`.
+fn foreign_routine(
+    storage: &Storage,
+    written: &str,
+    arguments: &[i32],
+    txid: u32,
+) -> Result<crate::storage::RoutineDef, SqlError> {
+    let missing = || {
+        use core::fmt::Write as _;
+        let mut signature = StackStr::<256>::new();
+        let _ = write!(signature, "{written}(");
+        for (index, oid) in arguments.iter().enumerate() {
+            let separator = if index == 0 { "" } else { ", " };
+            let name = builtin_type_name_fixed(*oid);
+            let _ = write!(
+                signature,
+                "{separator}{}",
+                name.as_ref().map_or("?", |name| name.as_str())
+            );
+        }
+        let _ = signature.write_char(')');
+        sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "function {} does not exist",
+            signature.as_str()
+        )
+    };
+    let slot = storage
+        .routine_slot_for_function_call_syntax_oids(written, arguments, false, txid)
+        .ok_or_else(missing)?;
+    let routine = storage.routine_for(slot, txid);
+    let exact = routine.argument_count == arguments.len()
+        && routine
+            .arguments()
+            .iter()
+            .zip(arguments)
+            .all(|(argument, oid)| argument.user_type.is_none() && argument.ctype.oid() == *oid);
+    if !exact {
+        return Err(missing());
+    }
+    Ok(routine)
 }
 
 fn bounded_foreign_value(
@@ -2532,11 +2630,11 @@ pub fn create_foreign_data_wrapper(
             "permission denied to create foreign-data wrapper"
         ));
     }
-    let handler = match resolve_foreign_handler(command.handler) {
+    let handler = match resolve_foreign_handler(storage, command.handler, txn.txid) {
         Ok(handler) => handler,
         Err(error) => return sql_fail(error),
     };
-    let validator = match resolve_foreign_validator(command.validator) {
+    let validator = match resolve_foreign_validator(storage, command.validator, txn.txid) {
         Ok(validator) => validator,
         Err(error) => return sql_fail(error),
     };
@@ -2544,8 +2642,10 @@ pub fn create_foreign_data_wrapper(
         Ok(options) => options,
         Err(error) => return sql_fail(error),
     };
-    if validator == crate::storage::foreign::ForeignDataValidator::Postgres
-        && let Err(error) =
+    if matches!(
+        validator,
+        crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+    ) && let Err(error) =
             validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Wrapper)
     {
         return sql_fail(error);
@@ -2616,7 +2716,10 @@ pub fn create_foreign_server(
         Ok(options) => options,
         Err(error) => return sql_fail(error),
     };
-    if wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+    if matches!(
+            wrapper.validator,
+            crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+        )
         && let Err(error) =
             validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Server)
     {
@@ -2837,7 +2940,10 @@ pub fn create_user_mapping(
     };
     let wrapper = storage.foreign_wrapper_by_slot(server.wrapper as usize, txn.txid);
     if wrapper.is_some_and(|wrapper| {
-        wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+        matches!(
+            wrapper.validator,
+            crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+        )
     }) && let Err(error) =
         validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Mapping)
     {
@@ -3114,13 +3220,13 @@ pub fn alter_foreign_data_wrapper(
         } => {
             let prior_handler = definition.handler;
             if let Some(handler) = handler {
-                definition.handler = match resolve_foreign_handler(handler) {
+                definition.handler = match resolve_foreign_handler(storage, handler, txn.txid) {
                     Ok(handler) => handler,
                     Err(error) => return sql_fail(error),
                 };
             }
             if let Some(validator) = validator {
-                definition.validator = match resolve_foreign_validator(validator) {
+                definition.validator = match resolve_foreign_validator(storage, validator, txn.txid) {
                     Ok(validator) => validator,
                     Err(error) => return sql_fail(error),
                 };
@@ -3129,8 +3235,10 @@ pub fn alter_foreign_data_wrapper(
                 Ok(options) => options,
                 Err(error) => return sql_fail(error),
             };
-            if definition.validator == crate::storage::foreign::ForeignDataValidator::Postgres
-                && let Err(error) = validate_postgres_foreign_options(
+            if matches!(
+                definition.validator,
+                crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+            ) && let Err(error) = validate_postgres_foreign_options(
                     &definition.options,
                     PostgresForeignOptionContext::Wrapper,
                 )
@@ -3235,7 +3343,10 @@ pub fn alter_foreign_server(
                     "foreign-data wrapper for server does not exist"
                 ));
             };
-            if wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+            if matches!(
+            wrapper.validator,
+            crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+        )
                 && let Err(error) = validate_postgres_foreign_options(
                     &definition.options,
                     PostgresForeignOptionContext::Server,
@@ -3303,7 +3414,10 @@ pub fn alter_user_mapping(
     if storage
         .foreign_wrapper_by_slot(server.wrapper as usize, txn.txid)
         .is_some_and(|wrapper| {
-            wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+            matches!(
+            wrapper.validator,
+            crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+        )
         })
         && let Err(error) = validate_postgres_foreign_options(
             &definition.options,
@@ -3976,7 +4090,10 @@ fn alter_foreign_table_as(
     if storage
         .foreign_wrapper_by_slot(server.wrapper as usize, txn.txid)
         .is_some_and(|wrapper| {
-            wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+            matches!(
+            wrapper.validator,
+            crate::storage::foreign::ForeignDataValidator::Postgres { .. }
+        )
         })
     {
         if let Err(error) =
@@ -46574,6 +46691,8 @@ fn check_routine_result_type(
         return Ok(());
     }
     Err(match language {
+        // A C routine's contract is its native code's.
+        RoutineLanguage::C => return Ok(()),
         RoutineLanguage::Sql => sql_err!(
             sqlstate::INVALID_FUNCTION_DEFINITION,
             "SQL functions cannot return type {}",
@@ -46597,6 +46716,7 @@ fn check_routine_argument_type(
         return Ok(());
     }
     match language {
+        RoutineLanguage::C => Ok(()),
         RoutineLanguage::Sql => Err(sql_err!(
             sqlstate::INVALID_FUNCTION_DEFINITION,
             "SQL functions cannot have arguments of type {}",
@@ -46611,24 +46731,80 @@ fn check_routine_argument_type(
     }
 }
 
+/// A native routine backs catalog uses such as a foreign-data wrapper's
+/// handler; pos3ql runs none of them as a called function.
+pub(crate) fn reject_native_routine_call(
+    routine: &crate::storage::RoutineDef,
+    txid: u32,
+) -> Result<(), SqlError> {
+    use core::fmt::Write as _;
+    if !matches!(routine.language, crate::storage::RoutineLanguage::Native(_)) {
+        return Ok(());
+    }
+    let mut message = StackStr::<192>::new();
+    let _ = write!(message, "function {}(", routine.name_for(txid).as_str());
+    for (index, argument) in routine.arguments().iter().enumerate() {
+        let separator = if index == 0 { "" } else { ", " };
+        let _ = write!(message, "{separator}{}", argument.ctype.name());
+    }
+    let _ = message.write_str(") is not supported");
+    Err(sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "{}",
+        message.as_str()
+    ))
+}
+
+/// The native routine a `LANGUAGE C` routine binds to: pos3ql loads no
+/// shared libraries, so only the modules it implements resolve.
+fn native_routine(file: &str, symbol: &str) -> Result<crate::storage::NativeRoutine, SqlError> {
+    let module = crate::storage::NativeModule::from_path(file).ok_or_else(|| {
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "native library \"{}\" is not built into pos3ql",
+            file
+        )
+    })?;
+    crate::storage::NativeRoutine::from_symbol(module, symbol).ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "could not find function \"{}\" in file \"{}\"",
+            symbol,
+            file
+        )
+    })
+}
+
 pub(crate) fn resolve_routine_declaration(
     storage: &Storage,
     txn: &TxnState,
     routine: &CreateRoutine<'_>,
     guc: &crate::sql::guc::GucState,
 ) -> Result<ResolvedRoutineDeclaration, SqlError> {
-    let (body_kind, _) = match routine.body {
-        super::ast::RoutineBody::String(body) => (crate::storage::RoutineBodyKind::String, body),
-        super::ast::RoutineBody::Return(body) => (crate::storage::RoutineBodyKind::Return, body),
-        super::ast::RoutineBody::Atomic(body) => (crate::storage::RoutineBodyKind::Atomic, body),
+    let body_kind = match routine.body {
+        super::ast::RoutineBody::String(_) | super::ast::RoutineBody::Library { .. } => {
+            crate::storage::RoutineBodyKind::String
+        }
+        super::ast::RoutineBody::Return(_) => crate::storage::RoutineBodyKind::Return,
+        super::ast::RoutineBody::Atomic(_) => crate::storage::RoutineBodyKind::Atomic,
     };
-    let language = match routine.language {
-        RoutineLanguage::Sql => crate::storage::RoutineLanguage::Sql,
-        RoutineLanguage::PlPgSql => crate::storage::RoutineLanguage::PlPgSql,
+    let language = match (routine.language, routine.body) {
+        (RoutineLanguage::Sql, _) => crate::storage::RoutineLanguage::Sql,
+        (RoutineLanguage::PlPgSql, _) => crate::storage::RoutineLanguage::PlPgSql,
+        (RoutineLanguage::C, super::ast::RoutineBody::Library { file, symbol }) => {
+            crate::storage::RoutineLanguage::Native(native_routine(
+                file,
+                symbol.unwrap_or(routine.name.name),
+            )?)
+        }
+        (RoutineLanguage::C, _) => {
+            unreachable!("the parser gives a C routine its object file")
+        }
     };
     let language_name = match routine.language {
         RoutineLanguage::Sql => "sql",
         RoutineLanguage::PlPgSql => "plpgsql",
+        RoutineLanguage::C => "c",
     };
     storage.require_language_usage(language_name, txn.txid)?;
     if routine.language == RoutineLanguage::Sql {
@@ -47374,11 +47550,7 @@ pub(crate) fn validate_routine_body(
                     .map(|column| column.ctype)
             })
     };
-    let body_text = match routine.body {
-        super::ast::RoutineBody::String(body)
-        | super::ast::RoutineBody::Return(body)
-        | super::ast::RoutineBody::Atomic(body) => body,
-    };
+    let body_text = routine.body.stored_text(routine.name.name);
     let body_inputs = if body_kind == crate::storage::RoutineBodyKind::String {
         validation_inputs
     } else {
@@ -47730,11 +47902,7 @@ pub(crate) fn create_routine(
         body_kind,
         replaced,
     } = declaration;
-    let body_text = match routine.body {
-        super::ast::RoutineBody::String(body)
-        | super::ast::RoutineBody::Return(body)
-        | super::ast::RoutineBody::Atomic(body) => body,
-    };
+    let body_text = routine.body.stored_text(routine.name.name);
     let body_inputs = if body_kind == crate::storage::RoutineBodyKind::String {
         &[][..]
     } else {

@@ -101,6 +101,10 @@ if ! [[ "$POSTGRES_REGRESS_SHARD" =~ ^[0-9]+$ \
 fi
 EXTENSION_CONTROL_ROOT=${POS3QL_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
 REFERENCE_EXTENSION_CONTROL_ROOT=${POS3QL_REFERENCE_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
+# Both servers search PostgreSQL's built-in packages first (`$system`, where
+# contrib's postgres_fdw is installed), then the test packages.
+EXTENSION_CONTROL_PATH="\$system:$EXTENSION_CONTROL_ROOT"
+REFERENCE_EXTENSION_CONTROL_PATH="\$system:$REFERENCE_EXTENSION_CONTROL_ROOT"
 
 PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); echo "PASS: $1"; }
@@ -260,7 +264,7 @@ max_value_indexes = 64
 max_prepared_transactions = 8
 ${DIFFERENTIAL_TRANSACTION_CONFIG}
 memtable_bytes = 256MiB
-extension_control_path = ${EXTENSION_CONTROL_ROOT}
+extension_control_path = ${EXTENSION_CONTROL_PATH}
 EOF
 printf '%s\n' 'Starting pos3ql'
 : > "$WORK/p3.log"
@@ -407,6 +411,7 @@ psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
   > "$WORK/foreign_extension.out" 2>&1
 cat > "$WORK/foreign_catalog.sql" <<'SQL'
 SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
 CREATE FOREIGN DATA WRAPPER pos3ql_catalog_fdw
   HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator;
 CREATE SERVER pos3ql_catalog_a TYPE 'postgresql' VERSION '18'
@@ -478,8 +483,7 @@ foreign_reference_status=$?
 psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 > "$WORK/foreign_pos3ql.out" 2>&1 <<SQL
 CREATE TYPE public.pos3ql_fdw_pair AS (code integer, label text);
-CREATE FOREIGN DATA WRAPPER postgres_fdw
-  HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator;
+CREATE EXTENSION postgres_fdw;
 CREATE SERVER reference_server FOREIGN DATA WRAPPER postgres_fdw
   OPTIONS (host '$PGHOST', port '$PGPORT', dbname 'postgres', sslmode 'disable');
 CREATE USER MAPPING FOR CURRENT_USER SERVER reference_server OPTIONS (user '$PGUSER');
@@ -881,7 +885,7 @@ psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 \
   -c 'DROP EXTENSION IF EXISTS pos3ql_ext CASCADE; DROP EXTENSION IF EXISTS pos3ql_base CASCADE; DROP SCHEMA IF EXISTS extension_dump CASCADE' \
   > "$WORK/extension_reference_clean.out" 2>&1
-PGOPTIONS="-c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
+PGOPTIONS="-c extension_control_path=$REFERENCE_EXTENSION_CONTROL_PATH" \
   psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
     -v ON_ERROR_STOP=1 -f "$WORK/extension.sql" \
     > "$WORK/extension_restore.out" 2>&1
@@ -1507,7 +1511,7 @@ run_corpus() { # host port outfile file diagnostics
     *) printf 'FAIL: unknown corpus diagnostics %s\n' "$diagnostics" >&2; return 1 ;;
   esac
   if [[ "$1" == "$PGHOST" && "$2" == "$PGPORT" ]]; then
-    PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
+    PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_PATH" \
       psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -e -P pager=off \
         -v VERBOSITY=verbose -f "$4" > "$3.stdout" 2> "$3.stderr" || status=$?
   else

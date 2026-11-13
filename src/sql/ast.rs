@@ -4646,6 +4646,23 @@ pub enum RoutineBody<'a> {
     String(&'a str),
     Return(&'a str),
     Atomic(&'a str),
+    /// `AS 'file' [, 'link symbol']` of a `LANGUAGE C` routine; without a
+    /// symbol the routine's name is its symbol.
+    Library {
+        file: &'a str,
+        symbol: Option<&'a str>,
+    },
+}
+
+impl<'a> RoutineBody<'a> {
+    /// The text `pg_proc.prosrc` keeps: a C routine's link symbol, which
+    /// defaults to the routine's `name`.
+    pub fn stored_text(self, name: &'a str) -> &'a str {
+        match self {
+            Self::String(body) | Self::Return(body) | Self::Atomic(body) => body,
+            Self::Library { symbol, .. } => symbol.unwrap_or(name),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4699,6 +4716,8 @@ pub enum RoutineVolatility {
 pub enum RoutineLanguage {
     Sql,
     PlPgSql,
+    /// Binds to a native routine pos3ql implements for a built-in module.
+    C,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

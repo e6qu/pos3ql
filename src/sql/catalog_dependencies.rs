@@ -149,30 +149,19 @@ pub(crate) fn for_each_dependency(
     for (_, entry) in storage.foreign_wrappers(txid) {
         let wrapper = entry.definition_for(txid);
         for routine in [
-            match wrapper.handler {
-                crate::storage::foreign::ForeignDataHandler::None => None,
-                crate::storage::foreign::ForeignDataHandler::Postgres => {
-                    Some("postgres_fdw_handler")
-                }
-            },
-            match wrapper.validator {
-                crate::storage::foreign::ForeignDataValidator::None => None,
-                crate::storage::foreign::ForeignDataValidator::Postgres => {
-                    Some("postgres_fdw_validator")
-                }
-            },
-        ]
-        .into_iter()
-        .flatten()
-        {
-            push!(
-                PG_FOREIGN_DATA_WRAPPER_OID,
-                entry.oid(),
-                PG_PROC_OID,
-                foreign_routine_oid(storage, txid, routine)?,
-                0,
-                "n",
-            )?;
+            wrapper.handler.routine_oid(),
+            wrapper.validator.routine_oid(),
+        ] {
+            if routine != 0 {
+                push!(
+                    PG_FOREIGN_DATA_WRAPPER_OID,
+                    entry.oid(),
+                    PG_PROC_OID,
+                    routine,
+                    0,
+                    "n",
+                )?;
+            }
         }
     }
     for (_, entry) in storage.foreign_servers(txid) {

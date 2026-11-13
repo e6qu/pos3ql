@@ -18707,7 +18707,9 @@ impl Engine {
             Ok(declaration) => declaration,
             Err(error) => return Ok(Err(error)),
         };
-        let check_body = guc.check_function_bodies();
+        // A C routine's body is its link symbol, checked as it resolved.
+        let check_body =
+            guc.check_function_bodies() && routine.language != ast::RoutineLanguage::C;
         let result = (|| {
             let _config = if declaration.body_kind == crate::storage::RoutineBodyKind::String {
                 match guc.enter_routine_configs(&declaration.configs[..declaration.config_count]) {
@@ -24693,8 +24695,11 @@ impl Engine {
                     | Stmt::ReleaseSavepoint(_)
                     | Stmt::RollbackToSavepoint(_)
                     | Stmt::CreateExtension { .. }
-                    | Stmt::AlterExtension { .. }
                     | Stmt::DropExtension { .. }
+            ) || matches!(
+                statement,
+                Stmt::AlterExtension { action, .. }
+                    if !matches!(action, ast::AlterExtensionAction::Member { .. })
             ) {
                 let _ = guc.set_config("search_path", Some(old_path.as_str()), true);
                 return Ok(Err(sql_err!(
@@ -25261,8 +25266,78 @@ impl Engine {
         })
     }
 
+    /// PostgreSQL's `DROP EXTENSION`: one dependency walk from the named
+    /// extensions decides `RESTRICT` and reports `CASCADE`, so an object that
+    /// depends on a member, but is not one, needs `CASCADE`. The members
+    /// themselves are dropped silently.
     #[allow(clippy::too_many_arguments)]
     fn drop_extension(
+        &mut self,
+        names: &[&str],
+        if_exists: bool,
+        cascade: bool,
+        arena: &Arena,
+        params: &[Datum],
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let mut originals = [catalog::dependencies::ObjectAddress::new(0, 0, 0);
+            crate::storage::MAX_EXTENSIONS];
+        let mut count = 0usize;
+        for name in names {
+            match self.storage.extension_slot(name, txn.txid) {
+                Some(slot) if count < originals.len() => {
+                    originals[count] = catalog::dependencies::ObjectAddress::new(
+                        catalog::PG_EXTENSION_OID,
+                        self.storage.extension(slot).oid(),
+                        0,
+                    );
+                    count += 1;
+                }
+                Some(_) => {
+                    return Ok(Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "DROP EXTENSION names more than {} extensions",
+                        crate::storage::MAX_EXTENSIONS
+                    )));
+                }
+                None if if_exists => {}
+                None => {
+                    return Ok(Err(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "extension \"{}\" does not exist",
+                        name
+                    )));
+                }
+            }
+        }
+        let report = exec::dependency_report::report_drop(
+            &self.storage,
+            txn.txid,
+            &originals[..count],
+            cascade,
+            arena,
+            responder,
+        );
+        match report {
+            Err(error) => Ok(Err(error)),
+            Ok(Some(filter)) => responder.with_dependency_report(filter, |responder| {
+                self.drop_extension_members(
+                    names, if_exists, cascade, arena, params, txn, sqlprep, cursors, guc,
+                    responder,
+                )
+            }),
+            Ok(None) => self.drop_extension_members(
+                names, if_exists, cascade, arena, params, txn, sqlprep, cursors, guc, responder,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drop_extension_members(
         &mut self,
         names: &[&str],
         if_exists: bool,

@@ -17848,11 +17848,24 @@ impl Engine {
                 }
             }
         }
-        // A data-modifying `WITH` hands its main write's completion over too:
-        // its unread queries run first, then every AFTER event runs on the
-        // engine, as PostgreSQL fires them at the statement's end.
+        // A data-modifying `WITH` whose main write reads every
+        // data-modifying query hands that write's completion over too, so
+        // their AFTER events run on the engine. Queries nothing reads run
+        // after the main write, so their statement keeps its own completion.
         let main_statement = match statement {
-            Stmt::With { statement, .. } => *statement,
+            Stmt::With { ctes, statement }
+                if !(0..ctes.len()).any(|index| {
+                    ctes[index].dml.is_some()
+                        && query::dml_cte_runs_after(
+                            ctes,
+                            index,
+                            query::CteReader::Statement(statement),
+                        )
+                }) =>
+            {
+                *statement
+            }
+            Stmt::With { .. } => statement,
             statement => statement,
         };
         let direct_relation = match main_statement {
@@ -19910,31 +19923,6 @@ impl Engine {
                 capture,
                 progress.as_deref_mut(),
             )?;
-            if let Err(error) = &outcome
-                && error.sqlstate == sqlstate::INTERNAL_ROUTINE_INVOCATION
-                && txn.pending_write_completion.is_some()
-            {
-                // The main write handed its completion to the caller, which
-                // fires the AFTER events after the unread queries run.
-                let unread = match progress.as_deref_mut() {
-                    Some(progress) => {
-                        progress.finish_step();
-                        progress.begin_step(1, false, txn, responder).map(|_| ())
-                    }
-                    None => Ok(()),
-                }
-                .and_then(|()| {
-                    self.run_unread_dml_ctes(
-                        ctes, main, dml_mats, txn, arena, params, guc, cursors, responder,
-                    )
-                });
-                if let Err(error) = unread {
-                    txn.pending_write_completion = None;
-                    let _sent = responder.truncate_to(output_mark);
-                    return Ok(Err(error));
-                }
-                return Ok(outcome);
-            }
             if outcome.is_err() {
                 return Ok(outcome);
             }

@@ -68,6 +68,6 @@ CREATE TRIGGER z BEFORE UPDATE ON p
 UPDATE p SET b = 'x';
 UPDATE p SET b = 'y';
 SELECT tgrelid::regclass, tgfoid::regproc FROM pg_trigger
-  WHERE tgname = 'z' ORDER BY 1::text;
+  WHERE tgname = 'z' ORDER BY tgrelid::regclass::text;
 DROP FUNCTION suppress_redundant_updates_trigger();
 DROP SCHEMA suppress_redundant CASCADE;

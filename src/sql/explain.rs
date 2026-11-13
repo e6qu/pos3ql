@@ -57,9 +57,40 @@ struct PlanNode {
     object_requests: u64,
     cache_blocks: u64,
     constant_false: bool,
+    qual_label: QualLabel,
+    qual: StackStr<512>,
+}
+
+/// The label PostgreSQL's EXPLAIN gives a node's qualification.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QualLabel {
+    None,
+    Filter,
+    HashCond,
+    JoinFilter,
+}
+
+impl QualLabel {
+    const fn text(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::Filter => "Filter",
+            Self::HashCond => "Hash Cond",
+            Self::JoinFilter => "Join Filter",
+        }
+    }
 }
 
 impl PlanNode {
+    /// This node with `qual` under `label`.
+    fn with_qual(mut self, label: QualLabel, qual: Option<StackStr<512>>) -> Self {
+        if let Some(qual) = qual {
+            self.qual_label = label;
+            self.qual = qual;
+        }
+        self
+    }
+
     const EMPTY: Self = Self {
         name: StackStr::new(),
         bitmap_index: StackStr::new(),
@@ -73,6 +104,8 @@ impl PlanNode {
         object_requests: 0,
         cache_blocks: 0,
         constant_false: false,
+        qual_label: QualLabel::None,
+        qual: StackStr::new(),
     };
 }
 
@@ -130,6 +163,394 @@ impl<'a> Plan<'a> {
                 .div_ceil(1024),
         )
     }
+}
+
+/// The most conjuncts a condition's EXPLAIN qualification is split into.
+const MAX_CONJUNCTS: usize = 32;
+
+/// `condition`'s AND conjuncts, or None when there are more than
+/// [`MAX_CONJUNCTS`].
+fn split_conjuncts<'e>(
+    condition: &'e Expr<'e>,
+    out: &mut [&'e Expr<'e>; MAX_CONJUNCTS],
+    count: &mut usize,
+) -> Option<()> {
+    match condition {
+        Expr::Binary {
+            operator: BinaryOp::And,
+            left,
+            right,
+            ..
+        } => {
+            split_conjuncts(left, out, count)?;
+            split_conjuncts(right, out, count)
+        }
+        _ => {
+            *out.get_mut(*count)? = condition;
+            *count += 1;
+            Some(())
+        }
+    }
+}
+
+/// The relations (bit per relation) an expression reads, as `resolve` maps
+/// each column reference. None when it reads anything else, such as a
+/// subquery or a name `resolve` cannot place.
+fn relation_mask(
+    expression: &Expr<'_>,
+    resolve: &dyn Fn(Option<&str>, &str) -> Option<usize>,
+) -> Option<u64> {
+    if expression.contains_subquery() {
+        return None;
+    }
+    let mut mask = 0u64;
+    let mut placed = true;
+    expression.for_each_column_reference(&mut |qualifier, name| match resolve(qualifier, name) {
+        Some(relation) if relation < 64 => mask |= 1 << relation,
+        _ => placed = false,
+    });
+    placed.then_some(mask)
+}
+
+/// Whether PostgreSQL's planner turns `conjunct` into an equivalence class
+/// (an equality between columns or between a column and a constant), whose
+/// clauses it regenerates after the scan's other restrictions.
+fn equivalence_clause(conjunct: &Expr<'_>) -> bool {
+    let operand = |side: &Expr<'_>| {
+        matches!(
+            side,
+            Expr::Column { .. }
+                | Expr::Int(_)
+                | Expr::Str(_)
+                | Expr::Float(_)
+                | Expr::NumericLit(_)
+                | Expr::Bool(_)
+        )
+    };
+    matches!(conjunct, Expr::Binary { operator: BinaryOp::Eq, left, right, .. }
+        if operand(left) && operand(right)
+            && (matches!(left, Expr::Column { .. }) || matches!(right, Expr::Column { .. })))
+}
+
+/// PostgreSQL's order of a scan's restrictions: the others as written, then
+/// the equivalence-class equalities in the order they were written.
+fn order_restrictions(conjuncts: &mut [&Expr<'_>]) {
+    let mut ordered = 0;
+    for index in 0..conjuncts.len() {
+        if !equivalence_clause(conjuncts[index]) {
+            conjuncts[ordered..=index].rotate_right(1);
+            ordered += 1;
+        }
+    }
+}
+
+/// PostgreSQL's EXPLAIN text of `conjuncts` combined with AND: each
+/// deparsed as `ruleutils.c` prints a qualification. None when one of them
+/// is outside the deparser's coverage.
+fn deparse_qual(
+    context: &crate::sql::catalog::deparse::Context<'_>,
+    conjuncts: &[&Expr<'_>],
+    arena: &Arena,
+) -> Result<Option<StackStr<512>>, SqlError> {
+    if conjuncts.is_empty() {
+        return Ok(None);
+    }
+    let mark = arena.mark();
+    let result = (|| {
+        let mut text = StackStr::<512>::new();
+        if conjuncts.len() > 1 {
+            let _ = write!(text, "(");
+        }
+        for (index, conjunct) in conjuncts.iter().enumerate() {
+            let Some(part) = crate::sql::catalog::deparse::deparse_expression(
+                context,
+                conjunct,
+                crate::sql::catalog::deparse::Destination::Condition,
+                arena,
+            )?
+            else {
+                return Ok(None);
+            };
+            if index != 0 {
+                let _ = write!(text, " AND ");
+            }
+            let _ = write!(text, "{part}");
+        }
+        if conjuncts.len() > 1 {
+            let _ = write!(text, ")");
+        }
+        Ok((!text.is_truncated()).then_some(text))
+    })();
+    // SAFETY: the text was copied out of the arena.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
+
+/// A comparison of two relations' columns with the outer relation's side
+/// first, as PostgreSQL prints a hash join's condition.
+fn equijoin<'e>(
+    conjunct: &'e Expr<'e>,
+    resolve: &dyn Fn(Option<&str>, &str) -> Option<usize>,
+    outer: usize,
+    arena: &'e Arena,
+) -> Result<Option<&'e Expr<'e>>, SqlError> {
+    let Expr::Binary {
+        operator: BinaryOp::Eq,
+        left,
+        right,
+        source_position,
+    } = conjunct
+    else {
+        return Ok(None);
+    };
+    let side = |expression: &Expr<'_>| match expression {
+        Expr::Column { qualifier, name } => resolve(*qualifier, name),
+        _ => None,
+    };
+    match (side(left), side(right)) {
+        (Some(a), Some(b)) if a == outer && b != outer => Ok(Some(conjunct)),
+        (Some(a), Some(b)) if b == outer && a != outer => {
+            let swapped = arena
+                .alloc(Expr::Binary {
+                    source_position: *source_position,
+                    operator: BinaryOp::Eq,
+                    left: right,
+                    right: left,
+                })
+                .map_err(|_| arena_full())?;
+            Ok(Some(&*swapped))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The qualifications PostgreSQL attaches to a join of two relations: each
+/// relation's own conjuncts as its scan's filter, and the conjuncts reading
+/// both as the join's hash condition (equalities, under a hash join) or join
+/// filter. None when a conjunct cannot be placed.
+struct JoinQuals {
+    filters: [Option<StackStr<512>>; 2],
+    hash_cond: Option<StackStr<512>>,
+    join_filter: Option<StackStr<512>>,
+}
+
+fn two_relation_quals<'a>(
+    storage: &Storage,
+    txid: u32,
+    relations: [(&'a str, &'a crate::storage::TableDef); 2],
+    condition: Option<&'a Expr<'a>>,
+    hash: bool,
+    arena: &'a Arena,
+) -> Result<Option<JoinQuals>, SqlError> {
+    let mut quals = JoinQuals {
+        filters: [None, None],
+        hash_cond: None,
+        join_filter: None,
+    };
+    let Some(condition) = condition else {
+        return Ok(Some(quals));
+    };
+    let resolve = |qualifier: Option<&str>, name: &str| -> Option<usize> {
+        let has = |table: &crate::storage::TableDef| {
+            table
+                .columns()
+                .iter()
+                .any(|column| column.name.as_str() == name)
+        };
+        match qualifier {
+            Some(qualifier) => relations
+                .iter()
+                .position(|(exposed, table)| *exposed == qualifier && has(table)),
+            None => match (has(relations[0].1), has(relations[1].1)) {
+                (true, false) => Some(0),
+                (false, true) => Some(1),
+                _ => None,
+            },
+        }
+    };
+    let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
+    let mut count = 0;
+    if split_conjuncts(condition, &mut conjuncts, &mut count).is_none() {
+        return Ok(None);
+    }
+    let mut own: [[&Expr<'_>; MAX_CONJUNCTS]; 2] = [[&Expr::Null; MAX_CONJUNCTS]; 2];
+    let mut own_count = [0usize; 2];
+    let mut hash_conds = [&Expr::Null; MAX_CONJUNCTS];
+    let mut hash_count = 0;
+    let mut joins = [&Expr::Null; MAX_CONJUNCTS];
+    let mut join_count = 0;
+    // PostgreSQL's equivalence classes: a column equal to another
+    // relation's column that a constant fixes is fixed by that constant too,
+    // and the join equality is then implied rather than checked.
+    let constant_of = |relation: usize, column: &Expr<'_>| -> Option<&'a Expr<'a>> {
+        let Expr::Column { name, .. } = column else {
+            return None;
+        };
+        conjuncts[..count].iter().find_map(|conjunct| {
+            let Expr::Binary {
+                operator: BinaryOp::Eq,
+                left,
+                right,
+                ..
+            } = conjunct
+            else {
+                return None;
+            };
+            let same = |side: &Expr<'_>| {
+                matches!(side, Expr::Column { qualifier, name: other }
+                    if other == name && resolve(*qualifier, other) == Some(relation))
+            };
+            let constant = |side: &'a Expr<'a>| {
+                matches!(
+                    side,
+                    Expr::Int(_)
+                        | Expr::Str(_)
+                        | Expr::Float(_)
+                        | Expr::NumericLit(_)
+                        | Expr::Bool(_)
+                )
+                .then_some(side)
+            };
+            if same(left) {
+                constant(right)
+            } else if same(right) {
+                constant(left)
+            } else {
+                None
+            }
+        })
+    };
+    for conjunct in &conjuncts[..count] {
+        match relation_mask(conjunct, &resolve) {
+            Some(1) => {
+                own[0][own_count[0]] = conjunct;
+                own_count[0] += 1;
+            }
+            Some(2) => {
+                own[1][own_count[1]] = conjunct;
+                own_count[1] += 1;
+            }
+            Some(3)
+                if let Some(Expr::Binary {
+                    operator: BinaryOp::Eq,
+                    left,
+                    right,
+                    ..
+                }) = equijoin(conjunct, &resolve, 0, arena)?
+                    && let Some((fixed, constant)) = constant_of(1, right)
+                        .map(|constant| (0usize, constant))
+                        .or_else(|| constant_of(0, left).map(|constant| (1usize, constant))) =>
+            {
+                let column = if fixed == 0 { *left } else { *right };
+                let derived = &*arena
+                    .alloc(Expr::Binary {
+                        source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                        operator: BinaryOp::Eq,
+                        left: column,
+                        right: constant,
+                    })
+                    .map_err(|_| arena_full())?;
+                if own_count[fixed] == MAX_CONJUNCTS {
+                    return Ok(None);
+                }
+                own[fixed][own_count[fixed]] = derived;
+                own_count[fixed] += 1;
+            }
+            Some(3) => match equijoin(conjunct, &resolve, 0, arena)? {
+                Some(equality) if hash => {
+                    hash_conds[hash_count] = equality;
+                    hash_count += 1;
+                }
+                _ => {
+                    joins[join_count] = conjunct;
+                    join_count += 1;
+                }
+            },
+            _ => return Ok(None),
+        }
+    }
+    for (index, (exposed, table)) in relations.iter().enumerate() {
+        order_restrictions(&mut own[index][..own_count[index]]);
+        let joined = [crate::sql::catalog::deparse::Joined::new(exposed, table)];
+        let context = crate::sql::catalog::deparse::Context {
+            storage,
+            txid,
+            table: Some(table),
+            parameters: &[],
+            joined: &joined,
+            pretty: false,
+            qualify: false,
+        };
+        quals.filters[index] = deparse_qual(&context, &own[index][..own_count[index]], arena)?;
+        if own_count[index] != 0 && quals.filters[index].is_none() {
+            return Ok(None);
+        }
+    }
+    let joined = [
+        crate::sql::catalog::deparse::Joined::new(relations[0].0, relations[0].1),
+        crate::sql::catalog::deparse::Joined::new(relations[1].0, relations[1].1),
+    ];
+    let context = crate::sql::catalog::deparse::Context {
+        storage,
+        txid,
+        table: None,
+        parameters: &[],
+        joined: &joined,
+        pretty: false,
+        qualify: true,
+    };
+    quals.hash_cond = deparse_qual(&context, &hash_conds[..hash_count], arena)?;
+    quals.join_filter = deparse_qual(&context, &joins[..join_count], arena)?;
+    if (hash_count != 0 && quals.hash_cond.is_none())
+        || (join_count != 0 && quals.join_filter.is_none())
+    {
+        return Ok(None);
+    }
+    Ok(Some(quals))
+}
+
+/// The filter of a scan of one relation reading `condition`, when every
+/// conjunct reads only that relation.
+fn single_relation_filter<'a>(
+    storage: &Storage,
+    txid: u32,
+    exposed: &'a str,
+    table: &'a crate::storage::TableDef,
+    condition: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+) -> Result<Option<StackStr<512>>, SqlError> {
+    let Some(condition) = condition else {
+        return Ok(None);
+    };
+    let resolve = |qualifier: Option<&str>, name: &str| -> Option<usize> {
+        (qualifier.is_none_or(|qualifier| qualifier == exposed)
+            && table
+                .columns()
+                .iter()
+                .any(|column| column.name.as_str() == name))
+        .then_some(0)
+    };
+    let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
+    let mut count = 0;
+    if split_conjuncts(condition, &mut conjuncts, &mut count).is_none()
+        || conjuncts[..count]
+            .iter()
+            .any(|conjunct| relation_mask(conjunct, &resolve).is_none())
+    {
+        return Ok(None);
+    }
+    order_restrictions(&mut conjuncts[..count]);
+    let joined = [crate::sql::catalog::deparse::Joined::new(exposed, table)];
+    let context = crate::sql::catalog::deparse::Context {
+        storage,
+        txid,
+        table: Some(table),
+        parameters: &[],
+        joined: &joined,
+        pretty: false,
+        qualify: false,
+    };
+    deparse_qual(&context, &conjuncts[..count], arena)
 }
 
 fn push_scan(plan: &mut Plan<'_>, scan: PlanNode) -> Result<(), SqlError> {
@@ -869,6 +1290,8 @@ fn scan_node<'a>(
         object_requests,
         cache_blocks,
         constant_false: false,
+        qual_label: QualLabel::None,
+        qual: StackStr::new(),
     })
 }
 
@@ -1196,6 +1619,57 @@ pub(super) fn plan_select<'a>(
             },
         )?;
     }
+    // The WHERE conjuncts PostgreSQL attaches to each scan and to the join
+    // of two relations, when every conjunct can be placed and printed.
+    let mut filters: [Option<StackStr<512>>; 2] = [None, None];
+    // Two relations, joined by a comma, CROSS JOIN or an inner join's ON
+    // condition, which PostgreSQL merges with the WHERE conjuncts.
+    let two_way = scope.as_ref().is_some_and(|scope| {
+        scope.n == 2
+            && statement.from.as_ref().is_some_and(|from| {
+                from.joins.iter().all(|join| {
+                    join.kind.is_cross()
+                        || (join.kind == crate::sql::ast::JoinKind::Inner
+                            && join.using.is_none()
+                            && !join.natural)
+                }) && !scope.lateral[..scope.n].iter().any(|&lateral| lateral)
+            })
+    });
+    let mut join_condition = statement.where_clause;
+    if two_way && let Some(from) = statement.from.as_ref() {
+        for join in from.joins {
+            join_condition = query::and_where(join_condition, join.on, arena)?;
+        }
+    }
+    if let Some(scope) = &scope {
+        let relation = |table: usize| {
+            scope
+                .defs
+                .stored(table)
+                .map(|def| (scope.names[table], def))
+        };
+        if scope.n == 1
+            && let Some((exposed, def)) = relation(0)
+        {
+            filters[0] =
+                single_relation_filter(storage, txid, exposed, def, statement.where_clause, arena)?;
+        } else if two_way
+            && let (Some(outer), Some(inner)) = (relation(table_order[0]), relation(table_order[1]))
+            && let Some(quals) = two_relation_quals(
+                storage,
+                txid,
+                [outer, inner],
+                join_condition,
+                hash_join,
+                arena,
+            )?
+        {
+            filters = quals.filters;
+            stages[0] = stages[0]
+                .with_qual(QualLabel::HashCond, quals.hash_cond)
+                .with_qual(QualLabel::JoinFilter, quals.join_filter);
+        }
+    }
     for (depth, stage) in stages[..stage_count].iter().rev().enumerate() {
         let mut stage = *stage;
         stage.depth = depth as u8;
@@ -1203,7 +1677,7 @@ pub(super) fn plan_select<'a>(
         plan.push(stage)?;
     }
     if let Some(scope) = &scope {
-        for &table in &table_order[..scope.n] {
+        for (position, &table) in table_order[..scope.n].iter().enumerate() {
             let mut scan = scan_node(
                 storage,
                 scope,
@@ -1217,6 +1691,33 @@ pub(super) fn plan_select<'a>(
                 ordered_index_only,
             )?;
             scan.output = output;
+            let sequential = scan.name.as_str() == "Seq Scan";
+            if sequential && position < 2 {
+                scan = scan.with_qual(QualLabel::Filter, filters[position].take());
+            }
+            if two_way && position == 1 {
+                // A hash join hashes its inner relation; a nested loop
+                // rescans its inner sequential scan from a materialized copy.
+                let wrapper = if hash_join {
+                    Some("Hash")
+                } else {
+                    sequential.then_some("Materialize")
+                };
+                if let Some(wrapper) = wrapper {
+                    plan.push(PlanNode {
+                        name: StackStr::from_str(wrapper),
+                        depth: scan.depth,
+                        total_cost: scan.total_cost,
+                        rows: scan.rows,
+                        width: scan.width,
+                        object_requests: scan.object_requests,
+                        cache_blocks: scan.cache_blocks,
+                        output: scan.output,
+                        ..PlanNode::EMPTY
+                    })?;
+                    scan.depth += 1;
+                }
+            }
             push_scan(&mut plan, scan)?;
         }
     }
@@ -1304,6 +1805,8 @@ fn physical_scan_node(
         object_requests,
         cache_blocks,
         constant_false: false,
+        qual_label: QualLabel::None,
+        qual: StackStr::new(),
     }
 }
 
@@ -1364,6 +1867,8 @@ fn push_set_tree(
                 object_requests: left.object_requests.saturating_add(right.object_requests),
                 cache_blocks: left.cache_blocks.saturating_add(right.cache_blocks),
                 constant_false: false,
+                qual_label: QualLabel::None,
+                qual: StackStr::new(),
             };
             plan.nodes[at] = node;
             Ok(node)
@@ -1517,6 +2022,8 @@ pub(super) fn plan_modification<'a>(
         object_requests: 0,
         cache_blocks: 0,
         constant_false: false,
+        qual_label: QualLabel::None,
+        qual: StackStr::new(),
     };
     plan.push(target_node)?;
     if let Some(from) = joined_from {
@@ -1576,7 +2083,7 @@ pub(super) fn plan_modification<'a>(
             cache_blocks = cache_blocks.saturating_add(node.cache_blocks);
             source_nodes[table] = node;
         }
-        let join = PlanNode {
+        let mut join = PlanNode {
             name: StackStr::from_str("Nested Loop"),
             depth: 1,
             total_cost: total_cost + rows as f64 * 0.01,
@@ -1586,10 +2093,48 @@ pub(super) fn plan_modification<'a>(
             cache_blocks,
             ..PlanNode::EMPTY
         };
+        let mut target_scan = target_scan;
+        // One source: the target and source scans' filters and the join
+        // filter, and the source rescanned from a materialized copy.
+        let target_definition = storage.table_def(target_slot, txid);
+        let single_source = scope.n == 1 && source_nodes[0].name.as_str() == "Seq Scan";
+        if single_source
+            && let Some(source) = scope.defs.stored(0)
+            && let Some(quals) = two_relation_quals(
+                storage,
+                txid,
+                [
+                    (alias.unwrap_or(target.name), &target_definition),
+                    (scope.names[0], source),
+                ],
+                predicate,
+                false,
+                arena,
+            )?
+        {
+            let [target_filter, source_filter] = quals.filters;
+            target_scan = target_scan.with_qual(QualLabel::Filter, target_filter);
+            source_nodes[0] = source_nodes[0].with_qual(QualLabel::Filter, source_filter);
+            join = join.with_qual(QualLabel::JoinFilter, quals.join_filter);
+        }
         plan.push(join)?;
         push_scan(&mut plan, target_scan)?;
         for &table in &order[..scope.n] {
-            push_scan(&mut plan, source_nodes[table])?;
+            let mut node = source_nodes[table];
+            if single_source {
+                plan.push(PlanNode {
+                    name: StackStr::from_str("Materialize"),
+                    depth: node.depth,
+                    total_cost: node.total_cost,
+                    rows: node.rows,
+                    width: node.width,
+                    object_requests: node.object_requests,
+                    cache_blocks: node.cache_blocks,
+                    ..PlanNode::EMPTY
+                })?;
+                node.depth += 1;
+            }
+            push_scan(&mut plan, node)?;
         }
         plan.nodes[0].total_cost = join.total_cost;
         plan.nodes[0].object_requests = join.object_requests;
@@ -1673,7 +2218,22 @@ pub(super) fn plan_modification<'a>(
                     plan.method(),
                 )
             });
-            physical_scan_node(storage, slot, target.name, filtered, txid, 1, index_name)
+            let scan =
+                physical_scan_node(storage, slot, target.name, filtered, txid, 1, index_name);
+            if scan.name.as_str() == "Seq Scan" {
+                let definition = storage.table_def(slot, txid);
+                let filter = single_relation_filter(
+                    storage,
+                    txid,
+                    alias.unwrap_or(target.name),
+                    &definition,
+                    predicate,
+                    arena,
+                )?;
+                scan.with_qual(QualLabel::Filter, filter)
+            } else {
+                scan
+            }
         };
         push_scan(&mut plan, child)?;
         child
@@ -1697,6 +2257,16 @@ pub(super) fn plan_modification<'a>(
     Ok(plan)
 }
 
+/// The column a node's property lines (`Filter:`, `Output:`) start at: two
+/// past the root, six past a child's `->  ` arrow.
+fn property_indent(depth: u8) -> usize {
+    if depth == 0 {
+        2
+    } else {
+        6 * usize::from(depth) + 2
+    }
+}
+
 fn text_line(
     node: &PlanNode,
     options: ExplainOptions,
@@ -1704,10 +2274,12 @@ fn text_line(
     root: bool,
 ) -> StackStr<512> {
     let mut line = StackStr::new();
-    for _ in 0..node.depth {
-        let _ = write!(line, "  ");
-    }
+    // PostgreSQL indents each child's `->  ` arrow six columns past its
+    // parent's, starting two columns in.
     if node.depth > 0 {
+        for _ in 0..property_indent(node.depth) - 6 {
+            let _ = write!(line, " ");
+        }
         let _ = write!(line, "->  ");
     }
     let _ = write!(line, "{}", node.name.as_str());
@@ -1762,16 +2334,24 @@ pub(super) fn visit_text_rows<E>(
         emit(line.as_str())?;
         if options.verbose && !node.output.as_str().is_empty() {
             let mut output = StackStr::<512>::new();
-            for _ in 0..=node.depth {
-                let _ = write!(output, "  ");
+            for _ in 0..property_indent(node.depth) {
+                let _ = write!(output, " ");
             }
             let _ = write!(output, "Output: {}", node.output.as_str());
             emit(output.as_str())?;
         }
+        if node.qual_label != QualLabel::None {
+            let mut qual = StackStr::<600>::new();
+            for _ in 0..property_indent(node.depth) {
+                let _ = write!(qual, " ");
+            }
+            let _ = write!(qual, "{}: {}", node.qual_label.text(), node.qual.as_str());
+            emit(qual.as_str())?;
+        }
         if node.constant_false {
             let mut filter = StackStr::<64>::new();
-            for _ in 0..=node.depth {
-                let _ = write!(filter, "  ");
+            for _ in 0..property_indent(node.depth) {
+                let _ = write!(filter, " ");
             }
             let _ = write!(filter, "One-Time Filter: false");
             emit(filter.as_str())?;
@@ -2062,6 +2642,12 @@ fn render_json_node(
         }
         let _ = write!(out, "]");
     }
+    if node.qual_label != QualLabel::None {
+        let _ = write!(out, ",");
+        json_string(out, node.qual_label.text());
+        let _ = write!(out, ":");
+        json_string(out, node.qual.as_str());
+    }
     if node.constant_false {
         let _ = write!(out, ",\"One-Time Filter\":\"false\"");
     }
@@ -2232,6 +2818,13 @@ fn render_xml_node(
         }
         let _ = write!(out, "</Output>");
     }
+    if node.qual_label != QualLabel::None {
+        let mut name = StackStr::<16>::new();
+        for character in node.qual_label.text().chars() {
+            let _ = write!(name, "{}", if character == ' ' { '-' } else { character });
+        }
+        xml_field(out, name.as_str(), node.qual.as_str());
+    }
     if node.constant_false {
         xml_field(out, "One-Time-Filter", "false");
     }
@@ -2378,6 +2971,14 @@ fn render_yaml_node(
             json_string(out, column);
             let _ = writeln!(out);
         }
+    }
+    if node.qual_label != QualLabel::None {
+        yaml_field(
+            out,
+            field_indent,
+            node.qual_label.text(),
+            node.qual.as_str(),
+        );
     }
     if node.constant_false {
         yaml_field(out, field_indent, "One-Time Filter", "false");
@@ -2580,6 +3181,365 @@ pub(super) fn visit_plan_rows(
     }
     let document = render_document(plan, options, actual, settings)?;
     emit(document.as_str())
+}
+
+/// An expression rewrite's failure: the arena filled, or the rewrite's own
+/// error.
+struct RewriteFailure(SqlError);
+
+impl From<crate::mem::arena::ArenaFull> for RewriteFailure {
+    fn from(_: crate::mem::arena::ArenaFull) -> Self {
+        Self(arena_full())
+    }
+}
+
+/// The statements a rewrite rule turns a data-changing statement into, in
+/// PostgreSQL's order: for `INSERT` the original first, for `UPDATE` and
+/// `DELETE` the rule actions first. Each action reads the original
+/// relation's rows under the original's condition, with `OLD` and `NEW`
+/// replaced by that row and its new values. None when no rule applies.
+fn rule_rewritten_statements<'a>(
+    storage: &Storage,
+    txid: u32,
+    statement: &'a Stmt<'a>,
+    arena: &'a Arena,
+) -> Result<Option<&'a [&'a Stmt<'a>]>, SqlError> {
+    use crate::storage::{RewriteEvent, RewriteMode, RuleTarget};
+    let (table, alias, event, condition) = match statement {
+        Stmt::Insert(insert) => (insert.table, insert.alias, RewriteEvent::Insert, None),
+        Stmt::Update(update) => (
+            update.table,
+            update.alias,
+            RewriteEvent::Update,
+            update.where_clause,
+        ),
+        Stmt::Delete(delete) => (
+            delete.table,
+            delete.alias,
+            RewriteEvent::Delete,
+            delete.where_clause,
+        ),
+        _ => return Ok(None),
+    };
+    let Some(crate::storage::ResolvedRelation::Table(slot)) =
+        storage.resolve_relation(table.schema, table.name, txid)
+    else {
+        return Ok(None);
+    };
+    let target = RuleTarget::Table(slot as u16);
+    if storage
+        .firing_rules_for(target, event, false, txid)
+        .next()
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let unsupported = |what: &str| {
+        sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN of a statement a rewrite rule changes is not supported for {}",
+            what
+        )
+    };
+    let definition = storage.table_def(slot, txid);
+    let exposed = alias.unwrap_or(table.name);
+    // A relation's unqualified columns named through its FROM item, as a
+    // rewritten action reads both its own target and the original relation.
+    let qualify_with = |expression: &'a Expr<'a>,
+                        relation: &crate::storage::TableDef,
+                        exposed: &'a str|
+     -> Result<&'a Expr<'a>, SqlError> {
+        crate::sql::ast::rewrite_expression(expression, arena, &mut |node: &'a Expr<'a>| -> Result<
+            Option<&'a Expr<'a>>,
+            RewriteFailure,
+        > {
+            Ok(match node {
+                Expr::Column {
+                    qualifier: None,
+                    name,
+                } if relation.column_index(name).is_some() => {
+                    Some(&*arena.alloc(Expr::Column {
+                        qualifier: Some(exposed),
+                        name,
+                    })?)
+                }
+                _ => None,
+            })
+        })
+        .map_err(|RewriteFailure(error)| error)
+    };
+    let qualify = |expression: &'a Expr<'a>| qualify_with(expression, &definition, exposed);
+    // An action's own target columns, before the original relation joins it.
+    let qualify_action = |expression: &'a Expr<'a>,
+                          action_table: crate::sql::ast::QualName<'a>|
+     -> Result<&'a Expr<'a>, SqlError> {
+        match storage.resolve_relation(action_table.schema, action_table.name, txid) {
+            Some(crate::storage::ResolvedRelation::Table(action_slot)) => qualify_with(
+                expression,
+                &storage.table_def(action_slot, txid),
+                action_table.name,
+            ),
+            _ => Err(unsupported("an action on a view")),
+        }
+    };
+    let old_value = |name: &'a str| -> Result<&'a Expr<'a>, SqlError> {
+        Ok(&*arena
+            .alloc(Expr::Column {
+                qualifier: Some(exposed),
+                name,
+            })
+            .map_err(|_| arena_full())?)
+    };
+    let new_value = |name: &'a str| -> Result<&'a Expr<'a>, SqlError> {
+        match statement {
+            Stmt::Update(update) => match update
+                .assignments
+                .iter()
+                .find(|(assigned, _)| *assigned == name)
+            {
+                Some((_, value)) => qualify(value),
+                None => old_value(name),
+            },
+            Stmt::Insert(insert) => {
+                let [row] = insert.rows else {
+                    return Err(unsupported("an INSERT of several or selected rows"));
+                };
+                let position = if insert.columns.is_empty() {
+                    definition.column_index(name)
+                } else {
+                    insert.columns.iter().position(|column| *column == name)
+                };
+                match position.and_then(|position| row.get(position)) {
+                    Some(Expr::DefaultMarker) => Err(unsupported("an inserted DEFAULT")),
+                    Some(value) => Ok(value),
+                    None => Ok(&Expr::Null),
+                }
+            }
+            _ => Err(unsupported("NEW in a DELETE rule")),
+        }
+    };
+    let substitute = |expression: &'a Expr<'a>| -> Result<&'a Expr<'a>, SqlError> {
+        crate::sql::ast::rewrite_expression(expression, arena, &mut |node: &'a Expr<'a>| -> Result<
+            Option<&'a Expr<'a>>,
+            RewriteFailure,
+        > {
+            match node {
+                Expr::Column {
+                    qualifier: Some(qualifier),
+                    name,
+                } if qualifier.eq_ignore_ascii_case("old") => {
+                    old_value(name).map(Some).map_err(RewriteFailure)
+                }
+                Expr::Column {
+                    qualifier: Some(qualifier),
+                    name,
+                } if qualifier.eq_ignore_ascii_case("new") => {
+                    new_value(name).map(Some).map_err(RewriteFailure)
+                }
+                _ => Ok(None),
+            }
+        })
+        .map_err(|RewriteFailure(error)| error)
+    };
+    let source = (event != RewriteEvent::Insert).then(|| crate::sql::ast::FromClause {
+        base: query::rule_relation_ref(table, alias),
+        joins: &[],
+    });
+    let original_condition = condition.map(qualify).transpose()?;
+    let mut actions = crate::mem::arena::ArenaList::new(arena);
+    let mut suppressed = false;
+    let mut exclusions: Option<&'a Expr<'a>> = None;
+    for (_, rule) in storage.firing_rules_for(target, event, false, txid) {
+        let rule = rule.definition_for(txid);
+        let rule_condition = match rule.condition_sql() {
+            Some(sql) => {
+                let sql = arena.alloc_str(sql).map_err(|_| arena_full())?;
+                Some(substitute(crate::sql::parser::parse_expr(sql, arena)?)?)
+            }
+            None => None,
+        };
+        if rule.mode == RewriteMode::Instead {
+            match rule_condition {
+                None => suppressed = true,
+                Some(rule_condition) => {
+                    let negated = arena
+                        .alloc(Expr::Unary {
+                            source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                            operator: crate::sql::ast::UnaryOp::Not,
+                            operand: rule_condition,
+                        })
+                        .map_err(|_| arena_full())?;
+                    exclusions = query::and_where(exclusions, Some(negated), arena)?;
+                }
+            }
+        }
+        let filter = query::and_where(original_condition, rule_condition, arena)?;
+        for action in rule.action_sql() {
+            let action = arena.alloc_str(action).map_err(|_| arena_full())?;
+            let action = crate::sql::parser::parse_stored_statement(action, arena)?;
+            let rewritten: Stmt<'a> = match *action {
+                Stmt::Notify { .. } => *action,
+                Stmt::Insert(insert)
+                    if insert.select.is_none()
+                        && insert.rows.len() == 1
+                        && insert.returning.is_empty() =>
+                {
+                    let row = insert.rows[0];
+                    let items = arena
+                        .alloc_slice_with(row.len(), |_| {
+                            SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN)
+                        })
+                        .map_err(|_| arena_full())?;
+                    let mut values = crate::mem::arena::ArenaList::new(arena);
+                    for (item, value) in items.iter_mut().zip(row) {
+                        let value = substitute(value)?;
+                        *item = SelectItem::Expr {
+                            expression: value,
+                            alias: None,
+                        };
+                        values.push(value).map_err(|_| arena_full())?;
+                    }
+                    if source.is_none() && filter.is_none() {
+                        let row = arena
+                            .alloc_slice_copy(values.as_slice())
+                            .map_err(|_| arena_full())?;
+                        let rows = arena
+                            .alloc_slice_with(1, |_| &*row)
+                            .map_err(|_| arena_full())?;
+                        Stmt::Insert(crate::sql::ast::Insert { rows, ..insert })
+                    } else {
+                        let select = arena
+                            .alloc(query::rule_select(items, source, filter))
+                            .map_err(|_| arena_full())?;
+                        Stmt::Insert(crate::sql::ast::Insert {
+                            rows: &[],
+                            select: Some(select),
+                            ..insert
+                        })
+                    }
+                }
+                Stmt::Update(update) if update.from.is_none() && update.returning.is_empty() => {
+                    let assignments = arena
+                        .alloc_slice_with(update.assignments.len(), |index| {
+                            update.assignments[index]
+                        })
+                        .map_err(|_| arena_full())?;
+                    for (_, value) in assignments.iter_mut() {
+                        *value = substitute(qualify_action(value, update.table)?)?;
+                    }
+                    let own = update
+                        .where_clause
+                        .map(|own| substitute(qualify_action(own, update.table)?))
+                        .transpose()?;
+                    let from = match source {
+                        Some(source) => Some(&*arena.alloc(source).map_err(|_| arena_full())?),
+                        None => None,
+                    };
+                    Stmt::Update(crate::sql::ast::Update {
+                        assignments,
+                        from,
+                        where_clause: query::and_where(own, filter, arena)?,
+                        ..update
+                    })
+                }
+                Stmt::Delete(delete) if delete.using.is_none() && delete.returning.is_empty() => {
+                    let own = delete
+                        .where_clause
+                        .map(|own| substitute(qualify_action(own, delete.table)?))
+                        .transpose()?;
+                    let using = match source {
+                        Some(source) => Some(&*arena.alloc(source).map_err(|_| arena_full())?),
+                        None => None,
+                    };
+                    Stmt::Delete(crate::sql::ast::Delete {
+                        using,
+                        where_clause: query::and_where(own, filter, arena)?,
+                        ..delete
+                    })
+                }
+                _ => return Err(unsupported("this rule action")),
+            };
+            let rewritten = &*arena.alloc(rewritten).map_err(|_| arena_full())?;
+            actions.push(rewritten).map_err(|_| arena_full())?;
+        }
+    }
+    let original = if suppressed {
+        None
+    } else if let Some(exclusions) = exclusions {
+        let rewritten = match statement {
+            Stmt::Update(update) => Stmt::Update(crate::sql::ast::Update {
+                where_clause: query::and_where(update.where_clause, Some(exclusions), arena)?,
+                ..*update
+            }),
+            Stmt::Delete(delete) => Stmt::Delete(crate::sql::ast::Delete {
+                where_clause: query::and_where(delete.where_clause, Some(exclusions), arena)?,
+                ..*delete
+            }),
+            _ => return Err(unsupported("a conditional INSTEAD rule on INSERT")),
+        };
+        Some(&*arena.alloc(rewritten).map_err(|_| arena_full())?)
+    } else {
+        Some(statement)
+    };
+    let actions = actions.as_slice();
+    let count = actions.len() + usize::from(original.is_some());
+    let ordered = arena
+        .alloc_slice_with(count, |_| statement)
+        .map_err(|_| arena_full())?;
+    let (first, rest) = if event == RewriteEvent::Insert {
+        (0, usize::from(original.is_some()))
+    } else {
+        (actions.len(), 0)
+    };
+    if let Some(original) = original {
+        ordered[first] = original;
+    }
+    ordered[rest..rest + actions.len()].copy_from_slice(actions);
+    Ok(Some(ordered))
+}
+
+/// EXPLAIN of a data-changing statement a rewrite rule changes: each
+/// statement the rule produces planned in turn, separated by an empty line.
+/// Returns false when no rule applies.
+pub(super) fn emit_rewritten_plans(
+    storage: &Storage,
+    txid: u32,
+    statement: &Stmt<'_>,
+    options: ExplainOptions,
+    settings: &PlannerSettings,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Result<Result<bool, SqlError>, WireFull> {
+    let statements = match rule_rewritten_statements(storage, txid, statement, arena) {
+        Ok(Some(statements)) => statements,
+        Ok(None) => return Ok(Ok(false)),
+        Err(error) => return Ok(Err(error)),
+    };
+    if options.analyze || options.format != ExplainFormat::Text {
+        return Ok(Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN ANALYZE or a structured format of a statement a rewrite rule changes is not supported"
+        )));
+    }
+    responder.row_description(&[ColDesc::new("QUERY PLAN", oid::TEXT, -1)])?;
+    for (index, statement) in statements.iter().enumerate() {
+        if index != 0 {
+            responder.data_row(&[Datum::Text("")])?;
+        }
+        if let Stmt::Notify { .. } = statement {
+            responder.data_row(&[Datum::Text("NOTIFY")])?;
+            continue;
+        }
+        let plan = match plan_statement(storage, txid, statement, arena) {
+            Ok(plan) => plan,
+            Err(error) => return Ok(Err(error)),
+        };
+        visit_text_rows(&plan, options, None, settings, |line| {
+            responder.data_row(&[Datum::Text(line)])
+        })?;
+    }
+    responder.command_complete("EXPLAIN")?;
+    Ok(Ok(true))
 }
 
 pub(super) fn emit_plan(

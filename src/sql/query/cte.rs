@@ -1029,7 +1029,7 @@ fn prepend_rule_source<'a>(
     })
 }
 
-fn rule_select<'a>(
+pub(crate) fn rule_select<'a>(
     items: &'a [SelectItem<'a>],
     from: Option<FromClause<'a>>,
     where_clause: Option<&'a Expr<'a>>,
@@ -1055,7 +1055,7 @@ fn rule_select<'a>(
     }
 }
 
-fn rule_relation_ref<'a>(
+pub(crate) fn rule_relation_ref<'a>(
     name: crate::sql::ast::QualName<'a>,
     alias: Option<&'a str>,
 ) -> TableRef<'a> {

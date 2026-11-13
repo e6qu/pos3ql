@@ -520,9 +520,15 @@ INTO t (a, b) VALUES (f.x, 'q'::text);`); a rule action that reads more than one
 relation, uses `ON CONFLICT`, or whose query groups, orders, limits or
 combines rows (`DO ALSO INSERT INTO log SELECT a FROM t GROUP BY a`) is
 printed as written, and its pretty form fails with `0A000`; policy
-expressions are not deparsed. `EXPLAIN` of a
-statement a rewrite rule changes shows only the original statement's plan,
-where PostgreSQL plans each statement the rule produces. Notices carry
+expressions are not deparsed. `EXPLAIN` prints
+scan filters, a hash join's condition and a nested loop's join filter only
+for queries over one or two relations; the executor has no merge join, so
+where PostgreSQL's costs pick `Merge Join` over sorted inputs pos3ql shows
+the hash join or nested loop it runs, and `UPDATE ... FROM` and `DELETE ...
+USING` always run as a nested loop where PostgreSQL may hash or merge. For a
+statement a rewrite rule changes, `EXPLAIN ANALYZE`, the structured formats
+and actions with their own `FROM`, `RETURNING` or an `INSERT ... SELECT`
+fail with `0A000`. Notices carry
 no position (`''::tsquery` points at the literal in PostgreSQL). Built-in
 calls with constant arguments are not folded once while planning: `SELECT
 timestamptypmodin('{7}') FROM generate_series(1, 3)` warns three times where

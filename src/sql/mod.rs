@@ -21918,6 +21918,21 @@ impl Engine {
                 if planned.is_err() {
                     return Ok(planned);
                 }
+                // A statement a rewrite rule changes is explained as the
+                // statements the rule produces.
+                match explain::emit_rewritten_plans(
+                    &self.storage,
+                    txn.txid,
+                    planned_statement,
+                    *options,
+                    &settings,
+                    arena,
+                    responder,
+                )? {
+                    Ok(true) => return Ok(Ok(())),
+                    Ok(false) => {}
+                    Err(error) => return Ok(Err(error)),
+                }
                 let plan = with_prepared_parameter_types(parameter_types, || {
                     explain::plan_statement(&self.storage, txn.txid, planned_statement, arena)
                 });

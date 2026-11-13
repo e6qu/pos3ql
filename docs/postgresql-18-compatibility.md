@@ -963,7 +963,12 @@ PostgreSQL physical standby cannot replay pos3ql's journal.
   column "ctid" is not supported`); as in PostgreSQL, a table column cannot
   take a system column's name (`42701`).
 - PostgreSQL parallel query, JIT, and planner/executor hooks do not exist.
-  Cost estimates and `EXPLAIN` text differ from PostgreSQL.
+  Cost estimates differ from PostgreSQL. `EXPLAIN` shows the plan pos3ql
+  runs: scan filters (`Filter: (a = 1)`), a hash join's `Hash Cond` and `Hash`
+  node, and a nested loop's `Join Filter` and `Materialize` inner scan, in
+  PostgreSQL's layout. There is no merge join, so a query PostgreSQL plans as
+  `Merge Join` shows a hash join or nested loop. A statement a rewrite rule
+  changes shows each statement the rule produces, separated by an empty line.
 - Logical copies are separate durable databases updated asynchronously; there
   are no shared-storage replicas or multiple writers.
 - Monitoring fields for absent subsystems report empty or zero values. A

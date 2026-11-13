@@ -16390,6 +16390,44 @@ fn user_cast_operator_catalog_survives_wal_checkpoint_and_cold_recovery() {
 }
 
 #[test]
+fn system_extension_packages_list_plpgsql_only_under_system() {
+    let rows = "SELECT name, default_version, installed_version, comment \
+                  FROM pg_available_extensions ORDER BY name; \
+                SELECT name, version, installed, superuser, trusted, relocatable, schema, \
+                       requires IS NULL \
+                  FROM pg_available_extension_versions ORDER BY name, version";
+    let plpgsql = [
+        "plpgsql|1.0|1.0|PL/pgSQL procedural language",
+        "plpgsql|1.0|t|t|t|f|pg_catalog|t",
+    ];
+    // An empty control path is PostgreSQL's default `$system`.
+    let config = test_config("system-extension-default");
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut engine, &mut budget, rows)),
+        plpgsql
+    );
+    drop(engine);
+    // A configured root without `$system` leaves the built-in package out.
+    let mut config = test_config("system-extension-configured");
+    let package_root = std::path::Path::new(&config.data_dir).join("extensions");
+    std::fs::create_dir_all(package_root.join("extension")).unwrap();
+    config.extension_control_path = package_root.to_str().unwrap().to_string();
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert!(data_rows(&run_with(&mut engine, &mut budget, rows)).is_empty());
+    drop(engine);
+    config.extension_control_path = format!("{}:$system", package_root.to_str().unwrap());
+    let mut budget = test_engine_budget(&config, test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut engine, &mut budget, rows)),
+        plpgsql
+    );
+}
+
+#[test]
 fn extension_packages_execute_transactionally_and_recover_catalog_state() {
     let mut config = test_config("extension-lifecycle");
     let package_root = std::path::Path::new(&config.data_dir).join("extensions");

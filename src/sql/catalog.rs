@@ -162,6 +162,8 @@ const SQL_LANGUAGE_OID: i32 = 14;
 /// The `plpgsql` extension, language and handler OIDs of the PostgreSQL 18.6
 /// reference initdb whose routine rows `catalog_callable_signatures` records.
 pub(crate) const PLPGSQL_EXTENSION_OID: i32 = 14_049;
+/// The comment of the `plpgsql` extension package.
+const PLPGSQL_EXTENSION_COMMENT: &str = "PL/pgSQL procedural language";
 const PLPGSQL_CALL_HANDLER_OID: i32 = 14_050;
 const PLPGSQL_INLINE_HANDLER_OID: i32 = 14_051;
 const PLPGSQL_VALIDATOR_OID: i32 = 14_052;
@@ -21039,11 +21041,25 @@ fn pg_available_extensions<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_available_extensions", false);
-    let count = storage.extension_packages().count();
+    let system = usize::from(storage.system_extension_packages());
+    let count = storage.extension_packages().count() + system;
     let out = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
+    // `$system` holds the plpgsql package initdb installs.
+    if system == 1 {
+        out[0] = row(
+            &[
+                text("plpgsql", arena)?,
+                text("1.0", arena)?,
+                text("1.0", arena)?,
+                text(PLPGSQL_EXTENSION_COMMENT, arena)?,
+            ],
+            arena,
+        )?;
+    }
     for (index, (_, package)) in storage.extension_packages().enumerate() {
+        let index = index + system;
         let installed = storage
             .extension_slot(package.name.as_str(), txid)
             .map(|slot| storage.extension(slot).definition_to(txid).2);
@@ -21079,6 +21095,23 @@ fn pg_available_extension_versions<'a>(
     let mut out: [&[Datum]; 256] = [&[]; 256];
     let mut emitted: [Option<(usize, crate::storage::ExtensionVersion)>; 256] = [None; 256];
     let mut count = 0usize;
+    if storage.system_extension_packages() {
+        out[0] = row(
+            &[
+                text("plpgsql", arena)?,
+                text("1.0", arena)?,
+                Datum::Bool(true),
+                Datum::Bool(true),
+                Datum::Bool(true),
+                Datum::Bool(false),
+                text("pg_catalog", arena)?,
+                Datum::Null,
+                text(PLPGSQL_EXTENSION_COMMENT, arena)?,
+            ],
+            arena,
+        )?;
+        count = 1;
+    }
     for (package_slot, package) in storage.extension_packages() {
         for (_, script) in storage.extension_scripts_for(package_slot) {
             if emitted[..count].contains(&Some((package_slot, script.to))) {

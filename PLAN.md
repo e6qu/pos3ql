@@ -433,7 +433,9 @@ describe commands match PostgreSQL 18.6 except: `\dF`, `\dFd` and `\dFt`
 list only the `simple` and `english` text search objects; `\dfS+` lists
 `postgres_fdw_handler` and `postgres_fdw_validator` in `pg_catalog`, where
 PostgreSQL has them only in the schema of an installed `postgres_fdw`
-extension; and `\dfS+` over 3,400 routines takes about twice as long as
+extension (`postgres_fdw` is not an extension package: `CREATE EXTENSION
+postgres_fdw` fails with `extension "postgres_fdw" is not available`, and `pg_available_extensions` lists only `plpgsql` under
+`$system`, the default control path); and `\dfS+` over 3,400 routines takes about twice as long as
 PostgreSQL (0.5 s against 0.24 s in release builds on one host, 2026-11-13)
 because each row's calls repeat overload resolution and expression typing
 that PostgreSQL does once while planning. Parameter inference walks a statement in its own order rather than

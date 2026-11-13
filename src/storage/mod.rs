@@ -16810,6 +16810,9 @@ pub struct Storage {
     extension_scripts: FixedVec<ExtensionScript>,
     extension_script_source: FixedBuf,
     extension_package_source: ExtensionPackageSource,
+    /// Whether the control path includes `$system`, PostgreSQL's built-in
+    /// package directory (its default): pos3ql's built-in `plpgsql`.
+    system_extension_packages: bool,
     role_catalog: Mutex<RoleCatalog>,
     /// One mutex-protected authorization bitmap per fixed query workspace.
     role_graph_scratch: FixedVec<Mutex<FixedVec<bool>>>,
@@ -23338,6 +23341,7 @@ impl Storage {
             extension_scripts,
             extension_script_source,
             extension_package_source: ExtensionPackageSource::Durable,
+            system_extension_packages: true,
             role_catalog: Mutex::new(RoleCatalog {
                 roles,
                 memberships: role_memberships,
@@ -23763,13 +23767,18 @@ impl Storage {
         } else {
             ExtensionPackageSource::Configured
         };
+        self.system_extension_packages = config.extension_control_path.is_empty()
+            || config
+                .extension_control_path
+                .split(':')
+                .any(|root| root == "$system");
         if self.extension_package_source == ExtensionPackageSource::Durable {
             return Ok(());
         }
         for root in config
             .extension_control_path
             .split(':')
-            .filter(|root| !root.is_empty())
+            .filter(|root| !root.is_empty() && *root != "$system")
         {
             let root = std::path::Path::new(root);
             let control_directory = root.join("extension");
@@ -24070,6 +24079,11 @@ impl Storage {
             .iter()
             .enumerate()
             .find(|(_, package)| package.name.as_str() == name)
+    }
+
+    /// Whether `pg_available_extensions` lists the built-in `plpgsql`.
+    pub(crate) fn system_extension_packages(&self) -> bool {
+        self.system_extension_packages
     }
 
     pub(crate) fn extension_packages(&self) -> impl Iterator<Item = (usize, &ExtensionPackage)> {

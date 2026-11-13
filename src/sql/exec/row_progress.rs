@@ -192,6 +192,11 @@ struct StepProgress {
     running: bool,
     finished: usize,
     start: Option<StepStart>,
+    /// Where the replay stood when the last finished step ended. An attempt
+    /// that skips that step continues there: a step finished before an
+    /// attempt boundary has no recorded start in the steps after it, and
+    /// the deeper steps it skips may stand past an outer step's start.
+    end: Option<ReplayPoint>,
     /// The finished steps' output rows and row counts, then the unfinished
     /// step's captured output rows: rows in `old`, one count row per step
     /// in `new`.
@@ -203,6 +208,7 @@ impl StepProgress {
         running: false,
         finished: 0,
         start: None,
+        end: None,
         saved: None,
     };
 }
@@ -262,6 +268,9 @@ pub(crate) struct RowProgress {
     /// The source row given to the unfinished row, kept when its attempt
     /// stops, so the row runs again with the same values.
     source_row: Option<(usize, transition_rows::SavedTransitionRows)>,
+    /// The level of the step that finished with its `AFTER` work handed to
+    /// the statement's attempt loop, until that work ends.
+    handoff_level: Option<usize>,
 }
 
 impl RowProgress {
@@ -291,6 +300,7 @@ impl RowProgress {
             produce_until: None,
             produced: false,
             source_row: None,
+            handoff_level: None,
         })
     }
 
@@ -534,6 +544,11 @@ impl RowProgress {
     ) -> Result<bool, SqlError> {
         let steps = &mut self.steps[level];
         if index < steps.finished {
+            if index + 1 == steps.finished
+                && let Some(end) = steps.end
+            {
+                end.seek()?;
+            }
             return Ok(false);
         }
         if index != steps.finished {
@@ -593,15 +608,17 @@ impl RowProgress {
     }
 
     /// The running step finished; the next one starts with no row progress.
-    pub(crate) fn finish_step(&mut self) {
-        self.finish_step_at(self.implicit_level);
+    pub(crate) fn finish_step(&mut self) -> Result<(), SqlError> {
+        self.finish_step_at(self.implicit_level)
     }
 
     /// [`Self::finish_step`] at a claimed `level`.
-    pub(crate) fn finish_step_at(&mut self, level: usize) {
+    pub(crate) fn finish_step_at(&mut self, level: usize) -> Result<(), SqlError> {
+        let end = ReplayPoint::capture()?;
         let steps = &mut self.steps[level];
         steps.finished += 1;
         steps.start = None;
+        steps.end = Some(end);
         steps.running = false;
         for deeper in &mut self.steps[level + 1..] {
             *deeper = StepProgress::EMPTY;
@@ -611,6 +628,35 @@ impl RowProgress {
         self.resume = None;
         self.returning = None;
         self.state = None;
+        Ok(())
+    }
+
+    /// The step just finished at `level` hands its `AFTER` work to the
+    /// statement's attempt loop.
+    pub(crate) fn hand_off_step_at(&mut self, level: usize) {
+        self.handoff_level = Some(level);
+    }
+
+    /// The handed-off `AFTER` work ended: later attempts skip the finished
+    /// steps to here, past the work's calls and sequence values, which do
+    /// not run again.
+    pub(crate) fn continue_after_handoff(
+        &mut self,
+        invocations: &query::RoutineInvocationState,
+        replay: Option<StatementReplayStart>,
+    ) -> Result<(), SqlError> {
+        let level = self.handoff_level.take().ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a rule step's AFTER work ended without a handed-off step"
+            )
+        })?;
+        invocations.begin_attempts_here();
+        self.steps[level].end = Some(ReplayPoint {
+            calls: Some(invocations.position()),
+            replay,
+        });
+        Ok(())
     }
 
     /// Saves the finished steps' outputs when an attempt stops for a

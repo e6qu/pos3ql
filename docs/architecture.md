@@ -392,7 +392,8 @@ BY id` sorts first, so its output queues in the spool instead.
 | A write's row after an effect a rerun would not repeat, or every row when such an effect ran in its scan | Blocks until the next step's rows or the statement's end |
 | A top-level write's `AFTER ROW` events, immediate constraint checks and `AFTER STATEMENT` triggers | Yields; finished events are kept (see above). An event's reads after its first effect block until that event ends |
 | A rule action's row selection after the rule's earlier steps, when their rows could resume | Yields; the step rolls back to its start and the finished steps are kept |
-| A data-modifying `WITH` main statement's row selection; `AFTER` triggers between the steps of a rule-rewritten write, and `AFTER` work of writes inside routine bodies | Blocks until the next step's rows or that work ends |
+| `AFTER` work of a top-level rule-rewritten write's steps | Yields; the step is kept finished, its finished events are kept, and the statement continues with the steps after it once that work ends |
+| A data-modifying `WITH` main statement's row selection; `AFTER` work of writes inside routine bodies | Blocks until the next step's rows or that work ends |
 | Routine calls inside a write's rows (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, data-modifying `WITH`, rule actions, `INSTEAD OF` view triggers): row expressions, row triggers, `RETURNING`; `BEFORE` and `INSTEAD OF` trigger bodies that need the engine | Run on the engine between attempts; the write keeps its changed rows and finished steps and continues at the unfinished row (see above). A storage or lock wait inside the call restarts the whole statement |
 | DDL and `COPY FROM` | Blocks for the whole statement |
 | Top-level `CALL` and `DO` bodies: queries and write scans before the statement's first effect | Yields; the body resumes at its waiting statement |
@@ -777,11 +778,19 @@ without calls) reads the query whole at its first read, and an `UPDATE`,
 runs the statement again from its first start: the main write's row
 progress would otherwise roll back over the step's rows.
 
-**Rule steps (not built).** A rule action's AFTER work should run from the
-same completion cursor as a top-level write's, so it yields instead of
-reading synchronously: the suspended completion returns to the statement's
-attempt loop, which records the step finished with its outputs and starts
-another attempt that skips the finished steps.
+**Built: rule steps.** A step of a top-level rule-rewritten write (the
+original statement or an action) runs under a completion boundary of its own
+command, so its `AFTER` work runs from the same completion cursor as a
+top-level write's and yields instead of reading synchronously. The
+completion records that it belongs to a step: the innermost rule loop marks
+the step finished with the write's row count, the completion replies with
+that count only, and the statement's attempt loop runs the `AFTER` work
+(retaining the write across a wait in it), then starts another attempt that
+skips the finished steps and replays from that point on. That point covers
+both invocation logs (routine results and the saved inputs of calls, which
+carry the result position after them) and the sequence replay; a level's
+last finished step records it, so skipping that step, also inside an outer
+step that resumes from its own start, continues past its calls.
 
 ### How saved state is owned
 

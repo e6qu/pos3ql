@@ -26981,7 +26981,6 @@ fn command_tags(bytes: &[u8]) -> Vec<String> {
     tags
 }
 
-/// Extracts text values from DataRow messages, '|'-joined per row.
 /// The message text of each `NoticeResponse` in `bytes`.
 fn notice_messages(bytes: &[u8]) -> Vec<String> {
     let mut messages = Vec::new();

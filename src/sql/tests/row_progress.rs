@@ -619,3 +619,158 @@ fn self_reading_insert_select_resumes_with_its_first_source() {
     drop((writer, engine));
     std::fs::remove_dir_all(config.data_dir).unwrap();
 }
+
+/// An `AFTER` trigger on a rule action's target that waits for a lock hands
+/// the step's `AFTER` work to the statement: the step stays finished, its
+/// trigger runs once when the lock is released, and the statement continues
+/// with the steps after it.
+#[test]
+fn rule_step_after_triggers_wait_and_resume_without_repeating_steps() {
+    let sql = "INSERT INTO ruled VALUES (1), (2)";
+    for mode in [
+        crate::config::TransactionMode::Mvcc,
+        crate::config::TransactionMode::Locking,
+    ] {
+        let mut config = test_config(&format!("rule-step-after-wait-{mode:?}"));
+        config.transaction_mode = mode;
+        let mut budget = test_engine_budget(&config, 1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+        let mut holder =
+            ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+        writer.success(
+            &mut engine,
+            "CREATE TABLE ruled(id int); CREATE TABLE copied(id int); \
+             CREATE TABLE seen(id int, n bigint); CREATE SEQUENCE seen_numbers; \
+             CREATE RULE copy_rows AS ON INSERT TO ruled DO ALSO \
+             INSERT INTO copied VALUES (new.id + 10); \
+             CREATE FUNCTION note_copy() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+             PERFORM pg_advisory_xact_lock(7); \
+             INSERT INTO seen VALUES (NEW.id, nextval('seen_numbers')); RETURN NULL; END $$; \
+             CREATE TRIGGER copied_after AFTER INSERT ON copied \
+             FOR EACH ROW EXECUTE FUNCTION note_copy()",
+            true,
+        );
+        holder.success(&mut engine, "SELECT pg_advisory_lock(7)", true);
+        let status = writer.execute_status(&mut engine, sql, true);
+        let completed = blocked_on_lock(status, &mut writer);
+        holder.success(&mut engine, "SELECT pg_advisory_unlock(7)", true);
+        assert_eq!(
+            resume(&mut engine, &mut writer, sql, completed),
+            ExecutionStatus::Complete,
+            "{mode:?}"
+        );
+        let output = writer.send.readable().to_vec();
+        let text = String::from_utf8_lossy(&output).into_owned();
+        assert!(error_sqlstates(&output).is_empty(), "{mode:?}: {text}");
+        assert!(text.contains("INSERT 0 2"), "{mode:?}: {text}");
+        assert_eq!(
+            data_rows(&writer.success(
+                &mut engine,
+                "SELECT id FROM ruled ORDER BY id; SELECT id FROM copied ORDER BY id; \
+                 SELECT id, n FROM seen ORDER BY id",
+                true
+            )),
+            ["1", "2", "11", "12", "11|1", "12|2"],
+            "{mode:?}"
+        );
+        drop((holder, writer, engine));
+        std::fs::remove_dir_all(config.data_dir).unwrap();
+    }
+}
+
+/// A rule action that evaluates the original statement's source again runs
+/// its calls again after the original step's `AFTER` work ran in its own
+/// attempt, as PostgreSQL does: each call raises its notice twice.
+#[test]
+fn rule_action_calls_after_a_step_handoff_run_again() {
+    let config = test_config("rule-step-handoff-calls");
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    writer.success(
+        &mut engine,
+        "CREATE TABLE ruled(a int); CREATE TABLE copied(a int); \
+         CREATE FUNCTION note() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+         RAISE NOTICE 'after %', NEW.a; RETURN NULL; END $$; \
+         CREATE FUNCTION value(v int) RETURNS int LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE NOTICE 'value %', v; RETURN v; END $$; \
+         CREATE TRIGGER a AFTER INSERT ON ruled FOR EACH ROW EXECUTE FUNCTION note(); \
+         CREATE RULE copy_rows AS ON INSERT TO ruled DO ALSO \
+         INSERT INTO copied VALUES (NEW.a * 10)",
+        true,
+    );
+    let output = writer.success(
+        &mut engine,
+        "INSERT INTO ruled SELECT value(g) FROM generate_series(3, 4) g",
+        true,
+    );
+    assert_eq!(
+        notice_messages(&output),
+        [
+            "value 3", "value 4", "after 3", "after 4", "value 3", "value 4"
+        ]
+    );
+    assert_eq!(
+        data_rows(&writer.success(&mut engine, "SELECT a FROM copied ORDER BY a", true)),
+        ["30", "40"]
+    );
+    drop((writer, engine));
+    std::fs::remove_dir_all(config.data_dir).unwrap();
+}
+
+/// A nested rule step's `AFTER` work that waits for a lock resumes once, and
+/// the outer steps after it continue with their own calls: the skipped
+/// inner steps leave the replay past their calls and sequence values.
+#[test]
+fn nested_rule_step_after_work_waits_and_later_steps_call_once() {
+    let sql = "INSERT INTO outer_t SELECT g FROM generate_series(1, 2) g";
+    let mut config = test_config("nested-rule-step-after-wait");
+    config.transaction_mode = crate::config::TransactionMode::Locking;
+    let mut budget = test_engine_budget(&config, 1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut holder = ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+    writer.success(
+        &mut engine,
+        "CREATE TABLE outer_t(id int); CREATE TABLE mid(id int); \
+         CREATE TABLE inner_t(id int); CREATE TABLE last_t(id int, n bigint); \
+         CREATE TABLE seen(id int, n bigint); CREATE SEQUENCE numbers; \
+         CREATE FUNCTION note() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+         PERFORM pg_advisory_xact_lock(7); \
+         INSERT INTO seen VALUES (NEW.id, nextval('numbers')); RETURN NULL; END $$; \
+         CREATE FUNCTION tick(v int) RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN \
+         RAISE NOTICE 'tick %', v; RETURN nextval('numbers'); END $$; \
+         CREATE TRIGGER inner_after AFTER INSERT ON inner_t \
+         FOR EACH ROW EXECUTE FUNCTION note(); \
+         CREATE RULE a_mid AS ON INSERT TO outer_t DO ALSO INSERT INTO mid VALUES (new.id); \
+         CREATE RULE b_last AS ON INSERT TO outer_t DO ALSO \
+         INSERT INTO last_t VALUES (new.id, tick(new.id)); \
+         CREATE RULE to_inner AS ON INSERT TO mid DO ALSO \
+         INSERT INTO inner_t VALUES (new.id + 10)",
+        true,
+    );
+    holder.success(&mut engine, "SELECT pg_advisory_lock(7)", true);
+    let status = writer.execute_status(&mut engine, sql, true);
+    let completed = blocked_on_lock(status, &mut writer);
+    holder.success(&mut engine, "SELECT pg_advisory_unlock(7)", true);
+    assert_eq!(
+        resume(&mut engine, &mut writer, sql, completed),
+        ExecutionStatus::Complete
+    );
+    let output = writer.send.readable().to_vec();
+    let text = String::from_utf8_lossy(&output).into_owned();
+    assert!(error_sqlstates(&output).is_empty(), "{text}");
+    assert_eq!(notice_messages(&output), ["tick 1", "tick 2"]);
+    assert_eq!(
+        data_rows(&writer.success(
+            &mut engine,
+            "SELECT id FROM mid ORDER BY id; SELECT id FROM inner_t ORDER BY id; \
+             SELECT id, n FROM seen ORDER BY id; SELECT id, n FROM last_t ORDER BY id",
+            true
+        )),
+        ["1", "2", "11", "12", "11|1", "12|2", "1|3", "2|4"]
+    );
+    drop((holder, writer, engine));
+    std::fs::remove_dir_all(config.data_dir).unwrap();
+}

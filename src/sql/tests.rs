@@ -23931,62 +23931,27 @@ fn row_level_security_covers_views_merge_copy_partitions_and_saved_queries() {
     );
     assert_eq!(copy_data_rows(&copied), ["1\trls_client", "3\trls_client"]);
 
-    let mut copy_transition = copy_transition_scratch(&mut budget);
-    let mut send = crate::mem::FixedBuf::new(&mut budget, "rls copy send", 1 << 18).unwrap();
-    let mut arena = Arena::new(&mut budget, "rls copy sql", 1 << 18).unwrap();
-    let mut transaction = TxnState::new(&mut budget, 1024).unwrap();
-    let mut pool = test_pool(&mut budget);
-    let mut cursors = test_cursors(&mut budget);
-    let guc = GucState::new();
-    {
-        let mut responder = Responder::new(&mut send);
-        engine
-            .execute_simple(
-                "SET ROLE rls_client; COPY rls_target FROM STDIN",
-                &arena,
-                &mut transaction,
-                &mut pool,
-                &mut cursors,
-                &guc,
-                &mut responder,
-                1,
-            )
-            .unwrap();
-    }
-    let (copy, _deadline) = engine
-        .take_pending_copy()
-        .expect("COPY enters streaming mode");
-    arena.reset();
-    assert_eq!(
-        copy_line(
-            &mut engine,
-            &mut budget,
-            &copy,
-            &mut transaction,
-            &guc,
-            &arena,
-            b"4\trls_client\tcopy",
-            &mut copy_transition,
-        )
-        .unwrap(),
-        crate::sql::exec::CopyRowOutcome::Stored
-    );
-    finish_copy(
+    // PostgreSQL's DoCopy refuses COPY FROM when policies apply.
+    let copy_from = run_with(
         &mut engine,
         &mut budget,
-        &copy,
-        &mut transaction,
-        &guc,
-        &mut copy_transition,
-    )
-    .unwrap();
+        "SET ROLE rls_client; COPY rls_target FROM STDIN",
+    );
+    let copy_from = String::from_utf8_lossy(&copy_from);
+    assert!(
+        copy_from.contains("0A000")
+            && copy_from.contains("COPY FROM not supported with row-level security")
+            && copy_from.contains("Use INSERT statements instead."),
+        "{copy_from}"
+    );
+    assert!(engine.take_pending_copy().is_none());
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
             &mut budget,
             "SET ROLE rls_client; SELECT id FROM rls_target ORDER BY id"
         )),
-        ["1", "3", "4"]
+        ["1", "3"]
     );
 
     let row_security_off = run_with(

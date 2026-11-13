@@ -12,6 +12,15 @@ use crate::mem::arena::Arena;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql_err;
 
+/// COPY's `DEFAULT` marker. PostgreSQL compares it with a field's raw input,
+/// before escapes are decoded and with any CSV quotes, and fails the row at
+/// once when that field's column has no default.
+pub struct DefaultMarker<'m> {
+    pub marker: &'m str,
+    /// Accepts the marker in field `i`, or reports why its column cannot.
+    pub accept: &'m dyn Fn(usize) -> Result<(), SqlError>,
+}
+
 /// Splits one row into fields, decoding escapes into the arena. Returns the
 /// field count; `fields[i] = None` is NULL. The line excludes its newline.
 pub fn decode_row<'a>(
@@ -19,17 +28,20 @@ pub fn decode_row<'a>(
     arena: &'a Arena,
     fields: &mut [Option<&'a str>],
 ) -> Result<usize, SqlError> {
-    decode_row_text(line, arena, fields, b'\t', "\\N")
+    decode_row_text(line, arena, fields, b'\t', "\\N", None, &mut [])
 }
 
 /// Decodes one text COPY row using its resolved delimiter and NULL sentinel.
-/// The sentinel is compared before escape processing, as PostgreSQL requires.
+/// The sentinels are compared before escape processing, as PostgreSQL
+/// requires; `defaulted[i]` is set for a field equal to the DEFAULT marker.
 pub fn decode_row_text<'a>(
     line: &[u8],
     arena: &'a Arena,
     fields: &mut [Option<&'a str>],
     delimiter: u8,
     null: &str,
+    default: Option<&DefaultMarker<'_>>,
+    defaulted: &mut [bool],
 ) -> Result<usize, SqlError> {
     let mut n = 0usize;
     let mut at = 0usize;
@@ -132,6 +144,13 @@ pub fn decode_row_text<'a>(
             decoded = Some(buf);
         } else if raw.contains(&b'\r') {
             return Err(literal_carriage_return());
+        }
+        if !is_null
+            && let Some(default) = default
+            && raw == default.marker.as_bytes()
+        {
+            (default.accept)(n)?;
+            defaulted[n] = true;
         }
         fields[n] = if is_null {
             None
@@ -376,6 +395,8 @@ pub fn decode_row_csv<'a>(
     null_str: &str,
     force_not_null: &dyn Fn(usize) -> bool,
     force_null: &dyn Fn(usize) -> bool,
+    default: Option<&DefaultMarker<'_>>,
+    defaulted: &mut [bool],
 ) -> Result<usize, SqlError> {
     let line = match line.split_last() {
         Some((b'\r', head)) => head,
@@ -401,6 +422,15 @@ pub fn decode_row_csv<'a>(
         } else {
             text == null_str && !force_not_null(n)
         };
+        // The raw input, quotes included, ends at the delimiter.
+        let raw = &line[at..next.map_or(line.len(), |after| after - 1)];
+        if !(text == null_str && !quoted)
+            && let Some(default) = default
+            && raw == default.marker.as_bytes()
+        {
+            (default.accept)(n)?;
+            defaulted[n] = true;
+        }
         fields[n] = if is_null { None } else { Some(text) };
         n += 1;
         match next {
@@ -696,6 +726,8 @@ mod tests {
             null,
             &no_force,
             &no_force,
+            None,
+            &mut [],
         )
         .expect("decodes");
         fields[..n]

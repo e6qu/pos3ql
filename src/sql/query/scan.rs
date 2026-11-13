@@ -156,6 +156,28 @@ pub(crate) enum RowSecurityExpression {
     WithCheck,
 }
 
+/// `check_enable_rls`'s error when `row_security` is off but policies apply.
+pub(crate) fn row_security_off_error(
+    storage: &Storage,
+    table: usize,
+    role: usize,
+    txid: u32,
+) -> SqlError {
+    if storage.object_owner(storage.table_access_object(table, txid), txid) == role {
+        crate::sql::eval::stash_diagnostic(
+            None,
+            Some(crate::util::StackStr::from_str(
+                "To disable the policy for the table's owner, use ALTER TABLE NO FORCE ROW LEVEL SECURITY.",
+            )),
+        );
+    }
+    sql_err!(
+        sqlstate::INSUFFICIENT_PRIVILEGE,
+        "query would be affected by row-level security policy for table \"{}\"",
+        storage.table_def(table, txid).name.as_str()
+    )
+}
+
 pub(crate) fn plan_row_security<'a>(
     storage: &Storage,
     table: usize,
@@ -168,13 +190,8 @@ pub(crate) fn plan_row_security<'a>(
     if !storage.row_security_applies(table, role, txid) {
         return Ok(None);
     }
-    let definition = storage.table_def(table, txid);
     if !crate::sql::guc::active_row_security() {
-        return Err(sql_err!(
-            sqlstate::INSUFFICIENT_PRIVILEGE,
-            "query would be affected by row-level security policy for table \"{}\"",
-            definition.name.as_str()
-        ));
+        return Err(row_security_off_error(storage, table, role, txid));
     }
     let capacity = storage.policies_for_table(table, txid).count();
     let predicates = arena

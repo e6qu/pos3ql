@@ -575,16 +575,10 @@ A user table's `tableoid` system column fails with `0A000`
 expose it. COPY to or from a server file or program,
 `COPY ... FREEZE`, a COPY `ENCODING` other than UTF8 and `JSON_QUERY ...
 RETURNING` a non-JSON, non-string type are rejected with `0A000`.
-`COPY FROM` checks a row's unique and exclusion constraints as it stores
-the row, while PostgreSQL buffers up to 1,000 rows of a table without
-`BEFORE` row triggers and inserts their index entries when it flushes the
-buffer. A later row's conversion or `CHECK` error in the same buffer
-therefore wins over an earlier row's duplicate key in PostgreSQL; pos3ql
-reports the duplicate first. `COPY FROM` rows into a table whose omitted
-columns default to a volatile function other than `nextval`, or whose
-`WHERE` clause is volatile, name the duplicate's input line in `CONTEXT`
-where PostgreSQL, inserting such rows one at a time, names only the line
-number.
+A string literal passed to a `regclass` parameter (`nextval('missing')`) is
+resolved when a row evaluates it, so a missing relation is not reported for a
+query or `COPY ... WHERE` that evaluates no row; PostgreSQL resolves it while
+analyzing the statement.
 A view
 dropped by the cascade of a function, sequence, collation, operator, text
 search object or type (`DROP FUNCTION f CASCADE` where view `v` calls `f`)

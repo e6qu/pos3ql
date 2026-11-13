@@ -72,7 +72,7 @@ pub(crate) use scan::{
 };
 pub(crate) use scan::{
     RowSecurityExpression, RowSecurityPlan, conjoin_row_security, plan_row_security,
-    row_security_passes,
+    row_security_off_error, row_security_passes,
 };
 
 mod scope;
@@ -122,6 +122,24 @@ pub use cte::{
     describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under, expand_dml_ctes,
     rewrite_view_dml,
 };
+
+/// Whether `expression` calls a volatile function. With `except_nextval`,
+/// `nextval` does not count (`contain_volatile_functions_not_nextval`).
+pub(crate) fn expression_contains_volatile(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+    except_nextval: bool,
+) -> bool {
+    cte::expression_contains_function(expression, &|name, arguments| {
+        let builtin = name.strip_prefix("pg_catalog.").unwrap_or(name);
+        if except_nextval && builtin == "nextval" {
+            return false;
+        }
+        crate::sql::ast::is_volatile_function(name)
+            || storage.has_volatile_function_routine_candidate(name, arguments, txid)
+    })
+}
 
 pub(crate) fn stored_query_dependencies(
     sql: &str,

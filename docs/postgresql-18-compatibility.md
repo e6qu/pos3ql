@@ -187,6 +187,16 @@ Syntax and errors:
   constraint of a domain violation. `RAISE ... USING COLUMN`, `CONSTRAINT`,
   `DATATYPE`, `TABLE` and `SCHEMA` set those fields (up to 1,024 bytes each)
   and `GET STACKED DIAGNOSTICS` reads them.
+- `COPY FROM` reports errors in PostgreSQL's order. PostgreSQL buffers rows
+  and adds their index entries only when the buffer flushes: after 1,000 rows,
+  after 64 KB of input lines, and at the end of the data. So if row 2
+  duplicates row 1 and row 3 fails a `CHECK`, the `CHECK` error is reported.
+  A duplicate found at a flush has the context `COPY t, line 2` with no input
+  text. Rows are not buffered, and a duplicate is reported at once with its
+  line text, when the table has a `BEFORE` row trigger, is a foreign table, an
+  omitted column's default calls a volatile function other than `nextval`, or
+  `WHERE` is volatile. `COPY FROM` into a table whose row-level security
+  policies apply to the user fails with `0A000`, as in PostgreSQL.
 - Checks PostgreSQL makes after parsing are reported when the statement would
   run, with PostgreSQL's code and message: type modifiers (`numeric(2000)` is
   `22023`, `NUMERIC precision 2000 must be between 1 and 1000`; `numeric(5,-2)`

@@ -20,7 +20,7 @@ use crate::storage::rowenc;
 use crate::storage::{
     CHECK_SQL_MAX, ColumnMeta, ColumnSet, IndexDef, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS,
     MAX_ROUTINE_OUTPUT_COLUMNS, PartitionBound as StoredPartitionBound, PartitionBoundValue,
-    PartitionDef, PartitionStrategy as StoredPartitionStrategy, PolicyCommandKind, ROUTINE_SQL_MAX,
+    PartitionDef, PartitionStrategy as StoredPartitionStrategy, ROUTINE_SQL_MAX,
     RoutineArgumentDef, RoutineIdentity, RoutineParameterDef, RoutineParameterMode, RoutineSpec,
     SeqSpec, SeqType, SqlName, Storage, TableDef, TableDefBuilder,
 };
@@ -1390,6 +1390,7 @@ fn run_reported_drop<'b>(
     }
 }
 
+mod copy_batch;
 mod copy_transition;
 mod partition_insert;
 mod partition_update;
@@ -71146,9 +71147,9 @@ pub struct CopySetup {
     pub reject_limit: Option<u64>,
     pub log_verbosity: crate::sql::ast::CopyLogVerbosity,
     filter: CopyFilter,
-    /// SQL COPY is authorized as the role fixed when the statement begins.
-    /// Subscription apply is a replication operation and has no SQL role.
-    security_role: Option<u16>,
+    /// The insert method `copy_statement_begin` chooses and its buffering
+    /// window, which decides when an index error is reported.
+    batch: Mutex<copy_batch::CopyBatch>,
 }
 
 impl CopySetup {
@@ -71253,6 +71254,17 @@ impl CopyFilter {
             mode: CopyFilterMode::Predicate,
             source,
         })
+    }
+
+    /// Whether the predicate calls a volatile function, `nextval` included.
+    fn is_volatile(self, storage: &Storage, txid: u32, arena: &Arena) -> Result<bool, SqlError> {
+        if self.mode == CopyFilterMode::All {
+            return Ok(false);
+        }
+        let predicate = crate::sql::parser::parse_expr(self.source.as_str(), arena)?;
+        Ok(super::query::expression_contains_volatile(
+            predicate, storage, txid, false,
+        ))
     }
 
     /// Evaluates after input coercion and defaults, before row triggers,
@@ -71652,6 +71664,27 @@ pub fn copy_begin(
         target_columns,
         txid,
     )?;
+    // `DoCopy`: policies cannot filter COPY FROM's rows.
+    if !statement.to && storage.row_security_applies(table_index, security_role, txid) {
+        if !crate::sql::guc::active_row_security() {
+            return Err(super::query::row_security_off_error(
+                storage,
+                table_index,
+                security_role,
+                txid,
+            ));
+        }
+        super::eval::stash_diagnostic(
+            None,
+            Some(crate::util::StackStr::from_str(
+                "Use INSERT statements instead.",
+            )),
+        );
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "COPY FROM not supported with row-level security"
+        ));
+    }
     if !statement.to && storage.matview_slot_for_table(table_index, txid).is_some() {
         return Err(sql_err!(
             sqlstate::WRONG_OBJECT_TYPE,
@@ -71703,6 +71736,9 @@ pub fn copy_begin(
     Ok(CopySetup {
         clock: super::datetime::statement_clock(),
         snapshot_lease: Mutex::new(None),
+        batch: Mutex::new(copy_batch::CopyBatch::new(
+            copy_batch::CopyInsertMethod::Single,
+        )),
         definitions,
         table_index,
         txid,
@@ -71713,12 +71749,6 @@ pub fn copy_begin(
         reject_limit: opts.reject_limit,
         log_verbosity: opts.log_verbosity,
         filter,
-        security_role: Some(u16::try_from(security_role).map_err(|_| {
-            sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "role catalog exceeds COPY capacity"
-            )
-        })?),
     })
 }
 
@@ -71856,6 +71886,9 @@ pub(crate) fn subscription_copy_setup(
     Ok(CopySetup {
         clock: super::datetime::statement_clock(),
         snapshot_lease: Mutex::new(None),
+        batch: Mutex::new(copy_batch::CopyBatch::new(
+            copy_batch::CopyInsertMethod::Single,
+        )),
         definitions,
         table_index,
         txid,
@@ -71882,7 +71915,6 @@ pub(crate) fn subscription_copy_setup(
             mode: CopyFilterMode::All,
             source: StackStr::new(),
         },
-        security_role: None,
     })
 }
 
@@ -71898,17 +71930,8 @@ pub(crate) fn copy_statement_begin(
     let definition = setup
         .definitions
         .definition(storage, setup.table_index, txn.txid)?;
-    if let Some(role) = setup.security_role {
-        let _ = super::query::plan_row_security(
-            storage,
-            setup.table_index,
-            usize::from(role),
-            PolicyCommandKind::Insert,
-            super::query::RowSecurityExpression::WithCheck,
-            txn.txid,
-            arena,
-        )?;
-    }
+    let method = copy_insert_method(storage, setup, &definition, txn, arena)?;
+    *setup.batch.lock().unwrap() = copy_batch::CopyBatch::new(method);
     fire_statement_triggers(
         TriggerExecContext {
             host: PlpgsqlExecHost::Atomic {
@@ -71941,6 +71964,10 @@ pub(crate) fn copy_statement_end(
     let definition = setup
         .definitions
         .definition(storage, setup.table_index, txn.txid)?;
+    let flushed = setup.batch.lock().unwrap().finish();
+    if let Err(failure) = flushed {
+        return Err(failure.raise(definition.name.as_str(), setup.fmt.binary));
+    }
     let mut transition_capture = if transition_capture_required(
         storage,
         setup.table_index,
@@ -72021,6 +72048,8 @@ fn copy_match_header_in_frame(
             setup.fmt.null.as_str(),
             &|_| false,
             &|_| false,
+            None,
+            &mut [],
         )?
     } else {
         crate::sql::copy::decode_row_text(
@@ -72029,6 +72058,8 @@ fn copy_match_header_in_frame(
             &mut fields,
             setup.fmt.delimiter,
             setup.fmt.null.as_str(),
+            None,
+            &mut [],
         )?
     };
     if count != setup.n_targets {
@@ -72084,9 +72115,39 @@ pub(crate) fn copy_row<'a>(
 ) -> Result<CopyRowOutcome, SqlError> {
     name_copy_frame(frame, storage, setup, txn.txid);
     frame.text.set(core::str::from_utf8(line).ok());
-    crate::sql::error_context::within(frame, || {
+    setup.batch.lock().unwrap().begin_row();
+    let outcome = crate::sql::error_context::within(frame, || {
         copy_row_in_frame(
             storage, txn, services, setup, line, arena, responder, inserted, frame,
+        )
+    });
+    // PostgreSQL counts the line without its end-of-line.
+    let line_bytes = line.len() - usize::from(line.last() == Some(&b'\r'));
+    finish_copy_row_window(storage, setup, txn.txid, outcome, line_bytes)
+}
+
+/// Accounts a COPY row in the buffering window, reporting the index error of
+/// a flush that fails before or after it.
+fn finish_copy_row_window(
+    storage: &Storage,
+    setup: &CopySetup,
+    txid: u32,
+    outcome: Result<CopyRowOutcome, SqlError>,
+    line_bytes: usize,
+) -> Result<CopyRowOutcome, SqlError> {
+    let mut batch = setup.batch.lock().unwrap();
+    let flushed = match batch.take_failure() {
+        Some(failure) => Err(failure),
+        None => {
+            let outcome = outcome?;
+            batch.finish_row(line_bytes).map(|()| outcome)
+        }
+    };
+    drop(batch);
+    flushed.map_err(|failure| {
+        failure.raise(
+            storage.table_def(setup.table_index, txid).name.as_str(),
+            setup.fmt.binary,
         )
     })
 }
@@ -72124,7 +72185,28 @@ fn copy_row_in_frame<'a>(
         .definitions
         .selection(storage, setup.table_index, txn.txid)?;
     let mut fields: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
+    let mut defaulted = [false; MAX_COLUMNS];
     let fmt = &setup.fmt;
+    let accept_default = |i: usize| {
+        let column = &def.columns()[setup.targets[i]];
+        if column.auto_increment || column.default.expression().is_some() {
+            return Ok(());
+        }
+        Err(crate::sql::eval::with_detail(
+            sql_err!(
+                sqlstate::BAD_COPY_FILE_FORMAT,
+                "unexpected default marker in COPY data"
+            ),
+            format_args!("Column \"{}\" has no default value.", column.name.as_str()),
+        ))
+    };
+    let default = fmt
+        .default
+        .as_ref()
+        .map(|marker| crate::sql::copy::DefaultMarker {
+            marker: marker.as_str(),
+            accept: &accept_default,
+        });
     let n_fields = if fmt.csv {
         crate::sql::copy::decode_row_csv(
             line,
@@ -72136,6 +72218,8 @@ fn copy_row_in_frame<'a>(
             fmt.null.as_str(),
             &|i| CopyFmt::forced(fmt.force_not_null, setup.targets[i]),
             &|i| CopyFmt::forced(fmt.force_null, setup.targets[i]),
+            default.as_ref(),
+            &mut defaulted[..setup.n_targets],
         )?
     } else {
         crate::sql::copy::decode_row_text(
@@ -72144,6 +72228,8 @@ fn copy_row_in_frame<'a>(
             &mut fields[..setup.n_targets],
             fmt.delimiter,
             fmt.null.as_str(),
+            default.as_ref(),
+            &mut defaulted[..setup.n_targets],
         )?
     };
     let checks = parse_checks(def, storage, txn.txid, arena)?;
@@ -72165,11 +72251,7 @@ fn copy_row_in_frame<'a>(
         frame
             .column
             .set(Some((StackStr::from_str(col.name.as_str()), *field)));
-        let use_default = field.is_some_and(|text| {
-            fmt.default
-                .as_ref()
-                .is_some_and(|default| text == default.as_str())
-        });
+        let use_default = defaulted[i];
         values[col_index] = match field {
             None => Datum::Null,
             Some(_) if use_default => Datum::Null,
@@ -72226,7 +72308,7 @@ fn copy_row_in_frame<'a>(
         responder,
         inserted,
         write_target,
-        setup.security_role,
+        &setup.batch,
         def,
         &checks,
         &generated_exprs,
@@ -72255,11 +72337,14 @@ pub(crate) fn copy_row_binary<'a>(
     inserted: &mut CopyTransitionRows,
 ) -> Result<CopyRowOutcome, SqlError> {
     name_copy_frame(frame, storage, setup, txn.txid);
-    crate::sql::error_context::within(frame, || {
+    setup.batch.lock().unwrap().begin_row();
+    let outcome = crate::sql::error_context::within(frame, || {
         copy_row_binary_in_frame(
             storage, txn, services, setup, row, arena, responder, inserted, frame,
         )
-    })
+    });
+    // Binary input has no line buffer, so only the row count fills a window.
+    finish_copy_row_window(storage, setup, txn.txid, outcome, 0)
 }
 
 #[expect(
@@ -72380,13 +72465,63 @@ fn copy_row_binary_in_frame<'a>(
         responder,
         inserted,
         write_target,
-        setup.security_role,
+        &setup.batch,
         def,
         &checks,
         &generated_exprs,
         &mut values,
         arena,
     )
+}
+
+/// PostgreSQL's choice of COPY FROM insert method (`CopyFrom`): rows are
+/// inserted one at a time when the target has a BEFORE or INSTEAD OF row
+/// trigger, is a foreign table, is partitioned with an INSERT transition
+/// table, fills an omitted column from a volatile default other than
+/// `nextval`, or filters with a volatile WHERE.
+fn copy_insert_method<Definition0: crate::storage::DefinitionBacking>(
+    storage: &Storage,
+    setup: &CopySetup,
+    definition: &crate::storage::TableDefinition<Definition0>,
+    txn: &TxnState,
+    arena: &Arena,
+) -> Result<copy_batch::CopyInsertMethod, SqlError> {
+    use copy_batch::CopyInsertMethod;
+    let table = setup.table_index;
+    let partitioned = definition.partition.is_partitioned();
+    if definition.kind == crate::storage::TableKind::Foreign
+        || !copy_buffers_rows(storage, table, txn.txid)
+        || (partitioned
+            && transition_capture_required(
+                storage,
+                table,
+                txn.txid,
+                txn.replication_apply,
+                TriggerEvents::INSERT,
+            ))
+    {
+        return Ok(CopyInsertMethod::Single);
+    }
+    let defaults = parse_defaults(definition, arena, storage, txn.txid)?;
+    for (column, default) in defaults.iter().enumerate().take(definition.n_columns) {
+        // The DEFAULT option can default any column, so all of them count.
+        let defaulted =
+            setup.fmt.default.is_some() || !setup.targets[..setup.n_targets].contains(&column);
+        if let Some(default) = default
+            && defaulted
+            && super::query::expression_contains_volatile(default, storage, txn.txid, true)
+        {
+            return Ok(CopyInsertMethod::Single);
+        }
+    }
+    if setup.filter.is_volatile(storage, txn.txid, arena)? {
+        return Ok(CopyInsertMethod::Single);
+    }
+    Ok(if partitioned {
+        CopyInsertMethod::MultiConditional
+    } else {
+        CopyInsertMethod::Multi
+    })
 }
 
 /// Whether PostgreSQL's COPY FROM buffers rows for `table` (`CIM_MULTI`):
@@ -72423,7 +72558,7 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
     responder: &mut Responder,
     inserted: &mut CopyTransitionRows,
     logical_target: crate::storage::TableDefinitionTarget,
-    security_role: Option<u16>,
+    batch: &Mutex<copy_batch::CopyBatch>,
     definition: &crate::storage::TableDefinition<Definition0>,
     checks: &ParsedChecks<'a>,
     generated: &constraints::ParsedDefaults<'a>,
@@ -72444,6 +72579,12 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
             if txn.replication_apply {
                 storage.require_subscription_target(target, txn.txid)?;
             }
+            let leaf_batches = physical.kind != crate::storage::TableKind::Foreign
+                && copy_buffers_rows(storage, target, txn.txid);
+            let Some(buffered) = batch.lock().unwrap().route(target, leaf_batches) else {
+                // The flush before this row failed; `copy_row` reports it.
+                return Ok(CopyRowOutcome::Filtered);
+            };
             let leaf_checks;
             let checks = if target == logical_table {
                 checks
@@ -72482,51 +72623,6 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                 &values[..physical.n_columns],
                 txn.txid,
             )?;
-            if let Some(role) = security_role
-                && let Some(plan) = super::query::plan_row_security(
-                    storage,
-                    logical_table,
-                    usize::from(role),
-                    PolicyCommandKind::Insert,
-                    super::query::RowSecurityExpression::WithCheck,
-                    txn.txid,
-                    arena,
-                )?
-            {
-                let logical_values = partition_insert::logical_insert_values(
-                    mapping,
-                    definition.n_columns,
-                    &values[..physical.n_columns],
-                    arena,
-                )?;
-                let row = RowCtx {
-                    def: crate::storage::RelationDefinition::from_definition(definition),
-                    values: logical_values,
-                    alias: None,
-                };
-                let catalog = super::query::storage_catalog(storage, arena, txn.txid);
-                let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                let hooks = EvalHooks {
-                    catalog: Some(&catalog),
-                    sequences: Some(&sequences),
-                    ..NO_HOOKS
-                };
-                if !super::query::row_security_passes(
-                    plan,
-                    &row,
-                    storage,
-                    txn.txid,
-                    arena,
-                    &[],
-                    &hooks,
-                )? {
-                    return Err(sql_err!(
-                        sqlstate::INSUFFICIENT_PRIVILEGE,
-                        "new row violates row-level security policy for table \"{}\"",
-                        definition.name.as_str()
-                    ));
-                }
-            }
             check_not_null(physical, values)?;
             let mut schema = [ColType::Bool; MAX_COLUMNS];
             physical.schema(&mut schema);
@@ -72535,29 +72631,11 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
             } else {
                 ConstraintRow::insert(storage.next_rowid()?)
             };
-            let buffered = copy_buffers_rows(storage, target, txn.txid);
-            let index_error = |error: SqlError| {
-                // PostgreSQL inserts a buffered row's index entries when it
-                // flushes the buffer, after the input line has moved on.
-                if buffered
-                    && matches!(
-                        error.sqlstate.as_str(),
-                        sqlstate::UNIQUE_VIOLATION | sqlstate::EXCLUSION_VIOLATION
-                    )
-                {
-                    frame.text.set(None);
-                }
-                error
-            };
-            enforce_row_constraints(
+            constraints::enforce_row_checks(
                 storage,
-                target,
                 physical,
-                &schema[..physical.n_columns],
                 &values[..physical.n_columns],
-                row,
                 txn.txid,
-                Some(txn),
                 checks,
                 arena,
                 &[],
@@ -72566,8 +72644,31 @@ fn finish_copy_row<'a, Definition0: crate::storage::DefinitionBacking>(
                     seq_session,
                     coercion_txid,
                 )),
-            )
-            .map_err(index_error)?;
+            )?;
+            if let Err(error) = constraints::enforce_row_keys(
+                storage,
+                target,
+                physical,
+                &schema[..physical.n_columns],
+                &values[..physical.n_columns],
+                row,
+                txn.txid,
+                Some(&mut *txn),
+                checks,
+                arena,
+            ) {
+                // PostgreSQL inserts a buffered row's index entries when the
+                // buffers flush; the row goes no further either way.
+                if buffered
+                    && error.sqlstate.internal_control().is_none()
+                    && error.sqlstate != sqlstate::INTERNAL_ERROR
+                {
+                    let diagnostic = crate::sql::eval::take_diagnostic();
+                    batch.lock().unwrap().defer(error, diagnostic, frame.line);
+                    return Ok(CopyRowOutcome::Stored);
+                }
+                return Err(error);
+            }
             if physical.kind == crate::storage::TableKind::Foreign {
                 crate::sql::foreign::insert_row(
                     storage,

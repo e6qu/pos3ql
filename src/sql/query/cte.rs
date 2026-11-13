@@ -30,7 +30,16 @@ pub fn expand_ctes<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
-    expand_ctes_with_path(sel, storage, txid, None, None, 0, None, arena)
+    expand_ctes_with_path(
+        sel,
+        storage,
+        txid,
+        None,
+        None,
+        0,
+        ViewReader::Session,
+        arena,
+    )
 }
 
 /// Expands a view body under the search path captured when that view was
@@ -43,7 +52,16 @@ pub fn expand_ctes_under<'a>(
     path: crate::storage::PathContext,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
-    expand_ctes_with_path(sel, storage, txid, Some(path), None, 0, None, arena)
+    expand_ctes_with_path(
+        sel,
+        storage,
+        txid,
+        Some(path),
+        None,
+        0,
+        ViewReader::Session,
+        arena,
+    )
 }
 
 pub(crate) fn expand_stored_query<'a>(
@@ -61,7 +79,7 @@ pub(crate) fn expand_stored_query<'a>(
         Some(path),
         Some(dependencies),
         0,
-        None,
+        ViewReader::Session,
         arena,
     )
 }
@@ -94,7 +112,7 @@ pub(crate) fn expand_stored_query_exec<'a>(
         0,
         Some(path),
         Some(dependencies),
-        None,
+        ViewReader::Session,
         None,
         |name| body_references(select, name),
         |context| subst_select_body(select, context, arena),
@@ -118,7 +136,71 @@ pub(crate) fn expand_stored_expression<'a>(
             depth: 0,
             path: Some(storage.path()),
             dependencies: Some(dependencies),
-            authorization_role: None,
+            authorization_role: ViewReader::Session,
+            qualifier: None,
+            rule_transition: None,
+            recursive_state: None,
+            execution: None,
+        },
+        arena,
+    )
+}
+
+/// The relation a stored query's FROM item names: its captured dependency,
+/// else the name under `path` (or the session's path). The second value is
+/// the captured dependency's relation alone.
+pub(super) fn stored_relation_binding(
+    t: &TableRef<'_>,
+    storage: &Storage,
+    txid: u32,
+    path: Option<crate::storage::PathContext>,
+    dependencies: Option<crate::storage::StoredQueryDependencyView<'_>>,
+) -> Result<
+    (
+        Option<crate::storage::ResolvedRelation>,
+        Option<crate::storage::ResolvedRelation>,
+    ),
+    SqlError,
+> {
+    let captured = dependencies
+        .and_then(|dependencies| {
+            dependencies.entries().iter().find(|dependency| {
+                matches!(
+                    dependency.class,
+                    crate::storage::DependencyClass::Table | crate::storage::DependencyClass::View
+                ) && dependency.referenced_schema.as_str() == t.schema.unwrap_or("")
+                    && dependency.referenced_name.as_str() == t.table
+            })
+        })
+        .map(|dependency| storage.resolve_stored_query_relation(dependency, txid))
+        .transpose()?;
+    let resolved = captured.or_else(|| match path {
+        Some(p) => storage.resolve_relation_under(&p, t.schema, t.table, txid),
+        None => storage.resolve_relation(t.schema, t.table, txid),
+    });
+    Ok((resolved, captured))
+}
+
+/// [`expand_stored_expression`] under a view creator's `path`.
+pub(super) fn expand_stored_expression_under<'a>(
+    expression: &'a Expr<'a>,
+    storage: &Storage,
+    txid: u32,
+    path: crate::storage::PathContext,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    subst_expr(
+        expression,
+        Subst {
+            ctes: &[],
+            materialized: &[],
+            storage,
+            txid,
+            depth: 0,
+            path: Some(path),
+            dependencies: Some(dependencies),
+            authorization_role: ViewReader::Session,
             qualifier: None,
             rule_transition: None,
             recursive_state: None,
@@ -221,7 +303,7 @@ fn expand_ctes_with_path<'a>(
     path: Option<crate::storage::PathContext>,
     dependencies: Option<crate::storage::StoredQueryDependencyView<'_>>,
     depth: u32,
-    authorization_role: Option<u16>,
+    authorization_role: ViewReader,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
     // Fast path: nothing to rewrite (no CTEs anywhere and no views defined).
@@ -253,7 +335,7 @@ fn with_schema_context<'a, 's, R>(
     path: Option<crate::storage::PathContext>,
     dependencies: Option<crate::storage::StoredQueryDependencyView<'s>>,
     depth: u32,
-    authorization_role: Option<u16>,
+    authorization_role: ViewReader,
     arena: &'a Arena,
     mut visit: Option<&mut dyn FnMut(ScopedCte<'a>) -> Result<(), SqlError>>,
     build: impl for<'c> FnOnce(Subst<'c, 'a, 's, 'a>) -> Result<R, SqlError>,
@@ -389,7 +471,7 @@ pub(super) fn visit_cte_sources<'a>(
         path,
         dependencies,
         0,
-        None,
+        ViewReader::Session,
         arena,
         Some(visit),
         |_| Ok(()),
@@ -413,7 +495,7 @@ pub(crate) fn expand_dml_ctes_schema<'a>(
         path,
         dependencies,
         0,
-        None,
+        ViewReader::Session,
         arena,
         None,
         |context| {
@@ -451,12 +533,63 @@ pub(crate) fn expand_from_schema<'a>(
         None,
         None,
         0,
-        None,
+        ViewReader::Session,
         arena,
         None,
         |context| {
             let expanded = subst_from(from, context, arena)?;
             Ok(&*arena.alloc(expanded).map_err(|_| arena_full())?)
+        },
+    )
+}
+
+/// [`expand_from_schema`] for a write: `from.base` is the write's target,
+/// whose view (and the views below it) are expanded without checking SELECT,
+/// since writing through a view does not read it; the other items are read.
+pub(crate) fn expand_dml_from_schema<'a>(
+    from: &'a FromClause<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a FromClause<'a>, SqlError> {
+    if !storage.has_any_view() {
+        return Ok(from);
+    }
+    with_schema_context(
+        &[],
+        storage,
+        txid,
+        None,
+        None,
+        0,
+        ViewReader::Session,
+        arena,
+        None,
+        |context| {
+            let base = subst_tableref(
+                &from.base,
+                Subst {
+                    authorization_role: ViewReader::WriteTarget,
+                    ..context
+                },
+                arena,
+            )?;
+            let mut joins = crate::mem::arena::ArenaList::new(arena);
+            for join in from.joins {
+                joins
+                    .push(Join {
+                        table: subst_tableref(&join.table, context, arena)?,
+                        on: opt_subst(join.on, context, arena)?,
+                        ..*join
+                    })
+                    .map_err(|_| arena_full())?;
+            }
+            Ok(&*arena
+                .alloc(FromClause {
+                    base,
+                    joins: joins.as_slice(),
+                })
+                .map_err(|_| arena_full())?)
         },
     )
 }
@@ -508,7 +641,7 @@ pub(crate) fn expand_enclosed_ctes_exec<'a>(
         0,
         None,
         None,
-        None,
+        ViewReader::Session,
         enclosing,
         |name| body_references(sel, name),
         |context| subst_select_body(sel, context, arena),
@@ -552,7 +685,7 @@ pub(crate) fn expand_stream_ctes<'a>(
         0,
         None,
         None,
-        None,
+        ViewReader::Session,
         None,
         |name| body_references(sel, name),
         |context| subst_select_body(sel, context, arena),
@@ -703,7 +836,7 @@ fn materialized_input_context<'a, 's>(
         depth: 0,
         path: None,
         dependencies: None,
-        authorization_role: None,
+        authorization_role: ViewReader::Session,
         qualifier: None,
         rule_transition: None,
         recursive_state: None,
@@ -897,7 +1030,7 @@ pub(crate) fn expand_stored_statement_exec<'a>(
         arena,
         params,
         sequences,
-        None,
+        ViewReader::Session,
         None,
     )
 }
@@ -931,7 +1064,7 @@ pub(crate) fn expand_stored_rule_action_exec<'a>(
         arena,
         params,
         sequences,
-        Some(authorization_role),
+        ViewReader::Role(authorization_role),
         Some(RuleTransition {
             names,
             old,
@@ -975,7 +1108,7 @@ pub(crate) fn expand_stored_rule_expression_exec<'a>(
         0,
         Some(path),
         Some(dependencies),
-        Some(authorization_role),
+        ViewReader::Role(authorization_role),
         None,
         |_| 0,
         |context| {
@@ -1779,7 +1912,7 @@ pub(crate) fn rule_returning_items<'a>(
         depth: 0,
         path: None,
         dependencies: None,
-        authorization_role: None,
+        authorization_role: ViewReader::Session,
         qualifier: Some(ViewQualifier {
             from: relation.name,
             from_schema: relation.schema,
@@ -2290,7 +2423,7 @@ fn expand_stored_statement_with_transition<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
-    authorization_role: Option<u16>,
+    authorization_role: ViewReader,
     transition: Option<RuleTransition<'a>>,
 ) -> Result<&'a Stmt<'a>, SqlError> {
     let (outer_with, body) = match statement {
@@ -2415,7 +2548,7 @@ fn expand_dml_ctes_with_relations<'a>(
         0,
         None,
         None,
-        None,
+        ViewReader::Session,
         None,
         |name| statement_references(statement, name),
         |context| {
@@ -2600,7 +2733,7 @@ pub(crate) fn filter_view_rows<'a>(
         depth: 0,
         path: None,
         dependencies: None,
-        authorization_role: None,
+        authorization_role: ViewReader::Session,
         qualifier: Some(qualifier),
         rule_transition: None,
         recursive_state: None,
@@ -2982,27 +3115,19 @@ fn split_view_predicate<'a>(
     Ok((Some(subst_expr(predicate, context, arena)?), None))
 }
 
-/// Rebinds a data-modifying statement from an auto-updatable view to its base
-/// relation without losing qualified target references or the view's exposed
-/// RETURNING shape.
+/// Replaces the columns `names` of the relation `from` with `projected`, as
+/// a view level's expressions read the composed columns of the level below.
 #[allow(clippy::too_many_arguments)]
-pub fn rewrite_view_dml<'a>(
-    statement: &'a Stmt<'a>,
-    view_name: &'a str,
-    base_name: &'a str,
-    base_schema: &'a str,
-    exposed_columns: &'a [&'a str],
-    base_columns: &'a [&'a str],
+pub(super) fn substitute_relation_columns<'a>(
+    expression: &'a Expr<'a>,
+    from: &'a str,
+    from_schema: Option<&'a str>,
+    names: &'a [&'a str],
+    projected: &'a [&'a Expr<'a>],
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
-) -> Result<&'a Stmt<'a>, SqlError> {
-    let alias = match statement {
-        Stmt::Update(update) => update.alias,
-        Stmt::Delete(delete) => delete.alias,
-        _ => None,
-    };
-    let visible_name = alias.unwrap_or(view_name);
+) -> Result<&'a Expr<'a>, SqlError> {
     let context = Subst {
         ctes: &[],
         materialized: &[],
@@ -3011,25 +3136,172 @@ pub fn rewrite_view_dml<'a>(
         depth: 0,
         path: None,
         dependencies: None,
-        authorization_role: None,
+        authorization_role: ViewReader::Session,
         qualifier: Some(ViewQualifier {
-            from: visible_name,
-            from_schema: None,
-            to: alias.unwrap_or(base_name),
-            to_schema: base_schema,
-            exposed_columns,
-            base_columns,
-            projected_columns: None,
+            from,
+            from_schema,
+            to: from,
+            to_schema: from_schema.unwrap_or(""),
+            exposed_columns: names,
+            base_columns: names,
+            projected_columns: Some(projected),
             projected_aliases: &[],
         }),
         rule_transition: None,
         recursive_state: None,
         execution: None,
     };
-    // `*` also covers the FROM items of `UPDATE ... FROM` and `DELETE ... USING`.
+    subst_expr(expression, context, arena)
+}
+
+/// Rebinds a data-modifying statement from an auto-updatable view to its base
+/// table: written columns are checked and mapped level by level, view
+/// columns read in expressions and `RETURNING` become their base-table
+/// expressions, and every level's filter joins the statement's `WHERE`.
+pub fn rewrite_view_dml<'a>(
+    statement: &'a Stmt<'a>,
+    view_name: &'a str,
+    view: &super::UpdatableView<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<super::ViewRewrite<'a>, SqlError> {
+    use super::ViewWrite;
+    let exposed_columns = view.columns();
+    let (alias, view_schema) = match statement {
+        Stmt::Insert(insert) => (insert.alias, insert.table.schema),
+        Stmt::Update(update) => (update.alias, update.table.schema),
+        Stmt::Delete(delete) => (delete.alias, delete.table.schema),
+        Stmt::Merge(merge) => (merge.target_alias, merge.target.schema),
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view rewrite expected INSERT, UPDATE, DELETE, or MERGE"
+            ));
+        }
+    };
+    let visible_name = alias.unwrap_or(view_name);
+    let target = alias.unwrap_or(view.base.name);
+    // The written columns, checked as PostgreSQL's rewriter checks them.
+    let mut written = [false; MAX_PROJ];
+    let mut mark = |name: &str| -> Result<(), SqlError> {
+        require_view_column(view_name, exposed_columns, name)?;
+        if let Some(index) = exposed_columns.iter().position(|column| *column == name) {
+            written[index] = true;
+        }
+        Ok(())
+    };
+    let write = match statement {
+        Stmt::Insert(insert) => {
+            if insert.columns.is_empty() {
+                let width = super::dependencies::insert_source_width(insert, storage, txid, arena)?;
+                for column in &exposed_columns[..width.min(exposed_columns.len())] {
+                    mark(column)?;
+                }
+            } else {
+                for column in insert.columns {
+                    mark(column)?;
+                }
+            }
+            if let Some(assignments) = insert.on_conflict.and_then(|conflict| conflict.update) {
+                for (column, _) in assignments {
+                    mark(column)?;
+                }
+            }
+            ViewWrite::Insert
+        }
+        Stmt::Update(update) => {
+            for (column, _) in update.assignments {
+                mark(column)?;
+            }
+            ViewWrite::Update
+        }
+        Stmt::Delete(_) => ViewWrite::Delete,
+        Stmt::Merge(merge) => {
+            let mut write = ViewWrite::MergeDelete;
+            for when in merge.whens {
+                match when.action() {
+                    crate::sql::ast::MergeActionRef::Update(assignments) => {
+                        for (column, _) in assignments {
+                            mark(column)?;
+                        }
+                        if write == ViewWrite::MergeDelete {
+                            write = ViewWrite::MergeUpdate;
+                        }
+                    }
+                    crate::sql::ast::MergeActionRef::Insert {
+                        columns, values, ..
+                    } => {
+                        if columns.is_empty() {
+                            for column in
+                                &exposed_columns[..values.len().min(exposed_columns.len())]
+                            {
+                                mark(column)?;
+                            }
+                        } else {
+                            for column in columns {
+                                mark(column)?;
+                            }
+                        }
+                        write = ViewWrite::MergeInsert;
+                    }
+                    _ => {}
+                }
+            }
+            write
+        }
+        _ => unreachable!("statement kind checked above"),
+    };
+    let written = view.check_written(&written[..exposed_columns.len()], write)?;
+    // Names of written view columns map to their base columns; any other
+    // name keeps its spelling and fails where the statement binds it.
+    let mapped = arena
+        .alloc_slice_with(exposed_columns.len(), |index| {
+            let base = view.base_column(index);
+            if base.is_empty() {
+                exposed_columns[index]
+            } else {
+                base
+            }
+        })
+        .map_err(|_| arena_full())?;
+    let projected = view.projected_over(target, storage, txid, arena)?;
+    let context = Subst {
+        ctes: &[],
+        materialized: &[],
+        storage,
+        txid,
+        depth: 0,
+        path: None,
+        dependencies: None,
+        authorization_role: ViewReader::Session,
+        qualifier: Some(ViewQualifier {
+            from: visible_name,
+            from_schema: alias.is_none().then_some(view_schema).flatten(),
+            to: target,
+            to_schema: view.base.schema.unwrap_or(""),
+            exposed_columns,
+            base_columns: mapped,
+            projected_columns: Some(projected),
+            projected_aliases: &[],
+        }),
+        rule_transition: None,
+        recursive_state: None,
+        execution: None,
+    };
+    // `*` also covers the FROM items of `UPDATE ... FROM` and `DELETE ... USING`,
+    // and MERGE's source.
+    let merge_source;
     let (returning, from) = match statement {
         Stmt::Update(update) => (update.returning, update.from),
         Stmt::Delete(delete) => (delete.returning, delete.using),
+        Stmt::Merge(merge) => {
+            merge_source = FromClause {
+                base: merge.source,
+                joins: &[],
+            };
+            (merge.returning, Some(&merge_source))
+        }
         _ => (Returning::NONE, None),
     };
     let from_star = match from {
@@ -3057,39 +3329,68 @@ pub fn rewrite_view_dml<'a>(
         }
         _ => &[],
     };
-    let expanded_returning =
-        |items| expand_view_returning(items, visible_name, exposed_columns, from_star, arena);
+    // MERGE's `*` lists its source before its target.
+    let source_first = matches!(statement, Stmt::Merge(_));
+    let expanded_returning = |items| {
+        expand_view_returning(
+            items,
+            visible_name,
+            exposed_columns,
+            from_star,
+            source_first,
+            arena,
+        )
+    };
+    let base = view.base;
     let rewritten = match statement {
         Stmt::Insert(insert) => {
-            for column in insert.columns {
-                require_view_column(view_name, exposed_columns, column)?;
-            }
-            let columns = map_view_columns(
-                view_name,
-                exposed_columns,
-                base_columns,
-                insert.columns,
-                arena,
-            )?;
+            let columns: &'a [&'a str] = if insert.columns.is_empty() {
+                let width = super::dependencies::insert_source_width(insert, storage, txid, arena)?;
+                // A wider source fails as an INSERT with too many values.
+                if width > exposed_columns.len() {
+                    mapped
+                } else {
+                    &mapped[..width]
+                }
+            } else {
+                map_view_columns(view_name, exposed_columns, mapped, insert.columns, arena)?
+            };
             let adjusted = Insert {
                 columns,
                 returning: Returning {
                     items: expanded_returning(insert.returning.items)?,
                     ..insert.returning
                 },
+                on_conflict: match insert.on_conflict {
+                    Some(conflict) => Some(OnConflict {
+                        update: match conflict.update {
+                            Some(assignments) => Some(map_view_assignments(
+                                view_name,
+                                exposed_columns,
+                                mapped,
+                                assignments,
+                                arena,
+                            )?),
+                            None => None,
+                        },
+                        ..conflict
+                    }),
+                    None => None,
+                },
                 ..*insert
             };
             let adjusted = arena.alloc(adjusted).map_err(|_| arena_full())?;
-            Stmt::Insert(subst_insert(&*adjusted, context, arena)?)
+            let substituted = subst_insert(&*adjusted, context, arena)?;
+            Stmt::Insert(Insert {
+                table: base,
+                ..substituted
+            })
         }
         Stmt::Update(update) => {
-            for (column, _) in update.assignments {
-                require_view_column(view_name, exposed_columns, column)?;
-            }
             let assignments = map_view_assignments(
                 view_name,
                 exposed_columns,
-                base_columns,
+                mapped,
                 update.assignments,
                 arena,
             )?;
@@ -3102,7 +3403,15 @@ pub fn rewrite_view_dml<'a>(
                 ..*update
             };
             let adjusted = arena.alloc(adjusted).map_err(|_| arena_full())?;
-            Stmt::Update(subst_update(&*adjusted, context, arena)?)
+            let substituted = subst_update(&*adjusted, context, arena)?;
+            let where_clause =
+                view.filter_over(target, substituted.where_clause, storage, txid, arena)?;
+            Stmt::Update(Update {
+                table: base,
+                inheritance: view.base_inheritance,
+                where_clause,
+                ..substituted
+            })
         }
         Stmt::Delete(delete) => {
             let adjusted = Delete {
@@ -3113,16 +3422,104 @@ pub fn rewrite_view_dml<'a>(
                 ..*delete
             };
             let adjusted = arena.alloc(adjusted).map_err(|_| arena_full())?;
-            Stmt::Delete(subst_delete(&*adjusted, context, arena)?)
+            let substituted = subst_delete(&*adjusted, context, arena)?;
+            let where_clause =
+                view.filter_over(target, substituted.where_clause, storage, txid, arena)?;
+            Stmt::Delete(Delete {
+                table: base,
+                inheritance: view.base_inheritance,
+                where_clause,
+                ..substituted
+            })
         }
-        _ => {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "view rewrite expected INSERT, UPDATE, or DELETE"
-            ));
+        Stmt::Merge(merge) => {
+            let mut whens: ArenaList<'a, MergeWhen<'a>> = ArenaList::new(arena);
+            let map_target = |action: MergeTargetAction<'a>| -> Result<_, SqlError> {
+                Ok(match action {
+                    MergeTargetAction::Update(assignments) => {
+                        MergeTargetAction::Update(map_view_assignments(
+                            view_name,
+                            exposed_columns,
+                            mapped,
+                            assignments,
+                            arena,
+                        )?)
+                    }
+                    other => other,
+                })
+            };
+            for when in merge.whens {
+                whens
+                    .push(match *when {
+                        MergeWhen::Matched { cond, action } => MergeWhen::Matched {
+                            cond,
+                            action: map_target(action)?,
+                        },
+                        MergeWhen::NotMatchedBySource { cond, action } => {
+                            MergeWhen::NotMatchedBySource {
+                                cond,
+                                action: map_target(action)?,
+                            }
+                        }
+                        MergeWhen::NotMatchedByTarget { cond, action } => {
+                            MergeWhen::NotMatchedByTarget {
+                                cond,
+                                action: match action {
+                                    MergeSourceAction::Insert {
+                                        columns,
+                                        values,
+                                        default_values,
+                                        overriding,
+                                    } => MergeSourceAction::Insert {
+                                        columns: if columns.is_empty() {
+                                            if values.len() > exposed_columns.len() {
+                                                mapped
+                                            } else {
+                                                &mapped[..values.len()]
+                                            }
+                                        } else {
+                                            map_view_columns(
+                                                view_name,
+                                                exposed_columns,
+                                                mapped,
+                                                columns,
+                                                arena,
+                                            )?
+                                        },
+                                        values,
+                                        default_values,
+                                        overriding,
+                                    },
+                                    MergeSourceAction::DoNothing => MergeSourceAction::DoNothing,
+                                },
+                            }
+                        }
+                    })
+                    .map_err(|_| arena_full())?;
+            }
+            let adjusted = Merge {
+                whens: whens.as_slice(),
+                returning: Returning {
+                    items: expanded_returning(merge.returning.items)?,
+                    ..merge.returning
+                },
+                ..*merge
+            };
+            let adjusted = arena.alloc(adjusted).map_err(|_| arena_full())?;
+            let substituted = subst_merge(&*adjusted, context, arena)?;
+            Stmt::Merge(Merge {
+                target: base,
+                target_inheritance: view.base_inheritance,
+                target_alias: Some(target),
+                ..substituted
+            })
         }
+        _ => unreachable!("statement kind checked above"),
     };
-    Ok(&*arena.alloc(rewritten).map_err(|_| arena_full())?)
+    Ok(super::ViewRewrite {
+        statement: arena.alloc(rewritten).map_err(|_| arena_full())?,
+        written,
+    })
 }
 
 fn view_base_column<'a>(exposed: &[&'a str], base: &[&'a str], name: &'a str) -> &'a str {
@@ -3201,6 +3598,7 @@ fn expand_view_returning<'a>(
     view_name: &'a str,
     exposed_columns: &'a [&'a str],
     from_star: &[(&'a Expr<'a>, &'a str)],
+    source_first: bool,
     arena: &'a Arena,
 ) -> Result<&'a [SelectItem<'a>], SqlError> {
     let extra = items.iter().fold(0usize, |count, item| {
@@ -3225,9 +3623,19 @@ fn expand_view_returning<'a>(
     let mut output = [SelectItem::Wildcard(crate::sql::ast::SourcePosition::UNKNOWN); MAX_PROJ];
     let mut count = 0usize;
     for item in items {
-        if matches!(item, SelectItem::Wildcard(_))
+        let wildcard = matches!(item, SelectItem::Wildcard(_));
+        if wildcard
             || matches!(item, SelectItem::TableWildcard(qualifier) if *qualifier == view_name)
         {
+            if wildcard && source_first {
+                for &(expression, name) in from_star {
+                    output[count] = SelectItem::Expr {
+                        expression,
+                        alias: Some(name),
+                    };
+                    count += 1;
+                }
+            }
             for column in exposed_columns {
                 let expression = arena
                     .alloc(Expr::Column {
@@ -3241,7 +3649,7 @@ fn expand_view_returning<'a>(
                 };
                 count += 1;
             }
-            if matches!(item, SelectItem::Wildcard(_)) {
+            if wildcard && !source_first {
                 for &(expression, name) in from_star {
                     output[count] = SelectItem::Expr {
                         expression,
@@ -3284,7 +3692,7 @@ fn with_exec_context<'a, 's, 'e, R>(
     depth: u32,
     path: Option<crate::storage::PathContext>,
     dependencies: Option<crate::storage::StoredQueryDependencyView<'s>>,
-    authorization_role: Option<u16>,
+    authorization_role: ViewReader,
     enclosing: Option<&dyn crate::sql::eval::ColumnLookup<'a>>,
     root_references: impl Fn(&str) -> usize,
     build: impl for<'c> FnOnce(Subst<'c, 'a, 's, 'e>) -> Result<R, SqlError>,
@@ -3690,8 +4098,16 @@ pub(crate) fn expand_set_tree<'a>(
         return Ok(tree);
     }
     let wrapper = wrap_set_tree_with(with, tree, arena)?;
-    let expanded =
-        expand_ctes_with_path(wrapper, storage, txid, path, dependencies, 0, None, arena)?;
+    let expanded = expand_ctes_with_path(
+        wrapper,
+        storage,
+        txid,
+        path,
+        dependencies,
+        0,
+        ViewReader::Session,
+        arena,
+    )?;
     Ok(expanded.set_body.expect("wrapper keeps its set body"))
 }
 
@@ -3797,6 +4213,18 @@ type CteBindings<'a> = [(&'a str, &'a Select<'a>, &'a [&'a str])];
 /// plus optional column-rename list), materialized recursive CTEs, storage (to
 /// resolve view names), and the current view-expansion depth (a cycle /
 /// runaway-nesting guard).
+/// Whose SELECT privilege a view expansion checks on the views it expands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViewReader {
+    /// The current effective role at the statement boundary.
+    Session,
+    /// A view owner's role, inside that view's body.
+    Role(u16),
+    /// Nobody: the expanded view is a write target, whose rows a write does
+    /// not read; reads of its columns are checked where they are read.
+    WriteTarget,
+}
+
 #[derive(Clone, Copy)]
 struct Subst<'c, 'a, 's, 'e> {
     ctes: &'c CteBindings<'a>,
@@ -3812,8 +4240,7 @@ struct Subst<'c, 'a, 's, 'e> {
     path: Option<crate::storage::PathContext>,
     dependencies: Option<crate::storage::StoredQueryDependencyView<'s>>,
     /// Privilege identity inherited while expanding a stored view body.
-    /// `None` means the current effective role at the statement boundary.
-    authorization_role: Option<u16>,
+    authorization_role: ViewReader,
     /// DML on an auto-updatable view is executed against its base table.
     /// Qualified target references must follow that rewrite too.
     qualifier: Option<ViewQualifier<'a>>,
@@ -4329,7 +4756,7 @@ fn select_mentions_column(select: &Select<'_>, qualifier: &str, name: &str) -> b
         })
 }
 
-fn expr_mentions_column(expression: &Expr<'_>, qualifier: &str, name: &str) -> bool {
+pub(super) fn expr_mentions_column(expression: &Expr<'_>, qualifier: &str, name: &str) -> bool {
     let child = |expression| expr_mentions_column(expression, qualifier, name);
     match expression {
         Expr::Column {
@@ -4917,7 +5344,7 @@ fn reject_recursive_name_collision<'a>(
             depth: 0,
             path: None,
             dependencies: None,
-            authorization_role: None,
+            authorization_role: ViewReader::Session,
             qualifier: None,
             rule_transition: None,
             recursive_state: None,
@@ -5190,7 +5617,7 @@ fn append_recursive_state<'a>(
             depth: 0,
             path: None,
             dependencies: None,
-            authorization_role: None,
+            authorization_role: ViewReader::Session,
             qualifier: None,
             rule_transition: None,
             recursive_state: Some(RecursiveStateSubst {
@@ -5866,7 +6293,7 @@ fn materialize_recursive<'a>(
             depth: 0,
             path: None,
             dependencies: None,
-            authorization_role: None,
+            authorization_role: ViewReader::Session,
             qualifier: None,
             rule_transition: None,
             recursive_state: None,
@@ -6015,7 +6442,7 @@ fn materialize_recursive<'a>(
         depth: 0,
         path: None,
         dependencies: None,
-        authorization_role: None,
+        authorization_role: ViewReader::Session,
         qualifier: None,
         rule_transition: None,
         recursive_state: None,
@@ -6840,31 +7267,13 @@ fn subst_tableref<'a>(
     // by a table earlier in the path) expands to a derived table over the
     // view's stored SELECT, recursively expanded under the view creator's
     // search path.
-    let captured = context
-        .dependencies
-        .and_then(|dependencies| {
-            dependencies.entries().iter().find(|dependency| {
-                matches!(
-                    dependency.class,
-                    crate::storage::DependencyClass::Table | crate::storage::DependencyClass::View
-                ) && dependency.referenced_schema.as_str() == t.schema.unwrap_or("")
-                    && dependency.referenced_name.as_str() == t.table
-            })
-        })
-        .map(|dependency| {
-            context
-                .storage
-                .resolve_stored_query_relation(dependency, context.txid)
-        })
-        .transpose()?;
-    let resolved = captured.or_else(|| match context.path {
-        Some(p) => context
-            .storage
-            .resolve_relation_under(&p, t.schema, t.table, context.txid),
-        None => context
-            .storage
-            .resolve_relation(t.schema, t.table, context.txid),
-    });
+    let (resolved, captured) = stored_relation_binding(
+        t,
+        context.storage,
+        context.txid,
+        context.path,
+        context.dependencies,
+    )?;
     if let Some(crate::storage::ResolvedRelation::View(slot)) = resolved {
         if context.txid != 0 && context.execution.is_some() {
             context.storage.lock_object(
@@ -6882,17 +7291,24 @@ fn subst_tableref<'a>(
             ));
         }
         let view = context.storage.view(slot);
+        let view_object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::View,
+            slot: slot as u16,
+        };
         let requester = match context.authorization_role {
-            Some(role) => role as usize,
-            None => context
-                .storage
-                .current_role_slot(context.txid)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INSUFFICIENT_PRIVILEGE,
-                        "current role is not present in the role catalog"
-                    )
-                })?,
+            ViewReader::Role(role) => Some(role as usize),
+            ViewReader::Session => Some(
+                context
+                    .storage
+                    .current_role_slot(context.txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INSUFFICIENT_PRIVILEGE,
+                            "current role is not present in the role catalog"
+                        )
+                    })?,
+            ),
+            ViewReader::WriteTarget => None,
         };
         let view_schema = view.schema_for(context.txid);
         let catalog_describes_other_temporary_view = view.persistence
@@ -6900,42 +7316,39 @@ fn subst_tableref<'a>(
             && !context
                 .storage
                 .is_current_temporary_schema(view_schema.as_str());
-        if !catalog_describes_other_temporary_view {
+        if let Some(requester) = requester
+            && !catalog_describes_other_temporary_view
+        {
             context.storage.require_schema_usage_as(
                 view_schema.as_str(),
                 requester,
                 context.txid,
             )?;
-        }
-        let view_object = crate::storage::AccessObject {
-            class: crate::storage::AccessClass::View,
-            slot: slot as u16,
-        };
-        if !catalog_describes_other_temporary_view
-            && !context.storage.has_object_privilege(
+            if !context.storage.has_object_privilege(
                 view_object,
                 requester,
                 crate::storage::PrivilegeSet::SELECT,
                 context.txid,
-            )
-            && !context.storage.has_any_column_privilege(
+            ) && !context.storage.has_any_column_privilege(
                 view_object,
                 requester,
                 crate::storage::PrivilegeSet::SELECT,
                 context.txid,
-            )
-        {
-            return Err(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "permission denied for view {}",
-                view.name_for(context.txid).as_str()
-            ));
-        }
-        let authorization_role = match view.security_for(context.txid) {
-            crate::storage::ViewSecurity::Definer => {
-                Some(context.storage.object_owner(view_object, context.txid) as u16)
+            ) {
+                return Err(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied for view {}",
+                    view.name_for(context.txid).as_str()
+                ));
             }
-            crate::storage::ViewSecurity::Invoker => context.authorization_role,
+        }
+        let authorization_role = match (context.authorization_role, view.security_for(context.txid))
+        {
+            (ViewReader::WriteTarget, _) => ViewReader::WriteTarget,
+            (_, crate::storage::ViewSecurity::Definer) => {
+                ViewReader::Role(context.storage.object_owner(view_object, context.txid) as u16)
+            }
+            (reader, crate::storage::ViewSecurity::Invoker) => reader,
         };
         let query = context
             .storage
@@ -7069,7 +7482,10 @@ fn subst_tableref<'a>(
                 crate::storage::ResolvedRelation::Table(slot) => u16::try_from(slot).ok(),
                 _ => None,
             }),
-            authorization_role: context.authorization_role,
+            authorization_role: match context.authorization_role {
+                ViewReader::Role(role) => Some(role),
+                ViewReader::Session | ViewReader::WriteTarget => None,
+            },
             ..*t
         });
     }
@@ -7591,6 +8007,34 @@ fn subst_expr<'a>(
                 .position(|known| *known == name)
         {
             return Ok(projected[index]);
+        }
+        // A whole-row reference reads every projected column.
+        let whole_row = match e {
+            Expr::WholeRow(qualifier) => *qualifier == rewrite.from,
+            Expr::Column {
+                qualifier: None,
+                name,
+            } => *name == rewrite.from,
+            _ => false,
+        };
+        if whole_row && projected.len() == rewrite.exposed_columns.len() {
+            return Ok(&*arena
+                .alloc(Expr::Call {
+                    kind: crate::sql::ast::CallKind::SqlSyntax,
+                    name: "row",
+                    bound_oid: None,
+                    bound_strict: None,
+                    source_position: crate::sql::ast::SourcePosition::UNKNOWN,
+                    args: projected,
+                    argument_names: &[],
+                    variadic: false,
+                    star: false,
+                    distinct: false,
+                    order_by: &[],
+                    over: None,
+                    filter: None,
+                })
+                .map_err(|_| arena_full())?);
         }
     }
     if context.qualifier.is_none()

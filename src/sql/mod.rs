@@ -178,7 +178,7 @@ fn publish_execution_identity(identity: ExecutionIdentity) {
     set_execution_database_oid(identity.database_oid);
 }
 
-use ast::{Delete, Expr, Insert, Stmt, TransactionIsolation, TransactionTarget, Update};
+use ast::{Expr, Insert, Stmt, TransactionIsolation, TransactionTarget};
 use eval::{
     EvalHooks, NO_HOOKS, NO_PARAMS, NoColumns, SequenceAccess, SqlError, SqlState, eval, sqlstate,
 };
@@ -17016,7 +17016,7 @@ impl Engine {
                         progress,
                     );
                 }
-                let (insert, view_check) = match query::resolve_view_for_dml(
+                let (insert, view_check, authorization) = match query::resolve_view_for_dml(
                     storage,
                     insert.table,
                     txn.txid,
@@ -17024,53 +17024,39 @@ impl Engine {
                     query::ViewWrite::Insert,
                 ) {
                     Ok(Some(view)) => {
-                        let view_check = Some(exec::ViewCheck {
-                            predicate: view.check_option.and(view.where_clause),
-                            view_name: insert.table.name,
-                            defaults: exec::ViewInsertDefaults {
-                                base_columns: view.base_columns,
-                                columns: view.defaults,
-                                inputs: view.default_inputs,
-                            },
-                        });
-                        let rewritten = match query::rewrite_view_dml(
+                        let rewrite = match query::rewrite_view_dml(
                             statement,
                             insert.table.name,
-                            view.base.name,
-                            view.base.schema.expect("view base is qualified"),
-                            view.columns,
-                            view.base_columns,
+                            &view,
                             storage,
                             txn.txid,
                             arena,
                         ) {
-                            Ok(Stmt::Insert(rewritten)) => rewritten,
-                            Ok(_) => unreachable!("insert rewrite keeps its statement kind"),
+                            Ok(rewrite) => rewrite,
                             Err(error) => return Ok(Err(error)),
                         };
-                        let columns = if rewritten.columns.is_empty() {
-                            view.base_columns
-                        } else {
-                            rewritten.columns
+                        let Stmt::Insert(rewritten) = rewrite.statement else {
+                            unreachable!("insert rewrite keeps its statement kind")
                         };
-                        let rewritten = match arena.alloc(Insert {
-                            source_position: rewritten.source_position,
-                            table: view.base,
-                            alias: rewritten.alias,
-                            columns,
-                            rows: rewritten.rows,
-                            select: rewritten.select,
-                            on_conflict: rewritten.on_conflict,
-                            returning: rewritten.returning,
-                            overriding: rewritten.overriding,
-                            values_defaults: rewritten.values_defaults,
-                        }) {
-                            Ok(rewritten) => &*rewritten,
-                            Err(_) => return Ok(Err(query::arena_full_pub())),
+                        let authorization = match exec::require_nested_view_privileges(
+                            storage,
+                            &view,
+                            &rewrite.written,
+                            query::ViewWrite::Insert,
+                            authorization,
+                            statement,
+                            txn.txid,
+                            arena,
+                        ) {
+                            Ok(authorization) => authorization,
+                            Err(error) => return Ok(Err(error)),
                         };
-                        (rewritten, view_check)
+                        match view.view_check(storage, txn.txid, arena) {
+                            Ok(check) => (rewritten, Some(check), authorization),
+                            Err(error) => return Ok(Err(error)),
+                        }
                     }
-                    Ok(None) => (insert, None),
+                    Ok(None) => (insert, None, authorization),
                     Err(error) => return Ok(Err(error)),
                 };
                 exec::insert(
@@ -17117,7 +17103,7 @@ impl Engine {
                         progress,
                     );
                 }
-                let (update, view_check) = match query::resolve_view_for_dml(
+                let (update, view_check, authorization) = match query::resolve_view_for_dml(
                     storage,
                     update.table,
                     txn.txid,
@@ -17125,54 +17111,39 @@ impl Engine {
                     query::ViewWrite::Update,
                 ) {
                     Ok(Some(view)) => {
-                        let view_check = view.check_option.map(|_| exec::ViewCheck {
-                            predicate: view.where_clause,
-                            view_name: update.table.name,
-                            defaults: exec::ViewInsertDefaults {
-                                base_columns: view.base_columns,
-                                columns: view.defaults,
-                                inputs: view.default_inputs,
-                            },
-                        });
-                        let rewritten = match query::rewrite_view_dml(
+                        let rewrite = match query::rewrite_view_dml(
                             statement,
                             update.table.name,
-                            view.base.name,
-                            view.base.schema.expect("view base is qualified"),
-                            view.columns,
-                            view.base_columns,
+                            &view,
                             storage,
                             txn.txid,
                             arena,
                         ) {
-                            Ok(Stmt::Update(rewritten)) => rewritten,
-                            Ok(_) => unreachable!("update rewrite keeps its statement kind"),
+                            Ok(rewrite) => rewrite,
                             Err(error) => return Ok(Err(error)),
                         };
-                        let where_clause = match query::and_where(
-                            view.where_clause,
-                            rewritten.where_clause,
+                        let Stmt::Update(rewritten) = rewrite.statement else {
+                            unreachable!("update rewrite keeps its statement kind")
+                        };
+                        let authorization = match exec::require_nested_view_privileges(
+                            storage,
+                            &view,
+                            &rewrite.written,
+                            query::ViewWrite::Update,
+                            authorization,
+                            statement,
+                            txn.txid,
                             arena,
                         ) {
-                            Ok(where_clause) => where_clause,
+                            Ok(authorization) => authorization,
                             Err(error) => return Ok(Err(error)),
                         };
-                        let rewritten = match arena.alloc(Update {
-                            source_position: rewritten.source_position,
-                            table: view.base,
-                            inheritance: view.base_inheritance,
-                            alias: update.alias,
-                            assignments: rewritten.assignments,
-                            from: rewritten.from,
-                            where_clause,
-                            returning: rewritten.returning,
-                        }) {
-                            Ok(rewritten) => &*rewritten,
-                            Err(_) => return Ok(Err(query::arena_full_pub())),
-                        };
-                        (rewritten, view_check)
+                        match view.view_check(storage, txn.txid, arena) {
+                            Ok(check) => (rewritten, Some(check), authorization),
+                            Err(error) => return Ok(Err(error)),
+                        }
                     }
-                    Ok(None) => (update, None),
+                    Ok(None) => (update, None, authorization),
                     Err(error) => return Ok(Err(error)),
                 };
                 exec::update(
@@ -17217,7 +17188,7 @@ impl Engine {
                         progress,
                     );
                 }
-                let delete = match query::resolve_view_for_dml(
+                let (delete, authorization) = match query::resolve_view_for_dml(
                     storage,
                     delete.table,
                     txn.txid,
@@ -17225,42 +17196,35 @@ impl Engine {
                     query::ViewWrite::Delete,
                 ) {
                     Ok(Some(view)) => {
-                        let rewritten = match query::rewrite_view_dml(
+                        let rewrite = match query::rewrite_view_dml(
                             statement,
                             delete.table.name,
-                            view.base.name,
-                            view.base.schema.expect("view base is qualified"),
-                            view.columns,
-                            view.base_columns,
+                            &view,
                             storage,
                             txn.txid,
                             arena,
                         ) {
-                            Ok(Stmt::Delete(rewritten)) => rewritten,
-                            Ok(_) => unreachable!("delete rewrite keeps its statement kind"),
+                            Ok(rewrite) => rewrite,
                             Err(error) => return Ok(Err(error)),
                         };
-                        let where_clause = match query::and_where(
-                            view.where_clause,
-                            rewritten.where_clause,
+                        let Stmt::Delete(rewritten) = rewrite.statement else {
+                            unreachable!("delete rewrite keeps its statement kind")
+                        };
+                        match exec::require_nested_view_privileges(
+                            storage,
+                            &view,
+                            &rewrite.written,
+                            query::ViewWrite::Delete,
+                            authorization,
+                            statement,
+                            txn.txid,
                             arena,
                         ) {
-                            Ok(where_clause) => where_clause,
+                            Ok(authorization) => (rewritten, authorization),
                             Err(error) => return Ok(Err(error)),
-                        };
-                        match arena.alloc(Delete {
-                            table: view.base,
-                            inheritance: view.base_inheritance,
-                            alias: delete.alias,
-                            using: rewritten.using,
-                            where_clause,
-                            returning: rewritten.returning,
-                        }) {
-                            Ok(rewritten) => &*rewritten,
-                            Err(_) => return Ok(Err(query::arena_full_pub())),
                         }
                     }
-                    Ok(None) => delete,
+                    Ok(None) => (delete, authorization),
                     Err(error) => return Ok(Err(error)),
                 };
                 exec::delete(

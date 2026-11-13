@@ -93216,13 +93216,20 @@ fn view_metadata_never_reserves_execution_locks_for_idle_or_active_transactions(
         for (name, expected) in [("metadata_writable", true), ("metadata_literal", false)] {
             session.arena.reset();
             assert_eq!(
-                crate::mem::guard::forbid_alloc(|| query::view_is_auto_updatable(
-                    &engine.storage,
-                    "public",
-                    name,
-                    session.transaction.txid,
-                    &session.arena,
-                ))
+                crate::mem::guard::forbid_alloc(|| {
+                    let Some(crate::storage::ResolvedRelation::View(slot)) = engine
+                        .storage
+                        .resolve_relation(Some("public"), name, session.transaction.txid)
+                    else {
+                        panic!("view {name} resolves");
+                    };
+                    query::view_is_auto_updatable(
+                        &engine.storage,
+                        slot,
+                        session.transaction.txid,
+                        &session.arena,
+                    )
+                })
                 .unwrap(),
                 expected
             );

@@ -375,14 +375,12 @@ pub(crate) fn describe_data_modification_columns<'a>(
             let rewritten = crate::sql::query::rewrite_view_dml(
                 statement,
                 target.name,
-                view.base.name,
-                view.base.schema.expect("view base is qualified"),
-                view.columns,
-                view.base_columns,
+                &view,
                 storage,
                 txid,
                 arena,
-            )?;
+            )?
+            .statement;
             let (returning, target_alias, from) = match rewritten {
                 Stmt::Insert(insert) => (insert.returning, insert.alias, None),
                 Stmt::Update(update) => (update.returning, update.alias, update.from),

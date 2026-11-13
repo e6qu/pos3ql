@@ -2890,7 +2890,7 @@ pub(crate) fn dml_dependency_scope<'a>(
     let from = arena
         .alloc(FromClause { base, joins })
         .map_err(|_| super::arena_full())?;
-    let from = super::cte::expand_from_schema(from, storage, txid, arena)?;
+    let from = super::cte::expand_dml_from_schema(from, storage, txid, arena)?;
     if crate::sql::is_pg_settings(target) {
         // Its rule reads the view, which no write can target directly.
         return super::QueryScope::resolve_schema(storage, from, txid, arena, outer);
@@ -5974,4 +5974,31 @@ fn resolve_sequence_reference(
             }
         },
     )
+}
+
+/// The number of values each row of an INSERT without a column list
+/// supplies: its `VALUES` row width or its query's output width.
+pub(super) fn insert_source_width(
+    insert: &crate::sql::ast::Insert<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<usize, SqlError> {
+    let path = crate::storage::execution_path();
+    match (insert.rows.first(), insert.select) {
+        (Some(row), _) => Ok(row.len()),
+        (None, Some(select)) => select_output_width(
+            select,
+            storage,
+            txid,
+            arena,
+            CollectionContext {
+                path: &path,
+                transition: None,
+                bindings: None,
+                enclosing: None,
+            },
+        ),
+        (None, None) => Ok(0),
+    }
 }

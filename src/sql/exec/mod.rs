@@ -785,14 +785,19 @@ pub struct RowCtx<'s, 'v, 'd> {
     pub alias: Option<&'d str>,
 }
 
-/// A view predicate that must remain true after an auto-updatable rewrite.
-/// The predicate is retained as a parsed expression, so the write boundary
-/// never reparses catalog text while rows are being changed.
+/// The view rules a write through an auto-updatable view keeps: the
+/// `WITH CHECK OPTION` filters its rows must pass and the view defaults an
+/// INSERT applies. Predicates are retained as parsed expressions over the
+/// base table, so the write boundary never reparses catalog text while rows
+/// are being changed.
 #[derive(Clone, Copy)]
 pub(crate) struct ViewCheck<'a> {
-    pub predicate: Option<&'a Expr<'a>>,
-    pub view_name: &'a str,
-    pub defaults: ViewInsertDefaults<'a>,
+    /// `(view name, filter)` pairs, innermost view first, as PostgreSQL's
+    /// `ExecWithCheckOptions` evaluates them.
+    pub checks: &'a [(&'a str, &'a Expr<'a>)],
+    /// Each view level's defaults, outermost first; the first level with a
+    /// default for a base column supplies it.
+    pub defaults: &'a [ViewInsertDefaults<'a>],
 }
 
 /// View-column defaults paired with the base columns reached by an
@@ -74697,75 +74702,118 @@ fn parse_view_defaults<'a, Definition0: crate::storage::DefinitionBacking>(
     let Some(view) = view else {
         return Ok(parsed);
     };
-    for (view_index, base_name) in view.defaults.base_columns.iter().enumerate() {
-        let Some(default) = view.defaults.columns.default_at(view_index) else {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "view default columns do not match the view output"
-            ));
-        };
-        let Some(source) = default.expression() else {
-            continue;
-        };
-        if default.constant().is_some() {
-            continue;
+    let mut claimed = [false; MAX_COLUMNS];
+    for defaults in view.defaults {
+        for (view_index, base_name) in defaults.base_columns.iter().enumerate() {
+            if base_name.is_empty() {
+                continue;
+            }
+            let Some(base_index) = definition.column_index(base_name) else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "view default target is absent from its base relation"
+                ));
+            };
+            if claimed[base_index] {
+                continue;
+            }
+            if level_default(defaults, view_index).is_some() {
+                claimed[base_index] = true;
+                parse_view_default(
+                    defaults,
+                    view_index,
+                    base_index,
+                    definition,
+                    &mut parsed,
+                    arena,
+                    storage,
+                    txid,
+                )?;
+            }
         }
-        if default.is_generated() {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "view column default is a generated expression"
-            ));
-        }
-        let Some(base_index) = definition.column_index(base_name) else {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "view default target is absent from its base relation"
-            ));
-        };
-        let original = super::enum_values::checks::default_display(source.as_str(), arena)?;
-        let source = super::enum_values::checks::resolve_default(
-            source.as_str(),
-            definition.columns.as_ref()[base_index].ctype,
-            storage,
-            txid,
-            arena,
-        )?;
-        let section = crate::storage::StoredInputSection::ViewDefault((view_index + 1) as u16);
-        let inputs = view
-            .defaults
-            .inputs
-            .binary_search_by_key(&section, |(section, _)| *section)
-            .ok()
-            .map_or(&[][..], |index| view.defaults.inputs[index].1);
-        let inputs = super::type_inputs::rebase(
-            original,
-            source,
-            super::parser::StoredSqlKind::Expression,
-            inputs,
-            |name| Ok(super::type_inputs::target_oid(storage, txid, name)),
-            arena,
-        )?;
-        parsed[base_index] = Some(crate::sql::parser::parse_expression_with_type_inputs(
-            source,
-            inputs,
-            arena,
-            |parser| {
-                super::type_inputs::validate_restored_candidates(parser, |candidate| {
-                    Ok(inputs
-                        .iter()
-                        .find(|input| {
-                            (input.start, input.end, input.kind)
-                                == (candidate.start, candidate.end, candidate.kind)
-                        })
-                        .map(|input| input.type_oid)
-                        .or_else(|| {
-                            super::type_inputs::candidate_target_oid(storage, txid, candidate)
-                        }))
-                })
-            },
-        )?);
     }
     Ok(parsed)
+}
+
+fn level_default(
+    defaults: &ViewInsertDefaults<'_>,
+    view_index: usize,
+) -> Option<crate::storage::ColumnDefault> {
+    defaults
+        .columns
+        .default_at(view_index)
+        .filter(|default| !matches!(default, crate::storage::ColumnDefault::None))
+}
+
+#[expect(clippy::too_many_arguments, reason = "default parsing context")]
+fn parse_view_default<'a, Definition0: crate::storage::DefinitionBacking>(
+    view: &ViewInsertDefaults<'a>,
+    view_index: usize,
+    base_index: usize,
+    definition: &crate::storage::TableDefinition<Definition0>,
+    parsed: &mut constraints::ParsedDefaults<'a>,
+    arena: &'a Arena,
+    storage: &Storage,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let Some(default) = view.columns.default_at(view_index) else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "view default columns do not match the view output"
+        ));
+    };
+    let Some(source) = default.expression() else {
+        return Ok(());
+    };
+    if default.constant().is_some() {
+        return Ok(());
+    }
+    if default.is_generated() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "view column default is a generated expression"
+        ));
+    }
+    let original = super::enum_values::checks::default_display(source.as_str(), arena)?;
+    let source = super::enum_values::checks::resolve_default(
+        source.as_str(),
+        definition.columns.as_ref()[base_index].ctype,
+        storage,
+        txid,
+        arena,
+    )?;
+    let section = crate::storage::StoredInputSection::ViewDefault((view_index + 1) as u16);
+    let inputs = view
+        .inputs
+        .binary_search_by_key(&section, |(section, _)| *section)
+        .ok()
+        .map_or(&[][..], |index| view.inputs[index].1);
+    let inputs = super::type_inputs::rebase(
+        original,
+        source,
+        super::parser::StoredSqlKind::Expression,
+        inputs,
+        |name| Ok(super::type_inputs::target_oid(storage, txid, name)),
+        arena,
+    )?;
+    parsed[base_index] = Some(crate::sql::parser::parse_expression_with_type_inputs(
+        source,
+        inputs,
+        arena,
+        |parser| {
+            super::type_inputs::validate_restored_candidates(parser, |candidate| {
+                Ok(inputs
+                    .iter()
+                    .find(|input| {
+                        (input.start, input.end, input.kind)
+                            == (candidate.start, candidate.end, candidate.kind)
+                    })
+                    .map(|input| input.type_oid)
+                    .or_else(|| super::type_inputs::candidate_target_oid(storage, txid, candidate)))
+            })
+        },
+    )?);
+    Ok(())
 }
 
 fn view_default_for<Definition0: crate::storage::DefinitionBacking>(
@@ -74773,17 +74821,15 @@ fn view_default_for<Definition0: crate::storage::DefinitionBacking>(
     definition: &crate::storage::TableDefinition<Definition0>,
     base_index: usize,
 ) -> Option<crate::storage::ColumnDefault> {
-    let view = view?;
     let base_name = definition.columns().get(base_index)?.name.as_str();
-    let view_index = view
-        .defaults
-        .base_columns
-        .iter()
-        .position(|candidate| *candidate == base_name)?;
-    view.defaults
-        .columns
-        .default_at(view_index)
-        .filter(|default| !matches!(default, crate::storage::ColumnDefault::None))
+    view?.defaults.iter().find_map(|defaults| {
+        defaults
+            .base_columns
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| **candidate == base_name)
+            .find_map(|(view_index, _)| level_default(defaults, view_index))
+    })
 }
 
 #[expect(clippy::too_many_arguments, reason = "default evaluation context")]
@@ -75727,10 +75773,132 @@ pub(crate) fn merge<'a>(
     params: &[Datum<'a>],
     services: &mut TriggerServices<'_>,
     responder: &mut Responder,
+    capture: Option<&mut super::ReturningCapture<'_>>,
+    progress: Option<&mut RowProgress>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+) -> Outcome {
+    use crate::sql::ast::MergeActionRef as MergeAction;
+    let target_qual = crate::sql::ast::QualName {
+        schema: statement.target.schema,
+        name: statement.target.name,
+    };
+    let Some(crate::storage::ResolvedRelation::View(_)) =
+        storage.resolve_relation(target_qual.schema, target_qual.name, txn.txid)
+    else {
+        return merge_target(
+            storage, txn, statement, arena, params, services, responder, capture, progress, outer,
+            None,
+        );
+    };
+    // PostgreSQL rejects a view that is not automatically updatable for the
+    // first action that would write it.
+    for when in statement.whens {
+        let write = match when.action() {
+            MergeAction::Insert { .. } => super::query::ViewWrite::MergeInsert,
+            MergeAction::Update(_) => super::query::ViewWrite::MergeUpdate,
+            MergeAction::Delete => super::query::ViewWrite::MergeDelete,
+            MergeAction::DoNothing => continue,
+        };
+        if let Err(error) =
+            super::query::resolve_view_for_dml(storage, target_qual, txn.txid, arena, write)
+        {
+            return sql_fail(error);
+        }
+    }
+    let view = match super::query::resolve_view_for_dml(
+        storage,
+        target_qual,
+        txn.txid,
+        arena,
+        super::query::ViewWrite::MergeUpdate,
+    ) {
+        Ok(Some(view)) => view,
+        Ok(None) => {
+            return sql_fail(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "MERGE target view is absent during rewriting"
+            ));
+        }
+        Err(error) => return sql_fail(error),
+    };
+    let original = match arena.alloc(Stmt::Merge(*statement)) {
+        Ok(original) => &*original,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let rewrite = match super::query::rewrite_view_dml(
+        original,
+        target_qual.name,
+        &view,
+        storage,
+        txn.txid,
+        arena,
+    ) {
+        Ok(rewrite) => rewrite,
+        Err(error) => return sql_fail(error),
+    };
+    let Stmt::Merge(rewritten) = rewrite.statement else {
+        unreachable!("MERGE rewrite keeps its statement kind")
+    };
+    let authorization = match require_merge_view_privileges(
+        storage, original, statement, &view, &rewrite, txn.txid, arena,
+    ) {
+        Ok(authorization) => authorization,
+        Err(error) => return sql_fail(error),
+    };
+    // The views' filters select the target rows before the join, as
+    // PostgreSQL applies them as security quals of the target.
+    let view_target = match (
+        view.filter_over(view.base.name, None, storage, txn.txid, arena),
+        view.view_check(storage, txn.txid, arena),
+    ) {
+        (Ok(filter), Ok(check)) => MergeViewTarget {
+            filter,
+            check,
+            authorization,
+        },
+        (Err(error), _) | (_, Err(error)) => return sql_fail(error),
+    };
+    merge_target(
+        storage,
+        txn,
+        rewritten,
+        arena,
+        params,
+        services,
+        responder,
+        capture,
+        progress,
+        outer,
+        Some(view_target),
+    )
+}
+
+/// The rules of the auto-updatable view a MERGE writes through.
+#[derive(Clone, Copy)]
+struct MergeViewTarget<'a> {
+    /// Every view level's filter over the base table: target rows outside
+    /// the view are not candidates.
+    filter: Option<&'a Expr<'a>>,
+    check: ViewCheck<'a>,
+    /// The authorization the base table is checked with.
+    authorization: DmlAuthorization,
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn merge_target<'a>(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    statement: &'a crate::sql::ast::Merge<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    services: &mut TriggerServices<'_>,
+    responder: &mut Responder,
     mut capture: Option<&mut super::ReturningCapture<'_>>,
     mut progress: Option<&mut RowProgress>,
     outer: Option<&dyn ColumnLookup<'a>>,
+    view_target: Option<MergeViewTarget<'a>>,
 ) -> Outcome {
+    let view_check = view_target.map(|target| target.check);
     let seq_session = services.seq_session;
     let coercion_txid = txn.txid;
     use crate::sql::ast::MergeActionRef as MergeAction;
@@ -75775,30 +75943,6 @@ pub(crate) fn merge<'a>(
         schema: statement.target.schema,
         name: statement.target.name,
     };
-    if let Some(crate::storage::ResolvedRelation::View(_)) =
-        storage.resolve_relation(target_qual.schema, target_qual.name, txn.txid)
-    {
-        // PostgreSQL rejects a view that is not automatically updatable for
-        // the first action that would write it.
-        for when in statement.whens {
-            let write = match when.action() {
-                MergeAction::Insert { .. } => super::query::ViewWrite::MergeInsert,
-                MergeAction::Update(_) => super::query::ViewWrite::MergeUpdate,
-                MergeAction::Delete => super::query::ViewWrite::MergeDelete,
-                MergeAction::DoNothing => continue,
-            };
-            if let Err(error) =
-                super::query::resolve_view_for_dml(storage, target_qual, txn.txid, arena, write)
-            {
-                return sql_fail(error);
-            }
-        }
-        return sql_fail(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "MERGE into view \"{}\" is not supported",
-            target_qual.name
-        ));
-    }
     let table_index = match resolve_dml_table(storage, &target_qual, txn.txid) {
         Ok(i) => i,
         Err(e) => return sql_fail(e),
@@ -75936,44 +76080,56 @@ pub(crate) fn merge<'a>(
         Ok(reads) => reads,
         Err(error) => return sql_fail(error),
     };
+    // A MERGE through a view checks its base table as the view's owner.
+    let privilege_role = match view_target
+        .map_or(DmlAuthorization::Invoker, |target| target.authorization)
+        .role(storage, txn.txid)
+    {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
+    };
     if has_delete
-        && let Err(error) = require_table_privilege(
+        && let Err(error) = require_table_privilege_as(
             storage,
             table_index,
             crate::storage::PrivilegeSet::DELETE,
+            privilege_role,
             txn.txid,
         )
     {
         return sql_fail(error);
     }
     if has_update
-        && let Err(error) = require_table_column_privilege(
+        && let Err(error) = require_table_column_privilege_as(
             storage,
             table_index,
             crate::storage::PrivilegeSet::UPDATE,
             update_columns,
+            privilege_role,
             txn.txid,
         )
     {
         return sql_fail(error);
     }
     if has_insert
-        && let Err(error) = require_table_column_privilege(
+        && let Err(error) = require_table_column_privilege_as(
             storage,
             table_index,
             crate::storage::PrivilegeSet::INSERT,
             insert_columns,
+            privilege_role,
             txn.txid,
         )
     {
         return sql_fail(error);
     }
     if !reads_target.is_empty()
-        && let Err(error) = require_table_column_privilege(
+        && let Err(error) = require_table_column_privilege_as(
             storage,
             table_index,
             crate::storage::PrivilegeSet::SELECT,
             reads_target,
+            privilege_role,
             txn.txid,
         )
     {
@@ -75997,15 +76153,7 @@ pub(crate) fn merge<'a>(
         return sql_fail(error);
     }
     let reads_target = !reads_target.is_empty();
-    let current_role = match storage.current_role_slot(txn.txid) {
-        Some(role) => role,
-        None => {
-            return sql_fail(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "current role is not present in the role catalog"
-            ));
-        }
-    };
+    let current_role = privilege_role;
     let select_security = if reads_target {
         match super::query::plan_row_security(
             storage,
@@ -76422,6 +76570,18 @@ pub(crate) fn merge<'a>(
                         return Ok(());
                     }
                 }
+                if !merge_view_row_visible(
+                    view_target,
+                    def,
+                    &values[..def.n_columns],
+                    storage,
+                    txn.txid,
+                    seq_session,
+                    arena,
+                    params,
+                )? {
+                    return Ok(());
+                }
                 let owned = arena
                     .alloc_slice_copy(&values[..def.n_columns])
                     .map_err(|_| super::query::arena_full_pub())?;
@@ -76624,6 +76784,20 @@ pub(crate) fn merge<'a>(
                     Err(error) => return sql_fail(error),
                 }
             }
+            match merge_view_row_visible(
+                view_target,
+                def,
+                &logical[..def.n_columns],
+                storage,
+                txn.txid,
+                seq_session,
+                arena,
+                params,
+            ) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => return sql_fail(error),
+            }
             let owned = match arena.alloc_slice_copy(&vals[..row_definition.n_columns]) {
                 Ok(v) => &*v,
                 Err(_) => return sql_fail(super::query::arena_full_pub()),
@@ -76694,6 +76868,10 @@ pub(crate) fn merge<'a>(
     let defaults = match parse_defaults(def, arena, storage, txn.txid) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
+    };
+    let view_defaults = match parse_view_defaults(view_check, def, arena, storage, txn.txid) {
+        Ok(defaults) => defaults,
+        Err(error) => return sql_fail(error),
     };
 
     drop(selection_snapshot);
@@ -76895,6 +77073,8 @@ pub(crate) fn merge<'a>(
                                         },
                                         &generated,
                                         &defaults,
+                                        view_check,
+                                        &view_defaults,
                                         services,
                                         arena,
                                         params,
@@ -77715,6 +77895,20 @@ pub(crate) fn merge<'a>(
                                 ) {
                                     return sql_fail(e);
                                 }
+                                if let Err(error) = enforce_view_check(
+                                    view_check,
+                                    def,
+                                    &new_values[..def.n_columns],
+                                    ViewCheckContext {
+                                        storage,
+                                        txid: txn.txid,
+                                        arena,
+                                        params,
+                                        seq_session,
+                                    },
+                                ) {
+                                    return sql_fail(error);
+                                }
                                 if let Some(tuple_id) = target_remote_ids
                                     .as_deref()
                                     .and_then(|identities| identities[j])
@@ -78222,6 +78416,39 @@ fn lock_merge_row<'a>(
 
 /// The 21000 error PostgreSQL raises when a MERGE would affect a target row a
 /// second time.
+/// Whether a target row lies inside the view a MERGE writes through.
+#[expect(clippy::too_many_arguments, reason = "row evaluation context")]
+fn merge_view_row_visible<'a, Definition0: crate::storage::DefinitionBacking>(
+    view: Option<MergeViewTarget<'a>>,
+    definition: &crate::storage::TableDefinition<Definition0>,
+    values: &[Datum<'a>],
+    storage: &Storage,
+    txid: u32,
+    seq_session: &crate::sql::guc::SeqSession,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+) -> Result<bool, SqlError> {
+    let Some(filter) = view.and_then(|view| view.filter) else {
+        return Ok(true);
+    };
+    let row = RowCtx {
+        def: crate::storage::RelationDefinition::from_definition(definition),
+        values,
+        alias: None,
+    };
+    let catalog = super::query::storage_catalog(storage, arena, txid);
+    let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
+    let hooks = EvalHooks {
+        catalog: Some(&catalog),
+        sequences: Some(&sequences),
+        ..NO_HOOKS
+    };
+    Ok(matches!(
+        eval_full(filter, arena, params, &row, &hooks)?,
+        Datum::Bool(true)
+    ))
+}
+
 fn merge_cardinality() -> SqlError {
     sql_err!(
         sqlstate::CARDINALITY_VIOLATION,
@@ -78246,6 +78473,8 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
     source_ctx: &Scope,
     generated: &[Option<&'a Expr<'a>>; MAX_COLUMNS],
     defaults: &[Option<&'a Expr<'a>>; MAX_COLUMNS],
+    view: Option<ViewCheck<'a>>,
+    view_defaults: &[Option<&'a Expr<'a>>; MAX_COLUMNS],
     services: &mut TriggerServices<'_>,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -78324,24 +78553,21 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
             sequences: Some(&seq),
             ..super::eval::NO_HOOKS
         };
-        for (i, col) in def.columns().iter().enumerate() {
+        for i in 0..def.columns().len() {
             if explicit[i] {
                 continue;
             }
-            if let Some(d) = col.default.constant() {
-                row[i] = super::enum_values::materialize(d.as_datum(), storage, txn.txid, arena)?;
-            } else if let Some(expr) = defaults[i] {
-                row[i] = eval_assignment(
-                    expr,
-                    col,
-                    storage,
-                    txn.txid,
-                    arena,
-                    crate::sql::eval::NO_PARAMS,
-                    &NoColumns,
-                    &hooks,
-                )?;
-            }
+            row[i] = insert_default_value(
+                storage,
+                txn.txid,
+                view,
+                def,
+                i,
+                defaults[i],
+                view_defaults[i],
+                arena,
+                &hooks,
+            )?;
         }
     }
     fill_auto_increment(
@@ -78492,6 +78718,26 @@ fn merge_insert<'a, Definition0: crate::storage::DefinitionBacking, Scope: Colum
                     row_target,
                     row.stored(),
                     &row_arr[..def.n_columns],
+                )?;
+            }
+            if view.is_some() {
+                let logical_values = partition_insert::logical_insert_values(
+                    mapping,
+                    logical_definition.n_columns,
+                    &row_arr[..def.n_columns],
+                    arena,
+                )?;
+                enforce_view_check(
+                    view,
+                    logical_definition,
+                    logical_values,
+                    ViewCheckContext {
+                        storage,
+                        txid: txn.txid,
+                        arena,
+                        params,
+                        seq_session,
+                    },
                 )?;
             }
             fire_partition_row_triggers(
@@ -78942,16 +79188,16 @@ fn instead_of_view_defaults<'a>(
             .alloc_str(column.name.as_str())
             .map_err(|_| super::query::arena_full_pub())?;
     }
-    Ok(ViewCheck {
-        predicate: None,
-        view_name: arena
-            .alloc_str(view.name.as_str())
-            .map_err(|_| super::query::arena_full_pub())?,
-        defaults: ViewInsertDefaults {
+    let defaults = arena
+        .alloc(ViewInsertDefaults {
             base_columns,
             columns: *view.columns_for(txid),
             inputs: view.default_inputs_for(txid).detached_sections(arena)?,
-        },
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    Ok(ViewCheck {
+        checks: &[],
+        defaults: core::slice::from_ref(defaults),
     })
 }
 
@@ -95412,14 +95658,12 @@ fn enforce_view_check<'a, Definition0: crate::storage::DefinitionBacking>(
     values: &[Datum<'a>],
     check_context: ViewCheckContext<'_, 'a, '_, '_>,
 ) -> Result<(), SqlError> {
-    let Some(ViewCheck {
-        predicate: Some(predicate),
-        view_name,
-        ..
-    }) = check
-    else {
+    let Some(check) = check else {
         return Ok(());
     };
+    if check.checks.is_empty() {
+        return Ok(());
+    }
     let row = RowCtx {
         def: crate::storage::RelationDefinition::from_definition(definition),
         values,
@@ -95440,23 +95684,31 @@ fn enforce_view_check<'a, Definition0: crate::storage::DefinitionBacking>(
         sequences: Some(&sequences),
         ..NO_HOOKS
     };
-    if matches!(
-        eval_full(
-            predicate,
-            check_context.arena,
-            check_context.params,
-            &row,
-            &hooks,
-        )?,
-        Datum::Bool(true)
-    ) {
-        return Ok(());
+    for (view_name, predicate) in check.checks {
+        if matches!(
+            eval_full(
+                predicate,
+                check_context.arena,
+                check_context.params,
+                &row,
+                &hooks,
+            )?,
+            Datum::Bool(true)
+        ) {
+            continue;
+        }
+        let detail = constraints::failing_row_detail(&values[..definition.columns().len()])?;
+        crate::sql::eval::stash_object_diagnostic(
+            Some(detail.as_str()),
+            crate::sql::eval::ErrorObjects::default(),
+        );
+        return Err(sql_err!(
+            sqlstate::WITH_CHECK_OPTION_VIOLATION,
+            "new row violates check option for view \"{}\"",
+            view_name
+        ));
     }
-    Err(sql_err!(
-        sqlstate::WITH_CHECK_OPTION_VIOLATION,
-        "new row violates check option for view \"{}\"",
-        view_name
-    ))
+    Ok(())
 }
 
 fn require_view_privilege_as(
@@ -95558,20 +95810,16 @@ fn view_privilege_definition<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<crate::storage::TableDefView<'a>, SqlError> {
+    // The stored column names suffice: describing the view's query would
+    // check SELECT on the relations it reads, which writing does not need.
     let definition = storage.view(view);
-    let mut descriptions = [super::types::ColDesc::new("", 0, 0); MAX_PROJ];
-    let count = super::catalog::describe_view(&definition, txid, arena, &mut descriptions)?;
-    if count > MAX_COLUMNS {
-        return Err(sql_err!(
-            sqlstate::TOO_MANY_COLUMNS,
-            "too many view columns"
-        ));
-    }
+    let names = definition.columns_for(txid).names();
+    let count = names.len();
     let columns = arena
         .alloc_slice_with(count, |_| ColumnMeta::EMPTY)
         .map_err(|_| super::query::arena_full_pub())?;
-    for (column, description) in columns.iter_mut().zip(&descriptions[..count]) {
-        column.name = crate::storage::SqlName::parse(description.name)?;
+    for (column, name) in columns.iter_mut().zip(names) {
+        column.name = *name;
     }
     Ok(crate::storage::TableDefView {
         schema: definition.schema_for(txid),
@@ -95583,6 +95831,170 @@ fn view_privilege_definition<'a>(
             .map_err(|_| super::query::arena_full_pub())?,
         ..crate::storage::TableDefView::empty()
     })
+}
+
+/// PostgreSQL checks each view below the written one as the role that
+/// checked the view above it: the upper view's owner, or that role again for
+/// a `security_invoker` upper view. Returns the authorization the base table
+/// is checked with.
+#[expect(clippy::too_many_arguments, reason = "privilege context")]
+pub(crate) fn require_nested_view_privileges(
+    storage: &Storage,
+    view: &super::query::UpdatableView<'_>,
+    written: &[ColumnSet],
+    write: super::query::ViewWrite,
+    authorization: DmlAuthorization,
+    statement: &crate::sql::ast::Stmt<'_>,
+    txid: u32,
+    arena: &Arena,
+) -> Result<DmlAuthorization, SqlError> {
+    use super::query::ViewWrite;
+    let reads = view.read_columns(view_dml_reads(
+        storage,
+        statement,
+        view.levels[0].slot,
+        txid,
+        arena,
+    )?);
+    let mut authorization = authorization;
+    for (index, level) in view.levels.iter().enumerate().skip(1) {
+        let role = authorization.role(storage, txid)?;
+        if !reads[index].is_empty() {
+            require_view_column_privilege_as(
+                storage,
+                level.slot,
+                crate::storage::PrivilegeSet::SELECT,
+                reads[index],
+                role,
+                txid,
+            )?;
+        }
+        match write {
+            ViewWrite::Insert | ViewWrite::MergeInsert => require_view_column_privilege_as(
+                storage,
+                level.slot,
+                crate::storage::PrivilegeSet::INSERT,
+                written[index],
+                role,
+                txid,
+            )?,
+            ViewWrite::Update | ViewWrite::MergeUpdate => require_view_column_privilege_as(
+                storage,
+                level.slot,
+                crate::storage::PrivilegeSet::UPDATE,
+                written[index],
+                role,
+                txid,
+            )?,
+            ViewWrite::Delete | ViewWrite::MergeDelete => require_view_privilege_as(
+                storage,
+                level.slot,
+                crate::storage::PrivilegeSet::DELETE,
+                role,
+                txid,
+            )?,
+            ViewWrite::CheckOption => {}
+        }
+        authorization = view_level_authorization(storage, level.slot, authorization, txid);
+    }
+    Ok(authorization)
+}
+
+fn view_level_authorization(
+    storage: &Storage,
+    view: usize,
+    authorization: DmlAuthorization,
+    txid: u32,
+) -> DmlAuthorization {
+    match storage.view(view).security_for(txid) {
+        crate::storage::ViewSecurity::Definer => DmlAuthorization::RuleOwner(storage.object_owner(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::View,
+                slot: view as u16,
+            },
+            txid,
+        ) as u16),
+        crate::storage::ViewSecurity::Invoker => authorization,
+    }
+}
+
+/// A MERGE into a view needs, on the view and on each view below it, the
+/// privilege of every action it can take.
+fn require_merge_view_privileges(
+    storage: &Storage,
+    original: &crate::sql::ast::Stmt<'_>,
+    statement: &crate::sql::ast::Merge<'_>,
+    view: &super::query::UpdatableView<'_>,
+    rewrite: &super::query::ViewRewrite<'_>,
+    txid: u32,
+    arena: &Arena,
+) -> Result<DmlAuthorization, SqlError> {
+    use super::query::ViewWrite;
+    let mut kinds = [false; 3];
+    for when in statement.whens {
+        match when.action() {
+            crate::sql::ast::MergeActionRef::Insert { .. } => kinds[0] = true,
+            crate::sql::ast::MergeActionRef::Update(_) => kinds[1] = true,
+            crate::sql::ast::MergeActionRef::Delete => kinds[2] = true,
+            crate::sql::ast::MergeActionRef::DoNothing => {}
+        }
+    }
+    let top = view.levels[0].slot;
+    let role = DmlAuthorization::Invoker.role(storage, txid)?;
+    let below = view_level_authorization(storage, top, DmlAuthorization::Invoker, txid);
+    let mut base = below;
+    for (present, write) in kinds.into_iter().zip([
+        ViewWrite::MergeInsert,
+        ViewWrite::MergeUpdate,
+        ViewWrite::MergeDelete,
+    ]) {
+        if !present {
+            continue;
+        }
+        match write {
+            ViewWrite::MergeDelete => require_view_privilege_as(
+                storage,
+                top,
+                crate::storage::PrivilegeSet::DELETE,
+                role,
+                txid,
+            )?,
+            _ => require_view_column_privilege_as(
+                storage,
+                top,
+                if write == ViewWrite::MergeInsert {
+                    crate::storage::PrivilegeSet::INSERT
+                } else {
+                    crate::storage::PrivilegeSet::UPDATE
+                },
+                rewrite.written[0],
+                role,
+                txid,
+            )?,
+        }
+        base = require_nested_view_privileges(
+            storage,
+            view,
+            &rewrite.written,
+            write,
+            below,
+            original,
+            txid,
+            arena,
+        )?;
+    }
+    let reads = view_dml_reads(storage, original, top, txid, arena)?;
+    if !reads.is_empty() {
+        require_view_column_privilege_as(
+            storage,
+            top,
+            crate::storage::PrivilegeSet::SELECT,
+            reads,
+            role,
+            txid,
+        )?;
+    }
+    Ok(base)
 }
 
 /// Checks the invoker's visible view privileges before its DML target is
@@ -95623,16 +96035,73 @@ pub(crate) fn require_view_dml_privileges(
         })
     };
     match statement {
-        crate::sql::ast::Stmt::Insert(insert) => {
+        crate::sql::ast::Stmt::Insert(insert) => require_view_column_privilege_as(
+            storage,
+            view,
+            crate::storage::PrivilegeSet::INSERT,
+            target_mask(insert.columns)?,
+            role,
+            txid,
+        )?,
+        crate::sql::ast::Stmt::Update(update) => {
+            let mut writes = ColumnSet::EMPTY;
+            for (name, _) in update.assignments {
+                writes |= target_mask(core::slice::from_ref(name))?;
+            }
             require_view_column_privilege_as(
                 storage,
                 view,
-                crate::storage::PrivilegeSet::INSERT,
-                target_mask(insert.columns)?,
+                crate::storage::PrivilegeSet::UPDATE,
+                writes,
                 role,
                 txid,
             )?;
-            let reads = returning_dml_target_columns(
+        }
+        crate::sql::ast::Stmt::Delete(_) => require_view_privilege_as(
+            storage,
+            view,
+            crate::storage::PrivilegeSet::DELETE,
+            role,
+            txid,
+        )?,
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view privilege target is not data-modifying"
+            ));
+        }
+    }
+    let reads = view_dml_reads(storage, statement, view, txid, arena)?;
+    if !reads.is_empty() {
+        require_view_column_privilege_as(
+            storage,
+            view,
+            crate::storage::PrivilegeSet::SELECT,
+            reads,
+            role,
+            txid,
+        )?;
+    }
+    Ok(view_level_authorization(storage, view, authorization, txid))
+}
+
+/// The columns of the view `view` a write through it reads: those its
+/// `WHERE`, assigned expressions, MERGE conditions and `RETURNING` name.
+pub(crate) fn view_dml_reads(
+    storage: &Storage,
+    statement: &crate::sql::ast::Stmt<'_>,
+    view: usize,
+    txid: u32,
+    arena: &Arena,
+) -> Result<ColumnSet, SqlError> {
+    let definition = view_privilege_definition(storage, view, txid, arena)?;
+    let expression_reads = |expression: &Expr<'_>, alias: Option<&str>| {
+        expression_dml_target_columns(expression, &definition, alias, storage, txid, arena)
+    };
+    let mut reads = ColumnSet::EMPTY;
+    match statement {
+        crate::sql::ast::Stmt::Insert(insert) => {
+            reads |= returning_dml_target_columns(
                 insert.returning,
                 &definition,
                 None,
@@ -95640,40 +96109,13 @@ pub(crate) fn require_view_dml_privileges(
                 txid,
                 arena,
             )?;
-            if !reads.is_empty() {
-                require_view_column_privilege_as(
-                    storage,
-                    view,
-                    crate::storage::PrivilegeSet::SELECT,
-                    reads,
-                    role,
-                    txid,
-                )?;
-            }
         }
         crate::sql::ast::Stmt::Update(update) => {
-            let mut writes = ColumnSet::EMPTY;
-            let mut reads = ColumnSet::EMPTY;
-            for (name, expression) in update.assignments {
-                writes |= target_mask(core::slice::from_ref(name))?;
-                reads |= expression_dml_target_columns(
-                    expression,
-                    &definition,
-                    update.alias,
-                    storage,
-                    txid,
-                    arena,
-                )?;
+            for (_, expression) in update.assignments {
+                reads |= expression_reads(expression, update.alias)?;
             }
             if let Some(expression) = update.where_clause {
-                reads |= expression_dml_target_columns(
-                    expression,
-                    &definition,
-                    update.alias,
-                    storage,
-                    txid,
-                    arena,
-                )?;
+                reads |= expression_reads(expression, update.alias)?;
             }
             reads |= returning_dml_target_columns(
                 update.returning,
@@ -95683,34 +96125,12 @@ pub(crate) fn require_view_dml_privileges(
                 txid,
                 arena,
             )?;
-            require_view_column_privilege_as(
-                storage,
-                view,
-                crate::storage::PrivilegeSet::UPDATE,
-                writes,
-                role,
-                txid,
-            )?;
-            if !reads.is_empty() {
-                require_view_column_privilege_as(
-                    storage,
-                    view,
-                    crate::storage::PrivilegeSet::SELECT,
-                    reads,
-                    role,
-                    txid,
-                )?;
-            }
         }
         crate::sql::ast::Stmt::Delete(delete) => {
-            require_view_privilege_as(
-                storage,
-                view,
-                crate::storage::PrivilegeSet::DELETE,
-                role,
-                txid,
-            )?;
-            let mut reads = returning_dml_target_columns(
+            if let Some(expression) = delete.where_clause {
+                reads |= expression_reads(expression, delete.alias)?;
+            }
+            reads |= returning_dml_target_columns(
                 delete.returning,
                 &definition,
                 delete.alias,
@@ -95718,44 +96138,40 @@ pub(crate) fn require_view_dml_privileges(
                 txid,
                 arena,
             )?;
-            if let Some(expression) = delete.where_clause {
-                reads |= expression_dml_target_columns(
-                    expression,
-                    &definition,
-                    delete.alias,
-                    storage,
-                    txid,
-                    arena,
-                )?;
-            }
-            if !reads.is_empty() {
-                require_view_column_privilege_as(
-                    storage,
-                    view,
-                    crate::storage::PrivilegeSet::SELECT,
-                    reads,
-                    role,
-                    txid,
-                )?;
-            }
         }
-        _ => {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "view privilege target is not data-modifying"
-            ));
+        crate::sql::ast::Stmt::Merge(merge) => {
+            let alias = merge.target_alias;
+            reads |= expression_reads(merge.on, alias)?;
+            for when in merge.whens {
+                if let Some(condition) = when.condition() {
+                    reads |= expression_reads(condition, alias)?;
+                }
+                match when.action() {
+                    crate::sql::ast::MergeActionRef::Update(assignments) => {
+                        for (_, expression) in assignments {
+                            reads |= expression_reads(expression, alias)?;
+                        }
+                    }
+                    crate::sql::ast::MergeActionRef::Insert { values, .. } => {
+                        for expression in values {
+                            reads |= expression_reads(expression, alias)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            reads |= returning_dml_target_columns(
+                merge.returning,
+                &definition,
+                alias,
+                storage,
+                txid,
+                arena,
+            )?;
         }
+        _ => {}
     }
-    Ok(match storage.view(view).security_for(txid) {
-        crate::storage::ViewSecurity::Definer => DmlAuthorization::RuleOwner(storage.object_owner(
-            crate::storage::AccessObject {
-                class: crate::storage::AccessClass::View,
-                slot: view as u16,
-            },
-            txid,
-        ) as u16),
-        crate::storage::ViewSecurity::Invoker => authorization,
-    })
+    Ok(reads)
 }
 
 /// Public view of the OID-to-ColType mapping for value-level renderers

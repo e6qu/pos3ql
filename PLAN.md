@@ -573,11 +573,11 @@ SQL/JSON result types) are reported when the statement would run. In a
 written before the failing modifier are reported first, as PostgreSQL's
 analysis order finds them; in other statements the modifier error comes first.
 Writes to catalog views other than `pg_settings`, and to system catalogs,
-fail with `42P01`. Writing through a view whose query reads
-another view, or that computes a column, fails with `0A000` (`writing through
-view "v" is not supported`) where PostgreSQL writes the base relation and
-rejects only an assignment to a computed column; `MERGE` into an
-automatically updatable view fails the same way.
+fail with `42P01`. A write through a view on another view that writes the
+lower view with its own `INSTEAD OF` trigger or rewrite rule fails with
+`0A000` (`writing through view "v2" into view "v1", which has INSTEAD OF
+triggers or rewrite rules, is not supported`); PostgreSQL rewrites onto the
+lower view and fires its trigger or rule.
 A trigger's returned `record` (as opposed to a named row type) keeps no
 field type modifiers, so a returned `varchar(10)` field fails only when its
 value does not fit the `varchar(5)` column, and its `DETAIL` names the

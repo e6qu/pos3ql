@@ -483,7 +483,7 @@ foreign_reference_status=$?
 psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 > "$WORK/foreign_pos3ql.out" 2>&1 <<SQL
 CREATE TYPE public.pos3ql_fdw_pair AS (code integer, label text);
-CREATE EXTENSION postgres_fdw;
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
 CREATE SERVER reference_server FOREIGN DATA WRAPPER postgres_fdw
   OPTIONS (host '$PGHOST', port '$PGPORT', dbname 'postgres', sslmode 'disable');
 CREATE USER MAPPING FOR CURRENT_USER SERVER reference_server OPTIONS (user '$PGUSER');

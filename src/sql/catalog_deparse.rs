@@ -1003,6 +1003,35 @@ impl Context<'_> {
                 match operand {
                     // A cast literal is converted while parsing.
                     Expr::Str(_) | Expr::Null => self.literal(operand, target, output),
+                    // An object identifier cast to a `reg*` type is a constant
+                    // PostgreSQL prints by its object's name, as bound
+                    // expressions store a named object's identifier.
+                    Expr::Int(object)
+                        if ColType::from_oid(target).is_some_and(ColType::is_reg_object) =>
+                    {
+                        let ctype = ColType::from_oid(target).expect("checked above");
+                        let catalog = crate::sql::query::storage_catalog(
+                            self.storage,
+                            output.arena,
+                            self.txid,
+                        );
+                        let Ok(object) = u32::try_from(*object) else {
+                            return output.unsupported();
+                        };
+                        let named = match crate::sql::eval::regobject_cast(
+                            crate::sql::types::Datum::Oid(object),
+                            ctype,
+                            Some(&catalog),
+                            output.arena,
+                        ) {
+                            Ok(value) => output
+                                .arena
+                                .alloc_str_display(value)
+                                .map_err(|_| arena_full())?,
+                            Err(_) => return output.unsupported(),
+                        };
+                        self.constant(named, target, output)
+                    }
                     _ => {
                         self.wrapped(operand, Some(None), Parent::Cast, true, output)?;
                         output.push("::")?;

@@ -651,6 +651,30 @@ pub(crate) fn default_expression<'a>(
         return copy_original();
     };
     let cached = constant.as_datum();
+    // A `reg*` constant keeps its object's identifier and prints that
+    // object's current name, like PostgreSQL's Const.
+    if let Datum::RegObject {
+        type_oid,
+        referenced_oid,
+        ..
+    } = cached
+        && let Some(ctype) = super::types::ColType::from_oid(type_oid)
+    {
+        let catalog = super::query::storage_catalog(storage, arena, txid);
+        let current = super::eval::regobject_cast(
+            Datum::Oid(referenced_oid as u32),
+            ctype,
+            Some(&catalog),
+            arena,
+        )?;
+        let value = arena
+            .alloc_str_display(current)
+            .map_err(|_| super::query::arena_full_pub())?;
+        return arena
+            .alloc_str_display(format_args!("{}::{}", SqlString(value), ctype.name()))
+            .map(Some)
+            .map_err(|_| super::query::arena_full_pub());
+    }
     if !matches!(cached, Datum::Enum { .. })
         && !matches!(cached, Datum::Array { element, .. } if matches!(element.to_coltype(), super::types::ColType::Enum(_)))
     {

@@ -44260,6 +44260,24 @@ fn user_defined_aggregate_executes_typed_transition_final_and_ordering() {
             crate::sql::types::ColType::Array(crate::sql::types::ArrElem::Int4).oid(),
         ]
     );
+    // A zero-argument aggregate is typed by its declared result, not taken
+    // for a trigger function that a zero-argument call could also name.
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT aggregate_old_tick(*) FROM aggregate_input"
+        )),
+        [crate::sql::types::oid::INT8]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_typeof(aggregate_old_tick(*)) FROM aggregate_input"
+        )),
+        ["bigint"]
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,

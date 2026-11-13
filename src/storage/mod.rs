@@ -11070,7 +11070,7 @@ pub(crate) enum RoutineCallKind {
 }
 
 impl RoutineCallKind {
-    const fn accepts(self, kind: RoutineKind) -> bool {
+    pub(crate) const fn accepts(self, kind: RoutineKind) -> bool {
         match self {
             Self::Function => kind.function_result().is_some(),
             Self::Scalar => kind.function_result().is_some() && !kind.is_set_returning(),

@@ -248,7 +248,7 @@ PGUSER=postgres
 PSQL=psql
 P3_PID=1
 REFERENCE_DATABASE=postgres
-REFERENCE_EXTENSION_CONTROL_ROOT=/oracle/extensions
+REFERENCE_PGOPTIONS='-c timezone=UTC -c extension_control_path=$system:/oracle/extensions'
 PGOPTIONS=
 server_alive() { return 0; }
 psql() {
@@ -287,7 +287,7 @@ psql() {
                         rows = stdout.splitlines()[1:]
                         self.assertEqual(
                             rows[0],
-                            "options=-c timezone=UTC -c extension_control_path=/oracle/extensions"
+                            "options=-c timezone=UTC -c extension_control_path=$system:/oracle/extensions"
                             if reference else "options=",
                         )
                         self.assertIn("-e", rows)
@@ -299,6 +299,32 @@ psql() {
                         self.assertEqual(record["line"], 8)
                         self.assertEqual(record["sqlstate"], "23505")
                         self.assertEqual("message" in record, diagnostics == "verbose")
+
+    def test_reference_options_escape_whitespace_instead_of_quoting(self):
+        for harness in ("ci_diff.sh", "differential.sh"):
+            with self.subTest(harness=harness):
+                source = (ROOT / "tests/external" / harness).read_text()
+                start = source.index("pgoptions_value() {")
+                end = source.index("\n}", start) + 2
+                definition = source[start:end]
+                start = source.index("REFERENCE_PGOPTIONS=")
+                end = source.index("\n", start)
+                assignment = source[start:end]
+                completed = subprocess.run(
+                    [
+                        "bash", "-c",
+                        "set -eu\n" + definition
+                        + '\nREFERENCE_EXTENSION_CONTROL_PATH="$1"\n' + assignment
+                        + '\nprintf %s "$REFERENCE_PGOPTIONS"',
+                        "test", "$system:/oracle/a b\\c\td",
+                    ],
+                    text=True, capture_output=True, check=True,
+                )
+                self.assertEqual(
+                    completed.stdout,
+                    "-c timezone=UTC -c extension_control_path="
+                    "$system:/oracle/a\\ b\\\\c\\\td",
+                )
 
     def test_both_harnesses_reject_a_failed_client_before_comparing_results(self):
         for harness in ("ci_diff.sh", "differential.sh"):

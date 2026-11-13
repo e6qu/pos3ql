@@ -105,6 +105,14 @@ REFERENCE_EXTENSION_CONTROL_ROOT=${POS3QL_REFERENCE_EXTENSION_CONTROL_PATH:-$PWD
 # contrib's postgres_fdw is installed), then the test packages.
 EXTENSION_CONTROL_PATH="\$system:$EXTENSION_CONTROL_ROOT"
 REFERENCE_EXTENSION_CONTROL_PATH="\$system:$REFERENCE_EXTENSION_CONTROL_ROOT"
+# The server splits PGOPTIONS on whitespace and honours only backslash
+# escapes, so quotes would become part of a value.
+pgoptions_value() {
+  local value=${1//\\/\\\\}
+  value=${value// /\\ }
+  printf '%s' "${value//$'\t'/\\$'\t'}"
+}
+REFERENCE_PGOPTIONS="-c timezone=UTC -c extension_control_path=$(pgoptions_value "$REFERENCE_EXTENSION_CONTROL_PATH")"
 
 PASS=0 FAIL=0
 ok()  { PASS=$((PASS+1)); echo "PASS: $1"; }
@@ -923,7 +931,7 @@ psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 \
   -c 'DROP EXTENSION IF EXISTS pos3ql_ext CASCADE; DROP EXTENSION IF EXISTS pos3ql_base CASCADE; DROP SCHEMA IF EXISTS extension_dump CASCADE' \
   > "$WORK/extension_reference_clean.out" 2>&1
-PGOPTIONS="-c extension_control_path=$REFERENCE_EXTENSION_CONTROL_PATH" \
+PGOPTIONS="$REFERENCE_PGOPTIONS" \
   psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
     -v ON_ERROR_STOP=1 -f "$WORK/extension.sql" \
     > "$WORK/extension_restore.out" 2>&1
@@ -1549,7 +1557,7 @@ run_corpus() { # host port outfile file diagnostics
     *) printf 'FAIL: unknown corpus diagnostics %s\n' "$diagnostics" >&2; return 1 ;;
   esac
   if [[ "$1" == "$PGHOST" && "$2" == "$PGPORT" ]]; then
-    PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_PATH" \
+    PGOPTIONS="$REFERENCE_PGOPTIONS" \
       psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -e -P pager=off \
         -v VERBOSITY=verbose -f "$4" > "$3.stdout" 2> "$3.stderr" || status=$?
   else

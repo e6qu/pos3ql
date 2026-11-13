@@ -653,6 +653,40 @@ finished run, and joins rewind their outer source. A tree containing a
 volatile function under a node that cannot evaluate rows again saves its
 outputs, as scrollable cursors over such shapes do now.
 
+### Write sub-statements that run as their rows are read
+
+*Design; not yet implemented (see PLAN.md, write phases).* PostgreSQL runs a
+data-modifying `WITH` query, a rule's action and an `INSERT ... SELECT`
+source as plan nodes the consuming statement pulls rows from. pos3ql runs
+each of them to completion first, which orders their `AFTER` events before
+the consumer's and keeps a materialized copy of every source row.
+
+- **Producer nodes.** A data-modifying `WITH` query becomes a retained plan
+  node (see [retained plan tree](#retained-plan-tree)) whose step writes one
+  source row and yields its `RETURNING` row. The consumer pulls it like a
+  scan; an unreferenced query is drained after the main statement, last one
+  first, as PostgreSQL's `ExecPostprocessPlan` does. `INSERT ... SELECT`
+  reads its source through the same node interface instead of materializing
+  it, so the source holds one row in the statement workspace at a time.
+- **Event order.** Each producer queues its `AFTER ROW` events in the
+  existing spilling event log as its rows are written, tagged with the
+  statement's depth and command, so they interleave with the consumer's in
+  PostgreSQL's order. Statement-level events stay queued at the producer's
+  end. No new memory class is needed: the log already spills to
+  `trigger_event_spill_bytes`.
+- **Separate logs per producer.** A wait or a routine call restarts the
+  statement at the unfinished row. Each producer keeps its own row progress
+  (changed rows, as for a top-level write) and its own routine invocation
+  log, so a restart replays neither another producer's calls nor its rows;
+  the consumer's progress records which producer row it last consumed.
+  Producers count against `write_step_levels`, and exhaustion stays the named
+  `54000`.
+- **Rule steps and foreign tables.** A rule action's AFTER work runs from the
+  same completion cursor as a top-level write's, so it yields instead of
+  reading synchronously; foreign-table writes record row progress through
+  the same interface, so a routine call after their first row resumes
+  instead of failing with `0A000`.
+
 ### How saved state is owned
 
 A paused command must resume exactly where it stopped, without repeating

@@ -71930,7 +71930,7 @@ pub(crate) fn copy_statement_begin(
     let definition = setup
         .definitions
         .definition(storage, setup.table_index, txn.txid)?;
-    let method = copy_insert_method(storage, setup, &definition, txn, arena)?;
+    let method = copy_insert_method(storage, setup, definition, txn, arena)?;
     *setup.batch.lock().unwrap() = copy_batch::CopyBatch::new(method);
     fire_statement_triggers(
         TriggerExecContext {

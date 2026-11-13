@@ -221,7 +221,7 @@ mod tests {
     }
 
     fn failure(result: Result<(), FlushFailure>) -> (u64, StackStr<192>) {
-        let failure = result.err().expect("flush fails");
+        let failure = result.expect_err("flush fails");
         (failure.line, failure.error.message)
     }
 

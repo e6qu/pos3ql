@@ -856,7 +856,7 @@ mod subquery;
 #[cfg(test)]
 pub(crate) use subquery::subquery_analyses;
 pub(crate) use subquery::{
-    CorrelatedSubqueries, DmlSubqueries, ProceduralSubqueries, SubqueryBinding,
+    CorrelatedSubqueries, DmlSubqueries, NestedBindings, ProceduralSubqueries, SubqueryBinding,
     check_sublink_columns, subquery_expression_type,
 };
 use subquery::{

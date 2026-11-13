@@ -727,9 +727,10 @@ fn left_items<'s, 'd>(
 }
 
 impl<'a> ColumnLookup<'a> for DerivedTableOuter<'_, '_, '_, 'a> {
-    fn statement_subqueries(&self) -> &'a [crate::sql::eval::DeferredSubquery<'a>] {
+    fn statement_subqueries(&self) -> crate::sql::eval::StatementScope<'a> {
         self.enclosing
-            .map_or(&[], |enclosing| enclosing.statement_subqueries())
+            .map(|enclosing| enclosing.statement_subqueries())
+            .unwrap_or_default()
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {

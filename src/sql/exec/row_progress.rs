@@ -85,6 +85,38 @@ struct RowResume {
     returning: Option<transition_rows::SavedTransitionRows>,
     /// Statement-wide row state the write keeps besides its counters.
     state: Option<transition_rows::SavedTransitionRows>,
+    /// A selection of foreign rows. The remote session keeps the earlier
+    /// rows' changes, so selecting them again would find their new versions
+    /// or miss them; the next attempt continues with these rows instead.
+    selection: Option<SavedSelection>,
+}
+
+struct SavedSelection {
+    rows: crate::mem::lease_pool::MutableSlice<PhysicalRow>,
+    /// Each row's joined `FROM` or `USING` row, in selection order.
+    joined: Option<transition_rows::SavedTransitionRows>,
+}
+
+/// A selection an interrupted attempt kept for the next one.
+#[derive(Clone, Copy)]
+pub(super) struct KeptSelection<'p> {
+    pub(super) rows: &'p [PhysicalRow],
+    joined: Option<&'p transition_rows::SavedTransitionRows>,
+}
+
+impl<'p> KeptSelection<'p> {
+    /// The joined rows, one per selected row, decoded in `arena`.
+    pub(super) fn joined<'out>(
+        self,
+        arena: &'out Arena,
+    ) -> Result<Option<&'out [&'out [u8]]>, SqlError>
+    where
+        'p: 'out,
+    {
+        self.joined
+            .map(|joined| joined.restore(arena).map(|rows| rows.old))
+            .transpose()
+    }
 }
 
 /// A write's transition captures: one per operation it performs.
@@ -112,6 +144,8 @@ pub(super) struct ResumedRows<'p> {
 pub(super) struct SavedReturning<'a> {
     pub(super) old: Option<&'a [Datum<'a>]>,
     pub(super) new: Option<&'a [Datum<'a>]>,
+    /// The joined row of `UPDATE ... FROM` or `DELETE ... USING`.
+    pub(super) joined: Option<&'a [Datum<'a>]>,
 }
 
 /// The unfinished row and how to roll it back, handed to the caller.
@@ -713,21 +747,28 @@ impl RowProgress {
         &mut self,
         old: Option<&[Datum<'_>]>,
         new: Option<&[Datum<'_>]>,
+        joined: Option<&[Datum<'_>]>,
         arena: &Arena,
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<(), SqlError> {
         let mark = arena.mark();
         let saved = (|| {
-            let old = old
-                .map(|old| encode_projected_pub(old, arena))
-                .transpose()?;
-            let new = new
-                .map(|new| encode_projected_pub(new, arena))
-                .transpose()?;
+            // The present images in order, then one row naming which.
+            let mut rows: [&[u8]; 3] = [&[]; 3];
+            let mut present = 0i32;
+            let mut count = 0;
+            for (bit, values) in [old, new, joined].into_iter().enumerate() {
+                if let Some(values) = values {
+                    rows[count] = encode_projected_pub(values, arena)?;
+                    count += 1;
+                    present |= 1 << bit;
+                }
+            }
+            let mask = encode_projected_pub(&[Datum::Int4(present)], arena)?;
             transition_rows::SavedTransitionRows::capture(
                 TransitionRows {
-                    old: old.as_slice(),
-                    new: new.as_slice(),
+                    old: &rows[..count],
+                    new: core::slice::from_ref(&mask),
                 },
                 pool,
             )
@@ -824,23 +865,42 @@ impl RowProgress {
             query::reopen_statement_reads();
         }
         let rows = saved.restore(arena)?;
-        let decode = |row: Option<&&[u8]>| -> Result<Option<&'out [Datum<'out>]>, SqlError> {
-            let Some(row) = row else {
-                return Ok(None);
-            };
-            let row = arena
-                .alloc_slice_copy(row)
-                .map_err(|_| crate::sql::query::arena_full_pub())?;
-            let mut values = [Datum::Null; MAX_COLUMNS];
-            let width = projected::decode_projected_row_into(row, arena, &mut values)?;
-            let values = arena
-                .alloc_slice_copy(&values[..width])
-                .map_err(|_| crate::sql::query::arena_full_pub())?;
-            Ok(Some(&*values))
+        let lost = || {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "a resumed RETURNING row lost its values"
+            )
         };
+        let present = match rows.new.first() {
+            Some(mask) => match decode_projected_col_record(mask, 0, arena)? {
+                Datum::Int4(present) => present,
+                _ => return Err(lost()),
+            },
+            None => return Err(lost()),
+        };
+        let mut images = rows.old.iter();
+        let mut next = |bit: usize| (present & (1 << bit) != 0).then(|| images.next());
+        let (old, new, joined) = (next(0), next(1), next(2));
+        let decode =
+            |row: Option<Option<&&[u8]>>| -> Result<Option<&'out [Datum<'out>]>, SqlError> {
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let row = row.ok_or_else(lost)?;
+                let row = arena
+                    .alloc_slice_copy(row)
+                    .map_err(|_| crate::sql::query::arena_full_pub())?;
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                let width = projected::decode_projected_row_into(row, arena, &mut values)?;
+                let values = arena
+                    .alloc_slice_copy(&values[..width])
+                    .map_err(|_| crate::sql::query::arena_full_pub())?;
+                Ok(Some(&*values))
+            };
         Ok(Some(SavedReturning {
-            old: decode(rows.old.first())?,
-            new: decode(rows.new.first())?,
+            old: decode(old)?,
+            new: decode(new)?,
+            joined: decode(joined)?,
         }))
     }
 
@@ -914,6 +974,69 @@ impl RowProgress {
         captures: [Option<&TransitionCapture<'_>>; CAPTURES],
         pool: &std::sync::Arc<LeasePool>,
     ) -> Result<(), SqlError> {
+        self.interrupt_with(selected, None, captures, pool)
+    }
+
+    /// [`Self::interrupt`] for a write over stored rows: a selection of
+    /// foreign rows is kept for the next attempt.
+    pub(super) fn interrupt_rows<'r>(
+        &mut self,
+        selection: &[PhysicalRow],
+        joined: &dyn Fn(PhysicalRow) -> Option<&'r [u8]>,
+        captures: [Option<&TransitionCapture<'_>>; CAPTURES],
+        pool: &std::sync::Arc<LeasePool>,
+    ) -> Result<(), SqlError> {
+        if self.running.is_none() {
+            return Ok(());
+        }
+        let kept = if selection
+            .iter()
+            .any(|row| matches!(row, PhysicalRow::Foreign { .. }))
+        {
+            let full = |error| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "foreign write selection: {}",
+                    error
+                )
+            };
+            let mut rows = pool.lease::<PhysicalRow>(selection.len()).map_err(full)?;
+            rows.extend_from_slice(selection).map_err(full)?;
+            let joined = if selection.first().is_some_and(|row| joined(*row).is_some()) {
+                let mut kept = pool.lease::<&[u8]>(selection.len()).map_err(full)?;
+                for row in selection {
+                    kept.push(joined(*row).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "selected DML row has no retained FROM row"
+                        )
+                    })?)
+                    .map_err(full)?;
+                }
+                Some(transition_rows::SavedTransitionRows::capture(
+                    TransitionRows {
+                        old: &kept,
+                        new: &[],
+                    },
+                    pool,
+                )?)
+            } else {
+                None
+            };
+            Some(SavedSelection { rows, joined })
+        } else {
+            None
+        };
+        self.interrupt_with(selection.len(), kept, captures, pool)
+    }
+
+    fn interrupt_with(
+        &mut self,
+        selected: usize,
+        kept_selection: Option<SavedSelection>,
+        captures: [Option<&TransitionCapture<'_>>; CAPTURES],
+        pool: &std::sync::Arc<LeasePool>,
+    ) -> Result<(), SqlError> {
         let Some(start) = self.running.take() else {
             return Ok(());
         };
@@ -941,8 +1064,21 @@ impl RowProgress {
             transitions,
             returning,
             state: self.state.take(),
+            selection: kept_selection,
         });
         Ok(())
+    }
+
+    /// The foreign rows an interrupted attempt selected, which the next
+    /// attempt continues with instead of selecting again.
+    pub(super) fn resumed_selection(&self) -> Option<KeptSelection<'_>> {
+        self.resume
+            .as_ref()
+            .and_then(|resume| resume.selection.as_ref())
+            .map(|selection| KeptSelection {
+                rows: &selection.rows,
+                joined: selection.joined.as_ref(),
+            })
     }
 
     /// For the caller after an attempt ended with a routine call: the row to
@@ -1001,6 +1137,16 @@ fn same_row(left: Option<PhysicalRow>, right: Option<PhysicalRow>) -> bool {
                 ..
             }),
         ) => left_table == right_table && left_row == right_row,
+        (
+            Some(PhysicalRow::Foreign {
+                table_index: left_table,
+                tuple_id: left_tuple,
+            }),
+            Some(PhysicalRow::Foreign {
+                table_index: right_table,
+                tuple_id: right_tuple,
+            }),
+        ) => left_table == right_table && left_tuple == right_tuple,
         _ => false,
     }
 }

@@ -167,6 +167,14 @@ impl<'arena> DmlRowImages<'arena> {
         Ok(())
     }
 
+    /// The joined row kept for `row`, when the selection joined one.
+    fn joined_bytes(&self, row: PhysicalRow) -> Option<&'arena [u8]> {
+        let rows = self.joined.as_slice();
+        rows.binary_search_by_key(&row.sort_key(), |(key, _)| *key)
+            .ok()
+            .map(|index| rows[index].1.bytes())
+    }
+
     fn joined(&self, row: PhysicalRow) -> Result<super::query::JoinedFromRow<'arena>, SqlError> {
         let rows = self.joined.as_slice();
         rows.binary_search_by_key(&row.sort_key(), |(key, _)| *key)
@@ -78423,7 +78431,8 @@ fn emit_merge_progress_returning<'a, Definition0: crate::storage::DefinitionBack
         Err(error) => {
             if let Some(progress) = progress
                 && progress.stops_for(&error)
-                && let Err(error) = progress.keep_returning(old, new, arena, &storage.row_work)
+                && let Err(error) =
+                    progress.keep_returning(old, new, None, arena, &storage.row_work)
             {
                 return sql_fail(error);
             }
@@ -81773,6 +81782,7 @@ fn emit_row_returning<Definition0: crate::storage::DefinitionBacking>(
         return sql_fail(error);
     }
     let current = new.or(old).expect("a changed row has old or new values");
+    let joined_values = joined.as_ref().map(|joined| joined.values);
     match emit_projected(
         storage,
         txn,
@@ -81793,7 +81803,8 @@ fn emit_row_returning<Definition0: crate::storage::DefinitionBacking>(
         Err(error) => {
             if let Some(progress) = progress
                 && progress.stops_for(&error)
-                && let Err(error) = progress.keep_returning(old, new, arena, &storage.row_work)
+                && let Err(error) =
+                    progress.keep_returning(old, new, joined_values, arena, &storage.row_work)
             {
                 return sql_fail(error);
             }
@@ -82655,7 +82666,21 @@ pub(crate) fn update<'a>(
         Ok(plan) => plan,
         Err(error) => return sql_fail(error),
     };
-    let collect = if let Some(from) = statement.from {
+    // A resumed foreign selection continues without selecting again.
+    let resumed_selection = progress.as_deref().and_then(RowProgress::resumed_selection);
+    let collect = if let Some(selection) = resumed_selection {
+        resumed_foreign_matches(
+            storage,
+            table_index,
+            selection,
+            DmlCapture::Update {
+                command: txn.command_id(),
+            },
+            arena,
+            txn.txid,
+            scratch,
+        )
+    } else if let Some(from) = statement.from {
         if let Some(outer) = outer {
             collect_join_matches_with_transition(
                 storage,
@@ -82832,10 +82857,22 @@ pub(crate) fn update<'a>(
             };
             if let Some(resumed) = resumed_returning {
                 // The row changed in an earlier attempt; only its RETURNING
-                // values remain. The joined row is not kept with the change.
-                if returning_from.is_some() {
-                    return sql_fail(retained_progress_required());
-                }
+                // values remain, with the joined row they read.
+                let joined = match (returning_from, resumed.joined) {
+                    (Some(from), Some(values)) => Some(JoinedReturningValues {
+                        table: statement.table,
+                        alias: statement.alias,
+                        from,
+                        values,
+                    }),
+                    (None, _) => None,
+                    (Some(_), None) => {
+                        return sql_fail(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "a resumed RETURNING row lost its joined row"
+                        ));
+                    }
+                };
                 match emit_row_returning(
                     progress.as_deref_mut(),
                     ChangedRow {
@@ -82855,7 +82892,7 @@ pub(crate) fn update<'a>(
                     statement.returning,
                     resumed.old,
                     resumed.new,
-                    None,
+                    joined,
                     arena,
                     params,
                     responder,
@@ -83702,8 +83739,9 @@ pub(crate) fn update<'a>(
             Ok(Err(error))
                 if progress.stops_for(error) && txn.pending_write_completion.is_none() =>
             {
-                if let Err(error) = progress.interrupt(
-                    scratch.len(),
+                if let Err(error) = progress.interrupt_rows(
+                    scratch,
+                    &|row| retained_rows.joined_bytes(row),
                     [transition_capture.as_ref(), None, None],
                     &storage.row_work,
                 ) {
@@ -84018,7 +84056,22 @@ pub(crate) fn delete<'a>(
         None
     };
     let row_security = super::query::conjoin_row_security(delete_security, select_security);
-    let collect = if let Some(using) = statement.using {
+    // A resumed foreign selection continues without selecting again.
+    let resumed_selection = progress.as_deref().and_then(RowProgress::resumed_selection);
+    let collect = if let Some(selection) = resumed_selection {
+        resumed_foreign_matches(
+            storage,
+            table_index,
+            selection,
+            DmlCapture::Delete {
+                command: txn.command_id(),
+                returning: !statement.returning.is_empty(),
+            },
+            arena,
+            txn.txid,
+            scratch,
+        )
+    } else if let Some(using) = statement.using {
         if let Some(outer) = outer {
             collect_join_matches_with_transition(
                 storage,
@@ -84574,8 +84627,9 @@ pub(crate) fn delete<'a>(
             Ok(Err(error))
                 if progress.stops_for(error) && txn.pending_write_completion.is_none() =>
             {
-                if let Err(error) = progress.interrupt(
-                    scratch.len(),
+                if let Err(error) = progress.interrupt_rows(
+                    scratch,
+                    &|row| retained_rows.joined_bytes(row),
                     [transition_capture.as_ref(), None, None],
                     &storage.row_work,
                 ) {
@@ -92290,6 +92344,45 @@ fn dml_leaf_slots_for<'a>(
         })?;
     let n = storage.relation_leaf_slots(table_index, txid, slots)?;
     Ok(&slots[..n])
+}
+
+/// The rows a resumed write over a foreign table continues with: the
+/// selection its interrupted attempt kept, with the joined `FROM` or `USING`
+/// rows. The remote session keeps the earlier rows' changes, so selecting
+/// again would find their new versions or miss them.
+fn resumed_foreign_matches<'a>(
+    storage: &Storage,
+    table_index: usize,
+    selection: row_progress::KeptSelection<'_>,
+    capture: DmlCapture,
+    arena: &'a Arena,
+    txid: u32,
+    scratch: &mut DmlScratch,
+) -> Result<DmlRowImages<'a>, SqlError> {
+    let def = (*storage.table_def(table_index, txid)).clone();
+    // Local rows of a mixed hierarchy would need their stored images.
+    if def.kind != crate::storage::TableKind::Foreign {
+        return Err(retained_progress_required());
+    }
+    let mut images = DmlRowImages::new(arena);
+    images.capture_layout(table_index, &def, &def, capture, arena, storage, txid)?;
+    scratch.clear();
+    scratch.extend_from_slice(selection.rows).map_err(|error| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "statement row selection: {}",
+            error
+        )
+    })?;
+    if let Some(joined) = selection.joined(arena)? {
+        for (row, joined) in selection.rows.iter().zip(joined) {
+            // The kept selection ends when the resumed row starts; the images
+            // live for the whole attempt.
+            let joined = arena.alloc_slice_copy(joined).map_err(|_| arena_full())?;
+            images.push_joined(*row, super::query::JoinedFromRow::from_bytes(joined))?;
+        }
+    }
+    images.finish()
 }
 
 #[expect(clippy::too_many_arguments, reason = "row pipeline plumbing")]

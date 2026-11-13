@@ -602,6 +602,18 @@ else
   bad "foreign procedural subtransaction cleanup"
   cat "$WORK/foreign_subtransaction_reference.out" "$WORK/foreign_subtransaction_pos3ql.out"
 fi
+for side in reference pos3ql; do
+  if [[ $side == reference ]]; then host=$PGHOST port=$PGPORT; else host=127.0.0.1 port=$P3_PORT; fi
+  psql -h "$host" -p "$port" -U "$PGUSER" -d postgres -X -Atq -F '|' \
+    -v ON_ERROR_STOP=1 -f "$EXT/foreign-row-progress.sql" \
+    > "$WORK/foreign_row_progress_$side.out" 2>&1 || echo "status $?" >> "$WORK/foreign_row_progress_$side.out"
+done
+if diff -u "$WORK/foreign_row_progress_reference.out" "$WORK/foreign_row_progress_pos3ql.out" \
+  && [[ "$(tail -1 "$WORK/foreign_row_progress_reference.out")" == 0 ]]; then
+  ok "foreign writes keep changed rows across routine calls"
+else
+  bad "foreign write row progress"
+fi
 cat > "$WORK/foreign_merge.sql" <<'SQL'
 BEGIN;
 SAVEPOINT outer_foreign_merge;

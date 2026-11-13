@@ -194,8 +194,12 @@ A multi-step statement inside another's step (a rule action whose target
 has rules of its own) keeps its steps one level deeper, up to
 `write_step_levels` levels (4 by default);
 a step that is resumed keeps the effects of the calls that ran before it
-resumed. Where a write cannot keep its rows (a foreign table, or a step
-that changed rows without row progress), a call after its first change
+resumed. A write to a foreign table keeps its selected remote rows (and
+their joined `FROM` or `USING` rows) instead of selecting them again, since
+the remote session keeps the earlier rows' changes. Where a write cannot
+keep its rows (a partitioned or inherited table mixing local and foreign
+children, or a step that changed rows without row progress), a call after
+its first change
 fails with `0A000` instead of running after a rollback that would hide
 those changes; one level deeper than `write_step_levels` it fails with
 `54000`, naming the setting. Writes that rules rewrite into
@@ -681,11 +685,10 @@ the consumer's and keeps a materialized copy of every source row.
   the consumer's progress records which producer row it last consumed.
   Producers count against `write_step_levels`, and exhaustion stays the named
   `54000`.
-- **Rule steps and foreign tables.** A rule action's AFTER work runs from the
-  same completion cursor as a top-level write's, so it yields instead of
-  reading synchronously; foreign-table writes record row progress through
-  the same interface, so a routine call after their first row resumes
-  instead of failing with `0A000`.
+- **Rule steps.** A rule action's AFTER work runs from the same completion
+  cursor as a top-level write's, so it yields instead of reading
+  synchronously. (Foreign-table writes already keep their selected remote
+  rows across routine calls; see [execution model](#execution-model).)
 
 ### How saved state is owned
 
@@ -724,8 +727,9 @@ Further rules that apply to every saved owner:
 - **Unsupported restarts fail loudly.** A path that cannot save its progress
   returns `0A000` and rolls back rather than repeat a write — for example
   `SQL row expression requires retained write progress` for a routine call
-  after a SQL-language function's `MERGE` or data-modifying `WITH`, or a
-  foreign table's write, changed rows; or an unsaved volatile
+  after a SQL-language function's `MERGE` or data-modifying `WITH`, or an
+  `UPDATE` or `DELETE` of a table mixing local and foreign children, changed
+  rows; or an unsaved volatile
   value such as `random()`. Contexts with no resumable executor reject advisory
   unlocks with `0A000`.
 - **Typed wait markers.** Internal waits use a typed marker, not a SQLSTATE.

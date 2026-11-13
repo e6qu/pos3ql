@@ -33,6 +33,15 @@ use super::{
 pub(crate) struct JoinedFromRow<'a>(&'a [u8]);
 
 impl<'a> JoinedFromRow<'a> {
+    /// A joined row saved with a write's progress, as [`Self::bytes`] gave it.
+    pub(crate) fn from_bytes(bytes: &'a [u8]) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) fn bytes(self) -> &'a [u8] {
+        self.0
+    }
+
     fn encode(row: &JoinRow<'_, '_, '_>, arena: &'a Arena) -> Result<Self, SqlError> {
         let scope = row.scope;
         // Every stored column, a parenthesized join's members included.

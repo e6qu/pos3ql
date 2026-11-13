@@ -270,3 +270,32 @@ fn parenthesized_joins_keep_unaliased_members_addressable() {
         );
     });
 }
+
+#[test]
+fn update_from_returning_routine_call_resumes_with_the_joined_row() {
+    with_engine("update-from-returning-call", |engine, budget| {
+        setup(engine, budget);
+        run_with(
+            engine,
+            budget,
+            "CREATE FUNCTION note(v text) RETURNS text LANGUAGE plpgsql \
+             AS $$BEGIN RETURN v || '!'; END$$",
+        );
+        // Each RETURNING call stops the write after its row changed; the
+        // next attempt keeps the row and the FROM row it joined.
+        let output = run_with(
+            engine,
+            budget,
+            "UPDATE t SET b = note(s.c) FROM s WHERE t.a = s.a \
+             RETURNING t.a, t.b, note(s.c || t.b), s.d",
+        );
+        assert_eq!(sorted_rows(&output), ["1|p!|pp!!|10.00", "2|q!|qq!!|20.00"]);
+        let output = run_with(
+            engine,
+            budget,
+            "DELETE FROM t USING s WHERE t.a = s.a RETURNING t.a, note(s.c), s.d",
+        );
+        assert_eq!(sorted_rows(&output), ["1|p!|10.00", "2|q!|20.00"]);
+        assert!(data_rows(&run_with(engine, budget, "SELECT * FROM t")).is_empty());
+    });
+}

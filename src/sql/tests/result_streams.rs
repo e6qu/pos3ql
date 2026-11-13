@@ -6,7 +6,7 @@ use super::*;
 use crate::pg::conn::{After, AuthContext, Conn};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const KEY: &[u8; 16] = b"result-stream-ky";
 
@@ -407,7 +407,7 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
     // The second query of a UNION ALL starts its own cold scan.
     let mut second_query_yielded = false;
     let mut gets = 0usize;
-    let mut deadline = Instant::now() + Duration::from_secs(10);
+    let mut deadline = crate::test_wait::deadline();
     loop {
         read_available(&mut client, &mut received);
         let delivered = messages(&received)
@@ -452,7 +452,7 @@ fn cold_result_stream(name: &str, request: ColdRequest) {
         let served = objects.requests.load(std::sync::atomic::Ordering::Relaxed);
         if served != gets {
             gets = served;
-            deadline = Instant::now() + Duration::from_secs(10);
+            deadline = crate::test_wait::deadline();
         }
         advance(&mut engine);
         assert_eq!(

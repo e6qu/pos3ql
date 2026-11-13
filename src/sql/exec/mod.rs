@@ -89883,6 +89883,32 @@ fn alter_table_relation(
                 if let Err(error) = require_row_type_unaltered(storage, txn.txid, table_index) {
                     return sql_fail(error);
                 }
+                // PostgreSQL keeps a generation expression's input types fixed.
+                if let Some(generated) = new_def.columns().iter().find(|candidate| {
+                    candidate.default.is_generated()
+                        && candidate.default.expression().is_some_and(|text| {
+                            crate::sql::parser::parse_expr(text.as_str(), arena).is_ok_and(
+                                |expression| {
+                                    let mut reads = false;
+                                    expression
+                                        .for_each_column(&mut |name| reads |= name == *column);
+                                    reads
+                                },
+                            )
+                        })
+                }) {
+                    return sql_fail(crate::sql::error_position::with_detail(
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "cannot alter type of a column used by a generated column"
+                        ),
+                        format_args!(
+                            "Column \"{}\" is used by generated column \"{}\".",
+                            column,
+                            generated.name.as_str()
+                        ),
+                    ));
+                }
                 if let ColSource::Keep(original) | ColSource::Cast { orig: original, .. } =
                     source[i]
                 {

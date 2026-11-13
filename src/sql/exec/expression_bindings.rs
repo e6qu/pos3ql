@@ -127,13 +127,17 @@ pub(crate) fn capture_column_expression_dependencies(
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let owner = ExpressionOwner::Column(def.columns[column].name);
-    match def.columns[column].default.expression() {
-        Some(text) => {
-            let text = *text;
-            capture_expression_dependencies(storage, def, owner, text.as_str(), txid, arena)
-        }
-        None => def.set_expression_dependencies(owner, &[]),
-    }
+    let Some(text) = def.columns[column].default.expression().copied() else {
+        return def.set_expression_dependencies(owner, &[]);
+    };
+    let mark = arena.mark();
+    // A default's stored text may carry enum member bindings; capture reads
+    // the SQL as written.
+    let captured = crate::sql::enum_values::checks::default_display(text.as_str(), arena)
+        .and_then(|text| collect_expression_dependencies(storage, &*def, text, txid, arena));
+    // SAFETY: the captured entries are values; nothing borrows the arena.
+    unsafe { arena.rewind_to(mark) };
+    def.set_expression_dependencies(owner, captured?.entries())
 }
 
 /// `expression`, the parsed text of `owner` in `def`, bound to the objects

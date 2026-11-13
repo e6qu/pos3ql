@@ -15839,8 +15839,10 @@ mod tests {
         assert!(decode_table_payload(&bytes[..bytes.len() - 1]).is_none());
         for invalid in [0, crate::storage::MAX_RELATION_GENERATION + 1, 101] {
             let mut corrupt = bytes.to_vec();
+            // The type-input length and the empty expression dependency
+            // count follow the constraint identities.
             let end = corrupt.len()
-                - 4
+                - 5
                 - definition.constraint_identities().count()
                     * crate::storage::ConstraintIdentity::ENCODED_BYTES;
             corrupt[end - 8..end].copy_from_slice(&invalid.to_le_bytes());
@@ -15871,7 +15873,9 @@ mod tests {
             .unwrap()
             .unwrap()
             .created_at();
-        let last: [u8; 4] = payload.readable()[length - 8..length - 4]
+        // The last identity precedes the empty expression dependency count
+        // and the type-input length.
+        let last: [u8; 4] = payload.readable()[length - 9..length - 5]
             .try_into()
             .unwrap();
         crate::mem::guard::forbid_alloc(|| {
@@ -15880,14 +15884,14 @@ mod tests {
                 assert!(decode_table_payload(&payload.readable()[..length - missing]).is_none());
             }
             for invalid in [0, 50, crate::storage::MAX_CONSTRAINT_CREATION + 1, first] {
-                payload.filled_mut()[length - 8..length - 4]
+                payload.filled_mut()[length - 9..length - 5]
                     .copy_from_slice(&(invalid as u32).to_le_bytes());
                 assert!(
                     decode_table_payload(payload.readable()).is_none(),
                     "accepted constraint identity {invalid}"
                 );
             }
-            payload.filled_mut()[length - 8..length - 4].copy_from_slice(&last);
+            payload.filled_mut()[length - 9..length - 5].copy_from_slice(&last);
             assert!(decode_table_payload(payload.readable()).is_some());
         });
     }

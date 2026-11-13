@@ -969,11 +969,37 @@ impl Context<'_> {
                 self.operator_pair(operand, pattern, symbol, output)
             }
             Expr::Cast {
-                operand, type_name, ..
+                operand,
+                type_name,
+                type_mod,
+                ..
             } => {
                 let Some(target) = self.named_type(type_name) else {
                     return output.unsupported();
                 };
+                // `transformArrayExpr`: a cast of an ARRAY constructor
+                // coerces each element to the element type instead.
+                if let Expr::Array(items) = operand
+                    && *type_mod < 0
+                    && let Some(element) = crate::sql::assignment_path::element_type_oid(target)
+                    && !items.iter().any(|item| matches!(item, Expr::Array(_)))
+                {
+                    output.push("ARRAY[")?;
+                    for (index, item) in items.iter().enumerate() {
+                        if index != 0 {
+                            output.push(", ")?;
+                        }
+                        match self.type_of(item)? {
+                            Some(natural) if natural != element => {
+                                self.wrapped(item, None, Parent::Cast, true, output)?;
+                                output.push("::")?;
+                                self.type_name(element, output)?;
+                            }
+                            _ => self.write(item, Some(element), output)?,
+                        }
+                    }
+                    return output.push("]");
+                }
                 match operand {
                     // A cast literal is converted while parsing.
                     Expr::Str(_) | Expr::Null => self.literal(operand, target, output),

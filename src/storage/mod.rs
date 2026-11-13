@@ -25425,6 +25425,7 @@ impl Storage {
                     )?);
                 }
                 definition.table_binding = Some(self.capture_index_binding(copied_table, txid));
+                self.rebind_template_index_types(&mut definition, source, txid)?;
                 for collation in definition.collations.iter_mut().take(definition.n_cols) {
                     if let Collation::Catalog(selected) = *collation {
                         self.collation_definition(selected, txid)?;

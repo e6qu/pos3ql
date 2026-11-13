@@ -61068,17 +61068,33 @@ fn enums_order_and_enforce() {
     );
     // DROP RESTRICT fails while a column depends on the enum.
     assert!(String::from_utf8_lossy(&run_with(&mut e, &mut b, "DROP TYPE mood")).contains("2BP01"));
-    // A column default's cast names the type and its labels as text, so
-    // label and type renames are refused until that table is gone.
-    for refused in [
-        "ALTER TYPE mood RENAME VALUE 'sad' TO 'blue'",
-        "ALTER TYPE mood RENAME TO feeling",
-    ] {
-        assert!(
-            String::from_utf8_lossy(&run_with(&mut e, &mut b, refused)).contains("0A000"),
-            "{refused}"
-        );
-    }
+    // A column default's cast spells its labels as text, so a label rename
+    // is refused until that table is gone; the default is bound to the type
+    // itself, so a type rename follows.
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "ALTER TYPE mood RENAME VALUE 'sad' TO 'blue'"
+        ))
+        .contains("0A000")
+    );
+    run_with(&mut e, &mut b, "ALTER TYPE mood RENAME TO mood_renamed");
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "INSERT INTO enum_defaults DEFAULT VALUES RETURNING m, moods; \
+             SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef \
+             WHERE adrelid = 'enum_defaults'::regclass ORDER BY adnum"
+        )),
+        [
+            "ok|{sad,happy}",
+            "'ok'::mood_renamed",
+            "ARRAY['sad'::mood_renamed, 'happy'::mood_renamed]"
+        ]
+    );
+    run_with(&mut e, &mut b, "ALTER TYPE mood_renamed RENAME TO mood");
     run_with(&mut e, &mut b, "DROP TABLE enum_defaults");
     // Renames rewrite inline scalar/array labels while preserving sort order,
     // then move the type identity (including its generated array type).

@@ -512,6 +512,9 @@ fn statement_sublinks<'a>(
             Ok(false) => {}
             Ok(true) | Err(_) => return Ok(None),
         }
+        if !super::subquery::select_from_resolves(select, storage, txid, arena)? {
+            return Ok(None);
+        }
     }
     Ok(Some(nodes.as_slice()))
 }

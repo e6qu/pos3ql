@@ -896,6 +896,16 @@ pub trait ColumnLookup<'a> {
         None
     }
 
+    /// The statement's slots for the uncorrelated subqueries nested in the
+    /// queries it runs again for each row (correlated and `LATERAL`
+    /// subqueries, set operations, functions in `FROM`). A nested query
+    /// prepared for a row reuses its slot, so each runs once per statement,
+    /// as PostgreSQL's initPlans do, however many rows run the query around
+    /// it.
+    fn statement_subqueries(&self) -> &'a [DeferredSubquery<'a>] {
+        &[]
+    }
+
     /// Declared size/precision, or the registered shape of a record column.
     fn column_type_mod(&self, _qualifier: Option<&str>, _name: &str) -> i32 {
         -1
@@ -1747,6 +1757,20 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
 impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
     fn outer_aggregate(&self, call: *const Expr<'_>) -> Option<Datum<'a>> {
         (**self).outer_aggregate(call)
+    }
+
+    fn statement_subqueries(&self) -> &'a [DeferredSubquery<'a>] {
+        (**self).statement_subqueries()
+    }
+
+    fn check_unassigned_row_field(
+        &self,
+        qualifier: &str,
+        name: &str,
+        catalog: Option<&dyn CatalogAccess>,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        (**self).check_unassigned_row_field(qualifier, name, catalog, arena)
     }
 
     fn procedural_variable(
@@ -3461,6 +3485,11 @@ pub trait SubqueryListProbe: 'static {
         catalog: Option<&dyn CatalogAccess>,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError>;
+
+    /// A copy of this probe in `owner`'s persistent tail, so a list kept for
+    /// the rest of the statement outlives the row that ran it.
+    fn persist(&self, owner: &Arena)
+    -> Result<core::ptr::NonNull<dyn SubqueryListProbe>, SqlError>;
 }
 
 /// How a quantified subquery's operand meets each member: a `ROW(...)`
@@ -3506,6 +3535,17 @@ pub struct SubqueryValues<'h, 'a> {
     /// query's uncorrelated scalar subqueries, so an expression no row
     /// reaches never runs its subquery.
     pub deferred: &'h [DeferredSubquery<'h>],
+    /// The statement's slots for the uncorrelated subqueries nested in the
+    /// queries it runs for each row; see
+    /// [`ColumnLookup::statement_subqueries`].
+    pub statement: &'a [DeferredSubquery<'a>],
+    /// The correlated scalar and `ARRAY` subqueries analysed once for the
+    /// statement, before any outer row.
+    pub(crate) bindings: &'a [crate::sql::query::SubqueryBinding<'a>],
+    /// Runs the query's correlated subqueries where evaluation reaches them,
+    /// against the row the query bound last
+    /// ([`crate::sql::query::CorrelatedSubqueries::bind_row`]).
+    pub(crate) correlated: Option<&'a crate::sql::query::CorrelatedSubqueries<'a>>,
 }
 
 /// A subquery run when evaluation first reaches it. An uncorrelated one runs
@@ -3519,24 +3559,247 @@ pub struct DeferredSubquery<'h> {
     pub(crate) cache: Option<&'h core::cell::Cell<DeferredSubqueryCache>>,
 }
 
-/// An uncorrelated deferred subquery's saved result: length-prefixed
-/// projected rows in `owner`'s retained bytes. A scalar is one row of value
-/// and witness; a list is a row of witness and NULL-seen flag, then its
-/// members in rows of at most [`LIST_CACHE_CHUNK`] values.
-#[derive(Clone, Copy, Default)]
-pub struct DeferredSubqueryCache {
-    /// The encoded result in `owner`'s persistent tail, as an address and
-    /// length; `None` until the subquery has run.
-    pub(crate) bytes: Option<(usize, usize)>,
-    pub(crate) list: bool,
-    /// A list's comparison collations in `owner`'s persistent tail, as an
-    /// address and length so the cache does not fix the hooks' lifetime.
-    collations: (usize, usize),
-    /// A list's declared column types, kept the same way.
-    column_types: (usize, usize),
+impl<'h> DeferredSubquery<'h> {
+    /// The statement slot in `slots` for `node`: the slot made for that very
+    /// node, or else the one slot for the same sublink, which `node` copies
+    /// after a per-row rewrite. A sublink written twice (a `BETWEEN` operand
+    /// is compared twice) has a slot per copy, as PostgreSQL plans one
+    /// subquery per copy, so a rewritten copy of it matches none.
+    pub(crate) fn find(slots: &[Self], node: &Expr<'_>) -> Option<Self> {
+        let address = (node as *const Expr<'_>).cast::<()>();
+        if let Some(slot) = slots.iter().find(|slot| core::ptr::eq(slot.node, address)) {
+            return Some(*slot);
+        }
+        let sublink = Sublink::of(node)?;
+        let mut same = slots.iter().filter(|slot| {
+            // SAFETY: a slot's node is an expression of the statement that
+            // owns the slot, which outlives every query that reads it.
+            Sublink::of(unsafe { &*slot.node.cast::<Expr<'_>>() }) == Some(sublink)
+        });
+        let slot = same.next()?;
+        same.next().is_none().then_some(Self {
+            node: address,
+            ..*slot
+        })
+    }
 }
 
-const LIST_CACHE_CHUNK: usize = 1024;
+/// Which sublink a subquery expression is. A query rewritten for an outer
+/// row (a FROM subquery merged into it, a restriction pushed into one)
+/// copies the nodes over the columns it substitutes, so an `IN` whose
+/// operand reads a merged column gets a new node each row; the subquery's
+/// own `SELECT` reads none of those columns, so the rewrite keeps it, and it
+/// names the sublink however often the node around it is copied.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Sublink {
+    select: *const crate::sql::ast::Select<'static>,
+    kind: SublinkKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SublinkKind {
+    Scalar,
+    Row(u8),
+    Exists,
+    Array,
+    In { negated: bool },
+    Quantified { operator: BinaryOp, all: bool },
+}
+
+impl Sublink {
+    fn of(node: &Expr<'_>) -> Option<Self> {
+        let (select, kind) = match *node {
+            Expr::Subquery(select) => (select, SublinkKind::Scalar),
+            Expr::RowSubquery { select, arity } => (select, SublinkKind::Row(arity)),
+            Expr::Exists(select) => (select, SublinkKind::Exists),
+            Expr::ArraySubquery(select) => (select, SublinkKind::Array),
+            Expr::InSubquery {
+                select, negated, ..
+            } => (select, SublinkKind::In { negated }),
+            Expr::QuantifiedSubquery {
+                select,
+                operator,
+                all,
+                ..
+            } => (select, SublinkKind::Quantified { operator, all }),
+            _ => return None,
+        };
+        Some(Self {
+            select: (select as *const crate::sql::ast::Select<'_>).cast(),
+            kind,
+        })
+    }
+}
+
+/// A row lookup that also carries the statement's slots for nested
+/// uncorrelated subqueries ([`ColumnLookup::statement_subqueries`]) into a
+/// query run for that row.
+pub(crate) struct StatementSubqueryScope<'r, 'a> {
+    pub(crate) row: &'r dyn ColumnLookup<'a>,
+    pub(crate) slots: &'a [DeferredSubquery<'a>],
+}
+
+impl<'a> StatementSubqueryScope<'_, 'a> {
+    /// `row`, carrying `slots` unless it already carries the statement's.
+    pub(crate) fn wrap<'r>(
+        row: &'r dyn ColumnLookup<'a>,
+        slots: &'a [DeferredSubquery<'a>],
+        scope: &'r mut Option<StatementSubqueryScope<'r, 'a>>,
+    ) -> &'r dyn ColumnLookup<'a> {
+        if slots.is_empty() || !row.statement_subqueries().is_empty() {
+            return row;
+        }
+        &*scope.insert(StatementSubqueryScope { row, slots })
+    }
+}
+
+impl<'a> ColumnLookup<'a> for StatementSubqueryScope<'_, 'a> {
+    fn statement_subqueries(&self) -> &'a [DeferredSubquery<'a>] {
+        self.slots
+    }
+
+    fn outer_aggregate(&self, call: *const Expr<'_>) -> Option<Datum<'a>> {
+        self.row.outer_aggregate(call)
+    }
+
+    fn check_unassigned_row_field(
+        &self,
+        qualifier: &str,
+        name: &str,
+        catalog: Option<&dyn CatalogAccess>,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
+        self.row
+            .check_unassigned_row_field(qualifier, name, catalog, arena)
+    }
+
+    fn procedural_variable(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::sql::guc::VariableConflict> {
+        self.row.procedural_variable(qualifier, name)
+    }
+
+    fn column_type_mod(&self, qualifier: Option<&str>, name: &str) -> i32 {
+        self.row.column_type_mod(qualifier, name)
+    }
+
+    fn resolve_column_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.row.resolve_column_type(qualifier, name)
+    }
+
+    fn is_empty_scope(&self) -> bool {
+        self.row.is_empty_scope()
+    }
+
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        self.row.lookup(qualifier, name)
+    }
+
+    fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'a>, SqlError> {
+        self.row.recursive_state(qualifier, index)
+    }
+
+    fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        self.row.whole_row_present(table)
+    }
+
+    fn whole_row_field_metadata(
+        &self,
+        table: &str,
+        index: usize,
+        catalog: Option<&dyn CatalogAccess>,
+    ) -> Option<(StackStr<64>, crate::sql::exec::StaticTypeMeta)> {
+        self.row.whole_row_field_metadata(table, index, catalog)
+    }
+
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a [super::types::RecordField<'a>]>, SqlError> {
+        self.row.whole_row_fields(table, arena)
+    }
+
+    fn whole_row_expansion_fields(
+        &self,
+        table: &str,
+        arena: &'a Arena,
+    ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
+        self.row.whole_row_expansion_fields(table, arena)
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        self.row.col_type(qualifier, name)
+    }
+
+    fn column_type_oid(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
+        self.row.column_type_oid(qualifier, name)
+    }
+
+    fn row_variable(&self, name: &str) -> Option<RowVariable> {
+        self.row.row_variable(name)
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        self.row.collation(qualifier, name)
+    }
+
+    fn whole_row_is_scalar(&self, table: &str) -> bool {
+        self.row.whole_row_is_scalar(table)
+    }
+
+    fn whole_row_type(&self, table: &str) -> Option<ColType> {
+        self.row.whole_row_type(table)
+    }
+
+    fn whole_row_relation(&self, table: &str) -> Option<(&str, &str)> {
+        self.row.whole_row_relation(table)
+    }
+
+    fn column_identity(&self, qualifier: Option<&str>, name: &str) -> Option<(u32, u32)> {
+        self.row.column_identity(qualifier, name)
+    }
+
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
+        self.row.column_user_type(qualifier, name)
+    }
+}
+
+/// An uncorrelated deferred subquery's saved result in `owner`'s persistent
+/// tail, which per-row rewinds and resumed attempts do not reclaim. Raw
+/// extents keep the hooks covariant.
+#[derive(Clone, Copy, Default)]
+pub struct DeferredSubqueryCache {
+    saved: Option<SavedSubquery>,
+}
+
+#[derive(Clone, Copy)]
+enum SavedSubquery {
+    /// A scalar, `EXISTS`, `ARRAY` or row subquery: its value and type
+    /// witness encoded as one projected row.
+    Scalar { encoded: (usize, usize) },
+    /// An `IN`, `ANY` or `ALL` list, probed in place: members encoded as
+    /// one-column rows, or the external run they were written to. Each
+    /// reading row probes the members without decoding the whole list.
+    List {
+        probe: core::ptr::NonNull<dyn SubqueryListProbe>,
+        /// The result column's type witness encoded as one projected row.
+        witness: (usize, usize),
+        saw_null: bool,
+        collations: (usize, usize),
+        column_types: (usize, usize),
+    },
+}
 
 impl<'h> DeferredSubquery<'h> {
     fn evaluate<'a>(
@@ -3547,164 +3810,311 @@ impl<'h> DeferredSubquery<'h> {
         row: &dyn ColumnLookup<'a>,
         sequences: Option<&dyn SequenceAccess>,
     ) -> Result<SubqueryResult<'a>, SqlError> {
-        if let Some(saved) = self.cache.map(core::cell::Cell::get)
-            && let Some((address, length)) = saved.bytes
-        {
-            // SAFETY: the bytes were written into `owner`'s persistent tail,
-            // which per-row rewinds and resumed attempts do not reclaim.
-            let bytes: &[u8] = unsafe { core::slice::from_raw_parts(address as *const u8, length) };
-            let bytes = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
-            // SAFETY: the collations were copied into `owner`'s persistent
-            // tail, which lives as long as `owner` is not reset.
-            let collations: &[Collation] = unsafe {
-                core::slice::from_raw_parts(
-                    saved.collations.0 as *const Collation,
-                    saved.collations.1,
-                )
-            };
-            // SAFETY: as for the collations.
-            let column_types: &[i32] = unsafe {
-                core::slice::from_raw_parts(
-                    saved.column_types.0 as *const i32,
-                    saved.column_types.1,
-                )
-            };
-            return decode_cached_subquery(
-                bytes,
-                saved.list,
-                collations,
-                column_types,
-                self.node,
-                arena,
-            );
+        if let Some(saved) = self.cache.and_then(|cache| cache.get().saved) {
+            return read_saved_subquery(saved, self.node, arena);
         }
-        let result = self.executor.evaluate(
-            expression,
-            arena,
-            params,
-            row,
-            sequences,
-            self.cache.is_some(),
-        )?;
+        let result = self
+            .executor
+            .evaluate(expression, arena, params, row, sequences)?;
         if let Some(cache) = self.cache {
-            cache.set(self.save(&result)?);
+            cache.set(DeferredSubqueryCache {
+                saved: Some(save_subquery_result(&result, self.owner)?),
+            });
         }
         Ok(result)
     }
+}
 
-    fn save(&self, result: &SubqueryResult<'_>) -> Result<DeferredSubqueryCache, SqlError> {
-        let header;
-        let (list, members, collations, column_types) = match result {
-            SubqueryResult::Scalar { value, witness } => {
-                header = [*value, *witness];
-                (false, &[][..], &[][..], &[][..])
-            }
-            SubqueryResult::List(list) => {
-                if list.probe.is_some() {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "a retained subquery list was spooled"
-                    ));
+fn saved_subquery_full() -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "an uncorrelated subquery's value exceeds the statement's memory"
+    )
+}
+
+/// Encodes `values` as one projected row in `owner`'s persistent tail.
+fn keep_projected_row(values: &[Datum<'_>], owner: &Arena) -> Result<(usize, usize), SqlError> {
+    let bytes = owner
+        .alloc_persistent_slice_with(super::exec::projected_row_len(values)?, |_| 0u8)
+        .map_err(|_| saved_subquery_full())?;
+    super::exec::encode_projected_into(values, bytes)?;
+    Ok((bytes.as_ptr() as usize, bytes.len()))
+}
+
+fn keep_slice<T: Copy>(values: &[T], owner: &Arena) -> Result<(usize, usize), SqlError> {
+    let kept = owner
+        .alloc_persistent_slice_with(values.len(), |index| values[index])
+        .map_err(|_| saved_subquery_full())?;
+    Ok((kept.as_ptr() as usize, kept.len()))
+}
+
+fn save_subquery_result(
+    result: &SubqueryResult<'_>,
+    owner: &Arena,
+) -> Result<SavedSubquery, SqlError> {
+    match result {
+        SubqueryResult::Scalar { value, witness } => Ok(SavedSubquery::Scalar {
+            encoded: keep_projected_row(&[*value, *witness], owner)?,
+        }),
+        SubqueryResult::List(list) => {
+            let probe = match list.probe {
+                Some(probe) => {
+                    debug_assert!(
+                        list.values.is_empty(),
+                        "a probed list has no inline members"
+                    );
+                    // SAFETY: see the lifetime invariant on `SubqueryList::probe`.
+                    unsafe { probe.as_ref() }.persist(owner)?
                 }
-                header = [list.witness, Datum::Bool(list.saw_null)];
-                (true, list.values, list.collations, list.column_types)
-            }
-        };
-        let mut length = 0usize;
-        for chunk in core::iter::once(&header[..]).chain(members.chunks(LIST_CACHE_CHUNK)) {
-            length += 4 + crate::sql::exec::projected_row_len(chunk)?;
+                None => {
+                    let mut length = 0usize;
+                    for member in list.values {
+                        length = length
+                            .checked_add(super::exec::projected_row_len(core::slice::from_ref(
+                                member,
+                            ))?)
+                            .ok_or_else(saved_subquery_full)?;
+                    }
+                    let members = owner
+                        .alloc_persistent_slice_with(length, |_| 0u8)
+                        .map_err(|_| saved_subquery_full())?;
+                    let mut at = 0usize;
+                    for member in list.values {
+                        at += super::exec::encode_projected_into(
+                            core::slice::from_ref(member),
+                            &mut members[at..],
+                        )?;
+                    }
+                    let probe = owner
+                        .alloc_persistent_slice_with(1, |_| EncodedSubqueryList {
+                            members: members.as_ptr(),
+                            len: length,
+                        })
+                        .map_err(|_| saved_subquery_full())?;
+                    let probe: &mut dyn SubqueryListProbe = &mut probe[0];
+                    core::ptr::NonNull::from(probe)
+                }
+            };
+            Ok(SavedSubquery::List {
+                probe,
+                witness: keep_projected_row(core::slice::from_ref(&list.witness), owner)?,
+                saw_null: list.saw_null,
+                collations: keep_slice(list.collations, owner)?,
+                column_types: keep_slice(list.column_types, owner)?,
+            })
         }
-        let bytes = self
-            .owner
-            .alloc_persistent_slice_with(length, |_| 0u8)
-            .map_err(|_| arena_full())?;
-        let mut at = 0usize;
-        for chunk in core::iter::once(&header[..]).chain(members.chunks(LIST_CACHE_CHUNK)) {
-            let chunk_length = crate::sql::exec::projected_row_len(chunk)?;
-            let prefix = u32::try_from(chunk_length).map_err(|_| arena_full())?;
-            bytes[at..at + 4].copy_from_slice(&prefix.to_le_bytes());
-            at += 4;
-            crate::sql::exec::encode_projected_into(chunk, &mut bytes[at..at + chunk_length])?;
-            at += chunk_length;
-        }
-        let collations = self
-            .owner
-            .alloc_persistent_slice_with(collations.len(), |index| collations[index])
-            .map_err(|_| arena_full())?;
-        let column_types = self
-            .owner
-            .alloc_persistent_slice_with(column_types.len(), |index| column_types[index])
-            .map_err(|_| arena_full())?;
-        Ok(DeferredSubqueryCache {
-            bytes: Some((bytes.as_ptr() as usize, bytes.len())),
-            list,
-            collations: (collations.as_ptr() as usize, collations.len()),
-            column_types: (column_types.as_ptr() as usize, column_types.len()),
-        })
     }
 }
 
-fn decode_cached_subquery<'a>(
-    bytes: &'a [u8],
-    list: bool,
-    collations: &[Collation],
-    column_types: &[i32],
+fn read_saved_subquery<'a>(
+    saved: SavedSubquery,
     node: *const (),
     arena: &'a Arena,
 ) -> Result<SubqueryResult<'a>, SqlError> {
-    let corrupt = || {
-        sql_err!(
+    // SAFETY (every extent below): it was written into the owner's
+    // persistent tail, which outlives every evaluation of the statement or
+    // reader that keeps this cache.
+    let bytes = |(address, length): (usize, usize)| -> &'a [u8] {
+        unsafe { core::slice::from_raw_parts(address as *const u8, length) }
+    };
+    match saved {
+        SavedSubquery::Scalar { encoded } => {
+            let encoded = bytes(encoded);
+            Ok(SubqueryResult::Scalar {
+                value: super::exec::decode_projected_col_record(encoded, 0, arena)?,
+                witness: super::exec::decode_projected_col_record(encoded, 1, arena)?,
+            })
+        }
+        SavedSubquery::List {
+            probe,
+            witness,
+            saw_null,
+            collations,
+            column_types,
+        } => Ok(SubqueryResult::List(SubqueryList {
+            node,
+            values: &[],
+            probe: Some(probe),
+            saw_null,
+            witness: super::exec::decode_projected_col_record(bytes(witness), 0, arena)?,
+            column_types: unsafe {
+                core::slice::from_raw_parts(column_types.0 as *const i32, column_types.1)
+            },
+            collations: unsafe {
+                core::slice::from_raw_parts(collations.0 as *const Collation, collations.1)
+            },
+        })),
+    }
+}
+
+/// A kept `IN`/`ANY`/`ALL` list's members, encoded back to back as
+/// one-column projected rows in an arena's persistent tail.
+#[derive(Clone, Copy)]
+struct EncodedSubqueryList {
+    members: *const u8,
+    len: usize,
+}
+
+impl EncodedSubqueryList {
+    fn rows<'s>(&'s self) -> impl FnMut() -> Result<Option<&'s [u8]>, SqlError> + 's {
+        // SAFETY: the extent lives in the persistent tail of the arena that
+        // owns this probe, which outlives every evaluation reading it.
+        let bytes = unsafe { core::slice::from_raw_parts(self.members, self.len) };
+        let mut at = 0usize;
+        move || {
+            if at == bytes.len() {
+                return Ok(None);
+            }
+            let length = super::exec::projected_prefix_len(&bytes[at..], 1);
+            let row = &bytes[at..at + length];
+            at += length;
+            Ok(Some(row))
+        }
+    }
+}
+
+impl SubqueryListProbe for EncodedSubqueryList {
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn probe<'a>(
+        &self,
+        value: Datum<'a>,
+        columns: QuantifiedColumns<'_>,
+        catalog: Option<&dyn CatalogAccess>,
+        arena: &'a Arena,
+    ) -> Result<(bool, bool), SqlError> {
+        probe_member_rows(self.rows(), value, columns, catalog, arena)
+    }
+
+    fn quantify<'a>(
+        &self,
+        value: Datum<'a>,
+        operator: BinaryOp,
+        all: bool,
+        columns: QuantifiedColumns<'_>,
+        catalog: Option<&dyn CatalogAccess>,
+        arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError> {
+        quantify_member_rows(self.rows(), value, operator, all, columns, catalog, arena)
+    }
+
+    fn persist(
+        &self,
+        _owner: &Arena,
+    ) -> Result<core::ptr::NonNull<dyn SubqueryListProbe>, SqlError> {
+        Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
-            "retained subquery result is corrupt"
-        )
-    };
-    /// One length-prefixed chunk and the bytes after it.
-    type Chunk<'b> = Option<(&'b [u8], &'b [u8])>;
-    let split = |rest: &'a [u8]| -> Result<Chunk<'a>, SqlError> {
-        let Some(prefix) = rest.get(..4) else {
-            return Ok(None);
+            "a kept subquery list was kept again"
+        ))
+    }
+}
+
+/// `value = ANY (members)` over one-column projected member rows: whether a
+/// member matched, and whether a comparison was unknown.
+pub(crate) fn probe_member_rows<'a, 'r>(
+    mut next: impl FnMut() -> Result<Option<&'r [u8]>, SqlError>,
+    value: Datum<'a>,
+    columns: QuantifiedColumns<'_>,
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &'a Arena,
+) -> Result<(bool, bool), SqlError> {
+    let mut saw_unknown = false;
+    while let Some(row) = next()? {
+        crate::sql::query::check_timeout()?;
+        let mark = arena.mark();
+        // SAFETY: the row outlives this iteration, and every value decoded
+        // from it is dead before the arena rewinds below.
+        let row: &'a [u8] = unsafe { core::slice::from_raw_parts(row.as_ptr(), row.len()) };
+        let member = super::exec::decode_projected_col_record(row, 0, arena)?;
+        let matched = if member.is_null() {
+            saw_unknown = true;
+            false
+        } else {
+            let left = coerce_unknown(value, &member)?;
+            let right = coerce_unknown(member, &left)?;
+            match quantified_comparison(
+                BinaryOp::Eq,
+                left,
+                right,
+                columns.row_constructor,
+                columns.collations,
+                catalog,
+                arena,
+            )? {
+                Datum::Bool(matched) => matched,
+                Datum::Null => {
+                    saw_unknown = true;
+                    false
+                }
+                _ => unreachable!("equality returns boolean or NULL"),
+            }
         };
-        let length = u32::from_le_bytes(prefix.try_into().map_err(|_| corrupt())?) as usize;
-        let chunk = rest.get(4..4 + length).ok_or_else(corrupt)?;
-        Ok(Some((chunk, &rest[4 + length..])))
-    };
-    let (header, members) = split(bytes)?.ok_or_else(corrupt)?;
-    let first = crate::sql::exec::decode_projected_col_record(header, 0, arena)?;
-    let second = crate::sql::exec::decode_projected_col_record(header, 1, arena)?;
-    if !list {
-        return Ok(SubqueryResult::Scalar {
-            value: first,
-            witness: second,
-        });
+        // SAFETY: the decoded member is consumed by the comparison above;
+        // `value` was allocated below the mark by the caller.
+        unsafe { arena.rewind_to(mark) };
+        if matched {
+            return Ok((true, saw_unknown));
+        }
     }
-    let mut count = 0usize;
-    let mut rest = members;
-    while let Some((chunk, next)) = split(rest)? {
-        count += crate::sql::exec::projected_row_width(chunk);
-        rest = next;
+    Ok((false, saw_unknown))
+}
+
+/// `value operator ANY|ALL (members)` over one-column projected member rows.
+pub(crate) fn quantify_member_rows<'a, 'r>(
+    mut next: impl FnMut() -> Result<Option<&'r [u8]>, SqlError>,
+    value: Datum<'a>,
+    operator: BinaryOp,
+    all: bool,
+    columns: QuantifiedColumns<'_>,
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let mut saw_unknown = false;
+    while let Some(row) = next()? {
+        crate::sql::query::check_timeout()?;
+        let mark = arena.mark();
+        // SAFETY: as in `probe_member_rows`.
+        let row: &'a [u8] = unsafe { core::slice::from_raw_parts(row.as_ptr(), row.len()) };
+        let member = super::exec::decode_projected_col_record(row, 0, arena)?;
+        let left = coerce_unknown(value, &member)?;
+        let right = coerce_unknown(member, &left)?;
+        let result = quantified_comparison(
+            operator,
+            left,
+            right,
+            columns.row_constructor,
+            columns.collations,
+            catalog,
+            arena,
+        )?;
+        let decided = match result {
+            Datum::Bool(true) if !all => Some(true),
+            Datum::Bool(false) if all => Some(false),
+            Datum::Null => {
+                saw_unknown = true;
+                None
+            }
+            Datum::Bool(_) => None,
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "op ANY/ALL (array) requires operator to yield boolean"
+                ));
+            }
+        };
+        // SAFETY: decoded values are dead after the comparison.
+        unsafe { arena.rewind_to(mark) };
+        if let Some(decided) = decided {
+            return Ok(Datum::Bool(decided));
+        }
     }
-    let values = arena
-        .alloc_slice_with(count, |_| Datum::Null)
-        .map_err(|_| arena_full())?;
-    let mut filled = 0usize;
-    let mut rest = members;
-    while let Some((chunk, next)) = split(rest)? {
-        filled += crate::sql::exec::decode_projected_row_into(chunk, arena, &mut values[filled..])?;
-        rest = next;
-    }
-    Ok(SubqueryResult::List(SubqueryList {
-        node,
-        values,
-        probe: None,
-        saw_null: matches!(second, Datum::Bool(true)),
-        witness: first,
-        column_types: arena
-            .alloc_slice_copy(column_types)
-            .map_err(|_| arena_full())?,
-        collations: arena
-            .alloc_slice_copy(collations)
-            .map_err(|_| arena_full())?,
-    }))
+    Ok(if saw_unknown {
+        Datum::Null
+    } else {
+        Datum::Bool(all)
+    })
 }
 
 pub enum SubqueryResult<'a> {
@@ -3718,8 +4128,6 @@ pub enum SubqueryResult<'a> {
 /// Runs one reached subquery. Returned values own arena-backed bytes or borrow
 /// static data; they never retain the executor's storage or outer-row borrow.
 pub trait SubqueryExecution {
-    /// `retained` asks for a result that can be saved past this row: a list
-    /// is gathered in memory rather than spooled.
     fn evaluate<'a>(
         &self,
         expression: &Expr<'a>,
@@ -3727,7 +4135,6 @@ pub trait SubqueryExecution {
         params: &[Datum<'a>],
         outer: &dyn ColumnLookup<'a>,
         sequences: Option<&dyn SequenceAccess>,
-        retained: bool,
     ) -> Result<SubqueryResult<'a>, SqlError>;
 }
 
@@ -5491,6 +5898,24 @@ pub(crate) fn routine_input_handoff(
     expression: &Expr<'_>,
     catalog: Option<&dyn CatalogAccess>,
 ) -> bool {
+    input_handoff(expression, catalog, false)
+}
+
+/// [`routine_input_handoff`] for a statement whose subqueries a retained
+/// reader keeps: they call no user-defined function and run apart from the
+/// row, so only their operands and comparison operators count.
+pub(crate) fn routine_input_handoff_kept_subqueries(
+    expression: &Expr<'_>,
+    catalog: Option<&dyn CatalogAccess>,
+) -> bool {
+    input_handoff(expression, catalog, true)
+}
+
+fn input_handoff(
+    expression: &Expr<'_>,
+    catalog: Option<&dyn CatalogAccess>,
+    kept_subqueries: bool,
+) -> bool {
     match expression {
         Expr::Call {
             kind,
@@ -5525,6 +5950,21 @@ pub(crate) fn routine_input_handoff(
                 return true;
             }
         }
+        Expr::QuantifiedSubquery { operator, .. }
+            if kept_subqueries
+                && operator.operator_name().is_some_and(|name| {
+                    catalog.is_some_and(|catalog| catalog.has_operator_candidate(name))
+                }) =>
+        {
+            return true;
+        }
+        Expr::Subquery(_)
+        | Expr::RowSubquery { .. }
+        | Expr::ArraySubquery(_)
+        | Expr::Exists(_)
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. }
+            if kept_subqueries => {}
         // Casts, operators and subqueries can invoke stored code even without
         // a Call node. Keep their journal until their executable target is bound.
         Expr::Cast {
@@ -5549,7 +5989,7 @@ pub(crate) fn routine_input_handoff(
     }
     let mut handoff = false;
     super::query::walk_children(expression, &mut |child| {
-        handoff |= routine_input_handoff(child, catalog);
+        handoff |= input_handoff(child, catalog, kept_subqueries);
         Ok(())
     })
     .expect("input handoff inspection does not evaluate expressions");
@@ -6076,6 +6516,231 @@ pub(crate) fn bound_literal_value<'a>(
     }
 }
 
+/// `expression`, an `IN`, `ANY` or `ALL` subquery, over its run `list`.
+fn eval_subquery_list<'a>(
+    expression: &Expr<'a>,
+    list: SubqueryList<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    match *expression {
+        Expr::InSubquery {
+            operand, negated, ..
+        } => {
+            validate_cstring_subquery_comparison("=", operand, list.column_types, row, hooks)?;
+            let witness = list.witness;
+            let collations = effective_quantified_collations(
+                operand,
+                list.collations,
+                row,
+                hooks.catalog,
+                arena,
+            )?;
+            // Coerce the operand to the subquery's column type first: PostgreSQL
+            // type-checks `x IN (...)` regardless of the set's contents, so a
+            // string literal that cannot become the column type errors even
+            // against an empty or all-NULL set.
+            let v = single_column_row_constructor(
+                operand,
+                eval_full(operand, arena, params, row, hooks)?,
+            );
+            let v = coerce_unknown(v, &witness)?;
+            // Resolve `=` against a single-column subquery's declared output
+            // type even when it is empty or yields only NULLs, as PostgreSQL
+            // does while analysing the query.
+            // A record compares with `record_eq`, whose field types are
+            // checked against each member below; a named composite's type
+            // witness carries no fields.
+            let record =
+                |value: &Datum<'_>| matches!(value, Datum::Record(_) | Datum::Composite { .. });
+            if !v.is_null() && !witness.is_null() && !record(&v) && !record(&witness) {
+                quantified_comparison(
+                    BinaryOp::Eq,
+                    v,
+                    witness,
+                    operand.is_row_constructor(),
+                    collations,
+                    hooks.catalog,
+                    arena,
+                )
+                .map_err(|error| crate::sql::error_position::operator_at_node(error, expression))?;
+            }
+            // A bit string is comparable only to another bit string; reject a
+            // bit-vs-other membership test up front (PostgreSQL type-checks the
+            // operand against the column type even over an empty set).
+            if matches!(v, Datum::Bit { .. }) && !matches!(witness, Datum::Bit { .. } | Datum::Null)
+            {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "operator does not exist: bit = {}",
+                    type_name_of(&witness)
+                ));
+            }
+            // `x IN (subquery)` is `x = ANY (subquery)`. Over an empty set the
+            // result is a constant FALSE (TRUE for NOT IN) regardless of x —
+            // even a NULL x — so the empty case precedes the null short-circuit.
+            if list.values.is_empty()
+                && list.probe.is_none_or(|probe| {
+                    // SAFETY: probe contexts are statement-arena allocations
+                    // and the hook containing this pointer cannot outlive that
+                    // arena.
+                    unsafe { probe.as_ref() }.is_empty()
+                })
+            {
+                return Ok(Datum::Bool(negated));
+            }
+            if v.is_null() {
+                return Ok(Datum::Null);
+            }
+            let mut saw_null = list.saw_null;
+            for member in list.values {
+                if member.is_null() {
+                    continue;
+                }
+                let l = coerce_unknown(v, member)?;
+                let r = coerce_unknown(*member, &l)?;
+                match quantified_comparison(
+                    BinaryOp::Eq,
+                    l,
+                    r,
+                    operand.is_row_constructor(),
+                    collations,
+                    hooks.catalog,
+                    arena,
+                )? {
+                    Datum::Bool(true) => return Ok(Datum::Bool(!negated)),
+                    Datum::Bool(false) => {}
+                    Datum::Null => saw_null = true,
+                    _ => unreachable!("equality returns boolean or NULL"),
+                }
+            }
+            if let Some(probe) = list.probe {
+                // SAFETY: see the lifetime invariant on `SubqueryList::probe`.
+                let (matched, unknown) = unsafe { probe.as_ref() }.probe(
+                    v,
+                    QuantifiedColumns {
+                        row_constructor: operand.is_row_constructor(),
+                        collations,
+                    },
+                    hooks.catalog,
+                    arena,
+                )?;
+                if matched {
+                    return Ok(Datum::Bool(!negated));
+                }
+                saw_null |= unknown;
+            }
+            Ok(if saw_null {
+                Datum::Null
+            } else {
+                Datum::Bool(negated)
+            })
+        }
+        Expr::QuantifiedSubquery {
+            operand,
+            operator,
+            all,
+            ..
+        } => {
+            let operator_name = operator.operator_name().ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "quantified comparison has no operator name"
+                )
+            })?;
+            validate_cstring_subquery_comparison(
+                operator_name,
+                operand,
+                list.column_types,
+                row,
+                hooks,
+            )?;
+            let value = materialize_named_composite(
+                single_column_row_constructor(
+                    operand,
+                    eval_full(operand, arena, params, row, hooks)?,
+                ),
+                hooks,
+                arena,
+            )?;
+            let value = coerce_unknown(value, &list.witness)?;
+            let collations = effective_quantified_collations(
+                operand,
+                list.collations,
+                row,
+                hooks.catalog,
+                arena,
+            )?;
+            // Resolve the operator against the subquery's declared output
+            // type even when it is empty or yields only NULLs.
+            let _ = quantified_comparison(
+                operator,
+                value,
+                list.witness,
+                operand.is_row_constructor(),
+                collations,
+                hooks.catalog,
+                arena,
+            )
+            .map_err(|error| crate::sql::error_position::operator_at_node(error, expression))?;
+            let mut saw_unknown = false;
+            for member in list.values {
+                let left = coerce_unknown(value, member)?;
+                let right = coerce_unknown(*member, &left)?;
+                match quantified_comparison(
+                    operator,
+                    left,
+                    right,
+                    operand.is_row_constructor(),
+                    collations,
+                    hooks.catalog,
+                    arena,
+                )? {
+                    Datum::Bool(true) if !all => return Ok(Datum::Bool(true)),
+                    Datum::Bool(false) if all => return Ok(Datum::Bool(false)),
+                    Datum::Null => saw_unknown = true,
+                    Datum::Bool(_) => {}
+                    _other => {
+                        return Err(sql_err!(
+                            sqlstate::WRONG_OBJECT_TYPE,
+                            "op ANY/ALL (array) requires operator to yield boolean"
+                        ));
+                    }
+                }
+            }
+            if let Some(probe) = list.probe {
+                // SAFETY: see the lifetime invariant on `SubqueryList::probe`.
+                let result = unsafe { probe.as_ref() }.quantify(
+                    value,
+                    operator,
+                    all,
+                    QuantifiedColumns {
+                        row_constructor: operand.is_row_constructor(),
+                        collations,
+                    },
+                    hooks.catalog,
+                    arena,
+                )?;
+                match result {
+                    Datum::Bool(true) if !all => return Ok(result),
+                    Datum::Bool(false) if all => return Ok(result),
+                    Datum::Null => saw_unknown = true,
+                    Datum::Bool(_) => {}
+                    _ => unreachable!("subquery quantifier returns boolean or NULL"),
+                }
+            }
+            Ok(if saw_unknown {
+                Datum::Null
+            } else {
+                Datum::Bool(all)
+            })
+        }
+        _ => unreachable!("only IN, ANY and ALL subqueries have a list"),
+    }
+}
+
 fn eval_full_inner<'a>(
     expression: &Expr<'a>,
     arena: &'a Arena,
@@ -6093,28 +6758,41 @@ fn eval_full_inner<'a>(
             .iter()
             .any(|(node, _, _)| core::ptr::eq(*node, expression))
     }) {
-        let result = deferred.evaluate(expression, arena, params, row, hooks.sequences)?;
         let scalars;
-        let lists;
-        let values = match result {
+        // A subquery run for this row reaches the statement's slots for the
+        // uncorrelated subqueries nested in it.
+        let mut scope = None;
+        let outer = StatementSubqueryScope::wrap(
+            row,
+            hooks.subs.map_or(&[], |subs| subs.statement),
+            &mut scope,
+        );
+        let values = match deferred.evaluate(expression, arena, params, outer, hooks.sequences)? {
             SubqueryResult::Scalar { value, witness } => {
                 scalars = [(expression as *const Expr, value, witness)];
                 SubqueryValues {
                     scalars: &scalars,
                     lists: &[],
                     deferred: &[],
+                    statement: &[],
+                    bindings: &[],
+                    correlated: None,
                 }
             }
+            // The operand reads the query's other subqueries, so it is
+            // evaluated against the query's own hooks.
             SubqueryResult::List(list) => {
-                lists = [SubqueryList {
-                    node: (expression as *const Expr).cast(),
-                    ..list
-                }];
-                SubqueryValues {
-                    scalars: &[],
-                    lists: &lists,
-                    deferred: &[],
-                }
+                return eval_subquery_list(
+                    expression,
+                    SubqueryList {
+                        node: (expression as *const Expr).cast(),
+                        ..list
+                    },
+                    arena,
+                    params,
+                    row,
+                    hooks,
+                );
             }
         };
         return eval_full_inner(
@@ -6149,7 +6827,13 @@ fn eval_full_inner<'a>(
                     .any(|list| core::ptr::eq(list.node, (expression as *const Expr).cast()))
         })
     {
-        let result = executor.evaluate(expression, arena, params, row, hooks.sequences, false)?;
+        let mut scope = None;
+        let outer = StatementSubqueryScope::wrap(
+            row,
+            hooks.subs.map_or(&[], |subs| subs.statement),
+            &mut scope,
+        );
+        let result = executor.evaluate(expression, arena, params, outer, hooks.sequences)?;
         let mut scalars = [(expression as *const Expr, Datum::Null, Datum::Null)];
         let mut lists = [SubqueryList {
             node: core::ptr::null(),
@@ -6168,6 +6852,9 @@ fn eval_full_inner<'a>(
                     scalars: &scalars,
                     lists: &[],
                     deferred: &[],
+                    statement: &[],
+                    bindings: &[],
+                    correlated: None,
                 }
             }
             SubqueryResult::List(list) => {
@@ -6179,6 +6866,9 @@ fn eval_full_inner<'a>(
                     scalars: &[],
                     lists: &lists,
                     deferred: &[],
+                    statement: &[],
+                    bindings: &[],
+                    correlated: None,
                 }
             }
         };
@@ -7151,144 +7841,7 @@ fn eval_full_inner<'a>(
                 "subqueries are not allowed in this context (or are correlated)"
             ))
         }
-        Expr::InSubquery {
-            operand, negated, ..
-        } => {
-            require_node_builtin_execute(expression, row, hooks)?;
-            let Some(subs) = hooks.subs else {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "subqueries are not allowed in this context"
-                ));
-            };
-            let mut found: Option<SubqueryList<'_>> = None;
-            for list in subs.lists {
-                if core::ptr::eq(list.node, (expression as *const Expr).cast()) {
-                    found = Some(*list);
-                    break;
-                }
-            }
-            let Some(list) = found else {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "subqueries are not allowed in this context (or are correlated)"
-                ));
-            };
-            validate_cstring_subquery_comparison("=", operand, list.column_types, row, hooks)?;
-            let witness = list.witness;
-            let collations = effective_quantified_collations(
-                operand,
-                list.collations,
-                row,
-                hooks.catalog,
-                arena,
-            )?;
-            // Coerce the operand to the subquery's column type first: PostgreSQL
-            // type-checks `x IN (...)` regardless of the set's contents, so a
-            // string literal that cannot become the column type errors even
-            // against an empty or all-NULL set.
-            let v = single_column_row_constructor(
-                operand,
-                eval_full(operand, arena, params, row, hooks)?,
-            );
-            let v = coerce_unknown(v, &witness)?;
-            // Resolve `=` against a single-column subquery's declared output
-            // type even when it is empty or yields only NULLs, as PostgreSQL
-            // does while analysing the query.
-            // A record compares with `record_eq`, whose field types are
-            // checked against each member below; a named composite's type
-            // witness carries no fields.
-            let record =
-                |value: &Datum<'_>| matches!(value, Datum::Record(_) | Datum::Composite { .. });
-            if !v.is_null() && !witness.is_null() && !record(&v) && !record(&witness) {
-                quantified_comparison(
-                    BinaryOp::Eq,
-                    v,
-                    witness,
-                    operand.is_row_constructor(),
-                    collations,
-                    hooks.catalog,
-                    arena,
-                )
-                .map_err(|error| crate::sql::error_position::operator_at_node(error, expression))?;
-            }
-            // A bit string is comparable only to another bit string; reject a
-            // bit-vs-other membership test up front (PostgreSQL type-checks the
-            // operand against the column type even over an empty set).
-            if matches!(v, Datum::Bit { .. }) && !matches!(witness, Datum::Bit { .. } | Datum::Null)
-            {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_FUNCTION,
-                    "operator does not exist: bit = {}",
-                    type_name_of(&witness)
-                ));
-            }
-            // `x IN (subquery)` is `x = ANY (subquery)`. Over an empty set the
-            // result is a constant FALSE (TRUE for NOT IN) regardless of x —
-            // even a NULL x — so the empty case precedes the null short-circuit.
-            if list.values.is_empty()
-                && list.probe.is_none_or(|probe| {
-                    // SAFETY: probe contexts are statement-arena allocations
-                    // and the hook containing this pointer cannot outlive that
-                    // arena.
-                    unsafe { probe.as_ref() }.is_empty()
-                })
-            {
-                return Ok(Datum::Bool(negated));
-            }
-            if v.is_null() {
-                return Ok(Datum::Null);
-            }
-            let mut saw_null = list.saw_null;
-            for member in list.values {
-                if member.is_null() {
-                    continue;
-                }
-                let l = coerce_unknown(v, member)?;
-                let r = coerce_unknown(*member, &l)?;
-                match quantified_comparison(
-                    BinaryOp::Eq,
-                    l,
-                    r,
-                    operand.is_row_constructor(),
-                    collations,
-                    hooks.catalog,
-                    arena,
-                )? {
-                    Datum::Bool(true) => return Ok(Datum::Bool(!negated)),
-                    Datum::Bool(false) => {}
-                    Datum::Null => saw_null = true,
-                    _ => unreachable!("equality returns boolean or NULL"),
-                }
-            }
-            if let Some(probe) = list.probe {
-                // SAFETY: see the lifetime invariant on `SubqueryList::probe`.
-                let (matched, unknown) = unsafe { probe.as_ref() }.probe(
-                    v,
-                    QuantifiedColumns {
-                        row_constructor: operand.is_row_constructor(),
-                        collations,
-                    },
-                    hooks.catalog,
-                    arena,
-                )?;
-                if matched {
-                    return Ok(Datum::Bool(!negated));
-                }
-                saw_null |= unknown;
-            }
-            Ok(if saw_null {
-                Datum::Null
-            } else {
-                Datum::Bool(negated)
-            })
-        }
-        Expr::QuantifiedSubquery {
-            operand,
-            operator,
-            all,
-            ..
-        } => {
+        Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } => {
             require_node_builtin_execute(expression, row, hooks)?;
             let Some(subs) = hooks.subs else {
                 return Err(sql_err!(
@@ -7307,98 +7860,7 @@ fn eval_full_inner<'a>(
                         "subqueries are not allowed in this context (or are correlated)"
                     )
                 })?;
-            let operator_name = operator.operator_name().ok_or_else(|| {
-                sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "quantified comparison has no operator name"
-                )
-            })?;
-            validate_cstring_subquery_comparison(
-                operator_name,
-                operand,
-                list.column_types,
-                row,
-                hooks,
-            )?;
-            let value = materialize_named_composite(
-                single_column_row_constructor(
-                    operand,
-                    eval_full(operand, arena, params, row, hooks)?,
-                ),
-                hooks,
-                arena,
-            )?;
-            let value = coerce_unknown(value, &list.witness)?;
-            let collations = effective_quantified_collations(
-                operand,
-                list.collations,
-                row,
-                hooks.catalog,
-                arena,
-            )?;
-            // Resolve the operator against the subquery's declared output
-            // type even when it is empty or yields only NULLs.
-            let _ = quantified_comparison(
-                operator,
-                value,
-                list.witness,
-                operand.is_row_constructor(),
-                collations,
-                hooks.catalog,
-                arena,
-            )
-            .map_err(|error| crate::sql::error_position::operator_at_node(error, expression))?;
-            let mut saw_unknown = false;
-            for member in list.values {
-                let left = coerce_unknown(value, member)?;
-                let right = coerce_unknown(*member, &left)?;
-                match quantified_comparison(
-                    operator,
-                    left,
-                    right,
-                    operand.is_row_constructor(),
-                    collations,
-                    hooks.catalog,
-                    arena,
-                )? {
-                    Datum::Bool(true) if !all => return Ok(Datum::Bool(true)),
-                    Datum::Bool(false) if all => return Ok(Datum::Bool(false)),
-                    Datum::Null => saw_unknown = true,
-                    Datum::Bool(_) => {}
-                    _other => {
-                        return Err(sql_err!(
-                            sqlstate::WRONG_OBJECT_TYPE,
-                            "op ANY/ALL (array) requires operator to yield boolean"
-                        ));
-                    }
-                }
-            }
-            if let Some(probe) = list.probe {
-                // SAFETY: see the lifetime invariant on `SubqueryList::probe`.
-                let result = unsafe { probe.as_ref() }.quantify(
-                    value,
-                    operator,
-                    all,
-                    QuantifiedColumns {
-                        row_constructor: operand.is_row_constructor(),
-                        collations,
-                    },
-                    hooks.catalog,
-                    arena,
-                )?;
-                match result {
-                    Datum::Bool(true) if !all => return Ok(result),
-                    Datum::Bool(false) if all => return Ok(result),
-                    Datum::Null => saw_unknown = true,
-                    Datum::Bool(_) => {}
-                    _ => unreachable!("subquery quantifier returns boolean or NULL"),
-                }
-            }
-            Ok(if saw_unknown {
-                Datum::Null
-            } else {
-                Datum::Bool(all)
-            })
+            eval_subquery_list(expression, list, arena, params, row, hooks)
         }
         Expr::Exists(_) => {
             // EXISTS results are pre-evaluated (uncorrelated) or evaluated per
@@ -14147,7 +14609,6 @@ mod tests {
                 _: &[Datum<'a>],
                 _: &dyn ColumnLookup<'a>,
                 _: Option<&dyn SequenceAccess>,
-                _: bool,
             ) -> Result<SubqueryResult<'a>, SqlError> {
                 self.0.set(self.0.get() + 1);
                 match expression {

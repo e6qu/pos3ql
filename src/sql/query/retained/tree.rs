@@ -642,7 +642,14 @@ fn advance<'a>(
                 accepted?;
                 release(below, pull.state_arena);
             }
-            group.fold(pull.scope, pull.storage, pull.txid, pull.work, pull.params)?;
+            group.fold(
+                pull.scope,
+                pull.storage,
+                pull.txid,
+                pull.work,
+                pull.params,
+                pull.subqueries,
+            )?;
             Ok(group.advance())
         }
         PlanNode::Project(_) | PlanNode::Limit { .. } => advance(below, state, keep_finished, pull),

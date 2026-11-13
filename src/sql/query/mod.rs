@@ -18,8 +18,8 @@ use super::ast::{
     WindowFrame,
 };
 use super::eval::{
-    CatalogAccess, ColumnLookup, EvalHooks, PrivilegeRelation, SequenceAccess, SqlError,
-    SubqueryValues, eval_full, resolved_expression_collation, sqlstate,
+    CatalogAccess, ColumnLookup, EvalHooks, PrivilegeRelation, SequenceAccess, SqlError, eval_full,
+    resolved_expression_collation, sqlstate,
 };
 use super::exec::{MAX_PROJ, describe_items};
 use super::types::{ColDesc, ColType, Datum};
@@ -68,6 +68,7 @@ use scan::{
 pub(crate) use scan::{
     IndexAccessPlan, OrderedIndexAccessPlan, dml_index_access_plan, dml_indexed_candidates,
     index_access_plan, ordered_index_access_plan, parameterized_index_access_plan,
+    rowless_one_time_filter_passes,
 };
 pub(crate) use scan::{
     RowSecurityExpression, RowSecurityPlan, conjoin_row_security, plan_row_security,
@@ -859,10 +860,15 @@ pub(crate) use plan::join_order;
 use plan::{postpone_cost, reorder_qual, simplify_qual, where_passes};
 
 mod subquery;
-pub(crate) use subquery::{ProceduralSubqueries, subquery_expression_type};
+#[cfg(test)]
+pub(crate) use subquery::subquery_analyses;
+pub(crate) use subquery::{
+    CorrelatedSubqueries, DmlSubqueries, ProceduralSubqueries, SubqueryBinding,
+    check_sublink_columns, subquery_expression_type,
+};
 use subquery::{
-    correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, merge_correlated,
-    prepare_outer_subqueries, subquery_witness,
+    correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes,
+    prepare_outer_subqueries,
 };
 pub(crate) use subquery::{
     expression_has_correlated_subquery, subquery_hooks_outer, subquery_hooks_with_outer,
@@ -1771,13 +1777,6 @@ pub(crate) fn reopen_reads_after_kept_work() {
 /// Changes whenever any statement starts an effect.
 pub(crate) fn statement_effect_epoch() -> u64 {
     STATEMENT_EFFECT_EPOCH.with(Cell::get)
-}
-
-/// Whether the running statement reads data-modifying `WITH` queries.
-pub(crate) fn statement_reads_write_queries() -> bool {
-    with_active_routine_invocations(|context| {
-        context.is_some_and(|(invocations, _)| invocations.reads_writes.get())
-    })
 }
 
 /// Whether the running statement attempt has invoked a routine whose result
@@ -8152,19 +8151,11 @@ pub(super) fn fromless_aggregate_hooks<'a, R: ColumnLookup<'a>>(
     Ok(Some((ptrs, values)))
 }
 
-fn array_subquery_column_type(witness: Datum) -> Option<ColType> {
-    match super::exec::coltype_of_oid(witness.type_oid())? {
-        ColType::Array(element) => Some(ColType::Array(element)),
-        scalar => super::types::ArrElem::from_coltype(scalar).map(ColType::Array),
-    }
-}
-
-/// Values established before RowDescription refine otherwise unknown columns.
-#[allow(clippy::too_many_arguments, reason = "query pipeline plumbing")]
-fn patch_subquery_column_types<'a>(
+/// A bare parameter whose type the description left as text takes its
+/// bound value's type.
+fn patch_param_column_types<'a>(
     items: &'a [SelectItem<'a>],
     scope: Option<&QueryScope<'a>>,
-    subs: &SubqueryValues,
     params: &[Datum],
     storage: &'a Storage,
     txid: u32,
@@ -8185,60 +8176,6 @@ fn patch_subquery_column_types<'a>(
             }
             SelectItem::Expr { expression, .. } => {
                 if slot < columns.len()
-                    && matches!(**expression, Expr::Subquery(_) | Expr::ArraySubquery(_))
-                {
-                    let node: *const Expr = *expression;
-                    match subs
-                        .scalars
-                        .iter()
-                        .find(|(p, _, _)| core::ptr::eq(*p, node))
-                    {
-                        Some((_, v, w)) => {
-                            let typed = if v.is_null() { w } else { v };
-                            let ct = if matches!(**expression, Expr::ArraySubquery(_)) {
-                                array_subquery_column_type(*typed)
-                            } else {
-                                super::exec::coltype_of_oid(typed.type_oid())
-                            };
-                            if !typed.is_null()
-                                && let Some(ct) = ct
-                            {
-                                columns[slot] = ColDesc::of_type(columns[slot].name, ct);
-                            }
-                        }
-                        // A correlated subquery has no pre-evaluated value;
-                        // infer its column type from the inner select's item.
-                        None => {
-                            if let Expr::Subquery(sub) | Expr::ArraySubquery(sub) = &**expression
-                                && let Some(SelectItem::Expr {
-                                    expression: inner, ..
-                                }) = sub.items.first()
-                                && let Some(from) = sub.from
-                                && let Ok(inner_scope) =
-                                    QueryScope::resolve_schema(storage, &from, txid, arena, None)
-                                && let Ok(witness) = subquery_witness(
-                                    storage,
-                                    txid,
-                                    inner,
-                                    Some(&inner_scope),
-                                    arena,
-                                )
-                            {
-                                let ct = if matches!(**expression, Expr::ArraySubquery(_)) {
-                                    array_subquery_column_type(witness)
-                                } else {
-                                    super::exec::coltype_of_oid(witness.type_oid())
-                                };
-                                if !witness.is_null()
-                                    && let Some(ct) = ct
-                                {
-                                    columns[slot] = ColDesc::of_type(columns[slot].name, ct);
-                                }
-                            }
-                        }
-                    }
-                }
-                if slot < columns.len()
                     && let Expr::Param(n) = **expression
                     && let Some(v) = params.get(n as usize - 1)
                     && !v.is_null()
@@ -8252,64 +8189,6 @@ fn patch_subquery_column_types<'a>(
         }
     }
     Ok(())
-}
-
-type CorrelatedScalarScratch<'a> = [(*const Expr<'a>, Datum<'a>, Datum<'a>)];
-type CorrelatedListScratch<'a> = [super::eval::SubqueryList<'a>];
-
-/// Materializes only the correlated subqueries needed for one source row.
-/// Streaming and row-emitting SELECT share this arena-backed seam, keeping
-/// per-row visibility and scratch bounds identical.
-#[allow(clippy::too_many_arguments)]
-fn correlated_row_subqueries<'a, 'scratch>(
-    correlated: &[&'a Expr<'a>],
-    base: &SubqueryValues<'a, 'a>,
-    row: &dyn ColumnLookup<'a>,
-    enclosing: Option<&dyn ColumnLookup<'a>>,
-    storage: &'a Storage,
-    txid: u32,
-    arena: &'a Arena,
-    params: &[Datum<'a>],
-    scalar_scratch: &'scratch mut CorrelatedScalarScratch<'a>,
-    list_scratch: &'scratch mut CorrelatedListScratch<'a>,
-    sequences: Option<&dyn SequenceAccess>,
-) -> Result<Option<SubqueryValues<'scratch, 'a>>, SqlError> {
-    if correlated.is_empty() {
-        Ok(None)
-    } else {
-        merge_correlated(
-            correlated,
-            base,
-            row,
-            enclosing,
-            storage,
-            txid,
-            arena,
-            params,
-            scalar_scratch,
-            list_scratch,
-            sequences,
-        )
-        .map(Some)
-    }
-}
-
-fn correlated_row_hooks<'scratch, 'a>(
-    base: &EvalHooks<'scratch, 'a>,
-    subqueries: &'scratch SubqueryValues<'scratch, 'a>,
-) -> EvalHooks<'scratch, 'a> {
-    EvalHooks {
-        group: None,
-        aggs: None,
-        subs: Some(subqueries),
-        subquery_executor: base.subquery_executor,
-        windows: None,
-        catalog: base.catalog,
-        srf_index: None,
-        project_sets: None,
-        sequences: base.sequences,
-        merge_action: base.merge_action,
-    }
 }
 
 /// PostgreSQL checks `EXECUTE` on every function a plan calls when the
@@ -10346,24 +10225,75 @@ fn collect_grouped_aggs<'a>(
         return Ok(());
     }
     if is_sublink(e) {
-        // The window layer evaluates subqueries above the grouped derived
-        // table: an aggregate this query owns is folded there, and the
-        // subquery reads it as that table's column.
-        aggregate_levels::visit_owned_outer_aggregates(e, &mut |call| {
-            if !out
-                .as_slice()
-                .iter()
-                .any(|(node, _)| core::ptr::eq(*node, call))
-            {
-                out.push((call as *const _, call))
-                    .map_err(|_| arena_full())?;
-            }
+        // A subquery reading an aggregate this query owns runs once per group
+        // in the grouped derived table, where that aggregate has its value;
+        // the window layer reads its result like an aggregate's.
+        let mut owns = false;
+        aggregate_levels::visit_owned_outer_aggregates(e, &mut |_| {
+            owns = true;
             Ok(())
         })?;
+        if owns {
+            if !out.as_slice().iter().any(|(p, _)| core::ptr::eq(*p, e)) {
+                out.push((e as *const _, e)).map_err(|_| arena_full())?;
+            }
+            return Ok(());
+        }
     }
     walk_children(e, &mut |child| {
         collect_grouped_aggs(child, out, storage, txid, columns)
     })
+}
+
+/// Adds the subqueries of a grouped window query's output to `out` after its
+/// aggregates: each runs once per group in the grouped derived table, where
+/// its references to this query's grouping keys resolve and an ungrouped one
+/// fails as in a grouped query without windows. A subquery inside an
+/// aggregate's arguments runs per input row and stays there; one whose
+/// operand holds a window function stays in the window layer.
+pub(super) fn collect_grouped_sublinks<'a>(
+    e: &'a Expr<'a>,
+    out: &mut ArenaList<'a, (*const Expr<'a>, &'a Expr<'a>)>,
+) -> Result<(), SqlError> {
+    if out.as_slice().iter().any(|(p, _)| core::ptr::eq(*p, e)) {
+        return Ok(());
+    }
+    if is_sublink(e) && !expr_has_window(e) {
+        return out.push((e as *const _, e)).map_err(|_| arena_full());
+    }
+    if let Expr::Call {
+        over: Some(spec),
+        args,
+        filter,
+        ..
+    } = e
+    {
+        for argument in args
+            .iter()
+            .copied()
+            .chain(spec.partition_by.iter().copied())
+        {
+            collect_grouped_sublinks(argument, out)?;
+        }
+        for key in spec.order_by {
+            collect_grouped_sublinks(key.expression, out)?;
+        }
+        if let Some(frame) = &spec.frame {
+            for bound in [&frame.start, &frame.end] {
+                if let FrameBound::Preceding(x) | FrameBound::Following(x) = bound {
+                    collect_grouped_sublinks(x, out)?;
+                }
+            }
+        }
+        if let Some(filter) = filter {
+            collect_grouped_sublinks(filter, out)?;
+        }
+        return Ok(());
+    }
+    if e.is_aggregate_use() {
+        return Ok(());
+    }
+    walk_children(e, &mut |child| collect_grouped_sublinks(child, out))
 }
 
 /// Context for [`rewrite_grouped_expr`]: the inner derived table's exposed
@@ -10491,18 +10421,17 @@ fn rewrite_grouped_expr<'a>(
             // A name outside the query's sources is an outer reference, such as
             // a PL/pgSQL variable, and stays constant in every group; evaluation
             // reports it if nothing defines it. A known one is ungrouped.
-            if let Some(scope) = context.scope
-                && scope.find_column(*qualifier, name).is_err()
-            {
-                return Ok(e);
+            match context.scope {
+                Some(scope) if scope.find_column(*qualifier, name).is_err() => Ok(e),
+                Some(scope) => Err(group::ungrouped_error(e, scope)),
+                None => Err(sql_err!(
+                    sqlstate::GROUPING_ERROR,
+                    "column \"{}{}{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+                    qualifier.unwrap_or(""),
+                    if qualifier.is_some() { "." } else { "" },
+                    name
+                )),
             }
-            Err(sql_err!(
-                sqlstate::GROUPING_ERROR,
-                "column \"{}{}{}\" must appear in the GROUP BY clause or be used in an aggregate function",
-                qualifier.unwrap_or(""),
-                if qualifier.is_some() { "." } else { "" },
-                name
-            ))
         }
         Expr::Unary { operator, operand , .. } => {
             alloc(Expr::Unary {source_position: e.source_position(),  operator: *operator, operand: rewrite(operand)? })
@@ -10784,6 +10713,18 @@ fn check_select_types<'a>(
             storage,
             txid,
         )?)?;
+    }
+    for expression in statement
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Expr { expression, .. } => Some(*expression),
+            _ => None,
+        })
+        .chain(statement.where_clause)
+        .chain(statement.having)
+    {
+        subquery::check_subquery_literals(expression, Some(scope), storage, txid, arena)?;
     }
     Ok(())
 }
@@ -11387,9 +11328,11 @@ pub(crate) fn select_query_resumable<'a>(
     // Subqueries first (uncorrelated, evaluated once).
     let n_items = statement.items.len();
     let n_order = statement.order_by.len();
-    let sub_exprs = match arena.alloc_slice_with(4 + n_items + n_order + 2 * scope.n, |_| {
-        Option::<&Expr>::None
-    }) {
+    let n_group = statement.group_by.len();
+    let sub_exprs = match arena
+        .alloc_slice_with(4 + n_items + n_order + n_group + 2 * scope.n, |_| {
+            Option::<&Expr>::None
+        }) {
         Ok(s) => s,
         Err(_) => return sql_fail(arena_full()),
     };
@@ -11407,11 +11350,30 @@ pub(crate) fn select_query_resumable<'a>(
             sub_exprs[4 + n_items + i] = Some(ob.expression);
         }
     }
-    let sample_start = 4 + n_items + n_order;
+    // Grouping keys may carry subqueries too, as may a bare ordinal's item.
+    for (i, key) in statement.group_by.iter().enumerate() {
+        if !matches!(key, Expr::Int(_)) {
+            sub_exprs[4 + n_items + n_order + i] = Some(key);
+        }
+    }
+    let sample_start = 4 + n_items + n_order + n_group;
     collect_table_sample_expressions(from, &mut sub_exprs[sample_start..]);
     // Uncorrelated subqueries are evaluated once; correlated ones are deferred
     // and re-evaluated per outer row during the scan.
-    let outer_subs = match prepare_outer_subqueries(sub_exprs, storage, txid, arena, params, seq) {
+    // A join condition's correlated subquery runs for each pair of rows.
+    let join_subqueries = ProceduralSubqueries { storage, txid };
+    let row_types = ScopeSchema(&scope);
+    let outer_subs = match prepare_outer_subqueries(
+        sub_exprs,
+        statement.from.as_ref(),
+        storage,
+        txid,
+        arena,
+        params,
+        None,
+        &row_types,
+        seq,
+    ) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
@@ -11432,7 +11394,7 @@ pub(crate) fn select_query_resumable<'a>(
         group: None,
         aggs: None,
         subs: Some(&outer_subs.base),
-        subquery_executor: None,
+        subquery_executor: Some(&join_subqueries),
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
@@ -11476,10 +11438,9 @@ pub(crate) fn select_query_resumable<'a>(
     ) {
         return sql_fail(e);
     }
-    if let Err(error) = patch_subquery_column_types(
+    if let Err(error) = patch_param_column_types(
         statement.items,
         Some(&scope),
-        &outer_subs.base,
         params,
         storage,
         txid,
@@ -11497,14 +11458,16 @@ pub(crate) fn select_query_resumable<'a>(
     }
     responder.row_description(&columns[..n_cols])?;
 
-    let offset = match super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks) {
-        Ok(o) => o,
-        Err(e) => return sql_fail(e),
-    };
-    let limit = match super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks) {
-        Ok(l) => l,
-        Err(e) => return sql_fail(e),
-    };
+    let offset =
+        match super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, None) {
+            Ok(o) => o,
+            Err(e) => return sql_fail(e),
+        };
+    let limit =
+        match super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, None) {
+            Ok(l) => l,
+            Err(e) => return sql_fail(e),
+        };
 
     // LIMIT 0 returns no rows without scanning or projecting anything, as
     // PostgreSQL does — so a per-row error in an unreturned row does not
@@ -11638,22 +11601,6 @@ pub(crate) fn select_query_resumable<'a>(
         // scan path retains full rows until it proves an equivalent contract.
         let pax_columns =
             streaming_pax_columns(&scope, from, statement.items, statement.where_clause);
-        // Per-row correlated-subquery scratch, allocated once and reused: the
-        // per-row rewind below reclaims the merged values, not this scratch.
-        let (n_scalar_scratch, n_list_scratch) =
-            subquery::merge_scratch_lens(Some(&outer_subs.base), correlated);
-        let scalar_scratch: &mut CorrelatedScalarScratch = match arena
-            .alloc_slice_with(n_scalar_scratch, |_| {
-                (core::ptr::null(), Datum::Null, Datum::Null)
-            }) {
-            Ok(s) => s,
-            Err(_) => return sql_fail(arena_full()),
-        };
-        let list_scratch: &mut CorrelatedListScratch =
-            match arena.alloc_slice_with(n_list_scratch, |_| subquery::empty_subquery_list()) {
-                Ok(s) => s,
-                Err(_) => return sql_fail(arena_full()),
-            };
         let scan = scan_source_recycling_with_pax_columns(
             storage,
             &scope,
@@ -11671,44 +11618,21 @@ pub(crate) fn select_query_resumable<'a>(
                 }
                 if !where_correlated.is_empty()
                     && !correlated_where_passes(
-                        where_correlated,
                         &outer_subs.base,
                         statement.where_clause,
                         row,
                         None,
-                        storage,
-                        txid,
                         arena,
                         params,
                         &hooks,
-                        scalar_scratch,
-                        list_scratch,
                     )?
                 {
                     return Ok(true);
                 }
-                // Per-row hooks for correlated subqueries; then WHERE.
-                let row_subqueries = correlated_row_subqueries(
-                    correlated,
-                    &outer_subs.base,
-                    row,
-                    None,
-                    storage,
-                    txid,
-                    arena,
-                    params,
-                    scalar_scratch,
-                    list_scratch,
-                    hooks.sequences,
-                )?;
-                let row_hooks_owned;
-                let row_hooks: &EvalHooks = match row_subqueries.as_ref() {
-                    Some(subqueries) => {
-                        row_hooks_owned = correlated_row_hooks(&hooks, subqueries);
-                        &row_hooks_owned
-                    }
-                    None => &hooks,
-                };
+                // The row's correlated subqueries run as its expressions
+                // reach them.
+                let _row_binding = subquery::bind_correlated_row(&outer_subs.base, row, None);
+                let row_hooks = &hooks;
                 // Number of output rows this source row yields (1, unless an
                 // `_pg_expandarray` expands it per array element).
                 let project_set = if projection_has_project_set {
@@ -11950,7 +11874,8 @@ fn prepare_fromless_projection<'a, R: ColumnLookup<'a>>(
         super::eval::require_expression_builtin_execute(expression, row, hooks)?;
     }
     if let Some(predicate) = statement.where_clause
-        && !where_passes(predicate, arena, params, row, hooks)?
+        && (!scan::rowless_one_time_filter_passes(Some(predicate), arena, params, hooks)?
+            || !where_passes(predicate, arena, params, row, hooks)?)
     {
         return Ok(srf::ProjectSet::empty());
     }
@@ -12135,10 +12060,9 @@ pub(crate) fn constant_select_resumable<'a>(
     ) {
         return sql_fail(e);
     }
-    if let Err(error) = patch_subquery_column_types(
+    if let Err(error) = patch_param_column_types(
         statement.items,
         None,
-        &subs,
         params,
         storage,
         txid,
@@ -12373,14 +12297,16 @@ pub(crate) fn constant_select_resumable<'a>(
         }
     }
 
-    let offset = match super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks) {
-        Ok(o) => o,
-        Err(e) => return sql_fail(e),
-    };
-    let limit = match super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks) {
-        Ok(l) => l,
-        Err(e) => return sql_fail(e),
-    };
+    let offset =
+        match super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, None) {
+            Ok(o) => o,
+            Err(e) => return sql_fail(e),
+        };
+    let limit =
+        match super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, None) {
+            Ok(l) => l,
+            Err(e) => return sql_fail(e),
+        };
     let project_set = if limit == 0 {
         srf::ProjectSet::empty()
     } else {
@@ -12752,8 +12678,10 @@ fn select_into_rows_mode<'a>(
         }
         let (mut rows, _target, n) =
             setops::materialize_set_body_tied(storage, txid, tree, arena, params, seq, outer)?;
-        let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-        let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
+        let offset =
+            super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
+        let limit =
+            super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
         // A trailing ORDER BY needs one final sort over the combined multiset.
         let columns_owned = if statement.order_by.is_empty() {
             None
@@ -12962,8 +12890,9 @@ fn select_into_rows_mode<'a>(
                 ..hooks
             };
             let offset =
-                super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-            let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
+                super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
+            let limit =
+                super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
             if limit == 0 || offset > 0 {
                 return Ok(());
             }
@@ -13006,8 +12935,10 @@ fn select_into_rows_mode<'a>(
         )?;
         let statement = resolve_group_ordinals(statement, Some(&scope), arena, storage, txid)?;
         check_key_types(statement, &scope, arena, storage, txid)?;
+        let n_items = statement.items.len();
+        let n_group = statement.group_by.len();
         let sub_exprs = arena
-            .alloc_slice_with(2 + statement.items.len() + 2 * scope.n, |_| None)
+            .alloc_slice_with(2 + n_items + n_group + 2 * scope.n, |_| None)
             .map_err(|_| arena_full())?;
         sub_exprs[0] = statement.where_clause;
         sub_exprs[1] = statement.having;
@@ -13016,13 +12947,34 @@ fn select_into_rows_mode<'a>(
                 sub_exprs[2 + i] = Some(expression);
             }
         }
-        collect_table_sample_expressions(from, &mut sub_exprs[2 + statement.items.len()..]);
-        let outer_subs = prepare_outer_subqueries(sub_exprs, storage, txid, arena, params, seq)?;
+        for (i, key) in statement.group_by.iter().enumerate() {
+            if !matches!(key, Expr::Int(_)) {
+                sub_exprs[2 + n_items + i] = Some(key);
+            }
+        }
+        collect_table_sample_expressions(from, &mut sub_exprs[2 + n_items + n_group..]);
+        let join_subqueries = ProceduralSubqueries { storage, txid };
+        let row_schema = ScopeSchema(&scope);
+        let row_types = Chained {
+            inner: &row_schema,
+            outer,
+        };
+        let outer_subs = prepare_outer_subqueries(
+            sub_exprs,
+            statement.from.as_ref(),
+            storage,
+            txid,
+            arena,
+            params,
+            outer,
+            &row_types,
+            seq,
+        )?;
         let hooks = EvalHooks {
             group: None,
             aggs: None,
             subs: Some(&outer_subs.base),
-            subquery_executor: None,
+            subquery_executor: Some(&join_subqueries),
             windows: None,
             catalog: Some(&catalog),
             srf_index: None,
@@ -13043,8 +12995,10 @@ fn select_into_rows_mode<'a>(
             outer_subs.correlated,
             outer,
         )?;
-        let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-        let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
+        let offset =
+            super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
+        let limit =
+            super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
         let start = (offset as usize).min(rows.len());
         let n = ((rows.len() - start) as u64).min(limit) as usize;
         for row in &rows[start..start + n] {
@@ -13094,8 +13048,10 @@ fn select_into_rows_mode<'a>(
                 emit,
             );
         }
-        let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-        let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
+        let offset =
+            super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
+        let limit =
+            super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
         if limit == 0 {
             return Ok(());
         }
@@ -13175,8 +13131,9 @@ fn select_into_rows_mode<'a>(
         return Ok(());
     };
 
-    let offset = super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks)?;
-    let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks)?;
+    let offset =
+        super::exec::eval_offset_pub(statement.offset, arena, params, &bound_hooks, outer)?;
+    let limit = super::exec::eval_limit_pub(statement.limit, arena, params, &bound_hooks, outer)?;
     if limit == 0 {
         // Plan the schema without materializing derived inputs or evaluating
         // subqueries/projections that Limit will never request.
@@ -13217,14 +13174,30 @@ fn select_into_rows_mode<'a>(
             arena,
         },
     };
-    let outer_subs = prepare_outer_subqueries(sub_exprs, storage, txid, arena, params, seq)?;
+    let join_subqueries = ProceduralSubqueries { storage, txid };
+    let row_schema = ScopeSchema(&scope);
+    let row_types = Chained {
+        inner: &row_schema,
+        outer,
+    };
+    let outer_subs = prepare_outer_subqueries(
+        sub_exprs,
+        statement.from.as_ref(),
+        storage,
+        txid,
+        arena,
+        params,
+        outer,
+        &row_types,
+        seq,
+    )?;
     let correlated = outer_subs.correlated;
     let where_correlated = correlated_in_expression(statement.where_clause, correlated, arena)?;
     let hooks = EvalHooks {
         group: None,
         aggs: None,
         subs: Some(&outer_subs.base),
-        subquery_executor: None,
+        subquery_executor: Some(&join_subqueries),
         windows: None,
         catalog: Some(&catalog),
         srf_index: None,
@@ -13419,58 +13392,23 @@ fn select_into_rows_mode<'a>(
     // source row into one output row per array element.
     let srf_call = find_srf(statement.items);
     let projection_has_project_set = has_project_set(statement.items, storage, txid);
-    // Per-row correlated-subquery scratch, allocated once and reused across
-    // the scan (this path may run without per-row arena recycling).
-    let (n_scalar_scratch, n_list_scratch) =
-        subquery::merge_scratch_lens(Some(&outer_subs.base), correlated);
-    let scalar_scratch: &mut CorrelatedScalarScratch = arena
-        .alloc_slice_with(n_scalar_scratch, |_| {
-            (core::ptr::null(), Datum::Null, Datum::Null)
-        })
-        .map_err(|_| arena_full())?;
-    let list_scratch: &mut CorrelatedListScratch = arena
-        .alloc_slice_with(n_list_scratch, |_| subquery::empty_subquery_list())
-        .map_err(|_| arena_full())?;
     let mut visit = |row: &JoinRow<'_, 'a, '_>| {
         if !where_correlated.is_empty()
             && !correlated_where_passes(
-                where_correlated,
                 &outer_subs.base,
                 statement.where_clause,
                 row,
                 outer,
-                storage,
-                txid,
                 arena,
                 params,
                 &hooks,
-                scalar_scratch,
-                list_scratch,
             )?
         {
             return Ok(true);
         }
-        let row_subqueries = correlated_row_subqueries(
-            correlated,
-            &outer_subs.base,
-            row,
-            outer,
-            storage,
-            txid,
-            arena,
-            params,
-            scalar_scratch,
-            list_scratch,
-            hooks.sequences,
-        )?;
-        let row_hooks_owned;
-        let row_hooks: &EvalHooks = match row_subqueries.as_ref() {
-            Some(subqueries) => {
-                row_hooks_owned = correlated_row_hooks(&hooks, subqueries);
-                &row_hooks_owned
-            }
-            None => &hooks,
-        };
+        // The row's correlated subqueries run as its expressions reach them.
+        let _row_binding = subquery::bind_correlated_row(&outer_subs.base, row, outer);
+        let row_hooks = &hooks;
         let mut projected = [Datum::Null; MAX_PROJ];
         let project_set = if projection_has_project_set {
             prepare_project_set(
@@ -15863,6 +15801,7 @@ pub(crate) fn semi_join_first_match_passes<'a>(
         &[where_clause],
         storage,
         txid,
+        None,
         arena,
         params,
         Some(first),

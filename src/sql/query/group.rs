@@ -9,7 +9,7 @@
 use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::Responder;
 use crate::sql::ast::{Collation, Expr, FromClause, GroupingSet, Select, SelectItem};
-use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, SubqueryList, eval_full, sqlstate};
+use crate::sql::eval::{ColumnLookup, EvalHooks, SqlError, eval_full, sqlstate};
 use crate::sql::types::Datum;
 use crate::sql_err;
 use crate::stack_format;
@@ -17,12 +17,11 @@ use crate::stack_format;
 use crate::sql::exec::MAX_PROJ;
 
 use super::aggregate::AggState;
-use super::plan::where_passes;
-use super::subquery::{correlated_in_expression, correlated_scan_conjuncts, merge_correlated};
+use super::subquery::{correlated_in_expression, correlated_scan_conjuncts};
 use super::{
-    Chained, JoinRow, Outcome, QueryScope, ScopeSchema, arena_full, expr_contains_node,
-    pax_column_demand, resolve_order_target, scan_source_recycling_with_pax_columns,
-    scan_source_with_pax_columns, sql_fail, sql_ok,
+    JoinRow, Outcome, QueryScope, ScopeSchema, arena_full, expr_contains_node, pax_column_demand,
+    resolve_order_target, scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
+    sql_fail, sql_ok,
 };
 use crate::storage::Storage;
 
@@ -46,51 +45,37 @@ pub(super) fn compare_group_rows(
 }
 
 /// With correlated subqueries in WHERE, the filter cannot run inside
-/// `scan_source` (their values change per row): re-evaluate those subqueries
-/// (`where_correlated`, only the ones inside WHERE) against this row, then
-/// apply WHERE under the merged hooks. With none this is a no-op (the scan
-/// already filtered).
-#[expect(clippy::too_many_arguments, reason = "query pipeline plumbing")]
+/// `scan_source` (their values change per row): apply WHERE to this row, its
+/// correlated subqueries running as the condition reaches them. With none
+/// this is a no-op (the scan already filtered).
 pub(super) fn row_passes_correlated_where<'a>(
     where_correlated: &'a [&'a Expr<'a>],
     where_clause: Option<&'a Expr<'a>>,
-    storage: &'a Storage,
-    txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     row: &JoinRow<'_, 'a, '_>,
     outer: Option<&dyn ColumnLookup<'a>>,
-    scalars: &mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)],
-    lists: &mut [SubqueryList<'a>],
 ) -> Result<bool, SqlError> {
     if where_correlated.is_empty() {
         return Ok(true);
     }
-    let Some(w) = where_clause else {
-        return Ok(true);
-    };
     let base = hooks.subs.expect("outer subqueries prepared");
-    let row = &Chained { inner: row, outer };
-    let row_subs = merge_correlated(
-        where_correlated,
+    // Only the verdict escapes: the subqueries' values and the condition's
+    // scratch are reclaimed even when the scan keeps each row's allocations.
+    let mark = arena.mark();
+    let passes = super::subquery::correlated_where_passes(
         base,
+        where_clause,
         row,
         outer,
-        storage,
-        txid,
         arena,
         params,
-        scalars,
-        lists,
-        hooks.sequences,
-    )?;
-    let h = EvalHooks {
-        subs: Some(&row_subs),
-        ..*hooks
-    };
-    let row = super::Chained { inner: row, outer };
-    where_passes(w, arena, params, &row, &h)
+        hooks,
+    );
+    // SAFETY: nothing the evaluation allocated escapes its verdict.
+    unsafe { arena.rewind_to(mark) };
+    passes
 }
 
 /// The outer-row lookup for a correlated subquery re-evaluated per GROUP:
@@ -197,7 +182,6 @@ pub(super) fn groups_for_mask<'a>(
     scan_where: Option<&'a Expr<'a>>,
     correlated: &'a [&'a Expr<'a>],
     where_correlated: &'a [&'a Expr<'a>],
-    row_correlated: &'a [&'a Expr<'a>],
     outer: Option<&dyn ColumnLookup<'a>>,
     mask: GroupingSet<'a>,
     group_collations: &[Collation],
@@ -218,10 +202,6 @@ pub(super) fn groups_for_mask<'a>(
     let group_of: &mut [u32] = arena
         .alloc_slice_with(row_count, |_| 0u32)
         .map_err(|_| arena_full())?;
-    // Per-row correlated-subquery scratch, allocated once and reused: per-row
-    // merges must not grow the statement arena.
-    let (where_scalars, where_lists) =
-        super::subquery::alloc_merge_scratch(hooks.subs, correlated, arena)?;
     let (n_groups, rep_keys): (usize, &[&[u8]]) = if storage.spill_attached() && n_keys > 0 {
         let mut sorter = storage.external_sorter()?;
         sorter.reset();
@@ -252,42 +232,20 @@ pub(super) fn groups_for_mask<'a>(
                 if !row_passes_correlated_where(
                     where_correlated,
                     statement.where_clause,
-                    storage,
-                    txid,
                     arena,
                     params,
                     hooks,
                     row,
                     outer,
-                    &mut *where_scalars,
-                    &mut *where_lists,
                 )? {
                     return Ok(true);
                 }
-                let row_subs;
-                let row_hooks_store;
-                let row_hooks: &EvalHooks = if row_correlated.is_empty() {
-                    hooks
-                } else {
-                    row_subs = merge_correlated(
-                        row_correlated,
-                        hooks.subs.expect("outer subqueries prepared"),
-                        row,
-                        outer,
-                        storage,
-                        txid,
-                        arena,
-                        params,
-                        &mut *where_scalars,
-                        &mut *where_lists,
-                        hooks.sequences,
-                    )?;
-                    row_hooks_store = EvalHooks {
-                        subs: Some(&row_subs),
-                        ..*hooks
-                    };
-                    &row_hooks_store
-                };
+                let _row_binding = super::subquery::bind_correlated_row(
+                    hooks.subs.expect("outer subqueries prepared"),
+                    row,
+                    outer,
+                );
+                let row_hooks: &EvalHooks = hooks;
                 // Outer references, such as an enclosing query's aggregate,
                 // read the caller's row.
                 let row = &super::scan::Chained { inner: row, outer };
@@ -387,42 +345,20 @@ pub(super) fn groups_for_mask<'a>(
                     if !row_passes_correlated_where(
                         where_correlated,
                         statement.where_clause,
-                        storage,
-                        txid,
                         arena,
                         params,
                         hooks,
                         row,
                         outer,
-                        &mut *where_scalars,
-                        &mut *where_lists,
                     )? {
                         return Ok(true);
                     }
-                    let row_subs;
-                    let row_hooks_store;
-                    let row_hooks: &EvalHooks = if row_correlated.is_empty() {
-                        hooks
-                    } else {
-                        row_subs = merge_correlated(
-                            row_correlated,
-                            hooks.subs.expect("outer subqueries prepared"),
-                            row,
-                            outer,
-                            storage,
-                            txid,
-                            arena,
-                            params,
-                            &mut *where_scalars,
-                            &mut *where_lists,
-                            hooks.sequences,
-                        )?;
-                        row_hooks_store = EvalHooks {
-                            subs: Some(&row_subs),
-                            ..*hooks
-                        };
-                        &row_hooks_store
-                    };
+                    let _row_binding = super::subquery::bind_correlated_row(
+                        hooks.subs.expect("outer subqueries prepared"),
+                        row,
+                        outer,
+                    );
+                    let row_hooks: &EvalHooks = hooks;
                     // Outer references, such as PL/pgSQL variables, read
                     // the caller's row.
                     let row = &super::scan::Chained { inner: row, outer };
@@ -589,51 +525,52 @@ pub(super) fn groups_for_mask<'a>(
     if n_aggs > 0 {
         let mut at = 0usize;
         let mut partial_rows = 0usize;
-        let recycling_safe = states[..n_groups * n_aggs]
-            .iter()
-            .all(AggState::recycling_safe);
+        // Every group's states share the first group's kinds; without a
+        // group no row folds.
+        let recycling_safe = agg_nodes.iter().enumerate().all(|(i, (_, node))| {
+            states
+                .get(i)
+                .is_none_or(|state| state.recycling_safe_for(node, aggregate_columns))
+        });
+        // Otherwise, states whose running values `hold` copies out after each
+        // row, and whose buffers live in the persistent tail, let the scan
+        // reclaim that row's allocations too.
+        let hold_values = !recycling_safe
+            && !partial_execution
+            && agg_nodes.iter().enumerate().all(|(i, (_, node))| {
+                states
+                    .get(i)
+                    .is_none_or(|state| state.holds_values_only(node))
+            });
+        let held: &mut [super::aggregate::HeldValues] = arena
+            .alloc_slice_with(if hold_values { n_groups * n_aggs } else { 0 }, |_| {
+                super::aggregate::HeldValues::default()
+            })
+            .map_err(|_| arena_full())?;
+        for (state, held) in states.iter_mut().zip(held.iter_mut()) {
+            state.keep_buffers_in(arena);
+            state.hold(held, arena, arena)?;
+        }
         let mut visit = |row: &JoinRow<'_, 'a, '_>| {
             if !row_passes_correlated_where(
                 where_correlated,
                 statement.where_clause,
-                storage,
-                txid,
                 arena,
                 params,
                 hooks,
                 row,
                 outer,
-                &mut *where_scalars,
-                &mut *where_lists,
             )? {
                 return Ok(true);
             }
             // Correlated subqueries inside aggregate arguments re-evaluate
             // against each input row.
-            let row_subs;
-            let row_hooks_store;
-            let row_hooks: &EvalHooks = if row_correlated.is_empty() {
-                hooks
-            } else {
-                row_subs = merge_correlated(
-                    row_correlated,
-                    hooks.subs.expect("outer subqueries prepared"),
-                    row,
-                    outer,
-                    storage,
-                    txid,
-                    arena,
-                    params,
-                    &mut *where_scalars,
-                    &mut *where_lists,
-                    hooks.sequences,
-                )?;
-                row_hooks_store = EvalHooks {
-                    subs: Some(&row_subs),
-                    ..*hooks
-                };
-                &row_hooks_store
-            };
+            let _row_binding = super::subquery::bind_correlated_row(
+                hooks.subs.expect("outer subqueries prepared"),
+                row,
+                outer,
+            );
+            let row_hooks: &EvalHooks = hooks;
             let g = if n_keys == 0 {
                 0
             } else {
@@ -649,6 +586,10 @@ pub(super) fn groups_for_mask<'a>(
                 let index = g * n_aggs + i;
                 if partial_execution && states[index].supports_partial() {
                     partial_states[index].update(node, arena, params, row, row_hooks)?;
+                } else if hold_values {
+                    states[index].restore_held(&held[index], arena)?;
+                    states[index].update(node, arena, params, row, row_hooks)?;
+                    states[index].hold(&mut held[index], arena, arena)?;
                 } else {
                     states[index].update(node, arena, params, row, row_hooks)?;
                 }
@@ -681,11 +622,14 @@ pub(super) fn groups_for_mask<'a>(
             }
             Ok(true)
         };
-        if recycling_safe {
+        if recycling_safe || hold_values {
             scan_source_recycling_with_pax_columns(
                 storage, scope, from, txid, scan_where, arena, params, hooks, outer, pax_demand,
                 &mut visit,
             )?;
+            for (state, held) in states.iter_mut().zip(held.iter()) {
+                state.restore_held(held, arena)?;
+            }
         } else {
             scan_source_with_pax_columns(
                 storage, scope, from, txid, scan_where, arena, params, hooks, outer, pax_demand,
@@ -712,10 +656,6 @@ pub(super) fn groups_for_mask<'a>(
     let per_group: &mut [&[&[u8]]] = arena
         .alloc_slice_with(n_groups, |_| empty_group)
         .map_err(|_| arena_full())?;
-    let (group_scalars, group_lists) =
-        super::subquery::alloc_merge_scratch(hooks.subs, output_correlated, arena)?;
-    let (having_scalars, having_lists) =
-        super::subquery::alloc_merge_scratch(hooks.subs, having_correlated, arena)?;
     let mut output_count = 0usize;
     for g in 0..n_groups {
         let mut key_vals = [Datum::Null; crate::sql::parser::MAX_GROUP_TERMS];
@@ -767,25 +707,16 @@ pub(super) fn groups_for_mask<'a>(
         let own = ScopeSchema(scope);
         let schema = super::Chained { inner: &own, outer };
         if let Some(h) = statement.having {
-            let having_subs;
+            let _having_subs_binding = super::subquery::bind_correlated_row(
+                hooks.subs.expect("outer subqueries prepared"),
+                &group_row,
+                outer,
+            );
             let having_hooks = if having_correlated.is_empty() {
                 base_hooks
             } else {
-                having_subs = merge_correlated(
-                    having_correlated,
-                    hooks.subs.expect("outer subqueries prepared"),
-                    &group_row,
-                    outer,
-                    storage,
-                    txid,
-                    arena,
-                    params,
-                    &mut *having_scalars,
-                    &mut *having_lists,
-                    hooks.sequences,
-                )?;
                 EvalHooks {
-                    subs: Some(&having_subs),
+                    subs: hooks.subs,
                     ..base_hooks
                 }
             };
@@ -800,25 +731,16 @@ pub(super) fn groups_for_mask<'a>(
                 }
             }
         }
-        let merged_subs;
+        let _merged_subs_binding = super::subquery::bind_correlated_row(
+            hooks.subs.expect("outer subqueries prepared"),
+            &group_row,
+            outer,
+        );
         let group_hooks = if output_correlated.is_empty() {
             base_hooks
         } else {
-            merged_subs = merge_correlated(
-                output_correlated,
-                hooks.subs.expect("outer subqueries prepared"),
-                &group_row,
-                outer,
-                storage,
-                txid,
-                arena,
-                params,
-                &mut *group_scalars,
-                &mut *group_lists,
-                hooks.sequences,
-            )?;
             EvalHooks {
-                subs: Some(&merged_subs),
+                subs: hooks.subs,
                 ..base_hooks
             }
         };
@@ -964,25 +886,6 @@ pub(super) fn grouped_rows<'a>(
     // sees the same filtered sequence.
     let where_correlated = correlated_in_expression(statement.where_clause, correlated, arena)?;
     let scan_where = correlated_scan_conjuncts(statement.where_clause, where_correlated, arena)?;
-    // Grouping keys and aggregate inputs read correlated subqueries per input
-    // row; those in the output, HAVING and ORDER BY run once per group.
-    let mut row_correlated = ArenaList::new(arena);
-    for &node in correlated {
-        let pointer = node as *const Expr;
-        if statement
-            .group_by
-            .iter()
-            .chain(agg_nodes.iter().map(|(_, aggregate)| aggregate))
-            .any(|expression| expr_contains_node(expression, pointer))
-        {
-            row_correlated.push(node).map_err(|_| arena_full())?;
-        }
-    }
-    let row_correlated = row_correlated.as_slice();
-    // Per-row correlated-subquery scratch, allocated once and reused: per-row
-    // merges must not grow the statement arena.
-    let (where_scalars, where_lists) =
-        super::subquery::alloc_merge_scratch(hooks.subs, correlated, arena)?;
     let mut row_count = 0usize;
     // A global aggregate has one group even for an empty source. It needs no
     // per-row group assignments and must not execute its source just to size them.
@@ -1002,15 +905,11 @@ pub(super) fn grouped_rows<'a>(
                 if !row_passes_correlated_where(
                     where_correlated,
                     statement.where_clause,
-                    storage,
-                    txid,
                     arena,
                     params,
                     hooks,
                     row,
                     outer,
-                    &mut *where_scalars,
-                    &mut *where_lists,
                 )? {
                     return Ok(true);
                 }
@@ -1116,7 +1015,6 @@ pub(super) fn grouped_rows<'a>(
             scan_where,
             correlated,
             where_correlated,
-            row_correlated,
             outer,
             mask,
             group_collations,
@@ -1424,7 +1322,7 @@ fn expand_grouped_stars<'a>(
 
 /// PostgreSQL's ungrouped-column error, naming the column as `table.column`
 /// however the query spelled it.
-fn ungrouped_error(column: &Expr, scope: &QueryScope) -> SqlError {
+pub(super) fn ungrouped_error(column: &Expr, scope: &QueryScope) -> SqlError {
     let (qualifier, name) = match column {
         Expr::Column { qualifier, name } => (*qualifier, *name),
         _ => (None, ""),

@@ -235,6 +235,9 @@ pub(super) fn expression_properties(
     storage: &Storage,
     txid: u32,
     stage: AnalysisStage,
+    // Scratch for each subquery's correlation check; nothing it holds
+    // outlives the call.
+    arena: &crate::mem::arena::Arena,
 ) -> Result<ExpressionProperties, SqlError> {
     let mut result = ExpressionProperties {
         volatile: false,
@@ -242,7 +245,7 @@ pub(super) fn expression_properties(
         columns: false,
     };
     super::walk_children(expression, &mut |child| {
-        let child = expression_properties(child, columns, storage, txid, stage)?;
+        let child = expression_properties(child, columns, storage, txid, stage, arena)?;
         result.volatile |= child.volatile;
         result.leaks_columns |= child.leaks_columns;
         result.columns |= child.columns;
@@ -703,12 +706,40 @@ pub(super) fn expression_properties(
             },
             _ => ProcedureProperties::UNKNOWN,
         }),
+        // A view pushes no qualifier containing a subquery, as PostgreSQL's
+        // `qual_is_pushdown_safe` does not.
         Expr::Subquery(_)
         | Expr::RowSubquery { .. }
         | Expr::InSubquery { .. }
         | Expr::QuantifiedSubquery { .. }
         | Expr::Exists(_)
-        | Expr::ArraySubquery(_) => Some(ProcedureProperties::UNKNOWN),
+        | Expr::ArraySubquery(_)
+            if stage == AnalysisStage::ViewPushdown =>
+        {
+            Some(ProcedureProperties::UNKNOWN)
+        }
+        // At run time an uncorrelated subquery calling no volatile or
+        // user-defined function has one result for the statement, as a
+        // stable function does; it is not known to be leakproof.
+        Expr::Subquery(_)
+        | Expr::RowSubquery { .. }
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. }
+        | Expr::Exists(_)
+        | Expr::ArraySubquery(_) => {
+            let mark = arena.mark();
+            let stable = super::subquery::stable_uncorrelated(expression, storage, txid, arena);
+            // SAFETY: the check returns a flag; nothing it allocated escapes.
+            unsafe { arena.rewind_to(mark) };
+            Some(if stable {
+                ProcedureProperties {
+                    volatile: false,
+                    leakproof: false,
+                }
+            } else {
+                ProcedureProperties::UNKNOWN
+            })
+        }
         _ => None,
     };
     if let Some(procedure) = procedure {

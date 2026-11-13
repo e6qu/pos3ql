@@ -3364,6 +3364,9 @@ impl Conn {
                     crate::sql::error_context::restore(&e, context, None);
                 }
                 self.copy_error_context.clear();
+                if let Some(diagnostic) = copy.failed_diagnostic.take() {
+                    crate::sql::eval::stash_full_diagnostic(diagnostic);
+                }
                 responder.error(e.sqlstate, e.message.as_str())
             }
         };
@@ -4531,6 +4534,7 @@ impl Conn {
                     ignored: 0,
                     line: 0,
                     failed: None,
+                    failed_diagnostic: None,
                     end_seen: false,
                     header_pending,
                     binary_header_pending,
@@ -4785,6 +4789,7 @@ impl Conn {
                         ignored: 0,
                         line: 0,
                         failed: None,
+                        failed_diagnostic: None,
                         end_seen: false,
                         header_pending,
                         binary_header_pending,
@@ -6499,6 +6504,8 @@ struct CopyInProgress {
     ignored: u64,
     line: u64,
     failed: Option<crate::sql::eval::SqlError>,
+    /// `failed`'s DETAIL and HINT, kept until it is reported.
+    failed_diagnostic: Option<crate::sql::eval::Diagnostic>,
     end_seen: bool,
     /// CSV/text HEADER: the first data line is column names to skip, not a row.
     header_pending: bool,
@@ -6520,6 +6527,7 @@ fn fail_copy(copy: &mut CopyInProgress, context: &mut FixedBuf, error: SqlError)
             let _ = context.append(reported.context.as_bytes());
         }
     });
+    copy.failed_diagnostic = crate::sql::eval::take_diagnostic();
     copy.failed = Some(error);
 }
 
@@ -6544,6 +6552,7 @@ fn record_copy_input_error(
     };
     // The skipped error is not reported.
     crate::sql::error_context::take(&error, |_| ());
+    let _ = crate::sql::eval::take_diagnostic();
     copy.ignored = copy.ignored.saturating_add(1);
     if matches!(
         copy.setup.log_verbosity,
@@ -6567,6 +6576,7 @@ fn record_copy_input_error(
         // Raised while the skipped row's column is still current.
         context.clear();
         let _ = context.append(conversion.context().as_str().as_bytes());
+        copy.failed_diagnostic = None;
         copy.failed = Some(crate::sql_err!(
             sqlstate::INVALID_TEXT_REPRESENTATION,
             "skipped more than REJECT_LIMIT ({}) rows due to data type incompatibility",

@@ -10133,6 +10133,12 @@ fn bound_index_source<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a super::ast::Expr<'a>, SqlError> {
+    if info.is_exclusion {
+        // An exclusion constraint keeps its predicate as name-resolved text;
+        // its index has no explicit definition to bind it through.
+        let source = arena.alloc_str(source).map_err(|_| arena_full())?;
+        return super::parser::parse_expr(source, arena);
+    }
     let index = info_index(storage, info, txid)
         .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "index definition is absent"))?;
     super::exec::expression_bindings::bound_index_expression(

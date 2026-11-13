@@ -2489,17 +2489,22 @@ impl<'a> Parser<'a> {
                 } else {
                     let numeric_timezone = name.eq_ignore_ascii_case("timezone")
                         && matches!(self.peeked, Tok::Num(_) | Tok::Op("+") | Tok::Op("-"));
-                    match self.configuration_value_list(name, true)? {
-                        RoutineConfigValue::Default => ("DEFAULT", SettingSyntax::Default),
-                        RoutineConfigValue::Value(value) => (
+                    match self.configuration_values(name, true, true)? {
+                        (RoutineConfigValue::Default, _) => ("DEFAULT", SettingSyntax::Default),
+                        (RoutineConfigValue::Value(value), items) => (
                             value,
                             if numeric_timezone {
                                 SettingSyntax::TimeZone
+                            } else if items > 1
+                                && !name.eq_ignore_ascii_case("search_path")
+                                && !name.eq_ignore_ascii_case("datestyle")
+                            {
+                                SettingSyntax::DecodedList
                             } else {
                                 SettingSyntax::DecodedValue
                             },
                         ),
-                        RoutineConfigValue::Current => {
+                        (RoutineConfigValue::Current, _) => {
                             unreachable!("FROM CURRENT is separate syntax")
                         }
                     }
@@ -9938,8 +9943,22 @@ impl<'a> Parser<'a> {
         name: &str,
         allow_list: bool,
     ) -> Result<RoutineConfigValue<'a>, ParseError> {
+        self.configuration_values(name, allow_list, false)
+            .map(|(value, _)| value)
+    }
+
+    /// A configuration value and how many list items it has. A `SET` of
+    /// `plpgsql.extra_warnings` or `plpgsql.extra_errors` (`deferred_lists`)
+    /// keeps a list for execution, which accepts it only once PL/pgSQL has
+    /// loaded and defined them as list parameters.
+    fn configuration_values(
+        &mut self,
+        name: &str,
+        allow_list: bool,
+        deferred_lists: bool,
+    ) -> Result<(RoutineConfigValue<'a>, usize), ParseError> {
         if self.eat_ident("default")? {
-            return Ok(RoutineConfigValue::Default);
+            return Ok((RoutineConfigValue::Default, 0));
         }
         let mut bytes = ArenaList::new(self.arena);
         let mut count = 0;
@@ -10010,7 +10029,11 @@ impl<'a> Parser<'a> {
             if !allow_list {
                 return Err(self.syntax_error_here());
             }
-            if !name.eq_ignore_ascii_case("search_path") && !name.eq_ignore_ascii_case("datestyle")
+            if !name.eq_ignore_ascii_case("search_path")
+                && !name.eq_ignore_ascii_case("datestyle")
+                && !(deferred_lists
+                    && (name.eq_ignore_ascii_case("plpgsql.extra_warnings")
+                        || name.eq_ignore_ascii_case("plpgsql.extra_errors")))
             {
                 return Err(ParseError {
                     at: self.peek_at,
@@ -10027,8 +10050,12 @@ impl<'a> Parser<'a> {
                 });
             }
         }
-        Ok(RoutineConfigValue::Value(
-            core::str::from_utf8(bytes.as_slice()).expect("decoded configuration value is UTF-8"),
+        Ok((
+            RoutineConfigValue::Value(
+                core::str::from_utf8(bytes.as_slice())
+                    .expect("decoded configuration value is UTF-8"),
+            ),
+            count,
         ))
     }
 

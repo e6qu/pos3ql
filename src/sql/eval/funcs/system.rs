@@ -2046,7 +2046,7 @@ pub(crate) fn dispatch<'a>(
                         ));
                     }
                 };
-                if crate::sql::guc::requires_set_privilege(name) {
+                if crate::sql::guc::active_requires_set_privilege(name)? {
                     hooks
                         .catalog
                         .ok_or_else(|| {

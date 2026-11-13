@@ -246,6 +246,17 @@ fn constant_value_in(
     })
 }
 
+/// Whether PostgreSQL's planner folds `expression`, which names no column
+/// or parameter, to a constant: every operator, cast and call in it is an
+/// immutable built-in.
+pub(crate) fn folds_builtin_constant(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> Result<bool, SqlError> {
+    builtin_constant(expression, &crate::sql::exec::NoCols, storage, txid)
+}
+
 fn builtin_constant(
     expression: &Expr<'_>,
     columns: &dyn ColTypeResolver,

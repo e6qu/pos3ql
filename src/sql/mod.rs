@@ -3930,7 +3930,9 @@ impl Engine {
                         guc.transaction_reset_owned(name).unwrap_or(value);
                     sources[setting_count] = txn.setting_source(name).unwrap_or("default");
                     setting_count += 1;
-                } else if let Some(value) = guc.get_owned(name) {
+                } else if !guc.is_placeholder(name)
+                    && let Some(value) = guc.get_owned(name)
+                {
                     names[setting_count] = name;
                     values[setting_count] = value;
                     reset_values[setting_count] = guc.reset_owned(name).unwrap_or(value);
@@ -10461,7 +10463,9 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        if let Err(error) = guc::SettingAuthorization::set(&self.storage, name, txn.txid) {
+        if let Err(error) =
+            guc::SettingAuthorization::set_in_session(&self.storage, guc, name, txn.txid)
+        {
             return Ok(Err(error));
         }
         if local && !txn.is_explicit() {
@@ -10493,6 +10497,13 @@ impl Engine {
             responder.command_complete("SET")?;
             return Ok(Ok(()));
         }
+        if syntax == ast::SettingSyntax::DecodedList && !guc.accepts_list(name) {
+            return Ok(Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "SET {} takes only one argument",
+                name
+            )));
+        }
         let characteristics = match syntax {
             ast::SettingSyntax::DecodedValue => guc.current_transaction_value(name, Some(value)),
             ast::SettingSyntax::Default => guc.current_transaction_value(name, None),
@@ -10512,7 +10523,7 @@ impl Engine {
             return Ok(Ok(()));
         }
         let changed = match syntax {
-            ast::SettingSyntax::DecodedValue => {
+            ast::SettingSyntax::DecodedValue | ast::SettingSyntax::DecodedList => {
                 guc.set_config(name, Some(value), local).map(|_| ())
             }
             ast::SettingSyntax::Default => guc.set_config(name, None, local).map(|_| ()),
@@ -10575,7 +10586,8 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if let Some(name) = name
-            && let Err(error) = guc::SettingAuthorization::set(&self.storage, name, txn.txid)
+            && let Err(error) =
+                guc::SettingAuthorization::set_in_session(&self.storage, guc, name, txn.txid)
         {
             return Ok(Err(error));
         }
@@ -18818,6 +18830,7 @@ impl Engine {
                 guc,
                 arena,
                 check_body,
+                responder,
             ))
         })();
         let role = eval::funcs::system::current_user_owned();
@@ -19657,6 +19670,8 @@ impl Engine {
             };
         }
         if routine.language == crate::storage::RoutineLanguage::PlPgSql {
+            let txid = txn.txid;
+            guc.load_plpgsql(responder, &|name| self.may_set_parameter(name, txid))?;
             let (instance, conflict) = match self.plpgsql_instance_owner(
                 routine,
                 pending.input_collation,
@@ -20371,6 +20386,8 @@ impl Engine {
             }
             let mut run = || {
                 if routine.language == crate::storage::RoutineLanguage::PlPgSql {
+                    let txid = txn.txid;
+                    guc.load_plpgsql(responder, &|name| self.may_set_parameter(name, txid))?;
                     let mut output_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
                     let (instance, conflict) = match self.plpgsql_instance_owner(
                         routine,
@@ -21102,7 +21119,8 @@ impl Engine {
             Stmt::CreateRoutine(routine) => routine.language == ast::RoutineLanguage::PlPgSql,
             _ => false,
         } {
-            guc.load_plpgsql(responder)?;
+            let txid = txn.txid;
+            guc.load_plpgsql(responder, &|name| self.may_set_parameter(name, txid))?;
         }
         let result = self.execute_stmt_loaded(
             statement,
@@ -21117,9 +21135,16 @@ impl Engine {
             timeout_entry,
         );
         if guc::take_plpgsql_use() {
-            guc.load_plpgsql(responder)?;
+            let txid = txn.txid;
+            guc.load_plpgsql(responder, &|name| self.may_set_parameter(name, txid))?;
         }
         result
+    }
+
+    /// Whether the current role may set the superuser-only parameter `name`.
+    fn may_set_parameter(&self, name: &str, txid: u32) -> bool {
+        self.storage
+            .current_role_has_parameter_privilege(name, ast::ParameterPrivileges::SET, txid)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -27053,7 +27078,7 @@ impl Engine {
         for &name in SETTING_NAMES {
             if let Some(value) = self
                 .fixed_setting_for(name, txn)
-                .or_else(|| guc.get_owned(name))
+                .or_else(|| (!guc.is_placeholder(name)).then(|| guc.get_owned(name))?)
             {
                 emit(name, value.as_str())?;
             }

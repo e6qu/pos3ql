@@ -545,6 +545,15 @@ pub(crate) fn with_hint(error: SqlError, hint: &'static str) -> SqlError {
     error
 }
 
+/// The one-based character position of `subject`, a slice of the client's
+/// statement, for a notice that points at it; `None` inside a routine's
+/// stored text.
+pub(crate) fn client_position(subject: &str) -> Option<usize> {
+    locate(subject)
+        .filter(|(_, source)| !source.internal)
+        .map(|(at, source)| character_position(source, at))
+}
+
 /// Positions `error` where the parser recorded `position`.
 pub(crate) fn at_source_position(
     error: SqlError,

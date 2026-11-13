@@ -426,7 +426,7 @@ fn explain_rewrites_each_rule_action_again() {
                 "  ->  Result"
             ]
         );
-        // An aggregated query is read as the `*SELECT*` subquery.
+        // The action reads the aggregated query as the `*SELECT*` subquery.
         assert_eq!(
             data_rows(&run_with(
                 engine,
@@ -435,14 +435,13 @@ fn explain_rewrites_each_rule_action_again() {
             )),
             [
                 "Insert on rr_t",
-                "  ->  Subquery Scan on \"*SELECT*\"",
-                "        ->  Aggregate",
-                "              ->  Seq Scan on rr_log",
+                "  ->  Aggregate",
+                "        ->  Seq Scan on rr_log",
                 "",
                 "Insert on rr_log",
                 "  ->  Subquery Scan on \"*SELECT*\"",
                 "        ->  Aggregate",
-                "              ->  Seq Scan on rr_log",
+                "              ->  Seq Scan on rr_log rr_log_1",
             ]
         );
         run_with(

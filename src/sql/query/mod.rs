@@ -8690,7 +8690,7 @@ pub(crate) fn analyse_rule_action<'a>(
         Stmt::Insert(insert)
             if insert
                 .select
-                .is_some_and(|select| select.set_body.is_none()) =>
+                .is_some_and(|select| select.set_body.is_none() && select.from.is_some()) =>
         {
             // The inserted query is analysed as a SELECT action is, with
             // OLD and NEW as its outer row.
@@ -8715,6 +8715,13 @@ pub(crate) fn analyse_rule_action<'a>(
             validate_dml_assignment_casts(statement, storage, txid, arena, Some(transition))
         }
         Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
+            if let Stmt::Insert(crate::sql::ast::Insert {
+                select: Some(select),
+                ..
+            }) = statement
+            {
+                check_rule_query_grouping(select)?;
+            }
             // Views the action reads are analysed through their queries.
             let expanded =
                 cte::expand_dml_ctes_schema(statement, &[], storage, txid, None, None, arena)?;

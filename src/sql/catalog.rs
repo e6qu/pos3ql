@@ -14683,12 +14683,22 @@ fn write_routine_type_name(
 
 /// Resolves the function catalog object types. `regproc` names a routine by
 /// unqualified name; `regprocedure` includes its complete argument signature.
+#[cfg(test)]
+thread_local! {
+    /// Name lookups `routine_oid_by_name` has made on this thread, which a
+    /// test reads to pin how often a statement repeats one.
+    pub(crate) static ROUTINE_NAME_LOOKUPS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+}
+
 pub(crate) fn routine_oid_by_name(
     storage: &Storage,
     txid: u32,
     written: &str,
     signature: bool,
 ) -> Result<Option<i32>, SqlError> {
+    #[cfg(test)]
+    ROUTINE_NAME_LOOKUPS.with(|lookups| lookups.set(lookups.get() + 1));
     let mut arguments = [crate::storage::RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
     let (name, argument_count) = if signature {
         let Some(parsed) = parse_routine_signature(written, storage, txid, &mut arguments) else {

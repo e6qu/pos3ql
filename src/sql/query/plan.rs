@@ -1253,3 +1253,105 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         RecursiveState { .. } => 0,
     }
 }
+
+/// PostgreSQL's parser converts a string literal cast to a catalog
+/// reference type (`'f()'::regprocedure`) once, with the type's input
+/// function, so a filter compares each row with the resulting constant.
+/// Converting it here keeps the catalog lookup from running per row.
+pub(super) fn fold_catalog_inputs<'a>(
+    expression: &'a Expr<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<&'a Expr<'a>, SqlError> {
+    let alloc = |expression: Expr<'a>| {
+        arena
+            .alloc(expression)
+            .map(|expression| &*expression)
+            .map_err(|_| arena_full())
+    };
+    match expression {
+        Expr::Cast {
+            operand: Expr::Str(_),
+            type_name,
+            ..
+        } if crate::sql::types::ColType::from_sql_name(type_name)
+            .is_some_and(crate::sql::types::ColType::is_reg_object) =>
+        {
+            let value = crate::sql::eval::eval_full(
+                expression,
+                arena,
+                params,
+                &crate::sql::eval::NoColumns,
+                hooks,
+            )?;
+            alloc(Expr::BoundLiteral {
+                value: crate::sql::ast::BoundLiteralValue::CachedDefault(
+                    crate::sql::exec::encode_projected_pub(&[value], arena)?,
+                ),
+                type_oid: value.type_oid(),
+                type_mod: -1,
+                collation: None,
+                source: expression,
+            })
+        }
+        Expr::Binary {
+            source_position,
+            operator,
+            left,
+            right,
+        } => {
+            let (folded_left, folded_right) = (
+                fold_catalog_inputs(left, arena, params, hooks)?,
+                fold_catalog_inputs(right, arena, params, hooks)?,
+            );
+            if core::ptr::eq(folded_left, *left) && core::ptr::eq(folded_right, *right) {
+                return Ok(expression);
+            }
+            alloc(Expr::Binary {
+                source_position: *source_position,
+                operator: *operator,
+                left: folded_left,
+                right: folded_right,
+            })
+        }
+        Expr::Unary {
+            source_position,
+            operator,
+            operand,
+        } => {
+            let folded = fold_catalog_inputs(operand, arena, params, hooks)?;
+            if core::ptr::eq(folded, *operand) {
+                return Ok(expression);
+            }
+            alloc(Expr::Unary {
+                source_position: *source_position,
+                operator: *operator,
+                operand: folded,
+            })
+        }
+        Expr::InList {
+            operand,
+            list,
+            negated,
+        } => {
+            let folded_operand = fold_catalog_inputs(operand, arena, params, hooks)?;
+            let mut changed = !core::ptr::eq(folded_operand, *operand);
+            let items = arena.alloc_slice_copy(list).map_err(|_| arena_full())?;
+            for item in items.iter_mut() {
+                let folded = fold_catalog_inputs(item, arena, params, hooks)?;
+                changed |= !core::ptr::eq(folded, *item);
+                *item = folded;
+            }
+            if !changed {
+                return Ok(expression);
+            }
+            alloc(Expr::InList {
+                operand: folded_operand,
+                list: items,
+                negated: *negated,
+            })
+        }
+        _ => Ok(expression),
+    }
+}

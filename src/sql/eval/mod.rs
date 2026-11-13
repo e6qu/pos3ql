@@ -706,6 +706,22 @@ fn same_resolved_column<'a>(row: &impl ColumnLookup<'a>, a: &Expr, b: &Expr) -> 
 pub(crate) struct EnclosingRow<'s, 'a>(pub(crate) &'s dyn ColumnLookup<'a>);
 
 impl<'b, 'a: 'b> ColumnLookup<'b> for EnclosingRow<'_, 'a> {
+    fn resolve_column_type_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.0.resolve_column_type_unsuggested(qualifier, name)
+    }
+
+    fn lookup_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Datum<'b>, SqlError> {
+        self.0.lookup_unsuggested(qualifier, name)
+    }
+
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'b>, SqlError> {
         self.0.lookup(qualifier, name)
     }
@@ -876,6 +892,27 @@ impl<'b, 'a: 'b> ColumnLookup<'b> for RoutineVariables<'_, 'a> {
 
 pub trait ColumnLookup<'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError>;
+
+    /// [`Self::lookup`] for a caller that may still find the column in an
+    /// enclosing scope: a missing column's spelling suggestion is left to the
+    /// caller that reports the error.
+    fn lookup_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Datum<'a>, SqlError> {
+        self.lookup(qualifier, name)
+    }
+
+    /// [`Self::resolve_column_type`] without the spelling suggestion, as
+    /// [`Self::lookup_unsuggested`].
+    fn resolve_column_type_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.resolve_column_type(qualifier, name)
+    }
 
     /// Offers this scope's FROM items, then the enclosing queries' ones, to
     /// a missing column's spelling suggestion.
@@ -1804,6 +1841,22 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
         name: &str,
     ) -> Result<ColType, SqlError> {
         (**self).resolve_column_type(qualifier, name)
+    }
+
+    fn resolve_column_type_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        (**self).resolve_column_type_unsuggested(qualifier, name)
+    }
+
+    fn lookup_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Datum<'a>, SqlError> {
+        (**self).lookup_unsuggested(qualifier, name)
     }
 
     fn is_empty_scope(&self) -> bool {
@@ -3659,6 +3712,22 @@ impl<'a> StatementSubqueryScope<'_, 'a> {
 }
 
 impl<'a> ColumnLookup<'a> for StatementSubqueryScope<'_, 'a> {
+    fn resolve_column_type_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ColType, SqlError> {
+        self.row.resolve_column_type_unsuggested(qualifier, name)
+    }
+
+    fn lookup_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Datum<'a>, SqlError> {
+        self.row.lookup_unsuggested(qualifier, name)
+    }
+
     fn statement_subqueries(&self) -> &'a [DeferredSubquery<'a>] {
         self.slots
     }

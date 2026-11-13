@@ -3615,6 +3615,29 @@ impl<'d> QueryScope<'d> {
         self.find_column_among(self.n, qualifier, name)
     }
 
+    /// [`Self::find_column`] for a caller that may still find the column
+    /// elsewhere or discards the error: a missing column's spelling
+    /// suggestion, which compares every visible column name, is built only
+    /// where the error is reported.
+    pub(crate) fn find_column_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ResolvedColumn, SqlError> {
+        self.find_column_among_unsuggested(self.n, qualifier, name)
+    }
+
+    /// [`Self::find_column_among`] without the spelling suggestion.
+    pub(crate) fn find_column_among_unsuggested(
+        &self,
+        visible: usize,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<ResolvedColumn, SqlError> {
+        self.find_column_prefix(visible, qualifier, name)
+            .map_err(|error| crate::sql::error_position::column_reference(error, qualifier, name))
+    }
+
     /// [`Self::find_column`] over the first `visible` FROM items only: a
     /// `LATERAL` body reads just the items to its left, never its own or a
     /// later item's columns.
@@ -3624,16 +3647,24 @@ impl<'d> QueryScope<'d> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ResolvedColumn, SqlError> {
-        self.find_column_prefix(visible, qualifier, name)
-            .map_err(|error| {
-                let mut suggestion =
-                    crate::sql::column_suggestion::ColumnSuggestion::new(qualifier, name);
-                self.suggest_columns(&mut suggestion);
-                crate::sql::error_position::with_column_suggestion(
-                    crate::sql::error_position::column_reference(error, qualifier, name),
-                    &suggestion,
-                )
-            })
+        self.find_column_among_unsuggested(visible, qualifier, name)
+            .map_err(|error| self.suggested(error, qualifier, name))
+    }
+
+    /// A missing column's error with the spelling suggestion this scope's
+    /// FROM items offer, as it is reported.
+    pub(crate) fn suggested(
+        &self,
+        error: SqlError,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> SqlError {
+        if error.sqlstate.as_str() != crate::sql::eval::sqlstate::UNDEFINED_COLUMN {
+            return error;
+        }
+        let mut suggestion = crate::sql::column_suggestion::ColumnSuggestion::new(qualifier, name);
+        self.suggest_columns(&mut suggestion);
+        crate::sql::error_position::with_column_suggestion(error, &suggestion)
     }
 
     /// Offers every FROM item, a parenthesized join through its members, to

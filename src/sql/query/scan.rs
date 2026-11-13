@@ -4203,7 +4203,8 @@ impl<'s, 'v> JoinRow<'s, 'v, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<ResolvedColumn, SqlError> {
-        self.scope.find_column_among(self.visible, qualifier, name)
+        self.scope
+            .find_column_among_unsuggested(self.visible, qualifier, name)
     }
 
     /// None means the source has not joined yet. A present zero-column row
@@ -4311,12 +4312,32 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<crate::sql::types::ColType, SqlError> {
+        self.resolve_column_type_unsuggested(qualifier, name)
+            .map_err(|error| self.scope.suggested(error, qualifier, name))
+    }
+
+    fn resolve_column_type_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<crate::sql::types::ColType, SqlError> {
         if self.visible < self.scope.n {
             return self
                 .visible_column(qualifier, name)
                 .map(|entry| self.scope.output_type(entry));
         }
-        super::ScopeSchema(self.scope).resolve_column_type(qualifier, name)
+        ColumnLookup::<'v>::resolve_column_type_unsuggested(
+            &super::ScopeSchema(self.scope),
+            qualifier,
+            name,
+        )
+    }
+
+    fn suggest_columns(
+        &self,
+        suggestion: &mut crate::sql::column_suggestion::ColumnSuggestion<'_>,
+    ) {
+        self.scope.suggest_columns(suggestion);
     }
 
     fn is_empty_scope(&self) -> bool {
@@ -4324,6 +4345,15 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     }
 
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
+        self.lookup_unsuggested(qualifier, name)
+            .map_err(|error| self.scope.suggested(error, qualifier, name))
+    }
+
+    fn lookup_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<Datum<'v>, SqlError> {
         let one = |t: usize, c: usize| match self.table_values(t) {
             // Empty slice = LEFT-join null row.
             Some([]) => Ok(Datum::Null),
@@ -4635,7 +4665,16 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<crate::sql::types::ColType, SqlError> {
-        match self.inner.resolve_column_type(qualifier, name) {
+        self.resolve_column_type_unsuggested(qualifier, name)
+            .map_err(|error| self.suggested(qualifier, name, error))
+    }
+
+    fn resolve_column_type_unsuggested(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<crate::sql::types::ColType, SqlError> {
+        match self.inner.resolve_column_type_unsuggested(qualifier, name) {
             Err(error)
                 if matches!(
                     error.sqlstate.as_str(),
@@ -4644,9 +4683,9 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
                     .is_some_and(|qualifier| self.inner.whole_row_type(qualifier).is_some()) =>
             {
                 match self.outer {
-                    Some(outer) if !outer.is_empty_scope() => outer
-                        .resolve_column_type(qualifier, name)
-                        .map_err(|error| self.suggested(qualifier, name, error)),
+                    Some(outer) if !outer.is_empty_scope() => {
+                        outer.resolve_column_type_unsuggested(qualifier, name)
+                    }
                     _ => Err(error),
                 }
             }
@@ -4656,7 +4695,7 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
                 } else {
                     self.outer
                         .expect("a variable answers only through an enclosing scope")
-                        .resolve_column_type(qualifier, name)
+                        .resolve_column_type_unsuggested(qualifier, name)
                 }
             }
             result => result,
@@ -4716,14 +4755,19 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
     }
 
     fn lookup(&self, q: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
-        match self.inner.lookup(q, name) {
+        self.lookup_unsuggested(q, name)
+            .map_err(|error| self.suggested(q, name, error))
+    }
+
+    fn lookup_unsuggested(&self, q: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
+        match self.inner.lookup_unsuggested(q, name) {
             Ok(v) => {
                 if crate::sql::eval::column_precedes_variable(self.outer, q, name)? {
                     Ok(v)
                 } else {
                     self.outer
                         .expect("a variable answers only through an enclosing scope")
-                        .lookup(q, name)
+                        .lookup_unsuggested(q, name)
                 }
             }
             Err(e)
@@ -4738,22 +4782,20 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
                 Err(e)
             }
             Err(e) => match self.outer {
-                Some(o) => o
-                    .lookup(q, name)
-                    .map_err(|error| self.suggested(q, name, error)),
+                Some(o) => o.lookup_unsuggested(q, name),
                 None => Err(e),
             },
         }
     }
     fn col_type(&self, q: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
-        self.resolve_column_type(q, name).ok()
+        self.resolve_column_type_unsuggested(q, name).ok()
     }
     fn column_user_type(
         &self,
         q: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        match self.inner.resolve_column_type(q, name) {
+        match self.inner.resolve_column_type_unsuggested(q, name) {
             Ok(_) if self.inner_column_wins(q, name) => self.inner.column_user_type(q, name),
             Ok(_) => self.outer.and_then(|outer| outer.column_user_type(q, name)),
             Err(error)
@@ -4780,7 +4822,7 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
     }
 
     fn column_type_oid(&self, q: Option<&str>, name: &str) -> Option<i32> {
-        match self.inner.resolve_column_type(q, name) {
+        match self.inner.resolve_column_type_unsuggested(q, name) {
             Ok(_) if self.inner_column_wins(q, name) => self.inner.column_type_oid(q, name),
             Ok(_) => self.outer.and_then(|outer| outer.column_type_oid(q, name)),
             Err(error)
@@ -4797,7 +4839,7 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
     }
 
     fn collation(&self, q: Option<&str>, name: &str) -> crate::sql::ast::Collation {
-        match self.inner.resolve_column_type(q, name) {
+        match self.inner.resolve_column_type_unsuggested(q, name) {
             Ok(_) if self.inner_column_wins(q, name) => self.inner.collation(q, name),
             Ok(_) => self
                 .outer
@@ -6552,6 +6594,7 @@ fn scan_source_mode<'a>(
     let where_clause = match where_clause {
         Some(w) => {
             let simplified = simplify_qual(w, arena)?;
+            let simplified = super::plan::fold_catalog_inputs(simplified, arena, params, hooks)?;
             Some(reorder_qual(
                 fold_null(simplified, scope, arena)?,
                 scope,

@@ -1645,6 +1645,22 @@ fi
 if [[ "$AUXILIARY_PHASE" == all || "$AUXILIARY_PHASE" == exact ]]; then
 restart_p3_fresh || exit 1
 echo "=== exact-error corpora (message wording must match) ==="
+# initdb draws the OIDs of what it creates after importing the platform's
+# collations from one counter, so those objects' absolute OIDs depend on the
+# reference's locale and ICU set, and the fixtures compare offsets only.
+# pos3ql numbers them as the pinned CI image does, whose last imported
+# collation is OID 13231; rebasing the reference's numbers onto that
+# collation makes this check exact on the CI image and portable elsewhere.
+initdb_objects="'dsnowball_init'::regproc::oid::int8, 'information_schema'::regnamespace::oid::int8, (SELECT oid::int8 FROM pg_extension WHERE extname = 'plpgsql'), (SELECT oid::int8 FROM pg_language WHERE lanname = 'plpgsql')"
+reference_numbering=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -A -t -c \
+  "SELECT d - c + 13231, n - c + 13231, e - c + 13231, l - c + 13231 FROM (SELECT $initdb_objects, (SELECT max(oid)::int8 FROM pg_collation)) AS reference(d, n, e, l, c)" 2>&1)
+p3_numbering=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -A -t \
+  -c "SELECT $initdb_objects" 2>&1)
+if [[ "$reference_numbering" == "$p3_numbering" ]]; then ok "initdb numbering of the pinned reference image"
+else
+  bad "initdb numbering of the pinned reference image"
+  printf 'PostgreSQL (rebased): %s\npos3ql:               %s\n' "$reference_numbering" "$p3_numbering"
+fi
 for f in "$EXT"/differential_exact/*.sql; do
   n=$(basename "$f" .sql)
   # Each fixture starts from an empty catalog on both servers, so objects a

@@ -774,3 +774,84 @@ fn nested_rule_step_after_work_waits_and_later_steps_call_once() {
     drop((holder, writer, engine));
     std::fs::remove_dir_all(config.data_dir).unwrap();
 }
+
+/// A user routine in a driven source (a write reading a data-modifying
+/// `WITH` query, or a plain `INSERT ... SELECT` whose output calls one) that
+/// waits for a lock inside its body after an effect resumes there: every
+/// call and row happens once, in PostgreSQL's order.
+#[test]
+fn driven_source_calls_that_wait_resume_inside_their_body() {
+    let setup = "CREATE TABLE src(x int); CREATE TABLE dst(x int, y bigint); \
+        CREATE TABLE log(n serial, msg text); \
+        CREATE FUNCTION note() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+        INSERT INTO log(msg) VALUES (TG_TABLE_NAME || ' ' || NEW.x); RETURN NEW; END $$; \
+        CREATE TRIGGER src_before BEFORE INSERT ON src FOR EACH ROW EXECUTE FUNCTION note(); \
+        CREATE TRIGGER dst_before BEFORE INSERT ON dst FOR EACH ROW EXECUTE FUNCTION note(); \
+        CREATE SEQUENCE numbers; \
+        CREATE FUNCTION f(v int) RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN \
+        INSERT INTO log(msg) VALUES ('f ' || v); \
+        IF v = 2 THEN PERFORM pg_advisory_xact_lock(7); END IF; \
+        INSERT INTO log(msg) VALUES ('f done ' || v); \
+        RETURN v * 10 + nextval('numbers'); END $$";
+    let cases = [
+        (
+            "WITH w AS (INSERT INTO src SELECT g FROM generate_series(1, 3) g RETURNING x) \
+             INSERT INTO dst SELECT x, f(x) FROM w",
+            "src 1,f 1,f done 1,dst 1,src 2,f 2,f done 2,dst 2,src 3,f 3,f done 3,dst 3",
+        ),
+        (
+            "INSERT INTO dst SELECT g, f(g) FROM generate_series(1, 3) g",
+            "f 1,f done 1,dst 1,f 2,f done 2,dst 2,f 3,f done 3,dst 3",
+        ),
+        (
+            "WITH w1 AS (INSERT INTO src SELECT g FROM generate_series(1, 3) g RETURNING x), \
+             w2 AS (INSERT INTO dst SELECT x, f(x) FROM w1 RETURNING x) \
+             INSERT INTO src SELECT x + 10 FROM w2",
+            "src 1,f 1,f done 1,dst 1,src 11,src 2,f 2,f done 2,dst 2,src 12,\
+             src 3,f 3,f done 3,dst 3,src 13",
+        ),
+    ];
+    for (sql, expected) in cases {
+        for mode in [
+            crate::config::TransactionMode::Mvcc,
+            crate::config::TransactionMode::Locking,
+        ] {
+            let mut config = test_config(&format!("driven-call-wait-{mode:?}"));
+            config.transaction_mode = mode;
+            let mut budget = test_engine_budget(&config, 1 << 29);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+            let mut holder =
+                ConfiguredTransactionSession::new(&config, &mut budget).with_connection_id(2);
+            writer.success(&mut engine, setup, true);
+            holder.success(&mut engine, "SELECT pg_advisory_lock(7)", true);
+            let status = writer.execute_status(&mut engine, sql, true);
+            let completed = blocked_on_lock(status, &mut writer);
+            holder.success(&mut engine, "SELECT pg_advisory_unlock(7)", true);
+            assert_eq!(
+                resume(&mut engine, &mut writer, sql, completed),
+                ExecutionStatus::Complete,
+                "{mode:?}: {sql}"
+            );
+            let output = writer.send.readable().to_vec();
+            assert!(
+                error_sqlstates(&output).is_empty(),
+                "{mode:?}: {sql}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            assert!(String::from_utf8_lossy(&output).contains("INSERT 0 3"));
+            assert_eq!(
+                data_rows(&writer.success(
+                    &mut engine,
+                    "SELECT string_agg(msg, ',' ORDER BY n) FROM log; \
+                     SELECT x, y FROM dst ORDER BY x",
+                    true
+                )),
+                [expected, "1|11", "2|22", "3|33"],
+                "{mode:?}: {sql}"
+            );
+            drop((holder, writer, engine));
+            std::fs::remove_dir_all(config.data_dir).unwrap();
+        }
+    }
+}

@@ -268,6 +268,11 @@ pub(crate) struct RowProgress {
     /// The source row given to the unfinished row, kept when its attempt
     /// stops, so the row runs again with the same values.
     source_row: Option<(usize, transition_rows::SavedTransitionRows)>,
+    /// The invocation log of the next source row's routine calls when one
+    /// waited inside its body: reading that row again continues the call
+    /// where it waited instead of running it a second time.
+    /// Leased only while a call waits, from the step records' pool.
+    source_calls: Option<crate::mem::lease_pool::MutableSlice<query::RoutineInvocationState>>,
     /// The level of the step that finished with its `AFTER` work handed to
     /// the statement's attempt loop, until that work ends.
     handoff_level: Option<usize>,
@@ -300,6 +305,7 @@ impl RowProgress {
             produce_until: None,
             produced: false,
             source_row: None,
+            source_calls: None,
             handoff_level: None,
         })
     }
@@ -340,6 +346,49 @@ impl RowProgress {
         unsafe { arena.rewind_to(mark) };
         self.source_row = Some((index, saved?));
         Ok(())
+    }
+
+    /// The log of the next source row's routine calls that an earlier read
+    /// kept because one waited inside its body.
+    pub(crate) fn take_source_calls(&mut self) -> Option<query::RoutineInvocationState> {
+        self.source_calls.take().and_then(|mut calls| calls.pop())
+    }
+
+    /// Keeps the log of the next source row's routine calls, one of which
+    /// waited inside its body, until the row is read again.
+    pub(crate) fn keep_source_calls(
+        &mut self,
+        calls: query::RoutineInvocationState,
+    ) -> Result<(), SqlError> {
+        let mut kept = self
+            .step_pool
+            .lease::<query::RoutineInvocationState>(1)
+            .map_err(|error| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "waiting source row call log: {}",
+                    error
+                )
+            })?;
+        kept.push(calls).map_err(|error| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "waiting source row call log: {}",
+                error
+            )
+        })?;
+        self.source_calls = Some(kept);
+        Ok(())
+    }
+
+    /// Whether a source row's routine call waited inside its body, which
+    /// continues there with every effect before the wait kept.
+    pub(crate) fn source_call_suspended(&self) -> bool {
+        self.source_calls.as_ref().is_some_and(|calls| {
+            calls
+                .first()
+                .is_some_and(|calls| calls.suspended.borrow().is_some())
+        })
     }
 
     /// Whether the source values of row `index` are kept.

@@ -174,19 +174,16 @@ is owned.
   statements nested deeper than `write_step_levels` fail the same way with
   `54000` naming that setting. `INSERT ... SELECT`
   streams a source that calls no volatile built-in and no user routine; one
-  whose output list calls volatile built-ins only (`nextval`, `random()`)
-  is read by the engine row by row, its output evaluated as each row is
-  written; any other source materializes before writing. Volatile user
-  routine calls in its output list (also a rule action's `VALUES` over
-  several rows) run as each row is inserted, as in PostgreSQL; calls in its
+  whose output list alone calls volatile built-ins or user routines is read
+  by the engine row by row, its output evaluated as each row is read and
+  written, a call that waits inside its body keeping its log with the
+  write and continuing there; any other source materializes before
+  writing. Volatile user routine calls in a materialized source's output
+  list (also a rule action's `VALUES` over several rows) run as each row is
+  inserted, as in PostgreSQL; calls in its
   `WHERE`, join conditions, subqueries, aggregate arguments or a
   `UNION`/`INTERSECT`/`EXCEPT` branch still run before the first row, so
-  they do not see rows the statement inserts. Reading a user routine's
-  source row by row needs a call handed off on its row to keep its body
-  across a wait (the call's own invocation log retained with the write),
-  which only a data-modifying `WITH` query's reader accepts today: there a
-  wait inside such a call fails with `0A000`
-  (`expression wait requires an owned invocation log`). A `WITH` `INSERT`
+  they do not see rows the statement inserts. A `WITH` `INSERT`
   read row by row re-reads nothing between steps: its reader and analysed
   statement stay in a 512 KiB block of the statement arena's persistent
   tail. A PL/pgSQL `WITH ... INSERT/UPDATE/DELETE` statement fails with

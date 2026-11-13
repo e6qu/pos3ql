@@ -247,8 +247,9 @@ impl Engine {
             } else {
                 match progress.kept_source_row(index, arena) {
                     Ok(Some(values)) => Some(values),
-                    Ok(None) => match self.read_driven_row(
-                        driven, writes, arena, params, txn, sqlprep, cursors, guc, responder,
+                    Ok(None) => match self.read_driven_row_keeping_calls(
+                        driven, progress, writes, arena, params, txn, sqlprep, cursors, guc,
+                        responder,
                     )? {
                         Ok(Some(values)) => Some(values),
                         Ok(None) => {
@@ -256,7 +257,7 @@ impl Engine {
                             None
                         }
                         Err(error) => {
-                            if exec::is_wait(&error) {
+                            if exec::is_wait(&error) && !progress.source_call_suspended() {
                                 // A step of a `WITH` query the source reads
                                 // waited inside its own rows.
                                 progress.abandon_rows();
@@ -315,6 +316,34 @@ impl Engine {
         }
     }
 
+    /// [`Self::read_driven_row`] with the row's call log kept in `progress`
+    /// while one of its calls waits inside its body.
+    #[allow(clippy::too_many_arguments)]
+    fn read_driven_row_keeping_calls<'a>(
+        &mut self,
+        driven: &mut DrivenInsert<'a>,
+        progress: &mut exec::RowProgress,
+        writes: &query::RoutineInvocationState,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<Option<&'a [Datum<'a>]>, SqlError>, WireFull> {
+        let mut calls = progress.take_source_calls();
+        let read = self.read_driven_row(
+            driven, writes, &mut calls, arena, params, txn, sqlprep, cursors, guc, responder,
+        );
+        if let Some(calls) = calls
+            && let Err(error) = progress.keep_source_calls(calls)
+        {
+            return Ok(Err(error));
+        }
+        read
+    }
+
     /// Reads the driven source's next row: its output values, detached into
     /// `arena`, or `None` at its end. A call hands off on its row, and a
     /// data-modifying `WITH` query the source reads runs its next step.
@@ -323,6 +352,7 @@ impl Engine {
         &mut self,
         driven: &mut DrivenInsert<'a>,
         writes: &query::RoutineInvocationState,
+        calls: &mut Option<query::RoutineInvocationState>,
         arena: &'a Arena,
         params: &[Datum<'a>],
         txn: &mut TxnState,
@@ -333,7 +363,7 @@ impl Engine {
     ) -> Result<Result<Option<&'a [Datum<'a>]>, SqlError>, WireFull> {
         let prior = self.storage.read_snapshot();
         let read = self.read_driven_row_at(
-            driven, writes, arena, params, txn, sqlprep, cursors, guc, responder,
+            driven, writes, calls, arena, params, txn, sqlprep, cursors, guc, responder,
         );
         self.storage.set_read_snapshot(prior);
         read
@@ -344,6 +374,7 @@ impl Engine {
         &mut self,
         driven: &mut DrivenInsert<'a>,
         writes: &query::RoutineInvocationState,
+        calls: &mut Option<query::RoutineInvocationState>,
         arena: &'a Arena,
         params: &[Datum<'a>],
         txn: &mut TxnState,
@@ -394,10 +425,13 @@ impl Engine {
                 }
                 Err(error) => return Ok(Err(error)),
             }
+            // The row's predicate and output share one log, which a call
+            // that waits inside its body keeps with the write: reading the
+            // row again replays the calls before it and continues that one.
             let reader = &driven.reader;
-            let passes = self.execute_retained_expression(
+            let row = self.execute_retained_expression(
                 arena,
-                None,
+                Some(&mut *calls),
                 snapshot,
                 query::CatalogReads::Statement,
                 txn,
@@ -406,7 +440,7 @@ impl Engine {
                 guc,
                 responder,
                 |storage, work, sequences, invocations, _cursors| {
-                    reader.evaluate_statement_predicate(
+                    if !reader.evaluate_statement_predicate(
                         storage,
                         txid,
                         work,
@@ -414,33 +448,12 @@ impl Engine {
                         Some(sequences),
                         Some(invocations),
                         arena,
-                    )
-                },
-            )?;
-            let passes = match passes {
-                Ok(passes) => passes,
-                Err(error) => return Ok(Err(error)),
-            };
-            if !passes {
-                driven.reader.finish_statement_row(driven.block, false);
-                continue;
-            }
-            let skipped = driven.reader.skip_statement_row();
-            let reader = &driven.reader;
-            let mut values = ArenaList::new(arena);
-            for index in 0..reader.statement_items_len() {
-                let item = self.execute_retained_expression(
-                    arena,
-                    None,
-                    snapshot,
-                    query::CatalogReads::Statement,
-                    txn,
-                    sqlprep,
-                    cursors,
-                    guc,
-                    responder,
-                    |storage, work, sequences, invocations, _cursors| {
-                        reader.evaluate_statement_item(
+                    )? {
+                        return Ok(None);
+                    }
+                    let mut values = ArenaList::new(arena);
+                    for index in 0..reader.statement_items_len() {
+                        let item = reader.evaluate_statement_item(
                             index,
                             storage,
                             txid,
@@ -449,24 +462,28 @@ impl Engine {
                             Some(sequences),
                             Some(invocations),
                             arena,
-                        )
-                    },
-                )?;
-                let item = match item {
-                    Ok(item) => item,
-                    Err(error) => return Ok(Err(error)),
-                };
-                for value in item {
-                    if values.push(*value).is_err() {
-                        return Ok(Err(query::arena_full_pub()));
+                        )?;
+                        for value in item {
+                            values.push(*value).map_err(|_| query::arena_full_pub())?;
+                        }
                     }
+                    Ok(Some(values.as_slice()))
+                },
+            )?;
+            let values = match row {
+                Ok(Some(values)) => values,
+                Ok(None) => {
+                    driven.reader.finish_statement_row(driven.block, false);
+                    continue;
                 }
-            }
+                Err(error) => return Ok(Err(error)),
+            };
+            let skipped = driven.reader.skip_statement_row();
             driven.reader.finish_statement_row(driven.block, !skipped);
             if skipped {
                 continue;
             }
-            return Ok(Ok(Some(values.as_slice())));
+            return Ok(Ok(Some(values)));
         }
     }
 

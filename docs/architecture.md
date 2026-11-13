@@ -235,11 +235,21 @@ source reading its own target sees none of the new rows, as in PostgreSQL.
 Its reads keep no invocation-log receipts. A restarted attempt reads the
 source again and skips, by count, the rows earlier attempts wrote; the
 source reads the same rows each time, so the count finds the unfinished
-row. Any other source materializes first, in the work arena, where a
-source larger than the arena fails with `54000`; an output item there that
-calls a volatile user routine is split so that the source reads only its
-other parts, and the row phase runs the calls as each row is inserted, as
-PostgreSQL computes its output list.
+row. A source whose volatile built-in and user routine calls are all in its
+output list, without ordering, grouping, `DISTINCT`, windows, set
+operations or row locking, is read by the engine one row at a time
+(`src/sql/driven_insert.rs`): each row's output is evaluated as the row is
+read, then the row is written, as PostgreSQL's ModifyTable pulls it. The
+row's predicate and output share one invocation log; when a call waits
+inside its body (a lock or a cold read), the write keeps that log in its
+progress (leased from `execution_control_bytes` only while the call waits)
+together with every effect before the wait, and reading the row again
+replays the calls before it and continues that call where it waited, so
+each call runs once. Any other source materializes first, in the work
+arena, where a source larger than the arena fails with `54000`; an output
+item there that calls a volatile user routine is split so that the source
+reads only its other parts, and the row phase runs the calls as each row is
+inserted, as PostgreSQL computes its output list.
 
 **Example:** `UPDATE items SET total = running_total()`, where
 `running_total()` sums `items`, gives each row the sum including the rows

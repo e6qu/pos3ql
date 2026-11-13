@@ -18947,7 +18947,8 @@ impl Engine {
         wait: SqlError,
         mut write: exec::RetainedWrite,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        if write.invocations.suspended.borrow().is_some() {
+        if write.invocations.suspended.borrow().is_some() || write.progress.source_call_suspended()
+        {
             txn.retain_write(write);
             return Ok(Err(wait));
         }
@@ -21114,8 +21115,8 @@ impl Engine {
     /// reader of its source, as PostgreSQL's ModifyTable pulls it: a source
     /// that reads a data-modifying `WITH` query of the statement (`with`),
     /// whose steps then interleave with the insert's rows, or a source whose
-    /// output list calls volatile built-in functions, which then stream
-    /// instead of materializing. `None` when the statement is not such an insert or
+    /// output list calls volatile built-in functions or user routines,
+    /// which then stream instead of materializing. `None` when the statement is not such an insert or
     /// its source is not driven.
     #[allow(clippy::too_many_arguments)]
     fn drive_main_insert<'a>(
@@ -21146,13 +21147,12 @@ impl Engine {
                         cte.dml.is_some() && cte.name.eq_ignore_ascii_case(from.base.table)
                     })
             }),
-            // A user routine's body may wait, which a call handed off on its
-            // row cannot keep; such a source materializes, its output calls
-            // still running as each row is written.
+            // A call that waits inside its body keeps its log with the
+            // write's progress and continues there when the row is read
+            // again.
             None => {
                 !query::select_reads_repeatably(select, &self.storage, txn.txid)
                     && query::select_streams_with_calls(select, &self.storage, txn.txid)
-                    && !query::select_calls_user_routines(select, &self.storage, txn.txid)
             }
         };
         if !driven {

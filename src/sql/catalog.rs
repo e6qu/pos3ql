@@ -12260,6 +12260,7 @@ fn write_statistics_keys<const N: usize>(
                 joined: &[],
                 pretty: true,
                 qualify: false,
+                bare: None,
             },
             source.as_str(),
             deparse::Destination::Value,
@@ -12384,6 +12385,7 @@ pub(crate) fn extended_statistics_expressions_by_oid<'a>(
                     joined: &[],
                     pretty: false,
                     qualify: false,
+                    bare: None,
                 },
                 expression.as_str(),
                 deparse::Destination::Value,
@@ -15384,6 +15386,7 @@ fn write_sql_body(
         joined: &[],
         pretty: false,
         qualify: false,
+        bare: None,
     };
     let dependencies = storage.snapshot_routine_dependencies_for(slot, txid, arena)?;
     let _formal = super::exec::enter_routine_parameter_types(
@@ -15962,6 +15965,7 @@ pub fn trigger_def_text<'a>(
                         joined: &joined,
                         pretty,
                         qualify: false,
+                        bare: None,
                     },
                     when.as_str(),
                     deparse::Destination::Condition,
@@ -16081,6 +16085,7 @@ fn write_routine_arguments(
                 joined: &[],
                 pretty: false,
                 qualify: false,
+                bare: None,
             };
             let deparsed = match storage
                 .routine_type_oid(parameter.ctype, parameter.user_type, txid)
@@ -18248,6 +18253,7 @@ pub fn constraint_def_text<'a>(
                 joined: &[],
                 pretty,
                 qualify: false,
+                bare: None,
             };
             match deparse::deparse(
                 &context,
@@ -19093,6 +19099,7 @@ pub fn index_def_text<'a>(
                     joined: &[],
                     pretty,
                     qualify: false,
+                    bare: None,
                 },
                 predicate.as_str(),
                 deparse::Destination::Condition,
@@ -19165,6 +19172,7 @@ fn index_expression_display<'a>(
             joined: &[],
             pretty,
             qualify: false,
+            bare: None,
         },
         source,
         deparse::Destination::Value,

@@ -1178,6 +1178,10 @@ fn pax_column_demand_bounded(
 struct IndexConstraint<'a> {
     operand: &'a Expr<'a>,
     operator: BinaryOp,
+    /// The indexed side of the conjunct, and the conjunct the constraint was
+    /// taken from, for EXPLAIN's index condition.
+    key: &'a Expr<'a>,
+    source: &'a Expr<'a>,
 }
 
 #[derive(Clone, Copy)]
@@ -1264,7 +1268,31 @@ impl<'a> OrderedIndexAccessPlan<'a> {
     }
 }
 
-impl IndexAccessPlan<'_> {
+impl<'a> IndexAccessPlan<'a> {
+    /// The conjuncts the index consumes in index column order, each as
+    /// `(source conjunct, indexed side, operator, other side)` with the
+    /// operator commuted so the indexed side is its left operand.
+    pub(crate) fn index_conditions(
+        &self,
+    ) -> impl Iterator<Item = (&'a Expr<'a>, &'a Expr<'a>, BinaryOp, &'a Expr<'a>)> + '_ {
+        (0..self.n_columns)
+            .flat_map(|position| {
+                [
+                    self.constraints[position],
+                    self.additional_constraints[position],
+                ]
+            })
+            .flatten()
+            .map(|constraint| {
+                (
+                    constraint.source,
+                    constraint.key,
+                    constraint.operator,
+                    constraint.operand,
+                )
+            })
+    }
+
     pub(crate) const fn method(&self) -> crate::sql::ast::IndexAccessMethod {
         self.method
     }
@@ -1687,7 +1715,12 @@ fn collect_index_constraints<'a, Resolve, Invariant>(
         let Some(index) = resolve_column(column) else {
             return false;
         };
-        let replacement = IndexConstraint { operand, operator };
+        let replacement = IndexConstraint {
+            operand,
+            operator,
+            key: column,
+            source: expression,
+        };
         let set = &mut constraints[index];
         match operator {
             BinaryOp::Eq => {

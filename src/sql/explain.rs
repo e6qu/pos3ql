@@ -72,14 +72,17 @@ enum QualLabel {
     None,
     Filter,
     HashCond,
+    IndexCond,
+    RecheckCond,
     JoinFilter,
 }
 
 impl QualLabel {
-    /// PostgreSQL's EXPLAIN shows a join's conditions before its filter.
+    /// PostgreSQL's EXPLAIN shows a join's or an index's conditions before
+    /// its filter.
     const fn rank(self) -> u8 {
         match self {
-            Self::HashCond => 0,
+            Self::HashCond | Self::IndexCond | Self::RecheckCond => 0,
             Self::JoinFilter => 1,
             Self::Filter => 2,
             Self::None => 3,
@@ -91,6 +94,8 @@ impl QualLabel {
             Self::None => "",
             Self::Filter => "Filter",
             Self::HashCond => "Hash Cond",
+            Self::IndexCond => "Index Cond",
+            Self::RecheckCond => "Recheck Cond",
             Self::JoinFilter => "Join Filter",
         }
     }
@@ -377,6 +382,7 @@ struct JoinQuals<'a> {
 
 /// `relations` are named as the query exposes them; `order` lists them in
 /// the order the joins add them.
+#[allow(clippy::too_many_arguments)]
 fn join_quals<'a>(
     storage: &Storage,
     txid: u32,
@@ -384,6 +390,8 @@ fn join_quals<'a>(
     order: &[usize],
     condition: Option<&'a Expr<'a>>,
     hash: bool,
+    indexes: &[Option<query::IndexAccessPlan<'a>>],
+    parameterized: &[bool],
     arena: &'a Arena,
 ) -> Result<Option<JoinQuals<'a>>, SqlError> {
     let count_relations = relations.len();
@@ -403,30 +411,8 @@ fn join_quals<'a>(
         return Ok(Some(quals));
     };
     let mut quals = quals;
-    let resolve = |qualifier: Option<&str>, name: &str| -> Option<usize> {
-        let has = |table: &crate::storage::TableDef| {
-            table
-                .columns()
-                .iter()
-                .any(|column| column.name.as_str() == name)
-        };
-        match qualifier {
-            Some(qualifier) => relations
-                .iter()
-                .position(|(exposed, table)| *exposed == qualifier && has(table)),
-            None => {
-                let mut found = relations
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (_, table))| has(table))
-                    .map(|(index, _)| index);
-                match (found.next(), found.next()) {
-                    (Some(index), None) => Some(index),
-                    _ => None,
-                }
-            }
-        }
-    };
+    let resolve =
+        |qualifier: Option<&str>, name: &str| resolve_relation(relations, qualifier, name);
     let mut position = [0usize; 64];
     for (depth, &relation) in order.iter().enumerate() {
         position[relation] = depth;
@@ -441,6 +427,13 @@ fn join_quals<'a>(
         .alloc_slice_with(count_relations * MAX_CONJUNCTS, |_| &Expr::Null)
         .map_err(|_| arena_full())?;
     let own_count = arena
+        .alloc_slice_with(count_relations, |_| 0usize)
+        .map_err(|_| arena_full())?;
+    // Join conjuncts a parameterized index scan evaluates, per relation.
+    let moved = arena
+        .alloc_slice_with(count_relations * MAX_CONJUNCTS, |_| &Expr::Null)
+        .map_err(|_| arena_full())?;
+    let moved_count = arena
         .alloc_slice_with(count_relations, |_| 0usize)
         .map_err(|_| arena_full())?;
     let joins = arena
@@ -553,6 +546,13 @@ fn join_quals<'a>(
         true
     };
     for &conjunct in &conjuncts[..count] {
+        // A scan's index condition, printed with the scan.
+        if indexes
+            .iter()
+            .any(|index| consumed_by(index.as_ref(), conjunct))
+        {
+            continue;
+        }
         let Some(mask) = relation_mask(conjunct, &resolve) else {
             return Ok(None);
         };
@@ -609,27 +609,28 @@ fn join_quals<'a>(
             hash_count += 1;
             continue;
         }
-        if !push(joins, join_count, depth, conjunct) {
+        let relation = order[depth];
+        let placed = if parameterized[relation] {
+            push(moved, moved_count, relation, conjunct)
+        } else {
+            push(joins, join_count, depth, conjunct)
+        };
+        if !placed {
             return Ok(None);
         }
     }
-    for (index, (exposed, table)) in relations.iter().enumerate() {
-        let own = &mut own[index * MAX_CONJUNCTS..index * MAX_CONJUNCTS + own_count[index]];
-        order_restrictions(own);
-        let joined = [crate::sql::catalog::deparse::Joined::new(exposed, table)];
-        let context = crate::sql::catalog::deparse::Context {
-            storage,
-            txid,
-            table: Some(table),
-            parameters: &[],
-            joined: &joined,
-            pretty: false,
-            qualify: false,
-        };
-        quals.filters[index] = deparse_qual(&context, own, arena)?;
-        if !own.is_empty() && quals.filters[index].is_none() {
-            return Ok(None);
-        }
+    if !scan_filters(
+        storage,
+        txid,
+        relations,
+        own,
+        own_count,
+        moved,
+        moved_count,
+        quals.filters,
+        arena,
+    )? {
+        return Ok(None);
     }
     let joined = arena
         .alloc_slice_with(count_relations, |index| {
@@ -644,6 +645,7 @@ fn join_quals<'a>(
         joined,
         pretty: false,
         qualify: true,
+        bare: None,
     };
     quals.hash_cond = deparse_qual(&context, &hash_conds[..hash_count], arena)?;
     if hash_count != 0 && quals.hash_cond.is_none() {
@@ -659,18 +661,379 @@ fn join_quals<'a>(
     Ok(Some(quals))
 }
 
-/// The filter of a scan of one relation reading `condition`, when every
-/// conjunct reads only that relation.
-fn single_relation_filter<'a>(
+/// Each relation's scan filter: its own conjuncts in PostgreSQL's order,
+/// then the join conjuncts a parameterized index scan of it evaluates,
+/// which name the other relations' columns qualified. False when one
+/// cannot be printed.
+#[allow(clippy::too_many_arguments)]
+fn scan_filters<'a>(
+    storage: &Storage,
+    txid: u32,
+    relations: &[(&'a str, &'a crate::storage::TableDef)],
+    own: &mut [&'a Expr<'a>],
+    own_count: &[usize],
+    moved: &[&'a Expr<'a>],
+    moved_count: &[usize],
+    filters: &mut [Option<StackStr<512>>],
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    for (index, (exposed, table)) in relations.iter().enumerate() {
+        let own = &mut own[index * MAX_CONJUNCTS..index * MAX_CONJUNCTS + own_count[index]];
+        order_restrictions(own);
+        let moved = &moved[index * MAX_CONJUNCTS..index * MAX_CONJUNCTS + moved_count[index]];
+        filters[index] = if moved.is_empty() {
+            let joined = [crate::sql::catalog::deparse::Joined::new(exposed, table)];
+            let context = crate::sql::catalog::deparse::Context {
+                storage,
+                txid,
+                table: Some(table),
+                parameters: &[],
+                joined: &joined,
+                pretty: false,
+                qualify: false,
+                bare: None,
+            };
+            deparse_qual(&context, own, arena)?
+        } else {
+            let all = arena
+                .alloc_slice_with(own.len() + moved.len(), |position| {
+                    own.get(position)
+                        .copied()
+                        .unwrap_or_else(|| moved[position - own.len()])
+                })
+                .map_err(|_| arena_full())?;
+            let joined = arena
+                .alloc_slice_with(relations.len(), |index| {
+                    crate::sql::catalog::deparse::Joined::new(
+                        relations[index].0,
+                        relations[index].1,
+                    )
+                })
+                .map_err(|_| arena_full())?;
+            let context = crate::sql::catalog::deparse::Context {
+                storage,
+                txid,
+                table: None,
+                parameters: &[],
+                joined,
+                pretty: false,
+                qualify: true,
+                bare: Some(exposed),
+            };
+            deparse_qual(&context, all, arena)?
+        };
+        if (!own.is_empty() || !moved.is_empty()) && filters[index].is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The relation of `relations` a column reference names, when exactly one
+/// has it.
+fn resolve_relation(
+    relations: &[(&str, &crate::storage::TableDef)],
+    qualifier: Option<&str>,
+    name: &str,
+) -> Option<usize> {
+    let has = |table: &crate::storage::TableDef| {
+        table
+            .columns()
+            .iter()
+            .any(|column| column.name.as_str() == name)
+    };
+    match qualifier {
+        Some(qualifier) => relations
+            .iter()
+            .position(|(exposed, table)| *exposed == qualifier && has(table)),
+        None => {
+            let mut found = relations
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, table))| has(table))
+                .map(|(index, _)| index);
+            match (found.next(), found.next()) {
+                (Some(index), None) => Some(index),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// The qualifications PostgreSQL attaches to relations joined in FROM order
+/// by outer joins (and inner joins with `ON`), relation `k` added by
+/// `joins[k - 1]`. An `ON` conjunct reading only a join's nullable input is
+/// filtered below the join; one reading only rows the join itself nulls,
+/// or both inputs, stays on the join as its hash condition or join filter.
+/// A `WHERE` conjunct reading a relation an outer join nulls filters the
+/// join's output (`Filter`) at the join that nulls it. None when a conjunct
+/// cannot be placed.
+#[allow(clippy::too_many_arguments)]
+fn outer_join_quals<'a>(
+    storage: &Storage,
+    txid: u32,
+    relations: &[(&'a str, &'a crate::storage::TableDef)],
+    joins: &'a [crate::sql::ast::Join<'a>],
+    condition: Option<&'a Expr<'a>>,
+    hash: bool,
+    indexes: &[Option<query::IndexAccessPlan<'a>>],
+    parameterized: &[bool],
+    arena: &'a Arena,
+) -> Result<Option<OuterJoinQuals<'a>>, SqlError> {
+    use crate::sql::ast::JoinKind;
+    let count = relations.len();
+    if count > 64 || joins.len() + 1 != count {
+        return Ok(None);
+    }
+    let resolve =
+        |qualifier: Option<&str>, name: &str| resolve_relation(relations, qualifier, name);
+    // A relation is nulled by a later join's outer side.
+    let nulls = |join: usize, relation: usize| match joins[join - 1].kind {
+        JoinKind::Left => relation == join,
+        JoinKind::Right => relation < join,
+        JoinKind::Full => relation <= join,
+        _ => false,
+    };
+    let nulled_below =
+        |relation: usize, depth: usize| (1..depth.min(count)).any(|join| nulls(join, relation));
+    let nulled_at = |relation: usize| {
+        (1..count)
+            .filter(|&join| nulls(join, relation))
+            .max()
+            .unwrap_or(0)
+    };
+    let own = arena
+        .alloc_slice_with(count * MAX_CONJUNCTS, |_| &Expr::Null)
+        .map_err(|_| arena_full())?;
+    let own_count = arena
+        .alloc_slice_with(count, |_| 0usize)
+        .map_err(|_| arena_full())?;
+    let moved = arena
+        .alloc_slice_with(count * MAX_CONJUNCTS, |_| &Expr::Null)
+        .map_err(|_| arena_full())?;
+    let moved_count = arena
+        .alloc_slice_with(count, |_| 0usize)
+        .map_err(|_| arena_full())?;
+    // Per join: its join filter and the filter of its output.
+    let join_list = arena
+        .alloc_slice_with(count * MAX_CONJUNCTS, |_| &Expr::Null)
+        .map_err(|_| arena_full())?;
+    let join_count = arena
+        .alloc_slice_with(count, |_| 0usize)
+        .map_err(|_| arena_full())?;
+    let post_list = arena
+        .alloc_slice_with(count * MAX_CONJUNCTS, |_| &Expr::Null)
+        .map_err(|_| arena_full())?;
+    let post_count = arena
+        .alloc_slice_with(count, |_| 0usize)
+        .map_err(|_| arena_full())?;
+    let mut hash_conds = [&Expr::Null; MAX_CONJUNCTS];
+    let mut hash_count = 0;
+    let push = |list: &mut [&'a Expr<'a>], counts: &mut [usize], slot: usize, conjunct| {
+        if counts[slot] == MAX_CONJUNCTS {
+            return false;
+        }
+        list[slot * MAX_CONJUNCTS + counts[slot]] = conjunct;
+        counts[slot] += 1;
+        true
+    };
+    // `ON` conjuncts of each join, then the `WHERE` conjuncts (depth 0).
+    for depth in (1..count).chain(core::iter::once(0)) {
+        let source = if depth == 0 {
+            condition
+        } else {
+            joins[depth - 1].on
+        };
+        let Some(source) = source else {
+            continue;
+        };
+        let mut conjuncts = [&Expr::Null; MAX_CONJUNCTS];
+        let mut conjunct_count = 0;
+        if split_conjuncts(source, &mut conjuncts, &mut conjunct_count).is_none() {
+            return Ok(None);
+        }
+        for &conjunct in &conjuncts[..conjunct_count] {
+            if indexes
+                .iter()
+                .any(|index| consumed_by(index.as_ref(), conjunct))
+            {
+                continue;
+            }
+            let Some(mask) = relation_mask(conjunct, &resolve) else {
+                return Ok(None);
+            };
+            if mask == 0 {
+                return Ok(None);
+            }
+            let highest = 63 - mask.leading_zeros() as usize;
+            let single = (mask.count_ones() == 1).then_some(highest);
+            let placed = if depth == 0 {
+                let nulled = (0..count)
+                    .filter(|relation| mask & (1 << relation) != 0)
+                    .map(nulled_at)
+                    .max()
+                    .unwrap_or(0);
+                if nulled == 0 {
+                    match single {
+                        Some(relation) => push(own, own_count, relation, conjunct),
+                        None if joins[highest - 1].kind.is_cross()
+                            || joins[highest - 1].kind == JoinKind::Inner =>
+                        {
+                            push(join_list, join_count, highest, conjunct)
+                        }
+                        None => push(post_list, post_count, highest, conjunct),
+                    }
+                } else {
+                    push(post_list, post_count, highest.max(nulled), conjunct)
+                }
+            } else {
+                if highest > depth {
+                    return Ok(None);
+                }
+                let kind = joins[depth - 1].kind;
+                let pushed_down = match (kind, single) {
+                    (JoinKind::Left, Some(relation)) => relation == depth,
+                    (JoinKind::Right | JoinKind::Inner, Some(relation)) => {
+                        (kind == JoinKind::Inner || relation < depth)
+                            && !nulled_below(relation, depth)
+                    }
+                    _ => false,
+                };
+                if pushed_down {
+                    push(own, own_count, highest, conjunct)
+                } else if hash
+                    && depth == 1
+                    && let Some(equality) = equijoin(conjunct, &resolve, 0, arena)?
+                {
+                    hash_conds[hash_count] = equality;
+                    hash_count += 1;
+                    true
+                } else if parameterized[depth] && mask & (1 << depth) != 0 {
+                    push(moved, moved_count, depth, conjunct)
+                } else {
+                    push(join_list, join_count, depth, conjunct)
+                }
+            };
+            if !placed {
+                return Ok(None);
+            }
+        }
+    }
+    let slots = || {
+        arena
+            .alloc_slice_with(count, |_| None::<StackStr<512>>)
+            .map_err(|_| arena_full())
+    };
+    let mut quals = OuterJoinQuals {
+        filters: slots()?,
+        hash_cond: None,
+        join_filters: slots()?,
+        post_filters: slots()?,
+    };
+    if !scan_filters(
+        storage,
+        txid,
+        relations,
+        own,
+        own_count,
+        moved,
+        moved_count,
+        quals.filters,
+        arena,
+    )? {
+        return Ok(None);
+    }
+    let joined = arena
+        .alloc_slice_with(count, |index| {
+            crate::sql::catalog::deparse::Joined::new(relations[index].0, relations[index].1)
+        })
+        .map_err(|_| arena_full())?;
+    let context = crate::sql::catalog::deparse::Context {
+        storage,
+        txid,
+        table: None,
+        parameters: &[],
+        joined,
+        pretty: false,
+        qualify: true,
+        bare: None,
+    };
+    quals.hash_cond = deparse_qual(&context, &hash_conds[..hash_count], arena)?;
+    if hash_count != 0 && quals.hash_cond.is_none() {
+        return Ok(None);
+    }
+    for depth in 1..count {
+        for (list, counts, target) in [
+            (&*join_list, &*join_count, &mut quals.join_filters[depth]),
+            (&*post_list, &*post_count, &mut quals.post_filters[depth]),
+        ] {
+            let conjuncts = &list[depth * MAX_CONJUNCTS..depth * MAX_CONJUNCTS + counts[depth]];
+            *target = deparse_qual(&context, conjuncts, arena)?;
+            if !conjuncts.is_empty() && target.is_none() {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(quals))
+}
+
+/// Each scan's index condition, with columns qualified by the relations
+/// joined.
+fn joined_index_conditions<'a>(
+    storage: &Storage,
+    txid: u32,
+    relations: &[(&'a str, &'a crate::storage::TableDef)],
+    indexes: &[Option<query::IndexAccessPlan<'a>>],
+    conditions: &mut [Option<StackStr<512>>],
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let joined = arena
+        .alloc_slice_with(relations.len(), |index| {
+            crate::sql::catalog::deparse::Joined::new(relations[index].0, relations[index].1)
+        })
+        .map_err(|_| arena_full())?;
+    let context = crate::sql::catalog::deparse::Context {
+        storage,
+        txid,
+        table: None,
+        parameters: &[],
+        joined,
+        pretty: false,
+        qualify: true,
+        bare: None,
+    };
+    for ((index, condition), (exposed, _)) in
+        indexes.iter().zip(conditions.iter_mut()).zip(relations)
+    {
+        if let Some(index) = index {
+            *condition = index_condition(&context, exposed, index, arena)?;
+        }
+    }
+    Ok(())
+}
+
+/// [`outer_join_quals`]' placement, per relation and per join depth.
+struct OuterJoinQuals<'a> {
+    filters: &'a mut [Option<StackStr<512>>],
+    hash_cond: Option<StackStr<512>>,
+    join_filters: &'a mut [Option<StackStr<512>>],
+    post_filters: &'a mut [Option<StackStr<512>>],
+}
+
+/// The index condition and filter of a scan of one relation reading
+/// `condition`, when every conjunct reads only that relation; the conjuncts
+/// `index` consumes form the index condition instead of the filter.
+fn single_relation_quals<'a>(
     storage: &Storage,
     txid: u32,
     exposed: &'a str,
     table: &'a crate::storage::TableDef,
     condition: Option<&'a Expr<'a>>,
+    index: Option<&query::IndexAccessPlan<'a>>,
     arena: &'a Arena,
-) -> Result<Option<StackStr<512>>, SqlError> {
+) -> Result<(Option<StackStr<512>>, Option<StackStr<512>>), SqlError> {
     let Some(condition) = condition else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let resolve = |qualifier: Option<&str>, name: &str| -> Option<usize> {
         (qualifier.is_none_or(|qualifier| qualifier == exposed)
@@ -687,9 +1050,16 @@ fn single_relation_filter<'a>(
             .iter()
             .any(|conjunct| relation_mask(conjunct, &resolve).is_none())
     {
-        return Ok(None);
+        return Ok((None, None));
     }
-    order_restrictions(&mut conjuncts[..count]);
+    let mut kept = 0;
+    for position in 0..count {
+        if !consumed_by(index, conjuncts[position]) {
+            conjuncts[kept] = conjuncts[position];
+            kept += 1;
+        }
+    }
+    order_restrictions(&mut conjuncts[..kept]);
     let joined = [crate::sql::catalog::deparse::Joined::new(exposed, table)];
     let context = crate::sql::catalog::deparse::Context {
         storage,
@@ -699,28 +1069,98 @@ fn single_relation_filter<'a>(
         joined: &joined,
         pretty: false,
         qualify: false,
+        bare: None,
     };
-    deparse_qual(&context, &conjuncts[..count], arena)
+    let index_cond = match index {
+        Some(index) => index_condition(&context, exposed, index, arena)?,
+        None => None,
+    };
+    Ok((
+        index_cond,
+        deparse_qual(&context, &conjuncts[..kept], arena)?,
+    ))
 }
 
-fn push_scan(plan: &mut Plan<'_>, scan: PlanNode) -> Result<(), SqlError> {
+/// Pushes `scan`; a bitmap heap scan rechecks the index condition its
+/// bitmap index scan child evaluates.
+fn push_scan(plan: &mut Plan<'_>, mut scan: PlanNode) -> Result<(), SqlError> {
     let bitmap_index = scan.bitmap_index;
     let bitmap_depth = scan.depth.saturating_add(1);
     let bitmap_rows = scan.rows;
     let bitmap_cost = scan.total_cost * 0.4;
+    let mut index_cond = None;
+    if !bitmap_index.as_str().is_empty()
+        && let Some(entry) = scan
+            .quals
+            .iter_mut()
+            .find(|(label, _)| *label == QualLabel::IndexCond)
+    {
+        entry.0 = QualLabel::RecheckCond;
+        index_cond = Some(entry.1);
+    }
     plan.push(scan)?;
     if !bitmap_index.as_str().is_empty() {
         let mut name = StackStr::new();
         let _ = write!(name, "Bitmap Index Scan on {}", bitmap_index.as_str());
-        plan.push(PlanNode {
-            name,
-            depth: bitmap_depth,
-            total_cost: bitmap_cost,
-            rows: bitmap_rows,
-            ..PlanNode::EMPTY
-        })?;
+        plan.push(
+            PlanNode {
+                name,
+                depth: bitmap_depth,
+                total_cost: bitmap_cost,
+                rows: bitmap_rows,
+                ..PlanNode::EMPTY
+            }
+            .with_qual(QualLabel::IndexCond, index_cond),
+        )?;
     }
     Ok(())
+}
+
+/// The conditions `index` consumes, each with the indexed side first as
+/// PostgreSQL prints an index scan's `Index Cond`; the scanned relation
+/// `exposed` prints its columns unqualified.
+fn index_condition<'a>(
+    context: &crate::sql::catalog::deparse::Context<'_>,
+    exposed: &str,
+    index: &query::IndexAccessPlan<'a>,
+    arena: &'a Arena,
+) -> Result<Option<StackStr<512>>, SqlError> {
+    let mut conditions = [&Expr::Null; MAX_CONJUNCTS];
+    let mut count = 0;
+    for (source, key, operator, operand) in index.index_conditions() {
+        if count == MAX_CONJUNCTS {
+            return Ok(None);
+        }
+        let source_position = match source {
+            Expr::Binary {
+                source_position, ..
+            } => *source_position,
+            _ => crate::sql::ast::SourcePosition::UNKNOWN,
+        };
+        conditions[count] = &*arena
+            .alloc(Expr::Binary {
+                source_position,
+                operator,
+                left: key,
+                right: operand,
+            })
+            .map_err(|_| arena_full())?;
+        count += 1;
+    }
+    let context = crate::sql::catalog::deparse::Context {
+        bare: Some(exposed),
+        ..*context
+    };
+    deparse_qual(&context, &conditions[..count], arena)
+}
+
+/// Whether `conjunct` is one of the conditions `index` consumes.
+fn consumed_by(index: Option<&query::IndexAccessPlan<'_>>, conjunct: &Expr<'_>) -> bool {
+    index.is_some_and(|index| {
+        index
+            .index_conditions()
+            .any(|(source, ..)| core::ptr::eq(source, conjunct))
+    })
 }
 
 fn projected_shape<'a>(
@@ -772,6 +1212,42 @@ fn projected_shape<'a>(
         ));
     }
     Ok((width, output))
+}
+
+/// Whether `statement` aggregates, resolving its columns through its FROM
+/// items.
+fn selects_aggregate(
+    statement: &Select<'_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+) -> Result<bool, SqlError> {
+    let scope = match &statement.from {
+        Some(from) => Some(QueryScope::resolve_schema(
+            storage, from, txid, arena, None,
+        )?),
+        None => None,
+    };
+    let scoped_columns = scope.as_ref().map(|scope| query::CatalogScopeCols {
+        scope,
+        outer: None,
+        storage,
+        txid,
+        arena,
+    });
+    let empty_columns = crate::sql::exec::CatalogCols {
+        definition: None,
+        alias: None,
+        output_aliases: &[],
+        storage,
+        txid,
+        arena,
+    };
+    let columns: &dyn crate::sql::exec::ColTypeResolver = scoped_columns.as_ref().map_or(
+        &empty_columns as &dyn crate::sql::exec::ColTypeResolver,
+        |columns| columns,
+    );
+    has_aggregate(statement, storage, txid, columns)
 }
 
 fn has_aggregate(
@@ -1286,7 +1762,7 @@ fn scan_node<'a>(
     ordered: Option<query::OrderedIndexAccessPlan<'a>>,
     parameterized: Option<query::IndexAccessPlan<'a>>,
     index_only: bool,
-) -> Result<PlanNode, SqlError> {
+) -> Result<(PlanNode, Option<query::IndexAccessPlan<'a>>), SqlError> {
     let slot = scope.slots[table];
     let derived = scope.derived[table].is_some() || slot == usize::MAX;
     let rows = if derived {
@@ -1438,7 +1914,7 @@ fn scan_node<'a>(
     } else {
         StackStr::from_str(if derived { "Subquery Scan" } else { "Seq Scan" })
     };
-    Ok(PlanNode {
+    let node = PlanNode {
         name,
         bitmap_index,
         relation,
@@ -1453,7 +1929,11 @@ fn scan_node<'a>(
         cache_blocks,
         constant_false: false,
         quals: NO_QUALS,
-    })
+    };
+    let used = index_identity
+        .filter(|_| use_index)
+        .map(|(access, _)| access);
+    Ok((node, used))
 }
 
 pub(super) fn plan_select<'a>(
@@ -1571,6 +2051,10 @@ pub(super) fn plan_select<'a>(
     let parameterized_indexes = arena
         .alloc_slice_with(table_count, |_| None)
         .map_err(|_| arena_full())?;
+    // The index each relation's scan uses, if any.
+    let scan_indexes = arena
+        .alloc_slice_with(table_count, |_| None)
+        .map_err(|_| arena_full())?;
     if let Some(scope) = &scope {
         let reorderable = statement.from.as_ref().is_some_and(|from| {
             from.joins.iter().all(|join| join.kind.is_cross())
@@ -1603,7 +2087,7 @@ pub(super) fn plan_select<'a>(
         estimated_rows = 1;
         total_cost = 0.0;
         for &table in &table_order[..scope.n] {
-            let scan = scan_node(
+            let (scan, index) = scan_node(
                 storage,
                 scope,
                 table,
@@ -1615,6 +2099,7 @@ pub(super) fn plan_select<'a>(
                 parameterized_indexes[table],
                 ordered_index_only,
             )?;
+            scan_indexes[table] = index;
             estimated_rows = estimated_rows.saturating_mul(scan.rows.max(1));
             total_cost += scan.total_cost;
             object_requests = object_requests.saturating_add(scan.object_requests);
@@ -1791,10 +2276,17 @@ pub(super) fn plan_select<'a>(
     let n = scope.as_ref().map_or(0, |scope| scope.n);
     // The WHERE conjuncts PostgreSQL attaches to each scan and to each join,
     // when every conjunct can be placed and printed.
+    let index_conds = arena
+        .alloc_slice_with(n.max(1), |_| None::<StackStr<512>>)
+        .map_err(|_| arena_full())?;
     let filters = arena
         .alloc_slice_with(n.max(1), |_| None::<StackStr<512>>)
         .map_err(|_| arena_full())?;
     let join_filters = arena
+        .alloc_slice_with(n.max(1), |_| None::<StackStr<512>>)
+        .map_err(|_| arena_full())?;
+    // Per join, the filter of its output.
+    let post_filters = arena
         .alloc_slice_with(n.max(1), |_| None::<StackStr<512>>)
         .map_err(|_| arena_full())?;
     // Relations joined by commas, CROSS JOIN or inner joins' ON conditions,
@@ -1816,6 +2308,12 @@ pub(super) fn plan_select<'a>(
             join_condition = query::and_where(join_condition, join.on, arena)?;
         }
     }
+    // Whether each relation's scan is a parameterized index scan.
+    let used_parameterized = arena
+        .alloc_slice_with(table_count, |table| {
+            parameterized_indexes[table].is_some() && scan_indexes[table].is_some()
+        })
+        .map_err(|_| arena_full())?;
     if let Some(scope) = &scope {
         let relation = |table: usize| {
             scope
@@ -1826,8 +2324,15 @@ pub(super) fn plan_select<'a>(
         if scope.n == 1
             && let Some((exposed, def)) = relation(0)
         {
-            filters[0] =
-                single_relation_filter(storage, txid, exposed, def, statement.where_clause, arena)?;
+            (index_conds[0], filters[0]) = single_relation_quals(
+                storage,
+                txid,
+                exposed,
+                def,
+                statement.where_clause,
+                scan_indexes[0].as_ref(),
+                arena,
+            )?;
         } else if inner_joins && (0..scope.n).all(|table| relation(table).is_some()) {
             let relations = arena
                 .alloc_slice_with(scope.n, |table| relation(table).expect("stored relation"))
@@ -1839,19 +2344,48 @@ pub(super) fn plan_select<'a>(
                 &table_order[..scope.n],
                 join_condition,
                 hash_join,
+                scan_indexes,
+                used_parameterized,
                 arena,
             )? {
                 filters.copy_from_slice(quals.filters);
                 join_filters.copy_from_slice(quals.join_filters);
                 stages[0] = stages[0].with_qual(QualLabel::HashCond, quals.hash_cond);
-                // A parameterized inner index scan takes the join's
-                // conditions as its index condition, which is not printed.
-                for position in 1..scope.n {
-                    if parameterized_indexes[table_order[position]].is_some() {
-                        join_filters[position] = None;
-                    }
-                }
             }
+            joined_index_conditions(storage, txid, relations, scan_indexes, index_conds, arena)?;
+        } else if scope.n >= 2
+            && let Some(from) = statement.from.as_ref()
+            && from
+                .joins
+                .iter()
+                .all(|join| join.using.is_none() && !join.natural)
+            && !scope.lateral[..scope.n].iter().any(|&lateral| lateral)
+            && table_order[..scope.n]
+                .iter()
+                .enumerate()
+                .all(|(position, &table)| position == table)
+            && (0..scope.n).all(|table| relation(table).is_some())
+        {
+            let relations = arena
+                .alloc_slice_with(scope.n, |table| relation(table).expect("stored relation"))
+                .map_err(|_| arena_full())?;
+            if let Some(quals) = outer_join_quals(
+                storage,
+                txid,
+                relations,
+                from.joins,
+                statement.where_clause,
+                hash_join,
+                scan_indexes,
+                used_parameterized,
+                arena,
+            )? {
+                filters.copy_from_slice(quals.filters);
+                join_filters.copy_from_slice(quals.join_filters);
+                post_filters.copy_from_slice(quals.post_filters);
+                stages[0] = stages[0].with_qual(QualLabel::HashCond, quals.hash_cond);
+            }
+            joined_index_conditions(storage, txid, relations, scan_indexes, index_conds, arena)?;
         }
     }
     for (depth, stage) in stages[..stage_count].iter().rev().enumerate() {
@@ -1859,7 +2393,9 @@ pub(super) fn plan_select<'a>(
         stage.depth = depth as u8;
         stage.output = output;
         if n >= 2 && depth + 1 == stage_count {
-            stage = stage.with_qual(QualLabel::JoinFilter, join_filters[n - 1].take());
+            stage = stage
+                .with_qual(QualLabel::JoinFilter, join_filters[n - 1].take())
+                .with_qual(QualLabel::Filter, post_filters[n - 1].take());
         }
         plan.push(stage)?;
     }
@@ -1884,7 +2420,8 @@ pub(super) fn plan_select<'a>(
                     output,
                     ..PlanNode::EMPTY
                 }
-                .with_qual(QualLabel::JoinFilter, join_filters[position].take()),
+                .with_qual(QualLabel::JoinFilter, join_filters[position].take())
+                .with_qual(QualLabel::Filter, post_filters[position].take()),
             )?;
         }
         for (position, &table) in table_order[..scope.n].iter().enumerate() {
@@ -1893,7 +2430,7 @@ pub(super) fn plan_select<'a>(
             } else {
                 top + n - position.max(1)
             };
-            let mut scan = scan_node(
+            let (mut scan, _) = scan_node(
                 storage,
                 scope,
                 table,
@@ -1907,9 +2444,9 @@ pub(super) fn plan_select<'a>(
             )?;
             scan.output = output;
             let sequential = scan.name.as_str() == "Seq Scan";
-            if sequential {
-                scan = scan.with_qual(QualLabel::Filter, filters[table].take());
-            }
+            scan = scan
+                .with_qual(QualLabel::IndexCond, index_conds[table].take())
+                .with_qual(QualLabel::Filter, filters[table].take());
             if position >= 1 {
                 // A hash join hashes its inner relation; a nested loop
                 // rescans its inner sequential scan from a materialized copy.
@@ -1946,6 +2483,9 @@ fn join_node(kind: Option<crate::sql::ast::JoinKind>, hash: bool) -> &'static st
     match (kind, hash) {
         (Some(crate::sql::ast::JoinKind::Left), true) => "Hash Left Join",
         (Some(crate::sql::ast::JoinKind::Left), false) => "Nested Loop Left Join",
+        // The executor keeps each preserved row that found no match.
+        (Some(crate::sql::ast::JoinKind::Right), false) => "Nested Loop Right Join",
+        (Some(crate::sql::ast::JoinKind::Full), false) => "Nested Loop Full Join",
         (_, true) => "Hash Join",
         (_, false) => "Nested Loop",
     }
@@ -2302,8 +2842,12 @@ pub(super) fn plan_modification<'a>(
         let source_nodes = arena
             .alloc_slice_with(scope.n, |_| PlanNode::EMPTY)
             .map_err(|_| arena_full())?;
+        // Per relation, the target first: the index its scan uses.
+        let scan_indexes = arena
+            .alloc_slice_with(scope.n + 1, |_| None)
+            .map_err(|_| arena_full())?;
         for (position, &table) in order[..scope.n].iter().enumerate() {
-            let node = scan_node(
+            let (node, index) = scan_node(
                 storage,
                 &scope,
                 table,
@@ -2315,6 +2859,7 @@ pub(super) fn plan_modification<'a>(
                 parameterized[table],
                 false,
             )?;
+            scan_indexes[table + 1] = index;
             total_cost += node.total_cost;
             rows = rows.saturating_mul(node.rows.max(1));
             object_requests = object_requests.saturating_add(node.object_requests);
@@ -2367,18 +2912,52 @@ pub(super) fn plan_modification<'a>(
             for join in from.joins {
                 condition = query::and_where(condition, join.on, arena)?;
             }
-            if let Some(quals) =
-                join_quals(storage, txid, relations, display, condition, hashed, arena)?
-            {
+            let joined_parameterized = arena
+                .alloc_slice_with(relations_count, |relation| {
+                    relation != 0
+                        && parameterized[relation - 1].is_some()
+                        && scan_indexes[relation].is_some()
+                })
+                .map_err(|_| arena_full())?;
+            if let Some(quals) = join_quals(
+                storage,
+                txid,
+                relations,
+                display,
+                condition,
+                hashed,
+                scan_indexes,
+                joined_parameterized,
+                arena,
+            )? {
                 filters.copy_from_slice(quals.filters);
                 join_filters.copy_from_slice(quals.join_filters);
                 hash_cond = quals.hash_cond;
-                // A parameterized inner index scan takes the join's
-                // conditions as its index condition, which is not printed.
-                for (position, &table) in order[..scope.n].iter().enumerate() {
-                    if parameterized[table].is_some() {
-                        join_filters[position + 1] = None;
-                    }
+            }
+            let joined = arena
+                .alloc_slice_with(relations_count, |index| {
+                    crate::sql::catalog::deparse::Joined::new(
+                        relations[index].0,
+                        relations[index].1,
+                    )
+                })
+                .map_err(|_| arena_full())?;
+            let context = crate::sql::catalog::deparse::Context {
+                storage,
+                txid,
+                table: None,
+                parameters: &[],
+                joined,
+                pretty: false,
+                qualify: true,
+                bare: None,
+            };
+            for table in 0..scope.n {
+                if let Some(index) = scan_indexes[table + 1].as_ref() {
+                    source_nodes[table] = source_nodes[table].with_qual(
+                        QualLabel::IndexCond,
+                        index_condition(&context, relations[table + 1].0, index, arena)?,
+                    );
                 }
             }
         }
@@ -2427,11 +3006,9 @@ pub(super) fn plan_modification<'a>(
         let target_scan = target_scan.with_qual(QualLabel::Filter, filters[0].take());
         push_scan(&mut plan, target_scan)?;
         for (position, &table) in order[..scope.n].iter().enumerate() {
-            let mut node = source_nodes[table];
+            let mut node =
+                source_nodes[table].with_qual(QualLabel::Filter, filters[table + 1].take());
             let sequential = node.name.as_str() == "Seq Scan";
-            if sequential {
-                node = node.with_qual(QualLabel::Filter, filters[table + 1].take());
-            }
             let hash = hash_at(position + 1);
             // A hash join hashes its inner relation; a nested loop rescans its
             // inner sequential scan from a materialized copy.
@@ -2546,20 +3123,18 @@ pub(super) fn plan_modification<'a>(
             let mut scan =
                 physical_scan_node(storage, slot, target.name, filtered, txid, 1, index_name);
             scan.alias = target_node.alias;
-            if scan.name.as_str() == "Seq Scan" {
-                let definition = storage.table_def(slot, txid);
-                let filter = single_relation_filter(
-                    storage,
-                    txid,
-                    alias.unwrap_or(target.name),
-                    &definition,
-                    predicate,
-                    arena,
-                )?;
-                scan.with_qual(QualLabel::Filter, filter)
-            } else {
-                scan
-            }
+            let definition = storage.table_def(slot, txid);
+            let (index_cond, filter) = single_relation_quals(
+                storage,
+                txid,
+                alias.unwrap_or(target.name),
+                &definition,
+                predicate,
+                index.as_ref().map(|(plan, _)| plan),
+                arena,
+            )?;
+            scan.with_qual(QualLabel::IndexCond, index_cond)
+                .with_qual(QualLabel::Filter, filter)
         };
         push_scan(&mut plan, child)?;
         child
@@ -3524,10 +4099,20 @@ fn rule_rewritten_statements<'a>(
         ),
         _ => return Ok(None),
     };
-    let Some(crate::storage::ResolvedRelation::Table(slot)) =
-        storage.resolve_relation(table.schema, table.name, txid)
-    else {
-        return Ok(None);
+    let slot = match storage.resolve_relation(table.schema, table.name, txid) {
+        Some(crate::storage::ResolvedRelation::Table(slot)) => slot,
+        Some(crate::storage::ResolvedRelation::View(view))
+            if storage
+                .firing_rules_for(RuleTarget::View(view as u16), event, false, txid)
+                .next()
+                .is_some() =>
+        {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "EXPLAIN of a statement a rewrite rule changes is not supported for a statement on a view"
+            ));
+        }
+        _ => return Ok(None),
     };
     let target = RuleTarget::Table(slot as u16);
     if storage
@@ -3582,7 +4167,9 @@ fn rule_rewritten_statements<'a>(
                 &storage.table_def(action_slot, txid),
                 action_table.name,
             ),
-            _ => Err(unsupported("an action on a view")),
+            _ => Err(unsupported(
+                "an action on a view or on a relation with rules",
+            )),
         }
     };
     let old_value = |name: &'a str| -> Result<&'a Expr<'a>, SqlError> {
@@ -3614,7 +4201,8 @@ fn rule_rewritten_statements<'a>(
                         && select
                             .items
                             .iter()
-                            .all(|item| matches!(item, SelectItem::Expr { .. })) =>
+                            .all(|item| matches!(item, SelectItem::Expr { .. }))
+                        && !selects_aggregate(select, storage, txid, arena)? =>
                 {
                     (&[], Some(select))
                 }
@@ -3883,6 +4471,35 @@ fn rule_rewritten_statements<'a>(
                 }
                 _ => return Err(unsupported("this rule action")),
             };
+            // PostgreSQL rewrites an action on a relation with rules again.
+            let (action_table, action_event) = match &rewritten {
+                Stmt::Insert(insert) => (Some(insert.table), RewriteEvent::Insert),
+                Stmt::Update(update) => (Some(update.table), RewriteEvent::Update),
+                Stmt::Delete(delete) => (Some(delete.table), RewriteEvent::Delete),
+                _ => (None, RewriteEvent::Insert),
+            };
+            if let Some(action_table) = action_table {
+                let action_target =
+                    match storage.resolve_relation(action_table.schema, action_table.name, txid) {
+                        Some(crate::storage::ResolvedRelation::Table(slot)) => {
+                            RuleTarget::Table(slot as u16)
+                        }
+                        Some(crate::storage::ResolvedRelation::View(view)) => {
+                            RuleTarget::View(view as u16)
+                        }
+                        _ => return Err(unsupported("this rule action")),
+                    };
+                if matches!(action_target, RuleTarget::View(_))
+                    || storage
+                        .firing_rules_for(action_target, action_event, false, txid)
+                        .next()
+                        .is_some()
+                {
+                    return Err(unsupported(
+                        "an action on a view or on a relation with rules",
+                    ));
+                }
+            }
             let rewritten = &*arena.alloc(rewritten).map_err(|_| arena_full())?;
             actions.push(rewritten).map_err(|_| arena_full())?;
         }

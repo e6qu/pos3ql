@@ -522,9 +522,18 @@ windows or grouping sets (`DO ALSO INSERT INTO log SELECT a FROM (SELECT a
 FROM t) s`), is printed as written, and its pretty form fails with `0A000`; policy
 expressions are not deparsed. `EXPLAIN` prints
 the left-deep join tree pos3ql runs, with scan filters, a hash join's
-condition and each nested loop's join filter, for relations joined by
-commas, `CROSS JOIN` or inner `ON` conditions; outer joins print the tree
-without their conditions, and index scans omit `Index Cond`. The join order
+condition and each nested loop's join filter. An index scan prints the
+conditions its index consumes as `Index Cond` (indexed column first and
+unqualified), and a parameterized inner index scan filters the other join
+conditions reading it, as PostgreSQL does. Outer joins of stored tables in
+FROM order place an `ON` condition reading only the nullable side below the
+join, keep the rest as the join's hash condition or join filter, and filter
+the join's output (`Filter`) by a `WHERE` condition reading a nulled
+relation. A right or full join runs, and prints, as a `Nested Loop Right
+Join` or `Nested Loop Full Join`, where PostgreSQL swaps a right join's
+inputs or hashes and merges. A `WHERE` condition that would let PostgreSQL
+reduce an outer join to an inner join is printed as a filter of the outer
+join pos3ql runs. The join order
 is pos3ql's (FROM order, or its selectivity order for comma lists), which
 can differ from PostgreSQL's cost-based order. The executor has no merge
 join, so where PostgreSQL's costs pick `Merge Join` over sorted inputs
@@ -535,7 +544,11 @@ it in nested loops; PostgreSQL may instead hash the joined FROM items. For a
 statement a rewrite rule changes, an `INSERT ... SELECT` action of an
 `INSERT` of several rows or of a query reading tables, an `INSERT` of an
 aggregated or ordered query, a conditional `INSTEAD` rule on an `INSERT` of
-several rows and an action on a view fail with `0A000`; under `EXPLAIN ANALYZE` the statement runs
+several rows, a statement on a view with rules, and an action on a view or on
+a relation with rules of its own (which PostgreSQL rewrites again) fail with
+`0A000`. Planning them needs a `VALUES` list kept apart from a `UNION ALL`
+of rows (PostgreSQL's `Values Scan on "*VALUES*"`), a derived table's plan
+under its `Subquery Scan`, and a rewrite of each action's own rules; under `EXPLAIN ANALYZE` the statement runs
 once and its time and I/O are reported on its last query. `EXPLAIN ANALYZE`
 reports actual rows only on each plan's top node, where PostgreSQL reports
 every node (`(never executed)` for nodes that did not run), because the

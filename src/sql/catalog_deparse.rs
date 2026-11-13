@@ -43,6 +43,9 @@ pub(crate) struct Context<'s> {
     /// Qualify every column, as PostgreSQL does when the query's range table
     /// holds more than the FROM items (a rule's `OLD` and `NEW`).
     pub qualify: bool,
+    /// The FROM item whose columns print unqualified while others are
+    /// qualified, as PostgreSQL prints a scan's own conditions.
+    pub bare: Option<&'s str>,
 }
 
 /// A FROM item: the name stored references qualify columns with, the name
@@ -783,8 +786,10 @@ impl Context<'_> {
                     let Some((exposed, _)) = self.joined_source(*qualifier, name) else {
                         return output.unsupported();
                     };
-                    write_identifier(&mut identifier, exposed);
-                    let _ = identifier.write_char('.');
+                    if self.bare != Some(exposed) {
+                        write_identifier(&mut identifier, exposed);
+                        let _ = identifier.write_char('.');
+                    }
                 }
                 write_identifier(&mut identifier, name);
                 output.push(identifier.as_str())
@@ -1558,6 +1563,7 @@ pub(crate) fn view_definition<'a>(
         joined: &joined[..count],
         pretty,
         qualify: origin == crate::storage::ViewQueryOrigin::ReturnRule,
+        bare: None,
     };
     let mut output = Output {
         arena,
@@ -1900,6 +1906,7 @@ pub(crate) fn rule_action_definition<'a>(
         joined,
         pretty,
         qualify: true,
+        bare: None,
     };
     // A source's relation, then its alias after `separator`.
     let relation = |source: &Joined<'_>, separator: &str| {
